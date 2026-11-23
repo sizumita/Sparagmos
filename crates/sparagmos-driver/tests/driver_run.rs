@@ -21772,3 +21772,124 @@ Wrap { items: [3, 1, 4] }
 ";
     assert_eq!(stdout, expected, "VecDeque Debug output must be the list form");
 }
+
+const PATHBUF_AS_PATH_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+fn main() {
+    let pb = PathBuf::from("abc");
+    let p = pb.as_path();
+    println!("len {}", p.as_os_str().len());
+    println!("eq {}", p == Path::new("abc"));
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_as_path() {
+    run_ok(
+        "pathbuf-as-path",
+        PATHBUF_AS_PATH_SRC,
+        "len 3\neq true\ndone\n",
+    );
+}
+
+const OSSTRING_AS_OS_STR_SRC: &str = r#"
+use std::ffi::OsString;
+fn main() {
+    let s = OsString::from("a/b");
+    println!("len {}", s.as_os_str().len());
+    let b = &s[..];
+    println!("sub {}", b.to_str().unwrap());
+    println!("enc {}", s.as_os_str().as_encoded_bytes().len());
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_osstring_as_os_str_and_index() {
+    run_ok(
+        "osstring-as-os-str",
+        OSSTRING_AS_OS_STR_SRC,
+        "len 3\nsub a/b\nenc 3\ndone\n",
+    );
+}
+
+const VEC_AS_PTR_WRAPPER_SRC: &str = r#"
+struct Holder {
+    v: Vec<u32>,
+}
+fn main() {
+    let h = Holder { v: vec![10, 20, 30] };
+    let p = h.v.as_ptr();
+    unsafe {
+        println!("{} {} {}", *p, *p.add(1), *p.add(2));
+    }
+    let v = vec![1u8, 2, 3];
+    let q = v.as_ptr();
+    unsafe {
+        println!("first {}", *q);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_as_ptr_through_wrapper() {
+    run_ok(
+        "vec-as-ptr-wrapper",
+        VEC_AS_PTR_WRAPPER_SRC,
+        "10 20 30\nfirst 1\ndone\n",
+    );
+}
+
+const VEC_DEDUP_LEN_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1u8, 1, 2, 2, 3];
+    v.dedup();
+    println!("{:?}", v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_dedup_len_slot_write() {
+    run_ok("vec-dedup", VEC_DEDUP_LEN_WRITE_SRC, "[1, 2, 3]\ndone\n");
+}
+
+const VEC_TRUNCATE_LEN_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1u8, 1, 2, 2, 3];
+    v.truncate(3);
+    println!("{:?}", v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_truncate_len_slot_write() {
+    run_ok(
+        "vec-truncate",
+        VEC_TRUNCATE_LEN_WRITE_SRC,
+        "[1, 1, 2]\ndone\n",
+    );
+}
+
+const CSTR_WITH_NUL_SRC: &str = r#"
+use std::ffi::CString;
+fn main() {
+    let c = CString::new("hello").unwrap();
+    let cs = c.as_c_str();
+    println!("len {}", cs.to_bytes().len());
+    println!("with_nul {:?}", cs.to_bytes_with_nul());
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_cstr_bytes_with_nul() {
+    run_ok(
+        "cstr-with-nul",
+        CSTR_WITH_NUL_SRC,
+        "len 5\nwith_nul [104, 101, 108, 108, 111, 0]\ndone\n",
+    );
+}

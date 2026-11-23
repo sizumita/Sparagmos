@@ -665,6 +665,27 @@ fn convert_all(
     out.union_tables = conv.union_tables.clone();
     out.async_closure_captures = conv.async_closure_captures.clone();
     out.mat_plans = conv.mat_table.clone();
+    // The ADT field-type table: each definition's declared field
+    // types, reduced to the skeletons place-walk type tracking
+    // can follow (see `field_ty_skeleton`), keyed by the same
+    // definition name the converted `Ty::Adt` tags carry.
+    out.adt_field_tys = program
+        .adt_shapes
+        .iter()
+        .map(|(def, shape)| {
+            let variants = shape
+                .variants
+                .iter()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|ty| conv.field_ty_skeleton(ty))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            (conv.def_display_name(def), variants)
+        })
+        .collect();
     // Joint fixpoint of conversion, cleanliness and the
     // builtin-served set. Each round recomputes, from the merged
     // program so far:
@@ -2860,6 +2881,38 @@ impl<'a> Converter<'a> {
             format!("{name}#{def}")
         } else {
             name
+        }
+    }
+
+    /// The skeleton of a declared ADT field type for the
+    /// interpreter's place-walk type tracking (see
+    /// [`ir::Program::adt_field_tys`]): the type reduced to the
+    /// structure a walk can follow without knowing the instance —
+    /// an ADT keeps its definition name (its generic arguments
+    /// are erased, exactly as [`Self::convert_ty`] erases them),
+    /// a reference or raw pointer keeps its pointee's skeleton, a
+    /// tuple keeps its elements' skeletons (an untrackable
+    /// element becomes the unit type, which no walk step can
+    /// mistake for a modelled type), and every other type goes
+    /// through the ordinary conversion. A field whose type
+    /// mentions a generic parameter or a type alias at its head
+    /// has no instance-independent skeleton: `None`, and tracking
+    /// through that field ends.
+    fn field_ty_skeleton(&self, ty: &mir::Ty) -> Option<ir::Ty> {
+        match ty {
+            mir::Ty::Param(..) | mir::Ty::Alias(..) => None,
+            mir::Ty::Adt(def, _) => Some(ir::Ty::Adt(self.def_display_name(def))),
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(
+                ir::Ty::Ref(Box::new(self.field_ty_skeleton(inner)?)),
+            ),
+            mir::Ty::Tuple(ts) => {
+                let mut out = Vec::with_capacity(ts.len());
+                for t in ts {
+                    out.push(self.field_ty_skeleton(t).unwrap_or(ir::Ty::Unit));
+                }
+                Some(ir::Ty::Tuple(out))
+            }
+            other => self.convert_ty(other, "an ADT field type").ok(),
         }
     }
 

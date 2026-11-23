@@ -1914,6 +1914,20 @@ pub struct Program {
     /// the driver. Consulted when a pointer offset over a static
     /// must be denominated in the declared type's element size.
     pub static_tys: std::collections::HashMap<String, Ty>,
+    /// Declared field types of the program's ADT definitions,
+    /// keyed by the ADT's definition name (the tag a [`Ty::Adt`]
+    /// carries): per variant, per field, the field's declared
+    /// type reduced to the skeleton the interpreter's place walks
+    /// can track (see `mir_convert`'s field-type skeleton): `None`
+    /// for a field whose type mentions a generic parameter at its
+    /// head, whose tracked type would differ per instance.
+    /// Consulted by place resolution, whose projections carry no
+    /// types, to know when a walk has reached a modelled `Vec`
+    /// behind wrapper fields (an `OsString`'s buffer field, a
+    /// struct's `Vec` field) whose declared slots the value model
+    /// answers from the element list itself.
+    pub adt_field_tys:
+        std::collections::HashMap<String, Vec<Vec<Option<Ty>>>>,
     /// The guest allocation shims of a program that defines a
     /// `#[global_allocator]`: symbol (`__rust_alloc`,
     /// `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`)
