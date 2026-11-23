@@ -679,7 +679,17 @@ impl MatPlan {
             MatPlan::Bool => Some(1),
             MatPlan::Char => Some(4),
             MatPlan::Int { size, .. } | MatPlan::Float { size } => Some(u64::from(*size)),
-            MatPlan::Ref(_) | MatPlan::FnPtr => Some(8),
+            MatPlan::Ref(inner) => match &**inner {
+                // A pointer to an unsized pointee (`str`, a
+                // slice) is a fat pointer: the data word plus
+                // the metadata word. (Any other pointee is
+                // sized, so the pointer is one word; an
+                // undescribed pointee is a sized type whose
+                // plan is missing, not an unsized one.)
+                MatPlan::Str | MatPlan::Slice(_) => Some(16),
+                _ => Some(8),
+            },
+            MatPlan::FnPtr => Some(8),
             MatPlan::Tuple { size, .. }
             | MatPlan::Struct { size, .. }
             | MatPlan::Enum { size, .. }

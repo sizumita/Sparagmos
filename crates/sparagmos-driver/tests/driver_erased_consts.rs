@@ -8,8 +8,9 @@
 //! that recovers the real type, from the byte-layout plan the
 //! conversion records for that cast. The allocation's identity
 //! survives: repeated casts of the same erased pointer compare
-//! equal, and a read through the recovered type sees the stored
-//! fields, nested references and enum tags included.
+//! equal, a cast back to the erased type compares equal to the
+//! original pointer, and a read through the recovered type sees
+//! the stored fields, nested references and enum tags included.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -219,4 +220,121 @@ fn read_exact_eof_kind_and_raw_os_error() {
         stderr.contains("Display formatting for an ADT value"),
         "stderr={stderr}"
     );
+}
+
+const IDENTITY_ROUND_TRIP_RS: &str = r#"
+use std::ptr::NonNull;
+
+struct Msg {
+    kind: u32,
+    message: &'static str,
+}
+
+struct Erased {
+    p: NonNull<()>,
+}
+
+const MSG: Msg = Msg { kind: 7, message: "hello erased" };
+const ERASED: Erased = Erased {
+    p: unsafe { NonNull::new_unchecked(&MSG as *const Msg as *mut ()) },
+};
+
+fn main() {
+    let raw = ERASED.p.as_ptr();
+    let typed = raw.cast::<Msg>();
+    let back = typed as *mut ();
+    println!("eq: {}", std::ptr::eq(raw, back));
+    println!("addr eq: {}", raw as usize == back as usize);
+    println!("kind={} msg={}", unsafe { (*typed).kind }, unsafe { (*typed).message });
+}
+"#;
+
+#[test]
+fn erased_pointer_identity_survives_materialising_cast() {
+    // The materialised value is a typed view of the one
+    // erased allocation, not a new allocation: a pointer cast
+    // to the concrete type and back to the erased type
+    // compares equal to the original pointer, by `ptr::eq`
+    // and by address, as it does natively.
+    run_ok(
+        "identity_round_trip",
+        IDENTITY_ROUND_TRIP_RS,
+        "eq: true\naddr eq: true\nkind=7 msg=hello erased\n",
+    );
+}
+
+const STR_SLICE_FIELD_RS: &str = r#"
+use std::ptr::NonNull;
+
+struct Holder {
+    p: NonNull<()>,
+}
+
+struct Inner {
+    names: &'static [&'static str],
+}
+
+const NAMES: [&'static str; 2] = ["a", "bb"];
+const INNER: Inner = Inner { names: &NAMES };
+const H: Holder = Holder {
+    p: unsafe { NonNull::new_unchecked(&INNER as *const Inner as *mut ()) },
+};
+
+fn main() {
+    let inner = unsafe { &*H.p.as_ptr().cast::<Inner>() };
+    println!("{} {}", inner.names[0], inner.names[1]);
+}
+"#;
+
+#[test]
+fn erased_const_with_str_slice_field() {
+    // The slice's elements are fat pointers (two words
+    // each): the second element is read at its real stride,
+    // not from the first element's length word.
+    run_ok("str_slice_field", STR_SLICE_FIELD_RS, "a bb\n");
+}
+
+const RECURSIVE_CAST_RS: &str = r#"
+struct Node {
+    a: *const Node,
+    b: *const Node,
+    c: *const Node,
+    v: u32,
+}
+
+fn main() {
+    let n = Node {
+        a: std::ptr::null(),
+        b: std::ptr::null(),
+        c: std::ptr::null(),
+        v: 3,
+    };
+    let erased = &n as *const Node as *const ();
+    let back = erased as *const Node;
+    println!("v={}", unsafe { (*back).v });
+}
+"#;
+
+#[test]
+fn recursive_type_cast_converts() {
+    // Recording the materialisation plan of a cast to a
+    // recursive type must not unroll the type graph into a
+    // tree: with three pointer fields per level the unguarded
+    // expansion exhausts memory during conversion. The
+    // recursive edge gets no plan; the program converts and
+    // runs.
+    let fixture = write_fixture("recursive_cast", RECURSIVE_CAST_RS);
+    let out = Command::new(driver())
+        .arg(&fixture)
+        .args(["--edition", "2021"])
+        .env_remove("SPARAGMOS_DUMP")
+        .output()
+        .expect("spawn driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a cast to a recursive type must convert; stderr={stderr}"
+    );
+    run_ok("recursive_cast_run", RECURSIVE_CAST_RS, "v=3\n");
 }

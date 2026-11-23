@@ -840,6 +840,13 @@ pub struct Interpreter<'a> {
     /// [`Interpreter::adt_instance_key`]), memoised: the
     /// resolution scans the program's instance tables.
     adt_instance_keys: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// The typed views materialised from type-erased constant
+    /// blocks, keyed by the view's rendering and mapping to
+    /// the block the view was materialised from (see
+    /// [`Interpreter::note_mat_origin`]): address resolution
+    /// denotes a pointer to a view by its block, so a
+    /// materialising cast preserves the pointer's identity.
+    mat_origins: std::cell::RefCell<HashMap<String, Value>>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -1391,6 +1398,7 @@ impl<'a> Interpreter<'a> {
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
             adt_instance_keys: std::cell::RefCell::new(HashMap::new()),
+            mat_origins: std::cell::RefCell::new(HashMap::new()),
             debug_ctl: None,
         }
     }
@@ -10227,13 +10235,24 @@ impl<'a> Interpreter<'a> {
                     None => projection.clone(),
                 },
             },
-            RefTarget::Value(base, projection) => RefTarget::Value(
-                base.clone(),
-                match leaf_ty {
+            RefTarget::Value(base, projection) => {
+                let projection = match leaf_ty {
                     Some(leaf) => self.canonical_projection_bwd(projection, leaf),
                     None => projection.clone(),
-                },
-            ),
+                };
+                // A value materialised from a type-erased
+                // constant block is a typed view of that one
+                // allocation, not a new one: a pointer
+                // denoting the view carries the block's
+                // identity, so it compares and converts to
+                // an address exactly as a pointer to the
+                // block does (see [`Self::note_mat_origin`]).
+                let base = match self.mat_origins.borrow().get(&format!("{base:?}")) {
+                    Some(origin) => Box::new(origin.clone()),
+                    None => base.clone(),
+                };
+                RefTarget::Value(base, projection)
+            }
             RefTarget::Null | RefTarget::Address(_) => target.clone(),
         }
     }
@@ -14785,6 +14804,27 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// Record that `materialised` is the typed view of the
+    /// type-erased constant block `origin` (the
+    /// [`Value::ErasedBlock`] a materialisation just read):
+    /// address resolution denotes a pointer to the view by
+    /// the block (see [`Self::canonical_target`]), so pointer
+    /// equality and pointer-to-integer casts answer the same
+    /// before and after a materialising cast, as they do
+    /// natively -- the cast recovers the allocation's type,
+    /// it does not move the allocation. The first origin
+    /// recorded for a view wins: blocks whose bytes differ
+    /// only where no plan reads (padding, uninitialised
+    /// bytes) materialise to the same view, and address
+    /// identity in this model is content-based, so either
+    /// origin names the view's identity as faithfully.
+    fn note_mat_origin(&self, materialised: &Value, origin: &Value) {
+        self.mat_origins
+            .borrow_mut()
+            .entry(format!("{materialised:?}"))
+            .or_insert_with(|| origin.clone());
+    }
+
     /// Evaluate a materialising cast (see [`Rvalue::Materialize`]):
     /// an operand denoting a type-erased constant allocation
     /// materialises into the cast target's type with the
@@ -14824,6 +14864,7 @@ impl<'a> Interpreter<'a> {
             ));
         };
         let materialised = self.materialize_value(bytes, relocs, plan, 0)?;
+        self.note_mat_origin(&materialised, pointee.as_ref());
         Ok(Value::Ref(RefTarget::value(materialised)))
     }
 
@@ -15151,6 +15192,7 @@ impl<'a> Interpreter<'a> {
                     unreachable!()
                 };
                 let m = self.materialize_value(bbytes, brelocs, inner, 0)?;
+                self.note_mat_origin(&m, v.as_ref());
                 Ok(Value::Ref(RefTarget::value(m)))
             }
             // A function value, an address-only pointer, a null

@@ -18,7 +18,7 @@
 //!   `TyConstKind::Value`); scalar values are read out of the allocation
 //!   bytes using the constant's own type, so sizes are exact.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
 use rustc_public::mir;
@@ -3132,7 +3132,8 @@ impl Converter {
             | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
             _ => return,
         };
-        let plan = self.mat_plan(&rustc_pointee, 0);
+        let mut active = HashSet::new();
+        let plan = self.mat_plan(&rustc_pointee, 0, &mut active);
         self.mat_plans.insert(key, plan);
     }
 
@@ -3149,11 +3150,41 @@ impl Converter {
         &mut self,
         ty: &rustc_public::ty::Ty,
         depth: usize,
+        active: &mut HashSet<rustc_public::ty::Ty>,
     ) -> sparagmos_interp::ir::MatPlan {
         use sparagmos_interp::ir::MatPlan;
         if depth > MAX_CONST_DEPTH {
             return MatPlan::Unsupported;
         }
+        // A type already being expanded on the path from the
+        // cast's target type: the type graph cycles here, and
+        // expanding the type again would unroll the cycle into
+        // a tree whose size grows like the branching factor
+        // raised to the depth limit (a recursive struct with
+        // three pointer fields alone would build tens of
+        // millions of plans and exhaust memory during
+        // conversion, for every cast that mentions the type).
+        // The recursive edge gets no plan -- materialising
+        // through it is an explicit error, never a guess --
+        // and every other edge of the type plans as before.
+        if !active.insert(*ty) {
+            return MatPlan::Unsupported;
+        }
+        let plan = self.mat_plan_body(ty, depth, active);
+        active.remove(ty);
+        plan
+    }
+
+    /// The plan of one type, expanded one level (see
+    /// `mat_plan`, which guards the expansion against type
+    /// graph cycles).
+    fn mat_plan_body(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        depth: usize,
+        active: &mut HashSet<rustc_public::ty::Ty>,
+    ) -> sparagmos_interp::ir::MatPlan {
+        use sparagmos_interp::ir::MatPlan;
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => MatPlan::Bool,
             TyKind::RigidTy(RigidTy::Char) => MatPlan::Char,
@@ -3181,7 +3212,7 @@ impl Converter {
             },
             TyKind::RigidTy(RigidTy::Str) => MatPlan::Str,
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
-                MatPlan::Slice(Box::new(self.mat_plan(&elem, depth + 1)))
+                MatPlan::Slice(Box::new(self.mat_plan(&elem, depth + 1, active)))
             }
             TyKind::RigidTy(RigidTy::Ref(_, inner, _))
             | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
@@ -3191,7 +3222,7 @@ impl Converter {
                 if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
                     MatPlan::Unsupported
                 } else {
-                    MatPlan::Ref(Box::new(self.mat_plan(&inner, depth + 1)))
+                    MatPlan::Ref(Box::new(self.mat_plan(&inner, depth + 1, active)))
                 }
             }
             TyKind::RigidTy(RigidTy::FnPtr(_)) => MatPlan::FnPtr,
@@ -3214,7 +3245,7 @@ impl Converter {
                     .zip(offsets)
                     .map(|(e, off)| sparagmos_interp::ir::MatField {
                         offset: off as u64,
-                        plan: self.mat_plan(e, depth + 1),
+                        plan: self.mat_plan(e, depth + 1, active),
                     })
                     .collect();
                 MatPlan::Tuple {
@@ -3233,13 +3264,13 @@ impl Converter {
                     return MatPlan::Unsupported;
                 };
                 MatPlan::Array {
-                    elem: Box::new(self.mat_plan(&elem, depth + 1)),
+                    elem: Box::new(self.mat_plan(&elem, depth + 1, active)),
                     stride: stride.bytes() as u64,
                     count: count as u64,
                 }
             }
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-                self.mat_plan_adt(&def, &args, ty, depth)
+                self.mat_plan_adt(&def, &args, ty, depth, active)
             }
             _ => MatPlan::Unsupported,
         }
@@ -3255,6 +3286,7 @@ impl Converter {
         args: &GenericArgs,
         ty: &rustc_public::ty::Ty,
         depth: usize,
+        active: &mut HashSet<rustc_public::ty::Ty>,
     ) -> sparagmos_interp::ir::MatPlan {
         use sparagmos_interp::ir::{MatField, MatPlan, MatTag};
         let Ok(layout) = ty.layout() else {
@@ -3276,7 +3308,7 @@ impl Converter {
                 let Some(offsets) = arbitrary_offsets(ty) else {
                     return MatPlan::Unsupported;
                 };
-                match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                match self.mat_plan_fields(&variant, args, &offsets, depth, active) {
                     Some(fields) => MatPlan::Struct { size, fields },
                     None => MatPlan::Unsupported,
                 }
@@ -3298,7 +3330,7 @@ impl Converter {
                             let Some(offsets) = arbitrary_offsets(ty) else {
                                 return MatPlan::Unsupported;
                             };
-                            match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                            match self.mat_plan_fields(&variant, args, &offsets, depth, active) {
                                 Some(fields) => variants.push(fields),
                                 None => return MatPlan::Unsupported,
                             }
@@ -3376,7 +3408,7 @@ impl Converter {
                         };
                         let offsets: Vec<usize> =
                             vshape.offsets.iter().map(|o| o.bytes()).collect();
-                        match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                        match self.mat_plan_fields(&variant, args, &offsets, depth, active) {
                             Some(fields) => variant_fields.push(fields),
                             None => return MatPlan::Unsupported,
                         }
@@ -3398,7 +3430,7 @@ impl Converter {
                     .iter()
                     .map(|f| {
                         let fty = f.ty_with_args(args);
-                        self.mat_plan(&fty, depth + 1)
+                        self.mat_plan(&fty, depth + 1, active)
                     })
                     .collect();
                 MatPlan::Union { size, fields }
@@ -3414,6 +3446,7 @@ impl Converter {
         args: &GenericArgs,
         offsets: &[usize],
         depth: usize,
+        active: &mut HashSet<rustc_public::ty::Ty>,
     ) -> Option<Vec<sparagmos_interp::ir::MatField>> {
         let fields = variant.fields();
         if fields.len() != offsets.len() {
@@ -3424,7 +3457,7 @@ impl Converter {
             let fty = field.ty_with_args(args);
             out.push(sparagmos_interp::ir::MatField {
                 offset: *off as u64,
-                plan: self.mat_plan(&fty, depth + 1),
+                plan: self.mat_plan(&fty, depth + 1, active),
             });
         }
         Some(out)
