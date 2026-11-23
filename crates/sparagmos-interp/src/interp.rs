@@ -298,6 +298,20 @@ pub(crate) struct ThreadSlot {
 /// them (see the `Drop` terminator's note in `drive_frames`), which
 /// is what makes disconnection observable exactly when the last
 /// handle of a side goes away.
+/// The `Wake` / `LocalWake` impl methods a modelled waker
+/// dispatches to, recorded by the modelled
+/// `From<Arc<T: Wake>>` / `From<Rc<T: LocalWake>>` conversion
+/// against the handle's allocation id (see
+/// `Interpreter::note_waker_dispatch` in `builtins`): the names
+/// the driver names the impl methods' bodies by. The waker
+/// value itself carries only the handle, whose pointee type -
+/// and with it the impl a wake runs - the value does not record.
+#[derive(Clone)]
+pub(crate) struct WakeDispatch {
+    pub(crate) wake: String,
+    pub(crate) wake_by_ref: String,
+}
+
 pub(crate) struct ChannelState {
     pub queue: std::collections::VecDeque<Value>,
     pub senders: usize,
@@ -751,6 +765,9 @@ pub struct Interpreter<'a> {
     /// mpsc channel states (see [`ChannelState`]), keyed by the id
     /// carried inside the handle values.
     channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
+    /// `Wake` dispatch of modelled wakers (see [`WakeDispatch`]),
+    /// keyed by the handle allocation's id.
+    pub(crate) wake_dispatch: std::cell::RefCell<HashMap<u64, WakeDispatch>>,
     /// The id the next created channel gets.
     next_channel: std::cell::RefCell<u64>,
     /// Modelled process commands under construction (see
@@ -1239,6 +1256,7 @@ impl<'a> Interpreter<'a> {
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
             current_thread: std::cell::Cell::new(1),
             channels: std::cell::RefCell::new(HashMap::new()),
+            wake_dispatch: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),

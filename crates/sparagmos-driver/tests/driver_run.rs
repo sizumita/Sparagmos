@@ -18852,3 +18852,151 @@ fn run_mode_slice_join() {
         "no UB-check message fires: {stderr}"
     );
 }
+
+const WAKER_FROM_ARC_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::sync::{mpsc, Arc};
+use std::task::{Context, Poll, Wake, Waker};
+
+fn simple_waker() -> (Waker, mpsc::Receiver<()>) {
+    struct SimpleWaker {
+        tx: mpsc::Sender<()>,
+    }
+    impl Wake for SimpleWaker {
+        fn wake(self: Arc<Self>) {
+            self.tx.send(()).unwrap();
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    (Waker::from(Arc::new(SimpleWaker { tx })), rx)
+}
+
+fn main() {
+    let (waker, _rx) = simple_waker();
+    let mut cx = Context::from_waker(&waker);
+    let fut = pin!(async { 42 });
+    let mut fut = fut;
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => println!("ready {v}"),
+        Poll::Pending => println!("pending"),
+    }
+    waker.wake_by_ref();
+    println!("woken");
+}
+"#;
+
+#[test]
+fn run_mode_waker_from_arc_wake_by_ref_default() {
+    // `Waker::from(Arc<T: Wake>)` with only `wake` defined:
+    // `wake_by_ref` runs the trait's default body (clone the
+    // handle, wake it), which the wake demand converts.
+    run_ok_edition("waker-from-arc", WAKER_FROM_ARC_SRC, "ready 42\nwoken\n");
+}
+
+const WAKER_OVERRIDE_SRC: &str = r#"
+use std::sync::{Arc, Weak};
+use std::task::{Wake, Waker};
+
+struct W2 {
+    tag: u32,
+}
+impl Wake for W2 {
+    fn wake(self: Arc<Self>) {
+        println!("wake {}", self.tag);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        println!("wake_by_ref override {}", self.tag);
+    }
+}
+
+fn main() {
+    let arc = Arc::new(W2 { tag: 9 });
+    let weak: Weak<W2> = Arc::downgrade(&arc);
+    let waker = Waker::from(arc);
+    println!("count {}", weak.strong_count());
+    waker.wake_by_ref();
+    println!("count {}", weak.strong_count());
+    let waker2 = waker.clone();
+    waker2.wake_by_ref();
+    waker.wake();
+    println!("count {}", weak.strong_count());
+    waker2.wake_by_ref();
+    drop(waker2);
+    println!("count {}", weak.strong_count());
+}
+"#;
+
+#[test]
+fn run_mode_waker_wake_override_and_counts() {
+    // An overridden `wake_by_ref` runs the override, and the
+    // strong count the wake consumes / preserves is the native
+    // one at every step.
+    run_ok_edition(
+        "waker-override",
+        WAKER_OVERRIDE_SRC,
+        "count 1\nwake_by_ref override 9\ncount 1\nwake_by_ref override 9\nwake 9\ncount 1\nwake_by_ref override 9\ncount 0\n",
+    );
+}
+
+const WAKER_RAW_VTABLE_SRC: &str = r#"
+use std::sync::Arc;
+use std::task::{RawWaker, RawWakerVTable, Wake, Waker};
+
+struct W3 {
+    tag: u32,
+}
+impl Wake for W3 {
+    fn wake(self: Arc<Self>) {
+        println!("w3 wake {}", self.tag);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        println!("w3 wake_by_ref {}", self.tag);
+    }
+}
+
+unsafe fn clone_fn(data: *const ()) -> RawWaker {
+    let arc = unsafe { Arc::<W3>::from_raw(data as *const W3) };
+    let cloned = arc.clone();
+    std::mem::forget(arc);
+    RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+}
+unsafe fn wake_fn(data: *const ()) {
+    let arc = unsafe { Arc::<W3>::from_raw(data as *const W3) };
+    arc.wake();
+}
+unsafe fn wake_by_ref_fn(data: *const ()) {
+    let arc = unsafe { Arc::<W3>::from_raw(data as *const W3) };
+    arc.wake_by_ref();
+    std::mem::forget(arc);
+}
+unsafe fn drop_fn(data: *const ()) {
+    let arc = unsafe { Arc::<W3>::from_raw(data as *const W3) };
+    drop(arc);
+}
+static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
+
+fn main() {
+    let arc = Arc::new(W3 { tag: 4 });
+    let raw = RawWaker::new(Arc::into_raw(arc) as *const (), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw) };
+    waker.wake_by_ref();
+    let waker2 = waker.clone();
+    waker2.wake_by_ref();
+    waker.wake();
+    println!("mid");
+    waker2.wake();
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_waker_from_raw_vtable_wake() {
+    // A hand-built `RawWaker`: wake and wake_by_ref run the
+    // vtable's entries with the data pointer.
+    run_ok_edition(
+        "waker-raw-vtable",
+        WAKER_RAW_VTABLE_SRC,
+        "w3 wake_by_ref 4\nw3 wake_by_ref 4\nw3 wake 4\nmid\nw3 wake 4\ndone\n",
+    );
+}

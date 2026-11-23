@@ -3435,6 +3435,199 @@ fn demand_clone_instances(
     }
 }
 
+/// Cap on `Wake` / `LocalWake` bodies demanded per program,
+/// mirroring the clone demand's cap.
+const MAX_DEMANDED_WAKE_BODIES: usize = 256;
+
+/// Demand the `Wake` / `LocalWake` impl method bodies
+/// (`wake` and `wake_by_ref`) of every type a converted body
+/// builds a `std::task::Waker` / `LocalWaker` from.
+///
+/// The interpreter models a waker's wake dispatch on the waker
+/// value's shape (see `Builtin::WakerWake` in
+/// `sparagmos-interp`): for a waker built by the modelled
+/// `From<Arc<T: Wake>>` / `From<Rc<T: LocalWake>>` conversion it
+/// calls the pointee's impl methods by name. `wake` is usually
+/// collected anyway (it is an impl item of the entry crate, or
+/// demanded through the vtable of a `dyn Wake`), but
+/// `wake_by_ref`'s *default* body - the common case, an impl
+/// that defines only `wake` - is an instance of the trait item
+/// that no call target names and no collected constant
+/// mentions: the only mention would be the `RawWakerVTable`
+/// constant the real `From` body builds, and that body is
+/// builtin-owned, so it is never collected. This pass is the
+/// demand the modelled conversion stands in for: it scans the
+/// seed bodies' call targets for the `From` / `Into`
+/// conversions whose target is a waker type, takes the
+/// pointee type out of the smart-pointer source, and converts
+/// the two impl method instances of that type, resolving the
+/// trait items directly (which yields the override where one
+/// exists and the trait's default body where none does).
+fn demand_wake_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+) {
+    // The (pointee type, is-local-waker) pairs the seed bodies
+    // build wakers from, in first-mention order.
+    let mut pointees: Vec<(Ty, bool)> = Vec::new();
+    for body in seed_bodies.iter() {
+        for (def, args) in sparagmos_driver::reach::call_targets(body) {
+            let name = def.name();
+            let from = name == "std::convert::From::from"
+                || name == "core::convert::From::from";
+            let into = name == "std::convert::Into::into"
+                || name == "core::convert::Into::into";
+            if !from && !into {
+                continue;
+            }
+            if args_mention_params(&args) {
+                continue;
+            }
+            let tys: Vec<Ty> = args
+                .0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(*t),
+                    _ => None,
+                })
+                .collect();
+            if tys.len() < 2 {
+                continue;
+            }
+            // `From::from` renders [target, source]; `Into::into`
+            // renders [source, target] (its `Self` is the source).
+            let (target, source) = if from {
+                (tys[0], tys[1])
+            } else {
+                (tys[1], tys[0])
+            };
+            let Some(TyKind::RigidTy(RigidTy::Adt(tdef, _))) =
+                sparagmos_driver::convert::guarded_ty_kind(&target)
+            else {
+                continue;
+            };
+            let (local, ptr_names): (bool, [&str; 2]) = match tdef.name().as_str() {
+                "std::task::Waker" | "core::task::Waker" => {
+                    (false, ["std::sync::Arc", "alloc::sync::Arc"])
+                }
+                "std::task::LocalWaker" | "core::task::LocalWaker" => {
+                    (true, ["std::rc::Rc", "alloc::rc::Rc"])
+                }
+                _ => continue,
+            };
+            let Some(TyKind::RigidTy(RigidTy::Adt(sdef, sargs))) =
+                sparagmos_driver::convert::guarded_ty_kind(&source)
+            else {
+                continue;
+            };
+            if !ptr_names.contains(&sdef.name().as_str()) {
+                continue;
+            }
+            let Some(pointee) = sargs.0.iter().find_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !pointees.contains(&(pointee, local)) {
+                pointees.push((pointee, local));
+            }
+        }
+    }
+    if pointees.is_empty() {
+        return;
+    }
+    // The trait items themselves: method declarations are
+    // `AssocFn` definitions of the trait's crate, so they are
+    // among its `fn_defs` (unlike an impl method, the item is
+    // what resolving a default body starts from).
+    let mut wake_item: Option<rustc_public::ty::FnDef> = None;
+    let mut wake_by_ref_item: Option<rustc_public::ty::FnDef> = None;
+    let mut local_wake_item: Option<rustc_public::ty::FnDef> = None;
+    let mut local_wake_by_ref_item: Option<rustc_public::ty::FnDef> = None;
+    let mut crates = vec![rustc_public::local_crate()];
+    crates.extend(rustc_public::external_crates());
+    for krate in &crates {
+        for f in krate.fn_defs() {
+            match f.name().as_str() {
+                "std::task::Wake::wake" | "core::task::Wake::wake" => {
+                    wake_item.get_or_insert(f);
+                }
+                "std::task::Wake::wake_by_ref" | "core::task::Wake::wake_by_ref" => {
+                    wake_by_ref_item.get_or_insert(f);
+                }
+                "std::task::LocalWake::wake" | "core::task::LocalWake::wake" => {
+                    local_wake_item.get_or_insert(f);
+                }
+                "std::task::LocalWake::wake_by_ref"
+                | "core::task::LocalWake::wake_by_ref" => {
+                    local_wake_by_ref_item.get_or_insert(f);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seen: std::collections::HashSet<(rustc_public::DefId, GenericArgs)> =
+        Default::default();
+    let mut demanded = 0usize;
+    for (pointee, local) in &pointees {
+        let items = if *local {
+            [local_wake_item, local_wake_by_ref_item]
+        } else {
+            [wake_item, wake_by_ref_item]
+        };
+        for item in items.into_iter().flatten() {
+            if demanded >= MAX_DEMANDED_WAKE_BODIES {
+                return;
+            }
+            let args = GenericArgs(vec![GenericArgKind::Type(*pointee)]);
+            if !seen.insert((item.def_id(), args.clone())) {
+                continue;
+            }
+            // Instance resolution goes through the compiler's
+            // internals and can panic on exotic targets; isolate
+            // it exactly as the clone demand does.
+            let resolved = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    Instance::resolve(item, &args)
+                        .ok()
+                        .and_then(|inst| inst.body().map(|body| (inst, body)))
+                }),
+            );
+            let Ok(Some((inst, sm_body))) = resolved else {
+                continue;
+            };
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
+            let name = inst.name().to_string();
+            if bodies.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            let before = bodies.len();
+            convert_item(
+                conv,
+                report,
+                bodies,
+                body_def_ids,
+                body_def_names,
+                name,
+                def_id,
+                Ok(Some(sm_body.clone())),
+            );
+            if bodies.len() > before {
+                seed_bodies.push(sm_body);
+                demanded += 1;
+            }
+        }
+    }
+}
+
 /// The ADT instantiations among the types the collected bodies
 /// drop that have no `Drop` impl at all, keyed like
 /// `certify_drop_trivial`'s result. A `Drop` impl for a type can
@@ -4421,6 +4614,22 @@ fn collect() -> ControlFlow<()> {
     // is builtin-served, so the call-graph collection stops
     // there and the elements' own `Clone` impls would never run.
     demand_clone_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut seed_bodies,
+    );
+
+    // Demand the `Wake` / `LocalWake` impl methods of the types
+    // the converted bodies build wakers from: a waker's wake
+    // dispatch is modelled in the interpreter, which calls the
+    // impl methods by name, and `wake_by_ref`'s default body is
+    // an instance nothing else ever demands (no call site names
+    // it, and the vtable that would mention it is built by the
+    // modelled `From` conversion, whose body is not collected).
+    demand_wake_instances(
         &mut conv,
         &mut report,
         &mut bodies,

@@ -36,7 +36,7 @@ use crate::interp::{
     box_alloc_pointer, channel_handle_id, eval_binary, eval_unary, float_to_int,
     float_to_uint, impl_qualified_self_type, project_value, rc_handle_id,
     round_to_f16, synthetic_address, FmtBuilderKind, FmtBuilderState, FmtCapture,
-    Frame, Interpreter, Resolved,
+    Frame, Interpreter, Resolved, WakeDispatch,
 };
 use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy, UnOp};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -506,6 +506,17 @@ pub enum Builtin {
     PrimitiveUnOp(UnOp),
     /// `std::convert::From::from(value)` (modelled conversions only).
     FromFrom,
+    /// `std::task::Waker::wake(self)` / `std::task::LocalWaker::wake(self)`:
+    /// dispatch to the waker's wake implementation - the `Wake` /
+    /// `LocalWake` impl method of the handle a modelled `From`
+    /// conversion built the waker from, or the `RawWakerVTable`
+    /// wake entry of a `from_raw` waker (see
+    /// `Interpreter::exec_waker_wake`).
+    WakerWake,
+    /// `std::task::Waker::wake_by_ref(&self)` /
+    /// `std::task::LocalWaker::wake_by_ref(&self)`: the
+    /// by-reference counterpart of [`Builtin::WakerWake`].
+    WakerWakeByRef,
     /// `std::hint::must_use(value)`: identity.
     MustUse,
     /// `std::sys::thread_local::destructors::linux_like::register`:
@@ -1901,6 +1912,8 @@ pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::OrdCmp
             | Builtin::PartialOrdRel(_)
             | Builtin::CloneClone
+            | Builtin::WakerWake
+            | Builtin::WakerWakeByRef
             | Builtin::VecNew
             | Builtin::VecWithCapacity
             // Only ever invoked with the Self type recovered
@@ -2436,6 +2449,21 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::MpscIter
         }
         "std::convert::From::from" => Builtin::FromFrom,
+        // The waker wake methods: std's bodies read the
+        // `RawWaker`'s vtable reference out of the waker value,
+        // which the modelled `From` waker (a one-field aggregate
+        // carrying the handle) cannot serve, so the dispatch is
+        // modelled on the value's shape, exactly as the `Clone`
+        // model and the `WakerDrop` glue judge it. Registering
+        // the names also keeps the driver from collecting the
+        // std bodies (see sparagmos-driver's reach pass).
+        "std::task::Waker::wake" | "core::task::Waker::wake"
+        | "std::task::LocalWaker::wake" | "core::task::LocalWaker::wake" => {
+            Builtin::WakerWake
+        }
+        "std::task::Waker::wake_by_ref" | "core::task::Waker::wake_by_ref"
+        | "std::task::LocalWaker::wake_by_ref"
+        | "core::task::LocalWaker::wake_by_ref" => Builtin::WakerWakeByRef,
         "std::hint::must_use" => Builtin::MustUse,
         "std::ops::Deref::deref" => Builtin::Deref,
         "std::path::Path::parent" => Builtin::PathPart(PathPart::Parent),
@@ -6995,10 +7023,40 @@ impl<'a> Interpreter<'a> {
                     // waker, handing it to `Context::from_waker`
                     // and cloning it (a value copy, exactly how the
                     // modelled `Arc` clones) are faithful. Calls
-                    // that would go through the vtable -
-                    // `Waker::wake` / `wake_by_ref` - are not
-                    // modelled and stay unsupported at their own
-                    // call sites.
+                    // that would go through the vtable dispatch
+                    // on this shape in their own builtins (see
+                    // `Builtin::WakerWake`).
+                    // `Waker::wake` / `wake_by_ref` are modelled
+                    // as their own builtins, which dispatch on
+                    // this shape; they find the handle's `Wake` /
+                    // `LocalWake` impl methods in the dispatch
+                    // recorded here, keyed by the handle's
+                    // allocation (the waker value itself carries
+                    // only the handle, so the pointee type - and
+                    // with it the impl - is noted at this, the
+                    // one place it is known).
+                    if let Some(id) = rc_handle_id(&value) {
+                        let (trait_path, pointee) = if target == "std::task::Waker" {
+                            (
+                                "std::task::Wake",
+                                smart_ptr_pointee(
+                                    source,
+                                    &["std::sync::Arc<", "alloc::sync::Arc<"],
+                                ),
+                            )
+                        } else {
+                            (
+                                "std::task::LocalWake",
+                                smart_ptr_pointee(
+                                    source,
+                                    &["std::rc::Rc<", "alloc::rc::Rc<"],
+                                ),
+                            )
+                        };
+                        if let Some(pointee) = pointee {
+                            self.note_waker_dispatch(id, &pointee, trait_path);
+                        }
+                    }
                     Ok(Value::Enum {
                         variant: 0,
                         fields: vec![value],
@@ -8247,6 +8305,17 @@ impl<'a> Interpreter<'a> {
                     (Some(Ordering::Greater | Ordering::Equal), RelOp::Ge) => true,
                     _ => false,
                 }))
+            }
+            Builtin::WakerWake => {
+                arity(1)?;
+                let value = vals.into_iter().next().expect("arity checked");
+                self.exec_waker_wake(frames, value, false, name)
+            }
+            Builtin::WakerWakeByRef => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let value = self.read_resolved(frames, &target)?;
+                self.exec_waker_wake(frames, value, true, name)
             }
             Builtin::CloneClone => {
                 arity(1)?;
@@ -11638,6 +11707,132 @@ fn value_fingerprint(value: &Value) -> u64 {
             ),
             other => other.clone(),
         })
+    }
+
+    /// Record the `Wake` / `LocalWake` impl methods a modelled
+    /// waker built from the handle allocation `id` dispatches to:
+    /// the impl methods of the pointee type `pointee` under the
+    /// trait `trait_path`, named exactly as the driver names
+    /// their bodies. Recorded by the modelled `From` conversion
+    /// (the one place the pointee type is known; the waker value
+    /// itself carries only the handle) and read by
+    /// [`Self::exec_waker_wake`]. The driver demands the named
+    /// bodies (see `demand_wake_instances` in the driver), so a
+    /// wake on a live modelled waker always finds them: the
+    /// handle the waker holds keeps the allocation - and with it
+    /// this entry's meaning - alive for exactly the waker's own
+    /// lifetime.
+    pub(crate) fn note_waker_dispatch(&self, id: u64, pointee: &str, trait_path: &str) {
+        self.wake_dispatch.borrow_mut().insert(
+            id,
+            WakeDispatch {
+                wake: format!("<{pointee} as {trait_path}>::wake"),
+                wake_by_ref: format!("<{pointee} as {trait_path}>::wake_by_ref"),
+            },
+        );
+    }
+
+    /// Execute a `Waker::wake` / `wake_by_ref` call (or the
+    /// `LocalWaker` counterparts) on the waker `value`. The two
+    /// shapes are judged exactly as the `Clone` model
+    /// ([`Self::clone_waker_value`]) and the `WakerDrop` glue
+    /// judge them:
+    ///
+    /// - The modelled `From<Arc<T: Wake>>` /
+    ///   `From<Rc<T: LocalWake>>` waker is a one-field aggregate
+    ///   carrying the handle itself: the wake runs the handle's
+    ///   `Wake` / `LocalWake` impl method - `wake_by_ref` with a
+    ///   reference to the stored handle, `wake` with the handle
+    ///   itself, which the method consumes, exactly as the std
+    ///   vtable entry hands the reconstructed handle to the same
+    ///   method. A modelled waker whose allocation has no
+    ///   recorded dispatch is an explicit error.
+    /// - A `from_raw` waker holds a real `RawWaker` (as the
+    ///   waker value itself or as its one field): the call runs
+    ///   the vtable's wake (entry 1) / wake_by_ref (entry 2) with
+    ///   the data pointer, exactly as std's own `Waker::wake`
+    ///   body does.
+    ///
+    /// Any other shape is an explicit error.
+    fn exec_waker_wake(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: Value,
+        by_ref: bool,
+        name: &str,
+    ) -> InterpResult<Value> {
+        if let Value::Enum { fields, .. } = &value {
+            if fields.len() == 1 {
+                if let Some(id) = rc_handle_id(&fields[0]) {
+                    let dispatch =
+                        self.wake_dispatch.borrow().get(&id).cloned().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                format!("builtin {name}"),
+                                "a waker whose Wake dispatch the modelled                                  From conversion recorded",
+                                "a modelled waker with no recorded dispatch",
+                            )
+                        })?;
+                    let handle = fields[0].clone();
+                    return if by_ref {
+                        let arg = Value::Ref(RefTarget::value(handle));
+                        self.call_sync(frames, &dispatch.wake_by_ref, vec![arg])
+                    } else {
+                        self.call_sync(frames, &dispatch.wake, vec![handle])
+                    };
+                }
+            }
+        }
+        let raw = match &value {
+            Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+            Value::Enum { .. } => value.clone(),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a Waker value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let Value::Enum { fields: raw_fields, .. } = &raw else {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWaker value",
+                raw.kind_name(),
+            ));
+        };
+        if raw_fields.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWaker value (data pointer and vtable)",
+                raw.kind_name(),
+            ));
+        }
+        let data = raw_fields[0].clone();
+        let resolved = self.deref_value(frames, &raw_fields[1])?;
+        let vtable = self.read_resolved(frames, &resolved)?;
+        let Value::Enum { fields: vtable_fields, .. } = &vtable else {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWakerVTable value",
+                vtable.kind_name(),
+            ));
+        };
+        if vtable_fields.len() != 4 {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWakerVTable value (clone, wake, wake_by_ref, drop)",
+                vtable.kind_name(),
+            ));
+        }
+        let entry = vtable_fields[if by_ref { 2 } else { 1 }].clone();
+        if !matches!(entry, Value::FnPtr(_) | Value::Closure { .. }) {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWakerVTable with a function-pointer wake entry",
+                entry.kind_name(),
+            ));
+        }
+        self.call_callable_sync(frames, &entry, None, vec![data])
     }
 
     /// Clone a `Waker` / `LocalWaker` value the way std's manual
@@ -21622,6 +21817,32 @@ fn sign_extend(pattern: u128, bits: u32) -> i128 {
 /// The field values of an aggregate value: a struct rides
 /// as a `Value::Enum` (variant 0), a plain aggregate as a
 /// `Value::Tuple`.
+/// The pointee type of a rendered smart-pointer type tag
+/// (`std::sync::Arc<T>` / `std::rc::Rc<T>`, in either crate
+/// spelling, with or without the allocator argument): the
+/// first top-level generic argument, or `None` when the tag
+/// names neither pointer.
+fn smart_ptr_pointee(source: &str, prefixes: &[&str]) -> Option<String> {
+    let mut inner = None;
+    for prefix in prefixes {
+        if let Some(rest) = source.strip_prefix(prefix) {
+            inner = Some(rest.strip_suffix('>')?);
+            break;
+        }
+    }
+    let inner = inner?;
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some(inner[..i].trim().to_string()),
+            _ => {}
+        }
+    }
+    Some(inner.trim().to_string())
+}
+
 fn aggregate_fields(value: &Value) -> Option<&[Value]> {
     match value {
         Value::Enum { fields, .. } => Some(fields),
