@@ -5699,6 +5699,12 @@ struct ToolArtifact {
     source: std::path::PathBuf,
     edition: Option<String>,
     crate_type: Option<String>,
+    /// The `--aux` specs the producing invocation itself
+    /// carried (its `--extern` bindings, already translated):
+    /// what a later run of the artifact (see `artifact_run`)
+    /// hands to the run subprocess so the artifact's source
+    /// converts against the same libraries its build used.
+    aux_specs: Vec<String>,
 }
 
 /// The artifact registry of one run (see `execute`): artifact
@@ -5722,6 +5728,7 @@ impl ToolRegistry {
                 source: a.source.clone(),
                 edition: a.edition.clone(),
                 crate_type: a.crate_type.clone(),
+                aux_specs: a.aux_specs.clone(),
             })
     }
 
@@ -5747,6 +5754,7 @@ impl ToolRegistry {
                         source: a.source.clone(),
                         edition: a.edition.clone(),
                         crate_type: a.crate_type.clone(),
+                        aux_specs: a.aux_specs.clone(),
                     },
                 )
             })
@@ -5815,7 +5823,8 @@ fn child_stream(stderr: &[u8]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Run this driver binary in convert mode as a subprocess and
+/// Run this driver binary as a subprocess (convert mode for a
+/// tool invocation, run mode for an artifact invocation) and
 /// collect (exit code, stdout, stderr). The guest command's
 /// environment is applied over the inherited one, as a real
 /// spawn would apply it.
@@ -5849,7 +5858,7 @@ fn run_convert_subprocess(
         }
     }
     let mut child = cmd.spawn().map_err(|e| {
-        format!("tool interception: cannot start the conversion subprocess: {e}")
+        format!("tool interception: cannot start the tool subprocess: {e}")
     })?;
     let mut out_pipe = child.stdout.take().expect("piped stdout");
     let mut err_pipe = child.stderr.take().expect("piped stderr");
@@ -5872,7 +5881,7 @@ fn run_convert_subprocess(
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(
-                        "tool interception: the conversion subprocess timed out"
+                        "tool interception: the tool subprocess timed out"
                             .to_string(),
                     );
                 }
@@ -5880,7 +5889,7 @@ fn run_convert_subprocess(
             }
             Err(e) => {
                 return Err(format!(
-                    "tool interception: waiting on the conversion subprocess failed: {e}"
+                    "tool interception: waiting on the tool subprocess failed: {e}"
                 ));
             }
         }
@@ -5910,9 +5919,7 @@ fn tool_run(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
-        Some(dir) => {
-            std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone()))
-        }
+        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
     };
@@ -6199,6 +6206,7 @@ fn tool_run(
     };
     let mut primary: Option<std::path::PathBuf> = None;
     let mut record = |path: std::path::PathBuf,
+                      crate_type: Option<String>,
                       registry: &ToolRegistry,
                       primary: &mut Option<std::path::PathBuf>| {
         if primary.is_none() {
@@ -6208,22 +6216,39 @@ fn tool_run(
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&path, b"");
+        if crate_type.as_deref() == Some("bin") {
+            // A real compiler's binary output is executable:
+            // the recipe's spawn of it (and its own executable
+            // checks) must find it so.
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
         registry.record(
             path,
             ToolArtifact {
                 name: crate_name.clone(),
                 source: input_abs.clone(),
                 edition: Some(edition.clone()),
-                crate_type: (types.len() == 1).then(|| types[0].clone()),
+                crate_type,
+                aux_specs: aux.clone(),
             },
         );
     };
     if let Some(out) = &out_file {
-        record(absolutize(&cwd, out), registry, &mut primary);
+        // `-o` names the invocation's one output (a real rustc
+        // refuses `-o` with several crate types), so the type is
+        // known exactly when the invocation carried one.
+        record(
+            absolutize(&cwd, out),
+            (types.len() == 1).then(|| types[0].clone()),
+            registry,
+            &mut primary,
+        );
     } else {
         for ty in &types {
             record(
                 out_base.join(artifact_filename(&crate_name, ty)),
+                Some(ty.clone()),
                 registry,
                 &mut primary,
             );
@@ -6236,7 +6261,7 @@ fn tool_run(
                     Some(p) => absolutize(&cwd, p),
                     None => out_base.join(artifact_filename(&crate_name, "rmeta")),
                 };
-                record(p, registry, &mut primary);
+                record(p, Some("rmeta".to_string()), registry, &mut primary);
             }
             "dep-info" => {
                 let p = match path {
@@ -6299,6 +6324,96 @@ fn tool_run(
         exit_code: 0,
         stdout: Vec::new(),
         stderr: child_stderr,
+    })
+}
+
+/// The run subprocess's stderr with the driver's own report
+/// lines removed (the `sparagmos-driver ...` lines the run
+/// entry point writes about itself): what remains is the guest
+/// program's own stderr, which is what a real child's stderr
+/// would have carried.
+fn run_child_stream(stderr: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(stderr);
+    let mut out = String::new();
+    for line in text.lines() {
+        if !line.starts_with("sparagmos-driver") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+/// Answer one invocation of a program the guest itself
+/// produced earlier in this run (a run-make recipe running a
+/// binary it just built): the artifact registry knows the
+/// path, so the run is this driver binary in run mode over the
+/// recorded source, with the `--aux` bindings the producing
+/// invocation carried and the guest's arguments as the
+/// program's own. This is the stage-3 harness's reading of
+/// "execute the built binary": the program's input/output and
+/// exit code are the interpreter's, not a native binary's
+/// (see docs/CI.md). Programs the registry does not know, and
+/// artifacts that are not binaries, stay unsupported -- as
+/// does a recorded program the driver cannot itself run (the
+/// subprocess's exit 2 names the reason), so the harness keeps
+/// sorting those recipes as unsupported rather than failed.
+fn artifact_run(
+    request: &sparagmos_interp::ToolRunRequest,
+    registry: &ToolRegistry,
+    exe: &std::path::Path,
+) -> Result<sparagmos_interp::ToolRunOutcome, String> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let cwd: std::path::PathBuf = match &request.cwd {
+        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        None => std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?,
+    };
+    let program = String::from_utf8_lossy(&request.program).into_owned();
+    let path = absolutize(&cwd, &program);
+    let Some(artifact) = registry.get(&path) else {
+        return Err(format!(
+            "tool interception: program `{program}` is not an artifact this run produced"
+        ));
+    };
+    if artifact.crate_type.as_deref() != Some("bin") {
+        return Err(format!(
+            "tool interception: artifact `{program}` is not a binary this run produced"
+        ));
+    }
+    let mut tail = vec!["run".to_string(), artifact.source.display().to_string()];
+    if let Some(edition) = &artifact.edition {
+        tail.push("--edition".to_string());
+        tail.push(edition.clone());
+    }
+    for spec in &artifact.aux_specs {
+        tail.push("--aux".to_string());
+        tail.push(spec.clone());
+    }
+    for arg in &request.args {
+        tail.push("--guest-arg".to_string());
+        tail.push(String::from_utf8_lossy(arg).into_owned());
+    }
+    let (code, stdout, stderr) = run_convert_subprocess(exe, &tail, &cwd, request)?;
+    if code == 2 {
+        // The recorded program itself could not be run (a
+        // conversion-side failure in the subprocess): the
+        // recipe's invocation is unsupported, with the
+        // subprocess's own named reason when it gave one.
+        let text = String::from_utf8_lossy(&stderr);
+        let reason = text
+            .lines()
+            .find_map(|line| line.strip_prefix("sparagmos-driver run: unsupported: "))
+            .map(|rest| rest.to_string())
+            .unwrap_or_else(|| "the recorded program could not be run".to_string());
+        return Err(format!(
+            "tool interception: running artifact `{program}`: {reason}"
+        ));
+    }
+    Ok(sparagmos_interp::ToolRunOutcome {
+        exit_code: code,
+        stdout,
+        stderr: run_child_stream(&stderr),
     })
 }
 
@@ -6485,12 +6600,16 @@ fn execute(
     // process. The artifact registry is shared by every
     // invocation of the run: a recipe builds a crate once and
     // names the artifact as an `--extern` input to later
-    // invocations.
+    // invocations -- and, through the fallback runner, runs the
+    // artifact itself, which `artifact_run` answers by
+    // interpreting the recorded source.
     let tool_interception = if tool_programs.is_empty() {
         None
     } else {
         let registry = std::sync::Arc::new(ToolRegistry::default());
         let exe = std::env::current_exe().unwrap_or_default();
+        let fallback_registry = registry.clone();
+        let fallback_exe = exe.clone();
         Some(sparagmos_interp::ToolInterception {
             programs: tool_programs
                 .iter()
@@ -6499,6 +6618,14 @@ fn execute(
             runner: sparagmos_interp::ToolRunner(std::sync::Arc::new(
                 move |request| tool_run(request, &registry, &exe),
             )),
+            // Programs the guest itself produced during the run
+            // (a recipe executing a binary it built) are answered
+            // from the same registry: running the artifact means
+            // interpreting its recorded source (see
+            // `artifact_run`).
+            fallback: Some(sparagmos_interp::ToolRunner(std::sync::Arc::new(
+                move |request| artifact_run(request, &fallback_registry, &fallback_exe),
+            ))),
         })
     };
     let config = sparagmos_interp::InterpConfig {

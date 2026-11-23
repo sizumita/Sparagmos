@@ -114,6 +114,29 @@ denominator. Runs on every push to `main` and on manual dispatch.
   produces the artifacts and the host tooling is wired in.
   The denominator is unaffected; all 1,735 stay in it as
   non-passes.
+- Inside a stage-3 recipe run, the driver's tool interception
+  answers the recipe's compiler invocations with its own
+  conversion machinery and records each produced artifact
+  (path, source, edition, crate type, and the library bindings
+  the producing invocation carried), leaving a placeholder file
+  at the artifact's path -- executable, for a binary -- so the
+  recipe's file and spawn checks find it. When the recipe then
+  executes a binary it produced earlier in the same run, the
+  interception answers that too: the recorded source is run
+  through the driver in run mode with the recorded bindings
+  and the recipe's arguments, and the fabricated process
+  outcome is the interpreter's exit code and output. This is a
+  deliberate reading of "execute the built binary": what is
+  judged is the program's input/output behaviour under
+  interpretation, not native code generation -- the category
+  these recipes belong to tests code generation, so a stage-3
+  pass for such a recipe is weaker evidence than a native
+  run-make pass. Recipes whose checks need the real artifact
+  (native linking, object or DWARF inspection), recipes that
+  run a program the run did not produce, and recipes that
+  spawn a child to feed its stdin (the process model
+  fabricates no child handle, and tool requests carry no
+  stdin) stay unsupported.
 - The aggregate job merges the shard results
   (`scripts/ci-subset-tools.py merge`; aggregates are recomputed from
   the merged records), derives metric 3 with

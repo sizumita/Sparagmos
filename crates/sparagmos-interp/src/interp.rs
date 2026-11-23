@@ -147,6 +147,16 @@ impl Eq for ToolRunner {}
 pub struct ToolInterception {
     pub programs: Vec<Vec<u8>>,
     pub runner: ToolRunner,
+    /// The runner for programs that are NOT in `programs`, when
+    /// the host side can still answer for some of them (the
+    /// driver answers for the artifacts a recipe produced
+    /// earlier in the same run: running one means interpreting
+    /// its recorded source). A fallback `Err` becomes the run's
+    /// unsupported error with the returned text as the reason,
+    /// exactly as a `runner` error does; with no fallback
+    /// configured, an unlisted program keeps the process model's
+    /// standing unsupported answer.
+    pub fallback: Option<ToolRunner>,
 }
 
 /// One call frame: a function's locals plus where to resume.

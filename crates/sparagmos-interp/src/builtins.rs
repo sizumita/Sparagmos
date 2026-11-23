@@ -24786,7 +24786,10 @@ fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
 }
 
 /// Run the configured tool runner for this command, when the
-/// command's program is one of the intercepted tool programs;
+/// command's program is one of the intercepted tool programs --
+/// or, for any other program, the interception's fallback
+/// runner when one is configured (the host side answers for
+/// artifacts the guest itself produced earlier in the run).
 /// `None` when no interception applies, in which case the
 /// caller keeps the process model's standing answer. A runner
 /// error becomes the run's unsupported error: the tool ran the
@@ -24798,9 +24801,13 @@ fn tool_outcome(
     let Some(interception) = interception else {
         return Ok(None);
     };
-    if !interception.programs.iter().any(|p| p == &state.program) {
+    let runner = if interception.programs.iter().any(|p| p == &state.program) {
+        &interception.runner
+    } else if let Some(fallback) = &interception.fallback {
+        fallback
+    } else {
         return Ok(None);
-    }
+    };
     let request = crate::interp::ToolRunRequest {
         program: state.program.clone(),
         args: state.args.clone(),
@@ -24809,7 +24816,7 @@ fn tool_outcome(
         env_clear: state.env_clear,
         cwd: state.cwd.clone(),
     };
-    match (interception.runner.0)(&request) {
+    match (runner.0)(&request) {
         Ok(outcome) => Ok(Some(outcome)),
         Err(reason) => Err(unsupported(reason)),
     }

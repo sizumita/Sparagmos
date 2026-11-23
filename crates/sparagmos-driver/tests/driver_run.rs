@@ -21462,6 +21462,136 @@ fn run_mode_tool_interception_answers_compiler_calls() {
     assert_eq!(stdout, "tool guest ok\n", "stderr={stderr}");
 }
 
+const ARTIFACT_GUEST_SRC: &str = r#"
+use std::process::Command;
+
+fn main() {
+    // The harness passes the tool program's path as the first
+    // guest argument; compiler calls are answered by the tool
+    // interception, and running a binary built during the run
+    // is answered from the interception's artifact registry:
+    // the recorded source is interpreted with the bindings its
+    // build invocation carried.
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // A library, then a binary that uses it through `--extern`.
+    std::fs::write("t.rs", "pub fn f() -> u32 { 7 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("t.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "library compile failed");
+    std::fs::write(
+        "u.rs",
+        "extern crate t; fn main() { println!(\"u says {}\", t::f()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--extern")
+        .arg("t=libt.rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("u.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "binary compile failed");
+    let out = Command::new(dir.join("u")).output().unwrap();
+    assert!(out.status.success(), "running u failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "u says 7\n");
+
+    // Arguments, stderr, and `status()` ride the same path.
+    std::fs::write(
+        "b.rs",
+        "fn main() { let a: Vec<String> = std::env::args().collect(); println!(\"b args: {}\", a[1..].join(\",\")); eprintln!(\"b err\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("b.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "b compile failed");
+    let out = Command::new(dir.join("b")).arg("x").arg("y").output().unwrap();
+    assert!(out.status.success(), "running b failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "b args: x,y\n");
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "b err\n");
+    let st = Command::new(dir.join("b")).status().unwrap();
+    assert!(st.success(), "status on b failed");
+
+    // A nonzero exit code is the program's own.
+    std::fs::write("c.rs", "fn main() { std::process::exit(3); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("c.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "c compile failed");
+    let out = Command::new(dir.join("c")).output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+
+    println!("artifact guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_runs_built_binaries() {
+    let dir = temp_dir("tool-artifact");
+    let src = fixture(&dir, "artifact_guest.rs", ARTIFACT_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "artifact guest ok\n", "stderr={stderr}");
+}
+
+const NEVER_BUILT_GUEST_SRC: &str = r#"
+fn main() {
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    // The file exists and is executable, so the process
+    // model's spawn gate passes; the run just never produced
+    // it, so the interception cannot answer for it.
+    let _out = std::process::Command::new(dir.join("never-built"))
+        .output()
+        .unwrap();
+    println!("never-built guest unexpectedly ran the program");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_unproduced_program_stays_unsupported() {
+    let dir = temp_dir("tool-unproduced");
+    let src = fixture(&dir, "never_built_guest.rs", NEVER_BUILT_GUEST_SRC);
+    let fake = dir.join("never-built");
+    std::fs::write(&fake, b"").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("is not an artifact this run produced"),
+        "stderr={stderr}"
+    );
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());
