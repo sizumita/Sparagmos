@@ -468,6 +468,22 @@ pub enum UnOp {
     PtrMetadata,
 }
 
+/// The metadata half of a fat pointer ([`ScalarShape::FatPtr`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatMeta {
+    /// An element count: the metadata of a slice or string
+    /// pointer, a plain word that a bit pattern carries
+    /// faithfully in both directions.
+    Len,
+    /// A vtable: the metadata of a `dyn` pointer. A vtable is
+    /// not a number in this model (a [`crate::value::Value::DynRef`]
+    /// carries the concrete type and trait bounds instead), so
+    /// the metadata word is an identity hash of that pair, and
+    /// a pattern reconstructs the pointer only through the
+    /// interpreter's fat-value table.
+    Vtable,
+}
+
 /// One side of a scalar `Transmute` reinterpretation
 /// ([`Rvalue::Reinterpret`]): how a value of this shape flattens
 /// to a bit pattern (little-endian, the x86_64 target's order)
@@ -533,6 +549,21 @@ pub enum ScalarShape {
         niche_variants: (u32, u32),
         niche_start: u128,
     },
+    /// A fat pointer: two words, the data pointer in the low
+    /// word and the metadata in the high word. The data word
+    /// flattens as the base pointer's synthetic address. The
+    /// metadata word is the element count for a slice or
+    /// string pointer; for a `dyn` pointer it is an opaque
+    /// identity word (see [`FatMeta::Vtable`]), and the exact
+    /// value a pattern came from is held in the interpreter's
+    /// fat-value table, which construction consults before
+    /// fabricating a pointer from the words alone.
+    FatPtr(FatMeta),
+    /// Several scalar shapes side by side in declaration
+    /// order: field `i` occupies the bits after all preceding
+    /// fields. A tuple flattens field by field and
+    /// construction builds the tuple of the fields' values.
+    Fields(Vec<ScalarShape>),
     /// A fieldless enum: the whole bit pattern is the
     /// variant's discriminant, held in a tag of `bits` width.
     /// Flattening yields the discriminant's bit pattern in
@@ -558,6 +589,10 @@ impl ScalarShape {
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),
             ScalarShape::FieldlessEnum { bits, .. } => *bits,
+            ScalarShape::FatPtr(_) => 128,
+            ScalarShape::Fields(fields) => {
+                fields.iter().map(|f| f.bits()).sum()
+            }
         }
     }
 }

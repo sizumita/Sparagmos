@@ -5808,6 +5808,74 @@ fn run_mode_transmute_arrays_and_scalars() {
     );
 }
 
+const TRANSMUTE_FAT_SLICE_SRC: &str = r#"
+struct W(*const [u8]);
+fn main() {
+    let s: &[u8] = &[10, 20, 30, 40];
+    let w: [usize; 2] = unsafe { std::mem::transmute(s) };
+    println!("{}", w[1]);
+    let back: &[u8] = unsafe { std::mem::transmute(w) };
+    println!("{} {}", back.len(), back[2]);
+    let lit: &str = "world!";
+    let t: (usize, usize) = unsafe { std::mem::transmute(lit) };
+    println!("{}", t.1);
+    let sback: &str = unsafe { std::mem::transmute(t) };
+    println!("{}", sback);
+    let s3: &[u8] = &[1, 2, 3];
+    let wrap = W(s3 as *const [u8]);
+    let words: [usize; 2] = unsafe { std::mem::transmute(wrap) };
+    println!("{}", words[1]);
+    let w2: W = unsafe { std::mem::transmute(words) };
+    unsafe { println!("{} {}", (&*w2.0).len(), (*w2.0)[1]) };
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fat_pointer_words() {
+    // A fat pointer transmutes to its two words and back: the
+    // metadata word is the length, and constructing the words
+    // returns the very pointer that flattened to them (its
+    // pointee still reads). A newtype wrapper over a fat
+    // pointer and a tuple target take the same shape path.
+    run_ok(
+        "transmute-fat-slice",
+        TRANSMUTE_FAT_SLICE_SRC,
+        "4\n4 30\n6\nworld!\n3\n3 2\n",
+    );
+}
+
+const TRANSMUTE_FAT_DYN_UNION_SRC: &str = r#"
+use std::fmt::Debug;
+union U {
+    p: *const [u8],
+    w: [usize; 2],
+}
+fn main() {
+    let x = 42u32;
+    let d: &dyn Debug = &x;
+    let w: [usize; 2] = unsafe { std::mem::transmute(d) };
+    let back: &dyn Debug = unsafe { std::mem::transmute(w) };
+    println!("{:?}", back);
+    let s: &[u8] = &[9, 8, 7];
+    let u = U { p: s as *const [u8] };
+    unsafe { println!("{}", u.w[1]) };
+}
+"#;
+
+#[test]
+fn run_mode_transmute_dyn_pointer_and_union_fat_field() {
+    // A `dyn` fat pointer's metadata word is a vtable identity
+    // only the fat-value table resolves: the round trip
+    // through the words returns the original pointer, whose
+    // dispatch still works. A union field holding a fat
+    // pointer reads back through the other field's words.
+    run_ok(
+        "transmute-fat-dyn-union",
+        TRANSMUTE_FAT_DYN_UNION_SRC,
+        "42\n3\n",
+    );
+}
+
 const TRANSMUTE_WRAPPER_SRC: &str = r#"
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
