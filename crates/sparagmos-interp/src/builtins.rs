@@ -28215,9 +28215,10 @@ impl<'a> Interpreter<'a> {
     /// non-UTF-8 bytes escaped, exactly the rendering the host's
     /// `OsStr` `Debug` produces (std's impls write the content
     /// directly and do not consult width or precision). The
-    /// `std::path::Display<'_>` helper that `Path::display`
-    /// returns displays as the lossy content. `None` when the
-    /// type is not one of these or the value holds no
+    /// `Display<'_>` helpers that `Path::display` and
+    /// `OsStr::display` return display as the lossy content
+    /// and debug as the content's own `Debug`. `None` when
+    /// the type is not one of these or the value holds no
     /// extractable bytes, in which case the existing behaviour
     /// stands.
     fn format_string_content(
@@ -28244,10 +28245,14 @@ impl<'a> Interpreter<'a> {
                 use std::os::unix::ffi::OsStrExt as _;
                 Ok(Some(format!("{:?}", std::ffi::OsStr::from_bytes(&bytes))))
             }
-            "std::path::Display" => {
-                if trait_ != FmtTrait::Display {
-                    return Ok(None);
-                }
+            "std::path::Display" | "std::ffi::os_str::Display" => {
+                // The `Display` helpers `Path::display` and
+                // `OsStr::display` return: `Display` is the
+                // lossy content of the bytes the inner value
+                // holds, and `Debug` forwards to the inner
+                // value's own `Debug` -- the byte content's
+                // `OsStr` form, which consults no options
+                // either.
                 let Value::Enum { fields, .. } = value else {
                     return Ok(None);
                 };
@@ -28258,7 +28263,17 @@ impl<'a> Interpreter<'a> {
                 let Some(bytes) = self.string_content_bytes(frames, &field) else {
                     return Ok(None);
                 };
-                Ok(Some(pad_str(&String::from_utf8_lossy(&bytes), options)))
+                match trait_ {
+                    FmtTrait::Display => Ok(Some(pad_str(
+                        &String::from_utf8_lossy(&bytes),
+                        options,
+                    ))),
+                    FmtTrait::Debug => {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        Ok(Some(format!("{:?}", std::ffi::OsStr::from_bytes(&bytes))))
+                    }
+                    _ => Ok(None),
+                }
             }
             _ => Ok(None),
         }
