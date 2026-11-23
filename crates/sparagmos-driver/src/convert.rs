@@ -128,6 +128,15 @@ pub struct Converter {
     /// discriminant's own bytes. Filled from the same layout
     /// query as `adt_layouts`.
     pub adt_tag_layouts: sm::AdtTagLayouts,
+    /// Materialisation plans for the pointee types of pointer
+    /// casts converted so far, keyed by the converted pointee
+    /// type's `Debug` rendering (the same rendering
+    /// `mir_convert` looks up). Handed to the interpreter with
+    /// the converted program: when a cast's operand is a
+    /// type-erased constant allocation, the plan materialises
+    /// the block into the cast target's type (see
+    /// `decode_erased_alloc`).
+    pub mat_plans: HashMap<String, sparagmos_interp::ir::MatPlan>,
     /// Storage-slot maps of the monomorphic coroutine instances
     /// converted so far, keyed like `adt_layouts` (see
     /// `sm::CoroutineLayouts`). Handed to the interpreter with the
@@ -938,6 +947,7 @@ impl Converter {
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
             adt_tag_layouts: sm::AdtTagLayouts::new(),
+            mat_plans: HashMap::new(),
             coroutine_layouts: sm::CoroutineLayouts::new(),
             coroutine_slots_attempted: std::collections::HashSet::new(),
             layout_attempted: std::collections::HashSet::new(),
@@ -1962,6 +1972,9 @@ impl Converter {
             R::Cast(kind, op, ty) => {
                 let o = self.operand(op);
                 let t = self.ty(ty);
+                if matches!(kind, mir::CastKind::PtrToPtr | mir::CastKind::Transmute) {
+                    self.note_mat_plan(ty, &t);
+                }
                 sm::Rvalue::Cast(self.cast_kind(kind), o, t)
             }
             R::BinaryOp(op, l, r) => {
@@ -3101,6 +3114,436 @@ impl Converter {
         Some(out)
     }
 
+    /// Record the materialisation plan of a pointer cast's
+    /// target pointee type (see `mat_plan`), keyed by the
+    /// converted pointee type's `Debug` rendering — the key
+    /// `mir_convert` looks up when it converts the same cast.
+    fn note_mat_plan(&mut self, ty: &rustc_public::ty::Ty, converted: &sm::Ty) {
+        let pointee = match converted {
+            sm::Ty::Ref(_, p, _) | sm::Ty::RawPtr(p, _) => (**p).clone(),
+            _ => return,
+        };
+        let key = format!("{pointee:?}");
+        if self.mat_plans.contains_key(&key) {
+            return;
+        }
+        let rustc_pointee = match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
+            _ => return,
+        };
+        let plan = self.mat_plan(&rustc_pointee, 0);
+        self.mat_plans.insert(key, plan);
+    }
+
+    /// The materialisation plan of a type (see
+    /// `sparagmos_interp::ir::MatPlan`): the byte-layout
+    /// description the interpreter needs to materialise a
+    /// type-erased constant allocation into a value of this
+    /// type. Built from the compiler's layout query, mirroring
+    /// `decode_const`'s reading of the same layouts; a type
+    /// whose layout cannot be described gets
+    /// `MatPlan::Unsupported` (materialising it is an explicit
+    /// error downstream, never a guess).
+    fn mat_plan(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> sparagmos_interp::ir::MatPlan {
+        use sparagmos_interp::ir::MatPlan;
+        if depth > MAX_CONST_DEPTH {
+            return MatPlan::Unsupported;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Bool) => MatPlan::Bool,
+            TyKind::RigidTy(RigidTy::Char) => MatPlan::Char,
+            TyKind::RigidTy(RigidTy::Int(t)) => match int_ty_size(&t) {
+                Some(size) => MatPlan::Int {
+                    size: size as u8,
+                    signed: true,
+                },
+                None => MatPlan::Unsupported,
+            },
+            TyKind::RigidTy(RigidTy::Uint(t)) => match uint_ty_size(&t) {
+                Some(size) => MatPlan::Int {
+                    size: size as u8,
+                    signed: false,
+                },
+                None => MatPlan::Unsupported,
+            },
+            TyKind::RigidTy(RigidTy::Float(f)) => MatPlan::Float {
+                size: match f {
+                    SmirFloatTy::F16 => 2,
+                    SmirFloatTy::F32 => 4,
+                    SmirFloatTy::F64 => 8,
+                    SmirFloatTy::F128 => 16,
+                },
+            },
+            TyKind::RigidTy(RigidTy::Str) => MatPlan::Str,
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                MatPlan::Slice(Box::new(self.mat_plan(&elem, depth + 1)))
+            }
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
+                // A `dyn` pointee's value needs its vtable,
+                // which no plan can name; everything else
+                // recurses into the pointee.
+                if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+                    MatPlan::Unsupported
+                } else {
+                    MatPlan::Ref(Box::new(self.mat_plan(&inner, depth + 1)))
+                }
+            }
+            TyKind::RigidTy(RigidTy::FnPtr(_)) => MatPlan::FnPtr,
+            TyKind::RigidTy(RigidTy::FnDef(..)) => MatPlan::Unit,
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                if elems.is_empty() {
+                    return MatPlan::Unit;
+                }
+                let Some(offsets) = arbitrary_offsets(ty) else {
+                    return MatPlan::Unsupported;
+                };
+                if offsets.len() != elems.len() {
+                    return MatPlan::Unsupported;
+                }
+                let Ok(layout) = ty.layout() else {
+                    return MatPlan::Unsupported;
+                };
+                let fields = elems
+                    .iter()
+                    .zip(offsets)
+                    .map(|(e, off)| sparagmos_interp::ir::MatField {
+                        offset: off as u64,
+                        plan: self.mat_plan(e, depth + 1),
+                    })
+                    .collect();
+                MatPlan::Tuple {
+                    size: layout.shape().size.bytes() as u64,
+                    fields,
+                }
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, len)) => {
+                let Ok(count) = len.eval_target_usize() else {
+                    return MatPlan::Unsupported;
+                };
+                let Ok(layout) = ty.layout() else {
+                    return MatPlan::Unsupported;
+                };
+                let FieldsShape::Array { stride, .. } = layout.shape().fields else {
+                    return MatPlan::Unsupported;
+                };
+                MatPlan::Array {
+                    elem: Box::new(self.mat_plan(&elem, depth + 1)),
+                    stride: stride.bytes() as u64,
+                    count: count as u64,
+                }
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                self.mat_plan_adt(&def, &args, ty, depth)
+            }
+            _ => MatPlan::Unsupported,
+        }
+    }
+
+    /// The materialisation plan of an ADT instance (see
+    /// `mat_plan`), mirroring `decode_adt`'s reading of the
+    /// layout: field offsets are the layout's, and the enum tag
+    /// placement is the layout's tag encoding.
+    fn mat_plan_adt(
+        &mut self,
+        def: &AdtDef,
+        args: &GenericArgs,
+        ty: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> sparagmos_interp::ir::MatPlan {
+        use sparagmos_interp::ir::{MatField, MatPlan, MatTag};
+        let Ok(layout) = ty.layout() else {
+            return MatPlan::Unsupported;
+        };
+        let shape = layout.shape();
+        let size = shape.size.bytes() as u64;
+        match def.kind() {
+            AdtKind::Struct => {
+                let Some(variant) = def.variant(VariantIdx::to_val(0)) else {
+                    return MatPlan::Unsupported;
+                };
+                if variant.fields().is_empty() {
+                    return MatPlan::Struct {
+                        size,
+                        fields: Vec::new(),
+                    };
+                }
+                let Some(offsets) = arbitrary_offsets(ty) else {
+                    return MatPlan::Unsupported;
+                };
+                match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                    Some(fields) => MatPlan::Struct { size, fields },
+                    None => MatPlan::Unsupported,
+                }
+            }
+            AdtKind::Enum => match &shape.variants {
+                VariantsShape::Single { index } => {
+                    let idx = index.to_index();
+                    let mut variants = Vec::new();
+                    for i in 0..def.num_variants() {
+                        if i == idx {
+                            let variant = match def.variant(VariantIdx::to_val(i)) {
+                                Some(v) => v,
+                                None => return MatPlan::Unsupported,
+                            };
+                            if variant.fields().is_empty() {
+                                variants.push(Vec::new());
+                                continue;
+                            }
+                            let Some(offsets) = arbitrary_offsets(ty) else {
+                                return MatPlan::Unsupported;
+                            };
+                            match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                                Some(fields) => variants.push(fields),
+                                None => return MatPlan::Unsupported,
+                            }
+                        } else {
+                            variants.push(Vec::new());
+                        }
+                    }
+                    MatPlan::Enum {
+                        size,
+                        tag: MatTag::Single(idx as u32),
+                        variants,
+                    }
+                }
+                VariantsShape::Multiple {
+                    tag,
+                    tag_encoding,
+                    tag_field,
+                    variants,
+                } => {
+                    let mat_tag = match tag_encoding {
+                        TagEncoding::Direct => {
+                            let Some((tsize, signed)) = tag_scalar_size_signed(tag) else {
+                                return MatPlan::Unsupported;
+                            };
+                            let Some(offsets) = arbitrary_offsets(ty) else {
+                                return MatPlan::Unsupported;
+                            };
+                            let Some(tag_off) = offsets.get(*tag_field).copied() else {
+                                return MatPlan::Unsupported;
+                            };
+                            let mut discriminants = Vec::new();
+                            for i in 0..def.num_variants() {
+                                let d = def.discriminant_for_variant(VariantIdx::to_val(i));
+                                match discr_value(&d) {
+                                    Some(v) => discriminants.push(v),
+                                    None => return MatPlan::Unsupported,
+                                }
+                            }
+                            MatTag::Direct {
+                                offset: tag_off as u64,
+                                size: tsize as u8,
+                                signed,
+                                discriminants,
+                            }
+                        }
+                        TagEncoding::Niche {
+                            untagged_variant,
+                            niche_variants,
+                            niche_start,
+                        } => {
+                            let Some((tsize, _)) = tag_scalar_size_signed(tag) else {
+                                return MatPlan::Unsupported;
+                            };
+                            let Some(offsets) = arbitrary_offsets(ty) else {
+                                return MatPlan::Unsupported;
+                            };
+                            let Some(tag_off) = offsets.get(*tag_field).copied() else {
+                                return MatPlan::Unsupported;
+                            };
+                            MatTag::Niche {
+                                offset: tag_off as u64,
+                                size: tsize as u8,
+                                untagged: untagged_variant.to_index() as u32,
+                                niche_start: *niche_start,
+                                start: niche_variants.start().to_index() as u32,
+                                end: niche_variants.end().to_index() as u32,
+                            }
+                        }
+                    };
+                    let mut variant_fields = Vec::new();
+                    for (i, vshape) in variants.iter().enumerate() {
+                        let variant = match def.variant(VariantIdx::to_val(i)) {
+                            Some(v) => v,
+                            None => return MatPlan::Unsupported,
+                        };
+                        let offsets: Vec<usize> =
+                            vshape.offsets.iter().map(|o| o.bytes()).collect();
+                        match self.mat_plan_fields(&variant, args, &offsets, depth) {
+                            Some(fields) => variant_fields.push(fields),
+                            None => return MatPlan::Unsupported,
+                        }
+                    }
+                    MatPlan::Enum {
+                        size,
+                        tag: mat_tag,
+                        variants: variant_fields,
+                    }
+                }
+                VariantsShape::Empty => MatPlan::Unsupported,
+            },
+            AdtKind::Union => {
+                let Some(variant) = def.variant(VariantIdx::to_val(0)) else {
+                    return MatPlan::Unsupported;
+                };
+                let fields = variant
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let fty = f.ty_with_args(args);
+                        self.mat_plan(&fty, depth + 1)
+                    })
+                    .collect();
+                MatPlan::Union { size, fields }
+            }
+        }
+    }
+
+    /// The materialisation plans of one variant's fields at the
+    /// given byte offsets (see `mat_plan`).
+    fn mat_plan_fields(
+        &mut self,
+        variant: &rustc_public::ty::VariantDef,
+        args: &GenericArgs,
+        offsets: &[usize],
+        depth: usize,
+    ) -> Option<Vec<sparagmos_interp::ir::MatField>> {
+        let fields = variant.fields();
+        if fields.len() != offsets.len() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (field, off) in fields.iter().zip(offsets) {
+            let fty = field.ty_with_args(args);
+            out.push(sparagmos_interp::ir::MatField {
+                offset: *off as u64,
+                plan: self.mat_plan(&fty, depth + 1),
+            });
+        }
+        Some(out)
+    }
+
+    /// Decode the allocation region at `offset` in `alloc` as a
+    /// type-erased block (see `sm::ConstValue::ErasedAlloc`):
+    /// the region's bytes verbatim, plus every provenance
+    /// relocation inside it decoded type-free by
+    /// `decode_erased_slot`. `None` when a relocation cannot be
+    /// decoded type-free; the caller then keeps the declared
+    /// type's decode.
+    fn decode_erased_alloc(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        let bytes = alloc.bytes.get(offset..)?.to_vec();
+        let mut relocs = Vec::new();
+        for (o, _) in &alloc.provenance.ptrs {
+            let o = *o as usize;
+            if o < offset {
+                continue;
+            }
+            let v = self.decode_erased_slot(alloc, o, depth + 1)?;
+            relocs.push(((o - offset) as u32, v));
+        }
+        Some(sm::ConstValue::ErasedAlloc { bytes, relocs })
+    }
+
+    /// Decode the pointer slot at `offset` in `alloc` without a
+    /// declared pointee type: the slot's value as a reference to
+    /// whatever its provenance names, with a memory pointee
+    /// preserved as an erased block. A static's pointee is its
+    /// initializer allocation's block: reads through a later
+    /// materialisation are exact, though the block is a
+    /// snapshot, not the static's store. Mirrors `decode_ref`'s
+    /// provenance handling.
+    fn decode_erased_slot(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        let prov = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .find(|(o, _)| *o as usize == offset);
+        let Some((_, prov)) = prov else {
+            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            if addr == 0 {
+                return Some(sm::ConstValue::NullPtr);
+            }
+            return Some(sm::ConstValue::IntPtr(addr as u64));
+        };
+        let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
+        match mir::alloc::GlobalAlloc::from(prov.0) {
+            mir::alloc::GlobalAlloc::Memory(target) => {
+                let block = self.decode_erased_alloc(&target, target_off, depth + 1)?;
+                Some(sm::ConstValue::Ref(Box::new(block)))
+            }
+            mir::alloc::GlobalAlloc::Static(def) => {
+                let init = def.eval_initializer().ok()?;
+                let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
+                Some(sm::ConstValue::Ref(Box::new(block)))
+            }
+            mir::alloc::GlobalAlloc::Function(inst) => self.fn_pointer_value(&inst),
+            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+                let (lo, _) = type_id_segments(&tid_ty);
+                Some(sm::ConstValue::IntPtr(lo))
+            }
+            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+                Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)))
+            }
+        }
+    }
+
+    /// Whether a reference decoded with declared pointee type
+    /// `inner` is type-erased: the declared type is zero-sized
+    /// while the region of `target` it denotes (from
+    /// `target_off` on) is not empty, so the pointer was stored
+    /// through an erased slot and its real type is named only
+    /// by later casts.
+    fn pointee_is_erased(
+        &self,
+        inner: &rustc_public::ty::Ty,
+        target: &Allocation,
+        target_off: usize,
+    ) -> bool {
+        if std::env::var_os("NT_DISABLE_ERASED").is_some() {
+            return false;
+        }
+        if target_off >= target.bytes.len() {
+            return false;
+        }
+        // A genuinely unsized pointee (a `str`-tailed struct is
+        // the canonical case) is not erased: its typed decode
+        // reads the trailing field to the end of the allocation,
+        // and the guest projects the value's fields directly,
+        // with no cast that could materialise a block. A
+        // sizedness the walk cannot prove keeps the typed
+        // decode too.
+        if ty_sizedness(inner, None, 0) != Sizedness::Sized {
+            return false;
+        }
+        match inner.layout() {
+            Ok(layout) => layout.shape().size.bytes() == 0,
+            Err(_) => false,
+        }
+    }
+
     /// Decode a reference (or raw pointer) stored in `alloc` at
     /// `offset`, pointing at a value of type `inner`. The result is
     /// the reference's value in the interpreter's model: string and
@@ -3352,6 +3795,23 @@ impl Converter {
                 Some(sm::ConstValue::Bytes(bytes.to_vec()))
             }
             _ => {
+                // A type-erased pointee: the declared type is
+                // zero-sized but the allocation region it denotes
+                // is not — the pointer was stored through an
+                // erased slot (a `NonNull<()>` field is the
+                // canonical case), and its real type is named
+                // only by the casts the guest later performs.
+                // Preserve the allocation exactly so those casts
+                // can materialise it (see `decode_erased_alloc`);
+                // when the block cannot be built, the declared
+                // type's decode below stands.
+                if self.pointee_is_erased(inner, &target, target_off) {
+                    if let Some(block) =
+                        self.decode_erased_alloc(&target, target_off, depth + 1)
+                    {
+                        return Some(sm::ConstValue::Ref(Box::new(block)));
+                    }
+                }
                 if let Some(def) = &static_def {
                     if let Some(c) =
                         self.decode_static_ref(def, inner, &target, target_off, depth)

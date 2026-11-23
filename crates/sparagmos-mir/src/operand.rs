@@ -48,6 +48,28 @@ pub enum ConstValue {
     /// materialised form of a reference constant whose pointee is
     /// itself a constant value.
     Ref(Box<ConstValue>),
+    /// A constant allocation preserved exactly — its bytes and
+    /// its provenance relocations — because the reference that
+    /// denotes it declares a zero-sized pointee type while the
+    /// allocation itself is not empty: the pointer was stored
+    /// through a type-erased slot (a `NonNull<()>` field is the
+    /// canonical case), so the pointee's real type is named only
+    /// by the pointer casts the guest later performs. The
+    /// interpreter materialises the block into the cast target's
+    /// type at those casts (see `sparagmos_interp::ir::MatPlan`);
+    /// until then the block is the pointee's identity, exactly
+    /// like the snapshot a typed decode would have produced.
+    ErasedAlloc {
+        /// The allocation's bytes from the denoted offset on;
+        /// `None` bytes are uninitialised.
+        bytes: Vec<Option<u8>>,
+        /// Provenance relocations inside the block: the byte
+        /// offset of a pointer slot and the reference value the
+        /// slot holds, decoded type-free (a nested block for a
+        /// memory allocation, a function value for a function
+        /// allocation, an address for a dangling word).
+        relocs: Vec<(u32, ConstValue)>,
+    },
     /// A wholly uninitialized constant of the constant's type
     /// (the payload of a `MaybeUninit::uninit()` constant):
     /// evaluating it yields the uninitialized value, and reading

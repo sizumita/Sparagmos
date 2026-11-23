@@ -340,6 +340,17 @@ pub enum Constant {
     Adt { variant: u32, fields: Vec<Constant> },
     /// A reference to a constant value.
     Ref(Box<Constant>),
+    /// A type-erased constant allocation (see
+    /// `sparagmos_mir::ConstValue::ErasedAlloc`): the block's
+    /// bytes verbatim plus its provenance relocations, each
+    /// decoded type-free as a constant of its own. Evaluating
+    /// it yields the block value that pointer casts
+    /// materialise into their target types (see
+    /// [`Rvalue::Materialize`]).
+    ErasedAlloc {
+        bytes: Vec<Option<u8>>,
+        relocs: Vec<(u32, Constant)>,
+    },
     /// A pointer constant with no provenance (dangling):
     /// evaluates to an address-only reference value.
     IntPtr(u64),
@@ -551,6 +562,143 @@ impl ScalarShape {
     }
 }
 
+/// One field of a [`MatPlan`] aggregate: the field's byte
+/// offset within the block and the plan of its type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatField {
+    pub offset: u64,
+    pub plan: MatPlan,
+}
+
+/// The tag placement of a [`MatPlan::Enum`]: how the block's
+/// bytes name the variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatTag {
+    /// A single-variant enum: the variant is fixed.
+    Single(u32),
+    /// A direct tag: the discriminant stored at `offset` as a
+    /// `size`-byte integer (read with the given signedness),
+    /// matched against each variant's discriminant in variant
+    /// order.
+    Direct {
+        offset: u64,
+        size: u8,
+        signed: bool,
+        discriminants: Vec<i128>,
+    },
+    /// A niche tag: the payload field's own bits at `offset`
+    /// (a `size`-byte word) encode the fieldless variants
+    /// `start..=end` as `niche_start + (variant - start)`;
+    /// every other bit pattern is the `untagged` (payload)
+    /// variant.
+    Niche {
+        offset: u64,
+        size: u8,
+        untagged: u32,
+        niche_start: u128,
+        start: u32,
+        end: u32,
+    },
+}
+
+/// A materialisation plan: the byte-layout description of a
+/// type, recorded by the driver from the compiler's layouts
+/// when it converts a pointer cast to the type (see
+/// [`Program::mat_plans`]). The interpreter reads a type-erased
+/// constant allocation (see [`Constant::ErasedAlloc`]) into a
+/// value of the planned type with it, producing the value the
+/// driver's typed constant decode would have produced for the
+/// same allocation. A type whose layout cannot be described
+/// is [`MatPlan::Unsupported`]: materialising it is an
+/// explicit error, never a guess.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatPlan {
+    Unsupported,
+    /// The unit type (and zero-sized function items).
+    Unit,
+    Bool,
+    Char,
+    Int {
+        size: u8,
+        signed: bool,
+    },
+    Float {
+        size: u8,
+    },
+    /// A `str` value: in trailing position its bytes run to
+    /// the end of the block.
+    Str,
+    /// A slice value: in trailing position its elements run
+    /// to the end of the block.
+    Slice(Box<MatPlan>),
+    /// A reference or raw pointer: the slot holds a pointer
+    /// word (plus a length word when the pointee is unsized);
+    /// a provenance relocation there names the target block,
+    /// which materialises with the pointee plan.
+    Ref(Box<MatPlan>),
+    /// A function pointer: the slot's relocation names the
+    /// function value.
+    FnPtr,
+    Tuple {
+        size: u64,
+        fields: Vec<MatField>,
+    },
+    Array {
+        elem: Box<MatPlan>,
+        stride: u64,
+        count: u64,
+    },
+    Struct {
+        size: u64,
+        fields: Vec<MatField>,
+    },
+    Enum {
+        size: u64,
+        tag: MatTag,
+        variants: Vec<Vec<MatField>>,
+    },
+    /// A union: every field sits at the same offset; the
+    /// materialisation mirrors the driver's union decode (a
+    /// unique pointer-shaped field under a relocation is the
+    /// live field, zero-sized fields are always read, and
+    /// otherwise every field is read).
+    Union {
+        size: u64,
+        fields: Vec<MatPlan>,
+    },
+}
+
+impl MatPlan {
+    /// The size in bytes of a value of the planned type, when
+    /// the plan determines it (unsized and unsupported plans
+    /// have none).
+    pub fn size(&self) -> Option<u64> {
+        match self {
+            MatPlan::Unsupported | MatPlan::Str | MatPlan::Slice(_) => None,
+            MatPlan::Unit => Some(0),
+            MatPlan::Bool => Some(1),
+            MatPlan::Char => Some(4),
+            MatPlan::Int { size, .. } | MatPlan::Float { size } => Some(u64::from(*size)),
+            MatPlan::Ref(_) | MatPlan::FnPtr => Some(8),
+            MatPlan::Tuple { size, .. }
+            | MatPlan::Struct { size, .. }
+            | MatPlan::Enum { size, .. }
+            | MatPlan::Union { size, .. } => Some(*size),
+            MatPlan::Array {
+                elem,
+                stride,
+                count,
+            } => {
+                if *count == 0 {
+                    Some(0)
+                } else {
+                    Some(stride * (count - 1) + elem.size()?)
+                }
+            }
+        }
+    }
+}
+
 /// A right-hand side expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rvalue {
@@ -610,6 +758,16 @@ pub enum Rvalue {
     /// `*const T`): evaluates to the fat pointer's base, or to the
     /// operand itself when it is not fat.
     DataPtr(Operand),
+    /// A pointer cast whose target pointee type has a recorded
+    /// materialisation plan (the second element is the plan's
+    /// index in [`Program::mat_plans`]): an operand denoting a
+    /// type-erased constant allocation (see
+    /// [`Constant::ErasedAlloc`]) materialises into the target
+    /// type with that plan; every other operand keeps the
+    /// behaviour the cast would have had without the plan -
+    /// the identity for a thin target, the base extraction of
+    /// [`Rvalue::DataPtr`] for a fat operand.
+    Materialize(Operand, usize),
     /// A `Transmute` cast from a pointer/reference value to an
     /// integer: the pointer's address. The model has no flat memory,
     /// so the address is synthetic: a deterministic, non-zero,
@@ -1744,6 +1902,12 @@ pub struct Program {
     /// borrows the environment field itself. Recorded by
     /// conversion from the creation aggregates.
     pub async_closure_captures: HashMap<String, Vec<bool>>,
+    /// Materialisation plans for the pointee types of the
+    /// program's pointer casts, interned by conversion in
+    /// sorted-key order (see [`Rvalue::Materialize`]): a cast
+    /// the conversion made materialising carries the index of
+    /// its target pointee's plan here.
+    pub mat_plans: Vec<MatPlan>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason
