@@ -1898,6 +1898,151 @@ fn run_mode_dyn_bound_projection_supertrait_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
 }
 
+const DYN_BOUND_PROJECTION_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_alias_runs() {
+    // The projected self type is itself a projection:
+    // the holder's field is `<<T as Carrier>::Item as
+    // Trait>::Assoc`, whose self type reaches the screen as
+    // an alias, not as the trait object the implementation
+    // assigns it (`dyn Trait<Assoc = u32>`). Resolving the
+    // intermediate projection through the implementation's
+    // own assigned type reaches the binding, so the screen
+    // must not reject the holder's constructor, the
+    // function taking the holder, or main — natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_alias.rs",
+        DYN_BOUND_PROJECTION_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the alias-self dyn-bound projection program runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n",
+        "the bound field value reaches the print"
+    );
+}
+
+const DYN_BOUND_PROJECTION_GENERIC_IMPL_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T>(T);
+impl<T> Carrier for Wrap<T> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<Wrap<u8>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<Wrap<u8>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_generic_impl_alias_runs() {
+    // The intermediate projection's implementation is
+    // generic: matching its self type `Wrap<T>` against
+    // `Wrap<u8>` binds the implementation's parameter, and
+    // the assigned type is read with that binding.
+    let dir = temp_dir("dyn-bound-projection-generic-impl-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_generic_impl_alias.rs",
+        DYN_BOUND_PROJECTION_GENERIC_IMPL_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the generic-impl alias projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_CHAINED_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+trait Carrier2 {
+    type Item2: Trait + ?Sized;
+}
+impl Carrier2 for () {
+    type Item2 = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {
+    type Item = <() as Carrier2>::Item2;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_chained_alias_runs() {
+    // The type an implementation assigns the intermediate
+    // item is itself a projection; the resolution follows
+    // it to the trait object behind it.
+    let dir = temp_dir("dyn-bound-projection-chained-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_chained_alias.rs",
+        DYN_BOUND_PROJECTION_CHAINED_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the chained-alias projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {

@@ -24,11 +24,10 @@ use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
 use rustc_public::mir;
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::ty::{
-    AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy,
-    ClosureKind, ExistentialPredicate, FnDef, GenericArgKind, GenericArgs,
-    IntTy as SmirIntTy, RigidTy,
-    Ty, TyConstKind, TyKind,
-    UintTy as SmirUintTy, VariantIdx,
+    AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, AssocContainer, AssocKind,
+    ClosureKind, ConstantKind, ExistentialPredicate, FloatTy as SmirFloatTy, FnDef, GenericArgKind,
+    GenericArgs, ImplDef, IntTy as SmirIntTy, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
+    TyConstKind, TyKind, UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
 use rustc_public::{CrateDef, CrateDefType};
@@ -912,8 +911,8 @@ fn projection_cannot_normalize(alias: &rustc_public::ty::AliasTy) -> bool {
 
 /// Whether the projection `alias` normalizes through an
 /// existential associated-type binding of its self type:
-/// the self type, resolved through the ambient arguments
-/// the way the screen's walk resolves a parameter, is a
+/// the self type, resolved as far as the screen's own
+/// evidence reaches (see `resolve_screen_self_ty`), is a
 /// trait object whose predicates bind this very associated
 /// item (`dyn Trait<Assoc = Term>`). Such a projection
 /// normalizes to the binding's term in a fully-monomorphized
@@ -934,37 +933,388 @@ fn dyn_binding_normalizes(
     let Some(GenericArgKind::Type(self_ty)) = alias.args.0.first() else {
         return false;
     };
-    let mut resolved: &Ty = self_ty;
+    let Some(resolved) = resolve_screen_self_ty(self_ty, ambient, depth) else {
+        return false;
+    };
+    let Some(TyKind::RigidTy(RigidTy::Dynamic(preds, _))) = guarded_ty_kind(&resolved) else {
+        return false;
+    };
+    preds.iter().any(|pred| {
+        matches!(
+            &pred.value,
+            ExistentialPredicate::Projection(p)
+                if p.def_id.def_id() == alias.def_id.def_id()
+        )
+    })
+}
+
+/// Resolve a type as far as the screen's own evidence
+/// reaches: parameters through the ambient arguments the
+/// way the screen's walk resolves them, and projections
+/// through the values the implementation table and
+/// trait-object bindings assign them (see
+/// `projection_resolved_ty`). Returns the first type that
+/// is neither a parameter nor a projection, or `None` when
+/// a step has no answer in that evidence. No normalization
+/// query is posed — the queries the screen exists to
+/// avoid — so a projection whose value the evidence does
+/// not determine simply stops the resolution.
+fn resolve_screen_self_ty(ty: &Ty, ambient: Option<&GenericArgs>, depth: usize) -> Option<Ty> {
+    let mut resolved: Ty = *ty;
     let mut depth = depth;
     loop {
-        let Some(kind) = guarded_ty_kind(resolved) else {
-            return false;
-        };
-        match kind {
-            TyKind::Param(param) => {
-                match ambient.and_then(|a| a.0.get(param.index as usize)) {
-                    Some(GenericArgKind::Type(t)) => resolved = t,
-                    _ => return false,
-                }
-                depth += 1;
-                if depth >= 8 {
-                    return false;
-                }
-            }
-            TyKind::RigidTy(RigidTy::Dynamic(preds, _)) => {
-                return preds.iter().any(|pred| {
-                    matches!(
-                        &pred.value,
-                        ExistentialPredicate::Projection(p)
-                            if p.def_id.def_id() == alias.def_id.def_id()
-                    )
-                });
-            }
-            _ => return false,
+        if depth >= 8 {
+            return None;
         }
+        let kind = guarded_ty_kind(&resolved)?;
+        match kind {
+            TyKind::Param(param) => match ambient.and_then(|a| a.0.get(param.index as usize)) {
+                Some(GenericArgKind::Type(t)) => resolved = *t,
+                _ => return None,
+            },
+            TyKind::Alias(SmirAliasKind::Projection, inner) => {
+                resolved = projection_resolved_ty(&inner, ambient, depth + 1)?;
+            }
+            TyKind::Alias(..) => return None,
+            _ => return Some(resolved),
+        }
+        depth += 1;
     }
 }
 
+/// The type a projection normalizes to, when the screen's
+/// own evidence determines it. Two sources of evidence,
+/// both read without posing a normalization query: the
+/// projection's self type is itself a trait object binding
+/// the item, in which case the binding's term is the
+/// value; or an implementation of the projection's trait
+/// applies to the resolved self type, in which case the
+/// type that implementation assigns the item — read from
+/// the implementation's own definition — is the value.
+/// Anything else (no applicable implementation, several
+/// disagreeing, an item with its own generic arguments)
+/// determines nothing and returns `None`.
+fn projection_resolved_ty(
+    alias: &rustc_public::ty::AliasTy,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> Option<Ty> {
+    let Some(GenericArgKind::Type(self_ty)) = alias.args.0.first() else {
+        return None;
+    };
+    if let Some(resolved_self) = resolve_screen_self_ty(self_ty, ambient, depth + 1) {
+        if let Some(TyKind::RigidTy(RigidTy::Dynamic(preds, _))) = guarded_ty_kind(&resolved_self) {
+            for pred in preds.iter() {
+                let ExistentialPredicate::Projection(p) = &pred.value else {
+                    continue;
+                };
+                if p.def_id.def_id() == alias.def_id.def_id() {
+                    if let TermKind::Type(term) = &p.term {
+                        return Some(*term);
+                    }
+                }
+            }
+        }
+    }
+    projection_impl_assigned_ty(alias, ambient, depth)
+}
+
+thread_local! {
+    /// The running compilation's implementations grouped
+    /// by trait, built once (see `impls_of_trait`).
+    static IMPLS_BY_TRAIT: std::cell::RefCell<
+        Option<HashMap<rustc_public::DefId, Vec<ImplDef>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The implementations of `trait_def` in the running
+/// compilation. Building the table enumerates
+/// `all_trait_impls` and reads each impl's trait
+/// reference, which neither substitutes nor normalizes,
+/// so it poses no query the projection screen exists to
+/// avoid (the same table `trait_has_impls` builds).
+fn impls_of_trait(trait_def: rustc_public::DefId) -> Vec<ImplDef> {
+    IMPLS_BY_TRAIT.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let map = cache.get_or_insert_with(|| {
+            let mut map: HashMap<rustc_public::DefId, Vec<ImplDef>> = HashMap::new();
+            for impl_def in rustc_public::all_trait_impls() {
+                map.entry(impl_def.trait_impl().value.def_id.def_id())
+                    .or_default()
+                    .push(impl_def);
+            }
+            map
+        });
+        map.get(&trait_def).cloned().unwrap_or_default()
+    })
+}
+
+/// The type the applicable implementation assigns a
+/// projection's item, read from the implementation table:
+/// the implementations of the projection's trait whose
+/// self type matches the projection's resolved self type
+/// (see `match_impl_self_ty`) must agree on one assigned
+/// type, read from the matching implementation's own
+/// definition through the compiler context. The query
+/// posed is the definition query for the item's type,
+/// which neither substitutes into nor normalizes the
+/// screened definitions — the same class of question
+/// `trait_has_impls`' table building already poses.
+fn projection_impl_assigned_ty(
+    alias: &rustc_public::ty::AliasTy,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> Option<Ty> {
+    let trait_def = alias.def_id.def_id().parent()?;
+    let Some(GenericArgKind::Type(self_ty)) = alias.args.0.first() else {
+        return None;
+    };
+    let resolved_self = resolve_screen_self_ty(self_ty, ambient, depth + 1)?;
+    let mut assigned: Option<Ty> = None;
+    for impl_def in impls_of_trait(trait_def) {
+        let tref = impl_def.trait_impl().value;
+        // A projection carrying arguments beyond its trait
+        // reference's (a generic associated type) has no
+        // value the table alone determines.
+        if alias.args.0.len() != tref.args().0.len() {
+            continue;
+        }
+        let mut bindings: HashMap<u32, GenericArgKind> = HashMap::new();
+        if !match_impl_self_ty(
+            &tref.self_ty(),
+            &resolved_self,
+            ambient,
+            &mut bindings,
+            depth + 1,
+        ) {
+            continue;
+        }
+        // An implementation matches the self type, so it
+        // is the applicable one; if its assigned type
+        // cannot be read, no other implementation's can
+        // stand in for it.
+        let args = impl_instantiation_args(&impl_def, &bindings)?;
+        let ty = impl_item_assigned_ty(&impl_def, alias, &args)?;
+        match assigned {
+            None => assigned = Some(ty),
+            Some(prev) if prev == ty => {}
+            Some(_) => return None,
+        }
+    }
+    assigned
+}
+
+/// The generic arguments instantiating an implementation
+/// from the arguments its self-type match bound (see
+/// `match_impl_self_ty`). A parameter the match never
+/// bound has no value the table determines — except a
+/// lifetime, which the assigned type's identity does not
+/// turn on for the screen's judgment and which is read as
+/// erased — so the instantiation fails rather than
+/// guessing.
+fn impl_instantiation_args(
+    impl_def: &ImplDef,
+    bindings: &HashMap<u32, GenericArgKind>,
+) -> Option<GenericArgs> {
+    let generics = impl_def.generics_of();
+    let mut args = Vec::with_capacity(generics.params.len());
+    for param in &generics.params {
+        match bindings.get(&param.index) {
+            Some(arg) => args.push(arg.clone()),
+            None => match param.kind {
+                rustc_public::ty::GenericParamDefKind::Lifetime => {
+                    args.push(GenericArgKind::Lifetime(Region {
+                        kind: RegionKind::ReErased,
+                    }));
+                }
+                _ => return None,
+            },
+        }
+    }
+    Some(GenericArgs(args))
+}
+
+/// The type an implementation assigns the projection's
+/// item, read from the implementation's own associated
+/// item definition through the compiler context installed
+/// for the conversion. Outside a compilation callback
+/// there is no definition to read.
+fn impl_item_assigned_ty(
+    impl_def: &ImplDef,
+    alias: &rustc_public::ty::AliasTy,
+    args: &GenericArgs,
+) -> Option<Ty> {
+    let item = impl_def.associated_items().into_iter().find(|item| {
+        matches!(item.kind, AssocKind::Type { .. })
+            && matches!(
+                &item.container,
+                AssocContainer::TraitImpl(owner)
+                    if owner.def_id() == alias.def_id.def_id()
+            )
+    })?;
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal_item = rustc_public::rustc_internal::internal(tcx, item.def_id.def_id());
+        let internal_args = rustc_public::rustc_internal::internal(tcx, args.clone());
+        let internal_ty = tcx
+            .type_of(internal_item)
+            .instantiate(tcx, internal_args)
+            .skip_normalization();
+        Some(rustc_public::rustc_internal::stable(internal_ty))
+    })
+}
+
+/// Whether an implementation with the trait-reference
+/// self type `impl_self` applies to the resolved self
+/// type `target`, recording the implementation's generic
+/// arguments in `bindings`. The match is structural: an
+/// implementation parameter binds the corresponding
+/// target argument (and must agree with any earlier
+/// binding of the same parameter), every other shape
+/// must agree exactly, and a target shape the match
+/// cannot judge — an unresolved parameter, a projection
+/// the screen cannot resolve — does not match. The match
+/// poses no query beyond the kind questions the guarded
+/// form answers.
+fn match_impl_self_ty(
+    impl_self: &Ty,
+    target: &Ty,
+    ambient: Option<&GenericArgs>,
+    bindings: &mut HashMap<u32, GenericArgKind>,
+    depth: usize,
+) -> bool {
+    let Some(ikind) = guarded_ty_kind(impl_self) else {
+        return false;
+    };
+    match ikind {
+        TyKind::Param(param) => bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target)),
+        TyKind::RigidTy(irigid) => {
+            if impl_self == target {
+                return true;
+            }
+            // A nested target position can still hold a
+            // parameter or a projection, which the same
+            // resolution settles before comparing.
+            let resolved_target = match guarded_ty_kind(target) {
+                Some(TyKind::Param(_)) | Some(TyKind::Alias(..)) => {
+                    match resolve_screen_self_ty(target, ambient, depth + 1) {
+                        Some(t) => t,
+                        None => return false,
+                    }
+                }
+                _ => *target,
+            };
+            if *impl_self == resolved_target {
+                return true;
+            }
+            let Some(TyKind::RigidTy(trigid)) = guarded_ty_kind(&resolved_target) else {
+                return false;
+            };
+            match (irigid, trigid) {
+                (RigidTy::Adt(idef, iargs), RigidTy::Adt(tdef, targs)) => {
+                    idef.def_id() == tdef.def_id()
+                        && match_impl_args(&iargs, &targs, ambient, bindings, depth)
+                }
+                (RigidTy::Ref(_, ii, im), RigidTy::Ref(_, ti, tm)) => {
+                    im == tm && match_impl_self_ty(&ii, &ti, ambient, bindings, depth)
+                }
+                (RigidTy::RawPtr(ii, im), RigidTy::RawPtr(ti, tm)) => {
+                    im == tm && match_impl_self_ty(&ii, &ti, ambient, bindings, depth)
+                }
+                (RigidTy::Slice(ii), RigidTy::Slice(ti)) => {
+                    match_impl_self_ty(&ii, &ti, ambient, bindings, depth)
+                }
+                (RigidTy::Pat(ii, _), RigidTy::Pat(ti, _)) => {
+                    match_impl_self_ty(&ii, &ti, ambient, bindings, depth)
+                }
+                (RigidTy::Array(ie, ilen), RigidTy::Array(te, tlen)) => {
+                    match_impl_self_ty(&ie, &te, ambient, bindings, depth)
+                        && match_impl_const(&ilen, &tlen, bindings)
+                }
+                (RigidTy::Tuple(its), RigidTy::Tuple(tts)) => {
+                    its.len() == tts.len()
+                        && its
+                            .iter()
+                            .zip(tts.iter())
+                            .all(|(i, t)| match_impl_self_ty(i, t, ambient, bindings, depth))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether the generic arguments of an implementation's
+/// trait reference (or of an ADT the self type mentions)
+/// match the target's, binding the implementation's
+/// parameters (see `match_impl_self_ty`).
+fn match_impl_args(
+    iargs: &GenericArgs,
+    targs: &GenericArgs,
+    ambient: Option<&GenericArgs>,
+    bindings: &mut HashMap<u32, GenericArgKind>,
+    depth: usize,
+) -> bool {
+    iargs.0.len() == targs.0.len()
+        && iargs
+            .0
+            .iter()
+            .zip(targs.0.iter())
+            .all(|(i, t)| match (i, t) {
+                (GenericArgKind::Type(it), GenericArgKind::Type(tt)) => {
+                    match_impl_self_ty(it, tt, ambient, bindings, depth)
+                }
+                (GenericArgKind::Const(ic), GenericArgKind::Const(tc)) => {
+                    match_impl_const(ic, tc, bindings)
+                }
+                (GenericArgKind::Lifetime(iregion), GenericArgKind::Lifetime(tregion)) => {
+                    match &iregion.kind {
+                        RegionKind::ReEarlyParam(param) => bind_impl_arg(
+                            bindings,
+                            param.index,
+                            GenericArgKind::Lifetime(tregion.clone()),
+                        ),
+                        _ => iregion == tregion,
+                    }
+                }
+                _ => false,
+            })
+}
+
+/// Whether an implementation's constant argument matches
+/// the target's: an implementation constant parameter
+/// binds the target constant, every other constant must
+/// be the same constant.
+fn match_impl_const(
+    iconst: &TyConst,
+    tconst: &TyConst,
+    bindings: &mut HashMap<u32, GenericArgKind>,
+) -> bool {
+    match iconst.kind() {
+        TyConstKind::Param(param) => {
+            bind_impl_arg(bindings, param.index, GenericArgKind::Const(tconst.clone()))
+        }
+        kind => kind == tconst.kind(),
+    }
+}
+
+/// Record an implementation parameter's matched argument,
+/// requiring agreement with any earlier binding of the
+/// same parameter.
+fn bind_impl_arg(
+    bindings: &mut HashMap<u32, GenericArgKind>,
+    index: u32,
+    arg: GenericArgKind,
+) -> bool {
+    match bindings.get(&index) {
+        Some(prev) => *prev == arg,
+        None => {
+            bindings.insert(index, arg);
+            true
+        }
+    }
+}
 /// Walk a type for a projection that cannot normalize (see
 /// [`projection_cannot_normalize`]), returning the recorded
 /// reason for the first one found. The walk mirrors
