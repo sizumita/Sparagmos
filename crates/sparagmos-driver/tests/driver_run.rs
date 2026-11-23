@@ -34109,3 +34109,33 @@ fn run_mode_btree_map_zst_iter_count() {
     // declared length.
     run_ok("btree-zst-iter", BTREE_ZST_ITER_SRC, "len=1 count=1\nget=true\n");
 }
+
+const STR_PATTERN_PRED_MUT_SRC: &str = r#"
+fn is_b(c: char) -> bool { c == 'b' }
+fn main() {
+    let mut n = 0;
+    let a = "ab".contains(move |_| { n += 1; n == 2 });
+    let mut m = 0;
+    let b = "ab".contains(move |_| { m += 1; m == 3 });
+    let mut k = 0;
+    let c = "ab".starts_with(move |_| { k += 1; k == 1 });
+    let d = "ab".contains(is_b);
+    println!("{a} {b} {c} {d}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_mutates_by_value_capture() {
+    // A str-pattern predicate is an `FnMut`: a `move` closure's
+    // by-value captures must live in mutable storage that persists
+    // across the per-character invocations, so the counter reaches
+    // 2 on the second character (and never reaches 3). With no
+    // environment reference the call machinery wraps a clone of the
+    // closure in a value target, and the capture write fails as a
+    // write to a constant aggregate.
+    run_ok(
+        "str-pattern-pred-mut",
+        STR_PATTERN_PRED_MUT_SRC,
+        "true false true true\n",
+    );
+}

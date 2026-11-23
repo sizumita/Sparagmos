@@ -10564,6 +10564,34 @@ impl<'a> Interpreter<'a> {
                         // test for the first (contains / starts
                         // with) or last (ends with) character the
                         // semantics reach.
+                        //
+                        // A predicate is an `FnMut`: it may
+                        // mutate a by-value capture, and the
+                        // mutation must be visible to the next
+                        // character's invocation. The predicate
+                        // value was moved into this call, so it
+                        // gets storage of its own in the
+                        // allocation store for the call's
+                        // duration, and every invocation receives
+                        // a reference to that storage -- the
+                        // arrangement the place-based iterator
+                        // predicates use with their predicate
+                        // field's storage. With no environment
+                        // reference the call machinery would wrap
+                        // a clone of the closure in a value
+                        // target instead, and a write to a
+                        // capture through it would fail as a
+                        // write to a constant aggregate.
+                        let pred_alloc = match &needle {
+                            Needle::Pred(pred) => Some(self.alloc_insert(pred.clone())),
+                            _ => None,
+                        };
+                        let pred_env = pred_alloc.map(|id| {
+                            Value::Ref(RefTarget::Alloc {
+                                id,
+                                projection: Vec::new(),
+                            })
+                        });
                         let mut test = |c: char| -> InterpResult<bool> {
                             Ok(match &needle {
                                 Needle::One(n) => c == *n,
@@ -10571,7 +10599,7 @@ impl<'a> Interpreter<'a> {
                                 Needle::Pred(pred) => match self.call_callable_sync(
                                     frames,
                                     pred,
-                                    None,
+                                    pred_env.clone(),
                                     vec![Value::Uint(u128::from(c as u32))],
                                 )? {
                                     Value::Bool(b) => b,
@@ -10586,7 +10614,7 @@ impl<'a> Interpreter<'a> {
                                 Needle::Text(_) => unreachable!(),
                             })
                         };
-                        match kind {
+                        let result = match kind {
                             Builtin::StrContains => {
                                 let mut found = false;
                                 for c in haystack.chars() {
@@ -10605,7 +10633,11 @@ impl<'a> Interpreter<'a> {
                                 Some(c) => test(c)?,
                                 None => false,
                             },
+                        };
+                        if let Some(id) = pred_alloc {
+                            self.free_alloc(id);
                         }
+                        result
                     }
                 };
                 Ok(Value::Bool(result))
