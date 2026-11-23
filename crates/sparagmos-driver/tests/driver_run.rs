@@ -5952,6 +5952,75 @@ fn run_mode_transmute_raw_pointer_to_box() {
     );
 }
 
+const TRANSMUTE_RAW_TO_ZST_FIRST_WRAPPER_SRC: &str = r#"
+#[repr(transparent)]
+struct Inner(*mut u32);
+#[repr(C)]
+struct Outer((), Inner);
+fn main() {
+    let mut x: u32 = 42;
+    let p = &mut x as *mut u32;
+    let outer: Outer = unsafe { std::mem::transmute(p) };
+    let q = outer.1.0;
+    unsafe { *q += 1; }
+    println!("{}", x);
+    let outer2: Outer = unsafe { std::mem::transmute(q) };
+    println!("{}", unsafe { *outer2.1.0 });
+}
+"#;
+
+#[test]
+fn run_mode_transmute_raw_pointer_to_wrapper_with_leading_zst() {
+    // The pointer chain enters the target at field 1 (a
+    // zero-sized field sits before the payload layer), so
+    // the rebuilt value must hold the pointer at that index
+    // with the zero-sized field's value beside it — not in a
+    // one-field aggregate at field 0, where reading `.1.0`
+    // finds a field that was never constructed.
+    run_ok(
+        "transmute-raw-to-zst-first-wrapper",
+        TRANSMUTE_RAW_TO_ZST_FIRST_WRAPPER_SRC,
+        "43\n43\n",
+    );
+}
+
+const TRANSMUTE_DEEP_ZST_CHAIN_SRC: &str = r#"
+#[repr(C)]
+struct Inner2((), *mut u32);
+#[repr(C)]
+struct Outer2(Inner2, ());
+fn main() {
+    let mut x: u32 = 42;
+    let p = &mut x as *mut u32;
+    let outer: Outer2 = unsafe { std::mem::transmute(p) };
+    let q = outer.0.1;
+    unsafe { *q += 1; }
+    println!("{}", x);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_deep_zst_chain_is_explicit_unsupported() {
+    // The chain enters a deeper layer at a non-zero field;
+    // rebuilding it would need an aggregate nested inside
+    // an operand, which the IR does not express. The
+    // transmute stays an explicit unsupported instead of
+    // building a value whose fields were never constructed.
+    let dir = temp_dir("transmute-deep-zst-chain");
+    let src = fixture(&dir, "case.rs", TRANSMUTE_DEEP_ZST_CHAIN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "deep non-zero chain transmute must be a named unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Cast Transmute"),
+        "stderr must name the transmute; stderr={stderr}"
+    );
+}
+
 const TRANSMUTE_CONSTANTS_SRC: &str = r#"
 fn main() {
     let a: u32 = unsafe { std::mem::transmute(1.5f32) };
