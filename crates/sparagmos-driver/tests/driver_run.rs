@@ -2396,6 +2396,186 @@ fn run_mode_dyn_bound_projection_alias_adt_arg_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_CONST_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<3> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<N>, const N: usize> {
+    field: <<T as Carrier<N>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_const_arg_runs() {
+    // The intermediate projection's trait reference
+    // passes the enclosing const parameter:
+    // `Carrier<N>` with `N` Holder's own parameter.
+    // Matching the implementation `Carrier<3> for ()`
+    // compared the concrete `3` against the unresolved
+    // `N` directly, found no implementation, and the
+    // screen rejected the holder and main. Resolving the
+    // target constant through the ambient frame first
+    // reaches `dyn Trait<Assoc = u32>`, whose binding the
+    // outer projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-const-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_const_arg.rs",
+        DYN_BOUND_PROJECTION_CONST_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the const-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_CONST_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<const N: usize>;
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<Wrap<3>> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<Wrap<N>>, const N: usize> {
+    field: <<T as Carrier<Wrap<N>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_const_arg_runs() {
+    // The const parameter rides in a nested position:
+    // the trait argument is the ADT `Wrap<N>`, whose own
+    // const argument is Holder's parameter. The match
+    // descends into the ADT's arguments, where the same
+    // ambient resolution applies -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-const-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_const_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_CONST_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested const-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC: &str = r#"
+#![feature(associated_type_defaults)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_assoc_default_runs() {
+    // The matching implementation declares no item of
+    // its own: it inherits the trait's associated-type
+    // default. Reading only the implementation's
+    // associated items found nothing, resolved nothing,
+    // and the screen rejected the holder and main.
+    // Falling back to the trait's default, instantiated
+    // with the matched trait reference, reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-assoc-default");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_assoc_default.rs",
+        DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the assoc-default projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_OVERRIDDEN_SRC: &str = r#"
+#![feature(associated_type_defaults)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_assoc_default_overridden_runs() {
+    // The implementation declares the item itself, so
+    // its own assignment (`Assoc = u64`) stands and the
+    // trait default is never consulted -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-assoc-default-overridden");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_assoc_default_overridden.rs",
+        DYN_BOUND_PROJECTION_ASSOC_DEFAULT_OVERRIDDEN_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the assoc-default-overridden projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {

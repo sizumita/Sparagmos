@@ -1356,7 +1356,27 @@ fn projection_impl_assigned_ty(
         let mut args = impl_instantiation_args(&impl_def, &bindings)?;
         args.0
             .extend_from_slice(&alias.args.0[tref.args().0.len()..]);
-        let ty = impl_item_assigned_ty(&impl_def, alias, &args)?;
+        let ty = match impl_item_assigned_ty(&impl_def, alias, &args) {
+            Some(ty) => ty,
+            None => {
+                // The implementation may inherit the item
+                // from the trait's own default
+                // (`associated_type_defaults`), declaring
+                // no item of its own: the assigned type is
+                // then the default, instantiated with the
+                // trait reference this match established --
+                // the resolved self type and the
+                // projection's own remaining arguments,
+                // composed with the ambient frame (the
+                // item's own arguments travel with them,
+                // past the trait reference's).
+                let mut trait_args = vec![GenericArgKind::Type(resolved_self)];
+                trait_args.extend_from_slice(
+                    &compose_args(&GenericArgs(alias.args.0[1..].to_vec()), ambient).0,
+                );
+                trait_item_default_ty(alias, &GenericArgs(trait_args))?
+            }
+        };
         match assigned {
             None => assigned = Some(ty),
             Some(prev) if prev == ty => {}
@@ -1418,6 +1438,44 @@ fn impl_item_assigned_ty(
         let tcx = compiler_tcx()?;
         let internal_item = rustc_public::rustc_internal::internal(tcx, item.def_id.def_id());
         let internal_args = rustc_public::rustc_internal::internal(tcx, args.clone());
+        let internal_ty = tcx
+            .type_of(internal_item)
+            .instantiate(tcx, internal_args)
+            .skip_normalization();
+        Some(rustc_public::rustc_internal::stable(internal_ty))
+    })
+}
+
+/// The type a projection's trait item defaults to, when
+/// the trait declares a default for it
+/// (`associated_type_defaults`) and an implementation
+/// inherits the item instead of declaring it: the
+/// default, read from the trait item's own definition
+/// through the compiler context and instantiated with
+/// `trait_args` -- the trait reference the implementation
+/// match established, plus the item's own arguments. The
+/// query posed is the definition query for the item's
+/// type, the same class of question
+/// `impl_item_assigned_ty` poses. An item the trait
+/// declares without a default has nothing to inherit, so
+/// nothing is read for it.
+fn trait_item_default_ty(
+    alias: &rustc_public::ty::AliasTy,
+    trait_args: &GenericArgs,
+) -> Option<Ty> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal_item =
+            rustc_public::rustc_internal::internal(tcx, alias.def_id.def_id());
+        if !tcx
+            .associated_item(internal_item)
+            .defaultness(tcx)
+            .is_default()
+        {
+            return None;
+        }
+        let internal_args =
+            rustc_public::rustc_internal::internal(tcx, trait_args.clone());
         let internal_ty = tcx
             .type_of(internal_item)
             .instantiate(tcx, internal_args)
@@ -1491,7 +1549,7 @@ fn match_impl_self_ty(
                 }
                 (RigidTy::Array(ie, ilen), RigidTy::Array(te, tlen)) => {
                     match_impl_self_ty(&ie, &te, ambient, bindings, depth)
-                        && match_impl_const(&ilen, &tlen, bindings)
+                        && match_impl_const(&ilen, &tlen, ambient, bindings, depth)
                 }
                 (RigidTy::Tuple(its), RigidTy::Tuple(tts)) => {
                     its.len() == tts.len()
@@ -1566,7 +1624,7 @@ fn match_impl_arg(
             match_impl_self_ty(it, tt, ambient, bindings, depth)
         }
         (GenericArgKind::Const(ic), GenericArgKind::Const(tc)) => {
-            match_impl_const(ic, tc, bindings)
+            match_impl_const(ic, tc, ambient, bindings, depth)
         }
         (GenericArgKind::Lifetime(iregion), GenericArgKind::Lifetime(tregion)) => {
             match &iregion.kind {
@@ -1585,16 +1643,48 @@ fn match_impl_arg(
 /// Whether an implementation's constant argument matches
 /// the target's: an implementation constant parameter
 /// binds the target constant, every other constant must
-/// be the same constant.
+/// be the same constant. The target constant is written
+/// in the frame the screen is walking, so a constant
+/// parameter there is first resolved through the ambient
+/// frame -- the constant form of the resolution the type
+/// match performs for its target (see
+/// `match_impl_self_ty`) -- and a parameter the ambient
+/// frame leaves unresolved stays a parameter. An
+/// unevaluated constant on each side matches another for
+/// the same definition whose arguments match in turn, so
+/// a parameter nested inside one is resolved (or bound)
+/// the same way.
 fn match_impl_const(
     iconst: &TyConst,
     tconst: &TyConst,
+    ambient: Option<&GenericArgs>,
     bindings: &mut HashMap<u32, GenericArgKind>,
+    depth: usize,
 ) -> bool {
+    let resolved;
+    let tconst = match tconst.kind() {
+        TyConstKind::Param(param) => {
+            match ambient.and_then(|a| a.0.get(param.index as usize)) {
+                Some(GenericArgKind::Const(bound)) => {
+                    resolved = bound.clone();
+                    &resolved
+                }
+                _ => tconst,
+            }
+        }
+        _ => tconst,
+    };
     match iconst.kind() {
         TyConstKind::Param(param) => {
             bind_impl_arg(bindings, param.index, GenericArgKind::Const(tconst.clone()))
         }
+        TyConstKind::Unevaluated(idef, iargs) => match tconst.kind() {
+            TyConstKind::Unevaluated(tdef, targs) => {
+                idef.def_id() == tdef.def_id()
+                    && match_impl_args(&iargs, &targs, ambient, bindings, depth)
+            }
+            _ => false,
+        },
         kind => kind == tconst.kind(),
     }
 }
