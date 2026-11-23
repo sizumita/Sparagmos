@@ -1041,6 +1041,112 @@ fn tag_sequence_elem(tag: &str) -> Option<&str> {
     generic_args_of(tag)?.into_iter().next()
 }
 
+/// The order of two pointers into the same target, from the
+/// positions they denote in it: `None` for pointers into
+/// different targets, and for same-target positions whose order
+/// the projections do not determine. The synthetic addresses are
+/// unordered hashes, so an ordering the guest computes between
+/// two positions of one allocation — the `offset_from`
+/// precondition checks (`self >= origin`), the pointer pairs of
+/// the slice iterators — must be answered here: natively those
+/// positions have a definite order, and a hash order that
+/// happens to invert it makes a well-formed program read as a
+/// UB violation.
+fn positional_order(a: &RefTarget, b: &RefTarget) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (
+            RefTarget::Place {
+                frame: fa,
+                local: la,
+                projection: pa,
+            },
+            RefTarget::Place {
+                frame: fb,
+                local: lb,
+                projection: pb,
+            },
+        ) if fa == fb && la == lb => compare_projections(pa, pb),
+        (
+            RefTarget::Static {
+                name: na,
+                projection: pa,
+            },
+            RefTarget::Static {
+                name: nb,
+                projection: pb,
+            },
+        ) if na == nb => compare_projections(pa, pb),
+        (
+            RefTarget::Alloc {
+                id: ia,
+                projection: pa,
+            },
+            RefTarget::Alloc {
+                id: ib,
+                projection: pb,
+            },
+        ) if ia == ib => compare_projections(pa, pb),
+        (RefTarget::Value(va, pa), RefTarget::Value(vb, pb)) if va == vb => {
+            compare_projections(pa, pb)
+        }
+        _ => None,
+    }
+}
+
+/// The order of two positions in one target's storage, from
+/// their projections: the first step where they differ decides
+/// when both steps are positions of the same kind (`Index` into
+/// a tuple-stored sequence, `Field` into an enum-stored one —
+/// in both spellings the step number is the element order —
+/// a byte displacement, or a sub-slice window's start). A
+/// projection that is a prefix of the other denotes the base
+/// position itself, which is the longer projection's position
+/// exactly when every remaining step enters element 0. Any
+/// other shape of difference is left undecided.
+fn compare_projections(a: &[RefProj], b: &[RefProj]) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let mut i = 0;
+    loop {
+        match (a.get(i), b.get(i)) {
+            (None, None) => return Some(Ordering::Equal),
+            (None, Some(_)) | (Some(_), None) => {
+                let rest = if a.len() < b.len() { &b[i..] } else { &a[i..] };
+                if rest
+                    .iter()
+                    .all(|step| matches!(step, RefProj::Index(0) | RefProj::Field(0)))
+                {
+                    return Some(Ordering::Equal);
+                }
+                return None;
+            }
+            (Some(x), Some(y)) => {
+                if x == y {
+                    i += 1;
+                    continue;
+                }
+                return match (x, y) {
+                    (RefProj::Index(m), RefProj::Index(n)) => Some(m.cmp(n)),
+                    (RefProj::Field(m), RefProj::Field(n)) => Some(m.cmp(n)),
+                    (RefProj::ByteOffset(m), RefProj::ByteOffset(n)) => Some(m.cmp(n)),
+                    (
+                        RefProj::Subslice { offset: m, .. },
+                        RefProj::Subslice { offset: n, .. },
+                    ) => {
+                        if m != n {
+                            Some(m.cmp(n))
+                        } else {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+}
+
 #[test]
 fn synthetic_addresses_do_not_collide_at_scale() {
     // A few thousand distinct allocation targets (a realistic
@@ -18557,13 +18663,16 @@ pub(crate) fn eval_binary(
     // compares the metadata word (its length). Ordering is
     // defined on the resolved addresses, which is deterministic
     // within a run -- except between two pointers into the same
-    // storage, whose order is their structural position order
-    // (see `structural_ptr_order`): the synthetic address hashes
-    // the whole target, projections included, so it orders two
-    // positions of one buffer arbitrarily, while the guest's
-    // pointer preconditions (`offset_from_unsigned`'s
-    // `self >= origin`, an iterator's `end >= ptr`) are stated
-    // on the real order.
+    // storage, whose order is their position order (see
+    // `positional_order` and `structural_ptr_order`): the
+    // synthetic address hashes the whole target, projections
+    // included, so it orders two positions of one buffer
+    // arbitrarily, while the guest's pointer preconditions
+    // (`offset_from_unsigned`'s `self >= origin`, an iterator's
+    // `end >= ptr`) are stated on the real order. A position
+    // order is consulted only between distinct resolved
+    // addresses: address-identical pointers have no position
+    // order between them.
     if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | Cmp) {
         let key = |v: &Value| -> Option<(u128, Option<u128>)> {
             match v {
@@ -18585,6 +18694,38 @@ pub(crate) fn eval_binary(
         };
         let ka = key(lhs);
         let kb = key(rhs);
+        let positional = if ka.is_some() && ka == kb {
+            // Address-identical pointers have no position order
+            // between them (see the comment above).
+            None
+        } else {
+            match (lhs, rhs) {
+                (Value::Ref(a), Value::Ref(b)) => positional_order(a, b),
+                (
+                    Value::FatRef { base: a, len: la },
+                    Value::FatRef { base: b, len: lb },
+                ) if la == lb => match (a.as_ref(), b.as_ref()) {
+                    (Value::Ref(x), Value::Ref(y)) => positional_order(x, y),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        if let Some(ord) = positional {
+            if op == Cmp {
+                return Ok((ordering_of(ord), false));
+            }
+            let v = match op {
+                Eq => ord == std::cmp::Ordering::Equal,
+                Ne => ord != std::cmp::Ordering::Equal,
+                Lt => ord == std::cmp::Ordering::Less,
+                Le => ord != std::cmp::Ordering::Greater,
+                Gt => ord == std::cmp::Ordering::Greater,
+                Ge => ord != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            };
+            return Ok((Value::Bool(v), false));
+        }
         let structural = if matches!(op, Eq | Ne) {
             None
         } else if ka.is_some() && ka == kb {

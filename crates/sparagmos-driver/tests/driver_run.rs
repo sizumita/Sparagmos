@@ -10606,6 +10606,94 @@ fn run_mode_iter_mut() {
     );
 }
 
+const ITER_MUT_METHOD_SRC: &str = r#"
+fn main() {
+    // The `iter_mut` method builds the iterator's real state;
+    // its consumers step element pointers through the
+    // container's own storage.
+    let mut a = [1, 2, 3, 4];
+    let n = a.iter_mut().count();
+    println!("count {}", n);
+    for x in a.iter_mut() {
+        *x *= 10;
+    }
+    println!("{:?}", a);
+    let mut v = vec![5, 6, 7];
+    let mut it = v.iter_mut();
+    println!("len {} hint {:?}", it.len(), it.size_hint());
+    *it.next().unwrap() += 100;
+    *it.next_back().unwrap() += 100;
+    println!("len {} {:?}", it.len(), v);
+    let mut boxed: Box<[i32]> = Box::new([1, 2]);
+    for x in boxed.iter_mut() {
+        *x += 1;
+    }
+    println!("{:?}", boxed);
+    let mut e: Vec<i32> = Vec::new();
+    println!("empty {}", (&mut e).into_iter().count());
+    let mut g = [1, 2, 3];
+    println!("refcount {}", (&mut g).into_iter().count());
+}
+"#;
+
+#[test]
+fn run_mode_iter_mut_method_forms() {
+    let dir = temp_dir("iter-mut-method");
+    let src = fixture(&dir, "iter_mut_method.rs", ITER_MUT_METHOD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "slice::IterMut method forms must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "count 4\n[10, 20, 30, 40]\nlen 3 hint (3, Some(3))\nlen 1 [105, 6, 107]\n[2, 3]\nempty 0\nrefcount 3\n",
+        "IterMut steps, counts and lengths read the real iterator state"
+    );
+}
+
+const ITER_MUT_ZST_SRC: &str = r#"
+fn main() {
+    // A zero-sized element type stores the remaining length in
+    // the iterator's end field as a provenance-free address.
+    let mut z = [(), (), ()];
+    let mut n = 0;
+    for _ in z.iter_mut() {
+        n += 1;
+    }
+    println!("zst {}", n);
+    let mut w = [(), (), (), ()];
+    let mut it = (&mut w).into_iter();
+    it.next_back();
+    println!("zlen {}", it.len());
+    let mut m = 0;
+    while it.next().is_some() {
+        m += 1;
+    }
+    println!("zrest {}", m);
+}
+"#;
+
+#[test]
+fn run_mode_iter_mut_zst() {
+    let dir = temp_dir("iter-mut-zst");
+    let src = fixture(&dir, "iter_mut_zst.rs", ITER_MUT_ZST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "slice::IterMut over a zero-sized element type must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "zst 3\nzlen 3\nzrest 3\n",
+        "the length stored in the end field drives every step"
+    );
+}
+
 // ----- pointer offset arithmetic (Lane DV) --------------------------------
 // `BinaryOp::Offset` (what `ptr::add` / `ptr::offset` compute in
 // MIR) and the `arith_offset` intrinsic (what the `wrapping_*`

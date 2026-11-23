@@ -6194,12 +6194,15 @@ impl<'a> Interpreter<'a> {
                         || inner.starts_with('[')
                     {
                         // `&mut Vec<T>`, `&mut [T; N]` and `&mut [T]`
-                        // iterate as `slice::IterMut`: the state is
-                        // the container reference, the next index
-                        // and the length. The elements stay in the
-                        // container's own storage; each step hands
-                        // out a reference to the element place (see
-                        // `Iterator::next` for `slice::IterMut`).
+                        // iterate as `slice::IterMut`, in the
+                        // iterator's real field layout (see
+                        // `slice_iter_value`): the `NonNull` first
+                        // element pointer, the past-the-end element
+                        // pointer and the `PhantomData` marker, all
+                        // denoting places in the container's own
+                        // storage — the same state the real
+                        // `iter_mut` body builds, which the
+                        // `slice::IterMut` steps consume.
                         let len = match &value {
                             Value::FatRef { len, .. } => *len,
                             _ => {
@@ -6208,9 +6211,59 @@ impl<'a> Interpreter<'a> {
                                 value_elements(&pointee)?.len() as u128
                             }
                         };
+                        // A zero-sized element type stores the
+                        // iterator's length in the end field
+                        // instead of a past-the-end pointer: core
+                        // builds that state with
+                        // `without_provenance_mut(len)` there, the
+                        // converted `len` body reads the address
+                        // back directly, and the `slice::IterMut`
+                        // steps decode the same form (see
+                        // `iter_zst_remaining`).
+                        let zero_sized = slice_container_element_tag(inner)
+                            .and_then(|tag| self.layout_of(tag))
+                            .is_some_and(|(size, _)| size == 0);
+                        let (first, end) = if zero_sized {
+                            // The front pointer still denotes the
+                            // first element when there is one. An
+                            // empty zero-sized container has no
+                            // element to denote and its steps never
+                            // read the pointer (the stored length
+                            // is zero), so the container reference
+                            // itself stands in.
+                            let first = if len == 0 {
+                                match &value {
+                                    Value::FatRef { base, .. } => (**base).clone(),
+                                    _ => value.clone(),
+                                }
+                            } else {
+                                self.iter_mut_element_ref(frames, &value, 0)?
+                            };
+                            (first, Value::Ref(RefTarget::Address(len as u64)))
+                        } else {
+                            (
+                                self.iter_mut_element_ref(frames, &value, 0)?,
+                                self.iter_mut_element_ref(frames, &value, len as usize)?,
+                            )
+                        };
                         Ok(Value::Enum {
                             variant: 0,
-                            fields: vec![value, Value::Uint(0), Value::Uint(len)],
+                            fields: vec![
+                                // `ptr: NonNull<T>` — the one-field
+                                // wrapper around the raw element
+                                // pointer.
+                                Value::Enum {
+                                    variant: 0,
+                                    fields: vec![first],
+                                },
+                                end,
+                                // `_marker: PhantomData<&mut T>` —
+                                // a zero-sized ADT value.
+                                Value::Enum {
+                                    variant: 0,
+                                    fields: Vec::new(),
+                                },
+                            ],
                         })
                     } else if inner.starts_with("std::option::Option<")
                         || inner.starts_with("core::option::Option<")
@@ -11132,7 +11185,8 @@ fn value_fingerprint(value: &Value) -> u64 {
         let tag = generic_args.first().map(String::as_str).unwrap_or("");
         let elem_size = self.layout_of(tag).map(|(size, _)| size);
         // Split a target into its base identity and the element
-        // index its trailing projection step denotes, if any.
+        // index its projection's element position denotes, if
+        // any.
         let split = |target: &Resolved| -> Option<(String, i128)> {
             let (base, projection): (String, &[RefProj]) = match target {
                 Resolved::Place {
@@ -11164,18 +11218,34 @@ fn value_fingerprint(value: &Value) -> u64 {
                     .collect::<Vec<_>>()
                     .join("/")
             };
-            match projection.split_last() {
-                Some((RefProj::Index(i), rest)) => {
-                    Some((format!("{base}|{}", key(rest)), *i as i128))
+            // A trailing byte displacement is itself the
+            // position, in element units of the intrinsic's
+            // element type (the reading this split has always
+            // used).
+            if let Some((RefProj::ByteOffset(d), rest)) = projection.split_last() {
+                let size = elem_size.filter(|sz| *sz > 0)? as i128;
+                if d % size != 0 {
+                    return None;
                 }
-                Some((RefProj::ByteOffset(d), rest)) => {
-                    let size = elem_size.filter(|sz| *sz > 0)? as i128;
-                    if d % size != 0 {
-                        return None;
-                    }
-                    Some((format!("{base}|{}", key(rest)), d / size))
+                return Some((format!("{base}|{}", key(rest)), d / size));
+            }
+            // Otherwise the position is the projection's element
+            // step (see `element_position_step`): everything
+            // before and after it — the base path and any wrapper
+            // entry into the element itself — is the shared
+            // identity the two pointers must agree on.
+            match element_position_step(projection) {
+                Some((at, i)) => {
+                    let mut steps: Vec<&RefProj> = projection[..at].iter().collect();
+                    steps.extend(projection[at + 1..].iter());
+                    let key = steps
+                        .iter()
+                        .map(|p| format!("{p:?}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    Some((format!("{base}|{key}"), i as i128))
                 }
-                _ => Some((format!("{base}|{}", key(projection)), 0)),
+                None => Some((format!("{base}|{}", key(projection)), 0)),
             }
         };
         Ok(match (split(x), split(y)) {
@@ -13706,44 +13776,52 @@ fn value_fingerprint(value: &Value) -> u64 {
                 },
             )
         } else if self_ty.starts_with("std::slice::IterMut<") {
-            // The state `IntoIterator` builds for `&mut Vec` /
-            // `&mut [T; N]` / `&mut [T]`: the container
-            // reference, the next index and the length. The
-            // element handed out is a reference to the element's
-            // place in the container's own storage.
+            // The state is the real field layout (see
+            // `slice_iter_value`): (ptr, end, marker) with element
+            // pointers into the container's own storage — the
+            // layout the real `iter_mut` body builds and the state
+            // `IntoIterator` builds for the `&mut` containers.
+            // `next` hands out the current pointer itself as the
+            // `&mut T` item and advances it by one element.
             if fields.len() != 3 {
                 return Err(InterpError::type_mismatch(
                     "slice::IterMut state",
-                    "[container, next index, length]",
+                    "[ptr, end, marker]",
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            let idx = match fields[1] {
-                Value::Uint(v) => v,
-                ref other => {
-                    return Err(InterpError::type_mismatch(
-                        "slice::IterMut index",
-                        "unsigned integer",
-                        other.kind_name(),
-                    ))
+            let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
+            if let Some(remaining) = iter_zst_remaining(&fields) {
+                // The zero-sized form: the end field is the
+                // remaining length as a provenance-free address
+                // and the front pointer never moves; each step
+                // hands it out again and decrements the length.
+                if remaining == 0 {
+                    return Ok((state.clone(), none_value()));
                 }
+                let item = iter_ptr_value(&ptr_field).expect("front pointer checked");
+                let new_end = Value::Ref(RefTarget::Address(remaining - 1));
+                return Ok((
+                    rebuild_state(
+                        state,
+                        vec![fields[0].clone(), new_end, fields[2].clone()],
+                    ),
+                    some_value(item),
+                ));
+            }
+            let (Some(cur), Some(last)) = (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
+            else {
+                return Err(InterpError::type_mismatch(
+                    "slice::IterMut state",
+                    "element pointers into the container storage",
+                    format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
+                ));
             };
-            let len = match fields[2] {
-                Value::Uint(v) => v,
-                ref other => {
-                    return Err(InterpError::type_mismatch(
-                        "slice::IterMut length",
-                        "unsigned integer",
-                        other.kind_name(),
-                    ))
-                }
-            };
-            if idx < len {
-                let elem = self.iter_mut_element_ref(frames, &fields[0], idx as usize)?;
-                (
-                    vec![fields[0].clone(), Value::Uint(idx + 1), Value::Uint(len)],
-                    some_value(elem),
-                )
+            if cur < last {
+                let advanced =
+                    iter_ptr_with_index(&ptr_field, cur + 1).expect("index step checked");
+                let item = iter_ptr_value(&ptr_field).expect("pointer field checked");
+                (vec![advanced, end, fields[2].clone()], some_value(item))
             } else {
                 (fields, none_value())
             }
@@ -14362,6 +14440,7 @@ fn value_fingerprint(value: &Value) -> u64 {
             || self_ty.starts_with("std::collections::btree_map::Iter<")
             || self_ty.starts_with("std::collections::btree_map::Keys<")
             || self_ty.starts_with("std::collections::btree_map::Values<")
+            || self_ty.starts_with("std::slice::IterMut<")
         {
             // The real layout's pointer pair: the remaining count
             // is the distance between the two element pointers.
@@ -18159,6 +18238,7 @@ fn iterator_next_back_state(
         || self_ty.starts_with("std::collections::btree_map::Iter<")
         || self_ty.starts_with("std::collections::btree_map::Keys<")
         || self_ty.starts_with("std::collections::btree_map::Values<")
+        || self_ty.starts_with("std::slice::IterMut<")
     {
         return step_slice_iter_back(state, self_ty);
     }
@@ -18462,6 +18542,46 @@ fn iter_ptr_value(field: &Value) -> Option<Value> {
     }
 }
 
+/// The element type tag of a slice-iterable container type tag:
+/// the `T` of `Vec<T>`, `[T; N]` or `[T]`.
+fn slice_container_element_tag(container_ty: &str) -> Option<&str> {
+    let ty = container_ty.trim();
+    if let Some(open) = ty.find('<') {
+        let close = ty.rfind('>')?;
+        return Some(ty[open + 1..close].trim());
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        return match inner.rsplit_once(';') {
+            Some((elem, _)) => Some(elem.trim()),
+            None => Some(inner.trim()),
+        };
+    }
+    None
+}
+
+
+/// The remaining element count a slice iterator state encodes
+/// for a zero-sized element type: core stores the length itself
+/// in the `end_or_len` field as a provenance-free address
+/// (`without_provenance_mut(len)`), and the front pointer never
+/// moves — every step hands the front pointer out again and
+/// decrements the stored length. Recognised by the address-only
+/// end field together with a front pointer denoting a real
+/// place: an address-only front pointer is a dangling empty
+/// slice instead, whose end field is its data address, not a
+/// length.
+fn iter_zst_remaining(fields: &[Value]) -> Option<u64> {
+    let Value::Ref(RefTarget::Address(n)) = fields.get(1)? else {
+        return None;
+    };
+    let ptr = iter_ptr_value(fields.first()?)?;
+    if matches!(ptr, Value::Ref(RefTarget::Address(_))) {
+        return None;
+    }
+    Some(*n)
+}
+
 /// The element index a slice-iterator pointer denotes: the
 /// trailing `Index` step of its target's projection, if it has
 /// one.
@@ -18478,8 +18598,37 @@ fn iter_ptr_index(value: &Value) -> Option<usize> {
         Value::Ref(RefTarget::Value(_, projection)) => projection,
         _ => return None,
     };
+    element_position(projection)
+}
+
+/// The element position a sequence pointer denotes: the last
+/// `Index` step of its projection (tuple-stored sequences;
+/// wrapper-entry steps into the element itself may follow it),
+/// or — for an enum-stored sequence, whose elements are the
+/// ADT's fields — the trailing `Field` step when the projection
+/// carries no `Index` step at all.
+fn element_position(projection: &[RefProj]) -> Option<usize> {
+    element_position_step(projection).map(|(_, i)| i)
+}
+
+/// The element position a projection denotes, as the
+/// (step index, element index) pair: the last `Index` step, or
+/// the trailing `Field` step when the projection carries no
+/// `Index` step at all (see `element_position`).
+fn element_position_step(projection: &[RefProj]) -> Option<(usize, usize)> {
+    if let Some((at, i)) = projection
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, step)| match step {
+            RefProj::Index(i) => Some((at, *i)),
+            _ => None,
+        })
+    {
+        return Some((at, i));
+    }
     match projection.last() {
-        Some(RefProj::Index(i)) => Some(*i),
+        Some(RefProj::Field(i)) => Some((projection.len() - 1, *i)),
         _ => None,
     }
 }
@@ -18498,8 +18647,19 @@ fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
     }
     fn with_index(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
         let mut projection = projection.to_vec();
+        // The element position `element_position` reads: the
+        // last `Index` step, or the trailing `Field` step of an
+        // enum-stored sequence.
+        if let Some(step) = projection
+            .iter_mut()
+            .rev()
+            .find(|step| matches!(step, RefProj::Index(_)))
+        {
+            *step = RefProj::Index(idx);
+            return Some(projection);
+        }
         match projection.last_mut() {
-            Some(RefProj::Index(i)) => {
+            Some(RefProj::Field(i)) => {
                 *i = idx;
                 Some(projection)
             }
@@ -18545,6 +18705,11 @@ fn slice_iter_bounds(state: &Value, self_ty: &str) -> InterpResult<(usize, usize
             "[ptr, end, marker]",
             format!("{} field(s)", fields.len()),
         ));
+    }
+    if let Some(remaining) = iter_zst_remaining(&fields) {
+        // The zero-sized form: the front pointer never moves, so
+        // the bounds are the origin and the stored length.
+        return Ok((0, remaining as usize));
     }
     let (Some(cur), Some(end)) = (iter_ptr_index(&fields[0]), iter_ptr_index(&fields[1]))
     else {
@@ -18609,6 +18774,23 @@ fn step_slice_iter_back(
             "slice::Iter state",
             "[ptr, end, marker]",
             format!("{} field(s)", fields.len()),
+        ));
+    }
+    if let Some(remaining) = iter_zst_remaining(&fields) {
+        // The zero-sized form (see `next_on_state`): the back
+        // step decrements the stored length and hands out the
+        // front pointer, exactly as the front step does.
+        if remaining == 0 {
+            return Ok((state.clone(), None));
+        }
+        let item = iter_ptr_value(&fields[0]).expect("front pointer checked");
+        let new_end = Value::Ref(RefTarget::Address(remaining - 1));
+        return Ok((
+            iterator_state_like(
+                state,
+                vec![fields[0].clone(), new_end, fields[2].clone()],
+            ),
+            Some(item),
         ));
     }
     let (cur, end) = slice_iter_bounds(state, self_ty)?;
