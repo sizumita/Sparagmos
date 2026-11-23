@@ -72,6 +72,15 @@ fn const_i32(v: i32) -> mir::Operand {
     )))
 }
 
+fn const_u32(v: u32) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Int {
+            data: v as u128,
+            size: 4,
+        },
+    )))
+}
+
 fn block(stmts: Vec<mir::Statement>, kind: mir::TerminatorKind) -> mir::BasicBlockData {
     let mut bb = mir::BasicBlockData::new(mir::Terminator::new(kind));
     bb.statements = stmts;
@@ -672,4 +681,74 @@ fn cast_const_f16_to_f64_quiets_snan() {
         )],
     );
     assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+// ----- f32 transmute reconstruction (PR #419 Codex follow-up, round 4) -----
+
+#[test]
+fn transmute_u32_to_f32_preserves_snan() {
+    // Reconstructing an `f32` from a bit pattern (a transmute) is
+    // transport, not a conversion: a signaling NaN pattern must be
+    // stored exactly (the exact widening of 0x7f802000), not quieted
+    // to 0x7fc02000 by the host widening that rebuilds the value.
+    for (bits, want) in [
+        (0x7f80_2000u32, 0x7ff0_0400_0000_0000u64),
+        (0xff80_2000, 0xfff0_0400_0000_0000),
+    ] {
+        let v = run(
+            "transmute_u32_f32_snan",
+            &[f32_ty()],
+            vec![assign(
+                place(0),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, const_u32(bits), f32_ty()),
+            )],
+        );
+        assert_float_bits(v, want);
+    }
+}
+
+#[test]
+fn transmute_f32_round_trip_preserves_snan() {
+    // An `f16` signaling NaN widened to `f32` (bits 0x7f802000),
+    // transmuted to `u32` and back: every step is transport, so the
+    // pattern survives the round trip unchanged.
+    let v = run(
+        "transmute_f32_u32_f32_snan",
+        &[f32_ty(), f32_ty(), u32_ty()],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    const_f16_bits(0x7c01),
+                    f32_ty(),
+                ),
+            ),
+            assign(
+                place(2),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, move_(1), u32_ty()),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, move_(2), f32_ty()),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
+}
+
+#[test]
+fn const_f32_snan_transports_exactly() {
+    // An `f32` signaling-NaN constant moved into a place is
+    // transport: the stored form is the exact widening of its bit
+    // pattern (0x7f802000), not the host-quieted form (0x7fc02000).
+    let v = run(
+        "const_f32_snan_use",
+        &[f32_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Use(const_f32(f32::from_bits(0x7f80_2000))),
+        )],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
 }

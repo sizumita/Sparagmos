@@ -14067,11 +14067,11 @@ impl<'a> Interpreter<'a> {
                         *slot = Value::Float(crate::f128::f16_bits_to_f64(bits as u16));
                     }
                     (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
-                        let bits = splice(u128::from((*f as f32).to_bits()));
-                        *slot = Value::Float(f32::from_bits(bits as u32) as f64);
+                        let bits = splice(u128::from(crate::f128::f64_to_f32_bits_exact(*f)));
+                        *slot = Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32));
                     }
                     (ByteScalar::Float(FloatTy::F32), Value::Uninit) => {
-                        *slot = Value::Float(f32::from_bits(splice(0) as u32) as f64);
+                        *slot = Value::Float(crate::f128::f32_bits_to_f64_exact(splice(0) as u32));
                     }
                     (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => {
                         let bits = splice(u128::from(f.to_bits()));
@@ -16481,7 +16481,7 @@ impl<'a> Interpreter<'a> {
                 None => Ok(Value::Uninit),
                 Some(bits) => match size {
                     2 => Ok(Value::Float(crate::mir_convert::f16_to_f64(bits as u16))),
-                    4 => Ok(Value::Float(f64::from(f32::from_bits(bits as u32)))),
+                    4 => Ok(Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32))),
                     8 => Ok(Value::Float(f64::from_bits(bits as u64))),
                     16 => Ok(Value::Float128(bits)),
                     _ => Err(InterpError::type_mismatch(
@@ -17837,7 +17837,11 @@ impl<'a> Interpreter<'a> {
             }
             ScalarShape::Float { bits: w } => Ok(Value::Float(match w {
                 16 => crate::mir_convert::f16_to_f64(bits as u16),
-                32 => f64::from(f32::from_bits(bits as u32)),
+                // Rebuilding a value from its bit pattern is
+                // transport: widen exactly, as `flatten_scalar`
+                // narrows exactly, so a signaling NaN pattern
+                // survives a transmute round trip.
+                32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
                 _ => f64::from_bits(bits as u64),
             })),
             ScalarShape::Ptr => Ok(self.materialized_ptr(bits as u64)),
@@ -19891,7 +19895,7 @@ fn byte_patch_tree(current: &Value, bytes: &[u8]) -> Option<Value> {
             Value::Float(_) => {
                 let bits = take(pos)?;
                 Some(Value::Float(match width {
-                    32 => f64::from(f32::from_bits(bits as u32)),
+                    32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
                     _ => f64::from_bits(bits as u64),
                 }))
             }

@@ -4662,7 +4662,7 @@ impl<'a> Converter<'a> {
                     ir::FloatTy::F16,
                 )),
                 mir::FloatTy::F32 => Ok(ir::Constant::Float(
-                    f32::from_bits(*bits as u32) as f64,
+                    crate::f128::f32_bits_to_f64_exact(*bits as u32),
                     ir::FloatTy::F32,
                 )),
                 mir::FloatTy::F64 => Ok(ir::Constant::Float(
