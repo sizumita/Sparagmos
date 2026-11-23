@@ -34218,3 +34218,85 @@ fn run_mode_str_pattern_char_slice_from_element_base() {
         "true true false true true true false\n",
     );
 }
+const STR_PATTERN_PRED_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let pred = move |_: char| {
+        let _ = &rc2;
+        false
+    };
+    let r0 = "".contains(pred);
+    println!("empty: {r0} count={}", Rc::strong_count(&rc));
+    let rc3 = rc.clone();
+    let pred2 = move |_: char| {
+        let _ = &rc3;
+        false
+    };
+    let r1 = "ab".contains(pred2);
+    println!("nomatch: {r1} count={}", Rc::strong_count(&rc));
+    let rc4 = rc.clone();
+    let mut pred3 = move |_: char| {
+        let _ = &rc4;
+        true
+    };
+    let r2 = "ab".contains(&mut pred3);
+    println!("borrowed: {r2} count={}", Rc::strong_count(&rc));
+    drop(pred3);
+    println!("after owner drop: count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_drops_by_value_captures() {
+    // A by-value predicate is consumed by the search: the
+    // callee's real body drops it on the way out, so an `Rc`
+    // its captures own is released when the call returns --
+    // including for an empty haystack, where the predicate is
+    // never invoked. A borrowed predicate is not dropped by
+    // the call; its capture lives until the owner drops it.
+    run_ok(
+        "str-pattern-pred-drop",
+        STR_PATTERN_PRED_DROP_SRC,
+        "empty: false count=1\nnomatch: false count=1\nborrowed: true count=2\nafter owner drop: count=1\n",
+    );
+}
+
+const OS_STR_ELEMENT_BASE_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+
+fn show(label: &str, s: &OsStr) {
+    let owned = OsString::from(s);
+    let b = owned.as_bytes();
+    let sum: u32 = b.iter().map(|x| *x as u32).sum();
+    println!("{label}: len={} sum={}", b.len(), sum);
+}
+
+fn main() {
+    let arr: [u8; 3] = *b"abc";
+    let full = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 3)) };
+    show("len3", full);
+    let empty = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 0)) };
+    show("len0", empty);
+    let one = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 1)) };
+    show("len1", one);
+    show("whole", OsStr::from_bytes(&arr[..]));
+}
+"#;
+
+#[test]
+fn run_mode_os_str_from_element_base_keeps_length() {
+    // An `OsStr` whose fat pointer references an individual
+    // byte of an array keeps the length its metadata states
+    // when it is cloned into an `OsString`: resolving the
+    // pointer to the byte alone would report a one-byte
+    // string for lengths 3 and 0 alike.
+    run_ok(
+        "os-str-element-base",
+        OS_STR_ELEMENT_BASE_SRC,
+        "len3: len=3 sum=294\nlen0: len=0 sum=0\nlen1: len=1 sum=97\nwhole: len=3 sum=294\n",
+    );
+}

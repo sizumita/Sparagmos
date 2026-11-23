@@ -10681,6 +10681,23 @@ impl<'a> Interpreter<'a> {
                             },
                         };
                         if let Some(id) = pred_alloc {
+                            // The call consumed the predicate:
+                            // the callee's real body drops it on
+                            // the way out, captures and all, so
+                            // hand its final state back for the
+                            // drop conversion attached to the
+                            // call (see `consumed_glue` in `ir`);
+                            // the interpreter runs that glue
+                            // once this builtin returns. This
+                            // runs whether or not the predicate
+                            // was ever invoked (an empty
+                            // haystack still drops it). A
+                            // borrowed predicate has no
+                            // allocation here and keeps its
+                            // owner, undropped.
+                            if let Some(final_pred) = self.alloc_value(id) {
+                                self.note_consumed_iter_final(final_pred);
+                            }
                             self.free_alloc(id);
                         }
                         result
@@ -19399,6 +19416,25 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// elements survive even when the slice's base references an
     /// individual element. `None` when the value is not a slice
     /// whose every element is a character.
+    /// The bytes of a byte-slice argument, read through
+    /// `slice_elements` so the length and the sibling elements
+    /// survive even when the slice's base references an
+    /// individual element. `None` when the value is not a slice
+    /// whose every element is a byte.
+    fn byte_slice_of_fat_ref(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<Vec<u8>> {
+        let (elems, _) = self.slice_elements(frames, value).ok()?;
+        let mut bytes = Vec::with_capacity(elems.len());
+        for e in &elems {
+            let Value::Uint(v) = e else { return None };
+            bytes.push(u8::try_from(*v).ok()?);
+        }
+        Some(bytes)
+    }
+
     fn char_set_of_slice(&self, frames: &[Frame], value: &Value) -> Option<Vec<char>> {
         let (elems, _) = self.slice_elements(frames, value).ok()?;
         let mut set = Vec::with_capacity(elems.len());
@@ -21215,6 +21251,20 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// program, argument, environment entry or directory): in
     /// this model an `OsStr` is its byte string.
     fn os_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        // A fat reference carries the byte string's length in
+        // its own metadata: read the bytes through
+        // `slice_elements` so the length and the sibling bytes
+        // survive. Resolving the value first would follow a
+        // base that references an individual byte to that byte
+        // alone, and a string of any length (including zero)
+        // would then be mistaken for the one-byte string the
+        // scalar shortcut below composes.
+        let from_fat_ref = matches!(value, Value::FatRef { .. });
+        if from_fat_ref {
+            if let Some(bytes) = self.byte_slice_of_fat_ref(frames, value) {
+                return Ok(bytes);
+            }
+        }
         let resolved0 = self.resolve_value(frames, value)?;
         // An owned byte-string aggregate in buffer form (an
         // `OsString` or `PathBuf` wrapping a `Buf` wrapping the
@@ -21243,8 +21293,14 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 // A one-byte string read back through a byte
                 // pointer composes the scalar byte (the byte
                 // view's shaped read): the lone byte value at
-                // this position is the one-byte string.
-                Value::Uint(v) if v <= 0xff => return Ok(vec![v as u8]),
+                // this position is the one-byte string. A fat
+                // reference never takes this shortcut: its
+                // metadata states the length, and the read at
+                // the top either honoured it or could not read
+                // the slice at all.
+                Value::Uint(v) if v <= 0xff && !from_fat_ref => {
+                    return Ok(vec![v as u8])
+                }
                 other => {
                     return Err(InterpError::type_mismatch(
                         "OsStr argument",
