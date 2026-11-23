@@ -3817,8 +3817,9 @@ impl Converter {
     /// uninitialized-read error instead of an invented value.
     /// A pointee whose decoded form IS the contents (a `str`)
     /// cannot be represented this way and stays undecodable,
-    /// as does an interior slice reference (the same
-    /// restriction `decode_static_slice_ref` applies).
+    /// as does a slice reference whose backing array cannot be
+    /// located in the static's declared type (see
+    /// `static_slice_path`).
     fn decode_foreign_static_ref(
         &mut self,
         def: &mir::mono::StaticDef,
@@ -3831,16 +3832,23 @@ impl Converter {
         let def_id = self.crate_def_id(def);
         match inner.kind() {
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
-                if target_off != 0
-                    || matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
-                {
+                if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
                     return None;
                 }
                 let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                // The projection names the slice's backing array
+                // inside the static's declared type (the whole
+                // array, an array field, an array element): an
+                // empty projection for a field's array would make
+                // the slice view index the static's whole value
+                // instead of the field. A slice whose backing
+                // array cannot be located stays undecodable.
+                let projection =
+                    self.static_slice_path(&def.ty(), target_off, &elem, count, depth)?;
                 Some(sm::ConstValue::StaticRef {
                     def: def_id,
                     value: Box::new(sm::ConstValue::Uninit),
-                    projection: Vec::new(),
+                    projection,
                     len: Some(count as u64),
                 })
             }
@@ -4279,6 +4287,140 @@ impl Converter {
             }
             _ => None,
         }
+    }
+
+    /// The projection path from the base of a value of type
+    /// `ty` to the array at byte offset `off` whose element type
+    /// is `elem` and whose length is `count` \u2014 the backing
+    /// array of a fat slice reference into a static's storage.
+    /// The descent mirrors `static_offset_path`, with the array
+    /// itself as the leaf: a slice starting at an array's base
+    /// and fitting inside it denotes that array (the empty path;
+    /// the reference's length word bounds the view), and an
+    /// array element that is itself the backing array is
+    /// reached through a constant index.
+    fn static_slice_path(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        off: usize,
+        elem: &rustc_public::ty::Ty,
+        count: usize,
+        depth: usize,
+    ) -> Option<Vec<sm::PlaceElem>> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Array(arr_elem, arr_len)) => {
+                if arr_elem == *elem && off == 0 {
+                    // The slice starts at this array's base and
+                    // denotes the array itself when it fits.
+                    if count as u64 <= arr_len.eval_target_usize().ok()? {
+                        return Some(Vec::new());
+                    }
+                    return None;
+                }
+                // An array element that is itself the backing
+                // array, reached at its own offset.
+                let stride = arr_elem.layout().ok()?.shape().size.bytes() as usize;
+                if stride == 0 || off % stride != 0 {
+                    return None;
+                }
+                let idx = off / stride;
+                let total =
+                    ty.layout().ok()?.shape().size.bytes() as usize / stride;
+                if idx >= total {
+                    return None;
+                }
+                let mut rest =
+                    self.static_slice_path(&arr_elem, 0, elem, count, depth + 1)?;
+                let mut path = vec![sm::PlaceElem::ConstantIndex {
+                    offset: idx as u64,
+                    min_length: total as u64,
+                    from_end: false,
+                }];
+                path.append(&mut rest);
+                Some(path)
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => match def.kind() {
+                AdtKind::Struct => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let offsets = arbitrary_offsets(ty)?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| f.ty_with_args(&args))
+                        .zip(offsets)
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_slice_path(&fields, off, elem, count, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Union => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| (f.ty_with_args(&args), 0))
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_slice_path(&fields, off, elem, count, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Enum => None,
+            },
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                let offsets = arbitrary_offsets(ty)?;
+                let fields: Vec<(rustc_public::ty::Ty, usize)> =
+                    elems.iter().cloned().zip(offsets).collect();
+                let (i, fty, mut rest) =
+                    self.record_slice_path(&fields, off, elem, count, depth)?;
+                let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                path.append(&mut rest);
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Find the record field (type and byte offset within the
+    /// record) that contains `off` and from which the backing
+    /// array of a slice reference (element type `elem`, length
+    /// `count`) is reachable, returning the field index, the
+    /// field's type, and the remaining path from that field.
+    /// Mirrors `record_offset_path`, with `static_slice_path`
+    /// as the reachability test.
+    fn record_slice_path(
+        &mut self,
+        fields: &[(rustc_public::ty::Ty, usize)],
+        off: usize,
+        elem: &rustc_public::ty::Ty,
+        count: usize,
+        depth: usize,
+    ) -> Option<(usize, rustc_public::ty::Ty, Vec<sm::PlaceElem>)> {
+        for (i, (fty, foff)) in fields.iter().enumerate() {
+            if *foff > off {
+                continue;
+            }
+            let size = fty.layout().ok()?.shape().size.bytes() as usize;
+            // A field contains `off` when it starts at or before
+            // it and ends after it; a zero-sized field contains
+            // only its own offset.
+            let contains = if size == 0 { *foff == off } else { off < foff + size };
+            if !contains {
+                continue;
+            }
+            if let Some(rest) =
+                self.static_slice_path(fty, off - foff, elem, count, depth + 1)
+            {
+                return Some((i, fty.clone(), rest));
+            }
+        }
+        None
     }
 
     /// Find the record field (type and byte offset within the

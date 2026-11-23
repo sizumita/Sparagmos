@@ -26065,3 +26065,74 @@ fn run_mode_extern_static_first_element_write_preserves_rest() {
         "e0=33 e1=20\n",
     );
 }
+
+const EXTERN_STATIC_SLICE_FIELD_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const S: *mut [u32] = unsafe { &raw mut EXT_PAIR.data };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_PAIR).write(Pair { data: [10, 20], sentinel: 7 });
+        (*S)[1] = 33;
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_slice_field_write_hits_field() {
+    // A constant slice pointer to an array FIELD of a foreign
+    // static: the field sits at byte offset zero, but the slice
+    // denotes the field's array, not the whole static. The
+    // projection must name the field, or a write through the
+    // slice indexes the static's whole value and lands on the
+    // wrong element (here it silently corrupted `sentinel`).
+    run_ok(
+        "extern-static-slice-field",
+        EXTERN_STATIC_SLICE_FIELD_SRC,
+        "d0=10 d1=33 sentinel=7\n",
+    );
+}
+
+const EXTERN_STATIC_SLICE_OFFSET_FIELD_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair2 {
+    sentinel: u32,
+    data: [u32; 2],
+}
+extern "C" {
+    static mut EXT_PAIR2: Pair2;
+}
+const S2: *mut [u32] = unsafe { &raw mut EXT_PAIR2.data };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_PAIR2).write(Pair2 { sentinel: 7, data: [10, 20] });
+        (*S2)[0] = 33;
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR2.data[0], EXT_PAIR2.data[1], EXT_PAIR2.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_slice_offset_field_write_hits_field() {
+    // The same shape with the array field at a nonzero byte
+    // offset: the slice reference decodes with the field's
+    // projection instead of staying undecodable.
+    run_ok(
+        "extern-static-slice-offset-field",
+        EXTERN_STATIC_SLICE_OFFSET_FIELD_SRC,
+        "d0=33 d1=20 sentinel=7\n",
+    );
+}
