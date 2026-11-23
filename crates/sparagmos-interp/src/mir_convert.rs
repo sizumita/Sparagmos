@@ -1058,6 +1058,11 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // time (a handle release, or the vtable entry the
             // value itself carries): no static edges.
             ir::DropPlan::WakerDrop => true,
+            // An `io::Error` representation's release is judged
+            // from the word at run time, and the payload's glue is
+            // the trait object's own (carried by the value, like
+            // `Dyn`): no static edges.
+            ir::DropPlan::IoErrorRepr => true,
             ir::DropPlan::RcHandleDrop { value } => walk(value, adts, targets, seen),
             // The dyn branch is chosen from the value at run time
             // (no static edges, like `Dyn` itself); the plain
@@ -10528,15 +10533,15 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // unevidenced field stays unaccounted for and fails
             // the plan, as usual.
             // The bitpacked error representation word: for the
-            // Os / Simple / SimpleMessage tags - the only
-            // representations the runtime produces - the word
-            // owns nothing (an error code, a kind discriminant,
-            // or a `&'static` message). The Custom tag's heap box
-            // is reachable only through `Error::new` construction,
-            // which has no converted body in this model; if that
-            // construction is ever modelled, this entry must be
-            // revisited so the box's glue runs.
-            "core::io::error::repr::Repr" => return Some(P::Trivial),
+            // Os / Simple / SimpleMessage tags the word owns
+            // nothing (an error code, a kind discriminant, or a
+            // `&'static` message). The Custom tag's word names the
+            // payload's allocation by registered synthetic
+            // address, and dropping the error must run the
+            // payload's glue exactly once: a runtime-judged plan
+            // (see `DropPlan::IoErrorRepr`), as the word's tag is
+            // a property of the value, not of the type.
+            "core::io::error::repr::Repr" => return Some(P::IoErrorRepr),
             "std::io::Error" => {
                 return Some(self.variant_fields_plan(def, args)?)
             }
