@@ -25174,3 +25174,88 @@ fn run_mode_transmute_enum_tuple_payload() {
         "A 86 4660 120\nB deadbeef\n",
     );
 }
+
+const TRANSMUTE_NICHE_WRAP_SRC: &str = r#"
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum E { A = 253, B = 254 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct W { a: E, b: u8 }
+#[derive(Clone, Copy)]
+enum N { Payload(W), Empty1, Empty2 }
+fn code(n: N) -> u32 {
+    match n {
+        N::Payload(w) => 1000 + (w.a as u32) + ((w.b as u32) << 8),
+        N::Empty1 => 1,
+        N::Empty2 => 2,
+    }
+}
+fn main() {
+    let a: N = unsafe { std::mem::transmute(0u16) };
+    let b: N = unsafe { std::mem::transmute(255u16) };
+    let c: N = unsafe { std::mem::transmute(253u16) };
+    let d: N = unsafe { std::mem::transmute(0x5AFEu16) };
+    println!("{} {} {} {}", code(a), code(b), code(c), code(d));
+    let e2: u16 = unsafe { std::mem::transmute(N::Empty2) };
+    let e1: u16 = unsafe { std::mem::transmute(N::Empty1) };
+    let p: u16 = unsafe { std::mem::transmute(N::Payload(W { a: E::B, b: 0x5A })) };
+    println!("{} {} {}", e2, e1, p);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_range_wraps_at_scalar_width() {
+    // A niche range that starts at the niche scalar's
+    // maximum (255 in a `u8` tag) wraps: the second niche
+    // variant encodes as 0, in both directions. Decoding
+    // measures the distance from the range's start at the
+    // scalar's width, and encoding masks to that width
+    // before shifting instead of spilling into the
+    // adjacent payload byte.
+    run_ok(
+        "transmute-niche-wrap",
+        TRANSMUTE_NICHE_WRAP_SRC,
+        "2 1 1253 24294\n0 255 23294\n",
+    );
+}
+
+const TRANSMUTE_NICHE_WRAP_SHIFTED_SRC: &str = r#"
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum E { A = 253, B = 254 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct W { b: u8, a: E }
+#[derive(Clone, Copy)]
+enum N { Payload(W), Empty1, Empty2 }
+fn code(n: N) -> u32 {
+    match n {
+        N::Payload(w) => 1000 + (w.a as u32) + (w.b as u32),
+        N::Empty1 => 1,
+        N::Empty2 => 2,
+    }
+}
+fn main() {
+    let a: N = unsafe { std::mem::transmute(0x0000u16) };
+    let b: N = unsafe { std::mem::transmute(0xFF00u16) };
+    let c: N = unsafe { std::mem::transmute(0xFE5Au16) };
+    println!("{} {} {}", code(a), code(b), code(c));
+    let e2: u16 = unsafe { std::mem::transmute(N::Empty2) };
+    let p: u16 = unsafe { std::mem::transmute(N::Payload(W { b: 0x5A, a: E::B })) };
+    println!("{} {}", e2, p);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_range_wraps_at_shifted_scalar() {
+    // The same wrapping niche range with the niche scalar
+    // in the payload's second byte: the wrapped value is
+    // masked to the scalar's width before it is shifted
+    // into its window, in both directions.
+    run_ok(
+        "transmute-niche-wrap-shifted",
+        TRANSMUTE_NICHE_WRAP_SHIFTED_SRC,
+        "2 1 1344\n0 65114\n",
+    );
+}

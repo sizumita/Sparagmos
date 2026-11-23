@@ -16277,8 +16277,12 @@ impl<'a> Interpreter<'a> {
             } => {
                 let raw = Self::mat_tag_raw(bytes, relocs, offset + toff, *size)?;
                 let span = u128::from(end - start);
-                if raw >= *niche_start && raw - niche_start <= span {
-                    let variant = start + (raw - niche_start) as u32;
+                // The niche range may wrap past the tag
+                // scalar's maximum, so the distance from the
+                // range's start is taken at the scalar's width.
+                let offset = raw.wrapping_sub(*niche_start) & bit_mask(u32::from(*size) * 8);
+                if offset <= span {
+                    let variant = start + offset as u32;
                     Ok((variant, variant_fields(variants, variant)?))
                 } else {
                     Ok((*untagged, variant_fields(variants, *untagged)?))
@@ -17223,13 +17227,19 @@ impl<'a> Interpreter<'a> {
                     niche_variants,
                     niche_start,
                     niche_shift,
-                    ..
+                    niche_bits,
                 },
                 Value::Enum { variant, fields },
             ) => {
                 if (niche_variants.0..=niche_variants.1).contains(variant) {
-                    Ok((*niche_start
-                        + u128::from(*variant - niche_variants.0))
+                    // The encoded value is taken at the niche
+                    // scalar's width before shifting: a range
+                    // starting near the scalar's maximum wraps
+                    // (255 + 1 encodes as 0 in a u8 scalar)
+                    // instead of spilling into the adjacent
+                    // payload byte.
+                    Ok(((*niche_start + u128::from(*variant - niche_variants.0))
+                        & bit_mask(*niche_bits))
                         << niche_shift)
                 } else if variant == untagged_variant {
                     match fields.first() {
@@ -17488,10 +17498,15 @@ impl<'a> Interpreter<'a> {
                 let window =
                     (bits >> niche_shift) & bit_mask(*niche_bits);
                 let span = u128::from(niche_variants.1 - niche_variants.0);
-                if window >= *niche_start && window - *niche_start <= span {
+                // The niche range may wrap past the niche
+                // scalar's maximum (a range starting at 255 in
+                // a u8 scalar encodes its second variant as 0),
+                // so the distance from the range's start is
+                // taken at the scalar's width.
+                let offset = window.wrapping_sub(*niche_start) & bit_mask(*niche_bits);
+                if offset <= span {
                     Ok(Value::Enum {
-                        variant: niche_variants.0
-                            + (window - *niche_start) as u32,
+                        variant: niche_variants.0 + offset as u32,
                         fields: Vec::new(),
                     })
                 } else {
