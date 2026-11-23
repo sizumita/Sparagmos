@@ -22865,3 +22865,147 @@ fn run_mode_non_data_pointer_format_flags() {
         "[     0x1]\n[0x1     ]\n[  0x1   ]\n[0x000001]\n[+0x1]\n[+0x00001]\n[0x0000000000000001]\n[0x0000000000000001]\n[0x000000000000000001]\n[0x000001]\n[*****0x1]\n[000000x1]\n[0x00000000deadbeef]\n[0x000000]\n",
     );
 }
+
+const ERROR_SOURCE_CHAIN_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct Inner;
+impl fmt::Display for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "inner") }
+}
+impl Error for Inner {}
+#[derive(Debug)]
+struct Outer { src: Inner }
+impl fmt::Display for Outer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "outer") }
+}
+impl Error for Outer {
+    fn source(&self) -> Option<&(dyn Error + 'static)> { Some(&self.src) }
+}
+#[derive(Debug)]
+struct Plain;
+impl fmt::Display for Plain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "plain") }
+}
+impl Error for Plain {}
+fn main() {
+    let outer = Outer { src: Inner };
+    let e: &dyn Error = &outer;
+    let s = e.source().expect("outer has source");
+    println!("source display: {}", s);
+    println!("source-of-source is none: {}", s.source().is_none());
+    let plain = Plain;
+    let e2: &dyn Error = &plain;
+    println!("plain source is none: {}", e2.source().is_none());
+    let boxed: Box<dyn Error> = Box::new(Outer { src: Inner });
+    println!("boxed source: {}", boxed.source().map(|s| s.to_string()).unwrap_or_else(|| "none".into()));
+    let pie = "x".parse::<u32>().unwrap_err();
+    let e3: &dyn Error = &pie;
+    println!("foreign source is none: {}", e3.source().is_none());
+}
+"#;
+
+#[test]
+fn run_mode_error_source_chain_and_default() {
+    // The vtable demand puts every `Error` method of a coerced
+    // concrete type in the program — an overriding `source`, and
+    // the trait's default body (which answers `None`) for types
+    // that do not override it, local and foreign alike.
+    run_ok(
+        "error-source-chain",
+        ERROR_SOURCE_CHAIN_SRC,
+        "source display: inner\nsource-of-source is none: true\nplain source is none: true\nboxed source: inner\nforeign source is none: true\n",
+    );
+}
+
+const ERROR_DOWNCAST_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug)]
+struct Counted { code: u32 }
+impl fmt::Display for Counted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "counted {}", self.code) }
+}
+impl Error for Counted {}
+impl Drop for Counted { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
+#[derive(Debug)]
+struct Other;
+impl fmt::Display for Other {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "other") }
+}
+impl Error for Other {}
+fn main() {
+    let boxed: Box<dyn Error> = Box::new(Counted { code: 42 });
+    println!("is Counted: {}", boxed.is::<Counted>());
+    println!("is Other: {}", boxed.is::<Other>());
+    println!("ref code: {}", boxed.downcast_ref::<Counted>().map(|r| r.code).unwrap_or(0));
+    let b = boxed.downcast::<Counted>().unwrap();
+    println!("box debug: {:?}", b);
+    println!("code: {}", b.code);
+    let e: Box<dyn Error> = b;
+    println!("back via ref: {}", e.downcast_ref::<Counted>().unwrap().code);
+    drop(e);
+    println!("drops after ok path: {}", DROPS.load(Ordering::SeqCst));
+    let boxed2: Box<dyn Error> = Box::new(Counted { code: 2 });
+    let back = boxed2.downcast::<Other>().unwrap_err();
+    println!("err display: {}", back);
+    drop(back);
+    println!("drops after err path: {}", DROPS.load(Ordering::SeqCst));
+    let send_box: Box<dyn Error + Send> = Box::new(Counted { code: 3 });
+    println!("send code: {}", send_box.downcast::<Counted>().unwrap().code);
+    println!("drops final: {}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_error_downcast_by_value() {
+    // By-value `Box<dyn Error>::downcast` runs std's collected
+    // body: the `type_id` vtable dispatch decides, the fat-to-thin
+    // pointer cast extracts the data pointer, and the rebuilt
+    // box owns the payload exactly once on both the Ok and the
+    // Err path (one drop each, counted).
+    run_ok(
+        "error-downcast",
+        ERROR_DOWNCAST_SRC,
+        "is Counted: true\nis Other: false\nref code: 42\nbox debug: Counted { code: 42 }\ncode: 42\nback via ref: 42\ndrops after ok path: 1\nerr display: counted 2\ndrops after err path: 2\nsend code: 3\ndrops final: 3\n",
+    );
+}
+
+const TO_STRING_DISPLAY_SHAPES_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct MyErr { code: u32 }
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "my err {}", self.code) }
+}
+impl Error for MyErr {}
+fn main() {
+    let e: &dyn Error = &MyErr { code: 5 };
+    println!("dyn to_string: {}", e.to_string());
+    println!("float: {}", 1.5f64.to_string());
+    println!("custom: {}", MyErr { code: 3 }.to_string());
+    let raw = Box::into_raw(Box::new(MyErr { code: 7 }));
+    let b2: Box<MyErr> = unsafe { Box::from_raw(raw) };
+    println!("from_raw debug: {:?}", b2);
+    println!("from_raw display: {}", b2);
+}
+"#;
+
+#[test]
+fn run_mode_to_string_display_shapes() {
+    // `to_string` is the receiver's `Display` formatting: a
+    // trait object's is its concrete type's, a float's is its
+    // decimal form, a guest type's is its collected body. A
+    // `Box::from_raw` product (the aggregate-built box shape)
+    // forwards `Debug` / `Display` to its pointee like a built
+    // box does.
+    run_ok(
+        "to-string-display-shapes",
+        TO_STRING_DISPLAY_SHAPES_SRC,
+        "dyn to_string: my err 5\nfloat: 1.5\ncustom: my err 3\nfrom_raw debug: MyErr { code: 7 }\nfrom_raw display: my err 7\n",
+    );
+}

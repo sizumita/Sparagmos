@@ -8905,29 +8905,22 @@ impl<'a> Interpreter<'a> {
                         Ok(Value::Str(self.format_arguments(frames, args, 0)?))
                     }
                     ref other => {
-                        // `to_string` is `Display` formatting with
-                        // the default options: an ADT value whose
-                        // type's `Display` the fmt engine serves
-                        // (a collected body, or one of the std
-                        // shapes it models) converts through it.
-                        // Anything else keeps the unsupported
-                        // error.
-                        if matches!(other, Value::Enum { .. }) {
-                            if let Ok(text) = self.format_value(
-                                frames,
-                                other,
-                                FmtTrait::Display,
-                                self_ty,
-                                &FmtOptions::new(),
-                                0,
-                            ) {
-                                return Ok(Value::Str(text));
-                            }
-                        }
-                        Err(unsupported(format!(
-                            "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
-                            other.kind_name()
-                        )))
+                        // Every remaining shape: `to_string` is
+                        // the receiver's `Display` formatting with
+                        // default options, which the fmt engine
+                        // serves for any value that has a `Display`
+                        // impl — a trait object's is its concrete
+                        // type's, a guest ADT's is its collected
+                        // body, a float's is its decimal form.
+                        let text = self.format_value(
+                            frames,
+                            other,
+                            FmtTrait::Display,
+                            self_ty,
+                            &FmtOptions::new(),
+                            0,
+                        )?;
+                        Ok(Value::Str(text))
                     }
                 }
             }
@@ -27733,14 +27726,18 @@ impl<'a> Interpreter<'a> {
                 // pointee reference (or, for an aggregate-shaped
                 // box, around the pointee value itself) -- the
                 // same shaping `format_debug_adt`'s `Box` arm and
-                // the `dyn` path apply.
+                // the `dyn` path apply. An aggregate-built box
+                // (`Box::from_raw`'s product) instead holds its
+                // `Unique` at field 0, beside the allocator field:
+                // its pointee reference is the box's data pointer.
                 let Value::Enum { fields, .. } = value else {
                     return Ok(None);
                 };
-                if fields.len() != 1 {
-                    return Ok(None);
+                if fields.len() == 1 {
+                    fields[0].clone()
+                } else {
+                    Self::dyn_data_pointer(value)
                 }
-                fields[0].clone()
             }
             _ => {
                 // `Rc` / `Arc`: the handle names the inner
