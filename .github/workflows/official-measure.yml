@@ -308,7 +308,7 @@ jobs:
             --expect-nature exec-debugger=170 \
             --expect-nature compile-check=18332 \
             --expect-nature rustdoc-check=1735 \
-            --survey "$SURVEY_JSON"
+            --survey "$SURVEY_JSON" \
             "$RUNNER_TEMP"/shards/subset-shard-*.json
           cat "$RUNNER_TEMP/metric2b.md" >> "$GITHUB_STEP_SUMMARY"
 
@@ -347,7 +347,7 @@ jobs:
             --expect-nature exec-debugger=170 \
             --expect-nature compile-check=18332 \
             --expect-nature rustdoc-check=1735 \
-            --survey "$SURVEY_JSON"
+            --survey "$SURVEY_JSON" \
             "$RUNNER_TEMP"/shards/subset-jit-shard-*.json
           cat "$RUNNER_TEMP/metric4.md" >> "$GITHUB_STEP_SUMMARY"
 
