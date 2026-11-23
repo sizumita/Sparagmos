@@ -18198,7 +18198,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             match self.read_seq_at(frames, &target, out.len())? {
                 Value::Uint(0) => return Ok(out),
                 Value::Uint(b) => out.push(b as u8),
-                Value::Int(b) if (0..=255).contains(&b) => {
+                // A signed byte element (an `i8` holding a byte
+                // above 127) keeps its bit pattern: the range
+                // runs from -128, not 0.
+                Value::Int(b) if (-128..=255).contains(&b) => {
                     if b == 0 {
                         return Ok(out);
                     }
@@ -18230,6 +18233,60 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         std::ffi::CString::new(bytes).map_err(|_| {
             unsupported("libc string conversion argument contains a NUL byte")
         })
+    }
+
+    /// The width in bytes of the elements of the sequence
+    /// `target`'s projection prefix denotes, from the
+    /// declared type recorded for the target's root (a
+    /// place's local type, a static's declared type) walked
+    /// through the prefix: `Some` only when the prefix
+    /// denotes an array or slice of integers. `None` when no
+    /// root type is recorded, or when a step's type cannot
+    /// be followed (ADT fields, downcasts, byte
+    /// displacements): the caller then reads the storage by
+    /// value alone, which cannot tell a wider-element array
+    /// whose values fit in a byte apart from a byte array.
+    fn sequence_elem_width(
+        &self,
+        frames: &[Frame],
+        target: &RefTarget,
+        prefix: &[RefProj],
+    ) -> Option<usize> {
+        let mut cur: Ty = match target {
+            RefTarget::Place { frame, local, .. } => frames
+                .iter()
+                .find(|f| f.id == *frame)
+                .and_then(|f| self.program().functions.get(&f.func))
+                .and_then(|body| body.local_tys.get(*local))
+                .cloned()?,
+            RefTarget::Static { name, .. } => self.program().static_tys.get(name).cloned()?,
+            _ => return None,
+        };
+        for step in prefix {
+            cur = match step {
+                RefProj::Field(k) => match cur {
+                    Ty::Tuple(ts) => ts.get(*k).cloned()?,
+                    _ => return None,
+                },
+                RefProj::Index(_) => match cur {
+                    Ty::Array(elem, _) | Ty::Slice(elem) => *elem,
+                    _ => return None,
+                },
+                RefProj::Subslice { .. } => match cur {
+                    Ty::Array(..) | Ty::Slice(..) => cur,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+        }
+        match cur {
+            Ty::Array(elem, _) | Ty::Slice(elem) => match *elem {
+                Ty::Int(t) => Some((t.bits() / 8) as usize),
+                Ty::Uint(t) => Some((t.bits() / 8) as usize),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Scan a C string whose argument pointer denotes one
@@ -18319,16 +18376,80 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             let Value::Tuple(fields) = &base else {
                 continue;
             };
+            // A sequence whose declared elements are wider
+            // than a byte: a `char*` cast into such storage
+            // denotes the storage's bytes, not its elements,
+            // so scan the elements' little-endian bytes (the
+            // target this model runs on is little-endian).
+            // The declared type is what tells this storage
+            // apart from a byte array; where no declared type
+            // is recorded the scan below reads by value alone
+            // and cannot tell the two apart.
+            if let Some(width) = self
+                .sequence_elem_width(frames, &target, &projection[..prefix_len])
+                .filter(|w| *w > 1)
+            {
+                if bytes < 0 {
+                    continue;
+                }
+                let Some(byte_start) = elems
+                    .checked_mul(width)
+                    .and_then(|s| s.checked_add(bytes as usize))
+                else {
+                    continue;
+                };
+                let mut out: Vec<u8> = Vec::new();
+                let mut pos = byte_start;
+                let mut candidate_live = true;
+                'bytes: loop {
+                    let idx = pos / width;
+                    let within = pos % width;
+                    let elem_bytes: [u8; 16] = match self.read_seq_at(frames, &resolved, idx) {
+                        Ok(Value::Uint(v)) => v.to_le_bytes(),
+                        Ok(Value::Int(v)) => v.to_le_bytes(),
+                        Ok(other) => {
+                            if out.is_empty() {
+                                candidate_live = false;
+                                break;
+                            }
+                            return Err(InterpError::type_mismatch(
+                                "libc string conversion element",
+                                "integer element",
+                                other.kind_name(),
+                            ));
+                        }
+                        Err(e) => {
+                            if out.is_empty() {
+                                candidate_live = false;
+                                break;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    for &byte in &elem_bytes[within..width] {
+                        if byte == 0 {
+                            break 'bytes;
+                        }
+                        out.push(byte);
+                    }
+                    pos += width - within;
+                }
+                if candidate_live {
+                    return Ok(Some(out));
+                }
+                continue;
+            }
             // The starting element: the element steps, plus
             // any byte displacement when the stored elements
             // are themselves single bytes (a byte displacement
             // over a byte sequence is an element
-            // displacement). A wider-element array whose
-            // values all happen to fit in a byte is
+            // displacement). Where no declared element
+            // type is recorded, a wider-element array whose
+            // values all happen to fit in a byte remains
             // indistinguishable from a byte array in the
-            // value model; a `char*` displaced into such
-            // storage is outside what this scan can tell
-            // apart, and any other element shape abandons
+            // value model, and a `char*` displaced into
+            // such storage is outside what this scan can
+            // tell apart; any other element shape abandons
             // the candidate.
             let start = if bytes == 0 {
                 elems
@@ -18348,7 +18469,9 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 match self.read_seq_at(frames, &resolved, start + out.len()) {
                     Ok(Value::Uint(0)) => break,
                     Ok(Value::Uint(b)) => out.push(b as u8),
-                    Ok(Value::Int(b)) if (0..=255).contains(&b) => {
+                    // As in `read_c_str`: a signed byte element
+                    // keeps its bit pattern (range from -128).
+                    Ok(Value::Int(b)) if (-128..=255).contains(&b) => {
                         if b == 0 {
                             break;
                         }

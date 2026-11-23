@@ -20836,6 +20836,98 @@ fn run_mode_libc_strtol_null_endptr() {
     );
 }
 
+const LIBC_SIGNED_CHAR_SRC: &str = r#"
+use std::ffi::{c_char, c_int, c_long};
+
+extern "C" {
+    fn atol(x: *const c_char) -> c_long;
+    fn atoi(x: *const c_char) -> c_int;
+}
+
+fn main() {
+    let a: [i8; 3] = [49, -1, 0];
+    let b: [i8; 4] = [53, 50, -128, 0];
+    let c: [u8; 3] = [49, 50, 0];
+    let d: [i8; 3] = [49, 50, 0];
+    unsafe {
+        println!("signed_high={}", atol(a.as_ptr()));
+        println!("signed_high2={}", atoi(b.as_ptr()));
+        println!("plain_u8={}", atol(c.as_ptr().cast()));
+        println!("plain_i8={}", atol(d.as_ptr()));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_signed_char_bytes() {
+    // A signed `c_char` array holding a byte above 127: the
+    // scan keeps the byte's bit pattern (the host reads
+    // "1\xff" and stops there), instead of rejecting the
+    // negative element as a type mismatch.
+    let dir = temp_dir("libc-signed-char");
+    let src = fixture(&dir, "libc_signed_char.rs", LIBC_SIGNED_CHAR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "signed char byte strings must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "signed_high=1\nsigned_high2=52\nplain_u8=12\nplain_i8=12\n",
+        "the host libc functions' own results"
+    );
+}
+
+const LIBC_WIDE_ELEM_SRC: &str = r#"
+use std::ffi::{c_char, c_long};
+
+extern "C" {
+    fn atol(x: *const c_char) -> c_long;
+}
+
+fn main() {
+    let a: [u16; 3] = [49, 50, 0];
+    let b: [u16; 3] = [0x3231, 0x0033, 0];
+    let c: [u32; 2] = [0x00323331, 0];
+    let d: [i16; 3] = [49, -1, 0];
+    let e: [i16; 3] = [49, -256, 0];
+    unsafe {
+        println!("u16_cast={}", atol(a.as_ptr().cast()));
+        println!("u16_packed={}", atol(b.as_ptr().cast()));
+        println!("u32_packed={}", atol(c.as_ptr().cast()));
+        println!("i16_cast={}", atol(d.as_ptr().cast()));
+        println!("byte_disp={}", atol(b.as_ptr().cast::<c_char>().add(1)));
+        println!("elem_disp={}", atol(b.as_ptr().add(1).cast()));
+        println!("i16_neg={}", atol(e.as_ptr().cast()));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_wide_element_storage() {
+    // A `*const c_char` cast into wider-element storage
+    // denotes the storage's little-endian bytes, not its
+    // elements: the scan reads the declared element type's
+    // bytes, so a high byte of an element terminates (or
+    // joins) the string exactly as on the host.
+    let dir = temp_dir("libc-wide-elem");
+    let src = fixture(&dir, "libc_wide_elem.rs", LIBC_WIDE_ELEM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wide-element storage casts must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "u16_cast=1\nu16_packed=123\nu32_packed=132\ni16_cast=1\nbyte_disp=23\nelem_disp=3\ni16_neg=1\n",
+        "the host libc functions' own results"
+    );
+}
+
 const LIBC_STRTOL_ENDPTR_SRC: &str = r#"
 use std::ffi::{c_char, c_int, c_long, CString};
 
