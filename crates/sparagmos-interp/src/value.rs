@@ -319,7 +319,28 @@ pub enum Value {
     /// reading one is an uninitialised read, dropping one is a
     /// no-op, and only the length, the stored elements, and
     /// bounded prefixes of the whole are observable.
-    SparseVec { elems: Vec<Value>, len: u128 },
+    ///
+    /// `cap` is the storage extent the value accounts beyond
+    /// what `len` and the stored list already imply: the
+    /// capacity a `Vec::with_capacity` past the materialisation
+    /// limit requested, which the value holds as accounted
+    /// storage without holding it element by element. It is
+    /// always at least `max(len, elems.len())` — every
+    /// constructor and rewrite maintains that — so the storage
+    /// extent (see `vec_stored_len`) is `cap` itself, and the
+    /// slots from the stored end up to `cap` are spare
+    /// capacity: reachable through the buffer pointer as
+    /// uninitialised slots, exactly like the slots a
+    /// materialised `with_capacity` holds. Without the record,
+    /// a length shrink would collapse the reported capacity
+    /// onto the new length and break the `len < capacity`
+    /// invariant guest code relies on (the assertion inside
+    /// `Vec::pop`, for one).
+    SparseVec {
+        elems: Vec<Value>,
+        len: u128,
+        cap: u128,
+    },
     /// A `core::fmt::rt::Argument` formatting a pointee.
     FmtArg {
         /// The reference passed to the `new_*` constructor.
@@ -552,8 +573,8 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::SparseVec { elems, len } => {
-                write!(f, "vec[{len} ({} stored)]", elems.len())
+            Value::SparseVec { elems, len, cap } => {
+                write!(f, "vec[{len} ({} stored, cap {cap})]", elems.len())
             }
             Value::FmtArg { ty, trait_, .. } => {
                 write!(f, "<fmt {trait_:?} argument of {ty}>")

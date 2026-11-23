@@ -4811,7 +4811,7 @@ impl<'a> Interpreter<'a> {
                         let Some(value) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
-                        if let Value::SparseVec { elems, len } = &value {
+                        if let Value::SparseVec { elems, len, .. } = &value {
                             // The declared elements drop one by
                             // one, as a materialised vector's do.
                             // The stored tail past the declared
@@ -9562,6 +9562,11 @@ impl<'a> Interpreter<'a> {
         value: &Value,
     ) -> Option<InterpResult<Value>> {
         let (buf, len) = crate::builtins::vec_real_aggregate_parts(value)?;
+        // The capacity the real form's `RawVec` declares: the
+        // translated value keeps accounting that storage (see
+        // `vec_with_len`), so a capacity the guest's own
+        // aggregate records is not lost in translation.
+        let prev_cap = crate::builtins::vec_real_aggregate_cap(&buf).unwrap_or(0);
         // The buffer's pointer: the `RawVec`'s inner triple
         // (`RawVecInner`) holds it in a `NonNull` wrapper at
         // field 0.
@@ -9590,10 +9595,21 @@ impl<'a> Interpreter<'a> {
         // whatever its buffer pointer denotes (a dangling
         // address-only pointer an allocator model handed out
         // for a `with_capacity` buffer has no pointee to read).
+        // A capacity the real form declares is still the
+        // vector's storage: the sparse form accounts it over
+        // the empty element list.
         if len == 0 {
-            return Some(Ok(Value::Enum {
-                variant: 0,
-                fields: Vec::new(),
+            return Some(Ok(if prev_cap > 0 {
+                Value::SparseVec {
+                    elems: Vec::new(),
+                    len: 0,
+                    cap: prev_cap,
+                }
+            } else {
+                Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                }
             }));
         }
         // Reading the elements can fail for a buffer the model
@@ -9607,12 +9623,15 @@ impl<'a> Interpreter<'a> {
                     base: Box::new(p),
                     len: len as u128,
                 };
-                self.slice_elements(frames, &fat)
-                    .map(|(elems, _)| crate::builtins::vec_with_len(elems, len, &Value::Uninit))
+                self.slice_elements(frames, &fat).map(|(elems, _)| {
+                    crate::builtins::vec_with_len(elems, len, &Value::Uninit, prev_cap)
+                })
             }
             Some(fat @ Value::FatRef { .. }) => self
                 .slice_elements(frames, &fat)
-                .map(|(elems, _)| crate::builtins::vec_with_len(elems, len, &Value::Uninit)),
+                .map(|(elems, _)| {
+                    crate::builtins::vec_with_len(elems, len, &Value::Uninit, prev_cap)
+                }),
             _ => Err(InterpError::type_mismatch(
                 "Vec value in its real aggregate form",
                 "a buffer pointer in the RawVec fields",
@@ -11196,8 +11215,8 @@ impl<'a> Interpreter<'a> {
                     Value::Enum { fields, .. } => {
                         i128::try_from(fields.len()).ok()?
                     }
-                    Value::SparseVec { elems, len } => {
-                        i128::try_from((*len).max(elems.len() as u128)).ok()?
+                    Value::SparseVec { elems, cap, .. } => {
+                        i128::try_from((*cap).max(elems.len() as u128)).ok()?
                     }
                     Value::Bytes(b) => {
                         if size != 1 {
@@ -11253,8 +11272,8 @@ impl<'a> Interpreter<'a> {
             // `Value::SparseVec`): a displacement in whole
             // element units denotes the element at that index,
             // spare-capacity slots included.
-            Value::SparseVec { elems, len } => {
-                i128::try_from((*len).max(elems.len() as u128)).ok()?
+            Value::SparseVec { elems, cap, .. } => {
+                i128::try_from((*cap).max(elems.len() as u128)).ok()?
             }
             Value::Bytes(b) => {
                 if size != 1 {
@@ -13853,7 +13872,7 @@ impl<'a> Interpreter<'a> {
                                 let len = fields.len();
                                 (fields, len)
                             }
-                            Value::SparseVec { elems, len } => (
+                            Value::SparseVec { elems, len, .. } => (
                                 elems,
                                 usize::try_from(len).unwrap_or(usize::MAX),
                             ),
@@ -13865,9 +13884,22 @@ impl<'a> Interpreter<'a> {
                                 ));
                             }
                         };
+                    // The write declares the vector's new
+                    // storage extent: the sparse form accounts
+                    // it as its capacity (see `Value::SparseVec`)
+                    // instead of materialising the slots, and
+                    // stored elements past the new extent are
+                    // gone with the storage they sat in.
                     let stored = new_cap.max(len);
-                    elems.resize(stored, Value::Uninit);
-                    *slot = crate::builtins::vec_with_len(elems, len, &Value::Uninit);
+                    if elems.len() > stored {
+                        elems.truncate(stored);
+                    }
+                    *slot = crate::builtins::vec_with_len(
+                        elems,
+                        len,
+                        &Value::Uninit,
+                        stored as u128,
+                    );
                     Ok(())
                 }))
             }
@@ -13923,6 +13955,11 @@ impl<'a> Interpreter<'a> {
                 };
                 return Ok(());
             }
+            // The length change keeps the storage the value
+            // already accounts (see `vec_with_len`): a shrink
+            // (a `pop` decrement) must not collapse the
+            // capacity onto the new length.
+            let prev_cap = crate::builtins::vec_stored_len(slot).unwrap_or(0);
             let elems = match std::mem::replace(slot, Value::Uninit) {
                 Value::Enum { fields, .. } => fields,
                 Value::SparseVec { elems, .. } => elems,
@@ -13934,7 +13971,7 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
             };
-            *slot = crate::builtins::vec_with_len(elems, new_len, &uninit_elem);
+            *slot = crate::builtins::vec_with_len(elems, new_len, &uninit_elem, prev_cap);
             Ok(())
         }))
     }
@@ -17839,9 +17876,10 @@ pub(crate) fn project_value(
                 // materialised aggregate's missing field does not.
                 Value::SparseVec {
                     ref elems,
-                    len,
+                    cap,
+                    ..
                 } => {
-                    if *idx as u128 >= len.max(elems.len() as u128) {
+                    if *idx as u128 >= cap.max(elems.len() as u128) {
                         return Err(InterpError::UninitializedRead {
                             func: func.to_string(),
                             place: place.to_string(),
@@ -17896,9 +17934,10 @@ pub(crate) fn project_value(
                 // storage bound does not widen slice reads.)
                 Value::SparseVec {
                     ref elems,
-                    len,
+                    cap,
+                    ..
                 } => {
-                    let extent = len.max(elems.len() as u128);
+                    let extent = cap.max(elems.len() as u128);
                     if *idx as u128 >= extent {
                         return Err(index_oob(extent as usize, *idx));
                     }
@@ -18335,8 +18374,8 @@ pub(crate) fn project_value_ref<'a>(
                     // as the rest does); the unmaterialised tail
                     // has no storage to lend, so the walk
                     // continues into an owned uninitialised slot.
-                    Value::SparseVec { elems, len } => {
-                        if *idx as u128 >= (*len).max(elems.len() as u128) {
+                    Value::SparseVec { elems, cap, .. } => {
+                        if *idx as u128 >= (*cap).max(elems.len() as u128) {
                             return Err(InterpError::UninitializedRead {
                                 func: func.to_string(),
                                 place: place.to_string(),
@@ -18483,8 +18522,8 @@ pub(crate) fn project_value_ref<'a>(
                 // spare-capacity tail past the declared length
                 // included), the unmaterialised tail continues
                 // into an owned uninitialised slot.
-                Value::SparseVec { elems, len } => {
-                    let extent = (*len).max(elems.len() as u128);
+                Value::SparseVec { elems, cap, .. } => {
+                    let extent = (*cap).max(elems.len() as u128);
                     if *idx as u128 >= extent {
                         return Err(index_oob(extent as usize, *idx));
                     }
@@ -18975,6 +19014,7 @@ fn navigate_mut_grow<'x>(
                     *slot = Value::SparseVec {
                         elems: fields,
                         len: len as u128,
+                        cap: len as u128,
                     };
                     return navigate_mut(slot, projection, func, place);
                 }
@@ -19012,10 +19052,17 @@ fn navigate_mut_grow<'x>(
             // bounded by the same materialisation limit as
             // `Vec::set_len`, past which the write stays an
             // explicit error rather than an allocation that
-            // exhausts the host.
-            Value::SparseVec { elems, len } => {
-                if *idx as u128 >= *len && *idx > elems.len() {
-                    let extent = (*len).max(elems.len() as u128);
+            // exhausts the host. The storage the value accounts
+            // (its capacity) is the bound a write must land
+            // in: the declared length, the stored elements and
+            // the accounted spare capacity are all storage, and
+            // a write that extends the stored list extends the
+            // account with it.
+            Value::SparseVec { elems, cap, .. } => {
+                let extent = (*cap).max(elems.len() as u128);
+                if *idx as u128 > extent
+                    || (*idx as u128 == extent && *idx > elems.len())
+                {
                     return Err(index_oob(extent as usize, *idx));
                 }
                 if *idx >= elems.len()
@@ -19029,6 +19076,9 @@ fn navigate_mut_grow<'x>(
                 }
                 if *idx >= elems.len() {
                     elems.resize(*idx + 1, Value::Uninit);
+                    if (elems.len() as u128) > *cap {
+                        *cap = elems.len() as u128;
+                    }
                 }
                 navigate_mut_grow(&mut elems[*idx], rest, func, place, grow)
             }
