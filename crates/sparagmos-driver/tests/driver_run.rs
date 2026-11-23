@@ -12279,6 +12279,47 @@ fn run_mode_asm_sym_call_to_bare_ret_naked_fn_reads_the_return_register() {
     );
 }
 
+const ASM_SYM_NAKED_CALLS_ORDINARY_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+pub extern "sysv64" fn normal() -> u64 {
+    42
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper() -> u64 {
+    naked_asm!("call {f}", "ret", f = sym normal);
+}
+
+fn main() {
+    let direct = helper();
+    let via: u64;
+    unsafe {
+        asm!(
+            "call {t}",
+            t = sym helper,
+            lateout("rax") via,
+        );
+    }
+    println!("{direct} {via}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_propagates_ordinary_callee_return() {
+    // The naked helper's body obtains its return value by
+    // calling an ordinary function: the call establishes the
+    // return register, so the helper's outgoing state carries
+    // it and a caller entering through an asm `call` observes
+    // the same value as a direct call. Natively this prints
+    // `42 42`.
+    run_ok(
+        "asm-sym-naked-calls-ordinary",
+        ASM_SYM_NAKED_CALLS_ORDINARY_SRC,
+        "42 42\n",
+    );
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is

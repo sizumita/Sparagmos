@@ -3467,6 +3467,13 @@ impl<'a> Interpreter<'a> {
             // no outgoing state (a non-naked callee).
             if outgoing.is_none() {
                 arch[idx] = asm_scalar_bits(&result, ret)?;
+                // The call established the return register's
+                // content: mark it written, so a naked body that
+                // returns through this block hands the register
+                // on in its outgoing state (which is measured
+                // against `arch_written`), and an output operand
+                // bound to the register observes the result.
+                arch_written[idx] = true;
             }
             ret_reg = Some(idx);
         }
