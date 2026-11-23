@@ -23009,3 +23009,64 @@ fn run_mode_to_string_display_shapes() {
         "dyn to_string: my err 5\nfloat: 1.5\ncustom: my err 3\nfrom_raw debug: MyErr { code: 7 }\nfrom_raw display: my err 7\n",
     );
 }
+
+const PANIC_PAYLOAD_INTO_RAW_SRC: &str = r#"
+use std::panic;
+#[derive(Clone, Copy)]
+struct Pair { a: i64, b: i64 }
+fn main() {
+    let result = panic::catch_unwind(|| {
+        panic::panic_any(Pair { a: 11, b: 22 });
+    });
+    let err = result.unwrap_err();
+    let raw = Box::into_raw(err) as *mut Pair;
+    unsafe {
+        println!("fields: {} {}", (*raw).a, (*raw).b);
+        let p = *raw;
+        println!("whole: {} {}", p.a, p.b);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_panic_payload_into_raw_cast_reads_whole_struct() {
+    // A caught panic payload travels as a trait object whose
+    // base is the one-field box aggregate holding the payload
+    // inline. Casting `Box::into_raw` of it to the concrete
+    // pointer type must produce a data pointer denoting the
+    // payload as a whole — field reads and a whole-struct read
+    // through it read the payload, not its first field.
+    run_ok(
+        "panic-payload-into-raw",
+        PANIC_PAYLOAD_INTO_RAW_SRC,
+        "fields: 11 22\nwhole: 11 22\n",
+    );
+}
+
+const JOIN_PAYLOAD_INTO_RAW_SRC: &str = r#"
+use std::thread;
+struct Pair { a: i64, b: i64 }
+fn main() {
+    let handle = thread::spawn(|| -> () {
+        std::panic::panic_any(Pair { a: 33, b: 44 });
+    });
+    let err = handle.join().unwrap_err();
+    let raw = Box::into_raw(err) as *mut Pair;
+    unsafe {
+        println!("fields: {} {}", (*raw).a, (*raw).b);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_join_payload_into_raw_cast_reads_whole_struct() {
+    // The thread-join error payload has the same inline-box
+    // trait-object shape as the catch_unwind cleanup product:
+    // the data pointer extracted for a cast to the concrete
+    // pointer type denotes the whole payload struct.
+    run_ok(
+        "join-payload-into-raw",
+        JOIN_PAYLOAD_INTO_RAW_SRC,
+        "fields: 33 44\n",
+    );
+}

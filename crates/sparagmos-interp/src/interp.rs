@@ -17430,13 +17430,14 @@ impl<'a> Interpreter<'a> {
     /// sized pointer performs). The base a `DynRef` records is
     /// the data pointer in the shape the sized value had: a
     /// reference base is the pointer itself; a box-shaped base
-    /// holds it as the only field of its one-field wrapper
-    /// chain; an upcast chain (a box whose field is itself a
-    /// `DynRef`) unwraps one layer at a time; a slice base
-    /// unwraps to its own data pointer. A reference-counted
-    /// handle's data pointer is the pointee slot inside its
-    /// inner allocation — the same position `deref_value`
-    /// resolves for the handle.
+    /// holds it in its field-0 wrapper chain, or holds the
+    /// pointee itself as the only field of a one-field box; an
+    /// upcast chain (a box whose field is itself a `DynRef`)
+    /// unwraps one layer at a time; a slice base unwraps to its
+    /// own data pointer. A reference-counted handle's data
+    /// pointer is the pointee slot inside its inner allocation
+    /// — the same position `deref_value` resolves for the
+    /// handle.
     pub(crate) fn dyn_data_pointer(base: &Value) -> Value {
         if let Some(id) = rc_handle_id(base) {
             return Value::Ref(RefTarget::Alloc {
@@ -17444,27 +17445,72 @@ impl<'a> Interpreter<'a> {
                 projection: vec![RefProj::Field(2)],
             });
         }
-        // Follow the pointer word through the shapes it travels
-        // in: a one-field wrapper (`Unique`, `NonNull`, a built
-        // box) holds it as its only field, and an aggregate-built
-        // `Box` holds its `Unique` at field 0, beside the
-        // allocator field. The walk stops at the first value
-        // that is not an aggregate: a reference is the data
-        // pointer itself.
+        // The outermost aggregate decides what the base is (the
+        // discrimination `deref_value` applies to a `DynRef`
+        // base). A one-field aggregate whose only field is an
+        // allocation pointer is a built box, and that pointer is
+        // the data pointer. A one-field aggregate holding any
+        // other value holds the pointee itself inline — the
+        // shape the panic-cleanup and thread-join models
+        // fabricate for a caught payload, and the shape an
+        // aggregate-built sized box has — so the data pointer
+        // denotes that field's slot and the walk stops there:
+        // descending further would name a position inside the
+        // payload, not the payload. Any other aggregate is a
+        // pointer wrapper (`Unique`, `NonNull`, an
+        // aggregate-built `Box` with its `Unique` at field 0
+        // beside the allocator field): follow its field 0 until
+        // the walk reaches the pointer itself, or a value stored
+        // inline at the position the walk reached. An upcast or
+        // slice layer restarts the walk at the value it denotes,
+        // which is a self-contained value in this model.
+        let mut root = base.clone();
         let mut cur = base.clone();
         let mut path: Vec<RefProj> = Vec::new();
         loop {
+            // The aggregate forms the walk descends, as a field
+            // list: an ADT value or a tuple value.
+            let fields = match &cur {
+                Value::Enum { fields, .. } if !fields.is_empty() => Some(fields.clone()),
+                Value::Tuple(items) if !items.is_empty() => Some(items.clone()),
+                _ => None,
+            };
+            if let Some(fields) = fields {
+                if path.is_empty() && fields.len() == 1 {
+                    match &fields[0] {
+                        // A built box: its only field is the
+                        // allocation pointer, which is the data
+                        // pointer itself.
+                        Value::Ref(RefTarget::Alloc { .. }) => {
+                            return fields[0].clone();
+                        }
+                        // An upcast layer sits in the box: keep
+                        // walking from the value it denotes.
+                        Value::DynRef { .. } | Value::FatRef { .. } => {
+                            cur = fields[0].clone();
+                            continue;
+                        }
+                        // An inline pointee: the field is the
+                        // payload itself, so the data pointer
+                        // denotes that field's slot in the base.
+                        _ => {
+                            return Value::Ref(RefTarget::Value(
+                                Box::new(root),
+                                vec![RefProj::Field(0)],
+                            ));
+                        }
+                    }
+                }
+                path.push(RefProj::Field(0));
+                cur = fields[0].clone();
+                continue;
+            }
             match cur {
-                Value::Enum { mut fields, .. } if !fields.is_empty() => {
-                    path.push(RefProj::Field(0));
-                    cur = fields.swap_remove(0);
+                Value::DynRef { base, .. } | Value::FatRef { base, .. } => {
+                    root = (*base).clone();
+                    cur = (*base).clone();
+                    path.clear();
                 }
-                Value::Tuple(mut items) if !items.is_empty() => {
-                    path.push(RefProj::Field(0));
-                    cur = items.swap_remove(0);
-                }
-                Value::DynRef { base, .. } => cur = (*base).clone(),
-                Value::FatRef { base, .. } => cur = (*base).clone(),
                 Value::Ref(_) => return cur,
                 other => {
                     // The pointee is stored inline in the base
@@ -17474,7 +17520,7 @@ impl<'a> Interpreter<'a> {
                     return if path.is_empty() {
                         other
                     } else {
-                        Value::Ref(RefTarget::Value(Box::new(base.clone()), path))
+                        Value::Ref(RefTarget::Value(Box::new(root), path))
                     };
                 }
             }
