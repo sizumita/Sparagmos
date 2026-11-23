@@ -5453,9 +5453,15 @@ enum TerminationReport<'a> {
     Code(i32),
     /// The report prints `Error: {payload:?}` -- the payload,
     /// rendered under the type tag of the `Err` type at the
-    /// level that produced it -- and exits with
-    /// `ExitCode::FAILURE`.
-    Error(&'a sparagmos_interp::Value, String),
+    /// level that produced it -- drops the payload, and exits
+    /// with `ExitCode::FAILURE`. The `Err` type itself rides
+    /// along so the executing interpreter can build the
+    /// payload's drop glue from it.
+    Error(
+        &'a sparagmos_interp::Value,
+        String,
+        &'a sparagmos_mir::Ty,
+    ),
 }
 
 /// `Termination::report` for the entry's returned value, walked
@@ -5471,7 +5477,7 @@ enum TerminationReport<'a> {
 fn result_report<'a>(
     c: &Collected,
     names: &std::collections::HashMap<sparagmos_mir::DefId, String>,
-    ty: &sparagmos_mir::Ty,
+    ty: &'a sparagmos_mir::Ty,
     value: &'a sparagmos_interp::Value,
 ) -> Option<TerminationReport<'a>> {
     let sparagmos_mir::Ty::Adt(def, args) = ty else {
@@ -5497,6 +5503,7 @@ fn result_report<'a>(
             Some(TerminationReport::Error(
                 payload,
                 sparagmos_interp::builtins::ty_tag(err_ty, names),
+                err_ty,
             ))
         }
         0 => ok_payload_report(c, names, args.first()?, payload),
@@ -5511,7 +5518,7 @@ fn result_report<'a>(
 fn ok_payload_report<'a>(
     c: &Collected,
     names: &std::collections::HashMap<sparagmos_mir::DefId, String>,
-    ty: &sparagmos_mir::Ty,
+    ty: &'a sparagmos_mir::Ty,
     value: &'a sparagmos_interp::Value,
 ) -> Option<TerminationReport<'a>> {
     match ty {
@@ -6438,7 +6445,9 @@ fn execute(
     let report = |value: &sparagmos_interp::Value| {
         let ty = entry_result_ty(c, entry_index)?;
         match result_report(c, &program.fn_names, ty, value) {
-            Some(TerminationReport::Error(payload, tag)) => Some((payload.clone(), tag)),
+            Some(TerminationReport::Error(payload, tag, err_ty)) => {
+                Some((payload.clone(), tag, err_ty.clone()))
+            }
             _ => None,
         }
     };

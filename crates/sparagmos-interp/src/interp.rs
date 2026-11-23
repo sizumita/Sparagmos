@@ -1652,7 +1652,7 @@ impl<'a> Interpreter<'a> {
 
     /// Run `entry` with `args` and return the value of its return place.
     pub fn run(&mut self, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
-        self.run_with_report(entry, args, |_, _| Ok(None))
+        self.run_with_report(entry, args, |_, _, _| Ok(None))
     }
 
     /// Like [`Interpreter::run`], but when the entry returns
@@ -1673,7 +1673,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         entry: &str,
         args: Vec<Value>,
-        report: impl FnOnce(&mut Self, &Value) -> InterpResult<Option<String>>,
+        report: impl FnOnce(&mut Self, &mut Vec<Frame>, &Value) -> InterpResult<Option<String>>,
     ) -> InterpResult<Value> {
         self.steps = 0;
         self.next_frame_id = 0;
@@ -1713,7 +1713,7 @@ impl<'a> Interpreter<'a> {
         // has returned, before its thread's TLS teardown (see
         // [`Interpreter::run_with_report`]).
         let result = match result {
-            Ok(value) => match report(self, &value) {
+            Ok(value) => match report(self, &mut frames, &value) {
                 Ok(Some(text)) => {
                     self.push_error_output(&text);
                     Ok(value)

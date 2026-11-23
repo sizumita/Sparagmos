@@ -9450,14 +9450,20 @@ fn run_mode_termination_report_guest_outcomes_and_tls_order() {
     let src = fixture(&dir, "err_panicking_debug.rs", RESULT_ERR_PANICKING_DEBUG_SRC);
     let out = run_driver(&src);
     assert_eq!(out.status.code(), Some(101), "panic in Debug::fmt");
+    // The report's `Error: ` prefix is written before the
+    // formatting starts (the native order), so it stands even
+    // though the formatting panicked: it precedes the panic
+    // line the driver prints for the run's outcome.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "thread 'main' panicked: fmt exploded\n"
+        "Error: thread 'main' panicked: fmt exploded\n"
     );
     let src = fixture(&dir, "err_exiting_debug.rs", RESULT_ERR_EXITING_DEBUG_SRC);
     let out = run_driver(&src);
     assert_eq!(out.status.code(), Some(7), "process::exit in Debug::fmt");
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    // Likewise the already-written prefix is the whole stderr
+    // when the formatting exits the process.
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: ");
     let src = fixture(&dir, "err_tls_dtor_order.rs", RESULT_ERR_TLS_DTOR_ORDER_SRC);
     let out = run_driver(&src);
     assert_eq!(out.status.code(), Some(1), "Err with TLS destructor");
@@ -9471,6 +9477,169 @@ fn run_mode_termination_report_guest_outcomes_and_tls_order() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "Error: val=Some(\"alive\")\n"
+    );
+}
+
+
+const RESULT_ERR_DROPPING_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "E") }
+}
+impl Drop for E {
+    fn drop(&mut self) { eprintln!("error dropped"); }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_DROP_EXITS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "E") }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        eprintln!("error dropped");
+        std::process::exit(7);
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_DROP_PANICS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "E") }
+}
+impl Drop for E {
+    fn drop(&mut self) { panic!("drop panicked"); }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_DROP_TLS_ORDER_SRC: &str = r#"
+use std::cell::RefCell;
+use std::fmt;
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) { eprintln!("tls dtor ran"); }
+}
+thread_local! {
+    static GUARD: RefCell<Option<Guard>> = RefCell::new(None);
+}
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "E") }
+}
+impl Drop for E {
+    fn drop(&mut self) { eprintln!("error dropped"); }
+}
+fn main() -> Result<(), E> {
+    GUARD.with(|g| *g.borrow_mut() = Some(Guard));
+    Err(E)
+}
+"#;
+
+const RESULT_ERR_SIDE_EFFECT_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        eprintln!("side effect");
+        write!(f, "E")
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_SIDE_EFFECT_EXIT_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        eprintln!("side effect");
+        std::process::exit(5);
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_SIDE_EFFECT_PANIC_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        eprintln!("side effect");
+        panic!("fmt panicked");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+#[test]
+fn run_mode_termination_report_drops_payload_and_prefix_order() {
+    // The native `Result::report` writes the `Error: ` prefix
+    // before it formats the payload, prints the formatted
+    // payload, and then consumes and drops the error -- all
+    // before the thread's TLS destructors run. So: stderr the
+    // payload's `Debug` body writes follows the prefix (and
+    // the prefix stands when the formatting exits or panics);
+    // the payload's destructor runs after the whole
+    // `Error: ...` line, its own guest outcome (an exit, a
+    // panic) replaces the report's failure exit, and it still
+    // precedes TLS destructor output.
+    let dir = temp_dir("termination-report-drop");
+    let src = fixture(&dir, "err_dropping.rs", RESULT_ERR_DROPPING_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "dropping Err payload");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: E\nerror dropped\n"
+    );
+    let src = fixture(&dir, "err_drop_exits.rs", RESULT_ERR_DROP_EXITS_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(7), "process::exit in payload Drop");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: E\nerror dropped\n"
+    );
+    let src = fixture(&dir, "err_drop_panics.rs", RESULT_ERR_DROP_PANICS_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "panic in payload Drop");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: E\nthread 'main' panicked: drop panicked\n"
+    );
+    let src = fixture(&dir, "err_drop_tls_order.rs", RESULT_ERR_DROP_TLS_ORDER_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "payload Drop before TLS dtors");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: E\nerror dropped\ntls dtor ran\n"
+    );
+    let src = fixture(&dir, "err_side_effect_debug.rs", RESULT_ERR_SIDE_EFFECT_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Debug::fmt writes to stderr");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: side effect\nE\n"
+    );
+    let src = fixture(&dir, "err_side_effect_exit_debug.rs", RESULT_ERR_SIDE_EFFECT_EXIT_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(5), "process::exit in Debug::fmt keeps prefix");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: side effect\n"
+    );
+    let src = fixture(&dir, "err_side_effect_panic_debug.rs", RESULT_ERR_SIDE_EFFECT_PANIC_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "panic in Debug::fmt keeps prefix");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: side effect\nthread 'main' panicked: fmt panicked\n"
     );
 }
 
