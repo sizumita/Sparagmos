@@ -988,6 +988,8 @@ fn glue_calls_dtor(glue: &ir::DropGlue, key: &str) -> bool {
                 variants.iter().any(|p| walk(p, glue, key, seen))
             }
             P::RcHandleDrop { value } => walk(value, glue, key, seen),
+            P::BoxPointee { pointee } => walk(pointee, glue, key, seen),
+            P::DynOrPlain { plain } => walk(plain, glue, key, seen),
             P::Adt { index } => {
                 seen.insert(*index)
                     && glue
@@ -1032,6 +1034,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // (no static edges, like `Dyn` itself); the plain
             // branch's edges are the subplan's.
             ir::DropPlan::DynOrPlain { plain } => walk(plain, adts, targets, seen),
+            // The pointee's storage is judged from the value at
+            // run time; the glue that runs is the subplan's.
+            ir::DropPlan::BoxPointee { pointee } => walk(pointee, adts, targets, seen),
             // Judged from the value at run time; calls no
             // destructor body.
             ir::DropPlan::Dynamic => true,
@@ -9684,28 +9689,48 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 });
             }
             "std::boxed::Box" => {
-                // A box is a one-field aggregate holding the
-                // pointee in this value model (see the `Box::new`
-                // builtin), and dropping the pointer drops the
-                // pointee. A `dyn` pointee is the exception: the
-                // pointer value *is* the fat pointer then, with no
-                // field to project, so the plan is the dyn plan
-                // itself. A pointee that merely mentions a trait
-                // object (an ADT or tuple whose unsized tail is a
-                // `dyn` field) may likewise hold the trait-object
-                // form — such a box is formed only by the unsizing
-                // coercion of a concrete box — but the same type
-                // also spells plain boxes (a `Vec<Box<dyn Trait>>`
-                // element type inside the pointee, say), so the
-                // form is judged on the value at run time.
+                // Dropping a box drops its pointee. Which storage
+                // the pointee lives in is a property of the box
+                // value's own shape — the `Box::new` builtin's
+                // one-field aggregate and the real `Unique` /
+                // `NonNull` layout a converted constructor body
+                // (`Box::from_raw`, `Box::new_in`, ...) builds
+                // both occur — so the plan defers to the run-time
+                // judgment in `DropPlan::BoxPointee`. A `dyn`
+                // pointee is the exception: the pointer value *is*
+                // the fat pointer then, with no field to project,
+                // so the plan is the dyn plan itself. A pointee
+                // that merely mentions a trait object (an ADT or
+                // tuple whose unsized tail is a `dyn` field) may
+                // likewise hold the trait-object form — such a box
+                // is formed only by the unsizing coercion of a
+                // concrete box — but the same type also spells
+                // plain boxes (a `Vec<Box<dyn Trait>>` element type
+                // inside the pointee, say), so the form is judged
+                // on the value at run time.
                 let pointee = args.first()?;
                 let inner = self.plan(pointee)?;
                 return Some(match inner {
                     P::Dyn => P::Dyn,
-                    other if ty_mentions_dyn(pointee) => P::DynOrPlain {
-                        plain: Box::new(at_field0(other)),
-                    },
-                    other => at_field0(other),
+                    other => {
+                        // A pointee with no glue leaves the box
+                        // nothing to drop, exactly as the field-0
+                        // addressing this replaces collapsed to
+                        // `Trivial` (see `at_field0`).
+                        let boxed = match other {
+                            P::Trivial => P::Trivial,
+                            o => P::BoxPointee {
+                                pointee: Box::new(o),
+                            },
+                        };
+                        if ty_mentions_dyn(pointee) {
+                            P::DynOrPlain {
+                                plain: Box::new(boxed),
+                            }
+                        } else {
+                            boxed
+                        }
+                    }
                 });
             }
             "std::rc::Rc" | "std::sync::Arc" => {

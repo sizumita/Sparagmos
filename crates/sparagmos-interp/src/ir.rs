@@ -1158,6 +1158,20 @@ pub enum DropPlan {
     /// how it was formed, not of the pointer type alone, so the
     /// judgment is made on the value at run time.
     DynOrPlain { plain: Box<DropPlan> },
+    /// The glue of a `Box`'s pointee: which storage the pointee
+    /// lives in depends on the box value's own shape, judged at
+    /// run time. A box the `Box::new` builtin built is a one-field
+    /// aggregate whose field is the allocation pointer, and a box
+    /// a converted constructor body built (`Box::from_raw`,
+    /// `Box::new_in`, ...) is the real layout instead: the
+    /// `Unique` / `NonNull` wrapper chain over the pointer, with
+    /// the allocator field beside it. In both forms the pointee
+    /// lives behind the pointer at the bottom of the field-0
+    /// chain, and `pointee` runs against that storage. A
+    /// fabricated box whose chain bottoms out at a value rather
+    /// than a pointer holds that value inline, and `pointee` runs
+    /// against it in place.
+    BoxPointee { pointee: Box<DropPlan> },
 }
 
 /// What happens when execution of a basic block panics (the MIR

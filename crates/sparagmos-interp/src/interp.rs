@@ -5276,11 +5276,23 @@ impl<'a> Interpreter<'a> {
                         let Some(value) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
+                        // The trait object may sit at the bottom of
+                        // a pointer wrapper chain rather than at the
+                        // value's surface: a box a converted
+                        // constructor body built (`Box::from_raw`)
+                        // is the real `Unique` / `NonNull` layout
+                        // over the fat pointer, with the allocator
+                        // field beside it, where the builtin's box
+                        // *is* the fat pointer itself. Descend the
+                        // field-0 chain — the layers beside the
+                        // pointer are not on the pointer path — and
+                        // judge the value found there.
+                        let (_, bottom) = wrapper_chain_bottom(&value);
                         let Value::DynRef {
                             base,
                             drop_glue,
                             ..
-                        } = value
+                        } = bottom.clone()
                         else {
                             // Not a trait-object value at all: judge
                             // it by its shape, as the `Dynamic` plan
@@ -5404,6 +5416,107 @@ impl<'a> Interpreter<'a> {
                             active.work.push((path, P::Dyn));
                         } else {
                             active.work.push((path, *plain));
+                        }
+                    }
+                    P::BoxPointee { pointee } => {
+                        // Judge the box value's own shape (see
+                        // `DropPlan::BoxPointee`). The raw read
+                        // keeps the stored form: the pointer must
+                        // not be followed before judging, or the
+                        // pointee would be judged instead of the
+                        // box.
+                        let Some(value) =
+                            self.read_at_raw(frames, &active.root, &path)?
+                        else {
+                            // Moved out of / never written: no
+                            // glue, as with rustc's drop flags.
+                            continue;
+                        };
+                        // A never-written zero-sized box reads as
+                        // a fabricated field-less aggregate (see
+                        // `read_at_raw`): there is no pointer and
+                        // no pointee to drop.
+                        if matches!(&value, Value::Enum { fields, .. } if fields.is_empty())
+                        {
+                            continue;
+                        }
+                        // Descend the pointer wrapper chain (see
+                        // `wrapper_chain_bottom`): the value at
+                        // its bottom is what the box carries — the
+                        // pointer itself, or the pointee a
+                        // fabricated box holds inline.
+                        let (depth, bottom) = wrapper_chain_bottom(&value);
+                        match bottom {
+                            Value::Ref(target) => {
+                                // The pointee lives behind the
+                                // pointer: its glue runs in a
+                                // nested session rooted at the
+                                // pointer's target, exactly as the
+                                // box's field 0 denoting the
+                                // pointee did for the builtin form.
+                                let nested = GlueSession {
+                                    root: target.clone(),
+                                    work: vec![(Vec::new(), *pointee)],
+                                    adts: active.adts.clone(),
+                                    completion: GlueCompletion::Resume,
+                                };
+                                suspended.push(std::mem::replace(&mut active, nested));
+                                continue 'sessions;
+                            }
+                            Value::FatRef { base, .. }
+                                if matches!(
+                                    &**base,
+                                    Value::Ref(RefTarget::Alloc { .. })
+                                        | Value::Ref(RefTarget::Place { .. })
+                                        | Value::Ref(RefTarget::Static { .. })
+                                        | Value::Ref(RefTarget::Value(..))
+                                ) =>
+                            {
+                                // A fat pointer at the chain's
+                                // bottom (a `Box<[T]>` a converted
+                                // constructor body built): the
+                                // pointee lives behind its data
+                                // pointer, as for a thin pointer;
+                                // the stored value behind it is the
+                                // whole slice the plan addresses.
+                                let Value::Ref(target) = &**base else {
+                                    unreachable!("base shape checked");
+                                };
+                                let nested = GlueSession {
+                                    root: target.clone(),
+                                    work: vec![(Vec::new(), *pointee)],
+                                    adts: active.adts.clone(),
+                                    completion: GlueCompletion::Resume,
+                                };
+                                suspended.push(std::mem::replace(&mut active, nested));
+                                continue 'sessions;
+                            }
+                            Value::DynRef { .. } => {
+                                // The chain carries a trait object
+                                // (a pointee that mentions `dyn`
+                                // without being one itself): its
+                                // glue is the dyn plan's, run
+                                // against the box value at this
+                                // path, whose own chain descent
+                                // finds the trait object.
+                                active.work.push((path, P::Dyn));
+                            }
+                            _ => {
+                                // The chain bottoms out at a value
+                                // the box holds inline (a
+                                // fabricated box, a fat pointer):
+                                // the pointee glue runs against it
+                                // in place, addressed through the
+                                // chain's field-0 steps — at least
+                                // the one step the plan always
+                                // addressed a box's contents
+                                // through.
+                                let mut sub = path.clone();
+                                for _ in 0..depth.max(1) {
+                                    sub.push(RefProj::Field(0));
+                                }
+                                active.work.push((sub, *pointee));
+                            }
                         }
                     }
                     P::CallDtor { func } => {
@@ -15519,7 +15632,14 @@ impl<'a> Interpreter<'a> {
                         }
                         Value::Ref(_) | Value::FatRef { .. } => {
                             match &places {
-                                Some((_, pointee, depth)) if layers < *depth => {
+                                Some((_, pointee, depth))
+                                    if layers < *depth
+                                        && (layers == 0
+                                            || matches!(
+                                                pointee,
+                                                Resolved::Alloc { .. }
+                                            )) =>
+                                {
                                     break Ok(Self::pointee_ref(
                                         frames, pointee,
                                     ));
@@ -15529,6 +15649,33 @@ impl<'a> Interpreter<'a> {
                         }
                         Value::Enum { mut fields, .. } if fields.len() == 1 => {
                             v = fields.pop().expect("one field");
+                            layers += 1;
+                        }
+                        // A wrapper layer with siblings: the real
+                        // layout of the chain the classification
+                        // names (`Box` over its allocator field,
+                        // `Unique` over its `PhantomData` marker)
+                        // carries the next layer at field 0 and
+                        // unrelated fields beside it. Descend field
+                        // 0 while it continues the chain (an
+                        // aggregate layer or the pointer itself);
+                        // any other field-0 shape is not a wrapper
+                        // chain and keeps the strict reading below.
+                        Value::Enum { fields, .. }
+                            if fields.len() > 1
+                                && places.is_some()
+                                && matches!(
+                                    fields[0],
+                                    Value::Enum { .. }
+                                        | Value::Ref(_)
+                                        | Value::FatRef { .. }
+                                        | Value::DynRef { .. }
+                                ) =>
+                        {
+                            v = fields
+                                .into_iter()
+                                .next()
+                                .expect("field 0 checked");
                             layers += 1;
                         }
                         other => {
@@ -19503,6 +19650,42 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
 /// `DynRef`) and judge the payload itself with
 /// [`drop_dyn_value`], whose shapes that can hide a destructor are
 /// explicit errors.
+/// The bottom of a pointer wrapper chain: descend field 0
+/// through the aggregate layers that carry a pointer — a `Box`
+/// over its `Unique`, the `Unique` over its `NonNull`, the
+/// `NonNull` over the pointer itself. A layer continues the
+/// chain when the value at its field 0 is the pointer (a thin,
+/// fat, or trait-object pointer), or — for a multi-field layer,
+/// whose remaining fields are the parts beside the pointer (an
+/// allocator, a `PhantomData` marker) — the next layer. The
+/// descent stops at the first value that is not a wrapper
+/// layer: the pointer itself, or the pointee a fabricated
+/// one-field box holds inline (its single field is the pointee
+/// value, not a pointer). Returns the number of field-0 steps
+/// taken and the value found there.
+fn wrapper_chain_bottom(value: &Value) -> (usize, &Value) {
+    let mut depth = 0usize;
+    let mut bottom = value;
+    loop {
+        let Value::Enum { fields, .. } = bottom else {
+            break;
+        };
+        let Some(first) = fields.first() else {
+            break;
+        };
+        let continues = matches!(
+            first,
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+        ) || (fields.len() > 1 && matches!(first, Value::Enum { .. }));
+        if !continues {
+            break;
+        }
+        depth += 1;
+        bottom = first;
+    }
+    (depth, bottom)
+}
+
 fn drop_unaccounted_dyn(value: &Value) -> InterpResult<()> {
     match value {
         Value::DynRef { base, .. } => drop_unaccounted_dyn(base),
