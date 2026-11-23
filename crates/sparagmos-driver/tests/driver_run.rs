@@ -28848,3 +28848,186 @@ fn debug_mode_lldb_env_field_reads_through_mut_capture() {
         "mutable capture must render its pointee: {stdout}"
     );
 }
+
+const DEBUG_CAST_PTR_VALUE_SRC: &str = r#"fn main() {
+    let a: [i32; 2] = [1, 2];
+    let r: &[i32; 2] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_to_array_pointer_keeps_the_pointer_value() {
+    // A cast to an array pointer is still a pointer: printing
+    // it renders the pointer, not the pointee. The array view
+    // materializes only at the step that consumes the pointer
+    // (a dereference, or a projection through it), and an
+    // element-changing cast reinterprets at that step.
+    let dir = temp_dir("debug-cast-ptr-value");
+    let src = fixture(&dir, "cast_ptr_value.rs", DEBUG_CAST_PTR_VALUE_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint r\nprint (r as *const [i32; 2])\nprint *(r as *const [i32; 2])\nprint (r as *const [i32; 2])[1]\nprint *(r as *const [u16; 4])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    let printed = |n: u32| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("${n} = ")))
+            .unwrap_or_else(|| panic!("no ${n} line in debug transcript: {stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        printed(2),
+        printed(1),
+        "cast print must render the pointer: {stdout}"
+    );
+    assert_eq!(printed(3), "[1, 2]");
+    assert_eq!(printed(4), "2");
+    assert_eq!(printed(5), "[1, 0, 2, 0]");
+}
+
+const DEBUG_UNION_TUPLE_COMMA_SRC: &str = r#"union U { bits: u32, value: (u32,) }
+fn main() {
+    let u = U { bits: 0x2a };
+    zzz();
+    let _ = &u;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_union_one_tuple_field_reads_through_trailing_comma() {
+    // The canonical one-element tuple spelling carries a
+    // trailing comma (`(u32,)`): the layout walk must not
+    // read it as a second, empty component, or the field's
+    // reinterpretation fails to resolve the layout and the
+    // read reports an uninitialized place.
+    let dir = temp_dir("debug-union-tuple-comma");
+    let src = fixture(&dir, "union_tuple_comma.rs", DEBUG_UNION_TUPLE_COMMA_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint u.value\nprint u.value.0\nprint u\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = (42,)", "$2 = 42", "value: (42,)"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_NESTED_CAST_SRC: &str = r#"fn main() {
+    let x: u32 = 0x3f800000;
+    let r: &u32 = &x;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_nested_casts_split_at_the_top_level() {
+    // The cast separator of a parenthesised expression is
+    // the top-level ` as `: a chain grouped as
+    // `((r as *const u32) as *const f32)`, and an extra
+    // grouping layer around a single cast, both reach the
+    // evaluator instead of splitting at the inner separator
+    // and failing to parse.
+    let dir = temp_dir("debug-nested-cast");
+    let src = fixture(&dir, "nested_cast.rs", DEBUG_NESTED_CAST_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *((r as *const u32) as *const f32)\nprint *((r as *const f32))\nwhatis *((r as *const u32) as *const f32)\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 1", "$2 = 1", "type = f32"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("cannot parse expression"),
+        "nested casts must parse: {stdout}"
+    );
+}
+
+const DEBUG_LLDB_PROJECTED_I8_SRC: &str = r#"fn main() {
+    let t: (i8,) = (65,);
+    zzz();
+    let _ = t;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_lldb_int_format_applies_to_projected_values() {
+    // A format registration names a type, not a variable:
+    // printing a projected value of that type (`t.0`, whose
+    // recorded tag the expression steps cleared) applies the
+    // registration through the value's concrete descriptor.
+    let dir = temp_dir("debug-lldb-projected");
+    let src = fixture(&dir, "lldb_projected.rs", DEBUG_LLDB_PROJECTED_I8_SRC);
+    let out = debug_driver_lldb(&dir, &src, "type-format hex i8\nbreak 3\nrun\nprint t.0\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("= 0x41"),
+        "hex registration must apply to the projected i8: {stdout}"
+    );
+}
+
+const DEBUG_DEREF_PROJECTED_SRC: &str = r#"struct S { p: *mut i32 }
+fn main() {
+    let mut v: i32 = 9;
+    let t: (*const i32,) = (&v as *const i32,);
+    let s = S { p: &mut v as *mut i32 };
+    let arr: [&i32; 2] = [&v, &v];
+    zzz();
+    let _ = (&t, &s, &arr);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_deref_applies_after_projection_steps() {
+    // A leading dereference reads the projected value's
+    // pointee (`*t.0` is `*(t.0)`, as in Rust and C), not
+    // the base value's: dereferencing the tuple or the
+    // struct itself is a type mismatch, and the type query
+    // for the dereferenced projection reports the pointee.
+    let dir = temp_dir("debug-deref-projected");
+    let src = fixture(&dir, "deref_projected.rs", DEBUG_DEREF_PROJECTED_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 7\nrun\nprint *t.0\nwhatis *t.0\nprint *s.p\nwhatis *s.p\nprint *arr[1]\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 9", "$2 = 9", "$3 = 9"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert_eq!(
+        stdout.matches("type = i32").count(),
+        2,
+        "both dereferenced projections must report the pointee type: {stdout}"
+    );
+    assert!(
+        !stdout.contains("type mismatch in dereference"),
+        "the base value must not be dereferenced: {stdout}"
+    );
+}

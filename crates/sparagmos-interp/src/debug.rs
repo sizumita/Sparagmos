@@ -1011,6 +1011,17 @@ struct EvaluatedValue {
     /// the pointer re-reads those bytes through the target
     /// layout. `(source, target)`.
     pending_cast: Option<(Desc, Desc)>,
+    /// An array/slice view a cast to an array or slice
+    /// pointer spelled but has not yet materialized: the
+    /// cast keeps the pointer value (printing the cast
+    /// renders the pointer), and the step that consumes the
+    /// pointer -- a dereference or a projection --
+    /// materializes the view first. The cast's spelled
+    /// pointer descriptor, and the value's descriptor
+    /// before the cast: an element-changing cast reinterprets
+    /// the storage through the source element type, which
+    /// the spelled target no longer records.
+    pending_array_view: Option<(Desc, Option<Desc>)>,
 }
 
 /// Resolve a print expression's base name: a variable of the
@@ -1134,6 +1145,7 @@ fn resolve_local_base(
         tag: entry.ty.clone(),
         cast_type: None,
         pending_cast: None,
+        pending_array_view: None,
     }))
 }
 
@@ -1195,6 +1207,7 @@ fn resolve_static_base(
         tag,
         cast_type: None,
         pending_cast: None,
+        pending_array_view: None,
     })
 }
 
@@ -1682,6 +1695,38 @@ fn reinterpret_scalar_pointee(
     }
 }
 
+/// Whether a descriptor is a pointer (a reference or a raw
+/// pointer) to an array or a slice: the cast target form
+/// whose view of the pointee a consuming step materializes.
+fn is_array_pointer_desc(desc: &Desc) -> bool {
+    match desc {
+        Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner) => {
+            matches!(**inner, Desc::Array(..) | Desc::Slice(_))
+        }
+        _ => false,
+    }
+}
+
+/// Materialize the array/slice view a cast to an array or
+/// slice pointer spelled (see
+/// `EvaluatedValue::pending_array_view`): read the pointee's
+/// elements through the cast, the reading a dereference or
+/// projection of the cast pointer applies. A no-op when no
+/// view is pending.
+fn materialize_array_view(
+    interp: &Interpreter,
+    frames: &[Frame],
+    ev: &mut EvaluatedValue,
+) -> Result<(), String> {
+    let Some((spelled, source)) = ev.pending_array_view.take() else {
+        return Ok(());
+    };
+    let (value, desc) = apply_cast(interp, frames, ev.value.clone(), source.as_ref(), spelled)?;
+    ev.value = value;
+    ev.desc = desc;
+    Ok(())
+}
+
 /// Apply a cast step (`as *const [T; N]` and kin): a pointer
 /// cast retargets the descriptor; an array cast views the
 /// pointee's elements as an array value (the form the slice
@@ -1760,10 +1805,14 @@ fn evaluate_expr(
     for step in &expr.steps {
         match step {
             ExprStep::Deref => {
-                // A cast to an array type already replaced the
-                // value with the pointee's elements (see
-                // `apply_cast`): dereferencing that pointer
-                // value is the identity on the elements.
+                // A cast to an array/slice pointer kept the
+                // pointer value; this dereference consumes it,
+                // so the spelled view materializes first, after
+                // which the dereference is the identity on the
+                // elements, as for a cast to an array type that
+                // already replaced the value with the pointee's
+                // elements (see `apply_cast`).
+                materialize_array_view(interp, frames, &mut ev)?;
                 if matches!(ev.desc, Some(Desc::Array(..) | Desc::Slice(_)))
                     && matches!(ev.value, Value::Tuple(_))
                 {
@@ -1809,6 +1858,7 @@ fn evaluate_expr(
                 // A dereference step therefore keeps it.
             }
             ExprStep::Field(index) => {
+                materialize_array_view(interp, frames, &mut ev)?;
                 let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
                 ev.value = v;
                 ev.desc = d;
@@ -1838,6 +1888,7 @@ fn evaluate_expr(
                 ev.char = false;
             }
             ExprStep::FieldName(name) => {
+                materialize_array_view(interp, frames, &mut ev)?;
                 let (v, d) = apply_field_name(
                     interp,
                     frames,
@@ -1851,6 +1902,7 @@ fn evaluate_expr(
                 ev.char = false;
             }
             ExprStep::Index(index) => {
+                materialize_array_view(interp, frames, &mut ev)?;
                 let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
                 ev.value = v;
                 ev.desc = d;
@@ -1881,13 +1933,26 @@ fn evaluate_expr(
                 // actually holds.
                 let source_pointee = ev.desc.as_ref().and_then(pointer_pointee).cloned();
                 let target_pointee = pointer_pointee(target).cloned();
-                let (v, d) = apply_cast(
-                    interp,
-                    frames,
-                    ev.value,
-                    ev.desc.as_ref(),
-                    target.clone(),
-                )?;
+                // A cast to an array or slice pointer keeps
+                // the pointer value: only a step that consumes
+                // the pointer materializes the spelled view
+                // (see `pending_array_view`), so printing the
+                // cast itself renders the pointer, not the
+                // pointee. Any other cast supersedes a pending
+                // view.
+                let (v, d) = if is_array_pointer_desc(target) {
+                    ev.pending_array_view = Some((target.clone(), ev.desc.clone()));
+                    (ev.value.clone(), Some(target.clone()))
+                } else {
+                    ev.pending_array_view = None;
+                    apply_cast(
+                        interp,
+                        frames,
+                        ev.value,
+                        ev.desc.as_ref(),
+                        target.clone(),
+                    )?
+                };
                 ev.value = v;
                 ev.desc = d;
                 ev.char = false;
@@ -2074,6 +2139,13 @@ fn lldb_format_scalar(
         Some("u8") => (formats.u8_format, 8),
         _ => match desc {
             Some(Desc::Char) => (formats.char_format, 32),
+            // A projected value's tag is cleared by the
+            // expression steps, but its descriptor keeps the
+            // concrete integer type: a registration for that
+            // type applies to the projection as it does to
+            // the variable itself.
+            Some(Desc::Int("i8")) => (formats.i8_format, 8),
+            Some(Desc::Int("u8")) => (formats.u8_format, 8),
             _ => (None, 0),
         },
     };
@@ -2346,6 +2418,7 @@ fn type_only_value(
         },
         cast_type,
         pending_cast: None,
+        pending_array_view: None,
     })
 }
 
@@ -2959,6 +3032,12 @@ fn split_top_level(text: &str) -> Vec<String> {
         }
     }
     parts.push(text[start..].trim().to_string());
+    // A trailing comma -- the canonical one-element tuple
+    // spelling `(u32,)` -- leaves an empty final component:
+    // it is not a component.
+    if parts.len() > 1 && parts.last().is_some_and(|part| part.is_empty()) {
+        parts.pop();
+    }
     parts
 }
 
@@ -5130,6 +5209,31 @@ fn matching_paren(text: &str) -> Option<usize> {
     None
 }
 
+/// Split a parenthesised expression's text at its top-level
+/// cast separator: the ` as ` that belongs to the whole
+/// expression, not one inside a nested parenthesised
+/// subexpression -- a cast chain grouped as
+/// `((r as *const u32) as *const f32)`, or an extra grouping
+/// layer around a single cast, whose inner separator sits
+/// one level down.
+fn split_top_level_cast(inner: &str) -> Option<(&str, &str)> {
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && inner[i..].starts_with(" as ") {
+            return Some((&inner[..i], &inner[i + 4..]));
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
     let text = text.trim();
     // Leading dereferences prefix the whole expression.
@@ -5143,7 +5247,7 @@ fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
         let close = matching_paren(rest)
             .ok_or_else(|| format!("cannot parse expression `{text}`"))?;
         let inner = &after_open[..close - 1];
-        let mut parsed = if let Some((lhs, ty)) = inner.split_once(" as ") {
+        let mut parsed = if let Some((lhs, ty)) = split_top_level_cast(inner) {
             let mut parsed = parse_expr(lhs)?;
             parsed.steps.push(ExprStep::Cast(Desc::from_tag(ty.trim())));
             parsed
@@ -5180,7 +5284,14 @@ fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
         base.push_str("::");
         base.push_str(&ident(&mut i)?);
     }
-    let mut steps: Vec<ExprStep> = (0..derefs).map(|_| ExprStep::Deref).collect();
+    // The leading dereferences apply to the projected value
+    // as a whole, after its own steps -- `*t.0` reads the
+    // pointee of the field, as in Rust and C -- matching the
+    // parenthesised form above. Seeding the steps with the
+    // dereferences would dereference the base value itself
+    // (a tuple or an aggregate) before projecting it.
+    let mut steps: Vec<ExprStep> = Vec::new();
     parse_steps(&rest[i..], &mut steps)?;
+    steps.extend((0..derefs).map(|_| ExprStep::Deref));
     Ok(ParsedExpr { base, steps })
 }
