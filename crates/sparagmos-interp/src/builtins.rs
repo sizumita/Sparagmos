@@ -22856,19 +22856,50 @@ fn slice_iter_elem_size(self_ty: &str) -> Option<u64> {
 /// The position of the element step in a pointer projection:
 /// the last `Index` or `Field` step, with only whole-value
 /// entry steps (a transparent wrapper's field 0, a downcast)
-/// after it. Any other trailing step means the projection does
-/// not end at an element position.
+/// after it. A `Field(0)` step counts as an entry step only
+/// when an element step precedes it: a lone leading `Field(0)`
+/// is the element step itself (element 0 of a field-stored
+/// sequence), and a non-zero `Field` step after an `Index`
+/// step denotes a field of the element, whose position is the
+/// `Index` step's. Any other trailing step means the
+/// projection does not end at an element position.
 fn elem_step_pos(projection: &[RefProj]) -> Option<usize> {
     let mut pos = projection.len();
     while pos > 0 {
         match projection[pos - 1] {
-            RefProj::Field(0) | RefProj::Downcast(_) => pos -= 1,
-            RefProj::Index(_) | RefProj::Field(_) => return Some(pos - 1),
-            _ => return None,
+            RefProj::Index(_) => return Some(pos - 1),
+            RefProj::Field(f) => {
+                let earlier_element = projection[..pos - 1]
+                    .iter()
+                    .any(|s| matches!(s, RefProj::Index(_) | RefProj::Field(_)));
+                if f == 0 && earlier_element {
+                    // A whole-value entry step into an element
+                    // the earlier steps denote: keep scanning.
+                    pos -= 1;
+                } else if f != 0
+                    && projection[..pos - 1]
+                        .iter()
+                        .any(|s| matches!(s, RefProj::Index(_)))
+                {
+                    // A field of the element the `Index` step
+                    // denotes: the element step is that step.
+                    break;
+                } else {
+                    return Some(pos - 1);
+                }
+            }
+            RefProj::Downcast(_) => pos -= 1,
+            _ => break,
         }
     }
-    None
+    // Steps after the last `Index` step denoted a field of the
+    // element (or the scan stopped at a non-entry step): the
+    // last `Index` step is the element step.
+    projection
+        .iter()
+        .rposition(|s| matches!(s, RefProj::Index(_)))
 }
+
 
 /// The element index a slice-iterator pointer denotes. Two
 /// forms occur. The states the builtins build point into a
