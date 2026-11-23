@@ -27591,6 +27591,12 @@ impl<'a> Interpreter<'a> {
         if let Some(text) = self.format_cow(frames, value, trait_, ty, options, indent)? {
             return Ok(text);
         }
+        // `std::num::Wrapping<T>` forwards the fmt traits it
+        // implements to the inner value: format the held value
+        // under `T`'s tag.
+        if let Some(text) = self.format_wrapping(frames, value, trait_, ty, options, indent)? {
+            return Ok(text);
+        }
         // The std byte-string wrapper types (`PathBuf`, `Path`,
         // `OsString`, `OsStr`) define their `Debug` over the
         // string content they hold, and the `std::path::Display`
@@ -28018,6 +28024,62 @@ impl<'a> Interpreter<'a> {
         };
         Ok(Some(self.format_value(
             frames, &pointee, trait_, elem, options, indent,
+        )?))
+    }
+
+    /// The fmt traits `core` implements for
+    /// `std::num::Wrapping<T>` (`Debug`, `Display`, `Binary`,
+    /// `Octal`, `LowerHex` and `UpperHex`) all forward to the
+    /// inner value's own impl of the same trait: the wrapper's
+    /// name never appears and the formatting options pass
+    /// through unchanged, so `Wrapping(5)` debugs as `5` and a
+    /// pretty-printed `Wrapping<Vec<_>>` is the inner list's
+    /// pretty form at the same indent. `None` when the type is
+    /// not a `Wrapping`, the trait is one `Wrapping` does not
+    /// implement (it has no `LowerExp` / `UpperExp` / `Pointer`
+    /// impl), or the value does not have the wrapper's
+    /// one-field shape, in which case the existing behaviour
+    /// stands.
+    fn format_wrapping(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        if !matches!(
+            trait_,
+            FmtTrait::Display
+                | FmtTrait::Debug
+                | FmtTrait::Binary
+                | FmtTrait::Octal
+                | FmtTrait::LowerHex
+                | FmtTrait::UpperHex
+        ) {
+            return Ok(None);
+        }
+        let plain = pointee_tag(ty);
+        let head = plain.split('<').next().unwrap_or(plain).trim();
+        if head != "core::num::Wrapping" && head != "std::num::Wrapping" {
+            return Ok(None);
+        }
+        let Some(inner_ty) = first_generic_arg(plain) else {
+            return Ok(None);
+        };
+        let inner_ty = inner_ty.to_string();
+        let inner = match value {
+            Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+            Value::Tuple(items) if items.len() == 1 => items[0].clone(),
+            // A scalar under a `Wrapping` tag is the payload
+            // itself in storage form: reformatting it under the
+            // inner type's tag gives it its own width.
+            Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::Bool(_) => value.clone(),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.format_value(
+            frames, &inner, trait_, &inner_ty, options, indent,
         )?))
     }
 

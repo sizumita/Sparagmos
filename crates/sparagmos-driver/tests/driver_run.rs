@@ -15296,6 +15296,44 @@ fn run_mode_debug_wrapper_forms_match_core() {
     );
 }
 
+const WRAPPING_FMT_SRC: &str = r#"
+use std::num::Wrapping;
+#[derive(Debug)]
+struct Holder { w: Wrapping<i32> }
+fn main() {
+    println!("{:?}", Wrapping(5i32));
+    println!("{:?}", Wrapping(-5i32));
+    println!("{:#?}", Wrapping(5i32));
+    println!("{:?}", Wrapping(18446744073709551615u64));
+    println!("{:?}", Wrapping(vec![1, 2, 3]));
+    println!("{:#?}", Wrapping(vec![1, 2]));
+    println!("{:?}", Wrapping("hi"));
+    println!("{:?}", Wrapping(Some(3)));
+    println!("{:?}", (Wrapping(1), Wrapping(2)));
+    println!("{:?}", Holder { w: Wrapping(7) });
+    println!("{:#?}", Holder { w: Wrapping(7) });
+    println!("{}", Wrapping(5i32));
+    println!("{:x}", Wrapping(255u32));
+    println!("{:X}", Wrapping(255u32));
+    println!("{:o}", Wrapping(8u32));
+    println!("{:b}", Wrapping(5u32));
+}
+"#;
+
+#[test]
+fn run_mode_wrapping_fmt_forwards_to_inner() {
+    // Core's fmt impls for `std::num::Wrapping<T>` forward to
+    // the inner value's own impl: the wrapper's name never
+    // appears, for `Debug` (plain and alternate) as for
+    // `Display` and the radix traits, at the top level and in
+    // a derived `Debug` field.
+    run_ok(
+        "wrapping-fmt",
+        WRAPPING_FMT_SRC,
+        "5\n-5\n5\n18446744073709551615\n[1, 2, 3]\n[\n    1,\n    2,\n]\n\"hi\"\nSome(3)\n(1, 2)\nHolder { w: 7 }\nHolder {\n    w: 7,\n}\n5\nff\nFF\n10\n101\n",
+    );
+}
+
 const SIMD_CAST_SRC: &str = r#"
 #![feature(repr_simd, core_intrinsics)]
 #[repr(simd)]
