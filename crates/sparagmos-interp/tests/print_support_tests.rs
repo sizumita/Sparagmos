@@ -451,17 +451,23 @@ fn array_index_write_through_index_place() {
 }
 
 #[test]
-fn array_index_out_of_bounds_is_a_guest_panic() {
+fn array_index_out_of_bounds_is_an_explicit_error() {
+    // A bare projection naming a position past the stored value:
+    // this synthetic body carries no `Assert` terminator, and in
+    // converted MIR the bounds check is that assert (or the
+    // modelled `Index` operation), never the projection. The
+    // projection's own failure is an explicit error in the
+    // model's terms, not a fabricated guest panic.
     let mut prog = MirProgram::new();
     prog.add("main", array_body(5));
-    let err = interpret_mir(&prog, "main", vec![]).expect_err("OOB must panic");
+    let err = interpret_mir(&prog, "main", vec![]).expect_err("OOB must fail");
     assert!(
         matches!(
             err,
-            MirRunError::Interp(InterpError::Panic { ref message, .. })
-            if message == "index out of bounds: the len is 3 but the index is 5"
+            MirRunError::Interp(InterpError::UnsupportedProjection { ref kind })
+            if kind == "index 5 past the end of the stored value (length 3)"
         ),
-        "expected the rustc bounds-check panic, got {err}"
+        "expected an explicit projection error, got {err}"
     );
 }
 

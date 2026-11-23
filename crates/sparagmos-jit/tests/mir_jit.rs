@@ -214,6 +214,12 @@ fn interp_call(
             other => panic!("unexpected interp result {other:?}"),
         }),
         Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
+        // An explicit interpreter error, not a guest panic: the
+        // expectation names it by its Display text (see
+        // `check_split`).
+        Err(MirRunError::Interp(e @ InterpError::UnsupportedProjection { .. })) => {
+            Err(e.to_string())
+        }
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }
@@ -242,6 +248,36 @@ fn int(v: i128) -> Value {
 }
 fn uint(v: u128) -> Value {
     Value::Uint(v)
+}
+
+/// Like `check`, for the one shape where the engines' contracts
+/// legitimately differ: a bare index projection naming a position
+/// past the end of the stored value. The JIT lowers the projection
+/// with its own bounds trap and reports core's bounds-check
+/// message. The interpreter's projections only name positions --
+/// a checked access panics at its MIR `Assert` terminator before
+/// any projection is evaluated -- so a position past the stored
+/// value is an explicit projection error there, never a guest
+/// panic.
+fn check_split(
+    jit: &JitProgram,
+    prog: &sparagmos_interp::MirProgram,
+    name: &str,
+    jit_args: &[i64],
+    interp_args: Vec<Value>,
+    jit_expected: Result<i64, &str>,
+    interp_expected: Result<i64, &str>,
+) {
+    assert_eq!(
+        jit_call(jit, name, jit_args),
+        jit_expected.map_err(|s| s.to_string()),
+        "JIT result for {name}"
+    );
+    assert_eq!(
+        interp_call(prog, name, interp_args),
+        interp_expected.map_err(|s| s.to_string()),
+        "interp result for {name}"
+    );
 }
 
 // ----- the silent_panic shape: checked add + Assert, called from main --------
@@ -1634,22 +1670,24 @@ fn dynamic_index_into_a_local_array() {
     let (jit, prog) = build(&[idx, set]);
     check(&jit, &prog, "idx", &[0], vec![uint(0)], Ok(3));
     check(&jit, &prog, "idx", &[1], vec![uint(1)], Ok(7));
-    check(
+    check_split(
         &jit,
         &prog,
         "idx",
         &[2],
         vec![uint(2)],
         Err("index out of bounds: the len is 2 but the index is 2"),
+        Err("unsupported projection: index 2 past the end of the stored value (length 2)"),
     );
     check(&jit, &prog, "set", &[1, 42], vec![uint(1), int(42)], Ok(42));
-    check(
+    check_split(
         &jit,
         &prog,
         "set",
         &[3, 42],
         vec![uint(3), int(42)],
         Err("index out of bounds: the len is 2 but the index is 3"),
+        Err("unsupported projection: index 3 past the end of the stored value (length 2)"),
     );
 }
 
@@ -2354,13 +2392,14 @@ fn fat_reference_argument_index_len_and_metadata() {
         vec![fatval(&[10, 20, 30], 3), uint(1)],
         Ok(20),
     );
-    check(
+    check_split(
         &jit,
         &prog,
         "get",
         &[addr, 3, 5],
         vec![fatval(&[10, 20, 30], 3), uint(5)],
         Err("index out of bounds: the len is 3 but the index is 5"),
+        Err("unsupported projection: index 5 past the end of the stored value (length 3)"),
     );
     check(&jit, &prog, "slen", &[addr, 3], vec![fatval(&[10, 20, 30], 3)], Ok(3));
     check(&jit, &prog, "meta", &[addr, 3], vec![fatval(&[10, 20, 30], 3)], Ok(3));
@@ -2837,6 +2876,12 @@ fn interp_call_pair(
         }
         Ok(other) => panic!("unexpected interp result {other:?}"),
         Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
+        // An explicit interpreter error, not a guest panic: the
+        // expectation names it by its Display text (see
+        // `check_split`).
+        Err(MirRunError::Interp(e @ InterpError::UnsupportedProjection { .. })) => {
+            Err(e.to_string())
+        }
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }
@@ -3864,9 +3909,10 @@ fn fat_reference_beyond_the_registers() {
         ],
         Ok(40),
     );
-    // An out-of-bounds index through the straddled pair panics
-    // identically on both engines (the length word arrived intact).
-    check(
+    // An out-of-bounds index through the straddled pair (the
+    // length word arrived intact): the JIT traps with the bounds
+    // message, the interpreter reports its projection error.
+    check_split(
         &jit,
         &prog,
         "pick_straddle",
@@ -3881,6 +3927,7 @@ fn fat_reference_beyond_the_registers() {
             uint(5),
         ],
         Err("index out of bounds: the len is 3 but the index is 5"),
+        Err("unsupported projection: index 5 past the end of the stored value (length 3)"),
     );
 }
 
@@ -4184,13 +4231,14 @@ fn signed_index_into_a_local_array() {
     let (jit, prog) = build(&[idx, set]);
     check(&jit, &prog, "idx", &[0], vec![int(0)], Ok(3));
     check(&jit, &prog, "idx", &[1], vec![int(1)], Ok(7));
-    check(
+    check_split(
         &jit,
         &prog,
         "idx",
         &[2],
         vec![int(2)],
         Err("index out of bounds: the len is 2 but the index is 2"),
+        Err("unsupported projection: index 2 past the end of the stored value (length 2)"),
     );
     check(
         &jit,
@@ -4239,13 +4287,14 @@ fn signed_index_into_a_slice() {
         vec![fatval(&[10, 20, 30], 3), int(1)],
         Ok(20),
     );
-    check(
+    check_split(
         &jit,
         &prog,
         "get",
         &[addr, 3, 5],
         vec![fatval(&[10, 20, 30], 3), int(5)],
         Err("index out of bounds: the len is 3 but the index is 5"),
+        Err("unsupported projection: index 5 past the end of the stored value (length 3)"),
     );
     check(
         &jit,
@@ -4412,13 +4461,14 @@ fn subslice_of_a_local_array() {
     check(&jit, &prog, "subget", &[], vec![], Ok(40));
     check(&jit, &prog, "subdyn", &[0], vec![uint(0)], Ok(20));
     check(&jit, &prog, "subdyn", &[2], vec![uint(2)], Ok(40));
-    check(
+    check_split(
         &jit,
         &prog,
         "subdyn",
         &[3],
         vec![uint(3)],
         Err("index out of bounds: the len is 3 but the index is 3"),
+        Err("unsupported projection: index 3 past the end of the stored value (length 3)"),
     );
     check(&jit, &prog, "subend", &[], vec![], Ok(3));
     check(&jit, &prog, "subsub", &[], vec![], Ok(40));

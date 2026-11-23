@@ -6863,9 +6863,11 @@ impl<'a> Interpreter<'a> {
                         *offset as u128
                     };
                     let idx = usize::try_from(idx).map_err(|_| {
-                        InterpError::panic(format!(
-                            "index out of bounds: the len is {len} but the index is {idx}"
-                        ))
+                        InterpError::UnsupportedProjection {
+                            kind: format!(
+                                "index {idx} past the end of the stored value (length {len})"
+                            ),
+                        }
                     })?;
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
                         Some(composed) => composed,
@@ -13830,10 +13832,24 @@ enum StorageByte {
     Padding,
 }
 
+/// The failure a value projector or place resolution reports
+/// when an index step names a position past the end of the value
+/// it ranges over. A projection only names a position; it is not
+/// a checked operation. Checked accesses panic at their own site
+/// -- the MIR `Assert` terminator for a source-level index, the
+/// modelled `Index` operation for a library index -- before any
+/// projection is evaluated, so a position past the stored value
+/// was reached through an unchecked route (raw-pointer
+/// arithmetic, `get_unchecked`, a bulk-memory intrinsic) and the
+/// model holds no storage there. That is an explicit error in the
+/// model's terms, never a fabricated guest panic: the guest
+/// indexed nothing.
 fn index_oob(len: usize, index: usize) -> InterpError {
-    InterpError::panic(format!(
-        "index out of bounds: the len is {len} but the index is {index}"
-    ))
+    InterpError::UnsupportedProjection {
+        kind: format!(
+            "index {index} past the end of the stored value (length {len})"
+        ),
+    }
 }
 
 /// Byte `index` of an integer value's little-endian
