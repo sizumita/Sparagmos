@@ -845,7 +845,10 @@ impl<'a> Interpreter<'a> {
                 let leaf = Self::dsrc_pointee_ty(body, src);
                 let value = self.eval_src(frames, body, src)?;
                 match self.pointer_address(frames, &value, leaf.as_ref()) {
-                    Some(addr) => Ok(Value::Uint(addr)),
+                    Some(addr) => {
+                        self.note_exposed_target(addr as u64, &value);
+                        Ok(Value::Uint(addr))
+                    }
                     None => Err(InterpError::TypeMismatch {
                         context: "pointer-to-integer transmute".to_string(),
                         expected: "a pointer value".to_string(),
@@ -856,12 +859,8 @@ impl<'a> Interpreter<'a> {
             DRvalue::IntToPtr(src) => {
                 let value = self.eval_src(frames, body, src)?;
                 match value {
-                    Value::Int(i) => {
-                        Ok(Value::Ref(crate::value::RefTarget::Address(i as u64)))
-                    }
-                    Value::Uint(u) => {
-                        Ok(Value::Ref(crate::value::RefTarget::Address(u as u64)))
-                    }
+                    Value::Int(i) => Ok(self.materialized_ptr(i as u64)),
+                    Value::Uint(u) => Ok(self.materialized_ptr(u as u64)),
                     other => Err(InterpError::type_mismatch(
                         "integer-to-pointer transmute",
                         "an integer value",

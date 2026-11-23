@@ -22552,3 +22552,73 @@ fn run_mode_file_handle_value_model() {
         "file model stdout mismatch; stderr={stderr}"
     );
 }
+
+// ----- exposed-provenance pointer round trips ----------------------
+//
+// A pointer exposed as an integer (a cast or a scalar transmute)
+// records its target under the synthetic address it produced;
+// materialising a pointer from that integer restores the target,
+// so a rebuilt `Box` dereferences to its pointee instead of an
+// address-only pointer that denotes no readable place.
+
+const EXPOSED_TRANSMUTE_BOX_SRC: &str = r#"
+fn main() {
+    let b = Box::new(7u32);
+    let n: usize = unsafe { std::mem::transmute(b) };
+    let b2: Box<u32> = unsafe { std::mem::transmute(n) };
+    println!("{}", *b2);
+}
+"#;
+
+#[test]
+fn run_mode_exposed_provenance_transmute_box_round_trip() {
+    run_ok("exposed-transmute-box", EXPOSED_TRANSMUTE_BOX_SRC, "7\n");
+}
+
+const EXPOSED_CAST_FROM_RAW_SRC: &str = r#"
+fn main() {
+    let b = Box::new(7u32);
+    let raw = Box::into_raw(b);
+    let n = raw as usize;
+    let raw2 = n as *mut u32;
+    println!("via raw: {}", unsafe { *raw2 });
+    let b2 = unsafe { Box::from_raw(raw2) };
+    println!("via box: {}", *b2);
+}
+"#;
+
+#[test]
+fn run_mode_exposed_provenance_cast_from_raw_round_trip() {
+    run_ok(
+        "exposed-cast-from-raw",
+        EXPOSED_CAST_FROM_RAW_SRC,
+        "via raw: 7\nvia box: 7\n",
+    );
+}
+
+const EXPOSED_DROP_ONCE_SRC: &str = r#"
+struct Counted(u32);
+static mut DROPS: u32 = 0;
+impl Drop for Counted {
+    fn drop(&mut self) { unsafe { DROPS += 1; } }
+}
+fn main() {
+    let b = Box::new(Counted(11));
+    let n: usize = unsafe { std::mem::transmute(b) };
+    let mut b2: Box<Counted> = unsafe { std::mem::transmute(n) };
+    println!("v={}", b2.0);
+    b2.0 = 12;
+    println!("v={}", (*b2).0);
+    drop(b2);
+    println!("drops={}", unsafe { DROPS });
+}
+"#;
+
+#[test]
+fn run_mode_exposed_provenance_round_trip_drops_once() {
+    run_ok(
+        "exposed-drop-once",
+        EXPOSED_DROP_ONCE_SRC,
+        "v=11\nv=12\ndrops=1\n",
+    );
+}
