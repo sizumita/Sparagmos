@@ -28702,3 +28702,72 @@ fn debug_mode_lldb_unsigned_format_masks_to_type_width() {
         "unsigned format must not print the 128-bit sign-extension: {stdout}"
     );
 }
+
+const DEBUG_MUT_SLICE_SRC: &str = r#"fn b() {}
+fn main() {
+    let mut_slice: &mut [i32] = &mut [2, 3, 5, 7];
+    let mut buf = String::from("mutable string slice");
+    let mut_str_slice: &mut str = buf.as_mut_str();
+    b();
+    let _ = (mut_slice, mut_str_slice);
+}
+"#;
+
+#[test]
+fn debug_mode_mut_slice_and_str_render_with_pretty_printers() {
+    // A mutable reference's rendering dispatches on the same
+    // slice/string summaries as a shared reference's: the
+    // qualifier changes the recorded descriptor, not the
+    // summary form.
+    let dir = temp_dir("debug-mut-slice");
+    let src = fixture(&dir, "mut_slice.rs", DEBUG_MUT_SLICE_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "pretty-printers\nbreak 6\nrun\nprint mut_slice\nprint mut_str_slice\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = &mut [i32](size=4) = {2, 3, 5, 7}",
+        "$2 = \"mutable string slice\"",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_MUT_CAPTURE_SRC: &str = r#"struct MyStruct { my_field1: u32, my_field2: u32 }
+fn _zzz() {}
+fn main() {
+    let mut my_var = MyStruct { my_field1: 11, my_field2: 22 };
+    let my_ref = &mut my_var;
+    let test = || {
+        let a = my_ref;
+    };
+    _zzz();
+    let _ = test;
+}
+"#;
+
+#[test]
+fn debug_mode_lldb_env_field_reads_through_mut_capture() {
+    // A closure environment field holding a `&mut` renders
+    // its pointee in the lldb environment form, the same
+    // reading a shared-reference capture gets.
+    let dir = temp_dir("debug-mut-capture");
+    let src = fixture(&dir, "mut_capture.rs", DEBUG_MUT_CAPTURE_SRC);
+    let out = debug_driver_lldb(
+        &dir,
+        &src,
+        "break 9\nrun\nv test\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("test = {my_ref:{my_field1:11, my_field2:22}}"),
+        "mutable capture must render its pointee: {stdout}"
+    );
+}

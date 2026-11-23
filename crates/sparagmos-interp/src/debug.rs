@@ -1346,10 +1346,12 @@ fn apply_field_name(
     if name == "data_ptr" {
         if let Value::FatRef { base, .. } = &value {
             let elem = match &desc {
-                Some(Desc::Ref(inner)) => match inner.as_ref() {
-                    Desc::Slice(elem) => Some((**elem).clone()),
-                    _ => None,
-                },
+                Some(Desc::Ref(inner) | Desc::RefMut(inner)) => {
+                    match inner.as_ref() {
+                        Desc::Slice(elem) => Some((**elem).clone()),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             // The base of a fat reference built from a constant
@@ -1845,7 +1847,7 @@ fn evaluate_print(
         render_env_lldb_lines(interp, frames, &value, desc.as_ref(), &print.expr)
     } else {
         match &desc {
-            Some(Desc::Ref(inner))
+            Some(Desc::Ref(inner) | Desc::RefMut(inner))
                 if parse_expr(&print.expr).map(|e| e.steps.is_empty()).unwrap_or(false)
                     && matches!(
                         inner.as_ref(),
@@ -3851,7 +3853,7 @@ fn render_pretty_gdb(
         return None;
     }
     match desc {
-        Some(Desc::Ref(inner)) => match inner.as_ref() {
+        Some(Desc::Ref(inner) | Desc::RefMut(inner)) => match inner.as_ref() {
             Desc::Slice(elem) => {
                 let pointee = slice_pointee(interp, frames, value)?;
                 // A sparse pointee declares its length past its
@@ -4068,7 +4070,7 @@ fn render_lldb_provider_line(
     expr: &str,
 ) -> Option<String> {
     match desc {
-        Some(Desc::Ref(inner)) => match inner.as_ref() {
+        Some(Desc::Ref(inner) | Desc::RefMut(inner)) => match inner.as_ref() {
             Desc::Slice(elem) => {
                 let pointee = slice_pointee(interp, frames, value)?;
                 let elems = sequence_values(&pointee)?;
@@ -4620,7 +4622,9 @@ fn render_env_lldb_field(
     desc: &Desc,
     depth: usize,
 ) -> Option<String> {
-    if let (Some(frames), Value::Ref(_), Desc::Ref(inner)) = (frames, value, desc) {
+    if let (Some(frames), Value::Ref(_), Desc::Ref(inner) | Desc::RefMut(inner)) =
+        (frames, value, desc)
+    {
         if matches!(inner.as_ref(), Desc::Adt(_)) {
             if let Ok(resolved) = interp.deref_value(frames, value) {
                 if let Ok(pointee) = interp.read_resolved(frames, &resolved) {
