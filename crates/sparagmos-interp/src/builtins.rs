@@ -1647,6 +1647,15 @@ pub enum Builtin {
     /// The C library's `strtoull(s, endptr, base) ->
     /// c_ulonglong`, delegated like [`Builtin::LibcStrtol`].
     LibcStrtoull,
+    /// The C library's `lgamma_r(x, signp) -> f64`: the
+    /// natural log of the gamma function, with the sign of
+    /// the gamma value written through `signp`. Delegated to
+    /// the host's libm function of the same name: the guest's
+    /// declaration names that very symbol, so the host
+    /// function is the function's own semantics. Served only
+    /// for callees with no converted body (see
+    /// [`foreign_helper_lookup`]).
+    LgammaR,
     /// `rust_dbg_abi_1(quad) -> {c + 1, d - 1, a + 1, b - 1}`
     /// (u64 wrapping).
     FfiDbgAbi1,
@@ -2115,6 +2124,14 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
         "strtoll" => Builtin::LibcStrtoll,
         "strtoul" => Builtin::LibcStrtoul,
         "strtoull" => Builtin::LibcStrtoull,
+        "free" => Builtin::LibcFree,
+        "lgamma_r" => Builtin::LgammaR,
+        // The declaration site may name the item `lgamma` and
+        // bind it to the reentrant symbol with
+        // `#[link_name = "lgamma_r"]` (the shape of
+        // `tests/ui/extern/lgamma-linkage.rs`): the signature
+        // carries the sign pointer, which is `lgamma_r`'s.
+        "lgamma" => Builtin::LgammaR,
         "rust_dbg_abi_1" => Builtin::FfiDbgAbi1,
         "rust_dbg_abi_2" => Builtin::FfiDbgAbi2,
         "rust_dbg_abi_3" => Builtin::FfiDbgAbi3,
@@ -4204,6 +4221,12 @@ extern "C" {
         endptr: *mut *mut std::ffi::c_char,
         base: std::ffi::c_int,
     ) -> std::ffi::c_ulonglong;
+    /// The host C library's `lgamma_r`, backing
+    /// [`Builtin::LgammaR`]: the guest's extern declaration
+    /// names this symbol, so the host function itself is the
+    /// faithful execution.
+    #[link_name = "lgamma_r"]
+    fn host_lgamma_r(x: f64, signp: *mut std::ffi::c_int) -> f64;
 }
 
 impl<'a> Interpreter<'a> {
@@ -4445,6 +4468,15 @@ impl<'a> Interpreter<'a> {
                 let (arg, base) = self.strto_args(frames, name, &vals)?;
                 let v = unsafe { host_strtoull(arg.as_ptr(), std::ptr::null_mut(), base) };
                 Ok(Value::Uint(v as u128))
+            }
+            Builtin::LgammaR => {
+                arity(2)?;
+                let x = as_f64(&vals[0], name)?;
+                let mut sign: std::ffi::c_int = 0;
+                let value = unsafe { host_lgamma_r(x, &mut sign) };
+                let target = self.deref_value(frames, &vals[1])?;
+                self.write_resolved(frames, &target, Value::Int(sign as i128))?;
+                Ok(Value::Float(value))
             }
             Builtin::FfiDbgAbi1 => {
                 arity(1)?;

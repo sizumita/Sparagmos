@@ -579,6 +579,134 @@ fn run_mode_aux_crate_functions_execute() {
     );
 }
 
+const AUX_EXPORT_SRC: &str = r#"
+#[no_mangle]
+pub extern "C" fn aux_export_add(a: i32, b: i32) -> i32 { a + b + 100 }
+
+#[export_name = "renamed_export"]
+pub extern "C" fn some_fn(x: i32) -> i32 { x * 3 }
+"#;
+
+const AUX_EXPORT_MAIN_SRC: &str = r#"
+extern crate auxlib;
+
+extern "C" {
+    fn aux_export_add(a: i32, b: i32) -> i32;
+    #[link_name = "renamed_export"]
+    fn renamed(x: i32) -> i32;
+}
+
+fn main() {
+    unsafe {
+        println!("sum={}", aux_export_add(1, 2));
+        println!("ren={}", renamed(7));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_decl_binds_aux_export_by_link_symbol() {
+    // An extern declaration and the auxiliary crate's
+    // `#[no_mangle]` / `#[export_name]` definition share no
+    // item identity, but the linker binds them by symbol; the
+    // run binds them the same way and executes the definition.
+    let dir = temp_dir("aux-export");
+    let aux = fixture(&dir, "auxlib.rs", AUX_EXPORT_SRC);
+    let src = fixture(&dir, "auxmain.rs", AUX_EXPORT_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "extern declarations must bind to the aux exports; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sum=103\nren=21\n",
+        "the exported definitions execute through the declarations"
+    );
+}
+
+const LOCAL_EXPORT_SRC: &str = r#"
+mod defs {
+    #[no_mangle]
+    pub extern "C" fn local_export(x: i32) -> i32 { x + 40 }
+}
+
+extern "C" {
+    fn local_export(x: i32) -> i32;
+}
+
+fn main() {
+    unsafe {
+        println!("loc={}", local_export(2));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_decl_binds_local_export_by_link_symbol() {
+    // The same binding within one crate: the declaration names
+    // a foreign item, the definition is an ordinary function in
+    // another module; only the link symbol connects them.
+    let dir = temp_dir("local-export");
+    let src = fixture(&dir, "localexport.rs", LOCAL_EXPORT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the local export must serve the declaration; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "loc=42\n",
+        "the local definition executes through the declaration"
+    );
+}
+
+const LIBC_EXTERN_SRC: &str = r#"
+use std::ffi::{c_int, c_void};
+
+extern "C" {
+    fn free(p: *mut c_void);
+    fn lgamma_r(x: f64, signp: *mut c_int) -> f64;
+}
+
+fn main() {
+    unsafe {
+        free(std::ptr::null_mut());
+        println!("free-null-ok");
+        let mut sign: c_int = 0;
+        let v = lgamma_r(5.0, &mut sign);
+        println!("lg(5)={v:.10} sign={sign}");
+        let v2 = lgamma_r(-0.5, &mut sign);
+        println!("lg(-0.5)={v2:.10} sign={sign}");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_extern_free_and_lgamma_r() {
+    // Body-less C library declarations with self-contained
+    // semantics: `free(NULL)` is a no-op, and `lgamma_r` is the
+    // host libm function, sign write-back included.
+    let dir = temp_dir("libc-extern");
+    let src = fixture(&dir, "libcextern.rs", LIBC_EXTERN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the libc models must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "free-null-ok\nlg(5)=3.1780538303 sign=1\nlg(-0.5)=1.2655121235 sign=-1\n",
+        "host libm results and signs reach the guest"
+    );
+}
+
 
 const AUX_PM_SRC: &str = r#"
 extern crate proc_macro;

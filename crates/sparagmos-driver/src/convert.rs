@@ -237,6 +237,16 @@ pub struct Converter {
     /// `note_fn_shim_location`). Index 0 is `call`, 1 is
     /// `call_mut`, 2 is `call_once`.
     pub fn_shim_locations: [Option<sm::ConstValue>; 3],
+    /// Link symbols of the instances registered so far, keyed
+    /// by the instance's Sparagmos `DefId` (see
+    /// `note_link_symbol`). Handed to the interpreter with the
+    /// converted program: an extern declaration and the
+    /// in-program definition exporting its symbol (a
+    /// `#[no_mangle]` / `#[export_name]` function, possibly of
+    /// an auxiliary crate) share no `DefId`, but a linker binds
+    /// them by this name, and the interpreter's call conversion
+    /// does the same.
+    pub link_symbols: HashMap<sm::DefId, String>,
     /// Reentrancy guard for `note_track_caller_instance`: the
     /// stamp decode itself resolves (and registers) instances.
     noting_track_caller: bool,
@@ -968,6 +978,7 @@ impl Converter {
             static_tys_mir: sm::StaticTys::new(),
             track_caller_defs: HashMap::new(),
             fn_shim_locations: [None, None, None],
+            link_symbols: HashMap::new(),
             noting_track_caller: false,
             errors: Vec::new(),
             const_closure_mentions: Vec::new(),
@@ -1065,6 +1076,7 @@ impl Converter {
         self.instance_ids.insert(key, idx);
         self.def_names.push(through.name());
         let id = sm::DefId::new(0, idx);
+        self.note_link_symbol(id, inst);
         self.note_track_caller_instance(id, inst);
         id
     }
@@ -1100,6 +1112,63 @@ impl Converter {
         if let Some(stamp) = stamp {
             self.track_caller_defs.insert(id, stamp);
         }
+    }
+
+    /// Record the link symbol of the instance registered as
+    /// `id` (see `link_symbols`). Runs once per registered
+    /// instance — every instance resolution in the driver flows
+    /// through `instance_def_id`, so every function the program
+    /// can name is recorded, extern declarations included. The
+    /// symbol is the compiler's own: `#[no_mangle]` and
+    /// `#[export_name]` definitions carry their export name,
+    /// extern declarations the name they import (a
+    /// `#[link_name]` included), and everything else its
+    /// mangled name, which no other instance shares. Asking
+    /// the compiler can panic for instances it cannot name (a
+    /// virtual instance, say); the panic is contained and the
+    /// instance simply gets no symbol, so it never binds by
+    /// name.
+    fn note_link_symbol(&mut self, id: sm::DefId, inst: &Instance) {
+        let symbol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.link_symbol_of(inst)
+        }))
+        .ok()
+        .flatten();
+        if let Some(symbol) = symbol {
+            self.link_symbols.insert(id, symbol);
+        }
+    }
+
+    /// Record the link symbol of the function item `def`,
+    /// registered under the Sparagmos `DefId` `id` without an
+    /// instance resolution: the auxiliary-crate loop in the
+    /// driver binary converts `FnDef` items directly, so their
+    /// symbols are noted here instead of in `note_link_symbol`.
+    /// The definition is resolved to its monomorphic instance
+    /// for the naming; a definition that does not resolve (a
+    /// generic one, say) gets no symbol.
+    pub fn note_link_symbol_for_def(&mut self, id: sm::DefId, def: rustc_public::DefId) {
+        if self.link_symbols.contains_key(&id) {
+            return;
+        }
+        let symbol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inst = Instance::resolve(FnDef(def), &GenericArgs(Vec::new())).ok()?;
+            self.link_symbol_of(&inst)
+        }))
+        .ok()
+        .flatten();
+        if let Some(symbol) = symbol {
+            self.link_symbols.insert(id, symbol);
+        }
+    }
+
+    /// The link symbol the compiler assigns to `inst`, when a
+    /// compiler context is installed (outside one there is no
+    /// compiler to ask, and no symbol is recorded).
+    fn link_symbol_of(&self, inst: &Instance) -> Option<String> {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, inst);
+        Some(tcx.symbol_name(internal).name.to_string())
     }
 
     /// The `&'static Location` of a body's own definition: the

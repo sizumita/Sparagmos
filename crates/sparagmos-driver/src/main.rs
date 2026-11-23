@@ -247,6 +247,9 @@ struct Collected {
     /// stamps (see `Converter::fn_shim_locations`), for the
     /// interpreter.
     fn_shim_locations: [Option<sparagmos_mir::ConstValue>; 3],
+    /// Link symbols of the program's instances (see
+    /// `Converter::link_symbols`), for the interpreter.
+    link_symbols: std::collections::HashMap<sparagmos_mir::DefId, String>,
     /// The source-file table the bodies' source lines index into
     /// (see `Converter::source_files`), for the interpreter's
     /// debugger interface.
@@ -5221,6 +5224,7 @@ fn collect() -> ControlFlow<()> {
                     continue;
                 }
                 let def_id = conv.crate_def_id(&fn_def);
+                conv.note_link_symbol_for_def(def_id, fn_def.def_id());
                 let generic = fn_def.generics_of().params.iter().any(|param| {
                     matches!(
                         param.kind,
@@ -5305,6 +5309,7 @@ fn collect() -> ControlFlow<()> {
         dtor_bodies,
         track_caller_defs: conv.track_caller_defs.clone(),
         fn_shim_locations: conv.fn_shim_locations.clone(),
+        link_symbols: conv.link_symbols.clone(),
         source_files: conv.source_files.clone(),
     });
     ControlFlow::Continue(())
@@ -6156,6 +6161,7 @@ fn build_program(
     program.dtor_bodies = c.dtor_bodies.clone();
     program.track_caller_defs = c.track_caller_defs.clone();
     program.fn_shim_locations = c.fn_shim_locations.clone();
+    program.link_symbols = c.link_symbols.clone();
     program.source_files = c.source_files.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and

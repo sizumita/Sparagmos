@@ -211,6 +211,13 @@ pub struct MirProgram {
     /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
     /// `call_once`), as recorded by the driver.
     pub fn_shim_locations: [Option<mir::ConstValue>; 3],
+    /// Link symbols of the program's function instances, keyed
+    /// by the instance's `DefId`, as recorded by the driver (see
+    /// `Converter::link_symbols` in the driver crate). A
+    /// body-less extern declaration binds to the unique
+    /// converted body exporting the same symbol (see
+    /// `Converter::link_symbol_route`).
+    pub link_symbols: HashMap<mir::DefId, String>,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -1929,6 +1936,15 @@ struct Converter<'a> {
     /// bind to these shims; the conversion binds them the same
     /// way (see `resolve_body_callee`).
     alloc_shims: HashMap<String, String>,
+    /// Link symbols of the program's instances (see
+    /// `MirProgram::link_symbols`).
+    link_symbols: &'a HashMap<mir::DefId, String>,
+    /// The bodies a body-less extern declaration can bind to,
+    /// by link symbol: symbol -> program key, holding only the
+    /// symbols exactly one converted body exports (a symbol
+    /// two bodies claim binds nothing, as a duplicate symbol
+    /// is a link error natively). See `link_symbol_route`.
+    link_exports: HashMap<String, String>,
     /// Scalar-shape tables of the program's union instances (see
     /// [`ir::Program::union_tables`]), interned in
     /// `Converter::new` by [`Self::compute_union_tables`]: every
@@ -1997,6 +2013,26 @@ impl<'a> Converter<'a> {
                 }
             }
         }
+        let mut link_exports: HashMap<String, Option<String>> = HashMap::new();
+        for (f, key) in program.functions.iter().zip(keys) {
+            let Some(def) = f.def_id else { continue };
+            let Some(symbol) = program.link_symbols.get(&def) else {
+                continue;
+            };
+            match link_exports.get(symbol) {
+                None => {
+                    link_exports.insert(symbol.clone(), Some(key.clone()));
+                }
+                Some(Some(existing)) if *existing != *key => {
+                    link_exports.insert(symbol.clone(), None);
+                }
+                _ => {}
+            }
+        }
+        let link_exports: HashMap<String, String> = link_exports
+            .into_iter()
+            .filter_map(|(symbol, key)| key.map(|key| (symbol, key)))
+            .collect();
         let mut conv = Converter {
             bodies,
             def_names,
@@ -2014,6 +2050,8 @@ impl<'a> Converter<'a> {
             adt_aggregates,
             local_crate,
             alloc_shims,
+            link_symbols: &program.link_symbols,
+            link_exports,
             impl_targets: None,
             unconverted: HashMap::new(),
             union_tables: Vec::new(),
@@ -7552,6 +7590,13 @@ let inner = match (&src, target) {
             if let Some(key) = self.alloc_shim_route(func) {
                 return Some(key);
             }
+            // An extern declaration whose symbol an in-program
+            // definition exports binds to that definition's
+            // body, exactly as the linker binds it in a native
+            // binary (see `link_symbol_route`).
+            if let Some(key) = self.link_symbol_route(func) {
+                return Some(key);
+            }
             return self.resolve_impl_callee(func);
         };
         // A `fmt` trait method call on a foreign `Self` type is
@@ -7663,6 +7708,31 @@ let inner = match (&src, target) {
             return None;
         }
         Some(shim.clone())
+    }
+
+    /// The body serving a call to a body-less extern
+    /// declaration, when exactly one converted body exports
+    /// the declaration's link symbol: the in-program
+    /// `#[no_mangle]` / `#[export_name]` definition a native
+    /// link would bind the declaration to (its own crate's, or
+    /// an auxiliary crate's). A body that failed conversion in
+    /// the previous round does not serve the call, the same
+    /// rule the allocation shims follow.
+    fn link_symbol_route(&self, func: &mir::Operand) -> Option<String> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        let def = match &c.literal {
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => def,
+            mir::ConstKind::Unevaluated { def, .. } => def,
+            _ => return None,
+        };
+        let symbol = self.link_symbols.get(def)?;
+        let key = self.link_exports.get(symbol)?;
+        if self.unconverted.contains_key(key) {
+            return None;
+        }
+        Some(key.clone())
     }
 
     /// Whether the external/builtin conversion below would serve
