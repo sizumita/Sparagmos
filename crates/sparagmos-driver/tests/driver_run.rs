@@ -117,6 +117,104 @@ fn run_mode_println_prints_to_stdout() {
     );
 }
 
+const BYTE_SEQ_SRC: &str = r#"
+fn main() {
+    let slice: &[u8] = &[104, 105, 0, 255];
+    println!("{:?}", slice);
+    let arr: [u8; 3] = [65, 66, 67];
+    println!("{:?}", arr);
+    println!("{:?}", b"hello");
+    println!("{:#?}", &[10u8, 20, 30] as &[u8]);
+    let signed: [i8; 4] = [1, -1, 127, -128];
+    println!("{:?}", signed);
+    println!("{:?}", &signed as &[i8]);
+    let chars: [std::ffi::c_char; 3] = [97, -1, 0];
+    println!("{:?}", chars);
+    let v: Vec<u8> = vec![9, 8, 7];
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_byte_sequences() {
+    // Byte values reach the Debug formatter as `Value::Bytes`
+    // blocks (a byte-slice value, a byte-string constant); the
+    // element type in the tag decides the signedness each byte
+    // prints with. The expected text is native output.
+    let dir = temp_dir("bytesfmt");
+    let src = fixture(&dir, "bytes.rs", BYTE_SEQ_SRC);
+    let out = run_driver_with_aux_specs(&src, Some("2021"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte sequences must format; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[104, 105, 0, 255]\n[65, 66, 67]\n[104, 101, 108, 108, 111]\n[\n    10,\n    20,\n    30,\n]\n[1, -1, 127, -128]\n[1, -1, 127, -128]\n[97, -1, 0]\n[9, 8, 7]\n",
+        "byte sequence Debug output matches native"
+    );
+}
+
+const C_STRING_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+fn main() {
+    println!("{:?}", c"hello");
+    println!("{:?}", c"");
+    println!("{:?}", c"a\tb\nc\"d\\e");
+    println!("{:?}", c"\xff\x01\x7f");
+    let bytes = b"from bytes\0";
+    println!("{:?}", CStr::from_bytes_until_nul(bytes).unwrap());
+    let owned = CString::new("owned text").unwrap();
+    println!("{:?}", owned);
+    println!("{:?}", owned.as_c_str());
+    let opt: Option<CString> = Some(CString::new("in option").unwrap());
+    println!("{:?}", opt);
+    let vec = vec![CString::new("elem0").unwrap(), CString::new(vec![b'x', 0x80]).unwrap()];
+    println!("{:?}", vec);
+    let tup = (CString::new("in tuple").unwrap(), 42);
+    println!("{:?}", tup);
+    #[derive(Debug)]
+    struct Holder<'a> { name: &'a CStr, n: i32 }
+    let h = Holder { name: c"field str", n: 7 };
+    println!("{:?}", h);
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_c_strings() {
+    // `CStr` / `CString` Debug is the quoted, ASCII-escaped
+    // string, whatever shape the value model stored the bytes
+    // in (constant block, buffer snapshot, owned aggregate).
+    // The expected text is native output.
+    let dir = temp_dir("cstrfmt");
+    let src = fixture(&dir, "cstr.rs", C_STRING_SRC);
+    let out = run_driver_with_aux_specs(&src, Some("2021"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "C strings must format; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r##""hello"
+""
+"a\tb\nc\"d\\e"
+"\xff\x01\x7f"
+"from bytes"
+"owned text"
+"owned text"
+Some("in option")
+["elem0", "x\x80"]
+("in tuple", 42)
+Holder { name: "field str", n: 7 }
+"##,
+        "C string Debug output matches native"
+    );
+}
+
 #[test]
 fn run_mode_silent_program_exits_zero() {
     // A plain computation-only main converts and executes to the end.
