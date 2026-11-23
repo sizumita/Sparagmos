@@ -6078,6 +6078,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Chain<")
                     || self_ty.starts_with("std::iter::Zip<")
                     || self_ty.starts_with("std::iter::SkipWhile<")
+                    || self_ty.starts_with("std::iter::Filter<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::path::Components")
                     || self_ty.starts_with("std::path::Ancestors")
@@ -12532,6 +12533,11 @@ fn value_fingerprint(value: &Value) -> u64 {
                 return Ok(result);
             }
         }
+        if self_ty.starts_with("std::iter::Filter<") {
+            if let Some(result) = self.filter_next(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
         let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
@@ -12569,10 +12575,96 @@ fn value_fingerprint(value: &Value) -> u64 {
                 return Ok(result);
             }
         }
+        if self_ty.starts_with("std::iter::Filter<") {
+            if let Some(result) = self.filter_next_back(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
         let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.next_back_on_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
         Ok(result)
+    }
+
+    /// The place-based front step of a `Filter` (see
+    /// `skip_while_next` for the shape this mirrors): pull
+    /// inner items in place until the predicate accepts one.
+    /// The predicate is an `FnMut`, so it is called with a
+    /// reference to its own field's storage, and it takes the
+    /// pulled item by reference. Declines a state that does
+    /// not live in a place, like `map_next` does.
+    fn filter_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(pred_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        loop {
+            let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
+            let Some(item) = option_payload_opt(item) else {
+                return Ok(Some(none_value()));
+            };
+            let callable = self.read_resolved(frames, &pred_target)?;
+            let env_ref = self.target_ref_value(frames, &pred_target)?;
+            let arg = Value::Ref(RefTarget::value(item.clone()));
+            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            match keep {
+                Value::Bool(true) => return Ok(Some(some_value(item))),
+                Value::Bool(false) => continue,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "Filter predicate result",
+                        "a boolean",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The place-based back step of a `Filter`: the mirror
+    /// of `filter_next` over the inner iterator's back step.
+    fn filter_next_back(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(pred_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        loop {
+            let item = self.iterator_next_back_at(frames, inner_ty, &inner_target)?;
+            let Some(item) = option_payload_opt(item) else {
+                return Ok(Some(none_value()));
+            };
+            let callable = self.read_resolved(frames, &pred_target)?;
+            let env_ref = self.target_ref_value(frames, &pred_target)?;
+            let arg = Value::Ref(RefTarget::value(item.clone()));
+            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            match keep {
+                Value::Bool(true) => return Ok(Some(some_value(item))),
+                Value::Bool(false) => continue,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "Filter predicate result",
+                        "a boolean",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
     }
 
     /// The place-based back step of a `Map` (see `map_next`):
@@ -12612,8 +12704,9 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// inner back step indexed from the end, a `Copied`'s is the
     /// inner back step with the yielded reference followed, a
     /// `Map`'s is the inner back step with the closure applied,
-    /// and an `IterMut`'s hands out the last remaining element
-    /// of the container.
+    /// a `Filter`'s is the inner back step repeated until the
+    /// predicate accepts an item, and an `IterMut`'s hands out
+    /// the last remaining element of the container.
     fn next_back_on_state(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -12761,6 +12854,54 @@ fn value_fingerprint(value: &Value) -> u64 {
                     Ok((rebuild_state(&state, vec![new_inner]), some_value(cloned)))
                 }
             };
+        }
+        if self_ty.starts_with("std::iter::Filter<") {
+            // The value-level back step, used when the Filter
+            // does not live in a place (see `filter_next_back`):
+            // pull inner items from the back until the
+            // predicate accepts one. The predicate is applied
+            // with a reference to the closure value itself, as
+            // in the front step's value-level arm.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Filter state",
+                    "[iterator, predicate]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let predicate = fields[1].clone();
+            loop {
+                let (new_inner, item) =
+                    self.next_back_on_state(frames, inner_ty, inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload_opt(item) else {
+                    return Ok((
+                        rebuild_state(&state, vec![inner, predicate]),
+                        none_value(),
+                    ));
+                };
+                let arg = Value::Ref(RefTarget::value(x.clone()));
+                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                match keep {
+                    Value::Bool(true) => {
+                        return Ok((
+                            rebuild_state(&state, vec![inner, predicate]),
+                            some_value(x),
+                        ));
+                    }
+                    Value::Bool(false) => continue,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Filter predicate result",
+                            "a boolean",
+                            other.kind_name(),
+                        ))
+                    }
+                }
+            }
         }
         if self_ty.starts_with("std::iter::Map<") {
             // The value-level step, used when the Map does not
@@ -13889,9 +14030,14 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
         } else if self_ty.starts_with("std::iter::Rev<") {
             // `Rev::next` is the inner iterator's `next_back`,
-            // computed on the inner state value (see
-            // `iterator_next_back_state`); the Rev state is the
-            // one-field wrapper around it.
+            // computed by the modelled back step
+            // (`next_back_on_state`) on the inner state value,
+            // so an adapter whose back step applies a closure
+            // (a `Map`, a `Filter`) composes under `Rev`
+            // exactly as it does at the top level; the leaf
+            // shapes fall through to the pure state transition
+            // inside that step. The Rev state is the one-field
+            // wrapper around the inner state.
             if fields.len() != 1 {
                 return Err(InterpError::type_mismatch(
                     "Rev state",
@@ -13903,14 +14049,9 @@ fn value_fingerprint(value: &Value) -> u64 {
                 .strip_prefix("std::iter::Rev<")
                 .and_then(|rest| rest.strip_suffix('>'))
                 .unwrap_or("");
-            let (new_inner, item) = iterator_next_back_state(&fields[0], inner_ty)?;
-            (
-                vec![new_inner],
-                match item {
-                    Some(value) => some_value(value),
-                    None => none_value(),
-                },
-            )
+            let (new_inner, item) =
+                self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
+            (vec![new_inner], item)
         } else if self_ty.starts_with("std::slice::IterMut<") {
             // The state is the real field layout (see
             // `slice_iter_value`): (ptr, end, marker) with element
@@ -14074,6 +14215,54 @@ fn value_fingerprint(value: &Value) -> u64 {
                     (vec![new_inner], some_value(cloned))
                 }
             }
+        } else if self_ty.starts_with("std::iter::Filter<") {
+            // `Filter` is (inner iterator, predicate): the
+            // step pulls inner items until the predicate
+            // accepts one; a rejected item is dropped as it
+            // is pulled, exactly as core's loop drops it. The
+            // predicate takes the item by reference and is
+            // handed a reference to the pulled item. This is
+            // the value-level step, used when the Filter does
+            // not live in a place (see `filter_next`): the
+            // predicate is applied with a reference to the
+            // closure value itself, so capture reads resolve
+            // and writes to by-value captures are the explicit
+            // constant-aggregate error inside the call.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Filter state",
+                    "[iterator, predicate]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let predicate = fields[1].clone();
+            let mut result = none_value();
+            loop {
+                let (new_inner, item) = self.next_on_state(frames, inner_ty, &inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload_opt(item) else {
+                    break;
+                };
+                let arg = Value::Ref(RefTarget::value(x.clone()));
+                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                match keep {
+                    Value::Bool(true) => {
+                        result = some_value(x);
+                        break;
+                    }
+                    Value::Bool(false) => continue,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Filter predicate result",
+                            "a boolean",
+                            other.kind_name(),
+                        ))
+                    }
+                }
+            }
+            (vec![inner, predicate], result)
         } else if self_ty.starts_with("std::iter::SkipWhile<") {
             // `SkipWhile` is (inner iterator, done flag,
             // predicate) — core's own field layout: the
@@ -14758,6 +14947,24 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             let n = remaining.len() as u128;
             return Ok(hint(n, Some(n)));
+        }
+        if self_ty.starts_with("std::iter::Filter<") {
+            // `Filter::size_hint` is `(0, inner upper)`: the
+            // predicate may reject every remaining item, so
+            // the lower bound is zero, and no more items can
+            // come out than go in, so the upper bound is the
+            // inner iterator's.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Filter state",
+                    "[iterator, predicate]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (_, upper) =
+                self.size_hint_parts(frames, inner_ty, fields[0].clone())?;
+            return Ok(hint(0, upper));
         }
         // Any other iterator: the trait default, `(0, None)`.
         // That pair is a valid `size_hint` answer for every
@@ -18264,6 +18471,7 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::iter::Copied<")
         || self_ty.starts_with("std::iter::Cloned<")
         || self_ty.starts_with("std::iter::Map<")
+        || self_ty.starts_with("std::iter::Filter<")
     {
         return first_generic_arg(self_ty).is_some_and(iterator_next_back_modelled);
     }

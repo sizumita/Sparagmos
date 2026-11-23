@@ -10816,6 +10816,104 @@ fn run_mode_adapter_iteration() {
     );
 }
 
+const FILTER_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3, 4, 5, 6];
+    let mut sum = 0;
+    for x in v.iter().filter(|x| **x % 2 == 0) {
+        sum += x;
+    }
+    println!("sum={sum}");
+    let mut calls = 0;
+    let mut it = v.iter().filter(|x| { calls += 1; **x % 2 == 0 });
+    println!("{:?}", it.next());
+    println!("{:?}", it.next());
+    println!("{:?}", it.next());
+    println!("calls={calls}");
+    let kept: Vec<i32> = (0..10).filter(|x| x % 3 == 0).collect();
+    println!("{kept:?}");
+    let n = (0..20).filter(|x| x % 2 == 1).count();
+    println!("n={n}");
+    let it2 = v.iter().filter(|x| **x > 1);
+    println!("hint={:?}", it2.size_hint());
+}
+"#;
+
+#[test]
+fn run_mode_filter_iteration() {
+    // The call count pins that the predicate runs once per
+    // pulled element and that its capture writes persist
+    // across steps (the predicate is called through its own
+    // storage); the size hint is core's `(0, inner upper)`.
+    let dir = temp_dir("filter-iteration");
+    let src = fixture(&dir, "filter_iteration.rs", FILTER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Filter over slice::Iter and Range must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sum=12\nSome(2)\nSome(4)\nSome(6)\ncalls=6\n[0, 3, 6, 9]\nn=10\nhint=(0, Some(6))\n",
+        "the predicate accepts exactly the even elements, once per pull"
+    );
+}
+
+const FILTER_BACK_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3, 4, 5, 6];
+    let mut it = v.iter().filter(|x| **x % 2 == 0);
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    let mut rsum = 0;
+    for x in (0..10).filter(|x| x % 2 == 0).rev() {
+        rsum += x;
+    }
+    println!("revsum={rsum}");
+    let out: Vec<i32> = v.iter().filter(|x| **x % 2 == 0).copied().collect();
+    println!("{out:?}");
+    let out2: Vec<i32> = v.iter().copied().filter(|x| x % 2 == 1).collect();
+    println!("{out2:?}");
+    let mut seen = 0;
+    let stateful: Vec<i32> = (0..10).filter(move |x| {
+        if *x % 2 == 0 {
+            seen += 1;
+            seen % 2 == 0
+        } else {
+            false
+        }
+    }).collect();
+    println!("{stateful:?}");
+}
+"#;
+
+#[test]
+fn run_mode_filter_next_back_and_composition() {
+    // The interleaved steps pin that front and back pulls
+    // meet in the middle without re-yielding an element; the
+    // stateful predicate pins that a by-value capture's
+    // writes persist from one pull to the next.
+    let dir = temp_dir("filter-next-back");
+    let src = fixture(&dir, "filter_next_back.rs", FILTER_BACK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Filter next_back, Rev and Copied composition must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some(2)\nSome(6)\nSome(4)\nNone\nNone\nrevsum=20\n[2, 4, 6]\n[1, 3, 5]\n[2, 6]\n",
+        "front and back steps share one predicate-gated sequence"
+    );
+}
+
 const ITER_MUT_SRC: &str = r#"
 fn bump(xs: &mut [i32]) {
     for x in xs {
