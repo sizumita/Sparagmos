@@ -9895,6 +9895,50 @@ fn run_mode_adapter_over_vec_into_iter_collect() {
     );
 }
 
+const FILTER_ZIP_INTO_ITER_COLLECT_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3, 4, 5, 6];
+    let evens: Vec<i32> = v.into_iter().filter(|x| x % 2 == 0).collect();
+    println!("filter {evens:?}");
+    let a = vec![1, 2, 3];
+    let b = vec![10, 20, 30, 40];
+    let pairs: Vec<(i32, i32)> = a.into_iter().zip(b.into_iter()).collect();
+    println!("zip {pairs:?}");
+    let e: Vec<i32> = Vec::new();
+    let no_pairs: Vec<(i32, i32)> = e.into_iter().zip(vec![1]).collect();
+    println!("zip-empty {}", no_pairs.len());
+    let w = vec![String::from("a"), String::from("bb")];
+    let cloned: Vec<String> = w.iter().cloned().collect();
+    println!("cloned {cloned:?}");
+}
+"#;
+
+#[test]
+fn run_mode_filter_zip_cloned_over_vec_into_iter_collect() {
+    // The same specialization path as the Map case, for the
+    // adapters the iterator framework models: `Filter` over
+    // `vec::IntoIter` delegates to the in-place entry, and
+    // `Zip` (no single source allocation to reuse) delegates
+    // to the nested entry's collected impl body, which drives
+    // `Vec::with_capacity` and the raw-buffer machinery. Both
+    // calls are served by the `VecFromIterNested` builtin.
+    let dir = temp_dir("filter-zip-into-iter-collect");
+    let src = fixture(
+        &dir,
+        "filterzipcollect.rs",
+        FILTER_ZIP_INTO_ITER_COLLECT_SRC,
+    );
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "filter [2, 4, 6]\nzip [(1, 10), (2, 20), (3, 30)]\nzip-empty 0\ncloned [\"a\", \"bb\"]\n",
+        "stdout={stdout}"
+    );
+}
+
 const ARGS_COLLECT_SRC: &str = r#"
 fn main() {
     let fwd: Vec<String> = std::env::args().collect();

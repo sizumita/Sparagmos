@@ -7162,14 +7162,7 @@ let inner = match (&src, target) {
         // collection for directly named calls. The same holds
         // for the nested specialization entry the builtin also
         // serves.
-        if matches!(
-            crate::builtins::lookup_qualified(
-                &crate::builtins::canonical_name(
-                    name.split(" [").next().unwrap_or(&name),
-                ),
-            ),
-            Some(crate::builtins::Builtin::VecFromIterNested)
-        ) {
+        if Self::vec_from_iter_nested_entry(&name) {
             return None;
         }
         let Some(plain) = self.unconverted.get(&name) else {
@@ -7535,23 +7528,73 @@ let inner = match (&src, target) {
         }
     }
 
-    /// A call through a function-pointer constant naming the
-    /// in-place collect entry point (`std::vec::in_place_collect::
-    /// from_iter_in_place`, the entry the `VecFromIterNested`
-    /// builtin serves): `SpecFromIter::from_iter` calls it
-    /// through exactly this shape — the func operand is the
-    /// decoded function-pointer value, not an `FnDef`-typed
-    /// constant — so neither the driver's name-based collection
-    /// nor the direct-call resolution ever sees the callee's
-    /// name, and the call would otherwise dispatch through the
-    /// value to the collected body, whose raw-allocation
-    /// machinery the value model does not serve. The builtin is
-    /// the function's own semantics in the model (drain the
-    /// iterator into a fresh `Vec`; the allocation reuse is
-    /// unobservable), so the call converts to it directly. The
-    /// stepping dispatch key is the iterator argument's own
-    /// type, which is the entry point's last generic argument.
-    fn in_place_collect_terminator(
+    /// Whether `name` (a body key, possibly carrying an
+    /// instance suffix) denotes one of the `Vec` collect
+    /// specialization entries the `VecFromIterNested` builtin
+    /// serves: the registry-named entries (the nested trait
+    /// entry and the in-place entry, under either crate
+    /// spelling), or the nested entry's impl-qualified form
+    /// (`<std::vec::Vec<T> as std::vec::spec_from_iter_nested::
+    /// SpecFromIterNested<T, I>>::from_iter`), which is how the
+    /// collected impl body is keyed. The recognition of the
+    /// impl-qualified form mirrors the interpreter's run-time
+    /// name fallback for the same entry.
+    fn vec_from_iter_nested_entry(name: &str) -> bool {
+        Self::vec_from_iter_builtin_name(name).is_some()
+    }
+
+    /// The name a `VecFromIterNested` call for the entry
+    /// `name` denotes is served under: the entry's own
+    /// canonical name when the registry names it (the nested
+    /// trait entry and the in-place entry), and the nested
+    /// trait entry's name for the impl-qualified form, whose
+    /// own spelling the registry does not carry — the
+    /// interpreter resolves a builtin call by its name, so the
+    /// call must carry a name the registry resolves.
+    fn vec_from_iter_builtin_name(name: &str) -> Option<String> {
+        let plain = name.split(" [").next().unwrap_or(name);
+        let canonical = crate::builtins::canonical_name(plain);
+        if matches!(
+            crate::builtins::lookup_qualified(&canonical),
+            Some(crate::builtins::Builtin::VecFromIterNested)
+        ) {
+            return Some(canonical);
+        }
+        if canonical.ends_with(">::from_iter")
+            && canonical
+                .contains("::spec_from_iter_nested::SpecFromIterNested")
+            && crate::interp::impl_qualified_self_type(&canonical)
+                .is_some_and(|target| {
+                    target.starts_with("std::vec::Vec<")
+                        || target.starts_with("alloc::vec::Vec<")
+                })
+        {
+            return Some(
+                "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// A call through a function-pointer constant naming one
+    /// of the `Vec` collect specialization entries
+    /// (`std::vec::in_place_collect::from_iter_in_place`, or
+    /// the `SpecFromIterNested` impl): `SpecFromIter::from_iter`
+    /// calls them through exactly this shape — the func operand
+    /// is the decoded function-pointer value, not an
+    /// `FnDef`-typed constant — so neither the driver's
+    /// name-based collection nor the direct-call resolution
+    /// ever sees the callee's name, and the call would
+    /// otherwise dispatch through the value to the collected
+    /// body, whose raw-allocation machinery the value model
+    /// does not serve. The builtin is the entry's own semantics
+    /// in the model (drain the iterator into a fresh `Vec`; the
+    /// allocation management is unobservable), so the call
+    /// converts to it directly. The stepping dispatch key is
+    /// the iterator argument's own type, which is the entry's
+    /// last generic argument.
+    fn vec_from_iter_value_terminator(
         &self,
         body: &mir::Body,
         func: &mir::Operand,
@@ -7569,16 +7612,11 @@ let inner = match (&src, target) {
         let Some(name) = self.def_names.get(def) else {
             return Ok(None);
         };
-        // A non-first instance is keyed with an instance suffix
-        // (`name [instance]`); the registry is keyed by the plain
-        // definition name.
-        let plain = name.split(" [").next().unwrap_or(name);
-        let canonical = crate::builtins::canonical_name(plain);
-        if !matches!(
-            crate::builtins::lookup_qualified(&canonical),
-            Some(crate::builtins::Builtin::VecFromIterNested)
-        ) || args.len() != 1
-        {
+        let Some(canonical) = Self::vec_from_iter_builtin_name(name)
+        else {
+            return Ok(None);
+        };
+        if args.len() != 1 {
             return Ok(None);
         }
         let Some(iter_ty) = self.operand_place_ty(body, &args[0]) else {
@@ -8299,7 +8337,7 @@ let inner = match (&src, target) {
                     self.drop_call_terminator(body, func, args, *target)
                 {
                     drop_term
-                } else if let Some(term) = self.in_place_collect_terminator(
+                } else if let Some(term) = self.vec_from_iter_value_terminator(
                     body,
                     func,
                     args,
