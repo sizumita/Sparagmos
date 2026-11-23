@@ -7950,8 +7950,10 @@ let inner = match (&src, target) {
     /// serve this call with one of the iterator-consumer
     /// builtins (`count` / `fold` / `for_each` / `collect` /
     /// `nth`) over an iterator type the modelled `next` state
-    /// machine serves: those calls are the builtin's, even when
-    /// a body is stored under the trait item's name (see
+    /// machine serves — or with the modelled
+    /// `ExactSizeIterator::len` over a slice-state iterator:
+    /// those calls are the builtin's, even when a body is
+    /// stored under the trait item's name (see
     /// `resolve_body_callee`).
     fn consumer_builtin_preempts(&self, func: &mir::Operand) -> bool {
         let Some((name, _, raw_generic_args)) = self.resolve_external_callee(func)
@@ -7967,14 +7969,18 @@ let inner = match (&src, target) {
             | crate::builtins::Builtin::IteratorFold
             | crate::builtins::Builtin::IteratorForEach
             | crate::builtins::Builtin::IteratorCollect
-            | crate::builtins::Builtin::IteratorNth => raw_generic_args.first(),
+            | crate::builtins::Builtin::IteratorNth
+            | crate::builtins::Builtin::IteratorLen => raw_generic_args.first(),
             _ => return false,
         };
         let Some(iter_ty) = iter_ty else {
             return false;
         };
         let tag = crate::builtins::ty_tag(iter_ty, self.names);
-        crate::builtins::iterator_consumer_modelled(&tag)
+        match kind {
+            crate::builtins::Builtin::IteratorLen => crate::builtins::iterator_len_modelled(&tag),
+            _ => crate::builtins::iterator_consumer_modelled(&tag),
+        }
     }
 
     /// Whether a call to one of the iterator-consumer builtins
@@ -8003,6 +8009,7 @@ let inner = match (&src, target) {
             crate::builtins::Builtin::IteratorNextBack => raw_generic_args.first(),
             crate::builtins::Builtin::IteratorNext => raw_generic_args.first(),
             crate::builtins::Builtin::IteratorNth => raw_generic_args.first(),
+            crate::builtins::Builtin::IteratorLen => raw_generic_args.first(),
             crate::builtins::Builtin::IntoIter => raw_generic_args.first(),
             _ => return false,
         };
@@ -8036,6 +8043,7 @@ let inner = match (&src, target) {
             | crate::builtins::Builtin::IteratorNth => {
                 crate::builtins::iterator_consumer_modelled(&tag)
             }
+            crate::builtins::Builtin::IteratorLen => crate::builtins::iterator_len_modelled(&tag),
             _ => crate::builtins::iterator_next_modelled(&tag),
         };
         if modelled {

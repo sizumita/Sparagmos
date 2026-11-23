@@ -1174,6 +1174,20 @@ fn consumer_instance_needs_body(
             };
             return !iterator_back_modelled(ty);
         }
+        "std::iter::ExactSizeIterator::len" => {
+            // `len` likewise: the builtin serves the call
+            // directly, reading the remaining count off the
+            // slice-state iterators' unified bounds, so a
+            // collected body is needed exactly for the
+            // iterator types it does not model — every other
+            // type (the trait default, which delegates to
+            // `size_hint`, and the types' own overrides) keeps
+            // its body as the primary execution.
+            let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+                return false;
+            };
+            return !slice_iter_len_modelled(ty);
+        }
         _ => return false,
     };
     let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
@@ -1424,6 +1438,30 @@ fn iterator_self_modelled(ty: &Ty) -> bool {
             | "core::str::Chars"
             | "std::str::Bytes"
             | "core::str::Bytes"
+    )
+}
+
+/// Whether this type is a slice-state iterator whose
+/// `ExactSizeIterator::len` the interpreter's builtin
+/// serves (see `iterator_len_modelled` in
+/// sparagmos-interp): the `slice::Iter` / `IterMut` pair
+/// and the B-tree iterators sharing their state layout.
+fn slice_iter_len_modelled(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    matches!(
+        def.name().as_str(),
+        "std::slice::Iter"
+            | "std::slice::IterMut"
+            | "std::collections::btree_set::Iter"
+            | "alloc::collections::btree_set::Iter"
+            | "std::collections::btree_map::Iter"
+            | "alloc::collections::btree_map::Iter"
+            | "std::collections::btree_map::Keys"
+            | "alloc::collections::btree_map::Keys"
+            | "std::collections::btree_map::Values"
+            | "alloc::collections::btree_map::Values"
     )
 }
 
