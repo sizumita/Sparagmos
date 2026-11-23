@@ -22805,3 +22805,63 @@ fn main() {
     println!("ok");
 }
 "#;
+
+const DEEP_RECURSION_SRC: &str = r#"
+fn f(x: isize) -> isize {
+    if x == 1 { return 1; } else { let y: isize = 1 + f(x - 1); return y; }
+}
+
+fn main() { println!("depth = {}", f(5000)); }
+"#;
+
+#[test]
+fn run_mode_deep_recursion_completes() {
+    run_ok("deep-recursion", DEEP_RECURSION_SRC, "depth = 5000\n");
+}
+
+const NON_DATA_POINTER_FMT_SRC: &str = r#"
+fn main() {
+    println!("{:?}", 1 as *const String);
+    println!("{:p}", 1 as *const String);
+    println!("{:?}", std::ptr::null::<u8>());
+}
+"#;
+
+#[test]
+fn run_mode_non_data_pointer_formats_as_address() {
+    run_ok(
+        "non-data-pointer-fmt",
+        NON_DATA_POINTER_FMT_SRC,
+        "0x1\n0x1\n0x0\n",
+    );
+}
+
+const NON_DATA_POINTER_FMT_FLAGS_SRC: &str = r#"
+fn main() {
+    let p = 1usize as *const u8;
+    let q = 0xdeadbeefusize as *const u8;
+    println!("[{:8p}]", p);
+    println!("[{:<8p}]", p);
+    println!("[{:^8p}]", p);
+    println!("[{:08p}]", p);
+    println!("[{:+p}]", p);
+    println!("[{:+08p}]", p);
+    println!("[{:#p}]", p);
+    println!("[{:#?}]", p);
+    println!("[{:<#20p}]", p);
+    println!("[{:<08p}]", p);
+    println!("[{:*>8p}]", p);
+    println!("[{:0>8p}]", p);
+    println!("[{:#?}]", q);
+    println!("[{:08p}]", std::ptr::null::<u8>());
+}
+"#;
+
+#[test]
+fn run_mode_non_data_pointer_format_flags() {
+    run_ok(
+        "non-data-pointer-fmt-flags",
+        NON_DATA_POINTER_FMT_FLAGS_SRC,
+        "[     0x1]\n[0x1     ]\n[  0x1   ]\n[0x000001]\n[+0x1]\n[+0x00001]\n[0x0000000000000001]\n[0x0000000000000001]\n[0x000000000000000001]\n[0x000001]\n[*****0x1]\n[000000x1]\n[0x00000000deadbeef]\n[0x000000]\n",
+    );
+}

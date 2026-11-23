@@ -72,7 +72,7 @@ impl Default for InterpConfig {
     fn default() -> Self {
         InterpConfig {
             max_steps: 1_000_000,
-            max_call_depth: 1024,
+            max_call_depth: 8192,
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
