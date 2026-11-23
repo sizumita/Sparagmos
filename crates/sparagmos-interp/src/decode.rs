@@ -742,7 +742,11 @@ impl<'a> Interpreter<'a> {
                 if let Some((from_size, payload_pos)) = units_from {
                     if let Some(field) = fields.get_mut(*payload_pos) {
                         let taken = std::mem::replace(field, Value::Unit);
-                        *field = crate::interp::ptr_cast_units_value(taken, *from_size);
+                        *field = crate::interp::ptr_cast_units_value(
+                            taken,
+                            *from_size,
+                            &|id| self.alloc_index_is_typed(id),
+                        );
                     }
                 }
                 // The `MaybeUninit::new(v)` normalization the
