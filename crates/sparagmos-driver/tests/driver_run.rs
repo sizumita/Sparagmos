@@ -4909,6 +4909,71 @@ fn run_mode_boxed_slice_from_borrowed_cow_deep_clones_elements() {
     );
 }
 
+const BOXED_STR_FROM_COW_SRC: &str = r#"
+use std::borrow::Cow;
+
+fn main() {
+    // Owned: the box takes the String's text over.
+    let b: Box<str> = Box::from(Cow::Owned(String::from("hello owned")));
+    println!("owned: [{b}] {} {:?}", b.len(), b);
+
+    // Owned from a variable: the String moves into the Cow
+    // and then into the box.
+    let s = String::from("var owned");
+    let b2: Box<str> = Box::from(Cow::Owned(s));
+    println!("var: [{b2}]");
+
+    // `Into` resolves to the same conversion.
+    let cow: Cow<str> = Cow::Owned(String::from("into owned"));
+    let b3: Box<str> = cow.into();
+    println!("into: [{b3}]");
+
+    // Borrowed: the box clones the text; later writes to
+    // the source do not show through.
+    let mut src = String::from("hello borrowed");
+    let b4: Box<str> = Box::from(Cow::Borrowed(src.as_str()));
+    src.push_str(" MUTATED");
+    println!("borrowed: [{b4}] src: [{src}]");
+
+    // Mutation through the box works on the boxed text.
+    let mut b5: Box<str> = Box::from(Cow::Owned(String::from("abc")));
+    b5.make_ascii_uppercase();
+    println!("upper: [{b5}]");
+
+    // Empty text, both variants.
+    let b6: Box<str> = Box::from(Cow::Owned(String::new()));
+    let b7: Box<str> = Box::from(Cow::Borrowed(""));
+    println!("empty: [{}] [{}] {} {}", b6, b7, b6.len(), b7.len());
+
+    // Slicing and comparison read the boxed text.
+    let b8: Box<str> = Box::from(Cow::Owned(String::from("slice me")));
+    println!("slice: [{}] eq: {}", &b8[0..5], &*b8 == "slice me");
+
+    // A Cow produced by a lossy conversion converts too.
+    let b9: Box<str> = Box::from(String::from_utf8_lossy(&[b'h', b'i', 0xFF]));
+    println!("lossy: [{b9}]");
+
+    println!("boxed str from cow ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_from_cow() {
+    let dir = temp_dir("boxed-str-from-cow");
+    let src = fixture(&dir, "boxed_str_from_cow.rs", BOXED_STR_FROM_COW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<str> from a Cow<str> must hold the string data, not the Cow aggregate; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "owned: [hello owned] 11 \"hello owned\"\nvar: [var owned]\ninto: [into owned]\nborrowed: [hello borrowed] src: [hello borrowed MUTATED]\nupper: [ABC]\nempty: [] [] 0 0\nslice: [slice] eq: true\nlossy: [hi\u{FFFD}]\nboxed str from cow ok\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");

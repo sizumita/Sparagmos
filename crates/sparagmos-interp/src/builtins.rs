@@ -7964,6 +7964,54 @@ impl<'a> Interpreter<'a> {
                         )),
                     }
                 } else if target.starts_with("std::boxed::Box<")
+                    && generic_first_arg(target, "std::boxed::Box<") == Some("str")
+                    && (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                {
+                    // `From<Cow<'_, str>> for Box<str>`: the box
+                    // holds the string data itself -- the owned
+                    // String's text handed over, or a clone of
+                    // the borrowed text -- never the Cow
+                    // aggregate (boxing the aggregate would
+                    // leave every str consumer of the box
+                    // reading the Cow's own fields: Display and
+                    // Debug see an ADT instead of the text).
+                    // The result is the shape
+                    // `String::into_boxed_str` builds. The Cow
+                    // is consumed by the conversion, so the
+                    // text moves into the box exactly once.
+                    match value {
+                        Value::Enum {
+                            mut fields, ..
+                        } if fields.len() == 1 => {
+                            let held = fields.pop().expect("len checked");
+                            // The borrowed variant's field is a
+                            // reference to the source text, the
+                            // owned variant's field is the String
+                            // itself; in this value model both
+                            // resolve to the text the box takes
+                            // (a copy of it, so later writes to
+                            // the source do not show through).
+                            match self.resolve_value(frames, &held)? {
+                                Value::Str(text) => {
+                                    let boxed = self.new_box(Value::Str(text));
+                                    self.record_box_ty(&boxed, Ty::Str);
+                                    Ok(boxed)
+                                }
+                                other => Err(InterpError::type_mismatch(
+                                    "From::from to Box<str>",
+                                    "string data",
+                                    other.kind_name(),
+                                )),
+                            }
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to Box<str>",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target.starts_with("std::boxed::Box<")
                     && matches!(
                         generic_first_arg(target, "std::boxed::Box<"),
                         Some(pt) if is_slice_tag(pt)
