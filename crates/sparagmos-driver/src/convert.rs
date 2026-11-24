@@ -1184,6 +1184,31 @@ fn dyn_binding_normalizes(
     })
 }
 
+thread_local! {
+    /// Whether the screen's type resolution gave up at
+    /// its depth cap during the judgment in progress:
+    /// set by `resolve_screen_self_ty` when its budget
+    /// runs out, and read -- and cleared -- by the one
+    /// judgment that consults resolution (see
+    /// `projection_screen_ty`), so exhaustion recorded
+    /// anywhere else cannot leak into a verdict.
+    static RESOLUTION_DEPTH_EXHAUSTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Note that the resolution in progress exhausted its
+/// depth budget (see `RESOLUTION_DEPTH_EXHAUSTED`).
+fn note_resolution_depth_exhausted() {
+    RESOLUTION_DEPTH_EXHAUSTED.with(|flag| flag.set(true));
+}
+
+/// Whether the resolution since the last take exhausted
+/// its depth budget, clearing the record (see
+/// `RESOLUTION_DEPTH_EXHAUSTED`).
+fn take_resolution_depth_exhausted() -> bool {
+    RESOLUTION_DEPTH_EXHAUSTED.with(|flag| flag.replace(false))
+}
+
 /// Resolve a type as far as the screen's own evidence
 /// reaches: parameters through the ambient arguments the
 /// way the screen's walk resolves them, and projections
@@ -1200,6 +1225,12 @@ fn resolve_screen_self_ty(ty: &Ty, ambient: Option<&GenericArgs>, depth: usize) 
     let mut depth = depth;
     loop {
         if depth >= 8 {
+            // The budget is a termination guard, not
+            // evidence: a resolution that runs out of it
+            // has reached no answer, and the absence must
+            // not be read as one (see
+            // `RESOLUTION_DEPTH_EXHAUSTED`).
+            note_resolution_depth_exhausted();
             return None;
         }
         let kind = guarded_ty_kind(&resolved)?;
@@ -1635,31 +1666,33 @@ fn match_impl_self_ty(
     match ikind {
         TyKind::Param(param) => {
             // The target is written in the frame the
-            // screen is walking, so a parameter there is
-            // first resolved through the ambient frame --
-            // the type form of the resolution the constant
-            // match performs for its target (see
-            // `match_impl_const`) -- and a parameter the
-            // ambient frame leaves unresolved stays a
-            // parameter. Without it, an implementation
-            // parameter appearing in both the self type
-            // and another trait argument binds the
-            // concrete value through the self type and is
-            // then compared against the target's
-            // unresolved parameter, rejecting an
+            // screen is walking, so the parameters inside
+            // it are first resolved through the ambient
+            // frame -- the type form of the resolution the
+            // constant match performs for its target (see
+            // `match_impl_const`) -- recursively (see
+            // `substitute_ty`), so a parameter nested
+            // inside a compound target is substituted the
+            // way a bare parameter target is: walking
+            // `Holder<u32>`, the self type `Wrap<(T,)>`
+            // binds the implementation's `A` to `(u32,)`,
+            // not to the unsubstituted `(T,)` the trait
+            // argument is then compared against. A
+            // parameter the ambient frame leaves
+            // unresolved stays a parameter. Without it, an
+            // implementation parameter appearing in both
+            // the self type and another trait argument
+            // binds the target's unsubstituted form
+            // through the self type and is then compared
+            // against the substituted one, rejecting an
             // applicable implementation.
-            let resolved;
-            let target = match guarded_ty_kind(target) {
-                Some(TyKind::Param(tparam)) => {
-                    match ambient.and_then(|a| a.0.get(tparam.index as usize)) {
-                        Some(GenericArgKind::Type(bound)) => {
-                            resolved = *bound;
-                            &resolved
-                        }
-                        _ => target,
-                    }
+            let substituted;
+            let target = match ambient {
+                Some(ambient) => {
+                    substituted = substitute_ty(target, ambient, 0, false);
+                    &substituted
                 }
-                _ => target,
+                None => target,
             };
             bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target))
         }
@@ -1940,14 +1973,27 @@ fn projection_screen_ty(
     let kind = guarded_ty_kind(ty)?;
     match kind {
         TyKind::Alias(alias_kind, alias) => {
-            if alias_kind == SmirAliasKind::Projection
-                && projection_cannot_normalize(&alias)
-                && !dyn_binding_normalizes(&alias, ambient, depth)
-            {
-                return Some(format!(
-                    "{UNNORMALIZABLE_PROJECTION_REASON}: \
-                     {alias:?}'s trait has no implementation"
-                ));
+            if alias_kind == SmirAliasKind::Projection && projection_cannot_normalize(&alias) {
+                // The judgment rests on resolving the
+                // projection's self type (see
+                // `dyn_binding_normalizes`); a resolution
+                // that exhausts its depth budget on the
+                // way reaches no answer, so exhaustion
+                // during this judgment leaves the screen
+                // without an opinion rather than rejecting
+                // a projection it could not finish
+                // resolving. The record is cleared first,
+                // so exhaustion from an earlier judgment
+                // cannot leak into this one.
+                let _ = take_resolution_depth_exhausted();
+                if !dyn_binding_normalizes(&alias, ambient, depth)
+                    && !take_resolution_depth_exhausted()
+                {
+                    return Some(format!(
+                        "{UNNORMALIZABLE_PROJECTION_REASON}: \
+                         {alias:?}'s trait has no implementation"
+                    ));
+                }
             }
             projection_screen_args(&alias.args, ambient, depth + 1)
         }

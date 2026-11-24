@@ -2822,6 +2822,125 @@ fn run_mode_dyn_bound_projection_conditional_impl_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_NESTED_TUPLE_TARGET_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T>
+where
+    Wrap<(T,)>: Carrier<(u32,)>,
+{
+    field: <<Wrap<(T,)> as Carrier<(u32,)>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_tuple_target_runs() {
+    // The implementation parameter matches a compound
+    // target type: walking `Holder<u32>`, the self type
+    // `Wrap<(T,)>` binds the implementation's `A` through
+    // `Self`. The binding used to record the tuple
+    // `(T,)` with the holder's parameter still inside
+    // it, so the trait argument's `(u32,)` disagreed
+    // with the recorded binding and the implementation
+    // was rejected, resolving nothing, so the screen
+    // rejected the holder and `main`. Substituting the
+    // target through the ambient frame before recording
+    // the binding -- recursively, the way a bare
+    // parameter target is already resolved -- binds
+    // `A := (u32,)`, and the outer projection normalizes
+    // through `dyn Trait<Assoc = u32>` -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-tuple-target");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_tuple_target.rs",
+        DYN_BOUND_PROJECTION_NESTED_TUPLE_TARGET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested-tuple-target projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_DEEP_CHAIN_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait A {
+    type Item: B + ?Sized;
+}
+trait B {
+    type Item: C + ?Sized;
+}
+trait C {
+    type Item: Trait + ?Sized;
+}
+impl A for () {
+    type Item = ();
+}
+impl B for () {
+    type Item = ();
+}
+impl C for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: A> {
+    field: <<<<T as A>::Item as B>::Item as C>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_deep_chain_runs() {
+    // A valid projection chain with three intermediate
+    // associated types: resolving the outer projection's
+    // self type walks `A::Item`, `B::Item`, then
+    // `C::Item`, and the recursion spends the resolution
+    // depth budget before the chain reaches the trait
+    // object -- the budget is spent on the way down, so
+    // even resolving the first hop's parameter exhausts
+    // it. Exhaustion used to make the resolution return
+    // no answer, which the screen read as proof the
+    // projection cannot normalize, rejecting the holder
+    // and `main`. The budget is a termination guard, not
+    // evidence: exhaustion during a judgment now leaves
+    // the screen without an opinion -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-deep-chain");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_deep_chain.rs",
+        DYN_BOUND_PROJECTION_DEEP_CHAIN_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the deep-chain projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
