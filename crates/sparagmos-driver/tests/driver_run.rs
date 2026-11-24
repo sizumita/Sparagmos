@@ -7375,6 +7375,123 @@ fn run_mode_boxed_slice_from_slice_ref_boxed_slice_elements() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CLOSURE_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    // A closure element capturing a Box<Cell<i32>> by value:
+    // the boxed clone's cell is independent of the source's.
+    let cell = Box::new(Cell::new(10));
+    let f = move || {
+        cell.set(cell.get() + 1);
+        cell.get()
+    };
+    let src = [f];
+    let boxed: Box<[_]> = Box::from(&src[..]);
+    println!("boxcapture src call: {}", src[0]());
+    println!("boxcapture boxed call: {}", boxed[0]());
+    println!("boxcapture src call 2: {}", src[0]());
+
+    // A closure element capturing an Rc<Cell<i32>> by value:
+    // the conversion moves the strong count.
+    let rc = Rc::new(Cell::new(7));
+    let rc_in = rc.clone();
+    let g = move || rc_in.get();
+    let gsrc = [g];
+    println!("rccapture strong before: {}", Rc::strong_count(&rc));
+    let gboxed: Box<[_]> = Box::from(&gsrc[..]);
+    println!("rccapture strong after: {}", Rc::strong_count(&rc));
+    println!("rccapture boxed call: {}", gboxed[0]());
+    drop(gboxed);
+    println!("rccapture strong after drop: {}", Rc::strong_count(&rc));
+
+    // A direct .clone() of a closure value clones its
+    // environment the same way.
+    let dcell = Box::new(Cell::new(10));
+    let df = move || {
+        dcell.set(dcell.get() + 1);
+        dcell.get()
+    };
+    let df2 = df.clone();
+    println!("direct src call: {}", df());
+    println!("direct clone call: {}", df2());
+    let drc = Rc::new(Cell::new(7));
+    let drc_in = drc.clone();
+    let dg = move || drc_in.get();
+    println!("direct strong before: {}", Rc::strong_count(&drc));
+    let dg2 = dg.clone();
+    println!("direct strong after clone: {}", Rc::strong_count(&drc));
+    drop(dg2);
+    println!("direct strong after drop: {}", Rc::strong_count(&drc));
+    println!("direct value: {}", dg());
+
+    // A by-reference capture: the clone shares the referent.
+    let shared = Cell::new(5);
+    let r = &shared;
+    let rf = move || r.get();
+    let rsrc = [rf];
+    let rboxed: Box<[_]> = Box::from(&rsrc[..]);
+    shared.set(9);
+    println!("refcapture boxed: {}", rboxed[0]());
+    println!("refcapture src: {}", rsrc[0]());
+
+    // An Arc capture: the count moves.
+    let arc = Arc::new(Cell::new(3));
+    let arc_in = arc.clone();
+    let ag = move || arc_in.get();
+    let agsrc = [ag];
+    let agboxed: Box<[_]> = Box::from(&agsrc[..]);
+    println!("arccapture strong: {}", Arc::strong_count(&arc));
+    println!("arccapture boxed call: {}", agboxed[0]());
+
+    // A closure nested in a tuple element.
+    let tcell = Box::new(Cell::new(20));
+    let k = move || {
+        tcell.set(tcell.get() + 1);
+        tcell.get()
+    };
+    let tsrc = [(k, 7)];
+    let tboxed: Box<[_]> = Box::from(&tsrc[..]);
+    println!("tuple src call: {}", (tsrc[0].0)());
+    println!("tuple boxed call: {}", (tboxed[0].0)());
+    println!("tuple plain: {}", tboxed[0].1);
+
+    // A closure capturing another closure: the inner
+    // environment clones recursively.
+    let ncell = Rc::new(Cell::new(1));
+    let ncell_in = ncell.clone();
+    let inner = move || ncell_in.get();
+    let outer = move || inner();
+    let osrc = [outer];
+    println!("nested strong before: {}", Rc::strong_count(&ncell));
+    let oboxed: Box<[_]> = Box::from(&osrc[..]);
+    println!("nested strong after: {}", Rc::strong_count(&ncell));
+    println!("nested boxed call: {}", oboxed[0]());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_closure_elements() {
+    let dir = temp_dir("boxed-from-slice-ref-closure");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_closure.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLOSURE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "cloning a closure element must clone its capture environment; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "boxcapture src call: 11\nboxcapture boxed call: 11\nboxcapture src call 2: 12\nrccapture strong before: 2\nrccapture strong after: 3\nrccapture boxed call: 7\nrccapture strong after drop: 2\ndirect src call: 11\ndirect clone call: 11\ndirect strong before: 2\ndirect strong after clone: 3\ndirect strong after drop: 2\ndirect value: 7\nrefcapture boxed: 9\nrefcapture src: 9\narccapture strong: 3\narccapture boxed call: 3\ntuple src call: 21\ntuple boxed call: 21\ntuple plain: 7\nnested strong before: 2\nnested strong after: 3\nnested boxed call: 1\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CHANNEL_SRC: &str = r#"use std::sync::mpsc::{channel, sync_channel, TryRecvError};
 
 fn state(r: &std::sync::mpsc::Receiver<i32>) -> &'static str {

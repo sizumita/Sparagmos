@@ -13814,6 +13814,32 @@ fn value_fingerprint(value: &Value) -> u64 {
                         return Ok(boxed);
                     }
                 }
+                // A cloned closure owns its environment:
+                // each capture clones with its declared tag
+                // (the discipline `clone_typed_aggregate`
+                // applies to the same value in the boxed-slice
+                // conversion), so an owned capture re-owns
+                // what it owns -- a boxed capture is a fresh
+                // box, a counted capture moves its count --
+                // instead of aliasing the source closure's
+                // environment. An instance with no recorded
+                // environment shape keeps the value copy
+                // below.
+                if let Value::Closure { .. } = value {
+                    let source_ref = match arg {
+                        Value::Ref(target) => Some(target.clone()),
+                        _ => None,
+                    };
+                    if let Some(cloned) = self.clone_typed_aggregate(
+                        frames,
+                        &value,
+                        source_ref.as_ref(),
+                        self_ty,
+                        None,
+                    )? {
+                        return Ok(cloned);
+                    }
+                }
                 // A cloned container owns its elements: a
                 // `Vec` value's fields are its elements in
                 // this model, and a tuple's / array's fields
@@ -14456,6 +14482,63 @@ fn value_fingerprint(value: &Value) -> u64 {
             return Ok(Some(Value::Enum {
                 variant: *variant,
                 fields: cloned.into_iter().map(|(v, _)| v).collect(),
+            }));
+        }
+        // A closure value: the recorded environment shape of
+        // the instance names each capture's tag, in
+        // environment field order. Each capture clones with
+        // its own tag judged the same way an aggregate field
+        // is, so an owned capture re-owns what it owns (a
+        // boxed capture is a fresh box, a counted capture
+        // moves its count) instead of aliasing the source
+        // closure's environment; a by-reference capture's tag
+        // is a reference tag, and references clone as the
+        // pointers they are, which is the sharing a reference
+        // capture means. An instance with no recorded shape,
+        // or whose shape does not cover the environment,
+        // keeps the shape-only fallback.
+        if let Value::Closure { def, env } = value {
+            let Some(capture_tys) = self
+                .program()
+                .env_debug_shapes
+                .get(ty)
+                .filter(|shape| shape.upvars.len() == env.len())
+                .map(|shape| {
+                    shape
+                        .upvars
+                        .iter()
+                        .map(|f| f.ty.clone())
+                        .collect::<Vec<_>>()
+                })
+            else {
+                return Ok(None);
+            };
+            let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
+                Vec::with_capacity(env.len());
+            for (i, capture) in env.iter().enumerate() {
+                let capture_ty = capture_tys[i].as_str();
+                let capture_glue = glue.and_then(|g| g.field_plan(None, i));
+                let capture_ref =
+                    value_ref.and_then(|t| t.projected(RefProj::Field(i)));
+                match self.clone_boxed_slice_element(
+                    frames,
+                    capture,
+                    capture_ref.as_ref(),
+                    Some(capture_ty),
+                    capture_glue.as_ref(),
+                ) {
+                    Ok(v) => cloned.push((v, capture_glue)),
+                    Err(err) => {
+                        // Construction temporaries, as in the
+                        // tuple arm above.
+                        cloned.reverse();
+                        return Err(self.drop_cloned_prefix(frames, cloned, err));
+                    }
+                }
+            }
+            return Ok(Some(Value::Closure {
+                def: def.clone(),
+                env: cloned.into_iter().map(|(v, _)| v).collect(),
             }));
         }
         Ok(None)
