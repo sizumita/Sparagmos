@@ -5075,7 +5075,7 @@ impl<'a> Interpreter<'a> {
                 if base == Value::Uninit {
                     return Ok(None);
                 }
-                match self.project_value_t(base, &projection, "<drop>", "drop glue") {
+                match self.project_value_t(base, &projection, "<drop>", "drop glue", None) {
                     Ok(v) if v == Value::Uninit => Ok(None),
                     Ok(v) => Ok(Some(v)),
                     Err(InterpError::UninitializedRead { .. }) => Ok(None),
@@ -5193,6 +5193,7 @@ impl<'a> Interpreter<'a> {
                 &steps[step_idx..step_idx + take],
                 "<drop>",
                 "drop glue",
+                None,
             ) {
                 Ok(v) => value = v,
                 Err(InterpError::UninitializedRead { .. }) => return Ok(None),
@@ -10676,7 +10677,7 @@ impl<'a> Interpreter<'a> {
                 let mut projection = projection.clone();
                 projection.push(step);
                 let projected =
-                    self.project_value_t(base, &projection, &func, &place.to_string())?;
+                    self.project_value_t(base, &projection, &func, &place.to_string(), None)?;
                 Ok(Resolved::Value(projected, Vec::new()))
             }
             Resolved::Static {
@@ -11479,7 +11480,14 @@ impl<'a> Interpreter<'a> {
                         return Ok(Cow::Owned(value));
                     }
                 }
-                let value = match project_value_ref(base, projection, &frame.func, &place_desc) {
+                let value = match project_value_ref_ev(
+                    Some(self.program()),
+                    ty.cloned(),
+                    base,
+                    projection,
+                    &frame.func,
+                    &place_desc,
+                ) {
                     Ok(v) if *v != Value::Uninit => v,
                     Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
                         // Mirror the owned read: a single-valued
@@ -13102,7 +13110,13 @@ impl<'a> Interpreter<'a> {
         if projection.is_empty() {
             Ok(base.clone())
         } else {
-            self.project_value_t(base.clone(), projection, "<constant>", "constant aggregate")
+            self.project_value_t(
+                base.clone(),
+                projection,
+                "<constant>",
+                "constant aggregate",
+                None,
+            )
         }
     }
 
@@ -13147,7 +13161,9 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<static>".to_string());
                 let place_desc = format!("static {name}");
-                let value = self.project_value_t(base, projection, &func, &place_desc)?;
+                let root_ty = self.program().static_tys.get(name).cloned();
+                let value =
+                    self.project_value_t(base, projection, &func, &place_desc, root_ty)?;
                 if value == Value::Uninit {
                     return self.uninit_read_value(ty, func, place_desc);
                 }
@@ -13178,7 +13194,14 @@ impl<'a> Interpreter<'a> {
                         }
                         _ => false,
                     };
-                let value = match self.project_value_t(base.clone(), projection, &func, &place_desc) {
+                let root_ty = self.alloc_ty(*id);
+                let value = match self.project_value_t(
+                    base.clone(),
+                    projection,
+                    &func,
+                    &place_desc,
+                    root_ty,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         // The stored form of an allocation is a
@@ -13244,7 +13267,18 @@ impl<'a> Interpreter<'a> {
                 // type — so the precomputed value (conversion's
                 // `Body::zst_fields` table) only rescues a read
                 // that otherwise fails as uninitialized.
-                let value = match self.project_value_t(base, projection, &frame.func, &place_desc) {
+                let root_ty = self
+                    .program()
+                    .get(&frame.func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
+                let value = match self.project_value_t(
+                    base,
+                    projection,
+                    &frame.func,
+                    &place_desc,
+                    root_ty,
+                ) {
                     Ok(v) if v != Value::Uninit => v,
                     Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
                         match self.zst_field_value(frame, *local, projection) {
@@ -13546,12 +13580,20 @@ impl<'a> Interpreter<'a> {
                         // with the slots it skips over
                         // uninitialized, exactly as the grow
                         // below treats a short tuple.
-                        if *slot == Value::Uninit {
-                            *slot = Value::Tuple(vec![Value::Uninit; i + 1]);
-                        }
-                        if let Value::Tuple(items) = &mut *slot {
-                            if i >= items.len() {
-                                items.resize(i + 1, Value::Uninit);
+                        // The same materialisation bound as
+                        // the tuple growth: an index at or past
+                        // it is the navigation's error to
+                        // produce, not storage to allocate (at
+                        // the extreme index the size computation
+                        // itself overflows).
+                        if i < crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                            if *slot == Value::Uninit {
+                                *slot = Value::Tuple(vec![Value::Uninit; i + 1]);
+                            }
+                            if let Value::Tuple(items) = &mut *slot {
+                                if i >= items.len() {
+                                    items.resize(i + 1, Value::Uninit);
+                                }
                             }
                         }
                     }
@@ -13781,8 +13823,13 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             } => {
+                let func = frames[*frame_pos].func.clone();
+                let root_ty = self
+                    .program()
+                    .get(&func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
                 let frame = &mut frames[*frame_pos];
-                let func = frame.func.clone();
                 let place_desc = describe_resolved(*local, projection);
                 let slot = frame.locals.get_mut(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
@@ -13790,7 +13837,15 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                let slot = navigate_mut(slot, projection, &func, &place_desc)?;
+                let slot = navigate_mut_grow(
+                    slot,
+                    projection,
+                    &func,
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )?;
                 f(slot)
             }
         }
@@ -16614,13 +16669,26 @@ impl<'a> Interpreter<'a> {
         proj: &[RefProj],
         desc: &str,
     ) -> InterpResult<()> {
+        let func = frames.last().expect("frame").func.clone();
+        let root_ty = self
+            .program()
+            .get(&func)
+            .and_then(|body| body.local_ty(Local(local)))
+            .cloned();
         let frame = frames.last_mut().expect("frame");
-        let func = frame.func.clone();
         let slot = frame.locals.get_mut(local).ok_or_else(|| InterpError::UnknownLocal {
             func: func.clone(),
             local,
         })?;
-        let slot = navigate_mut(slot, proj, &func, desc)?;
+        let slot = navigate_mut_grow(
+            slot,
+            proj,
+            &func,
+            desc,
+            false,
+            Some(self.program()),
+            root_ty,
+        )?;
         *slot = Value::Uninit;
         Ok(())
     }
@@ -17480,12 +17548,15 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         func: &str,
         place: &str,
+        root_ty: Option<Ty>,
     ) -> InterpResult<Value> {
         let mut value = value;
+        let mut cur_ty = root_ty;
         let mut i = 0;
         while i < projection.len() {
             if let RefProj::UnionField { idx, table } = projection[i] {
                 value = self.union_field_read(value, idx, table, func, place)?;
+                cur_ty = stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, idx);
                 i += 1;
             } else {
                 let start = i;
@@ -17494,7 +17565,16 @@ impl<'a> Interpreter<'a> {
                 {
                     i += 1;
                 }
-                value = project_value(value, &projection[start..i], func, place)?;
+                let segment = &projection[start..i];
+                value = project_value_ev(
+                    Some(self.program()),
+                    cur_ty.clone(),
+                    value,
+                    segment,
+                    func,
+                    place,
+                )?;
+                cur_ty = step_ty_across(Some(self.program()), cur_ty, segment);
             }
         }
         Ok(value)
@@ -20984,6 +21064,26 @@ pub(crate) fn project_value(
     func: &str,
     place: &str,
 ) -> InterpResult<Value> {
+    project_value_ev(None, None, value, projection, func, place)
+}
+
+/// [`project_value`] with type evidence: `root_ty` is the
+/// declared type of `value`, walked alongside the projection
+/// so the transparent-wrapper descent can tell a wrapper's
+/// payload -- a complete value of the type the projection
+/// addresses -- from a partially materialised aggregate's
+/// first field, which is a value of a strictly smaller type
+/// (see `wrapper_descent_sanctioned`). Callers without
+/// evidence use `project_value`, whose descent judgments are
+/// the shape-only ones.
+pub(crate) fn project_value_ev(
+    program: Option<&Program>,
+    root_ty: Option<Ty>,
+    value: Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Value> {
     let composed;
     let projection = if projection_needs_composition(projection) {
         composed = compose_projection(&value, projection, func, place);
@@ -20996,6 +21096,9 @@ pub(crate) fn project_value(
     // The state a coroutine downcast named, for the field step
     // that follows it (see the `Downcast` arm below).
     let mut downcast_state: Option<u32> = None;
+    // The declared type of the value in hand, stepped alongside
+    // it (see `project_value_ev`).
+    let mut cur_ty = root_ty;
     while step_idx < projection.len() {
         let step = &projection[step_idx];
         step_idx += 1;
@@ -21024,12 +21127,18 @@ pub(crate) fn project_value(
                         fields.len() == 1
                             && fields.get(*idx).is_none()
                             && wrapper_payload(&fields[0])
+                            && wrapper_descent_sanctioned(
+                                program,
+                                cur_ty.as_ref(),
+                                &value,
+                            )
                     }
                     _ => false,
                 };
                 if !descend {
                     break;
                 }
+                cur_ty = descent_payload_ty(program, cur_ty.as_ref(), &value);
                 value = match value {
                     Value::Enum { mut fields, .. } => {
                         fields.pop().expect("one field checked")
@@ -21038,6 +21147,26 @@ pub(crate) fn project_value(
                 };
             }
         }
+        // The declared type steps alongside the value, so the
+        // next step's descent judgment sees the type of the
+        // value it judges. A step the type walk cannot follow
+        // ends the evidence; later judgments are the shape-only
+        // ones, exactly as for a caller without evidence.
+        cur_ty = match step {
+            RefProj::Field(idx) => {
+                let variant = match &value {
+                    Value::Enum { variant, .. } => *variant as usize,
+                    _ => 0,
+                };
+                stepped_field_ty(program, cur_ty.as_ref(), variant, *idx)
+            }
+            RefProj::Index(_) => stepped_index_ty(cur_ty.as_ref()),
+            RefProj::UnionField { idx, .. } => {
+                stepped_field_ty(program, cur_ty.as_ref(), 0, *idx)
+            }
+            RefProj::Downcast(_) => cur_ty,
+            _ => None,
+        };
         value = match step {
             RefProj::Field(idx) => match value {
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
@@ -21688,6 +21817,16 @@ fn grow_tuples_along(value: &mut Value, projection: &[RefProj]) {
     };
     match (value, step) {
         (Value::Tuple(items), RefProj::Index(idx)) => {
+            // The materialisation bound the navigation itself
+            // enforces (`navigate_mut_grow` errors at this
+            // index): growing to it here would resize the
+            // storage before that error can fire -- and at the
+            // extreme index the size computation itself
+            // overflows. Leave the storage alone and let the
+            // navigation produce its error.
+            if *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                return;
+            }
             if *idx >= items.len() {
                 items.resize(*idx + 1, Value::Uninit);
             }
@@ -21762,6 +21901,43 @@ fn adt_variant_field_count(program: &Program, name: &str, variant: usize) -> Opt
     adt_field_tys_of(program, name)?
         .get(variant)
         .map(|fields| fields.len())
+}
+
+/// Walk `ty` across a whole projection at the type level
+/// alone (no value at hand), for callers that project a value
+/// in segments and must carry the declared type across a
+/// segment boundary (`project_value_t`'s union-field
+/// segmentation). A step the walk cannot follow ends the
+/// evidence (`None`).
+fn step_ty_across(
+    program: Option<&Program>,
+    ty: Option<Ty>,
+    projection: &[RefProj],
+) -> Option<Ty> {
+    let mut ty = ty;
+    let mut variant = 0usize;
+    for step in projection {
+        ty = match step {
+            RefProj::Field(idx) => {
+                let next = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                variant = 0;
+                next
+            }
+            RefProj::UnionField { idx, .. } => {
+                stepped_field_ty(program, ty.as_ref(), 0, *idx)
+            }
+            RefProj::Downcast(v) => {
+                variant = *v as usize;
+                ty
+            }
+            RefProj::Index(_) => stepped_index_ty(ty.as_ref()),
+            _ => None,
+        };
+        if ty.is_none() {
+            return None;
+        }
+    }
+    ty
 }
 
 /// The declared type one field step down from `ty`, when both
@@ -21890,6 +22066,31 @@ fn value_complete_for_ty_at(
 /// one-field stored form is one variant's payload, which field
 /// steps address transparently. With no type evidence the
 /// stored form decides, as before.
+/// The declared type of a wrapper's payload after a
+/// sanctioned descent: the payload is a value of the slot's
+/// declared type (the retargeted-pointer case), except when
+/// the declared type is the one-field wrapper itself, whose
+/// interior is its sole field's type. (The same computation
+/// `navigate_mut_grow` performs inline at its descent.)
+fn descent_payload_ty(
+    program: Option<&Program>,
+    ty: Option<&Ty>,
+    slot: &Value,
+) -> Option<Ty> {
+    let slot_variant = match slot {
+        Value::Enum { variant, .. } => *variant as usize,
+        _ => 0,
+    };
+    match (program, ty) {
+        (Some(program), Some(adt @ Ty::Adt(name)))
+            if adt_variant_field_count(program, name, slot_variant) == Some(1) =>
+        {
+            adt_field_ty_in(program, adt, slot_variant, 0)
+        }
+        _ => ty.cloned(),
+    }
+}
+
 fn wrapper_descent_sanctioned(
     program: Option<&Program>,
     ty: Option<&Ty>,
@@ -21901,7 +22102,14 @@ fn wrapper_descent_sanctioned(
         return true;
     };
     let Some(variants) = adt_field_tys_of(program, name) else {
-        return true;
+        // The type is a named ADT the program's field table
+        // does not record: there is no evidence the stored
+        // form is a wrapper around a value of this type rather
+        // than the type's own partially materialised form, so
+        // the descent does not stand. (With no type evidence
+        // at all -- no program or a non-ADT type -- the shape
+        // judgment above stands as before.)
+        return false;
     };
     if variants.len() != 1 || variants[0].len() <= 1 {
         return true;
@@ -22102,6 +22310,19 @@ pub(crate) fn project_value_ref<'a>(
     func: &str,
     place: &str,
 ) -> InterpResult<Cow<'a, Value>> {
+    project_value_ref_ev(None, None, value, projection, func, place)
+}
+
+/// [`project_value_ref`] with type evidence, as in
+/// `project_value_ev`.
+pub(crate) fn project_value_ref_ev<'a>(
+    program: Option<&Program>,
+    root_ty: Option<Ty>,
+    value: &'a Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Cow<'a, Value>> {
     let composed;
     let projection = if projection_needs_composition(projection) {
         composed = compose_projection(value, projection, func, place);
@@ -22110,6 +22331,7 @@ pub(crate) fn project_value_ref<'a>(
         projection
     };
     let mut cur: &'a Value = value;
+    let mut cur_ty = root_ty;
     let mut rest = projection;
     // The state a coroutine downcast named, for the field step
     // that follows it (see the `Downcast` arm below).
@@ -22123,6 +22345,19 @@ pub(crate) fn project_value_ref<'a>(
         }
         rest = tail;
         let step_state = downcast_state.take();
+        // The declared type steps alongside the value (see
+        // `project_value_ev`); the field step steps inside its
+        // arm, past its wrapper descent.
+        if !matches!(step, RefProj::Field(_)) {
+            cur_ty = match step {
+                RefProj::Index(_) => stepped_index_ty(cur_ty.as_ref()),
+                RefProj::UnionField { idx, .. } => {
+                    stepped_field_ty(program, cur_ty.as_ref(), 0, *idx)
+                }
+                RefProj::Downcast(_) => cur_ty,
+                _ => None,
+            };
+        }
         match step {
             RefProj::Field(idx) => {
                 // The transparent-wrapper descent of
@@ -22132,12 +22367,18 @@ pub(crate) fn project_value_ref<'a>(
                     if fields.len() == 1
                         && fields.get(*idx).is_none()
                         && wrapper_payload(&fields[0])
+                        && wrapper_descent_sanctioned(program, cur_ty.as_ref(), cur)
                     {
+                        cur_ty = descent_payload_ty(program, cur_ty.as_ref(), cur);
                         cur = &fields[0];
                     } else {
                         break;
                     }
                 }
+                let variant = match cur {
+                    Value::Enum { variant, .. } => *variant as usize,
+                    _ => 0,
+                };
                 cur = match cur {
                     Value::Tuple(items) => items.get(*idx).ok_or_else(|| {
                         InterpError::UninitializedRead {
@@ -22294,6 +22535,7 @@ pub(crate) fn project_value_ref<'a>(
                         ))
                     }
                 };
+                cur_ty = stepped_field_ty(program, cur_ty.as_ref(), variant, *idx);
             }
             RefProj::Index(idx) => match cur {
                 Value::FatRef { base, len } => {
@@ -22583,7 +22825,7 @@ pub(crate) fn navigate_mut<'x>(
 /// Steps whose interior the declared types do not describe
 /// (byte positions, vector storage, coroutine state) drop the
 /// walk, and the judgments there stay shape-only.
-fn navigate_mut_grow<'x>(
+pub(crate) fn navigate_mut_grow<'x>(
     slot: &'x mut Value,
     projection: &[RefProj],
     func: &str,
@@ -25401,5 +25643,41 @@ fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
         (Value::Closure { .. }, Ty::Closure(..)) => true,
         (Value::Coroutine { .. }, Ty::Coroutine(_)) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod write_bound_tests {
+    use super::*;
+
+    /// A projected write whose index step sits at the
+    /// materialisation bound must produce the navigation's
+    /// interpreter error, not resize the allocation's storage
+    /// first: the growth pre-pass runs ahead of the bounded
+    /// navigation, and at the extreme index its size
+    /// computation overflows the host's arithmetic.
+    #[test]
+    fn alloc_write_at_materialisation_bound_errors() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(0), RefProj::Index(usize::MAX)],
+        };
+        let result = interp.write_resolved(&mut frames, &target, Value::Int(7));
+        assert!(result.is_err(), "write at the bound must error");
+        // The storage is untouched by the rejected write.
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+            })
+        );
     }
 }

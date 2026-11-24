@@ -31384,74 +31384,6 @@ fn main() {
     if false {
         outer::<i32>();
     }
-const ELEM_BLOCK_NEWTYPE_SRC: &str = r#"
-use std::alloc::{alloc, dealloc, Layout};
-#[derive(Clone, Copy)]
-struct Inner { a: i32, b: i32 }
-struct Outer { inner: Inner }
-fn main() {
-    unsafe {
-        let layout = Layout::new::<[Outer; 2]>();
-        let p = alloc(layout) as *mut Outer;
-        p.write(Outer { inner: Inner { a: 10, b: 20 } });
-        p.add(1).write(Outer { inner: Inner { a: 30, b: 40 } });
-        let inner = (*p).inner;
-        println!("{} {}", inner.a, inner.b);
-        let inner2 = (*p.add(1)).inner;
-        println!("{} {}", inner2.a, inner2.b);
-        (*p).inner = Inner { a: 1, b: 2 };
-        let inner3 = (*p).inner;
-        println!("{} {}", inner3.a, inner3.b);
-        dealloc(p as *mut u8, layout);
-    }
-}
-"#;
-
-#[test]
-fn run_mode_elem_block_genuine_newtype_field_read_write() {
-    // A genuine one-field struct (`Outer`) around an aggregate
-    // (`Inner`) in a raw allocation block is a real field, not a
-    // `MaybeUninit` wrapper: reading the field yields the whole
-    // aggregate (not its first field), and writing it replaces
-    // the field (not the element). The pointee field-0 rewrite
-    // and the resolver's bare-wrapper judgment must both stand
-    // down for it, judged by the place's declared type and by
-    // the element's own stored form.
-    run_ok(
-        "elemblock-newtype",
-        ELEM_BLOCK_NEWTYPE_SRC,
-        "10 20\n30 40\n1 2\n",
-    );
-}
-
-const SLICE_WRAP_CAST_SRC: &str = r#"
-fn main() {
-    let b: Box<[i32]> = Box::new([1, 2, 3]);
-    let p: *const [i32] = &*b;
-    let q = p as *const [std::mem::MaybeUninit<i32>];
-    let _ = q;
-    println!("{}", unsafe { (*p)[2] });
-    println!("{}", b[1]);
-}
-"#;
-
-#[test]
-fn run_mode_slice_wrap_cast_preserves_original_view() {
-    // Casting a slice pointer to the `MaybeUninit` element view
-    // (without ever dereferencing the result) must not rewrite
-    // the backing elements: the original view keeps reading the
-    // original integers.
-    run_ok("slice-wrap-cast", SLICE_WRAP_CAST_SRC, "3\n2\n");
-}
-
-const SLICE_UNWRAP_TWICE_SRC: &str = r#"
-struct N(i32);
-fn main() {
-    let v: Vec<std::mem::MaybeUninit<N>> = vec![std::mem::MaybeUninit::new(N(7)), std::mem::MaybeUninit::new(N(8))];
-    let s1: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
-    println!("{}", s1[0].0);
-    let s2: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
-    println!("{}", s2[1].0);
 }
 "#;
 
@@ -31500,25 +31432,6 @@ fn outer<T>() {
 fn main() {
     if false {
         outer::<i32>();
-fn run_mode_slice_unwrap_casts_keep_genuine_newtype() {
-    // Repeated unwrap casts over a slice of wrapped genuine
-    // one-field elements (`N`) must not strip the newtype layer:
-    // the elements read back as `N` values through both casts.
-    run_ok("slice-unwrap-twice", SLICE_UNWRAP_TWICE_SRC, "7\n8\n");
-}
-
-const ELEM_BLOCK_PARTIAL_INIT_SRC: &str = r#"
-use std::alloc::{alloc, dealloc, Layout};
-struct S { first: (i32, i32), second: i32 }
-fn main() {
-    unsafe {
-        let layout = Layout::new::<S>();
-        let p = alloc(layout) as *mut S;
-        (*p).first = (10, 20);
-        (*p).second = 30;
-        println!("{} {}", (*p).first.0, (*p).first.1);
-        println!("{}", (*p).second);
-        dealloc(p as *mut u8, layout);
     }
 }
 "#;
@@ -31807,6 +31720,105 @@ fn convert_mode_required_const_behind_unsize_vtable_is_a_compile_failure() {
         stderr.contains("sparagmos-driver: compilation failed")
             && stderr.contains("E0080"),
         "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+const ELEM_BLOCK_NEWTYPE_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+#[derive(Clone, Copy)]
+struct Inner { a: i32, b: i32 }
+struct Outer { inner: Inner }
+fn main() {
+    unsafe {
+        let layout = Layout::new::<[Outer; 2]>();
+        let p = alloc(layout) as *mut Outer;
+        p.write(Outer { inner: Inner { a: 10, b: 20 } });
+        p.add(1).write(Outer { inner: Inner { a: 30, b: 40 } });
+        let inner = (*p).inner;
+        println!("{} {}", inner.a, inner.b);
+        let inner2 = (*p.add(1)).inner;
+        println!("{} {}", inner2.a, inner2.b);
+        (*p).inner = Inner { a: 1, b: 2 };
+        let inner3 = (*p).inner;
+        println!("{} {}", inner3.a, inner3.b);
+        dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_elem_block_genuine_newtype_field_read_write() {
+    // A genuine one-field struct (`Outer`) around an aggregate
+    // (`Inner`) in a raw allocation block is a real field, not a
+    // `MaybeUninit` wrapper: reading the field yields the whole
+    // aggregate (not its first field), and writing it replaces
+    // the field (not the element). The pointee field-0 rewrite
+    // and the resolver's bare-wrapper judgment must both stand
+    // down for it, judged by the place's declared type and by
+    // the element's own stored form.
+    run_ok(
+        "elemblock-newtype",
+        ELEM_BLOCK_NEWTYPE_SRC,
+        "10 20\n30 40\n1 2\n",
+    );
+}
+
+const SLICE_WRAP_CAST_SRC: &str = r#"
+fn main() {
+    let b: Box<[i32]> = Box::new([1, 2, 3]);
+    let p: *const [i32] = &*b;
+    let q = p as *const [std::mem::MaybeUninit<i32>];
+    let _ = q;
+    println!("{}", unsafe { (*p)[2] });
+    println!("{}", b[1]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_wrap_cast_preserves_original_view() {
+    // Casting a slice pointer to the `MaybeUninit` element view
+    // (without ever dereferencing the result) must not rewrite
+    // the backing elements: the original view keeps reading the
+    // original integers.
+    run_ok("slice-wrap-cast", SLICE_WRAP_CAST_SRC, "3\n2\n");
+}
+
+const SLICE_UNWRAP_TWICE_SRC: &str = r#"
+struct N(i32);
+fn main() {
+    let v: Vec<std::mem::MaybeUninit<N>> = vec![std::mem::MaybeUninit::new(N(7)), std::mem::MaybeUninit::new(N(8))];
+    let s1: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
+    println!("{}", s1[0].0);
+    let s2: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
+    println!("{}", s2[1].0);
+}
+"#;
+
+#[test]
+fn run_mode_slice_unwrap_casts_keep_genuine_newtype() {
+    // Repeated unwrap casts over a slice of wrapped genuine
+    // one-field elements (`N`) must not strip the newtype layer:
+    // the elements read back as `N` values through both casts.
+    run_ok("slice-unwrap-twice", SLICE_UNWRAP_TWICE_SRC, "7\n8\n");
+}
+
+const ELEM_BLOCK_PARTIAL_INIT_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+struct S { first: (i32, i32), second: i32 }
+fn main() {
+    unsafe {
+        let layout = Layout::new::<S>();
+        let p = alloc(layout) as *mut S;
+        (*p).first = (10, 20);
+        (*p).second = 30;
+        println!("{} {}", (*p).first.0, (*p).first.1);
+        println!("{}", (*p).second);
+        dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
 fn run_mode_elem_block_partial_struct_init_keeps_siblings() {
     // A struct in a raw allocation block initialized field by
     // field: after the first (aggregate) field is stored, the
