@@ -1202,7 +1202,9 @@ fn consumer_instance_needs_body(
             return false;
         };
         return if canonical.ends_with("next") {
-            hash_iterator_ty(ty) || str_iter_ty(ty) || foreign_adt_ty(ty)
+            hash_iterator_ty(ty)
+                || (str_iter_ty(ty) && !str_split_char_ty(ty))
+                || foreign_adt_ty(ty)
         } else {
             hash_collection_ty(ty)
                 || drain_ty(ty)
@@ -1531,6 +1533,49 @@ fn str_iter_ty(ty: &Ty) -> bool {
                 | "SplitAsciiWhitespace"
                 | "EncodeUtf16"
         )
+    )
+}
+
+/// Whether `ty` is one of the `str` split iterators over a
+/// `char` pattern (`Split`, `RSplit`, `SplitTerminator`,
+/// `RSplitTerminator`, `SplitInclusive`): the interpreter's
+/// builtin replays both steps of this family for char
+/// patterns (`str_split_step` in sparagmos-interp), so their
+/// `next` instances stay builtin-served and out of
+/// `str_iter_ty`'s body demand. Collecting the real body
+/// replaces the replay with an execution that dies inside
+/// `core::slice::memchr::memrchr_aligned`, which has no
+/// converted body. Non-char patterns keep the collected
+/// body: the replay rejects non-char searcher shapes.
+fn str_split_char_ty(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, args))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    if !name.contains("::str::") {
+        return false;
+    }
+    if !matches!(
+        name.rsplit("::").next(),
+        Some(
+            "Split"
+                | "RSplit"
+                | "SplitTerminator"
+                | "RSplitTerminator"
+                | "SplitInclusive"
+        )
+    ) {
+        return false;
+    }
+    // The pattern is the ADT's type argument (after the
+    // haystack lifetime); the replay serves exactly `char`.
+    let pattern = args.0.iter().find_map(|arg| match arg {
+        GenericArgKind::Type(ty) => Some(ty),
+        _ => None,
+    });
+    matches!(
+        pattern,
+        Some(ty) if matches!(guarded_ty_kind(ty), Some(TyKind::RigidTy(RigidTy::Char)))
     )
 }
 
