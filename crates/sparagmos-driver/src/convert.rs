@@ -1818,6 +1818,14 @@ fn match_impl_self_ty(
 /// does not (an object type can carry bounds beyond the
 /// ones an implementation's self type names); only the
 /// implementation's own predicates constrain the match.
+/// The auto traits are the exception: they are part of
+/// the object type's identity -- `dyn Other` and
+/// `dyn Other + Send` are different self types with
+/// different implementations -- so both objects must
+/// carry the same auto traits, or the `dyn Other`
+/// implementation would also match a `dyn Other + Send`
+/// target and leave two disagreeing candidates where
+/// the native resolution has exactly one.
 /// A failed counterpart attempt leaves no bindings
 /// behind, so a later counterpart is tried against the
 /// bindings as they stood.
@@ -1828,6 +1836,30 @@ fn match_impl_dynamic_preds(
     bindings: &mut HashMap<u32, GenericArgKind>,
     depth: usize,
 ) -> bool {
+    // The auto traits must agree as a multiset (see the
+    // doc comment above): collect each side's auto-trait
+    // definitions and compare their multiplicities before
+    // the per-predicate subset match below.
+    let auto_traits =
+        |preds: &[rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>]| {
+            preds
+                .iter()
+                .filter_map(|pred| match &pred.value {
+                    ExistentialPredicate::AutoTrait(def) => Some(def.def_id()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+    let iautos = auto_traits(ipreds);
+    let tautos = auto_traits(tpreds);
+    let same_auto_traits = iautos.len() == tautos.len()
+        && iautos.iter().all(|id| {
+            iautos.iter().filter(|other| *other == id).count()
+                == tautos.iter().filter(|other| *other == id).count()
+        });
+    if !same_auto_traits {
+        return false;
+    }
     ipreds.iter().all(|ipred| {
         tpreds.iter().any(|tpred| {
             let saved = bindings.clone();

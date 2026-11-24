@@ -2445,6 +2445,113 @@ fn run_mode_dyn_bound_projection_dyn_self_impl_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_AUTO_TRAIT_SET_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for dyn Other {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for dyn Other + Send {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier + ?Sized> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<dyn Other + Send> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_auto_trait_set_runs() {
+    // Separate implementations exist for `dyn Other`
+    // (assigning `Assoc = u64`) and for `dyn Other + Send`
+    // (assigning `Assoc = u32`). The predicate-subset
+    // match let the `dyn Other` implementation also match
+    // the `dyn Other + Send` target, so the resolver saw
+    // two disagreeing candidates and resolved nothing,
+    // screening out main. Auto traits are part of the
+    // object type's identity -- natively the two impls
+    // cover different self types and neither covers the
+    // other (each alone leaves the other target an E0277)
+    // -- so the match requires equal auto-trait sets and
+    // the `+ Send` implementation alone applies:
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-auto-trait-set");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_auto_trait_set.rs",
+        DYN_BOUND_PROJECTION_AUTO_TRAIT_SET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the auto-trait-set projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const UNNORMALIZABLE_PROJECTION_AUTO_TRAIT_MISMATCH_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+trait Trait {
+    type Assoc;
+}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for dyn Other {
+    type Item = dyn Trait<Assoc = u32>;
+}
+fn f(_: <<dyn Other + Send as Carrier>::Item as Trait>::Assoc) where dyn Other + Send: Carrier {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_auto_trait_mismatch_is_not_demanded() {
+    // The equal-auto-trait requirement cuts both ways:
+    // with only the `dyn Other` implementation present,
+    // the `dyn Other + Send` projection has no applicable
+    // implementation (natively an E0277), so the function
+    // carrying it is accounted not demanded with the
+    // screen's reason while main still converts. The
+    // false where-clause is a trivial bound, the form the
+    // const-mismatch case above also takes.
+    let dir = temp_dir("projection-auto-trait-mismatch-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_auto_trait_mismatch.rs",
+        UNNORMALIZABLE_PROJECTION_AUTO_TRAIT_MISMATCH_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the auto-trait-mismatch projection function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
 const DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC: &str = r#"
 trait Trait {
     type Assoc;
