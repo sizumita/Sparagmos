@@ -6774,6 +6774,21 @@ def stage4_ui_attempt(rec, view, path, revision, all_revisions,
                          "not judge")
         res["bucket"] = "out of stage-4 scope (run mode)"
         return res
+    if mode == "build-fail":
+        # compiletest's build-fail prerequisite is a check build
+        # (--emit=metadata) that must pass while the judged build
+        # fails. That distinction exists only for rustc:
+        # compiletest passes no --emit to rustdoc, and rustdoc
+        # rejects --emit=metadata outright, so for rustdoc the
+        # prerequisite would be the judged run itself, required
+        # to both pass and fail. The mode cannot be judged.
+        res["reason"] = ("pass/fail mode build-fail has no "
+                         "check-only prerequisite run for rustdoc "
+                         "(compiletest's --emit=metadata check "
+                         "build exists only for rustc), so stage "
+                         "4 does not judge the mode")
+        res["bucket"] = "out of stage-4 scope (build-fail)"
+        return res
     if view.has("run-rustfix"):
         res["reason"] = ("run-rustfix (suggestion application and "
                          "the .fixed comparison) is not attempted "
@@ -6808,22 +6823,6 @@ def stage4_ui_attempt(rec, view, path, revision, all_revisions,
         args, explicit = stage4_ui_args(view, path, nbase, revision,
                                         all_revisions, extern_args,
                                         aux_dir, src_base, rust_dir)
-        if mode == "build-fail":
-            pre = run_cmd([rustdoc] + args,
-                          timeout=STAGE4_NATIVE_TIMEOUT, cwd=nbase,
-                          env_extra=nenv, env_remove=env_unset)
-            if pre["timeout"]:
-                res["reason"] = "native rustdoc timed out"
-                res["bucket"] = "timeout"
-                return res
-            if pre["exit_code"] != 0:
-                res["status"] = "fail"
-                res["reason"] = ("native rustdoc failure: "
-                                 "`build-fail` test is required to "
-                                 "pass check build, but check build "
-                                 "failed")
-                res["bucket"] = "native rustdoc failure"
-                return res
         nproc = run_cmd([rustdoc] + args,
                         timeout=STAGE4_NATIVE_TIMEOUT, cwd=nbase,
                         env_extra=nenv, env_remove=env_unset)

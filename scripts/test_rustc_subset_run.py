@@ -4148,6 +4148,36 @@ class Stage4RustdocTests(unittest.TestCase):
             return run.process_test(rec, self.rust_dir,
                                     Path("/driver"), stage4=True)
 
+    def test_ui_build_fail_mode_is_not_attempted(self):
+        # compiletest's build-fail prerequisite is a check build
+        # (--emit=metadata) that must pass while the judged build
+        # fails; that distinction exists only for rustc (rustdoc
+        # rejects --emit=metadata, and compiletest passes no
+        # --emit to rustdoc at all), so stage 4 classifies the
+        # mode instead of requiring one deterministic run to both
+        # pass and fail. The native stub fails the way a real
+        # build-fail judged run must; the previous flow failed
+        # the record as a native failure on that prerequisite
+        # before the guest was ever judged.
+        calls = []
+
+        def counting_run_cmd(argv, **kw):
+            calls.append(argv)
+            return {"exit_code": 1, "stdout": "",
+                    "stderr": "error: nope\n", "timeout": False}
+
+        rec = self.write_rec("rustdoc-ui", "tests/rustdoc-ui/x.rs",
+                             "//@ build-fail\n/// [missing]\n"
+                             "pub fn f() {}\n")
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        counting_run_cmd):
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/driver"), stage4=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "out of stage-4 scope (build-fail)")
+        self.assertEqual(calls, [])
+
     def test_ui_check_fail_guest_reproducing_native_passes(self):
         proc = {"exit_code": 1, "stdout": "",
                 "stderr": self.ui_diag(1), "timeout": False}

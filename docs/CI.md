@@ -273,7 +273,14 @@ suites that need no JavaScript or browser environment:
   with compiletest's UI argument set; the verdict is
   compiletest's UI verdict (pass/fail mode and failure status,
   snapshot compare of the rendered diagnostics, `//~`
-  annotations, error patterns).
+  annotations, error patterns). A `rustdoc-ui` record
+  declaring `build-fail` is recorded as out of stage-4 scope:
+  compiletest's build-fail prerequisite is a check build
+  (`--emit=metadata`) that must pass while the judged build
+  fails, a distinction that exists only for rustc --
+  compiletest passes no `--emit` to rustdoc, and rustdoc
+  rejects the flag -- so the mode has no prerequisite run to
+  judge against for rustdoc.
 
 The `rustdoc-gui`, `rustdoc-js`, and `rustdoc-js-std` suites
 (299 records) run in a browser / JavaScript environment; stage 4
