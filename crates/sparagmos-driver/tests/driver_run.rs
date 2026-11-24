@@ -28250,3 +28250,49 @@ fn convert_mode_materialization_validity_in_entry_body_still_fails() {
         "the failure must surface the evaluation error; stderr={stderr}"
     );
 }
+// ----- rustc_private type defaults (rustdoc execution path) -----------------
+
+// The rustdoc entry program's emitter setup asks for
+// `anstream::adapter::strip::StripBytes::default()` (the third
+// stop on the rustdoc execution path). The distributed sysroot
+// carries anstream as metadata only, so no `Default` body is
+// ever collected and the interpreter's modelled
+// `Default::default` serves the value: the ANSI-strip state
+// machine in its initial state (`state: State::Ground`,
+// wrapping a fresh `utf8parse::Parser { point: 0, state:
+// Ground }`). The guest prints the value through the derived
+// `Debug`, which the interpreter renders from the recorded
+// shape; the expected line is the native 1.100.0 output of the
+// same program. (Against the MIR-carrying artifact-tree build
+// of anstream 0.6.21, the collected strip machinery also runs
+// over this modelled value and renders it identically.)
+const STRIP_BYTES_DEFAULT_SRC: &str = r#"
+#![feature(rustc_private)]
+
+extern crate anstream;
+
+use anstream::adapter::StripBytes;
+
+fn main() {
+    let s = StripBytes::default();
+    println!("{:?}", s);
+}
+"#;
+
+#[test]
+fn run_mode_strip_bytes_default() {
+    let dir = temp_dir("strip-bytes-default");
+    let src = fixture(&dir, "case.rs", STRIP_BYTES_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "StripBytes { state: Ground, utf8parser: Utf8Parser { utf8_parser: Parser { point: 0, state: Ground } } }\n",
+        "StripBytes::default() must be the initial strip state; stderr={stderr}"
+    );
+}
