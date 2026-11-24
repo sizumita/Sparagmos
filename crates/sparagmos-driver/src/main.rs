@@ -6107,15 +6107,45 @@ impl ToolRegistry {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "source.rs".to_string());
-        let dir = std::env::temp_dir()
-            .join(format!("sparagmos-artifact-sources-{}", std::process::id()))
-            .join(format!("{hash:016x}"));
+        let base =
+            std::env::temp_dir().join(format!("sparagmos-artifact-sources-{}", std::process::id()));
+        let dir = base.join(format!("{hash:016x}"));
         for (rel, bytes) in tree {
             let target = dir.join(rel);
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
+                // The materialised tree copies every recorded
+                // neighbouring file verbatim -- a private file
+                // beside the crate root among them -- so it
+                // must not stand in the shared temporary
+                // directory under the default permissions:
+                // keep every directory of it owner-only (the
+                // restriction is re-applied on each visit, so
+                // a directory an older run left at this pid's
+                // name is tightened too).
+                for ancestor in parent.ancestors() {
+                    if !ancestor.starts_with(&base) {
+                        break;
+                    }
+                    restrict_to_owner(ancestor, 0o700);
+                    if ancestor == base {
+                        break;
+                    }
+                }
             }
-            let _ = std::fs::write(&target, bytes);
+            // Owner-only from the moment the file exists,
+            // and tightened again after the write in case a
+            // file of that name already stood there.
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&target)
+                .and_then(|mut f| f.write_all(bytes));
+            restrict_to_owner(&target, 0o600);
         }
         let path = dir.join(root_name);
         files.insert(source.to_path_buf(), (hash, path.clone()));
@@ -6368,6 +6398,18 @@ fn run_convert_subprocess(
 /// contents are worth keeping from other accounts on a
 /// shared host -- the guest environment file is the one
 /// here (see `write_guest_env_file`).
+/// Set `path`'s permissions to the owner-only `mode`,
+/// best-effort. For the directories and files of a
+/// materialised source snapshot (see
+/// `ToolRegistry::effective_source_of`): the snapshot
+/// copies recorded neighbouring files verbatim, so its
+/// scratch tree in the shared temporary directory must
+/// not be traversable or readable by other accounts.
+fn restrict_to_owner(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
 fn create_private_temp_file(tag: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

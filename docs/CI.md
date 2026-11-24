@@ -160,7 +160,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   the conversion is done; a conversion that reads a
   snapshot remaps the snapshot's directory back to the
   recorded source's directory, so the program's `file!()`
-  spellings stay the build's. A run through
+  spellings stay the build's. The snapshot itself is
+  materialised owner-only in the shared temporary
+  directory -- it copies every recorded neighbouring file
+  verbatim, private contents included, so neither its
+  directories nor its files are readable by other
+  accounts. A run through
   `Command::status()` inherits the recipe's streams, so
   the program's output stands in them in invocation
   order; a run through `Command::output()` collects it

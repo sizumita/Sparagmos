@@ -22820,6 +22820,102 @@ fn run_mode_tool_interception_guest_env_file_is_private() {
     );
 }
 
+#[test]
+fn run_mode_tool_interception_snapshot_tree_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_dir("tool-snapshot-privacy");
+    let src = fixture(
+        &dir,
+        "snapshot_privacy_guest.rs",
+        ADDED_MODULE_CANDIDATE_GUEST_SRC,
+    );
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let started = std::time::SystemTime::now();
+    let mut child = Command::new(driver)
+        .arg("run")
+        .arg(&src)
+        .arg("--tool-program")
+        .arg(driver)
+        .arg("--guest-arg")
+        .arg(driver)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sparagmos-driver");
+    // The guest's added module candidate ends the recorded
+    // tree's intact reading, so the artifact run converts a
+    // materialised snapshot of the recorded tree under the
+    // shared temporary directory. The snapshot copies every
+    // recorded neighbouring file verbatim -- a private file
+    // beside the crate root among them -- so the whole
+    // materialised tree must stand owner-only. It outlives
+    // the driver, so sweep for it while the driver works
+    // and once more after it exits.
+    let sweep = |seen: &mut Vec<(String, u32, bool)>| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("sparagmos-artifact-sources-") {
+                continue;
+            }
+            let Ok(md) = entry.metadata() else { continue };
+            if md.modified().map(|m| m < started).unwrap_or(true) {
+                continue; // a leftover of an earlier run
+            }
+            let mut stack = vec![entry.path()];
+            while let Some(p) = stack.pop() {
+                let Ok(md) = std::fs::metadata(&p) else {
+                    continue;
+                };
+                let item = (
+                    p.to_string_lossy().into_owned(),
+                    md.permissions().mode() & 0o777,
+                    md.is_dir(),
+                );
+                if !seen.contains(&item) {
+                    seen.push(item);
+                }
+                if md.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&p) {
+                        stack.extend(entries.flatten().map(|e| e.path()));
+                    }
+                }
+            }
+        }
+    };
+    let mut seen: Vec<(String, u32, bool)> = Vec::new();
+    while child
+        .try_wait()
+        .expect("failed to poll the driver")
+        .is_none()
+    {
+        sweep(&mut seen);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let out = child
+        .wait_with_output()
+        .expect("failed to read the driver's output");
+    sweep(&mut seen);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "added module candidate guest ok\n",
+        "stderr={stderr}"
+    );
+    assert!(
+        seen.iter().any(|(_, _, is_dir)| *is_dir) && seen.iter().any(|(_, _, is_dir)| !*is_dir),
+        "no materialised snapshot tree was observed during the run: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, mode, is_dir)| *mode == if *is_dir { 0o700 } else { 0o600 }),
+        "materialised snapshot entries were not owner-only: {seen:?}"
+    );
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());
