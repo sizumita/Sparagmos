@@ -29149,6 +29149,118 @@ fn debug_mode_data_ptr_cast_recovers_source_element_layout() {
     );
 }
 
+const DEBUG_MIXED_CAST_CHAIN_SRC: &str = r#"fn main() {
+    let v: u32 = 1065353216;
+    let r: *const u32 = &v;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_through_array_pointer_keeps_storage_type() {
+    // A scalar pointer cast through an array-pointer type
+    // and back composes its dereference reinterpretation
+    // from the descriptor the pending array view recorded --
+    // the storage's actual type -- not from the array
+    // spelling the second cast replaces, which discards the
+    // recorded source and renders the stored integer
+    // unchanged.
+    let dir = temp_dir("debug-mixed-cast-chain");
+    let src = fixture(&dir, "mixed_cast_chain.rs", DEBUG_MIXED_CAST_CHAIN_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const f32)\nprint *((r as *const [u32; 1]) as *const f32)\nprint *((r as *const [f32; 1]) as *const f32)\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 1", "$2 = 1", "$3 = 1"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("<error"),
+        "mixed cast chains must not error: {stdout}"
+    );
+}
+
+const DEBUG_MIXED_CAST_CHAIN_REF_SRC: &str = r#"fn main() {
+    let a: [u32; 1] = [1065353216];
+    let r: &[u32; 1] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_through_array_pointer_from_array_ref() {
+    // The same family switch from an array reference: the
+    // recorded source is the array descriptor itself, whose
+    // element is the storage's scalar, and the dereference
+    // re-reads the element aggregate's leading bytes through
+    // the target layout.
+    let dir = temp_dir("debug-mixed-cast-chain-ref");
+    let src = fixture(
+        &dir,
+        "mixed_cast_chain_ref.rs",
+        DEBUG_MIXED_CAST_CHAIN_REF_SRC,
+    );
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *((r as *const [f32; 1]) as *const f32)\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("$1 = 1"),
+        "missing `$1 = 1` in debug transcript: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<error"),
+        "mixed cast chains must not error: {stdout}"
+    );
+}
+
+const DEBUG_UNION_PTR_FIELD_SRC: &str = r#"union U { bits: u32, value: f32, ptr: *const u32 }
+fn main() {
+    let u = U { bits: 0x3f800000 };
+    zzz();
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_union_field_read_with_unsupported_sibling() {
+    // Reading one field of a union serializes the stored
+    // field and deserializes the requested field
+    // independently: a sibling whose layout the byte
+    // conversion cannot express (here a raw pointer) does
+    // not disable the supported fields' reads, the way the
+    // whole-union reading -- which must produce every field
+    // at once -- is disabled by it.
+    let dir = temp_dir("debug-union-ptr-field");
+    let src = fixture(&dir, "union_ptr_field.rs", DEBUG_UNION_PTR_FIELD_SRC);
+    let out = debug_driver(&dir, &src, "break 4\nrun\nprint u.value\nprint u.bits\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 1", "$2 = 1065353216"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("uninitialized"),
+        "union field read must not report an uninitialized read: {stdout}"
+    );
+}
+
 const DEBUG_LLDB_NEG_HEX_SRC: &str = r#"fn main() {
     let b: i8 = -1;
     zzz();

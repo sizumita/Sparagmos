@@ -1663,6 +1663,22 @@ fn reinterpret_cast(
     Some(Ok(Value::Tuple(out)))
 }
 
+/// The scalar type a descriptor's storage starts with: its
+/// pointee (or the descriptor itself) when scalar, or an
+/// array/slice pointee's element when scalar -- the type
+/// whose bytes a scalar dereference of the storage re-reads.
+fn storage_scalar_desc(desc: &Desc) -> Option<Desc> {
+    let inner = pointer_pointee(desc).unwrap_or(desc);
+    match inner {
+        Desc::Array(elem, _) | Desc::Slice(elem) => match &**elem {
+            scalar if is_scalar_desc(scalar) => Some(scalar.clone()),
+            _ => None,
+        },
+        scalar if is_scalar_desc(scalar) => Some(scalar.clone()),
+        _ => None,
+    }
+}
+
 /// Whether a descriptor names a scalar type, the family a
 /// byte reinterpretation can express.
 fn is_scalar_desc(desc: &Desc) -> bool {
@@ -1691,9 +1707,28 @@ fn reinterpret_scalar_pointee(
             desc_type_name(target).unwrap_or_else(|| "?".into()),
         )
     };
-    let bytes = match scalar_value_bytes(value, source) {
-        Some(bytes) => bytes,
-        None => return Err(unsupported()),
+    // The pointee value may arrive as an element aggregate
+    // (a cast that reached the storage through an array
+    // view): its items are consecutive storage, serialized
+    // under the source type the way `reinterpret_cast`
+    // serializes them, and the target reads the leading
+    // bytes. An item the source layout cannot express is
+    // the same explicit error as an unexpressible scalar.
+    let bytes = match value {
+        Value::Tuple(items) => {
+            let mut bytes = Vec::new();
+            for item in items {
+                match scalar_value_bytes(item, source) {
+                    Some(bs) => bytes.extend(bs),
+                    None => return Err(unsupported()),
+                }
+            }
+            bytes
+        }
+        _ => match scalar_value_bytes(value, source) {
+            Some(bytes) => bytes,
+            None => return Err(unsupported()),
+        },
     };
     let Some(width) = desc_scalar_width(target) else {
         return Err(unsupported());
@@ -1948,6 +1983,23 @@ fn evaluate_expr(
                 // actually holds.
                 let source_pointee = ev.desc.as_ref().and_then(pointer_pointee).cloned();
                 let target_pointee = pointer_pointee(target).cloned();
+                // When this cast supersedes a pending array
+                // view, the descriptor the view recorded names
+                // the storage's actual type: the spelled
+                // descriptor is an array pointer whose pointee
+                // is not the scalar the storage holds, so the
+                // reinterpretation a scalar target composes
+                // starts from the recorded descriptor's scalar
+                // rather than discarding it with the view.
+                let view_source_scalar = ev
+                    .pending_array_view
+                    .as_ref()
+                    .and_then(|(_, recorded)| recorded.as_ref())
+                    .and_then(storage_scalar_desc);
+                let effective_source = match &source_pointee {
+                    Some(s) if is_scalar_desc(s) => source_pointee.clone(),
+                    _ => view_source_scalar.or(source_pointee.clone()),
+                };
                 // A cast to an array or slice pointer keeps
                 // the pointer value: only a step that consumes
                 // the pointer materializes the spelled view
@@ -1983,7 +2035,7 @@ fn evaluate_expr(
                 ev.value = v;
                 ev.desc = d;
                 ev.char = false;
-                let new_pending = match (source_pointee, target_pointee) {
+                let new_pending = match (effective_source, target_pointee) {
                     (Some(source), Some(target_inner))
                         if is_scalar_desc(&source) && is_scalar_desc(&target_inner) =>
                     {
@@ -3773,10 +3825,15 @@ fn union_field_values(
         .collect()
 }
 
-/// One field of a union value, read the way
-/// [`union_field_values`] reads every field: the stored
-/// field's bytes reinterpreted as the requested field's
-/// type.
+/// One field of a union value: the stored field's bytes
+/// reinterpreted as the requested field's type. The stored
+/// field is serialized and the requested field deserialized
+/// independently of the union's other fields, so a sibling
+/// whose layout or byte conversion is unsupported (a raw
+/// pointer field, say) does not prevent reading a supported
+/// field -- the independence the whole-union reading in
+/// [`union_field_values`] cannot offer, since it must
+/// produce every field at once.
 fn union_field_value(
     shape_fields: &[sparagmos_mir::AdtDebugField],
     value: &Value,
@@ -3787,9 +3844,13 @@ fn union_field_value(
         Value::Tuple(fields) => fields,
         _ => return None,
     };
-    union_field_values(shape_fields, fields)?
-        .into_iter()
-        .nth(index)
+    let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
+    let stored_ty = &shape_fields.get(stored)?.ty;
+    let requested = shape_fields.get(index)?;
+    let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
+    let (size, _) = tag_layout(&requested.ty)?;
+    bytes.resize(size, 0);
+    value_from_union_bytes(&bytes, &requested.ty)
 }
 
 /// The value of one field of the ADT value a descriptor
