@@ -1120,6 +1120,19 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
         // and address comparisons depend on it.
         return Some(0);
     }
+    // A dyn fat pointer over an address-only base denotes that
+    // base address: over the null pointer it is the null
+    // pointer (address 0, as above), and over a stored integer
+    // address it is that address -- the vtable word does not
+    // move the data pointer.
+    if let Value::DynRef { base, .. } = value {
+        if let Value::Ref(RefTarget::Address(addr)) = &**base {
+            return Some(*addr as u128);
+        }
+        if matches!(&**base, Value::Ref(RefTarget::Null)) {
+            return Some(0);
+        }
+    }
     address_key(value).map(|key| hash_address_key(&key))
 }
 
@@ -11401,6 +11414,16 @@ impl<'a> Interpreter<'a> {
         ) {
             return synthetic_address(value);
         }
+        // A dyn fat pointer over an address-only base has the
+        // base's address (see `synthetic_address`).
+        if let Value::DynRef { base, .. } = value {
+            if matches!(
+                &**base,
+                Value::Ref(RefTarget::Address(_)) | Value::Ref(RefTarget::Null)
+            ) {
+                return synthetic_address(value);
+            }
+        }
         match self.canonical_address_key(frames, value, leaf_ty) {
             Some(key) => Some(hash_address_key(&key)),
             None => synthetic_address(value),
@@ -16386,6 +16409,17 @@ impl<'a> Interpreter<'a> {
             Constant::FatPtr { addr, meta } => Value::FatRef {
                 base: Box::new(Value::Ref(RefTarget::Address(*addr))),
                 len: u128::from(*meta),
+            },
+            Constant::DynRef {
+                base,
+                concrete,
+                traits,
+                glue,
+            } => Value::DynRef {
+                base: Box::new(self.eval_constant(base)?),
+                concrete: concrete.clone(),
+                traits: traits.clone(),
+                drop_glue: glue.clone().map(Box::new),
             },
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
             Constant::Closure(def, env) => Value::Closure {

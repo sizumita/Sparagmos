@@ -982,6 +982,24 @@ impl Conv {
                 addr: atom_parse(field(f, "addr")?, "address")?,
                 meta: atom_parse(field(f, "meta")?, "meta")?,
             },
+            ("DynRef", Payload::Fields(f)) => mir::ConstValue::DynRef {
+                base: Box::new(Self::const_value(field(f, "base")?)?),
+                concrete: Self::ty(field(f, "concrete")?)?,
+                traits: {
+                    let mut traits = Vec::new();
+                    for t in as_list(field(f, "traits")?)? {
+                        match t {
+                            Node::Str(name) => traits.push(name.clone()),
+                            _ => {
+                                return err(
+                                    "DynRef constant with a non-string trait bound",
+                                )
+                            }
+                        }
+                    }
+                    traits
+                },
+            },
             ("ByRef", Payload::Fields(f)) => mir::ConstValue::ByRef {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,
