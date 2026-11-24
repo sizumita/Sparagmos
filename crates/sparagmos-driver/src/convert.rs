@@ -5329,6 +5329,19 @@ impl Converter {
                     if stride.bytes() == 1
                         && matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
                     {
+                        // The copy materialises `count` bytes:
+                        // charge them against the shared expansion
+                        // budget before allocating, like the
+                        // byte-copying arms of `decode_ref` do.
+                        // The presence check above bounds one
+                        // decode by the allocation, but a table of
+                        // references to one shared array reaches
+                        // this arm once per element, so without
+                        // the charge the copies add up past the
+                        // budget.
+                        if !self.spend_const_budget(count as usize) {
+                            return None;
+                        }
                         // Read the array's own byte range, not
                         // the whole allocation: a static's
                         // storage is routinely padded past the

@@ -628,6 +628,48 @@ fn run_mode_fat_pointer_prefix_under_budget_reads_back() {
 }
 
 #[test]
+fn run_mode_shared_tuple_byte_array_over_budget_stays_undecoded() {
+    // A table of references to one shared aggregate holding a
+    // 1 MiB byte array: each element's decode reaches the inline
+    // byte-array copy in `decode_const` through the tuple, so
+    // the copies are charged against the shared expansion
+    // budget and the table stays undecoded instead of
+    // materialising one 1 MiB copy per element.
+    let src = "static TABLE: [&([u8; 1048576], bool); 4] = [&([7; 1048576], true); 4]; fn main() { println!(\"{} {}\", TABLE[0].0[0], TABLE[3].1); }";
+    let dir = temp_dir("shared-tuple-byte-array-over-budget");
+    let src = fixture(&dir, "shared_tuple_byte_array_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared byte-array table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_shared_tuple_byte_array_under_budget_reads_back() {
+    // The same tuple-wrapped shape at a size the budget covers
+    // still materialises: an over-element-limit byte array
+    // reached through a shared reference table decodes as bytes.
+    let src = "static TABLE: [&([u8; 5000], bool); 3] = [&([9; 5000], true); 3]; fn main() { println!(\"{} {}\", TABLE[2].0[4999], TABLE[0].1); }";
+    let dir = temp_dir("shared-tuple-byte-array-under-budget");
+    let src = fixture(&dir, "shared_tuple_byte_array_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget shared byte-array table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "9 true\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the
