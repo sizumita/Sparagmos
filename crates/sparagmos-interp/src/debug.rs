@@ -4935,7 +4935,11 @@ fn btree_node_value(stored: &Value) -> Option<Value> {
 /// bounds the bucket width: the width is the region's even
 /// split when there is no padding, and otherwise one of
 /// the narrower widths whose padded region ends at the
-/// same offset. A bucket is live when its slot holds a
+/// same offset. A candidate width is accepted only when
+/// every pair-shaped slot in the region sits at one of
+/// its bucket starts, so a deleted bucket's stale pair
+/// cannot be read as a live entry at a wider candidate's
+/// offset. A bucket is live when its slot holds a
 /// pair and its control byte is a hash byte (below the
 /// empty/deleted sentinels).
 fn hash_entries(
@@ -4999,6 +5003,25 @@ fn hash_entries(
         }
         if entries.len() as u128 != size {
             return None;
+        }
+        // The width must also account for every pair-shaped
+        // slot in the region: a pair this partition does not
+        // place at a bucket start belongs to another width's
+        // buckets — a deleted bucket's stale pair sits at its
+        // own bucket start, and a wider candidate reads it as
+        // a nearer bucket's entry, passing the shape and
+        // count checks above with a removed entry in place of
+        // a live one. Only the true width places every pair
+        // in the region at one of its bucket starts.
+        let region_start = ctrl_index - num_buckets * width;
+        for j in region_start..ctrl_index {
+            let is_pair = matches!(
+                slots.get(j),
+                Some(Value::Tuple(items)) if items.len() == 2
+            );
+            if is_pair && (ctrl_index - j) % width != 0 {
+                return None;
+            }
         }
         Some(entries)
     };
@@ -6474,4 +6497,59 @@ mod hash_stride_tests {
         );
         assert!(hash_entries(&interp, &map, false).is_none());
     }
+    /// A deleted bucket retains its stale pair at its own
+    /// bucket start; the wider even-split candidate (16 / 4
+    /// = 4) would read that pair as bucket 0's entry and
+    /// pass the shape and count checks with the removed
+    /// entry in place of the live one. The walk must reject
+    /// width 4 — slot 14's live pair sits at no bucket start
+    /// of its partition — and walk at the true width 2.
+    #[test]
+    fn deleted_bucket_stale_pair_does_not_win_a_wider_width() {
+        let program: &'static Program = Box::leak(Box::new(Program::default()));
+        let interp = Interpreter::new(program);
+        let num_buckets = 4usize;
+        let ctrl_index = 16usize;
+        let mut slots = vec![Value::Uninit; ctrl_index + num_buckets + 16];
+        for i in 0..num_buckets {
+            slots[ctrl_index + i] = Value::Uint(0xFF);
+        }
+        slots[14] = Value::Tuple(vec![Value::Uint(1), Value::Uint(10)]);
+        slots[ctrl_index] = Value::Uint(0x2A);
+        slots[12] = Value::Tuple(vec![Value::Uint(2), Value::Uint(20)]);
+        slots[ctrl_index + 1] = Value::Uint(0x80);
+        let id = interp.alloc_insert(Value::Tuple(slots));
+        let ctrl = Value::Enum {
+            variant: 0,
+            fields: vec![Value::Ref(RefTarget::Alloc {
+                id,
+                projection: vec![RefProj::Index(ctrl_index)],
+            })],
+        };
+        let inner = Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Uint((num_buckets - 1) as u128),
+                ctrl,
+                Value::Uint(0),
+                Value::Uint(1),
+            ],
+        };
+        let table = Value::Enum {
+            variant: 0,
+            fields: vec![inner],
+        };
+        let map = Value::Enum {
+            variant: 0,
+            fields: vec![Value::Unit, table],
+        };
+        let value = Value::Enum {
+            variant: 0,
+            fields: vec![map],
+        };
+        let (entries, size) = hash_entries(&interp, &value, false).expect("entries");
+        assert_eq!(size, 1);
+        assert_eq!(entries, vec![(Value::Uint(1), Value::Uint(10))]);
+    }
 }
+
