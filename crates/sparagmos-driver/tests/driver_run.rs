@@ -784,6 +784,84 @@ fn run_mode_several_large_literals_each_decode() {
 }
 
 #[test]
+fn run_mode_erased_pointer_pair_over_budget_stays_undecoded() {
+    // Two copies of one type-erased pointer (a `*const ()`
+    // denoting a 600,000-byte allocation) in one constant:
+    // each erased decode charges the allocation's bytes
+    // against the shared expansion budget, so the second
+    // copy does not fit. The constant must stay undecoded:
+    // falling back to the declared type's decode for the
+    // second copy would give it a reference to a unit value,
+    // so the two identical pointers would compare unequal
+    // (the run printed `eq=false` before this fix) and the
+    // second pointer's backing bytes would be lost.
+    let src = "static BIG: [u8; 600000] = [7; 600000]; struct Pair(*const (), *const ()); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(BIG.as_ptr() as *const (), BIG.as_ptr() as *const ()); fn main() { println!(\"eq={}\", PAIR.0 == PAIR.1); println!(\"b={}\", unsafe { *(PAIR.1 as *const u8) }); }";
+    let dir = temp_dir("erased-pointer-pair-over-budget");
+    let src = fixture(&dir, "erased_pointer_pair_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget erased pointer pair must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_erased_pointer_pair_under_budget_reads_back() {
+    // The same erased-pointer pair at a size whose two
+    // charges fit the shared budget: both copies decode as
+    // erased blocks, compare equal, and read back exactly.
+    let src = "static BIG: [u8; 400000] = [7; 400000]; struct Pair(*const (), *const ()); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(BIG.as_ptr() as *const (), BIG.as_ptr() as *const ()); fn main() { println!(\"eq={}\", PAIR.0 == PAIR.1); println!(\"b={}\", unsafe { *(PAIR.1 as *const u8) }); }";
+    let dir = temp_dir("erased-pointer-pair-under-budget");
+    let src = fixture(&dir, "erased_pointer_pair_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget erased pointer pair must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq=true\nb=7\n",
+        "decoded erased pointers must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_reference_table_reads_back() {
+    // A 400,000-element table of references to one promoted
+    // value: the table's allocation carries 400,000
+    // provenance entries, and each element's decode looks
+    // its entry up in the offset-sorted vector by binary
+    // search. A linear scan made this decode quadratic in
+    // the table length (on the order of 80 billion
+    // comparisons) and the run did not finish in reasonable
+    // time.
+    let src = "static TABLE: [&u32; 400000] = [&7; 400000]; fn main() { println!(\"{} {}\", TABLE[0], TABLE[399999]); }";
+    let dir = temp_dir("large-reference-table");
+    let src = fixture(&dir, "large_reference_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large reference table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the

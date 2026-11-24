@@ -27,7 +27,7 @@ use rustc_public::ty::{
     AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, AssocContainer, AssocKind, Binder,
     ClosureKind, ConstantKind, ExistentialPredicate, ExistentialProjection, ExistentialTraitRef,
     FloatTy as SmirFloatTy, FnDef, FnSig, GenericArgKind, GenericArgs, ImplDef,
-    IntTy as SmirIntTy, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
+    IntTy as SmirIntTy, Prov, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
     TyConstKind, TyKind, UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
@@ -648,6 +648,14 @@ pub struct Converter {
     /// reference to one shared byte block copy that block once
     /// per element, unbounded by the call count.
     const_budget: usize,
+    /// Set when a `spend_const_budget` charge does not fit.
+    /// Read by the erased-pointer fallback in `decode_ref`,
+    /// which clears it before attempting an erased decode and
+    /// checks it afterwards: a block that failed to build
+    /// because the budget ran out must fail the whole constant
+    /// rather than fall back to the declared type's decode
+    /// (see `decode_ref`).
+    const_budget_failed: bool,
 }
 
 impl Default for Converter {
@@ -3232,6 +3240,7 @@ impl Converter {
             const_fn_mentions: Vec::new(),
             const_fn_mentions_seen: std::collections::HashSet::new(),
             const_budget: MAX_CONST_TOTAL_ELEMS,
+            const_budget_failed: false,
         }
     }
 
@@ -5176,9 +5185,13 @@ impl Converter {
     /// Charge `units` against the shared constant-expansion
     /// budget (see `MAX_CONST_TOTAL_ELEMS`); `false` when the
     /// charge does not fit, in which case the constant being
-    /// decoded stays undecoded.
+    /// decoded stays undecoded. A failed charge also sets
+    /// `const_budget_failed`, so a caller that would otherwise
+    /// fall back to a different decode can tell budget
+    /// exhaustion apart from ordinary undecodability.
     fn spend_const_budget(&mut self, units: usize) -> bool {
         if units > self.const_budget {
+            self.const_budget_failed = true;
             return false;
         }
         self.const_budget -= units;
@@ -5593,11 +5606,7 @@ impl Converter {
                             // another variant (the `Option<&T>` case:
                             // a non-null pointer reads back as
                             // offset 0 in its target allocation).
-                            let has_prov = alloc
-                                .provenance
-                                .ptrs
-                                .iter()
-                                .any(|(o, _)| *o as usize == offset + tag_off);
+                            let has_prov = prov_at(alloc, offset + tag_off).is_some();
                             let idx = if !has_prov
                                 && raw >= *niche_start
                                 && raw - *niche_start <= (end - start) as u128
@@ -5664,11 +5673,7 @@ impl Converter {
         // payload fields overlap its bytes and decode as
         // uninitialized (they are not the live field, and reading
         // them would reinterpret the pointer's representation).
-        let prov_at_offset = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .any(|(at, _)| *at as usize == offset);
+        let prov_at_offset = prov_at(alloc, offset).is_some();
         if prov_at_offset {
             let ptr_fields: Vec<usize> = fields
                 .iter()
@@ -6153,12 +6158,8 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset);
-        let Some((_, prov)) = prov else {
+        let prov = prov_at(alloc, offset);
+        let Some(prov) = prov else {
             let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
             if addr == 0 {
                 return Some(sm::ConstValue::NullPtr);
@@ -6245,11 +6246,7 @@ impl Converter {
         alloc: &Allocation,
         offset: usize,
     ) -> Option<sm::ConstValue> {
-        let (_, prov) = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset)?;
+        let prov = prov_at(alloc, offset)?;
         let mir::alloc::GlobalAlloc::Function(inst) =
             mir::alloc::GlobalAlloc::from(prov.0)
         else {
@@ -6431,12 +6428,8 @@ impl Converter {
         if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
             return self.decode_dyn_ref(inner, alloc, offset, depth);
         }
-        let prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset);
-        let Some((_, prov)) = prov else {
+        let prov = prov_at(alloc, offset);
+        let Some(prov) = prov else {
             // No provenance at the pointer slot: a stored
             // zero word is a null pointer (Lane CK). A
             // nonzero word is a dangling address from
@@ -6595,13 +6588,32 @@ impl Converter {
                 // only by the casts the guest later performs.
                 // Preserve the allocation exactly so those casts
                 // can materialise it (see `decode_erased_alloc`);
-                // when the block cannot be built, the declared
-                // type's decode below stands.
+                // when the block cannot be built for an ordinary
+                // reason, the declared type's decode below
+                // stands; when the expansion budget ran out, the
+                // constant stays undecoded instead.
                 if self.pointee_is_erased(inner, &target, target_off) {
+                    // A block that cannot be built because the
+                    // expansion budget ran out must not fall
+                    // back to the declared type's decode below:
+                    // that decode names the zero-sized declared
+                    // type, so the constant would hold a
+                    // reference to a unit value where the source
+                    // holds the whole allocation -- and a
+                    // second, identical pointer in the same
+                    // constant that did decode would compare
+                    // unequal to it. An ordinary failure to
+                    // build the block (a relocation that cannot
+                    // be decoded type-free) keeps the declared
+                    // decode, as before.
+                    self.const_budget_failed = false;
                     if let Some(block) =
                         self.decode_erased_alloc(&target, target_off, depth + 1)
                     {
                         return Some(sm::ConstValue::Ref(Box::new(block)));
+                    }
+                    if self.const_budget_failed {
+                        return None;
                     }
                 }
                 if let Some(def) = &static_def {
@@ -6668,11 +6680,7 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let vtable_prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset + PTR_SIZE);
+        let vtable_prov = prov_at(alloc, offset + PTR_SIZE);
         let Some(vtable_prov) = vtable_prov else {
             // No vtable provenance: the pointer's dispatch
             // identity is unknowable. A data word that names an
@@ -6681,11 +6689,7 @@ impl Converter {
             // (or null) value a thin pointer decodes to -- a
             // dangling fat pointer minted from raw integers,
             // whose only observable property is its address.
-            let has_data_prov = alloc
-                .provenance
-                .ptrs
-                .iter()
-                .any(|(o, _)| *o as usize == offset);
+            let has_data_prov = prov_at(alloc, offset).is_some();
             if has_data_prov {
                 return None;
             }
@@ -6697,7 +6701,7 @@ impl Converter {
             });
         };
         let mir::alloc::GlobalAlloc::VTable(concrete_ty, _) =
-            mir::alloc::GlobalAlloc::from(vtable_prov.1.0)
+            mir::alloc::GlobalAlloc::from(vtable_prov.0)
         else {
             return None;
         };
@@ -6712,11 +6716,7 @@ impl Converter {
         // reference when the pointee is a static's storage, a
         // snapshot otherwise). A data word with no provenance is
         // a null or dangling address, as for a thin pointer.
-        let has_data_prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .any(|(o, _)| *o as usize == offset);
+        let has_data_prov = prov_at(alloc, offset).is_some();
         let base = if has_data_prov {
             self.decode_ref(&concrete_ty, alloc, offset, depth + 1)?
         } else {
@@ -8716,6 +8716,24 @@ fn vtable_id(
 }
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
+/// The provenance recorded for the pointer slot at
+/// `offset` in `alloc`, if any. rustc_public builds
+/// `Allocation::provenance.ptrs` from the compiler's
+/// provenance map, which iterates in offset order, so the
+/// vector is sorted by offset and the entry is found by
+/// binary search. The linear scan this replaces made
+/// decoding a large reference table quadratic in its
+/// length: every element's lookup rescanned the table's
+/// provenance from the start (a 400,000-element table
+/// needed on the order of 80 billion comparisons).
+fn prov_at(alloc: &Allocation, offset: usize) -> Option<&Prov> {
+    let ptrs = &alloc.provenance.ptrs;
+    let idx = ptrs.partition_point(|(o, _)| *o < offset);
+    ptrs.get(idx)
+        .filter(|(o, _)| *o == offset)
+        .map(|(_, prov)| prov)
+}
+
 fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {
     if size == 0 || size > 16 {
         return None;
