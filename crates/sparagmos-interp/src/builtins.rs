@@ -27157,6 +27157,56 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
                 ],
             }
         }
+        // `anstream::adapter::strip::StripBytes::default()`:
+        // the ANSI-escape stripping state machine the compiler's
+        // error emitter carries (anstream 0.6.21,
+        // `src/adapter/strip.rs`). Both fields are themselves
+        // `Default` state machines: `state` is
+        // `anstyle_parse::state::State::Ground` (the `#[default]`
+        // variant, discriminant 12) and `utf8parser` wraps a
+        // `utf8parse::Parser { point: 0, state: State::Ground }`
+        // (utf8parse 0.2.2; its `State::Ground` is likewise the
+        // `#[default]` variant, discriminant 0). This is the
+        // third runtime value the rustdoc entry program asks for
+        // (emitter setup), so it is modelled here like the other
+        // hand-modelled defaults.
+        // The rendered tag of a compiler-crate type named
+        // through an explicit `extern crate` item carries the
+        // naming crate's prefix (`<caller>::anstream::...`);
+        // from inside the compiler crates it is the bare path.
+        // The path itself is spelled through the defining
+        // module (`adapter::strip::StripBytes`) when the call
+        // originates inside anstream and through the public
+        // re-export (`adapter::StripBytes`) when it is named
+        // from outside. All spellings denote this one ADT.
+        _ if tag == "anstream::adapter::strip::StripBytes"
+            || tag == "anstream::adapter::StripBytes"
+            || tag.ends_with("::anstream::adapter::strip::StripBytes")
+            || tag.ends_with("::anstream::adapter::StripBytes") =>
+        {
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Enum {
+                        variant: 12,
+                        fields: Vec::new(),
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Uint(0),
+                                Value::Enum {
+                                    variant: 0,
+                                    fields: Vec::new(),
+                                },
+                            ],
+                        }],
+                    },
+                ],
+            }
+        }
         _ if tag.starts_with("std::vec::Vec<") => Value::Enum {
             variant: 0,
             fields: Vec::new(),
