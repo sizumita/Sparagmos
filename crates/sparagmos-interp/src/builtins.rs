@@ -19874,6 +19874,31 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             || base_ty.starts_with("alloc::vec::Vec<")
         {
             if target_ty.starts_with('[') {
+                // The slice view of a vector: the fat pointer
+                // denotes the vector's element sequence, in the
+                // shape every slice consumer reads (the element
+                // aggregate `boxed_slice_value` builds). A vector
+                // in its real aggregate form denotes its elements
+                // through its buffer pointer, which the fat
+                // pointer then carries directly; a modelled
+                // vector is its element list, which becomes the
+                // element tuple. Wrapping the vector aggregate
+                // itself would leave the fat pointer's base a
+                // bare ADT value, which no dereference can follow
+                // (the failure `Vec::as_ref` hit on element
+                // access, where `len` and iteration still worked
+                // because they read the fat pointer itself).
+                if let Some((_, real_len)) = vec_real_aggregate_parts(&value) {
+                    let ptr = Self::real_vec_buffer_ptr(&value).ok_or_else(|| {
+                        unsupported(format!(
+                            "{what} for {base_ty}: the vector's buffer pointer is not a reference value"
+                        ))
+                    })?;
+                    return Ok(Value::FatRef {
+                        base: Box::new(ptr),
+                        len: real_len as u128,
+                    });
+                }
                 let len = value.len().ok_or_else(|| {
                     InterpError::type_mismatch(
                         what,
@@ -19881,8 +19906,12 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                         value.kind_name(),
                     )
                 })?;
+                let base = match value {
+                    Value::Enum { fields, .. } => Value::Tuple(fields),
+                    other => other,
+                };
                 return Ok(Value::FatRef {
-                    base: Box::new(value),
+                    base: Box::new(base),
                     len,
                 });
             }

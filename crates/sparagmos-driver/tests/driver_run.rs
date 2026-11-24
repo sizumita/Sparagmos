@@ -10124,6 +10124,77 @@ fn run_mode_boxed_conversions_and_ref_views() {
     );
 }
 
+const VEC_AS_REF_SLICE_SRC: &str = r#"fn main() {
+    let v: Vec<i32> = vec![5, 3, 8, 1];
+    let s: &[i32] = v.as_ref();
+    println!("idx {} {} {}", s[0], s[2], s[3]);
+    println!("first {:?}", s.first());
+    println!("get {:?}", s.get(2));
+    println!("debug {:?}", s);
+    println!("sub {:?}", &s[1..3]);
+    println!("contains {}", s.contains(&8));
+    println!("eq {}", s == [5, 3, 8, 1].as_slice());
+    println!("to_vec {:?}", s.to_vec());
+    let mut w: Vec<i32> = Vec::with_capacity(16);
+    w.push(10);
+    w.push(20);
+    let ws: &[i32] = w.as_ref();
+    println!("sparse {} {} len {}", ws[0], ws[1], ws.len());
+    let e: Vec<i32> = Vec::new();
+    let es: &[i32] = e.as_ref();
+    println!("empty {} {:?}", es.len(), es.first());
+    let bv = Box::new(vec![7, 9]);
+    let bs: &[i32] = bv.as_ref();
+    println!("boxvec {} {}", bs[0], bs[1]);
+    let rv = std::rc::Rc::new(vec![4, 6]);
+    let rs: &[i32] = rv.as_ref();
+    println!("rcvec {} {}", rs[0], rs[1]);
+    let vs: Vec<String> = vec!["aa".to_string(), "bbb".to_string()];
+    let ss: &[String] = vs.as_ref();
+    println!("strings {} {} {}", ss[0], ss[1], ss[1].len());
+    let vv: Vec<Vec<i32>> = vec![vec![1, 2], vec![3]];
+    let sv: &[Vec<i32>] = vv.as_ref();
+    println!("nested {} {}", sv[0][1], sv[1][0]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_as_ref_slice_element_access() {
+    // Issue #443: `Vec::as_ref` built its slice view as a fat
+    // pointer over the vector aggregate itself, a bare ADT value
+    // no dereference can follow: `len` and iteration (which read
+    // the fat pointer itself) worked, but element access through
+    // the view (`s[0]`, `first`, `get`, sub-slicing, `Debug`)
+    // failed with "type mismatch in dereference: expected
+    // reference, found ADT value". The view now denotes the
+    // element sequence, like every other slice construction.
+    let dir = temp_dir("vec-as-ref-slice");
+    let src = fixture(&dir, "vec_as_ref_slice.rs", VEC_AS_REF_SLICE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "idx 5 8 1",
+            "first Some(5)",
+            "get Some(8)",
+            "debug [5, 3, 8, 1]",
+            "sub [3, 8]",
+            "contains true",
+            "eq true",
+            "to_vec [5, 3, 8, 1]",
+            "sparse 10 20 len 2",
+            "empty 0 None",
+            "boxvec 7 9",
+            "rcvec 4 6",
+            "strings aa bbb 3",
+            "nested 2 3",
+        ]
+    );
+}
+
 const CALLER_LOCATION_TRACK_CALLER_OPT_SRC: &str = r#"#[inline(never)]
 #[track_caller]
 fn codegen_caller_loc() -> &'static core::panic::Location<'static> {
