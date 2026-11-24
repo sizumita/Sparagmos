@@ -1391,14 +1391,15 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 return;
             }
             // The same discipline for demand-path instance
-            // resolution (see `convert::resolve_instance_guarded`):
-            // a resolution diagnostic discounted at the resolve
-            // is a finding when the collector collects the
-            // instance, under the instance's key or its
-            // definition's, for the same reason as above.
-            if crate::convert::resolution_emitted(&key)
-                || crate::convert::resolution_emitted(&def_key)
-            {
+            // resolution (see `convert::resolve_instance_guarded`),
+            // with one difference: only the instance's own key
+            // is consulted. A materialization diagnostic is a
+            // property of the one generic body fetched per
+            // definition, but a resolution's outcome depends on
+            // the generic arguments attempted, so a record keyed
+            // by the definition would condemn instantiations
+            // that resolve cleanly.
+            if crate::convert::resolution_emitted(&key) {
                 self.finding = Some(format!(
                     "resolution of `{key}` emitted diagnostics \
                      (rustc reports them for the instances it collects; \

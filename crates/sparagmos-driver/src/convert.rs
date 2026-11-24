@@ -210,25 +210,31 @@ fn note_materialization_lint(key: &str) {
 ///
 /// The discount follows the materialization discipline. When
 /// the run raised the session's non-lint error count, the
-/// emission is recorded under `key` (see
-/// `resolution_emitted`), the error count is reset, and the
-/// returned flag is set: a resolution that emitted
-/// diagnostics is a failed resolution whatever it returned,
-/// and the caller records it with its usual "instance
-/// resolution failed" reason. `mono_check`'s collector replay
-/// turns a record on an instance the collector actually
-/// collects into a finding, so a diagnostic rustc would
-/// report for a collected instance still fails the
-/// compilation. Lint-class growth is never discounted — a
-/// resolution is not expected to lint at all, and leaving the
-/// growth standing keeps its usual effect, exactly as at a
+/// error count is reset and the returned flag is set: a
+/// resolution that emitted diagnostics is a failed resolution
+/// whatever it returned, and the caller records it with its
+/// usual "instance resolution failed" reason. The caller also
+/// records the emission (see `resolution_emitted`) under the
+/// attempted instantiation's own name — never under the
+/// definition's argument-free key. Unlike a body
+/// materialization, whose diagnostics are properties of the
+/// one generic body fetched per definition, a resolution's
+/// outcome depends on the generic arguments attempted (the
+/// resolution query normalizes them), so a record keyed by
+/// the definition would condemn every other instantiation
+/// of it. `mono_check`'s collector replay turns a record on
+/// an instance the collector actually collects into a
+/// finding, so a diagnostic rustc would report for a
+/// collected instance still fails the compilation.
+/// Lint-class growth is never discounted — a resolution is
+/// not expected to lint at all, and leaving the growth
+/// standing keeps its usual effect, exactly as at a
 /// materialization.
 ///
 /// A panic out of the resolution is discounted the same way;
 /// the payload is returned for the caller to resume or
 /// contain as it already does.
 fn with_instance_resolution_contained<R>(
-    key: &str,
     f: impl FnOnce() -> R,
 ) -> (Result<R, Box<dyn std::any::Any + Send>>, bool) {
     let Some(tcx) = compiler_tcx() else {
@@ -242,7 +248,6 @@ fn with_instance_resolution_contained<R>(
     if dcx.err_count() > errors_before {
         let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
         if non_lint_after && !non_lint_before {
-            note_resolution_emission(key);
             dcx.reset_err_count();
             emitted = true;
         }
@@ -256,15 +261,20 @@ fn with_instance_resolution_contained<R>(
 /// diagnostics emitted on the way — to `None`: on the demand
 /// path each is the same "instance resolution failed"
 /// outcome, which the caller records as such. An emission is
-/// recorded under the definition's key by the discount, and
-/// under the resolved instance's own name as well when the
-/// resolution produced one before failing.
+/// recorded under the resolved instance's own name when the
+/// resolution produced one before failing. When it produced
+/// none there is no record: an instantiation the resolution
+/// fails is one the collector's identical `try_resolve` does
+/// not collect either, so a record could never legitimately
+/// fire for it — and keyed by the definition instead, it
+/// would fire against every collected instantiation of the
+/// definition, condemning instantiations that resolve
+/// cleanly.
 pub fn resolve_instance_guarded(
     def: rustc_public::ty::FnDef,
     args: &rustc_public::ty::GenericArgs,
 ) -> Option<Instance> {
-    let key = def.def_id().name();
-    let (result, emitted) = with_instance_resolution_contained(&key, || {
+    let (result, emitted) = with_instance_resolution_contained(|| {
         Instance::resolve(def, args)
     });
     let inst = match result {
@@ -296,8 +306,7 @@ pub fn resolve_closure_guarded(
     args: &rustc_public::ty::GenericArgs,
     kind: rustc_public::ty::ClosureKind,
 ) -> Option<Instance> {
-    let key = def.def_id().name();
-    let (result, emitted) = with_instance_resolution_contained(&key, || {
+    let (result, emitted) = with_instance_resolution_contained(|| {
         Instance::resolve_closure(def, args, kind)
     });
     let inst = match result {
@@ -319,9 +328,11 @@ pub fn resolve_closure_guarded(
 thread_local! {
     /// Keys of the instances whose demand-path resolution
     /// emitted diagnostics that the resolution discount
-    /// recorded: the definition's def path, and the resolved
-    /// instance's own name when resolution produced one.
-    /// Written during collection, read by the compile verdict
+    /// recorded: only the resolved instance's own name (the
+    /// `def_path_str_with_args` form the collector replay
+    /// consults), and only when the resolution produced that
+    /// instance before failing. Written during collection,
+    /// read by the compile verdict
     /// (`mono_check::check_required_consts`); one compilation
     /// runs per process, so nothing clears it.
     static RESOLUTION_EMISSIONS: std::cell::RefCell<std::collections::HashSet<String>> =
