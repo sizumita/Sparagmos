@@ -5562,8 +5562,12 @@ def stage4_artifacts_dir():
     librustc_driver.so)."""
     cand = _STAGE4_ARTIFACTS_ARG or os.environ.get(
         "SPARAGMOS_RUSTDOC_ARTIFACTS")
+    # Resolve to an absolute path: the probe and the guest runs
+    # execute from temporary directories, so a relative configured
+    # directory would validate here yet point nowhere there.
     d = Path(cand).expanduser() if cand else (
         Path.home() / "rustdoc-artifacts-1.100.0")
+    d = d.resolve()
     if (d / "librustdoc.rlib").is_file() \
             and (d / "librustc_driver.so").is_file():
         return d
@@ -5584,7 +5588,10 @@ def stage4_main_rs(rust_dir):
                  / "rustdoc" / "main.rs")
     for p in paths:
         if p.is_file():
-            return p
+            # Absolute for the same reason as in
+            # stage4_artifacts_dir: the guest invocation runs
+            # from a temporary directory.
+            return p.resolve()
     return None
 
 

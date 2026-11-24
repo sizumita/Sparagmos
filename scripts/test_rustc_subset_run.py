@@ -4103,6 +4103,37 @@ class Stage4RustdocTests(unittest.TestCase):
         self.assertEqual(res["bucket"],
                          "not attempted (rustdoc artifact tree)")
 
+    def test_configured_paths_resolve_absolute(self):
+        # --rustdoc-artifacts / --rustdoc-main (and their env
+        # counterparts) may name relative paths: validation runs
+        # in the runner's working directory, but the probe and the
+        # guest runs execute from temporary directories, so the
+        # resolvers must hand back absolute paths.
+        tree = self.rust_dir / "artifacts"
+        tree.mkdir()
+        (tree / "librustdoc.rlib").write_bytes(b"")
+        (tree / "librustc_driver.so").write_bytes(b"")
+        (tree / "main.rs").write_text("fn main() {}\n")
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        self.addCleanup(setattr, run, "_STAGE4_ARTIFACTS_ARG",
+                        run._STAGE4_ARTIFACTS_ARG)
+        self.addCleanup(setattr, run, "_STAGE4_MAIN_RS_ARG",
+                        run._STAGE4_MAIN_RS_ARG)
+        run._STAGE4_ARTIFACTS_ARG = "artifacts"
+        run._STAGE4_MAIN_RS_ARG = "artifacts/main.rs"
+        os.chdir(self.rust_dir)
+        artifacts = run.stage4_artifacts_dir()
+        main_rs = run.stage4_main_rs(self.rust_dir)
+        self.assertEqual(artifacts, tree.resolve())
+        self.assertEqual(main_rs, (tree / "main.rs").resolve())
+        # From any other working directory (the probe's and the
+        # guests' temporary directories), the returned paths must
+        # still name the validated files.
+        os.chdir(self.rust_dir.parent)
+        self.assertTrue((artifacts / "librustdoc.rlib").is_file())
+        self.assertTrue(main_rs.is_file())
+
     # -- UI guest exit statuses --------------------------------------
     #
     # The guest rustdoc's own exit status belongs to the UI
