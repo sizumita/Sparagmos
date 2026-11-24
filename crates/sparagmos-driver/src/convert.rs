@@ -641,7 +641,10 @@ pub struct Converter {
     /// root of every `decode_const` / `decode_ref` tree and spent
     /// once per `decode_const` call, so one constant's total
     /// materialised size is bounded however its element counts
-    /// nest.
+    /// nest. Arms that copy a byte payload spend the copied
+    /// length as well: counting calls alone would let a repeated
+    /// reference to one shared byte block copy that block once
+    /// per element, unbounded by the call count.
     const_budget: usize,
 }
 
@@ -4934,6 +4937,9 @@ impl Converter {
         // allocation behind a `Location` constant carries a
         // trailing NUL byte, for one).
         let data = raw.get(..meta as usize)?.to_vec();
+        if !self.spend_const_budget(data.len()) {
+            return None;
+        }
         Some((data, meta))
     }
 
@@ -5092,6 +5098,18 @@ impl Converter {
         }
     }
 
+    /// Charge `units` against the shared constant-expansion
+    /// budget (see `MAX_CONST_TOTAL_ELEMS`); `false` when the
+    /// charge does not fit, in which case the constant being
+    /// decoded stays undecoded.
+    fn spend_const_budget(&mut self, units: usize) -> bool {
+        if units > self.const_budget {
+            return false;
+        }
+        self.const_budget -= units;
+        true
+    }
+
     /// Decode the value of type `ty` stored in `alloc` at `offset`
     /// into a structured constant. Aggregates are laid out with the
     /// type's own layout (`Ty::layout`), pointers are followed
@@ -5115,15 +5133,15 @@ impl Converter {
         // (see `MAX_CONST_TOTAL_ELEMS`): the root call refills
         // it and every call spends one unit, so the total
         // materialised size is bounded even when declared
-        // element counts nest multiplicatively. A constant
-        // whose expansion exhausts it stays undecoded.
+        // element counts nest multiplicatively. Byte-copying
+        // arms spend the copied length against the same budget.
+        // A constant whose expansion exhausts it stays undecoded.
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
         }
-        if self.const_budget == 0 {
+        if !self.spend_const_budget(1) {
             return None;
         }
-        self.const_budget -= 1;
         // A range whose bytes are all uninitialized is the
         // uninitialized value of this type (the payload of a
         // `MaybeUninit::uninit()` constant, at whichever nesting
@@ -5991,6 +6009,9 @@ impl Converter {
             return None;
         }
         let bytes = alloc.bytes.get(offset..)?.to_vec();
+        if !self.spend_const_budget(bytes.len()) {
+            return None;
+        }
         let mut relocs = Vec::new();
         for (o, _) in &alloc.provenance.ptrs {
             let o = *o as usize;
@@ -6400,6 +6421,9 @@ impl Converter {
                 let len = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
                 let raw = target.raw_bytes().ok()?;
                 let bytes = raw.get(target_off..target_off + len)?;
+                if !self.spend_const_budget(bytes.len()) {
+                    return None;
+                }
                 String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
@@ -6420,6 +6444,9 @@ impl Converter {
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
                     let raw = target.raw_bytes().ok()?;
                     let bytes = raw.get(target_off..target_off + count)?;
+                    if !self.spend_const_budget(bytes.len()) {
+                        return None;
+                    }
                     return Some(sm::ConstValue::Bytes(bytes.to_vec()));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
@@ -6442,6 +6469,9 @@ impl Converter {
                 // fmt pieces template is the canonical case).
                 let raw = target.raw_bytes().ok()?;
                 let bytes = raw.get(target_off..)?;
+                if !self.spend_const_budget(bytes.len()) {
+                    return None;
+                }
                 Some(sm::ConstValue::Bytes(bytes.to_vec()))
             }
             _ => {
@@ -6489,6 +6519,9 @@ impl Converter {
                 ) {
                     if let Ok(raw) = target.raw_bytes() {
                         if raw.len() > target_off + 1 {
+                            if !self.spend_const_budget(raw.len() - target_off) {
+                                return None;
+                            }
                             return Some(sm::ConstValue::Ref(Box::new(
                                 sm::ConstValue::Bytes(raw[target_off..].to_vec()),
                             )));
@@ -8496,6 +8529,9 @@ const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
 /// budget spent by every recursive decode answers that: a
 /// constant whose expansion exceeds it stays undecoded, the
 /// same fallback as any other undecodable constant.
+/// Byte-copying arms spend the copied length against it too,
+/// so repeated references to one shared byte block cannot
+/// multiply that block's copies past the budget either.
 const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
 
 /// Pointer width in bytes on the target this driver runs for

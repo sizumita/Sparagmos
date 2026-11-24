@@ -511,6 +511,54 @@ fn run_mode_nested_zst_elements_under_budget() {
 }
 
 #[test]
+fn run_mode_shared_byte_block_refs_stay_undecoded() {
+    // An array of references to one shared byte block: each
+    // element's decode copies the block's bytes, so counting
+    // decode calls alone would materialise gigabytes here
+    // while spending only ~500,000 budget units. Byte-copying
+    // arms charge the copied length against the shared budget,
+    // so the constant stays undecoded and the run stops at it.
+    let dir = temp_dir("shared-byte-block-refs");
+    let src = fixture(
+        &dir,
+        "shared_byte_block_refs.rs",
+        "static TABLE: [&[u8; 4096]; 500000] = [&[7; 4096]; 500000]; fn main() { println!(\"{}\", TABLE[0][0]); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "repeated copies of one byte block must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_shared_byte_block_refs_under_budget() {
+    // The same shape at a count whose total copied bytes fit
+    // the shared budget still materialises and reads back
+    // exactly.
+    let dir = temp_dir("shared-byte-block-refs-under-budget");
+    let src = fixture(
+        &dir,
+        "shared_byte_block_refs_under_budget.rs",
+        "static TABLE: [&[u8; 4096]; 100] = [&[7; 4096]; 100]; fn main() { println!(\"{} {} {}\", TABLE.len(), TABLE[0][0], TABLE[99][4095]); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "moderate shared byte block refs must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "100 7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the
