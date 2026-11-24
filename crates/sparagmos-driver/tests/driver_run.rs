@@ -16432,6 +16432,58 @@ fn run_mode_from_boxed_slice_to_counted_slice() {
     );
 }
 
+const FROM_VEC_RAW_PTRS_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let v = vec![Box::into_raw(Box::new(42))];
+    let rc: Rc<[*mut i32]> = v.into();
+    let a = unsafe { *rc[0] };
+    let v2 = vec![Box::into_raw(Box::new(7))];
+    let arc: Arc<[*mut i32]> = v2.into();
+    let b = unsafe { *arc[0] };
+    println!("{a} {b} {} {}", rc.len(), arc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_vec_of_raw_ptrs_to_counted_slice() {
+    // `From<Vec<T>>` for `Rc<[T]>` / `Arc<[T]>` where the
+    // vector's single element is an allocation-backed raw
+    // pointer: the vector's value has the same one-field shape
+    // as a box aggregate, so the counted-slice conversion must
+    // not unbox it -- the pointer stays the vector's element,
+    // and its pointee is untouched. (The boxed-source take is
+    // gated on the source type naming `Box`.)
+    run_ok(
+        "from-vec-raw-ptrs",
+        FROM_VEC_RAW_PTRS_SRC,
+        "42 7 1 1\n",
+    );
+}
+
+const FROM_VEC_RAW_PTR_FROM_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let p = Box::into_raw(Box::new(11));
+    let v = vec![p];
+    let rc: Rc<[*mut i32]> = Rc::from(v);
+    println!("{} {}", unsafe { *rc[0] }, rc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_vec_of_raw_ptr_to_counted_slice_via_from() {
+    // The `Rc::from(vec)` spelling of the same conversion.
+    run_ok(
+        "from-vec-raw-ptr-from",
+        FROM_VEC_RAW_PTR_FROM_SRC,
+        "11 1\n",
+    );
+}
+
 #[test]
 fn run_mode_array_into_iter_collect_into_boxed_and_counted_slices() {
     // `array::IntoIter` is a modelled iterator, so its `collect`

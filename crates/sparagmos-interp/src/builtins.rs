@@ -8431,8 +8431,26 @@ impl<'a> Interpreter<'a> {
                     // arm of `unsize_to_slice`). A boxed source
                     // hands over its pointee (releasing the box's
                     // allocation); every other source resolves
-                    // as it is.
-                    let resolved = match self.unbox_take(&value) {
+                    // as it is. The take is gated on the source
+                    // type naming a box: a vector's value has
+                    // the same one-field shape as a box
+                    // aggregate (a single allocation reference),
+                    // so the shape alone cannot decide -- an
+                    // ungated take unwraps a vector's buffer
+                    // and mistakes its contents for the element
+                    // sequence itself.
+                    let boxed_source = matches!(
+                        generic_first_arg(source, "std::boxed::Box<"),
+                        Some(pt) if is_slice_tag(pt)
+                    ) || matches!(
+                        generic_first_arg(source, "alloc::boxed::Box<"),
+                        Some(pt) if is_slice_tag(pt)
+                    );
+                    let resolved = match if boxed_source {
+                        self.unbox_take(&value)
+                    } else {
+                        None
+                    } {
                         Some(pointee) => pointee,
                         None => self.resolve_value(frames, &value)?,
                     };
