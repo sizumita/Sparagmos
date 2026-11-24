@@ -51,7 +51,10 @@ pub struct InterpConfig {
     /// invoked as. The driver sets it to the source path it was
     /// handed (the stand-in for the compiled binary's path: a
     /// natively built test binary is invoked by its own path, and
-    /// the source path is the corresponding name in this model).
+    /// the source path is the corresponding name in this model),
+    /// or to the invocation name it was given separately when it
+    /// reconstructs a run under another name (an artifact run:
+    /// the name the recipe invoked the built binary under).
     /// Empty when no invocation path is known; `env::args` then
     /// yields just the guest arguments.
     pub program_path: String,
@@ -97,6 +100,28 @@ pub struct ToolRunRequest {
     pub envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub env_clear: bool,
     pub cwd: Option<Vec<u8>>,
+    /// The program path the interpreter's own spawn
+    /// resolution (the process model's `execvp` search)
+    /// settled on for this invocation, when it resolved:
+    /// the path the host side must look its answer up by.
+    /// For a bare program name invoked under a
+    /// command-specific `PATH` this differs from the
+    /// spelled `program` -- the artifact the search finds
+    /// is the one the invocation denotes, not a namesake
+    /// in the working directory. `program` itself stays
+    /// as spelled: it is what the program reads as its
+    /// argv[0].
+    pub resolved_program: Option<Vec<u8>>,
+    /// Whether the invocation collects the program's output
+    /// (`Command::output`: the streams are piped, and the
+    /// outcome's bytes are the caller's to keep) or inherits
+    /// them (`Command::status`: the streams are the guest's
+    /// own, and the interpreter relays the outcome's bytes
+    /// into them before it reports the status). The runner
+    /// produces the outcome's bytes either way; the mode is
+    /// part of the request so the host side answers for the
+    /// invocation the guest actually made.
+    pub output_captured: bool,
 }
 
 /// The outcome of one tool invocation, from which the fabricated
@@ -147,6 +172,16 @@ impl Eq for ToolRunner {}
 pub struct ToolInterception {
     pub programs: Vec<Vec<u8>>,
     pub runner: ToolRunner,
+    /// The runner for programs that are NOT in `programs`, when
+    /// the host side can still answer for some of them (the
+    /// driver answers for the artifacts a recipe produced
+    /// earlier in the same run: running one means interpreting
+    /// its recorded source). A fallback `Err` becomes the run's
+    /// unsupported error with the returned text as the reason,
+    /// exactly as a `runner` error does; with no fallback
+    /// configured, an unlisted program keeps the process model's
+    /// standing unsupported answer.
+    pub fallback: Option<ToolRunner>,
 }
 
 /// One call frame: a function's locals plus where to resume.
@@ -434,6 +469,22 @@ pub(crate) struct FmtBuilderState {
     pub result_ok: bool,
 }
 
+/// One stream's `Stdio` configuration, as the guest set it
+/// on a command (see [`CommandState::stdout_stdio`]): the
+/// routing an invocation's outcome bytes get for that
+/// stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StdioConfig {
+    Inherit,
+    Null,
+    Piped,
+    /// A configuration the value model does not decode (the
+    /// file-descriptor form and anything unrecognized): an
+    /// invocation carrying one is reported unsupported
+    /// rather than run with a guessed routing.
+    Unmodelled,
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandState {
     /// The program path as passed to `Command::new` (raw bytes:
@@ -455,6 +506,13 @@ pub(crate) struct CommandState {
     /// byte (std rejects such commands at spawn with an
     /// `InvalidInput` error).
     pub saw_nul: bool,
+    /// The `Stdio` configuration set for the child's stdout,
+    /// when the guest set one; `None` keeps the entry point's
+    /// default (inherit for `status`, piped for `output`).
+    pub stdout_stdio: Option<StdioConfig>,
+    /// The `Stdio` configuration set for the child's stderr;
+    /// see `stdout_stdio`.
+    pub stderr_stdio: Option<StdioConfig>,
 }
 
 /// The channel id carried by an mpsc handle value, if the value

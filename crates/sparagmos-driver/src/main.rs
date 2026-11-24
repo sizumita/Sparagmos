@@ -5811,6 +5811,215 @@ fn session_overflow_checks(args: &[String]) -> bool {
     opt_is_zero
 }
 
+/// The source tree one build converted: every file under
+/// the crate root's directory at the moment of the build,
+/// as (path relative to that directory, bytes) pairs, the
+/// root itself among them under its file name. A crate is
+/// more than its root file -- `mod` files and `include!`
+/// inputs live beside it -- so an artifact denoting "the
+/// program its build produced" must denote the tree, not
+/// the root alone: rewriting only a module file after the
+/// build must not change what an earlier artifact runs,
+/// and rewriting or deleting the root must not orphan the
+/// artifact while its modules survive in the snapshot.
+type SourceTree = Vec<(std::path::PathBuf, Vec<u8>)>;
+
+/// The bounds past which a directory is not read as a
+/// crate's source tree: past them the snapshot keeps the
+/// root alone (the root-only behaviour) rather than
+/// copying a tree the build could not have read whole.
+const SOURCE_TREE_MAX_FILES: usize = 4096;
+const SOURCE_TREE_MAX_BYTES: usize = 64 << 20;
+const SOURCE_TREE_MAX_DEPTH: usize = 32;
+
+/// Read `path` holding at most `limit` bytes: `None` when
+/// the file cannot be opened or read, or when it holds
+/// more than `limit` bytes. The size stands checked from
+/// the metadata before any byte is read, and the read
+/// itself is capped at `limit + 1` bytes, so a file that
+/// grows between the check and the read is caught by the
+/// extra byte rather than allocated whole: a snapshot
+/// read must never take in more than its bound, however
+/// large a file in the tree stands on disk.
+fn read_bounded(path: &std::path::Path, limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if std::fs::metadata(path).ok()?.len() > limit as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Snapshot the source tree rooted at `root` (see
+/// `SourceTree`): the root's own bytes and, recursively,
+/// every regular file under the root's directory, in
+/// deterministic (sorted) order.
+fn snapshot_source_tree(root: &std::path::Path) -> SourceTree {
+    let root_name = root
+        .file_name()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("source.rs"));
+    let root_bytes = read_bounded(root, SOURCE_TREE_MAX_BYTES).unwrap_or_default();
+    let mut tree: SourceTree = vec![(root_name, root_bytes)];
+    if let Some(base) = root.parent() {
+        let mut budget = (SOURCE_TREE_MAX_FILES, SOURCE_TREE_MAX_BYTES);
+        if !collect_source_tree(base, base, 0, &mut tree, &mut budget) {
+            // Over the bounds: keep the root alone.
+            tree.truncate(1);
+            return tree;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    tree.retain(|(rel, _)| seen.insert(rel.clone()));
+    tree.sort();
+    tree
+}
+
+/// The recursive walk under `snapshot_source_tree`; `false`
+/// when the tree runs past the snapshot bounds.
+fn collect_source_tree(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    tree: &mut SourceTree,
+    budget: &mut (usize, usize),
+) -> bool {
+    if depth > SOURCE_TREE_MAX_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable directory contributes nothing.
+        return true;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            if !collect_source_tree(base, &path, depth + 1, tree, budget) {
+                return false;
+            }
+        } else if path.is_file() {
+            if budget.0 == 0 {
+                return false;
+            }
+            // The size stands checked before any read: a
+            // file past the remaining byte budget ends the
+            // walk without its bytes ever being allocated,
+            // however large it stands on disk.
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() > budget.1 as u64 => return false,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            // The read itself stays bounded by the same
+            // budget, so a file that grows between the
+            // check and the read ends the walk the same
+            // way instead of being allocated whole; a file
+            // that cannot be read at all leaves the walk
+            // the same way, since a tree this walk cannot
+            // read whole is not one it can snapshot.
+            let Some(bytes) = read_bounded(&path, budget.1) else {
+                return false;
+            };
+            budget.0 -= 1;
+            budget.1 -= bytes.len();
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            tree.push((rel.to_path_buf(), bytes));
+        }
+    }
+    true
+}
+
+/// Whether the tree standing at `root`'s directory still
+/// denotes the conversion the build made: every file of
+/// `tree` holds the bytes the build converted, and no
+/// source file has been added beside them. An addition
+/// can change what a re-conversion reads even when every
+/// recorded file stands unchanged -- a `mod helper;` the
+/// build resolved to the recorded `helper.rs` gains a
+/// second candidate when `helper/mod.rs` appears beside
+/// it, and converting the live tree then fails with
+/// E0761 although the program the build produced is
+/// unchanged -- so an added `.rs` file anywhere in the
+/// tree ends the intact reading too, and the run falls
+/// back to the recorded snapshot (see
+/// `tree_has_added_source_file`).
+fn source_tree_intact(root: &std::path::Path, tree: &SourceTree) -> bool {
+    let Some(base) = root.parent() else {
+        return false;
+    };
+    if !tree.iter().all(|(rel, bytes)| {
+        read_bounded(&base.join(rel), bytes.len()).is_some_and(|now| now == *bytes)
+    }) {
+        return false;
+    }
+    let recorded: std::collections::HashSet<&std::path::Path> =
+        tree.iter().map(|(rel, _)| rel.as_path()).collect();
+    let mut budget = SOURCE_TREE_MAX_FILES;
+    !tree_has_added_source_file(base, base, 0, &recorded, &mut budget)
+}
+
+/// Whether a `.rs` file the recorded tree does not hold
+/// has appeared anywhere under `dir` (recursing from
+/// `base`): the addition scan behind `source_tree_intact`.
+/// Only `.rs` files take part -- they are the files whose
+/// presence steers source resolution (`mod` candidates
+/// and `#[path]` targets). An added file of any other
+/// kind cannot change what a conversion reads: a file
+/// the build's conversion did read (an `include!` input,
+/// say) stood in the tree at build time, and so stands
+/// recorded. The scan gives up -- reports no addition --
+/// once it has looked at more entries than the snapshot
+/// bounds allow: a tree that large was never recorded
+/// whole (see `snapshot_source_tree`), and its runs keep
+/// the recorded-files-only reading rather than falling
+/// back to a snapshot that does not hold the tree.
+fn tree_has_added_source_file(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    recorded: &std::collections::HashSet<&std::path::Path>,
+    budget: &mut usize,
+) -> bool {
+    if depth > SOURCE_TREE_MAX_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable directory contributes nothing.
+        return false;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let path = entry.path();
+        if path.is_dir() {
+            if tree_has_added_source_file(base, &path, depth + 1, recorded, budget) {
+                return true;
+            }
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            if !recorded.contains(rel) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// One artifact a tool invocation produced, as the registry
 /// remembers it: the name it was built under, the source it was
 /// converted from, and the attributes the producing invocation
@@ -5819,8 +6028,69 @@ fn session_overflow_checks(args: &[String]) -> bool {
 struct ToolArtifact {
     name: String,
     source: std::path::PathBuf,
+    /// The source tree as it stood when the producing
+    /// invocation converted it (see `SourceTree`): a recipe
+    /// may rewrite or delete the source files after
+    /// building, and a later run of the artifact must still
+    /// execute the program its build produced (see
+    /// `ToolRegistry::effective_source`).
+    source_tree: SourceTree,
+    /// The working directory of the producing invocation:
+    /// the directory its relative compilation paths (a
+    /// forwarded `--extern` path, a `-L` directory) were
+    /// resolved against when it converted. A later run of
+    /// the artifact re-converts under this directory, not
+    /// the execution's, so those paths denote the same
+    /// files at both times (see `artifact_run`).
+    build_cwd: std::path::PathBuf,
     edition: Option<String>,
     crate_type: Option<String>,
+    /// The compilation environment the producing invocation
+    /// ran under (its request's environment assignments and
+    /// clear flag): what a later run of the artifact (see
+    /// `artifact_run`) spawns its re-conversion with, so
+    /// compile-time environment reads (`option_env!`, `env!`)
+    /// see the values the build saw, while the interpreted
+    /// program itself runs under the execution request's
+    /// environment.
+    compile_env_clear: bool,
+    compile_envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// The `--aux` specs the producing invocation itself
+    /// carried (its `--extern` bindings, already translated):
+    /// what a later run of the artifact (see `artifact_run`)
+    /// hands to the run subprocess so the artifact's source
+    /// converts against the same libraries its build used.
+    aux_specs: Vec<String>,
+    /// The dependency version each entry of `aux_specs`
+    /// bound when this artifact's build linked it, in the
+    /// same order: the dependency artifact's source path
+    /// and the source tree its build converted. A later run of
+    /// this artifact resolves its `--aux` specs against
+    /// these pins, not against the registry as it then
+    /// stands: the registry replaces a rebuilt artifact's
+    /// entry and keys nothing by version, so resolving by
+    /// source path at execution time would hand the run
+    /// whatever build of the dependency happens to be
+    /// current then -- a library rebuilt after this
+    /// artifact was, or another output built from the
+    /// same source.
+    aux_pins: Vec<(std::path::PathBuf, SourceTree)>,
+    /// The compilation-shaping options the producing
+    /// invocation carried (its forwarded rustc arguments --
+    /// `--cfg`, `--check-cfg`, codegen and lint options, and
+    /// the rest of that family): what a later run of the
+    /// artifact (see `artifact_run`) replays through
+    /// `--rustc-arg` so the recorded source converts under
+    /// the same configuration its build used, not merely
+    /// against the same libraries.
+    rustc_args: Vec<String>,
+    /// The identity (device and inode) of the placeholder
+    /// file the producing invocation left at its output
+    /// path, as it stood when the build recorded it: how a
+    /// later execution lookup tells this artifact's file
+    /// from another's after the recipe renames one over the
+    /// other (see `ToolRegistry::get_for_run`).
+    file_id: Option<(u64, u64)>,
 }
 
 /// The artifact registry of one run (see `execute`): artifact
@@ -5830,6 +6100,44 @@ struct ToolArtifact {
 #[derive(Default)]
 struct ToolRegistry {
     entries: std::sync::Mutex<Vec<(std::path::PathBuf, ToolArtifact)>>,
+    /// Source trees materialised to directories, keyed by
+    /// the artifact's recorded source path, with the tree's
+    /// content hash: a rebuilt artifact at the same path
+    /// with a different tree gets a different directory.
+    /// The value is the materialised root file's path.
+    snapshot_files:
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, std::path::PathBuf)>>,
+}
+
+/// A detached copy of one recorded artifact: the registry
+/// hands these out, so a caller can hold an artifact while
+/// the registry keeps accepting records.
+fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
+    ToolArtifact {
+        name: a.name.clone(),
+        source: a.source.clone(),
+        source_tree: a.source_tree.clone(),
+        build_cwd: a.build_cwd.clone(),
+        edition: a.edition.clone(),
+        crate_type: a.crate_type.clone(),
+        compile_env_clear: a.compile_env_clear,
+        compile_envs: a.compile_envs.clone(),
+        aux_specs: a.aux_specs.clone(),
+        aux_pins: a.aux_pins.clone(),
+        rustc_args: a.rustc_args.clone(),
+        file_id: a.file_id,
+    }
+}
+
+/// The identity (device and inode numbers) of the file at
+/// `path`: what distinguishes one artifact's placeholder
+/// file from another's after a recipe moves files around,
+/// given every placeholder holds the same (empty) bytes.
+/// `None` when the file cannot be stat'ed.
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.dev(), md.ino()))
 }
 
 impl ToolRegistry {
@@ -5839,12 +6147,219 @@ impl ToolRegistry {
             .unwrap()
             .iter()
             .find(|(p, _)| p == path)
-            .map(|(_, a)| ToolArtifact {
-                name: a.name.clone(),
-                source: a.source.clone(),
-                edition: a.edition.clone(),
-                crate_type: a.crate_type.clone(),
+            .map(|(_, a)| cloned_artifact(a))
+    }
+
+    /// The artifact an execution of the file at `path` must
+    /// run. The registry's records are keyed by the path a
+    /// build produced its output at, but a recipe can move
+    /// files after building them -- `std::fs::rename` of one
+    /// artifact over another's path is the plain case -- and
+    /// the interpreter's filesystem builtins perform such
+    /// moves directly on the host, with no word to this
+    /// registry. So the lookup follows the file itself: when
+    /// the file now at `path` carries an identity a build
+    /// recorded, that build's artifact is the program the
+    /// path now denotes, wherever it was recorded under.
+    /// When the path's recorded artifact is no longer the
+    /// file there and no recorded identity matches, what
+    /// stands there is not an artifact this run produced,
+    /// and the execution is refused rather than answered
+    /// with a stale program. When the file cannot be
+    /// stat'ed (it is gone), the path record alone decides,
+    /// as before.
+    fn get_for_run(&self, path: &std::path::Path) -> Result<Option<ToolArtifact>, String> {
+        let entries = self.entries.lock().unwrap();
+        if let Some(id) = file_identity(path) {
+            if let Some((_, a)) = entries.iter().find(|(_, a)| a.file_id == Some(id)) {
+                return Ok(Some(cloned_artifact(a)));
+            }
+            if entries.iter().any(|(p, _)| p == path) {
+                return Err(format!(
+                    "tool interception: the file at `{}` was replaced after it was built; what stands there is not an artifact this run produced",
+                    path.display()
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(entries
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, a)| cloned_artifact(a)))
+    }
+
+    /// The source a conversion of `artifact` must read: the
+    /// recorded path itself while every file of the recorded
+    /// tree still holds the bytes the build converted (the
+    /// common case, and the one whose `file!` spellings stay
+    /// the build's), and a materialised snapshot of the
+    /// recorded tree -- relative layout preserved, so the
+    /// root's `mod` and `include!` inputs stand beside it --
+    /// once the recipe has rewritten or deleted any of it.
+    fn effective_source(&self, artifact: &ToolArtifact) -> std::path::PathBuf {
+        self.effective_source_of(&artifact.source, &artifact.source_tree)
+    }
+
+    /// `effective_source` for a bare (source path, tree)
+    /// pair: an artifact's own source, or one recorded
+    /// dependency pin (see `ToolArtifact::aux_pins`).
+    fn effective_source_of(
+        &self,
+        source: &std::path::Path,
+        tree: &SourceTree,
+    ) -> std::path::PathBuf {
+        if source_tree_intact(source, tree) {
+            return source.to_path_buf();
+        }
+        use std::hash::Hasher as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (rel, bytes) in tree {
+            hasher.write(rel.as_os_str().as_bytes());
+            hasher.write(bytes);
+        }
+        let hash = hasher.finish();
+        let mut files = self.snapshot_files.lock().unwrap();
+        if let Some((h, path)) = files.get(source) {
+            if *h == hash {
+                return path.clone();
+            }
+        }
+        let root_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source.rs".to_string());
+        let base =
+            std::env::temp_dir().join(format!("sparagmos-artifact-sources-{}", std::process::id()));
+        let dir = base.join(format!("{hash:016x}"));
+        for (rel, bytes) in tree {
+            let target = dir.join(rel);
+            if let Some(parent) = target.parent() {
+                // The materialised tree copies every recorded
+                // neighbouring file verbatim -- a private file
+                // beside the crate root among them -- so it
+                // must not stand in the shared temporary
+                // directory under the default permissions:
+                // keep every directory of it owner-only. The
+                // mode is set at creation time, not tightened
+                // afterwards: a create-then-tighten sequence
+                // leaves a window in which a concurrent
+                // observer sees the tree at the default mode
+                // (a parallel test run caught exactly that in
+                // CI). The restriction below is still applied
+                // on each visit, so a directory an older run
+                // left at this pid's name is tightened too.
+                use std::os::unix::fs::DirBuilderExt as _;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent);
+                for ancestor in parent.ancestors() {
+                    if !ancestor.starts_with(&base) {
+                        break;
+                    }
+                    restrict_to_owner(ancestor, 0o700);
+                    if ancestor == base {
+                        break;
+                    }
+                }
+            }
+            // Owner-only from the moment the file exists,
+            // and tightened again after the write in case a
+            // file of that name already stood there.
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&target)
+                .and_then(|mut f| f.write_all(bytes));
+            restrict_to_owner(&target, 0o600);
+        }
+        let path = dir.join(root_name);
+        files.insert(source.to_path_buf(), (hash, path.clone()));
+        path
+    }
+
+    /// The path-prefix remap a conversion reading the
+    /// source at `source` from its snapshot needs, so the
+    /// converted program's source-location spellings
+    /// (`file!` and its kin) stay the build's: when the
+    /// recorded tree no longer stands intact, the
+    /// conversion reads the materialised snapshot under
+    /// the returned scratch directory, while the build
+    /// read the same relative layout under the recorded
+    /// source's own directory -- the pair to hand rustc as
+    /// `--remap-path-prefix <from>=<to>`. `None` when the
+    /// recorded path itself is read (the intact case,
+    /// whose spellings already are the build's).
+    fn snapshot_remap(
+        &self,
+        source: &std::path::Path,
+        tree: &SourceTree,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        if source_tree_intact(source, tree) {
+            return None;
+        }
+        let materialised = self.effective_source_of(source, tree);
+        let from = materialised.parent()?.to_path_buf();
+        let to = source.parent()?.to_path_buf();
+        Some((from, to))
+    }
+
+    /// One `--aux` spec with its source path routed
+    /// through a recorded dependency pin rather than the
+    /// registry's current state: the conversion the spec
+    /// feeds reads the tree the pinned build converted,
+    /// even if the dependency has since been rebuilt (at
+    /// the same output path, or as another output from
+    /// the same source).
+    fn pinned_aux_spec(&self, spec: &str, pin: &(std::path::PathBuf, SourceTree)) -> String {
+        let Some((name, rest)) = spec.split_once('=') else {
+            return spec.to_string();
+        };
+        let attrs = match rest.split_once(';') {
+            Some((_, a)) => format!(";{a}"),
+            None => String::new(),
+        };
+        format!(
+            "{}={}{}",
+            name,
+            self.effective_source_of(&pin.0, &pin.1).display(),
+            attrs
+        )
+    }
+
+    /// `specs` with each entry routed through its
+    /// recorded pin (see `pinned_aux_spec`). Specs and
+    /// pins are recorded together by `tool_run`, so a
+    /// spec without a pin does not arise for a recorded
+    /// artifact; should one appear anyway it stands as
+    /// recorded -- no resolution against the registry's
+    /// current state happens anywhere on this path.
+    fn pinned_aux_specs(
+        &self,
+        specs: &[String],
+        pins: &[(std::path::PathBuf, SourceTree)],
+    ) -> Vec<String> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match pins.get(i) {
+                Some(pin) => self.pinned_aux_spec(s, pin),
+                None => s.clone(),
             })
+            .collect()
+    }
+
+    /// The `--aux` specs a run of `artifact` hands its
+    /// subprocess: the specs its build recorded, each
+    /// resolved against the dependency version that
+    /// build bound (see `ToolArtifact::aux_pins`).
+    fn artifact_aux_specs(&self, artifact: &ToolArtifact) -> Vec<String> {
+        self.pinned_aux_specs(&artifact.aux_specs, &artifact.aux_pins)
     }
 
     fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
@@ -5861,17 +6376,7 @@ impl ToolRegistry {
             .lock()
             .unwrap()
             .iter()
-            .map(|(p, a)| {
-                (
-                    p.clone(),
-                    ToolArtifact {
-                        name: a.name.clone(),
-                        source: a.source.clone(),
-                        edition: a.edition.clone(),
-                        crate_type: a.crate_type.clone(),
-                    },
-                )
-            })
+            .map(|(p, a)| (p.clone(), cloned_artifact(a)))
             .collect()
     }
 }
@@ -5937,7 +6442,8 @@ fn child_stream(stderr: &[u8]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Run this driver binary in convert mode as a subprocess and
+/// Run this driver binary as a subprocess (convert mode for a
+/// tool invocation, run mode for an artifact invocation) and
 /// collect (exit code, stdout, stderr). The guest command's
 /// environment is applied over the inherited one, as a real
 /// spawn would apply it.
@@ -5945,7 +6451,8 @@ fn run_convert_subprocess(
     exe: &std::path::Path,
     tail: &[String],
     cwd: &std::path::Path,
-    request: &sparagmos_interp::ToolRunRequest,
+    env_clear: bool,
+    envs: &[(Vec<u8>, Option<Vec<u8>>)],
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -5954,10 +6461,10 @@ fn run_convert_subprocess(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if request.env_clear {
+    if env_clear {
         cmd.env_clear();
     }
-    for (key, value) in &request.envs {
+    for (key, value) in envs {
         match value {
             Some(v) => {
                 cmd.env(
@@ -5971,7 +6478,7 @@ fn run_convert_subprocess(
         }
     }
     let mut child = cmd.spawn().map_err(|e| {
-        format!("tool interception: cannot start the conversion subprocess: {e}")
+        format!("tool interception: cannot start the tool subprocess: {e}")
     })?;
     let mut out_pipe = child.stdout.take().expect("piped stdout");
     let mut err_pipe = child.stderr.take().expect("piped stderr");
@@ -5994,7 +6501,7 @@ fn run_convert_subprocess(
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(
-                        "tool interception: the conversion subprocess timed out"
+                        "tool interception: the tool subprocess timed out"
                             .to_string(),
                     );
                 }
@@ -6002,7 +6509,7 @@ fn run_convert_subprocess(
             }
             Err(e) => {
                 return Err(format!(
-                    "tool interception: waiting on the conversion subprocess failed: {e}"
+                    "tool interception: waiting on the tool subprocess failed: {e}"
                 ));
             }
         }
@@ -6010,6 +6517,222 @@ fn run_convert_subprocess(
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
     Ok((status.code().unwrap_or(101), stdout, stderr))
+}
+
+/// Create a fresh file in the shared temporary directory
+/// that no other account can read or predict: the name
+/// carries the process id, a per-process sequence, and the
+/// wall-clock nanosecond stamp; the open is `create_new`,
+/// so an existing namesake is never truncated (the name is
+/// retried instead); and the permissions are owner-only
+/// from the moment the file exists. For files whose
+/// contents are worth keeping from other accounts on a
+/// shared host -- the guest environment file is the one
+/// here (see `write_guest_env_file`).
+/// Set `path`'s permissions to the owner-only `mode`,
+/// best-effort. For the directories and files of a
+/// materialised source snapshot (see
+/// `ToolRegistry::effective_source_of`): the snapshot
+/// copies recorded neighbouring files verbatim, so its
+/// scratch tree in the shared temporary directory must
+/// not be traversable or readable by other accounts.
+fn restrict_to_owner(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+fn create_private_temp_file(tag: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "sparagmos-{tag}-{}-{seq}-{nanos:x}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free private temporary file name",
+    ))
+}
+
+/// Write one complete environment assignment (the environment
+/// an interpreted program is to run under, as `artifact_run`
+/// computed it from the execution request) to a fresh private
+/// temporary file (see `create_private_temp_file`), in the
+/// length-prefixed binary form `read_guest_env_file` reads:
+/// a sequence of key/value records, each two u32-LE-length-
+/// prefixed byte strings. The assignment is complete, not a
+/// delta: the reader replaces its whole environment with it,
+/// so no variable from the conversion's environment can leak
+/// into the program's. The file is private because the
+/// assignment is this process's whole environment --
+/// inherited credentials and tokens included -- and it
+/// stands in the shared temporary directory for the run's
+/// whole duration. Returns the file's path; the caller
+/// removes it once the run is over.
+fn write_guest_env_file(env: &[(Vec<u8>, Vec<u8>)]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    for (key, value) in env {
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+    let (path, mut file) = create_private_temp_file("artifact-env")?;
+    if let Err(e) = file.write_all(&buf) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// Read back a file `write_guest_env_file` wrote.
+fn read_guest_env_file(path: &std::path::Path) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let buf = std::fs::read(path)?;
+    let mut env = Vec::new();
+    let mut at = 0usize;
+    let take = |buf: &[u8], at: &mut usize| -> std::io::Result<Vec<u8>> {
+        let len = |buf: &[u8], at: &mut usize| -> std::io::Result<usize> {
+            let bytes = buf.get(*at..*at + 4).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated env file")
+            })?;
+            *at += 4;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+        };
+        let n = len(buf, at)?;
+        let bytes = buf.get(*at..*at + n).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated env file")
+        })?;
+        *at += n;
+        Ok(bytes.to_vec())
+    };
+    while at < buf.len() {
+        let key = take(&buf, &mut at)?;
+        let value = take(&buf, &mut at)?;
+        env.push((key, value));
+    }
+    Ok(env)
+}
+
+/// Replace this process's environment with the complete
+/// assignment `env`: the run entry point applies the guest
+/// environment file with this after the conversion is done,
+/// so the interpreted program's environment reads (which the
+/// interpreter answers from the host environment) see the
+/// environment the program was invoked with, not the one its
+/// source was converted under.
+fn apply_guest_env(env: &[(Vec<u8>, Vec<u8>)]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    for (key, _) in std::env::vars_os() {
+        std::env::remove_var(&key);
+    }
+    for (key, value) in env {
+        std::env::set_var(
+            std::ffi::OsStr::from_bytes(key),
+            std::ffi::OsStr::from_bytes(value),
+        );
+    }
+}
+
+/// The literal `include!` paths a source text names, in
+/// order: `include!` followed by a string literal, the
+/// only spelling rustc accepts for the path.
+fn literal_include_paths(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while let Some(at) = text[i..].find("include!") {
+        let mut j = i + at + "include!".len();
+        i = j;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            continue;
+        }
+        j += 1;
+        let mut path = String::new();
+        while j < bytes.len() && bytes[j] != b'"' {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 1;
+            }
+            path.push(bytes[j] as char);
+            j += 1;
+        }
+        if j < bytes.len() {
+            paths.push(path);
+            i = j;
+        }
+    }
+    paths
+}
+
+/// Whether the crate rooted at `root` declares a `main`
+/// function: the root's own text, or the text of a file
+/// the root splices in through a literal `include!`
+/// (transitively, each include resolved against the
+/// including file's directory). A `mod` file cannot hold
+/// the crate's entry point, but an included file is root
+/// text by other means, and a root that only includes
+/// its `main` still builds a binary under a real rustc --
+/// the root-only reading would record such a build as a
+/// library, and the artifact could never be run.
+fn crate_root_has_main(root: &std::path::Path, root_text: &str) -> bool {
+    if root_text.contains("fn main") {
+        return true;
+    }
+    let base = root.parent().unwrap_or(root);
+    let mut frontier: Vec<std::path::PathBuf> = literal_include_paths(root_text)
+        .iter()
+        .map(|rel| base.join(rel))
+        .collect();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> =
+        frontier.iter().cloned().collect();
+    let mut steps = 0;
+    while let Some(path) = frontier.pop() {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains("fn main") {
+            return true;
+        }
+        let base = path.parent().unwrap_or(&path).to_path_buf();
+        for rel in literal_include_paths(&text) {
+            let next = base.join(rel);
+            if seen.insert(next.clone()) {
+                frontier.push(next);
+            }
+        }
+    }
+    false
 }
 
 /// Answer one intercepted tool invocation (a run-make recipe's
@@ -6032,11 +6755,22 @@ fn tool_run(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
-        Some(dir) => {
-            std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone()))
-        }
+        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
+    };
+    // A guest-spelled directory is relative to this
+    // process's own working directory (the parent the
+    // child would have inherited it from); make it stand
+    // on its own, so the paths resolved against it -- the
+    // recorded build directory among them -- keep their
+    // meaning wherever they are read back.
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?
+            .join(cwd)
     };
     let args: Vec<String> = request
         .args
@@ -6051,6 +6785,12 @@ fn tool_run(
     let mut crate_types: Vec<String> = Vec::new();
     let mut forward: Vec<String> = Vec::new();
     let mut aux: Vec<String> = Vec::new();
+    // The dependency version each `aux` entry binds, in
+    // the same order (see `ToolArtifact::aux_pins`): the
+    // specs are resolved through these pins, so a build
+    // -- and the artifact it records -- keeps the
+    // dependency builds it actually named.
+    let mut aux_pins: Vec<(std::path::PathBuf, SourceTree)> = Vec::new();
     let mut emits: Vec<(String, Option<String>)> = Vec::new();
     let mut out_file: Option<String> = None;
     let mut out_dir: Option<String> = None;
@@ -6127,7 +6867,10 @@ fn tool_run(
                         registry.get(&abs).map(|art| (name.clone(), art))
                     });
                     match bound {
-                        Some((name, art)) => aux.push(aux_spec_for(&name, &art)),
+                        Some((name, art)) => {
+                            aux_pins.push((art.source.clone(), art.source_tree.clone()));
+                            aux.push(aux_spec_for(&name, &art));
+                        }
                         None => {
                             // A real file (a sysroot or prebuilt
                             // rlib) or a name the session must
@@ -6192,16 +6935,16 @@ fn tool_run(
             }
         };
         let mut tail = vec![input];
-        for spec in &aux {
+        for spec in registry.pinned_aux_specs(&aux, &aux_pins) {
             tail.push("--aux".to_string());
-            tail.push(spec.clone());
+            tail.push(spec);
         }
         for tok in &forward {
             tail.push("--rustc-arg".to_string());
             tail.push(tok.clone());
         }
         let (code, _stdout, stderr) =
-            run_convert_subprocess(exe, &tail, &cwd, request)?;
+            run_convert_subprocess(exe, &tail, &cwd, request.env_clear, &request.envs)?;
         let text = child_stream(&stderr);
         return Ok(if code == 0 {
             sparagmos_interp::ToolRunOutcome {
@@ -6232,6 +6975,12 @@ fn tool_run(
             .unwrap_or_else(|| "crate".to_string())
     });
     let source_text = std::fs::read_to_string(&input_abs).unwrap_or_default();
+    // The source tree this build converts, snapshotted
+    // into every artifact it records: the recipe may
+    // rewrite or delete the sources once the build returns,
+    // and the artifact must still denote the program this
+    // invocation produced.
+    let source_tree = snapshot_source_tree(&input_abs);
 
     // Registered artifacts the input declares through
     // `extern crate` items bind too (the driver's session
@@ -6241,6 +6990,7 @@ fn tool_run(
         if source_text.contains(&needle)
             && !aux.iter().any(|s| s == &aux_spec_for(&art.name, &art))
         {
+            aux_pins.push((art.source.clone(), art.source_tree.clone()));
             aux.push(aux_spec_for(&art.name, &art));
         }
     }
@@ -6264,9 +7014,9 @@ fn tool_run(
         "--edition".to_string(),
         edition.clone(),
     ];
-    for spec in &aux {
+    for spec in registry.pinned_aux_specs(&aux, &aux_pins) {
         tail.push("--aux".to_string());
-        tail.push(spec.clone());
+        tail.push(spec);
     }
     for tok in &forward {
         tail.push("--rustc-arg".to_string());
@@ -6276,7 +7026,8 @@ fn tool_run(
         tail.push("--dump".to_string());
         tail.push(dump.display().to_string());
     }
-    let (code, stdout, stderr) = run_convert_subprocess(exe, &tail, &cwd, request)?;
+    let (code, stdout, stderr) =
+        run_convert_subprocess(exe, &tail, &cwd, request.env_clear, &request.envs)?;
 
     // The verdict: exit 0 only when the target crate converted
     // with nothing skipped. The report's target-crate line is
@@ -6307,7 +7058,7 @@ fn tool_run(
     // would have produced, so later invocations and the
     // recipe's own file checks find them.
     let types: Vec<String> = if crate_types.is_empty() {
-        let has_main = source_text.contains("fn main");
+        let has_main = crate_root_has_main(&input_abs, &source_text);
         let wants_metadata = emits.iter().any(|(k, _)| k == "metadata");
         if wants_metadata {
             vec!["rmeta".to_string()]
@@ -6321,6 +7072,7 @@ fn tool_run(
     };
     let mut primary: Option<std::path::PathBuf> = None;
     let mut record = |path: std::path::PathBuf,
+                      crate_type: Option<String>,
                       registry: &ToolRegistry,
                       primary: &mut Option<std::path::PathBuf>| {
         if primary.is_none() {
@@ -6330,22 +7082,47 @@ fn tool_run(
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&path, b"");
+        if crate_type.as_deref() == Some("bin") {
+            // A real compiler's binary output is executable:
+            // the recipe's spawn of it (and its own executable
+            // checks) must find it so.
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
+        let file_id = file_identity(&path);
         registry.record(
             path,
             ToolArtifact {
                 name: crate_name.clone(),
                 source: input_abs.clone(),
+                source_tree: source_tree.clone(),
+                build_cwd: cwd.clone(),
                 edition: Some(edition.clone()),
-                crate_type: (types.len() == 1).then(|| types[0].clone()),
+                crate_type,
+                compile_env_clear: request.env_clear,
+                compile_envs: request.envs.clone(),
+                aux_specs: aux.clone(),
+                aux_pins: aux_pins.clone(),
+                rustc_args: forward.clone(),
+                file_id,
             },
         );
     };
     if let Some(out) = &out_file {
-        record(absolutize(&cwd, out), registry, &mut primary);
+        // `-o` names the invocation's one output (a real rustc
+        // refuses `-o` with several crate types), so the type is
+        // known exactly when the invocation carried one.
+        record(
+            absolutize(&cwd, out),
+            (types.len() == 1).then(|| types[0].clone()),
+            registry,
+            &mut primary,
+        );
     } else {
         for ty in &types {
             record(
                 out_base.join(artifact_filename(&crate_name, ty)),
+                Some(ty.clone()),
                 registry,
                 &mut primary,
             );
@@ -6358,7 +7135,7 @@ fn tool_run(
                     Some(p) => absolutize(&cwd, p),
                     None => out_base.join(artifact_filename(&crate_name, "rmeta")),
                 };
-                record(p, registry, &mut primary);
+                record(p, Some("rmeta".to_string()), registry, &mut primary);
             }
             "dep-info" => {
                 let p = match path {
@@ -6424,6 +7201,302 @@ fn tool_run(
     })
 }
 
+/// Answer one invocation of a program the guest itself
+/// produced earlier in this run (a run-make recipe running a
+/// binary it just built): the artifact registry knows the
+/// path, so the run is this driver binary in run mode over
+/// the recorded source, with the `--aux` bindings and the
+/// compilation-shaping options the producing invocation
+/// carried and the guest's arguments as the program's own.
+/// This is the stage-3 harness's reading of "execute the
+/// built binary": the program's input/output and exit code
+/// are the interpreter's, not a native binary's (see
+/// docs/CI.md). Programs the registry does not know, and
+/// artifacts that are not binaries, stay unsupported -- as
+/// does a recorded program the driver cannot itself run, so
+/// the harness keeps sorting those recipes as unsupported
+/// rather than failed.
+///
+/// The run is reconstructed from what the producing
+/// invocation carried, not from the file system as it now
+/// stands: the source it converts is the recorded path while
+/// every file of its tree still holds the build's bytes, and
+/// the recorded snapshot once the recipe has rewritten or
+/// deleted any of it (see `ToolRegistry::effective_source`),
+/// and its `--aux` bindings
+/// likewise resolve against the dependency versions its build
+/// bound, not the registry's current entries (see
+/// `ToolArtifact::aux_pins`); the program's argv[0]
+/// is the name the recipe invoked it under, not the source
+/// path; and the two environments are kept apart -- the
+/// subprocess is spawned under the producing invocation's
+/// compilation environment, so compile-time environment
+/// reads see the build's values, and the execution request's
+/// environment is handed over as a complete assignment the
+/// subprocess applies to itself once the conversion is done
+/// (see `--guest-env-file`), so the program's own environment
+/// reads see the values it was invoked with and nothing from
+/// the build leaks into them.
+///
+/// The two working directories are kept apart the same
+/// way: the subprocess is spawned in the producing
+/// invocation's working directory (see
+/// `ToolArtifact::build_cwd`), so the compilation-shaping
+/// arguments it replays -- a forwarded relative `--extern`
+/// path, a `-L` directory -- resolve to the files they
+/// denoted at build time, and the requested execution
+/// directory is handed over as `--guest-cwd`, which the
+/// subprocess enters once its conversion is done, so the
+/// program itself runs where the recipe invoked it.
+///
+/// The lookup path the interpreter's spawn resolution
+/// settled on is read against the directory that
+/// resolution ran in -- this process's own working
+/// directory -- not the execution directory: the
+/// resolution already applied the child's directory to a
+/// spelled path (and a relative `PATH` entry is relative
+/// to the searching process), so standing it on the
+/// execution directory would apply the child's directory
+/// twice. The guest arguments travel to the subprocess as
+/// command-line strings, so an argument that is not valid
+/// UTF-8 cannot be carried unchanged and makes the
+/// invocation unsupported instead of lossy.
+///
+/// The subprocess keeps the two stderr channels apart: the
+/// recorded program's own stderr travels through the file
+/// named by `--guest-stderr-file` and is relayed byte for
+/// byte, while the subprocess's stderr carries only the
+/// driver's own lines. The channel file is allocated
+/// owner-only under an unpredictable name before the
+/// subprocess starts (see `create_private_temp_file`), as
+/// the environment file is: the program's stderr can carry
+/// the recipe's own diagnostics and secrets, so it is no
+/// more exposed to other accounts than the environment is.
+/// That separation is also what tells a
+/// driver failure from the program's own exit: the run
+/// subprocess exits 2 both when it cannot run the recorded
+/// program and when the program itself exits 2, but only
+/// the driver failure reports a `sparagmos-driver` line on
+/// its stderr.
+fn artifact_run(
+    request: &sparagmos_interp::ToolRunRequest,
+    registry: &ToolRegistry,
+    exe: &std::path::Path,
+) -> Result<sparagmos_interp::ToolRunOutcome, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    let cwd: std::path::PathBuf = match &request.cwd {
+        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        None => std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?,
+    };
+    // As in `tool_run`: a guest-spelled directory is
+    // relative to this process's own, and the execution
+    // directory is handed to a subprocess that starts in
+    // the build's directory, so it must stand on its own.
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?
+            .join(cwd)
+    };
+    let program = String::from_utf8_lossy(&request.program).into_owned();
+    // The lookup follows the path the interpreter's spawn
+    // resolution settled on, not the spelled name: a bare
+    // name invoked under a command-specific `PATH` denotes
+    // the artifact that search found, not a namesake in
+    // the working directory (see
+    // `ToolRunRequest::resolved_program`). The spelled
+    // name remains what the run presents as argv[0].
+    let path = match &request.resolved_program {
+        Some(resolved) => {
+            let resolved = std::path::PathBuf::from(std::ffi::OsString::from_vec(resolved.clone()));
+            if resolved.is_absolute() {
+                resolved
+            } else {
+                // The resolution settled this path against
+                // this process's own working directory (the
+                // directory the interpreter's spawn search
+                // ran in), not the execution directory: a
+                // spelling like `sub/./prog` already carries
+                // the child's directory, and standing it on
+                // the execution directory would apply that
+                // directory twice.
+                std::env::current_dir()
+                    .map_err(|e| format!("tool interception: no working directory: {e}"))?
+                    .join(resolved)
+            }
+        }
+        None => absolutize(&cwd, &program),
+    };
+    let artifact = match registry.get_for_run(&path) {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            return Err(format!(
+                "tool interception: program `{program}` is not an artifact this run produced"
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if artifact.crate_type.as_deref() != Some("bin") {
+        return Err(format!(
+            "tool interception: artifact `{program}` is not a binary this run produced"
+        ));
+    }
+    // The recorded program's stderr gets its own channel,
+    // so nothing of it is filtered or rewritten on its way
+    // to the recipe. The channel is a private temporary
+    // file (see `create_private_temp_file`), allocated
+    // before the subprocess starts: it stands owner-only
+    // under an unpredictable name for the whole run, so
+    // the guest's stderr is never readable by another
+    // account while it stands, and the subprocess writes
+    // into the file that is already there, keeping its
+    // permissions.
+    let (stderr_path, stderr_file) =
+        create_private_temp_file("artifact-stderr").map_err(|e| {
+            format!("tool interception: cannot allocate the guest stderr channel: {e}")
+        })?;
+    drop(stderr_file);
+    // The environment the recorded program runs under, as a
+    // complete assignment: this process's environment (the
+    // guest's own, which the interpreter answers its
+    // environment reads from) with the execution request's
+    // assignments applied -- or, when the request clears the
+    // environment, exactly the request's assignments.
+    let mut guest_env: Vec<(Vec<u8>, Vec<u8>)> = if request.env_clear {
+        Vec::new()
+    } else {
+        std::env::vars_os()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    };
+    for (key, value) in &request.envs {
+        match value {
+            Some(v) => {
+                if let Some(slot) = guest_env.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = v.clone();
+                } else {
+                    guest_env.push((key.clone(), v.clone()));
+                }
+            }
+            None => guest_env.retain(|(k, _)| k != key),
+        }
+    }
+    let env_path = write_guest_env_file(&guest_env).map_err(|e| {
+        format!("tool interception: cannot record the guest environment: {e}")
+    })?;
+    // The name the program reads as its argv[0]: the explicit
+    // argv0 the invocation carried, else the program name as
+    // the recipe spelled it -- never the source path the run
+    // is reconstructed from.
+    let program_name = match &request.argv0 {
+        Some(argv0) => String::from_utf8_lossy(argv0).into_owned(),
+        None => program.clone(),
+    };
+    let mut tail = vec![
+        "run".to_string(),
+        registry.effective_source(&artifact).display().to_string(),
+    ];
+    if let Some(edition) = &artifact.edition {
+        tail.push("--edition".to_string());
+        tail.push(edition.clone());
+    }
+    for spec in registry.artifact_aux_specs(&artifact) {
+        tail.push("--aux".to_string());
+        tail.push(spec);
+    }
+    for tok in &artifact.rustc_args {
+        tail.push("--rustc-arg".to_string());
+        tail.push(tok.clone());
+    }
+    // A recorded source tree that no longer stands intact
+    // is read from its materialised snapshot under a
+    // scratch directory; remap that directory back to the
+    // recorded source's own directory, so the program's
+    // source-location spellings stay the build's (see
+    // `ToolRegistry::snapshot_remap`). The artifact's own
+    // tree and every pinned dependency's tree take part.
+    let mut remap_trees: Vec<(&std::path::Path, &SourceTree)> =
+        vec![(&artifact.source, &artifact.source_tree)];
+    for pin in &artifact.aux_pins {
+        remap_trees.push((&pin.0, &pin.1));
+    }
+    for (source, tree) in remap_trees {
+        if let Some((from, to)) = registry.snapshot_remap(source, tree) {
+            tail.push("--rustc-arg".to_string());
+            tail.push("--remap-path-prefix".to_string());
+            tail.push("--rustc-arg".to_string());
+            tail.push(format!("{}={}", from.display(), to.display()));
+        }
+    }
+    tail.push("--guest-cwd".to_string());
+    tail.push(cwd.display().to_string());
+    tail.push("--guest-stderr-file".to_string());
+    tail.push(stderr_path.display().to_string());
+    tail.push("--guest-env-file".to_string());
+    tail.push(env_path.display().to_string());
+    tail.push("--guest-program-name".to_string());
+    tail.push(program_name);
+    // The arguments travel as command-line strings, and
+    // the interpreter's argument model holds text: an
+    // argument that is not valid UTF-8 cannot be carried
+    // without changing its bytes, so the invocation is
+    // unsupported rather than silently lossy.
+    for arg in &request.args {
+        if std::str::from_utf8(arg).is_err() {
+            let _ = std::fs::remove_file(&stderr_path);
+            let _ = std::fs::remove_file(&env_path);
+            return Err(format!(
+                "tool interception: running artifact `{program}`: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
+            ));
+        }
+        tail.push("--guest-arg".to_string());
+        tail.push(String::from_utf8_lossy(arg).into_owned());
+    }
+    let outcome = run_convert_subprocess(
+        exe,
+        &tail,
+        &artifact.build_cwd,
+        artifact.compile_env_clear,
+        &artifact.compile_envs,
+    );
+    let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stderr_path);
+    let _ = std::fs::remove_file(&env_path);
+    let (code, stdout, stderr) = outcome?;
+    if code == 2 {
+        // Exit 2 is both the subprocess's driver-failure code
+        // and a code the recorded program itself may exit
+        // with; the driver's own stderr channel tells them
+        // apart (see the doc comment above). A driver failure
+        // makes the recipe's invocation unsupported, with the
+        // subprocess's own named reason when it gave one; no
+        // driver line means the program ran and chose 2.
+        let text = String::from_utf8_lossy(&stderr);
+        let reason = text.lines().find_map(|line| {
+            line.strip_prefix("sparagmos-driver run: unsupported: ")
+                .or_else(|| line.strip_prefix("sparagmos-driver: compilation failed: "))
+                .map(|rest| rest.to_string())
+        });
+        let driver_failed = reason.is_some()
+            || text.lines().any(|line| line.starts_with("sparagmos-driver"));
+        if driver_failed {
+            let reason =
+                reason.unwrap_or_else(|| "the recorded program could not be run".to_string());
+            return Err(format!(
+                "tool interception: running artifact `{program}`: {reason}"
+            ));
+        }
+    }
+    Ok(sparagmos_interp::ToolRunOutcome {
+        exit_code: code,
+        stdout,
+        stderr: guest_stderr,
+    })
+}
+
 /// A converted program ready to run, with its entry point
 /// resolved: the shared front half of the run and debug entry
 /// points (the two differ only in how the interpreter is driven).
@@ -6442,11 +7515,15 @@ struct BuiltProgram {
 }
 
 /// Build the interpreter program from a collection and resolve
-/// its entry point. On failure the run-mode error has already
-/// been reported and the `Err` carries the process exit code.
+/// its entry point. `program_name` is the name the entry
+/// invocation presents as argv[0] (the invocation path, which
+/// a caller reconstructing a run may name separately from the
+/// source it converted). On failure the run-mode error has
+/// already been reported and the `Err` carries the process
+/// exit code.
 fn build_program(
     c: &Collected,
-    input: &str,
+    program_name: &str,
     guest_args: &[String],
 ) -> Result<BuiltProgram, i32> {
     let mut program = sparagmos_interp::MirProgram::new();
@@ -6546,7 +7623,7 @@ fn build_program(
     let entry_arg_count = c.bodies[entry_index].1.arg_count;
     let entry_args: Vec<sparagmos_interp::Value> = if entry_arg_count == 2 {
         let mut argv: Vec<sparagmos_interp::Value> = Vec::new();
-        let mut all_args = vec![input.to_string()];
+        let mut all_args = vec![program_name.to_string()];
         all_args.extend(guest_args.iter().cloned());
         for arg in &all_args {
             let mut bytes = arg.as_bytes().to_vec();
@@ -6588,8 +7665,16 @@ fn execute(
     guest_args: &[String],
     overflow_checks: bool,
     tool_programs: &[String],
+    guest_stderr_file: Option<&str>,
+    program_name: Option<&str>,
 ) -> i32 {
-    let built = match build_program(c, input, guest_args) {
+    // The name the program reads as its argv[0]: the input
+    // path by default (the stand-in for the compiled binary's
+    // path), or the name the caller names separately when it
+    // reconstructs a run under a different invocation name
+    // (an artifact run answering a recipe: see `artifact_run`).
+    let program_name = program_name.unwrap_or(input);
+    let built = match build_program(c, program_name, guest_args) {
         Ok(b) => b,
         Err(code) => return code,
     };
@@ -6608,12 +7693,16 @@ fn execute(
     // process. The artifact registry is shared by every
     // invocation of the run: a recipe builds a crate once and
     // names the artifact as an `--extern` input to later
-    // invocations.
+    // invocations -- and, through the fallback runner, runs the
+    // artifact itself, which `artifact_run` answers by
+    // interpreting the recorded source.
     let tool_interception = if tool_programs.is_empty() {
         None
     } else {
         let registry = std::sync::Arc::new(ToolRegistry::default());
         let exe = std::env::current_exe().unwrap_or_default();
+        let fallback_registry = registry.clone();
+        let fallback_exe = exe.clone();
         Some(sparagmos_interp::ToolInterception {
             programs: tool_programs
                 .iter()
@@ -6622,11 +7711,19 @@ fn execute(
             runner: sparagmos_interp::ToolRunner(std::sync::Arc::new(
                 move |request| tool_run(request, &registry, &exe),
             )),
+            // Programs the guest itself produced during the run
+            // (a recipe executing a binary it built) are answered
+            // from the same registry: running the artifact means
+            // interpreting its recorded source (see
+            // `artifact_run`).
+            fallback: Some(sparagmos_interp::ToolRunner(std::sync::Arc::new(
+                move |request| artifact_run(request, &fallback_registry, &fallback_exe),
+            ))),
         })
     };
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
-        program_path: input.to_string(),
+        program_path: program_name.to_string(),
         overflow_checks,
         tool_interception,
         ..sparagmos_interp::InterpConfig::default()
@@ -6655,16 +7752,51 @@ fn execute(
         report,
     );
     // The guest's stdout is this process's stdout, whatever the
-    // outcome was; the guest's stderr likewise goes to stderr.
+    // outcome was; the guest's stderr likewise goes to stderr,
+    // unless the caller named a separate channel for it (an
+    // artifact run answering a recipe: see `artifact_run`), in
+    // which case this process's stderr carries only the
+    // driver's own lines.
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(run.stdout.as_bytes());
         let _ = out.flush();
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(run.stderr.as_bytes());
-        let _ = err.flush();
+        let mut relay_to_stderr = true;
+        if let Some(path) = guest_stderr_file {
+            relay_to_stderr = std::fs::write(path, run.stderr.as_bytes()).is_err();
+            if !relay_to_stderr {
+                // The caller allocated the channel
+                // owner-only (see `artifact_run`), and
+                // writing into the standing file keeps
+                // that; restate it so the channel is
+                // owner-only even when this write itself
+                // had to create the file.
+                restrict_to_owner(std::path::Path::new(path), 0o600);
+            }
+        }
+        if relay_to_stderr {
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(run.stderr.as_bytes());
+            let _ = err.flush();
+        }
     }
+    // Lines this entry point renders onto the guest's stderr
+    // itself (the panic and abort reports below): they are
+    // part of the guest's stream, so with a separate guest
+    // stderr channel they join it there, after the output
+    // already relayed, instead of this process's stderr.
+    let guest_report_line = |line: &str| {
+        use std::io::Write as _;
+        if let Some(path) = guest_stderr_file {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                if writeln!(file, "{line}").is_ok() {
+                    return;
+                }
+            }
+        }
+        eprintln!("{line}");
+    };
     match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(ref value) if entry_returns_exit_code(c, entry_index) => {
@@ -6745,7 +7877,7 @@ fn execute(
             message,
             ..
         })) => {
-            eprintln!("thread 'main' panicked: {message}");
+            guest_report_line(&format!("thread 'main' panicked: {message}"));
             101
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Abort {
@@ -6754,7 +7886,7 @@ fn execute(
             // A panic that escaped a cleanup (a native double
             // panic aborts the process): the guest-panic exit, with
             // the abort reason on stderr.
-            eprintln!("thread 'main' aborted: {message}");
+            guest_report_line(&format!("thread 'main' aborted: {message}"));
             101
         }
         Err(e) => {
@@ -7943,6 +9075,10 @@ fn driver_main() {
     let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut dump_path: Option<String> = None;
+    let mut guest_stderr_file: Option<String> = None;
+    let mut guest_env_file: Option<String> = None;
+    let mut guest_cwd: Option<String> = None;
+    let mut guest_program_name: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
@@ -7954,6 +9090,34 @@ fn driver_main() {
                 i += 1;
                 dump_path = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--dump needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-stderr-file" => {
+                i += 1;
+                guest_stderr_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-stderr-file needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-env-file" => {
+                i += 1;
+                guest_env_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-env-file needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-cwd" => {
+                i += 1;
+                guest_cwd = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-cwd needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-program-name" => {
+                i += 1;
+                guest_program_name = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-program-name needs a value");
                     std::process::exit(2);
                 }));
             }
@@ -8037,7 +9201,7 @@ fn driver_main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -8323,6 +9487,42 @@ fn driver_main() {
                 ));
             }
             if mode == Mode::Run || mode == Mode::RunJit {
+                // A caller reconstructing a run (an artifact run
+                // answering a recipe) hands the environment the
+                // program was invoked with as a complete
+                // assignment in a file: apply it now that the
+                // conversion is done, so the conversion above
+                // ran under the environment it was spawned with
+                // (the producing invocation's compilation
+                // environment) while the program's own
+                // environment reads see its invocation
+                // environment (see `artifact_run`).
+                if let Some(path) = &guest_env_file {
+                    match read_guest_env_file(std::path::Path::new(path)) {
+                        Ok(env) => apply_guest_env(&env),
+                        Err(e) => {
+                            eprintln!(
+                                "sparagmos-driver run: unsupported: cannot read the guest environment file {path}: {e}"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                // A caller reconstructing a run converts in
+                // one directory and executes in another (an
+                // artifact run converts in the build's
+                // directory): it hands the execution
+                // directory over the same way, and the
+                // program enters it now that the conversion
+                // is done (see `artifact_run`).
+                if let Some(dir) = &guest_cwd {
+                    if let Err(e) = std::env::set_current_dir(dir) {
+                        eprintln!(
+                            "sparagmos-driver run: unsupported: cannot enter the guest working directory {dir}: {e}"
+                        );
+                        std::process::exit(2);
+                    }
+                }
                 if let Some(path) = &dump_path {
                     let text =
                         sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
@@ -8340,6 +9540,8 @@ fn driver_main() {
                     &guest_args,
                     overflow_checks,
                     &tool_programs,
+                    guest_stderr_file.as_deref(),
+                    guest_program_name.as_deref(),
                 ));
             }
             print_convert_report(&c, &input);

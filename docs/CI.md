@@ -114,6 +114,77 @@ denominator. Runs on every push to `main` and on manual dispatch.
   produces the artifacts and the host tooling is wired in.
   The denominator is unaffected; all 1,735 stay in it as
   non-passes.
+- Inside a stage-3 recipe run, the driver's tool interception
+  answers the recipe's compiler invocations with its own
+  conversion machinery and records each produced artifact
+  (path, source tree, edition, crate type, the
+  library bindings -- each pinned to the dependency tree
+  the build bound -- and compilation options the producing
+  invocation carried, the environment it ran under, and
+  the directory it ran in),
+  leaving a placeholder file
+  at the artifact's path -- executable, for a binary -- so the
+  recipe's file and spawn checks find it. When the recipe then
+  executes a binary it produced earlier in the same run, the
+  interception answers that too: the recorded program is run
+  through the driver in run mode with the recorded bindings
+  and options and the recipe's arguments, and the fabricated process
+  outcome is the interpreter's exit code and output. The run
+  is reconstructed from the producing invocation, not from
+  the file system as it later stands: the conversion reads
+  the recorded source tree (or its recorded snapshot, once
+  the recipe has rewritten or deleted any of its files),
+  the artifact a bare program name denotes is the one the
+  invocation's own `PATH` search finds, the artifact a path
+  denotes is the one whose recorded file identity (device
+  and inode) the file now at that path carries -- so
+  renaming one built binary over another makes the path run
+  the replacement, and a path whose file no recorded
+  identity matches is refused rather than answered with a
+  stale program -- the program's
+  argv[0] is the name the recipe invoked it under, the
+  re-conversion runs under the producing invocation's
+  compilation environment (so `option_env!` and its kin see
+  the build's values), and the program itself runs under
+  the environment its invocation carried, applied as a
+  complete assignment once the conversion is done. That
+  assignment travels to the run subprocess in a file
+  created owner-only under an unpredictable name in the
+  shared temporary directory, since it is the driver's
+  whole environment, inherited credentials included. The
+  program's stderr likewise travels through a channel
+  file created owner-only under an unpredictable name,
+  since a recipe's diagnostics can carry the same kind
+  of contents. The re-conversion likewise runs in the
+  producing
+  invocation's working directory, so its relative
+  compilation paths (a forwarded `--extern` path, a `-L`
+  directory) denote the files they denoted at build time,
+  and the program enters its invocation's directory once
+  the conversion is done; a conversion that reads a
+  snapshot remaps the snapshot's directory back to the
+  recorded source's directory, so the program's `file!()`
+  spellings stay the build's. The snapshot itself is
+  materialised owner-only in the shared temporary
+  directory -- it copies every recorded neighbouring file
+  verbatim, private contents included, so neither its
+  directories nor its files are readable by other
+  accounts. A run through
+  `Command::status()` inherits the recipe's streams, so
+  the program's output stands in them in invocation
+  order; a run through `Command::output()` collects it
+  into the fabricated `Output` instead. This is a
+  deliberate reading of "execute the built binary": what is
+  judged is the program's input/output behaviour under
+  interpretation, not native code generation -- the category
+  these recipes belong to tests code generation, so a stage-3
+  pass for such a recipe is weaker evidence than a native
+  run-make pass. Recipes whose checks need the real artifact
+  (native linking, object or DWARF inspection), recipes that
+  run a program the run did not produce, and recipes that
+  spawn a child to feed its stdin (the process model
+  fabricates no child handle, and tool requests carry no
+  stdin) stay unsupported.
 - The aggregate job merges the shard results
   (`scripts/ci-subset-tools.py merge`; aggregates are recomputed from
   the merged records), derives metric 3 with

@@ -6419,9 +6419,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ProcessCommandStdio => {
                 arity(2)?;
-                // The receiver must still denote a live command;
-                // the configuration itself is not observed.
-                let _ = self.command_id_of(frames, &vals[0], name)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                self.with_command(id, |state| record_stdio_config(state, name, &vals[1]))
+                    .ok_or_else(|| {
+                        unsupported(format!("call to {name} on a stale command handle"))
+                    })?;
                 Ok(Value::Unit)
             }
             Builtin::ProcessSpawn => {
@@ -6449,9 +6451,37 @@ impl<'a> Interpreter<'a> {
                         // spawned tool cannot be fabricated, so
                         // `spawn` itself stays unsupported.
                         if name == "std::process::Command::status" {
+                            check_stdio_modelled(&state)?;
                             if let Some(outcome) =
-                                tool_outcome(self.tool_interception(), &state)?
+                                tool_outcome(self.tool_interception(), &state, false)?
                             {
+                                // `status` inherits the child's
+                                // streams (it collects no
+                                // `Output`): what the program
+                                // printed joins the guest's own
+                                // streams here, in invocation
+                                // order, before the status is
+                                // reported -- for the streams
+                                // whose configuration inherits
+                                // them. A stream the guest
+                                // redirected to null or a pipe
+                                // is not the guest's own, and
+                                // its bytes go nowhere
+                                // observable.
+                                if stdio_route(state.stdout_stdio, false)
+                                    == StdioRoute::Relay
+                                {
+                                    self.push_output(&String::from_utf8_lossy(
+                                        &outcome.stdout,
+                                    ));
+                                }
+                                if stdio_route(state.stderr_stdio, false)
+                                    == StdioRoute::Relay
+                                {
+                                    self.push_error_output(&String::from_utf8_lossy(
+                                        &outcome.stderr,
+                                    ));
+                                }
                                 return Ok(ok_result(exit_status_value(
                                     outcome.exit_code,
                                 )));
@@ -6528,7 +6558,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ProcessCommandStdioPublic => {
                 arity(2)?;
-                let _ = self.command_id_of(frames, &vals[0], name)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                self.with_command(id, |state| record_stdio_config(state, name, &vals[1]))
+                    .ok_or_else(|| {
+                        unsupported(format!("call to {name} on a stale command handle"))
+                    })?;
                 Ok(vals.into_iter().next().expect("arity checked"))
             }
             Builtin::ProcessOutput => {
@@ -6539,15 +6573,51 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 match process_spawn_error(&state) {
                     Some(error) => Ok(err_result(error)),
-                    None => match tool_outcome(self.tool_interception(), &state)? {
-                        Some(outcome) => {
-                            Ok(ok_result(process_output_value(&outcome)))
+                    None => {
+                        check_stdio_modelled(&state)?;
+                        match tool_outcome(self.tool_interception(), &state, true)? {
+                            Some(outcome) => {
+                                // `output` collects the streams
+                                // it pipes -- by default and on
+                                // an explicit pipe. A stream the
+                                // guest redirected elsewhere is
+                                // not collected: an inherited
+                                // one joins the guest's own
+                                // stream here, a nulled one is
+                                // dropped, and the `Output`
+                                // carries no bytes for either.
+                                let stdout = match stdio_route(state.stdout_stdio, true) {
+                                    StdioRoute::Collect => outcome.stdout.clone(),
+                                    StdioRoute::Relay => {
+                                        self.push_output(&String::from_utf8_lossy(
+                                            &outcome.stdout,
+                                        ));
+                                        Vec::new()
+                                    }
+                                    StdioRoute::Discard => Vec::new(),
+                                };
+                                let stderr = match stdio_route(state.stderr_stdio, true) {
+                                    StdioRoute::Collect => outcome.stderr.clone(),
+                                    StdioRoute::Relay => {
+                                        self.push_error_output(&String::from_utf8_lossy(
+                                            &outcome.stderr,
+                                        ));
+                                        Vec::new()
+                                    }
+                                    StdioRoute::Discard => Vec::new(),
+                                };
+                                Ok(ok_result(process_output_value(
+                                    outcome.exit_code,
+                                    &stdout,
+                                    &stderr,
+                                )))
+                            }
+                            None => Err(unsupported(format!(
+                                "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
+                                String::from_utf8_lossy(&state.program)
+                            ))),
                         }
-                        None => Err(unsupported(format!(
-                            "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
-                            String::from_utf8_lossy(&state.program)
-                        ))),
-                    },
+                    }
                 }
             }
             Builtin::CurrentExe => {
@@ -23631,6 +23701,8 @@ fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState {
         envs: Vec::new(),
         env_clear: false,
         cwd: None,
+        stdout_stdio: None,
+        stderr_stdio: None,
     }
 }
 
@@ -24503,9 +24575,12 @@ fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
 /// (relative to the child's working directory when one is set);
 /// any other program is searched along the effective `PATH`
 /// (the command's own `PATH` entry wins over the inherited one,
-/// as in std's environment capture). `Ok` means the program
-/// would start; `Err` is the `errno` the failed spawn reports.
-fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
+/// as in std's environment capture). `Ok` is the path the
+/// search settled on -- the program the invocation denotes,
+/// which a bare name under a command-specific `PATH` owes to
+/// the search, not to the working directory; `Err` is the
+/// `errno` the failed spawn reports.
+fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::PathBuf, i32> {
     use std::os::unix::ffi::OsStrExt;
     let program = std::ffi::OsStr::from_bytes(&state.program);
     if state.program.contains(&b'/') {
@@ -24519,7 +24594,7 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
                 None => std::path::PathBuf::from(program),
             }
         };
-        return check_executable(&candidate);
+        return check_executable(&candidate).map(|()| candidate);
     }
     // The effective PATH: the inherited environment with the
     // command's entries applied in order.
@@ -24538,7 +24613,7 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
     for dir in std::env::split_paths(std::ffi::OsStr::from_bytes(&search)) {
         let candidate = dir.join(program);
         match check_executable(&candidate) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(candidate),
             Err(ERRNO_PERMISSION_DENIED) => denied = true,
             Err(_) => {}
         }
@@ -24571,7 +24646,7 @@ fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
         }
     }
     match resolve_program(state) {
-        Ok(()) => None,
+        Ok(_) => None,
         Err(code) => Some(io_os_error_value(code)),
     }
 }
@@ -24996,7 +25071,10 @@ fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
 }
 
 /// Run the configured tool runner for this command, when the
-/// command's program is one of the intercepted tool programs;
+/// command's program is one of the intercepted tool programs --
+/// or, for any other program, the interception's fallback
+/// runner when one is configured (the host side answers for
+/// artifacts the guest itself produced earlier in the run).
 /// `None` when no interception applies, in which case the
 /// caller keeps the process model's standing answer. A runner
 /// error becomes the run's unsupported error: the tool ran the
@@ -25004,13 +25082,30 @@ fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
 fn tool_outcome(
     interception: Option<&crate::interp::ToolInterception>,
     state: &crate::interp::CommandState,
+    output_captured: bool,
 ) -> InterpResult<Option<crate::interp::ToolRunOutcome>> {
     let Some(interception) = interception else {
         return Ok(None);
     };
-    if !interception.programs.iter().any(|p| p == &state.program) {
+    let runner = if interception.programs.iter().any(|p| p == &state.program) {
+        &interception.runner
+    } else if let Some(fallback) = &interception.fallback {
+        fallback
+    } else {
         return Ok(None);
-    }
+    };
+    // The path the spawn resolution settled on rides along:
+    // the host side looks its answer up by it, so a bare
+    // program name invoked under a command-specific `PATH`
+    // reaches the artifact that search found, not a
+    // namesake in the working directory (see
+    // `ToolRunRequest::resolved_program`). Both callers run
+    // this only after the spawn gate has accepted the
+    // command, so the resolution is the one that succeeded.
+    use std::os::unix::ffi::OsStrExt as _;
+    let resolved_program = resolve_program(state)
+        .ok()
+        .map(|path| path.as_os_str().as_bytes().to_vec());
     let request = crate::interp::ToolRunRequest {
         program: state.program.clone(),
         args: state.args.clone(),
@@ -25018,8 +25113,10 @@ fn tool_outcome(
         envs: state.envs.clone(),
         env_clear: state.env_clear,
         cwd: state.cwd.clone(),
+        resolved_program,
+        output_captured,
     };
-    match (interception.runner.0)(&request) {
+    match (runner.0)(&request) {
         Ok(outcome) => Ok(Some(outcome)),
         Err(reason) => Err(unsupported(reason)),
     }
@@ -25090,13 +25187,94 @@ fn exit_status_value(exit_code: i32) -> Value {
 
 /// A `std::process::Output` value: the exit status and the two
 /// captured byte vectors, in declaration order.
-fn process_output_value(outcome: &crate::interp::ToolRunOutcome) -> Value {
+/// The `Stdio` configuration a stdio argument value
+/// denotes. The public `std::process::Stdio` is a one-field
+/// wrapper over the sys enum (`Inherit` 0, `Null` 1,
+/// `MakePipe` 2, `Fd` 3); the sys-level setter receives the
+/// sys value unwrapped. Anything the model does not decode
+/// -- the `Fd` form included -- is
+/// [`StdioConfig::Unmodelled`](crate::interp::StdioConfig::Unmodelled).
+fn stdio_config_of(value: &Value) -> crate::interp::StdioConfig {
+    use crate::interp::StdioConfig;
+    let inner = match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+        other => other,
+    };
+    match inner {
+        Value::Enum { variant: 0, fields } if fields.is_empty() => StdioConfig::Inherit,
+        Value::Enum { variant: 1, fields } if fields.is_empty() => StdioConfig::Null,
+        Value::Enum { variant: 2, fields } if fields.is_empty() => StdioConfig::Piped,
+        _ => StdioConfig::Unmodelled,
+    }
+}
+
+/// Record a stdio setter's configuration on the command it
+/// names: the builtin's own name says which stream it
+/// configures. The stdin configuration is not recorded:
+/// the tool model never feeds a child's stdin, so it has
+/// no routing to decide.
+fn record_stdio_config(state: &mut crate::interp::CommandState, name: &str, value: &Value) {
+    let config = stdio_config_of(value);
+    if name.ends_with("::stdout") {
+        state.stdout_stdio = Some(config);
+    } else if name.ends_with("::stderr") {
+        state.stderr_stdio = Some(config);
+    }
+}
+
+/// Reject an invocation whose stdio configuration the
+/// model does not route (see `StdioConfig::Unmodelled`):
+/// running it with a guessed routing would expose output
+/// the guest configured away, or hide output it kept.
+fn check_stdio_modelled(state: &crate::interp::CommandState) -> InterpResult<()> {
+    for config in [state.stdout_stdio, state.stderr_stdio] {
+        if config == Some(crate::interp::StdioConfig::Unmodelled) {
+            return Err(unsupported(
+                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where one stream's bytes go for an invocation, under
+/// its configuration: `output` collects the streams it
+/// pipes, `status` relays the streams it inherits, and a
+/// stream redirected to null -- or, for `status`, to a
+/// pipe nobody reads -- goes nowhere observable. An
+/// unmodelled configuration never reaches the routing
+/// (`check_stdio_modelled` rejects it first); it is
+/// grouped with the discards defensively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdioRoute {
+    Collect,
+    Relay,
+    Discard,
+}
+
+fn stdio_route(
+    config: Option<crate::interp::StdioConfig>,
+    output_captured: bool,
+) -> StdioRoute {
+    use crate::interp::StdioConfig;
+    match (config, output_captured) {
+        (Some(StdioConfig::Null), _) | (Some(StdioConfig::Unmodelled), _) => {
+            StdioRoute::Discard
+        }
+        (Some(StdioConfig::Piped), false) => StdioRoute::Discard,
+        (Some(StdioConfig::Piped), true) | (None, true) => StdioRoute::Collect,
+        (Some(StdioConfig::Inherit), _) | (None, false) => StdioRoute::Relay,
+    }
+}
+
+fn process_output_value(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
     Value::Enum {
         variant: 0,
         fields: vec![
-            exit_status_value(outcome.exit_code),
-            byte_vec_value(&outcome.stdout),
-            byte_vec_value(&outcome.stderr),
+            exit_status_value(exit_code),
+            byte_vec_value(stdout),
+            byte_vec_value(stderr),
         ],
     }
 }
