@@ -15281,6 +15281,49 @@ fn run_mode_slice_scalar_backed_signed_byte_element() {
     );
 }
 
+const SLICE_SCALAR_BACKED_BYTE_VIEW_OF_BOOL_SRC: &str = r#"
+fn main() {
+    let b = true;
+    let bytes = unsafe { std::slice::from_raw_parts(&b as *const bool as *const u8, 1) };
+    let n: u8 = bytes[0];
+    println!("n={n}");
+    println!("r={:?}", &bytes[0]);
+    let b2 = false;
+    let bytes2 = unsafe { std::slice::from_raw_parts(&b2 as *const bool as *const u8, 1) };
+    println!("n2={}", bytes2[0]);
+    println!("r2={:?}", &bytes2[0]);
+    let m = -1i8;
+    let sbytes = unsafe { std::slice::from_raw_parts(&m as *const i8 as *const u8, 1) };
+    println!("s={:?}", &sbytes[0]);
+    let bb = unsafe { std::slice::from_raw_parts(&b as *const bool as *const bool, 1) };
+    println!("same={} {:?}", bb[0], &bb[0]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_byte_view_of_bool() {
+    // A byte view of a boolean's storage denotes the storage's
+    // byte, not the boolean: the same-width shortcut in place
+    // resolution left the element position on the boolean
+    // itself, so a consumer resolving the element reference
+    // directly (the formatting path) printed `true` instead of
+    // `1`. The same held for a byte view of an `i8` (printed
+    // `-1` instead of `255`). A same-kind view still denotes
+    // the scalar itself. Expected output is the native result
+    // of the same source.
+    let dir = temp_dir("slice-scalar-backed-byte-view-of-bool");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_BYTE_VIEW_OF_BOOL_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "n=1\nr=1\nn2=0\nr2=0\ns=255\nsame=true true\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }

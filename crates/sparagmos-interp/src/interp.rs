@@ -15671,9 +15671,17 @@ impl<'a> Interpreter<'a> {
     /// is the storage of a scalar-backed slice whose element
     /// type is `elem_ty`: the element is then the scalar the
     /// target denotes itself (see
-    /// [`Self::target_is_scalar_storage`]). An element type
-    /// with no scalar layout (an ADT, a reference, ...) never
-    /// denotes the storage.
+    /// [`Self::target_is_scalar_storage`]). A byte-width
+    /// element of a different scalar kind never denotes the
+    /// storage: a byte view of a boolean's storage (a `&[u8]`
+    /// over a `bool`) denotes the storage's byte, not the
+    /// boolean, and the byte projection owns those reads. (A
+    /// wider element of a different kind but the storage's
+    /// width still denotes the storage: a typed read of the
+    /// position reinterprets the storage's bytes, while the
+    /// byte projection reads only one byte of it.) An element
+    /// type with no scalar layout (an ADT, a reference, ...)
+    /// never denotes the storage.
     fn fat_denotes_scalar_element(
         &self,
         frames: &[Frame],
@@ -15683,11 +15691,27 @@ impl<'a> Interpreter<'a> {
         let Some(elem_ty) = elem_ty else {
             return false;
         };
-        let width = match self.byte_layout_of_ty(elem_ty) {
-            Some(ByteLayout::Scalar(kind)) => kind.width(),
+        let elem_kind = match self.byte_layout_of_ty(elem_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind,
             _ => return false,
         };
-        self.target_is_scalar_storage(frames, target, width)
+        if elem_kind.width() == 1 {
+            let Some((projection, _, root_ty, _, _)) =
+                self.byte_view_base(frames, target)
+            else {
+                return false;
+            };
+            if projection.is_empty() {
+                let root_kind = match self.byte_layout_of_ty(&root_ty) {
+                    Some(ByteLayout::Scalar(kind)) => kind,
+                    _ => return false,
+                };
+                if root_kind != elem_kind {
+                    return false;
+                }
+            }
+        }
+        self.target_is_scalar_storage(frames, target, elem_kind.width())
     }
 
     /// Whether the position a fat dereference left in `target`
