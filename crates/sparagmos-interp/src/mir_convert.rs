@@ -9045,6 +9045,7 @@ let inner = match (&src, target) {
             drop_glue: None,
             consumed_glue: None,
             skipped_glue: None,
+            elem_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -9097,6 +9098,7 @@ let inner = match (&src, target) {
             drop_glue: None,
             consumed_glue: None,
             skipped_glue: None,
+            elem_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -9173,6 +9175,7 @@ let inner = match (&src, target) {
             drop_glue: None,
             consumed_glue: None,
             skipped_glue: None,
+            elem_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -10305,6 +10308,57 @@ let inner = match (&src, target) {
                         } else {
                             None
                         };
+                        // A `From` / `Into` conversion into a
+                        // `Box<[T]>` clones the source slice's
+                        // elements one by one in the modelled
+                        // conversion: build the element type's
+                        // glue now (see `elem_glue` in `ir`), so
+                        // the interpreter can drop the cloned
+                        // prefix when a later element's clone
+                        // panics. The conversion's target type:
+                        // `From` renders the callee's generic
+                        // arguments as [target, source], `Into`
+                        // (whose `Self` is the source) as
+                        // [source, target]. A trivial glue has
+                        // nothing to run; a glue that cannot be
+                        // accounted for keeps the plain call, the
+                        // treatment these calls have always had.
+                        let elem_glue = if matches!(
+                            kind,
+                            crate::builtins::Builtin::FromFrom
+                                | crate::builtins::Builtin::IntoInto
+                        ) {
+                            let target_ty = if matches!(
+                                kind,
+                                crate::builtins::Builtin::IntoInto
+                            ) {
+                                raw_generic_args.get(1)
+                            } else {
+                                raw_generic_args.first()
+                            };
+                            target_ty
+                                .and_then(|ty| match ty {
+                                    mir::Ty::Adt(def, targs)
+                                        if self.names.get(def).map(String::as_str)
+                                            == Some("std::boxed::Box") =>
+                                    {
+                                        match targs.first() {
+                                            Some(mir::Ty::Slice(elem))
+                                            | Some(mir::Ty::Array(elem, _)) => {
+                                                Some(elem.clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                })
+                                .and_then(|elem| self.drop_glue(&elem))
+                                .filter(|glue| {
+                                    glue.root != ir::DropPlan::Trivial
+                                })
+                        } else {
+                            None
+                        };
                         // A `box_assume_init_into_vec_unsafe` call
                         // asserts its source array is fully
                         // initialized; an element slot that still
@@ -10338,6 +10392,7 @@ let inner = match (&src, target) {
                                 drop_glue,
                                 consumed_glue,
                                 skipped_glue,
+                                elem_glue,
                                 cmp_discriminants,
                                 result_unsize,
                                 unique_elem,

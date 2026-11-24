@@ -7482,6 +7482,316 @@ fn run_mode_boxed_slice_from_slice_ref_keeps_waker_handles() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SRC: &str = r#"
+#[derive(Debug)]
+struct S(i32);
+impl Clone for S {
+    fn clone(&self) -> Self {
+        S(self.0 + 100)
+    }
+}
+
+fn main() {
+    let src = [S(1), S(2), S(3)];
+    let boxed: Box<[S]> = Box::from(&src[..]);
+    println!("boxed: {:?}", boxed);
+    let cow: std::borrow::Cow<[S]> = std::borrow::Cow::Borrowed(&src[..]);
+    let boxed2: Box<[S]> = Box::from(cow);
+    println!("cow boxed: {:?}", boxed2);
+    // Nested: a tuple element carrying a custom-Clone field.
+    let src3 = [(S(7), 1u32)];
+    let boxed3: Box<[(S, u32)]> = Box::from(&src3[..]);
+    println!("tuple boxed: {:?}", boxed3);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_runs_custom_clone() {
+    let dir = temp_dir("boxed-from-slice-ref-custom-clone");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_custom_clone.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from &[T] must run the elements' own Clone impls; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "boxed: [S(101), S(102), S(103)]\ncow boxed: [S(101), S(102), S(103)]\ntuple boxed: [(S(107), 1)]\n"
+    );
+}
+
+const BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_PANIC_SRC: &str = r#"
+struct P(i32);
+impl Clone for P {
+    fn clone(&self) -> Self {
+        panic!("custom clone ran");
+    }
+}
+
+fn main() {
+    let src = [P(1)];
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[P]> = Box::from(&src[..]);
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_custom_clone_panic_unwinds() {
+    let dir = temp_dir("boxed-from-slice-ref-custom-clone-panic");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_custom_clone_panic.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_PANIC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a panicking custom Clone must unwind out of the conversion; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "caught: true\n");
+}
+
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_WAKER_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{RawWaker, RawWakerVTable, Waker};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct Counted;
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+unsafe fn clone_ok(data: *const ()) -> RawWaker {
+    let arc = Arc::from_raw(data as *const Counted);
+    let cloned = arc.clone();
+    let raw = Arc::into_raw(cloned) as *const ();
+    std::mem::forget(arc);
+    RawWaker::new(raw, &VT_OK)
+}
+unsafe fn clone_panic(_data: *const ()) -> RawWaker {
+    panic!("clone boom")
+}
+unsafe fn wake_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+unsafe fn wake_by_ref_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    std::mem::forget(arc);
+}
+unsafe fn drop_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+
+static VT_OK: RawWakerVTable = RawWakerVTable::new(clone_ok, wake_fn, wake_by_ref_fn, drop_fn);
+static VT_PANIC: RawWakerVTable =
+    RawWakerVTable::new(clone_panic, wake_fn, wake_by_ref_fn, drop_fn);
+
+fn make(probe: &Arc<Counted>, vt: &'static RawWakerVTable) -> Waker {
+    let raw = Arc::into_raw(probe.clone()) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, vt)) }
+}
+
+fn main() {
+    let probe = Arc::new(Counted);
+    let src = [make(&probe, &VT_OK), make(&probe, &VT_PANIC)];
+    println!("base count: {}", Arc::strong_count(&probe));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[Waker]> = Box::from(&src[..]);
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+    println!("after count: {}", Arc::strong_count(&probe));
+    drop(src);
+    println!("after drop-src count: {}", Arc::strong_count(&probe));
+    println!("pointee drops: {}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_prefix() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-panic-waker");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_panic_waker.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_WAKER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwinding element clone must drop the cloned prefix; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "base count: 3\ncaught: true\nafter count: 3\nafter drop-src count: 1\npointee drops: 0\n"
+    );
+}
+
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{RawWaker, RawWakerVTable, Waker};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct Counted;
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+unsafe fn clone_ok(data: *const ()) -> RawWaker {
+    let arc = Arc::from_raw(data as *const Counted);
+    let cloned = arc.clone();
+    let raw = Arc::into_raw(cloned) as *const ();
+    std::mem::forget(arc);
+    RawWaker::new(raw, &VT_OK)
+}
+unsafe fn clone_panic(_data: *const ()) -> RawWaker {
+    panic!("clone boom")
+}
+unsafe fn wake_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+unsafe fn wake_by_ref_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    std::mem::forget(arc);
+}
+unsafe fn drop_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+
+static VT_OK: RawWakerVTable = RawWakerVTable::new(clone_ok, wake_fn, wake_by_ref_fn, drop_fn);
+static VT_PANIC: RawWakerVTable =
+    RawWakerVTable::new(clone_panic, wake_fn, wake_by_ref_fn, drop_fn);
+
+fn make(probe: &Arc<Counted>, vt: &'static RawWakerVTable) -> Waker {
+    let raw = Arc::into_raw(probe.clone()) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, vt)) }
+}
+
+fn main() {
+    // One tuple element whose SECOND field's clone panics:
+    // the first field's successful clone must still be
+    // dropped by the unwinding construction.
+    let probe = Arc::new(Counted);
+    let src = [(make(&probe, &VT_OK), make(&probe, &VT_PANIC))];
+    println!("base count: {}", Arc::strong_count(&probe));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[(Waker, Waker)]> = Box::from(&src[..]);
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+    println!("after count: {}", Arc::strong_count(&probe));
+    drop(src);
+    println!("after drop-src count: {}", Arc::strong_count(&probe));
+    println!("pointee drops: {}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_aggregate_prefix() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-panic-aggregate");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_panic_aggregate.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwinding field clone must drop the aggregate's cloned fields; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "base count: 3\ncaught: true\nafter count: 3\nafter drop-src count: 1\npointee drops: 0\n"
+    );
+}
+
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_COUNTED_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Debug)]
+struct S2 {
+    rc: Rc<Cell<i32>>,
+    boom: bool,
+}
+
+impl Clone for S2 {
+    fn clone(&self) -> Self {
+        if self.boom {
+            panic!("s2 boom");
+        }
+        S2 {
+            rc: self.rc.clone(),
+            boom: self.boom,
+        }
+    }
+}
+
+fn main() {
+    let rc = Rc::new(Cell::new(0));
+    let src = [
+        S2 { rc: rc.clone(), boom: false },
+        S2 { rc: rc.clone(), boom: true },
+    ];
+    println!("base strong: {}", Rc::strong_count(&rc));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[S2]> = Box::from(&src[..]);
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+    println!("after strong: {}", Rc::strong_count(&rc));
+    drop(src);
+    println!("final strong: {}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_counted_prefix() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-panic-counted");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_panic_counted.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_COUNTED_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwinding custom clone must drop the counted prefix; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "base strong: 3\ncaught: true\nafter strong: 3\nfinal strong: 1\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");

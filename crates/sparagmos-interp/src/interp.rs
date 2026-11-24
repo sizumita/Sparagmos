@@ -2902,6 +2902,7 @@ impl<'a> Interpreter<'a> {
                     drop_glue,
                     consumed_glue,
                     skipped_glue,
+                    elem_glue,
                     cmp_discriminants,
                     result_unsize,
                     unique_elem,
@@ -3008,6 +3009,7 @@ impl<'a> Interpreter<'a> {
                             cmp_discriminants.as_deref(),
                             unique_elem.as_ref(),
                             skipped_glue.as_ref(),
+                            elem_glue.as_ref(),
                         );
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
@@ -3996,6 +3998,7 @@ impl<'a> Interpreter<'a> {
             None,
             None,
             None,
+            None,
         )?;
         match target {
             Some(bb) => {
@@ -4522,6 +4525,7 @@ impl<'a> Interpreter<'a> {
                     &canonical,
                     &generic_args,
                     arg_values,
+                    None,
                     None,
                     None,
                     None,
@@ -5965,6 +5969,21 @@ impl<'a> Interpreter<'a> {
                                             format!("{arg_count} argument(s)"),
                                         ));
                                     }
+                                    if sync_dtors {
+                                        // A synchronous session has
+                                        // no owner block to resume
+                                        // at: run the drop function
+                                        // to completion now, as the
+                                        // `CallDtor` arm runs a
+                                        // destructor in the same
+                                        // session kind.
+                                        self.call_to_completion(
+                                            frames,
+                                            &drop_fn,
+                                            call_args,
+                                        )?;
+                                        continue;
+                                    }
                                     let mut locals = vec![Value::Uninit; local_count];
                                     for (i, arg) in call_args.into_iter().enumerate() {
                                         locals[1 + i] = arg;
@@ -6173,6 +6192,17 @@ impl<'a> Interpreter<'a> {
                                 "one argument",
                                 format!("{arg_count} argument(s)"),
                             ));
+                        }
+                        if sync_dtors {
+                            // A synchronous session has no owner
+                            // block to resume at: run the drop
+                            // entry to completion now, as the
+                            // `CallDtor` arm runs a destructor in
+                            // the same session kind. A panic in it
+                            // propagates as the consuming builtin's
+                            // own panic.
+                            self.call_to_completion(frames, &drop_name, vec![data])?;
+                            continue;
                         }
                         let mut locals = vec![Value::Uninit; local_count];
                         locals[1] = data;
