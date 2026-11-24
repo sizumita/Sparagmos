@@ -1665,6 +1665,1959 @@ fn summary_mode_undemanded_coroutine_is_not_demanded() {
     );
 }
 
+const UNNORMALIZABLE_PROJECTION_FN_SRC: &str = r#"
+trait Trait {
+    type Type;
+}
+struct Extern;
+fn f<'a>(_: <&'a Extern as Trait>::Type) where &'a Extern: Trait {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_fn_is_not_demanded() {
+    // A function whose argument type is a trait projection
+    // no implementation covers: materializing its body would
+    // ask the compiler to normalize the projection in a
+    // monomorphized typing environment, which ICEs the whole
+    // conversion (a delayed bug, uncontainable). Nothing
+    // demands the function — rustc's monomorphization
+    // collector never instantiates it either — so it is
+    // accounted not demanded with the screen's reason, and
+    // the rest of the crate still converts.
+    let dir = temp_dir("projection-fn-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_fn_undemanded.rs",
+        UNNORMALIZABLE_PROJECTION_FN_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the projection-argument function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
+const UNNORMALIZABLE_PROJECTION_CTOR_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+pub trait Foo {
+    type Assoc;
+}
+pub struct Bar;
+pub struct Baz(<Bar as Foo>::Assoc)
+where
+    Bar: Foo;
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_ctor_is_converted() {
+    // A tuple struct whose field is a projection no
+    // implementation covers: the constructor's signature
+    // carries the projection, so materializing its body
+    // would ICE the conversion the same way. An undemanded
+    // constructor is accounted converted (the accounting
+    // undemanded generic constructors get), and the crate
+    // still converts.
+    let dir = temp_dir("projection-ctor");
+    let src = fixture(
+        &dir,
+        "projection_ctor.rs",
+        UNNORMALIZABLE_PROJECTION_CTOR_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::Baz"))
+        .expect("summary lists the projection-field constructor");
+    assert!(
+        line.contains("[converted]"),
+        "the undemanded projection-field constructor is converted: {line}"
+    );
+}
+
+const UNNORMALIZABLE_PROJECTION_CONST_SRC: &str = r#"
+#![feature(const_trait_impl, generic_const_exprs)]
+#![allow(incomplete_features)]
+const trait Trait {
+    type Assoc: [const] Trait;
+    fn func() -> i32;
+}
+struct Type<const N: i32>;
+fn unqualified<T: const Trait>() -> Type<{ T::Assoc::func() }> {
+    Type
+}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_const_is_not_demanded() {
+    // An anonymous constant inside a generic function, whose
+    // body resolves an associated call through a projection
+    // over the function's own parameter: converting the
+    // constant would pose that normalization during
+    // resolution and ICE. The constant is a generic
+    // definition nothing demands (monomorphized bodies that
+    // use it carry its evaluated value), so it is accounted
+    // not demanded with the screen's reason.
+    let dir = temp_dir("projection-const-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_const_undemanded.rs",
+        UNNORMALIZABLE_PROJECTION_CONST_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("{constant#0}"))
+        .expect("summary lists the anonymous constant");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the projection constant is not demanded: {line}"
+    );
+}
+
+const DYN_BOUND_PROJECTION_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn take(h: Holder<dyn Trait<Assoc = u32>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Trait<Assoc = u32>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_holder_runs() {
+    // A projection whose trait has no implementation at all
+    // still normalizes when its self type is a trait object
+    // binding the item (`dyn Trait<Assoc = u32>`): the
+    // object type carries the equality itself. The
+    // unnormalizable-projection screen must not reject the
+    // holder's constructor, the function taking the holder,
+    // or the main holding one as a local — natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection");
+    let src = fixture(&dir, "dyn_bound_projection.rs", DYN_BOUND_PROJECTION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the dyn-bound projection program runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n",
+        "the bound field value reaches the print"
+    );
+}
+
+const DYN_BOUND_SECOND_ITEM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+    type Other;
+}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Other,
+}
+fn main() {
+    let h = Holder::<dyn Trait<Assoc = u8, Other = u32>> { field: 7 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_second_item_runs() {
+    // The screen's exemption is per associated item: the
+    // projected item here is `Other`, bound by the object's
+    // second predicate, not the first.
+    let dir = temp_dir("dyn-bound-second-item");
+    let src = fixture(&dir, "dyn_bound_second_item.rs", DYN_BOUND_SECOND_ITEM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the second bound item's projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+const DYN_BOUND_SUPERTRAIT_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Sub: Trait {}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn main() {
+    let h = Holder::<dyn Sub<Assoc = u32>> { field: 9 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_supertrait_runs() {
+    // The binding names the supertrait's item: the object's
+    // predicates elaborate `Sub`'s binding into a projection
+    // predicate for `Trait::Assoc`, which is the item the
+    // holder's field projects.
+    let dir = temp_dir("dyn-bound-supertrait");
+    let src = fixture(&dir, "dyn_bound_supertrait.rs", DYN_BOUND_SUPERTRAIT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the supertrait-bound projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+}
+
+const DYN_BOUND_SUPERTRAIT_INHERITED_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Child: Trait<Assoc = u32> {}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn take(h: Holder<dyn Child>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Child> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_supertrait_inherited_runs() {
+    // The binding is inherited rather than written on the
+    // object: `Child`'s own supertrait bound fixes
+    // `Trait::Assoc = u32`, and `dyn Child` spells no
+    // binding itself. Forming the object type elaborates
+    // the principal trait's supertrait bindings into the
+    // object's existential predicates, so a projection
+    // predicate binding `Trait::Assoc` is present in the
+    // object's own predicate list and the screen's
+    // exemption applies as it stands — measured on the
+    // pinned 1.100.0 toolchain (the program runs and
+    // prints 42); this test pins that elaboration.
+    let dir = temp_dir("dyn-bound-supertrait-inherited");
+    let src = fixture(
+        &dir,
+        "dyn_bound_supertrait_inherited.rs",
+        DYN_BOUND_SUPERTRAIT_INHERITED_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the inherited-binding projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_alias_runs() {
+    // The projected self type is itself a projection:
+    // the holder's field is `<<T as Carrier>::Item as
+    // Trait>::Assoc`, whose self type reaches the screen as
+    // an alias, not as the trait object the implementation
+    // assigns it (`dyn Trait<Assoc = u32>`). Resolving the
+    // intermediate projection through the implementation's
+    // own assigned type reaches the binding, so the screen
+    // must not reject the holder's constructor, the
+    // function taking the holder, or main — natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_alias.rs",
+        DYN_BOUND_PROJECTION_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the alias-self dyn-bound projection program runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n",
+        "the bound field value reaches the print"
+    );
+}
+
+const DYN_BOUND_PROJECTION_GENERIC_IMPL_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T>(T);
+impl<T> Carrier for Wrap<T> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<Wrap<u8>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<Wrap<u8>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_generic_impl_alias_runs() {
+    // The intermediate projection's implementation is
+    // generic: matching its self type `Wrap<T>` against
+    // `Wrap<u8>` binds the implementation's parameter, and
+    // the assigned type is read with that binding.
+    let dir = temp_dir("dyn-bound-projection-generic-impl-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_generic_impl_alias.rs",
+        DYN_BOUND_PROJECTION_GENERIC_IMPL_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the generic-impl alias projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_CHAINED_ALIAS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+trait Carrier2 {
+    type Item2: Trait + ?Sized;
+}
+impl Carrier2 for () {
+    type Item2 = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {
+    type Item = <() as Carrier2>::Item2;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_through_chained_alias_runs() {
+    // The type an implementation assigns the intermediate
+    // item is itself a projection; the resolution follows
+    // it to the trait object behind it.
+    let dir = temp_dir("dyn-bound-projection-chained-alias");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_chained_alias.rs",
+        DYN_BOUND_PROJECTION_CHAINED_ALIAS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the chained-alias projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TRAIT_ARGS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<u8> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Carrier<bool> for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier<u8>> {
+    field: <<T as Carrier<u8>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_args_select_impl_runs() {
+    // The intermediate projection's trait is implemented
+    // for the same self type at two of its own argument
+    // instantiations, assigning the item different trait
+    // objects. Matching only the self type reads both
+    // implementations, finds their assigned types in
+    // disagreement, and resolves nothing, so the screen
+    // rejects the holder and main. Matching the whole
+    // trait reference selects the `Carrier<u8>`
+    // implementation, whose binding the outer projection
+    // normalizes through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-trait-args");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_args.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARGS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the trait-args projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TRAIT_ARGS_OTHER_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<u8> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Carrier<bool> for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier<bool>> {
+    field: <<T as Carrier<bool>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u64 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_args_other_impl_runs() {
+    // The same pair of implementations, projected at the
+    // other trait argument: the `Carrier<bool>`
+    // implementation is the applicable one, and its
+    // `u64` binding is what the field holds.
+    let dir = temp_dir("dyn-bound-projection-trait-args-other");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_args_other.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARGS_OTHER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the other-trait-args projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TRAIT_ARG_PARAM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for () {
+    type Item = dyn Trait<Assoc = A>;
+}
+struct Holder<T: Carrier<u8>> {
+    field: <<T as Carrier<u8>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u8 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_arg_only_param_runs() {
+    // The implementation's parameter appears only in the
+    // trait reference's own arguments, never in the self
+    // type: matching those arguments binds it from the
+    // projection's (`A := u8`), and the assigned type is
+    // read with that binding, reaching `dyn Trait<Assoc =
+    // u8>` -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-trait-arg-param");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_arg_param.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARG_PARAM_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the trait-arg-param projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_ADT_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T> {
+    marker: std::marker::PhantomData<T>,
+}
+impl Carrier for Wrap<u32> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+struct Outer<T>(Holder<Wrap<T>>)
+where
+    Wrap<T>: Carrier;
+fn main() {
+    let o = Outer::<u32>(Holder::<Wrap<u32>> { field: 42 });
+    println!("{}", o.0.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_adt_arg_runs() {
+    // The holder reaches the screen through another ADT's
+    // field, as `Holder<Wrap<T>>` in `Outer<T>`'s frame.
+    // Composing the holder's arguments with the outer
+    // frame's used to substitute only arguments that are
+    // directly parameters, leaving `Wrap<T>` with the outer
+    // parameter still inside; the implementation matcher
+    // then could not select `Carrier for Wrap<u32>` and the
+    // screen rejected every function using `Outer<u32>`,
+    // including main. Substituting parameters throughout
+    // the nested argument gives the holder `Wrap<u32>`,
+    // whose implementation's binding the field projection
+    // normalizes through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-adt-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_adt_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_ADT_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested-ADT-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_GENERIC_ASSOC_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item<A>: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item<A> = dyn Trait<Assoc = A>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item<u32> as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_generic_assoc_type_runs() {
+    // The intermediate projection is a generic associated
+    // type: `<T::Item<u32> as Trait>::Assoc`. The
+    // projection carries the item's own argument past its
+    // trait reference's, and the implementation matcher
+    // used to skip every implementation on that argument
+    // count alone, resolving nothing, so the screen
+    // rejected the holder and main. Reading the assigned
+    // type with the item's arguments applied reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-generic-assoc");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_generic_assoc.rs",
+        DYN_BOUND_PROJECTION_GENERIC_ASSOC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the generic-associated-type projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_FN_PTR_IMPL_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier for fn(A) {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<fn(u8)>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<fn(u8)> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_fn_ptr_impl_runs() {
+    // The intermediate projection's item is assigned by a
+    // generic implementation for a function pointer:
+    // `impl<A> Carrier for fn(A)`. Matching the
+    // implementation's self type against the concrete
+    // `fn(u8)` used to fail the initial equality check and
+    // reach the unsupported-shape fallback, resolving
+    // nothing, so the screen rejected the holder and main.
+    // Matching function-pointer signatures structurally
+    // binds `A := u8` and reaches `dyn Trait<Assoc = u32>`,
+    // whose binding the outer projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-fn-ptr-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_fn_ptr_impl.rs",
+        DYN_BOUND_PROJECTION_FN_PTR_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the fn-ptr-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_DYN_SELF_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Other<A> {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier for dyn Other<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier + ?Sized> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<dyn Other<u8>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Other<u8>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_dyn_self_impl_runs() {
+    // The intermediate projection's item is assigned by a
+    // generic implementation for a trait object:
+    // `impl<A> Carrier for dyn Other<A>`. Matching the
+    // implementation's self type against the concrete
+    // `dyn Other<u8>` reached the unsupported-shape
+    // fallback -- the self-type match had no trait-object
+    // arm -- resolving nothing, so the screen rejected
+    // the holder and main. Matching the object's
+    // existential predicates structurally binds
+    // `A := u8` and reaches `dyn Trait<Assoc = u32>`,
+    // whose binding the outer projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-dyn-self-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_dyn_self_impl.rs",
+        DYN_BOUND_PROJECTION_DYN_SELF_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the dyn-self-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_AUTO_TRAIT_SET_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for dyn Other {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for dyn Other + Send {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier + ?Sized> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<dyn Other + Send> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_auto_trait_set_runs() {
+    // Separate implementations exist for `dyn Other`
+    // (assigning `Assoc = u64`) and for `dyn Other + Send`
+    // (assigning `Assoc = u32`). The predicate-subset
+    // match let the `dyn Other` implementation also match
+    // the `dyn Other + Send` target, so the resolver saw
+    // two disagreeing candidates and resolved nothing,
+    // screening out main. Auto traits are part of the
+    // object type's identity -- natively the two impls
+    // cover different self types and neither covers the
+    // other (each alone leaves the other target an E0277)
+    // -- so the match requires equal auto-trait sets and
+    // the `+ Send` implementation alone applies:
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-auto-trait-set");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_auto_trait_set.rs",
+        DYN_BOUND_PROJECTION_AUTO_TRAIT_SET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the auto-trait-set projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const UNNORMALIZABLE_PROJECTION_AUTO_TRAIT_MISMATCH_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+trait Trait {
+    type Assoc;
+}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for dyn Other {
+    type Item = dyn Trait<Assoc = u32>;
+}
+fn f(_: <<dyn Other + Send as Carrier>::Item as Trait>::Assoc) where dyn Other + Send: Carrier {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_auto_trait_mismatch_is_not_demanded() {
+    // The equal-auto-trait requirement cuts both ways:
+    // with only the `dyn Other` implementation present,
+    // the `dyn Other + Send` projection has no applicable
+    // implementation (natively an E0277), so the function
+    // carrying it is accounted not demanded with the
+    // screen's reason while main still converts. The
+    // false where-clause is a trivial bound, the form the
+    // const-mismatch case above also takes.
+    let dir = temp_dir("projection-auto-trait-mismatch-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_auto_trait_mismatch.rs",
+        UNNORMALIZABLE_PROJECTION_AUTO_TRAIT_MISMATCH_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the auto-trait-mismatch projection function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
+const DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<U: Trait + ?Sized> {
+    field: U::Assoc,
+}
+struct Outer<T: Carrier>(Holder<T::Item>);
+fn main() {
+    let o = Outer::<()>(Holder { field: 42 });
+    println!("{}", o.0.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_alias_adt_arg_runs() {
+    // An ADT argument that is itself a projection:
+    // `Outer<T: Carrier>(Holder<T::Item>)`. The alias's
+    // parameters belong to the enclosing frame; composing
+    // the holder's arguments used to carry `T::Item`
+    // across the ADT boundary unresolved, where resolving
+    // its self parameter against the holder's frame read
+    // the very argument carrying it, until the depth cap
+    // gave up and the screen rejected main. Resolving the
+    // projection through the screen's own evidence before
+    // the crossing substitutes `dyn Trait<Assoc = u32>`,
+    // whose binding the field projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-alias-adt-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_alias_adt_arg.rs",
+        DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the alias-ADT-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_CONST_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<3> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<N>, const N: usize> {
+    field: <<T as Carrier<N>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_const_arg_runs() {
+    // The intermediate projection's trait reference
+    // passes the enclosing const parameter:
+    // `Carrier<N>` with `N` Holder's own parameter.
+    // Matching the implementation `Carrier<3> for ()`
+    // compared the concrete `3` against the unresolved
+    // `N` directly, found no implementation, and the
+    // screen rejected the holder and main. Resolving the
+    // target constant through the ambient frame first
+    // reaches `dyn Trait<Assoc = u32>`, whose binding the
+    // outer projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-const-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_const_arg.rs",
+        DYN_BOUND_PROJECTION_CONST_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the const-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_CONST_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<const N: usize>;
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<Wrap<3>> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<Wrap<N>>, const N: usize> {
+    field: <<T as Carrier<Wrap<N>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_const_arg_runs() {
+    // The const parameter rides in a nested position:
+    // the trait argument is the ADT `Wrap<N>`, whose own
+    // const argument is Holder's parameter. The match
+    // descends into the ADT's arguments, where the same
+    // ambient resolution applies -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-const-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_const_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_CONST_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested const-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_UNEVALUATED_CONST_TARGET_SRC: &str = r#"
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<3> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<{ N + 0 }>, const N: usize> {
+    field: <<T as Carrier<{ N + 0 }>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_unevaluated_const_target_runs() {
+    // The intermediate projection's trait reference
+    // carries an unevaluated constant: `Carrier<{ N + 0 }>`
+    // with `N` Holder's own parameter, instantiated at 3.
+    // Matching the implementation `Carrier<3> for ()`
+    // compared the concrete `3` against the unevaluated
+    // expression and rejected the implementation, so the
+    // screen rejected the holder and main. An unevaluated
+    // constant cannot be compared without evaluating it,
+    // which the screen never does, so the comparison is
+    // inconclusive: the implementation stays a candidate
+    // and its assigned type resolves the projection --
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-unevaluated-const-target");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_unevaluated_const_target.rs",
+        DYN_BOUND_PROJECTION_UNEVALUATED_CONST_TARGET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the unevaluated-const-target projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_UNEVALUATED_CONST_IMPL_SRC: &str = r#"
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<{ 1 + 2 }> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<3>> {
+    field: <<T as Carrier<3>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_unevaluated_const_impl_runs() {
+    // The mirror image: the implementation's constant is
+    // the unevaluated one (`Carrier<{ 1 + 2 }> for ()`)
+    // and the projection's is the concrete `3`. The
+    // comparison is just as inconclusive in this
+    // direction, so the implementation stays a candidate
+    // -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-unevaluated-const-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_unevaluated_const_impl.rs",
+        DYN_BOUND_PROJECTION_UNEVALUATED_CONST_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the unevaluated-const-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const UNNORMALIZABLE_PROJECTION_CONST_MISMATCH_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<4> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+fn f(_: <<() as Carrier<3>>::Item as Trait>::Assoc) where (): Carrier<3> {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_const_mismatch_is_not_demanded() {
+    // The inconclusive treatment reaches only
+    // unevaluated constants: two concrete constants that
+    // differ (`Carrier<4>` implemented, `Carrier<3>`
+    // projected) are still a proven mismatch, no
+    // implementation assigns the item, and the function
+    // carrying the projection is accounted not demanded
+    // with the screen's reason while main still converts.
+    // The false where-clause is a trivial bound, the
+    // form the ctor case above also takes: without it
+    // the definition itself fails WF checking.
+    let dir = temp_dir("projection-const-mismatch-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_const_mismatch.rs",
+        UNNORMALIZABLE_PROJECTION_CONST_MISMATCH_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the const-mismatch projection function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
+const DYN_BOUND_PROJECTION_LIFETIME_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<'a> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<'static> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<'a, T: Carrier<'a>> {
+    field: <<T as Carrier<'a>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<'static, ()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_lifetime_arg_runs() {
+    // The intermediate projection's trait reference
+    // passes the enclosing lifetime parameter:
+    // `Carrier<'a>` with `'a` Holder's own parameter.
+    // Matching the implementation `Carrier<'static> for
+    // ()` compared `'static` against the unresolved `'a`
+    // directly, found no implementation, and the screen
+    // rejected the holder and main. Resolving the target
+    // lifetime through the ambient frame first reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-lifetime-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_lifetime_arg.rs",
+        DYN_BOUND_PROJECTION_LIFETIME_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the lifetime-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TYPE_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<S: Carrier<A>, A> {
+    field: <<S as Carrier<A>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>, u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_type_arg_runs() {
+    // The implementation parameter appears in both the
+    // self type and the trait argument: `Carrier<A> for
+    // Wrap<A>`. Matching the implementation against the
+    // projection `<S as Carrier<A>>::Item` in the
+    // holder's frame binds `A` to `u32` through the self
+    // type, then compared that binding against the
+    // holder's unresolved parameter `A` in the trait
+    // argument and rejected the implementation, so the
+    // screen rejected the holder and main. Resolving the
+    // target type argument through the ambient frame
+    // first reaches `dyn Trait<Assoc = u32>`, whose
+    // binding the outer projection normalizes through --
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-type-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_type_arg.rs",
+        DYN_BOUND_PROJECTION_TYPE_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the type-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_TYPE_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<Wrap<A>> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<S: Carrier<Wrap<A>>, A> {
+    field: <<S as Carrier<Wrap<A>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>, u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_type_arg_runs() {
+    // The type parameter rides in a nested position:
+    // the trait argument is the ADT `Wrap<A>`, whose own
+    // type argument is the holder's parameter. The match
+    // descends into the ADT's arguments, where the same
+    // ambient resolution applies -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-type-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_type_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_TYPE_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested type-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC: &str = r#"
+#![feature(associated_type_defaults)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_assoc_default_runs() {
+    // The matching implementation declares no item of
+    // its own: it inherits the trait's associated-type
+    // default. Reading only the implementation's
+    // associated items found nothing, resolved nothing,
+    // and the screen rejected the holder and main.
+    // Falling back to the trait's default, instantiated
+    // with the matched trait reference, reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-assoc-default");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_assoc_default.rs",
+        DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the assoc-default projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_OVERRIDDEN_SRC: &str = r#"
+#![feature(associated_type_defaults)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized = dyn Trait<Assoc = u32>;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_assoc_default_overridden_runs() {
+    // The implementation declares the item itself, so
+    // its own assignment (`Assoc = u64`) stands and the
+    // trait default is never consulted -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-assoc-default-overridden");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_assoc_default_overridden.rs",
+        DYN_BOUND_PROJECTION_ASSOC_DEFAULT_OVERRIDDEN_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the assoc-default-overridden projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_EQUAL_SELF_PARAM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<A>(A);
+impl<A> Carrier for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<A> {
+    field: <<Wrap<A> as Carrier>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_equal_self_param_runs() {
+    // The implementation's self type and the field's are
+    // the same `Wrap<A>` -- the implementation's parameter
+    // and the holder's, identically indexed, so interned
+    // identity calls them equal. Accepting the match on
+    // identity alone binds nothing, the instantiation the
+    // assigned-type read performs has no argument for the
+    // implementation's parameter, and the screen rejects
+    // the holder and `main`. Matching a
+    // parameter-mentioning self type structurally binds
+    // the parameter through the ambient frame -- natively
+    // the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-equal-self-param");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_equal_self_param.rs",
+        DYN_BOUND_PROJECTION_EQUAL_SELF_PARAM_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the equal-self-param projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_CONDITIONAL_IMPL_SRC: &str = r#"
+trait Bound {}
+impl Bound for u8 {}
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<T: Bound> Carrier for T {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_conditional_impl_runs() {
+    // Two implementations structurally match the self
+    // type `()` and assign the item different trait
+    // objects: a blanket one conditional on `T: Bound` --
+    // which `()` does not satisfy -- and an unconditional
+    // one for `()` itself. Structural matching checks no
+    // predicates, so both match and their disagreement
+    // resolves nothing, and the screen rejects the holder
+    // and `main`. The conditional implementation may not
+    // apply at all, and in a program that compiles it
+    // cannot apply alongside the unconditional one
+    // (coherence), so the unconditional assignment is the
+    // applicable one -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-conditional-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_conditional_impl.rs",
+        DYN_BOUND_PROJECTION_CONDITIONAL_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the conditional-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_TUPLE_TARGET_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T>
+where
+    Wrap<(T,)>: Carrier<(u32,)>,
+{
+    field: <<Wrap<(T,)> as Carrier<(u32,)>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_tuple_target_runs() {
+    // The implementation parameter matches a compound
+    // target type: walking `Holder<u32>`, the self type
+    // `Wrap<(T,)>` binds the implementation's `A` through
+    // `Self`. The binding used to record the tuple
+    // `(T,)` with the holder's parameter still inside
+    // it, so the trait argument's `(u32,)` disagreed
+    // with the recorded binding and the implementation
+    // was rejected, resolving nothing, so the screen
+    // rejected the holder and `main`. Substituting the
+    // target through the ambient frame before recording
+    // the binding -- recursively, the way a bare
+    // parameter target is already resolved -- binds
+    // `A := (u32,)`, and the outer projection normalizes
+    // through `dyn Trait<Assoc = u32>` -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-tuple-target");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_tuple_target.rs",
+        DYN_BOUND_PROJECTION_NESTED_TUPLE_TARGET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested-tuple-target projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_DEEP_CHAIN_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait A {
+    type Item: B + ?Sized;
+}
+trait B {
+    type Item: C + ?Sized;
+}
+trait C {
+    type Item: Trait + ?Sized;
+}
+impl A for () {
+    type Item = ();
+}
+impl B for () {
+    type Item = ();
+}
+impl C for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: A> {
+    field: <<<<T as A>::Item as B>::Item as C>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_deep_chain_runs() {
+    // A valid projection chain with three intermediate
+    // associated types: resolving the outer projection's
+    // self type walks `A::Item`, `B::Item`, then
+    // `C::Item`, and the recursion spends the resolution
+    // depth budget before the chain reaches the trait
+    // object -- the budget is spent on the way down, so
+    // even resolving the first hop's parameter exhausts
+    // it. Exhaustion used to make the resolution return
+    // no answer, which the screen read as proof the
+    // projection cannot normalize, rejecting the holder
+    // and `main`. The budget is a termination guard, not
+    // evidence: exhaustion during a judgment now leaves
+    // the screen without an opinion -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-deep-chain");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_deep_chain.rs",
+        DYN_BOUND_PROJECTION_DEEP_CHAIN_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the deep-chain projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TWO_CONDITIONAL_IMPLS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Bound {}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<T: Bound> Carrier for T {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Wrap<U>(U);
+impl<U: Other> Carrier for Wrap<U> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Bound for u8 {}
+impl Other for u32 {}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_two_conditional_impls_runs() {
+    // Both implementations that structurally match the
+    // self type `Wrap<u32>` are conditional: a blanket
+    // one on `T: Bound`, which `Wrap<u32>` does not
+    // satisfy, and one for `Wrap<U>` on `U: Other`, which
+    // `u32` does. Structural matching checks no
+    // predicates, so both match, their assigned types
+    // disagree, and no unconditional implementation
+    // settles the disagreement -- the verdict the
+    // single-conditional case relies on has nothing to
+    // settle with here. The disagreement rests on
+    // predicates the match never checked, so it proves
+    // nothing about whether the projection normalizes:
+    // the resolution is recorded inconclusive and the
+    // screen abstains -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-two-conditional-impls");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_two_conditional_impls.rs",
+        DYN_BOUND_PROJECTION_TWO_CONDITIONAL_IMPLS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the two-conditional-impls projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_FN_PTR_BINDER_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for fn(&'static u8) {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for for<'a> fn(&'a u8) {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<for<'a> fn(&'a u8)> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_fn_ptr_binder_runs() {
+    // Implementations exist for two function-pointer
+    // self types distinguished only by their bound
+    // lifetimes: `fn(&'static u8)` and
+    // `for<'a> fn(&'a u8)` are different self types with
+    // different assignments. The signature match does
+    // not turn on bound lifetimes, so the `'static`
+    // implementation also matches the higher-ranked
+    // target, the two candidates disagree, and the
+    // screen used to reject the holder and `main`. A
+    // disagreement the match cannot adjudicate is an
+    // inconclusive resolution, not proof the projection
+    // cannot normalize -- natively the program prints
+    // 42.
+    let dir = temp_dir("dyn-bound-projection-fn-ptr-binder");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_fn_ptr_binder.rs",
+        DYN_BOUND_PROJECTION_FN_PTR_BINDER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the fn-ptr-binder projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_PROJECTION_TARGET_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Source {
+    type Item: Trait + ?Sized;
+}
+impl Source for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+trait Carrier<A: ?Sized> {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T: ?Sized>(std::marker::PhantomData<T>);
+impl<A: ?Sized> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Source>
+where
+    Wrap<T::Item>: Carrier<dyn Trait<Assoc = u32>>,
+{
+    field: <<Wrap<T::Item> as Carrier<dyn Trait<Assoc = u32>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_projection_target_arg_runs() {
+    // The implementation parameter `A` appears in both
+    // the self type (`Carrier<A> for Wrap<A>`) and the
+    // trait argument, and the target at the self type is
+    // a projection: walking `Holder<()>` matches the self
+    // type `Wrap<T::Item>`, whose argument the ambient
+    // frame substitutes to `<() as Source>::Item` but
+    // leaves standing as a projection. Binding `A` to
+    // that unresolved projection and then comparing it
+    // against the trait argument's `dyn Trait<Assoc =
+    // u32>` -- the very type the projection denotes --
+    // rejected the implementation, so the screen
+    // rejected the holder and `main`. The target is
+    // resolved before it is bound, the way a rigid self
+    // type's nested targets are -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-projection-target-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_projection_target_arg.rs",
+        DYN_BOUND_PROJECTION_PROJECTION_TARGET_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the projection-target-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TUPLE_TARGET_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Source {
+    type Item;
+}
+impl Source for () {
+    type Item = u32;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T>(std::marker::PhantomData<T>);
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Source>
+where
+    Wrap<(T::Item,)>: Carrier<(u32,)>,
+{
+    field: <<Wrap<(T::Item,)> as Carrier<(u32,)>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_tuple_target_arg_runs() {
+    // The implementation parameter `A` appears in both
+    // the self type (`Carrier<A> for Wrap<A>`) and the
+    // trait argument, and the target at the self type is
+    // a tuple holding a projection: matching binds `A`
+    // to `(<() as Source>::Item,)` through the self type
+    // and compares it against the trait argument's
+    // `(u32,)` -- the very tuple the binding denotes,
+    // since the projection resolves to `u32`. The
+    // disagreement check inspected only the binding's
+    // outermost shape, saw a tuple rather than a
+    // projection, and treated the disagreement as
+    // conclusive, so the screen rejected the holder and
+    // `main`. A disagreement over a binding that
+    // contains an unresolved projection anywhere inside
+    // it is inconclusive rather than proof the outer
+    // projection cannot normalize -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-tuple-target-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_tuple_target_arg.rs",
+        DYN_BOUND_PROJECTION_TUPLE_TARGET_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the tuple-target-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
+#![feature(ptr_metadata)]
+struct Holder<T: ?Sized> {
+    value: <T as std::ptr::Pointee>::Metadata,
+}
+fn direct() -> <[u8] as std::ptr::Pointee>::Metadata {
+    4
+}
+fn main() {
+    let h = Holder::<[u8]> { value: 3 };
+    let s = Holder::<str> { value: 5 };
+    println!("{} {} {}", h.value, s.value, direct());
+}
+"#;
+
+#[test]
+fn run_mode_compiler_implemented_trait_pointee_runs() {
+    // `Pointee` is implemented by the compiler itself (core
+    // marks it `#[rustc_deny_explicit_impl]`): no `impl` item
+    // ever records it, so the implementation table is empty
+    // for it, yet `<T as Pointee>::Metadata` normalizes for
+    // every self type. The unnormalizable-projection screen
+    // must not reject the holder or `main` over it -- natively
+    // the program prints `3 5 4`.
+    let dir = temp_dir("pointee-metadata-projection");
+    let src = fixture(
+        &dir,
+        "pointee_metadata_projection.rs",
+        POINTEE_METADATA_PROJECTION_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Pointee-metadata projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 5 4\n");
+}
+
+const DISCRIMINANT_KIND_PROJECTION_SRC: &str = r#"
+#![feature(discriminant_kind)]
+use std::marker::DiscriminantKind;
+struct Holder<T: DiscriminantKind> {
+    value: T::Discriminant,
+}
+#[allow(dead_code)]
+enum E {
+    A,
+    B,
+}
+fn main() {
+    let h = Holder::<E> { value: 1 };
+    println!("{}", h.value);
+}
+"#;
+
+#[test]
+fn run_mode_compiler_implemented_trait_discriminant_kind_runs() {
+    // The exemption is the compiler-implemented class, not
+    // `Pointee` by name: `DiscriminantKind` is another trait
+    // core marks `#[rustc_deny_explicit_impl]`, implemented
+    // by the compiler for every enum, with no `impl` item
+    // recording it. Its projection normalizes (to `isize`
+    // here), and the screen must not reject the program --
+    // natively it prints `1`.
+    let dir = temp_dir("discriminant-kind-projection");
+    let src = fixture(
+        &dir,
+        "discriminant_kind_projection.rs",
+        DISCRIMINANT_KIND_PROJECTION_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the DiscriminantKind projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
 const COROUTINE_ONLY_CALLER_SRC: &str = r#"
 fn helper<T: Copy>(v: T) -> T { v }
 fn main() {
