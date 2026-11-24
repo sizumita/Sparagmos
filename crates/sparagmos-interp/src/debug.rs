@@ -1730,6 +1730,23 @@ fn reinterpret_scalar_pointee(
     source: &Desc,
     target: &Desc,
 ) -> Result<Value, String> {
+    // A cast to the pointee's own type changes no bytes, so
+    // there is nothing to reinterpret -- but the dereference
+    // still reads a single scalar: the storage a scalar
+    // pointer reaches (a slice's `data_ptr`, above all) is
+    // the whole element aggregate, whose first element is
+    // the pointee. Any other value form already is the
+    // scalar the pointer names (or a storage form the byte
+    // path does not model) and passes through unchanged.
+    if source == target {
+        return Ok(match value {
+            Value::Tuple(items) => match items.first() {
+                Some(first) if is_scalar_value(first) => first.clone(),
+                _ => value.clone(),
+            },
+            _ => value.clone(),
+        });
+    }
     let unsupported = || {
         format!(
             "cast changing pointee type from {} to {} is not supported",
@@ -2044,7 +2061,19 @@ fn evaluate_expr(
                 // element through the target layout at the
                 // target's width rather than projecting the
                 // storage's own elements.
-                if let Some((source, target)) = ev.pending_cast.take() {
+                // A cast to the pointee's own type records
+                // the pair as well, but indexing it reads the
+                // storage's own elements: the ordinary
+                // projection below already consumes the right
+                // one, so only a type-changing pair takes the
+                // reinterpretation branch.
+                let reinterpret = match ev.pending_cast.take() {
+                    Some((source, target)) if source != target => {
+                        Some((source, target))
+                    }
+                    _ => None,
+                };
+                if let Some((source, target)) = reinterpret {
                     let (v, _) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
                     ev.value = reinterpret_index(&v, &source, &target, *index)?;
                     ev.desc = Some(target);
@@ -2163,11 +2192,14 @@ fn evaluate_expr(
                             Some((first, mid)) if *mid == source => first.clone(),
                             _ => source,
                         };
-                        if source == target_inner {
-                            None
-                        } else {
-                            Some((source, target_inner))
-                        }
+                        // The pair is recorded even when the
+                        // cast changes nothing: the storage a
+                        // scalar pointer reaches is the whole
+                        // element aggregate, and the dereference
+                        // that consumes the pointer must still
+                        // read a single scalar from it (see
+                        // `reinterpret_scalar_pointee`).
+                        Some((source, target_inner))
                     }
                     _ => None,
                 };

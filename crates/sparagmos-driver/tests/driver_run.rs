@@ -29308,6 +29308,45 @@ fn debug_mode_cast_pointer_index_reinterprets_elements() {
     );
 }
 
+const DEBUG_CAST_NOOP_SRC: &str = r#"fn main() {
+    let a: [u32; 2] = [42, 7];
+    let s: &[u32] = &a;
+    zzz();
+    let _ = s;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_noop_cast_deref_consumes_one_element() {
+    // A cast to the pointer's existing element type changes
+    // no bytes, so no reinterpretation is owed -- but the
+    // dereference still reads through the cast pointer, whose
+    // pointee storage is the whole element aggregate: the
+    // read consumes the first scalar element, the value
+    // indexing the same pointer reports, rather than
+    // rendering the entire aggregate under the element type.
+    let dir = temp_dir("debug-cast-noop");
+    let src = fixture(&dir, "cast_noop.rs", DEBUG_CAST_NOOP_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(s.data_ptr as *const u32)\nprint (s.data_ptr as *const u32)[0]\nprint (s.data_ptr as *const u32)[1]\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 42", "$2 = 42", "$3 = 7"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("(42, 7)"),
+        "a no-op cast dereference must not render the whole aggregate: {stdout}"
+    );
+}
+
 const DEBUG_ARRAY_VIEW_SCALAR_BACKING_SRC: &str = r#"fn main() {
     let v: u32 = 1065353216;
     let r: &u32 = &v;
