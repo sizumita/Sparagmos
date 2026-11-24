@@ -1067,6 +1067,20 @@ pub struct Interpreter<'a> {
     /// never removed; allocation ids are never reused, so a
     /// stale entry can never alias a later allocation.
     exposed_targets: std::cell::RefCell<std::collections::HashMap<u64, RefTarget>>,
+    /// The function-pointer values whose synthetic address
+    /// has been exposed as an integer (see
+    /// [`Self::note_exposed_target`]): a function pointer's
+    /// integer form denotes the function itself, not a place,
+    /// so constructing a function-pointer shape from that
+    /// address
+    /// recovers the callable value -- the same round-trip
+    /// contract `exposed_targets` gives data pointers --
+    /// instead of an address-only data reference sitting in
+    /// a function-pointer place. Only function identities
+    /// (a `Value::FnPtr`, or a non-capturing closure value,
+    /// which coerces to a function pointer) are recorded.
+    exposed_fn_ptrs:
+        std::cell::RefCell<std::collections::HashMap<u64, Value>>,
     /// The declared type recorded for an allocation at its
     /// creation point (see [`Interpreter::record_alloc_ty`]):
     /// for an ordinary allocation, the pointee type it was
@@ -1752,6 +1766,9 @@ impl<'a> Interpreter<'a> {
             address_owners: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             exposed_targets: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
+            exposed_fn_ptrs: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             ),
             alloc_tys: std::cell::RefCell::new(HashMap::new()),
@@ -18063,6 +18080,12 @@ impl<'a> Interpreter<'a> {
                 }
                 _ => None,
             },
+            (ScalarShape::FnPtr, ScalarShape::FnPtr) => match value {
+                Value::FnPtr(_) | Value::Closure { .. } => {
+                    Some(value.clone())
+                }
+                _ => None,
+            },
             (
                 ScalarShape::AdtField {
                     index: si,
@@ -18313,7 +18336,7 @@ impl<'a> Interpreter<'a> {
                     ))
                 }
             }
-            (ScalarShape::Ptr, _) => match synthetic_address(value) {
+            (ScalarShape::Ptr | ScalarShape::FnPtr, _) => match synthetic_address(value) {
                 Some(addr) => {
                     self.note_exposed_target(addr as u64, value);
                     Ok(addr & bit_mask(64))
@@ -18517,7 +18540,26 @@ impl<'a> Interpreter<'a> {
                     _ => f64::from_bits(bits as u64),
                 })),
             }
-            ScalarShape::Ptr => Ok(self.materialized_ptr(bits as u64)),
+            ScalarShape::Ptr => {
+                // A data-pointer leaf constructs a data
+                // pointer, even when the pattern is an address
+                // a function value was exposed at: the callable
+                // reading belongs to function-pointer
+                // destinations (the `FnPtr` leaf below) only.
+                Ok(self.materialized_ptr(bits as u64))
+            }
+            ScalarShape::FnPtr => {
+                // An address a function pointer was exposed
+                // at reconstructs that function value (see
+                // the `exposed_fn_ptrs` field); any other
+                // pattern is an address-only pointer as usual.
+                if let Some(v) =
+                    self.exposed_fn_ptrs.borrow().get(&(bits as u64))
+                {
+                    return Ok(v.clone());
+                }
+                Ok(self.materialized_ptr(bits as u64))
+            }
             ScalarShape::Bool => Ok(Value::Bool(bits != 0)),
             ScalarShape::Char => match char::from_u32(bits as u32) {
                 Some(c) => Ok(Value::Uint(u128::from(c as u32))),
@@ -18847,6 +18889,19 @@ impl<'a> Interpreter<'a> {
                     .borrow_mut()
                     .insert(addr, target.clone());
             }
+        }
+        // A function pointer's address denotes the function
+        // itself: record the identity so a pointer shape
+        // constructed from the address recovers the callable
+        // value (see the `exposed_fn_ptrs` field). A
+        // non-capturing closure value is a function pointer
+        // (it coerces to one) and records the same way.
+        if matches!(value, Value::FnPtr(_))
+            || matches!(value, Value::Closure { env, .. } if env.is_empty())
+        {
+            self.exposed_fn_ptrs
+                .borrow_mut()
+                .insert(addr, value.clone());
         }
     }
 

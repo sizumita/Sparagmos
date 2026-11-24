@@ -8926,6 +8926,70 @@ fn main() {
 }
 "#;
 
+const TRANSMUTE_FN_PTR_NICHE_SRC: &str = r#"
+unsafe extern "C" fn hello() { println!("hello"); }
+fn main() {
+    let none = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(0) };
+    println!("none={}", none.is_none());
+    let some = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(1) };
+    println!("some={}", some.is_some());
+    let null = unsafe { std::mem::transmute::<*const usize, Option<unsafe extern "C" fn()>>(std::ptr::null()) };
+    println!("null={}", null.is_none());
+    let p: unsafe extern "C" fn() = hello;
+    let bits = unsafe { std::mem::transmute::<unsafe extern "C" fn(), usize>(p) };
+    let back = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(bits) };
+    match back { Some(f) => unsafe { f() }, None => println!("none") }
+    let optbits = unsafe { std::mem::transmute::<Option<unsafe extern "C" fn()>, usize>(Some(p)) };
+    println!("round={}", optbits == bits);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fn_ptr_niche_payload() {
+    // A function pointer has the pointer-width scalar leaf,
+    // so a niche-encoded enum over one (`Option<fn()>`)
+    // transmutes from an integer or a raw pointer: the null
+    // pattern is the niche variant, any other pattern is the
+    // payload variant. A real function pointer flattens to
+    // its synthetic address and the reverse construction
+    // recovers the very function value, which still calls.
+    run_ok(
+        "transmute-fn-ptr-niche",
+        TRANSMUTE_FN_PTR_NICHE_SRC,
+        "none=true\nsome=true\nnull=true\nhello\nround=true\n",
+    );
+}
+
+const TRANSMUTE_FN_ADDR_AS_DATA_PTR_SRC: &str = r#"
+fn hello() { println!("hello called"); }
+fn main() {
+    let bits = hello as usize;
+    let arr: [*const u8; 1] = unsafe { std::mem::transmute(bits) };
+    let p = arr[0];
+    let q = p.wrapping_add(1);
+    println!("diff={}", (q as usize).wrapping_sub(p as usize));
+    let opt: Option<fn()> = unsafe { std::mem::transmute(bits) };
+    match opt { Some(f) => f(), None => println!("none") }
+    let f2: fn() = unsafe { std::mem::transmute(bits) };
+    f2();
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fn_addr_into_data_ptr_stays_data_ptr() {
+    // The address a function pointer was exposed at is just
+    // an integer: transmuted into a data-pointer destination
+    // it constructs a data pointer (pointer arithmetic
+    // applies), not the callable value. The callable reading
+    // is specific to function-pointer destinations, where
+    // the same bits still recover the function.
+    run_ok(
+        "transmute-fn-addr-data-ptr",
+        TRANSMUTE_FN_ADDR_AS_DATA_PTR_SRC,
+        "diff=1\nhello called\nhello called\n",
+    );
+}
+
 #[test]
 fn run_mode_transmute_fat_pointer_words() {
     // A fat pointer transmutes to its two words and back: the

@@ -554,6 +554,16 @@ pub enum ScalarShape {
     /// pointer payloads of wrapper and niche-encoded shapes
     /// (`NonNull<T>`, `Option<NonNull<T>>`).
     Ptr,
+    /// A function pointer: flattened as its synthetic address,
+    /// like a thin data pointer, but construction recovers the
+    /// callable value the address was exposed for (see
+    /// `Interpreter::exposed_fn_ptrs`), which is what a
+    /// niche-encoded `Option<fn()>` payload holds. The leaf is
+    /// distinct from [`Self::Ptr`] so the recovery stays
+    /// specific to function-pointer destinations: an address
+    /// that happens to name a function constructs an ordinary
+    /// data pointer at a data-pointer leaf.
+    FnPtr,
     /// An array of a scalar element shape: element `i` occupies
     /// bits `[i * elem_bits, (i + 1) * elem_bits)`.
     Array(Box<ScalarShape>, u64),
@@ -674,7 +684,7 @@ impl ScalarShape {
             ScalarShape::Int { bits, .. } | ScalarShape::Float { bits } => *bits,
             ScalarShape::Bool => 8,
             ScalarShape::Char => 32,
-            ScalarShape::Ptr => 64,
+            ScalarShape::Ptr | ScalarShape::FnPtr => 64,
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),
