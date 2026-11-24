@@ -6761,9 +6761,6 @@ fn execute_debug(
     for name in &parsed.break_fns {
         session.set_fn_breakpoint(name);
     }
-    for (ty, format) in &parsed.lldb_formats {
-        session.set_lldb_format(ty, *format);
-    }
     session.set_hide_locals(hide_locals);
     session.set_pretty_printers(pretty_printers);
     // Register the source text of every file the converted
@@ -6799,8 +6796,6 @@ struct ParsedDebugScript {
     commands: Vec<sparagmos_interp::DebugCommand>,
     /// Whether gdb prints render through the pretty printers.
     pretty_printers: bool,
-    /// lldb type-format registrations: (type name, format).
-    lldb_formats: Vec<(String, sparagmos_interp::LldbNumFormat)>,
 }
 
 /// Parse a debugger session script (see [`execute_debug`]) into
@@ -6812,7 +6807,6 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
     let mut break_fns = Vec::new();
     let mut commands = Vec::new();
     let mut pretty_printers = false;
-    let mut lldb_formats = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -6842,7 +6836,10 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
                         return Err(bad(&format!("unknown type format `{other}`")));
                     }
                 };
-                lldb_formats.push((ty.trim().to_string(), format));
+                commands.push(DebugCommand::SetLldbFormat {
+                    ty: ty.trim().to_string(),
+                    format,
+                });
             }
             "break" => {
                 let n: u32 = rest
@@ -6930,7 +6927,6 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
         break_fns,
         commands,
         pretty_printers,
-        lldb_formats,
     })
 }
 

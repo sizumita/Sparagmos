@@ -29412,6 +29412,30 @@ fn debug_mode_lldb_hex_format_applies_to_negative_values() {
     );
 }
 
+#[test]
+fn debug_mode_lldb_format_registration_applies_in_command_order() {
+    // A registration takes effect when its command runs, not
+    // before the session starts: re-registering a type's
+    // format mid-session changes the later prints and leaves
+    // the earlier ones under the previous registration (the
+    // order lldb applies `type format add` in).
+    let dir = temp_dir("debug-lldb-format-order");
+    let src = fixture(&dir, "lldb_format_order.rs", DEBUG_LLDB_NEG_HEX_SRC);
+    let out = debug_driver_lldb(
+        &dir,
+        &src,
+        "type-format hex i8\nbreak 3\nrun\nprint b\ntype-format dec i8\nprint b\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    let hex_at = stdout.find("= 0xff").expect("first print renders hex");
+    let dec_at = stdout.find("= -1").expect("second print renders decimal");
+    assert!(
+        hex_at < dec_at,
+        "the hex print must precede the decimal one: {stdout}"
+    );
+}
+
 const DEBUG_LLDB_COMMAND_FORMAT_SRC: &str = r#"fn main() {
     let b: i8 = -1;
     let c: char = 'a';

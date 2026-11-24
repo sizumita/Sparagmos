@@ -95,6 +95,12 @@ pub enum DebugCommand {
     /// List the selected frame's locals (gdb `info locals`):
     /// `No locals.` when none are in scope at the stop.
     InfoLocals,
+    /// Register an lldb type format (lldb `type format add`):
+    /// takes effect at this point in the session, so a print
+    /// before the command renders under the earlier
+    /// registration and a print after it under the new one --
+    /// the order the real debugger applies its commands in.
+    SetLldbFormat { ty: String, format: LldbNumFormat },
 }
 
 /// A print command: the expression text plus the number format
@@ -424,7 +430,8 @@ impl DebugSession {
                     | DebugCommand::WhatIs(_)
                     | DebugCommand::Ptype(_)
                     | DebugCommand::Repr(_)
-                    | DebugCommand::InfoFunctions { .. },
+                    | DebugCommand::InfoFunctions { .. }
+                    | DebugCommand::SetLldbFormat { .. },
                 ) => {
                     let cmd = ctl.script.pop_front().expect("front checked");
                     exec_session_command(&mut ctl, &interp, &[], &cmd);
@@ -496,6 +503,9 @@ fn exec_session_command(
         DebugCommand::InfoLocals => {
             let lines = render_info_locals(interp, ctl, frames);
             ctl.transcript.extend(lines);
+        }
+        DebugCommand::SetLldbFormat { ty, format } => {
+            ctl.lldb_formats.register(ty, *format);
         }
         _ => {}
     }
@@ -806,7 +816,8 @@ pub(crate) fn drive_hook(
                     | DebugCommand::Ptype(_)
                     | DebugCommand::Repr(_)
                     | DebugCommand::InfoFunctions { .. }
-                    | DebugCommand::InfoLocals),
+                    | DebugCommand::InfoLocals
+                    | DebugCommand::SetLldbFormat { .. }),
                 ) => {
                     exec_session_command(&mut ctl, interp, frames, &cmd);
                 }
