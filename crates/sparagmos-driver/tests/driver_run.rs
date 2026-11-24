@@ -5409,6 +5409,63 @@ fn run_mode_f16_copysign() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
+const F128_COPYSIGN_SRC: &str = r##"#![feature(f128)]
+fn emit(m: u128, s: u128) {
+    println!("{}", f128::from_bits(m).copysign(f128::from_bits(s)).to_bits());
+}
+fn main() {
+    emit(0x3fff0000000000000000000000000000, 0x00000000000000000000000000000000);
+    emit(0x3fff0000000000000000000000000000, 0x80000000000000000000000000000000);
+    emit(0x00000000000000000000000000000000, 0x80000000000000000000000000000000);
+    emit(0x80000000000000000000000000000000, 0x3fff0000000000000000000000000000);
+    emit(0x7fff0000000000000000000000000001, 0x80000000000000000000000000000000);
+    emit(0xffff0000000000000000000000000001, 0x00000000000000000000000000000000);
+    emit(0x7f800000000000000000000000000000, 0xbfff0000000000000000000000000000);
+    emit(0x7fff0000000000000000000000000000, 0x80000000000000000000000000000000);
+    println!("{}", 1.5f128.copysign(-0.0f128).to_bits());
+    println!("{}", (-2.5f128).copysign(0.0f128).to_bits());
+    println!("{}", unsafe { std::mem::transmute::<f128, u128>(2.5f128) });
+    println!("{}", unsafe { std::mem::transmute::<u128, f128>(0x40004000000000000000000000000000u128) }.to_bits());
+}
+"##;
+
+#[test]
+fn run_mode_f128_copysign_and_transmute() {
+    // `f128::copysign` runs the collected `copysignf128` body,
+    // whose `to_bits` / `from_bits` are `Cast Transmute`
+    // rvalues between `f128` and `u128`. The scalar-shape
+    // reinterpretation covers the 128-bit float shape (an
+    // `f128` value is stored as its exact bit pattern), so
+    // both directions are exact: NaN payloads, signaling
+    // included, pass through unquieted, and signed zeros and
+    // infinities follow the sign argument. The values below
+    // were measured natively on the pinned toolchain.
+    let dir = temp_dir("f128copysign");
+    let src = fixture(&dir, "f128copysign.rs", F128_COPYSIGN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "f128 copysign program must run to completion; stderr={stderr}"
+    );
+    let expected = "\
+85065399433376081038215121361612832768
+255206582893845312769902425077496938496
+170141183460469231731687303715884105728
+0
+340277174624079928635746076935438991361
+170135991163610696904058773219554885633
+339617752923046005526922703901628039168
+340277174624079928635746076935438991360
+255209179042274580183716690325661548544
+85071889804449249572750784482024357888
+85071889804449249572750784482024357888
+85071889804449249572750784482024357888
+";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
 #[test]
 fn run_mode_null_and_fn_pointer_constants_execute() {
     let dir = temp_dir("nullptr");

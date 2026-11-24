@@ -17569,6 +17569,9 @@ impl<'a> Interpreter<'a> {
                 32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
                 _ => u128::from(f.to_bits()),
             }),
+            // An `f128` value is stored as its exact bit
+            // pattern, so flattening it is the identity.
+            (ScalarShape::Float { bits: 128 }, Value::Float128(b)) => Ok(*b),
             (ScalarShape::Bool, Value::Bool(b)) => Ok(u128::from(*b)),
             (ScalarShape::Char, Value::Uint(u)) => Ok(*u & bit_mask(32)),
             (ScalarShape::Array(elem, n), Value::Tuple(items))
@@ -17847,15 +17850,21 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Uint(wrap_unsigned(bits, *w)))
                 }
             }
-            ScalarShape::Float { bits: w } => Ok(Value::Float(match w {
-                16 => crate::mir_convert::f16_to_f64(bits as u16),
-                // Rebuilding a value from its bit pattern is
-                // transport: widen exactly, as `flatten_scalar`
-                // narrows exactly, so a signaling NaN pattern
-                // survives a transmute round trip.
-                32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
-                _ => f64::from_bits(bits as u64),
-            })),
+            ScalarShape::Float { bits: w } => match w {
+                // An `f128` value is its exact bit pattern
+                // (`Value::Float128`), so construction is the
+                // identity on the pattern.
+                128 => Ok(Value::Float128(bits)),
+                _ => Ok(Value::Float(match w {
+                    16 => crate::mir_convert::f16_to_f64(bits as u16),
+                    // Rebuilding a value from its bit pattern is
+                    // transport: widen exactly, as `flatten_scalar`
+                    // narrows exactly, so a signaling NaN pattern
+                    // survives a transmute round trip.
+                    32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
+                    _ => f64::from_bits(bits as u64),
+                })),
+            }
             ScalarShape::Ptr => Ok(self.materialized_ptr(bits as u64)),
             ScalarShape::Bool => Ok(Value::Bool(bits != 0)),
             ScalarShape::Char => match char::from_u32(bits as u32) {
