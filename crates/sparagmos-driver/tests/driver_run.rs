@@ -461,6 +461,56 @@ fn run_mode_large_u32_table_const() {
 }
 
 #[test]
+fn run_mode_nested_zst_table_stays_undecoded() {
+    // A nonzero-stride element type can contain zero-sized
+    // arrays whose declared lengths multiply without occupying
+    // allocation bytes: this static is 5,000 bytes of storage
+    // whose element-wise expansion would produce tens of
+    // billions of values. The shared expansion budget keeps
+    // the constant undecoded, so the run stops at it -- the
+    // same outcome as before the presence check existed --
+    // instead of exhausting host memory in the decode.
+    let dir = temp_dir("nested-zst-table");
+    let src = fixture(
+        &dir,
+        "nested_zst_table.rs",
+        "static TABLE: [([[(); 4096]; 4096], bool); 5000] = [([[(); 4096]; 4096], true); 5000]; fn main() { println!(\"{} {}\", TABLE.len(), TABLE[0].1); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "nested zero-sized expansion must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_nested_zst_elements_under_budget() {
+    // The same nesting shape at a size whose total expansion
+    // fits the shared budget still materialises element by
+    // element and reads back exactly.
+    let dir = temp_dir("nested-zst-under-budget");
+    let src = fixture(
+        &dir,
+        "nested_zst_under_budget.rs",
+        "static TABLE: [([[(); 10]; 10], u32); 5000] = [([[(); 10]; 10], 7); 5000]; fn main() { println!(\"{} {} {}\", TABLE.len(), TABLE[0].1, TABLE[4999].1); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "moderate nested expansion must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5000 7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the

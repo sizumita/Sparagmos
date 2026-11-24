@@ -636,6 +636,13 @@ pub struct Converter {
     /// rendered generic arguments).
     const_fn_mentions_seen:
         std::collections::HashSet<(rustc_public::DefId, String)>,
+    /// Expansion budget remaining for the constant currently
+    /// being decoded (see `MAX_CONST_TOTAL_ELEMS`): reset at the
+    /// root of every `decode_const` / `decode_ref` tree and spent
+    /// once per `decode_const` call, so one constant's total
+    /// materialised size is bounded however its element counts
+    /// nest.
+    const_budget: usize,
 }
 
 impl Default for Converter {
@@ -3203,6 +3210,7 @@ impl Converter {
             const_closure_mentions_seen: std::collections::HashSet::new(),
             const_fn_mentions: Vec::new(),
             const_fn_mentions_seen: std::collections::HashSet::new(),
+            const_budget: MAX_CONST_TOTAL_ELEMS,
         }
     }
 
@@ -5103,6 +5111,19 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
+        // One shared expansion budget per decoded constant
+        // (see `MAX_CONST_TOTAL_ELEMS`): the root call refills
+        // it and every call spends one unit, so the total
+        // materialised size is bounded even when declared
+        // element counts nest multiplicatively. A constant
+        // whose expansion exhausts it stays undecoded.
+        if depth == 0 {
+            self.const_budget = MAX_CONST_TOTAL_ELEMS;
+        }
+        if self.const_budget == 0 {
+            return None;
+        }
+        self.const_budget -= 1;
         // A range whose bytes are all uninitialized is the
         // uninitialized value of this type (the payload of a
         // `MaybeUninit::uninit()` constant, at whichever nesting
@@ -5227,7 +5248,12 @@ impl Converter {
                     // bounded by bytes the host already holds.
                     // A zero stride proves nothing about the
                     // count, so zero-sized elements keep the
-                    // bound and stay undecoded.
+                    // bound and stay undecoded. Zero-sized
+                    // descendants of a nonzero-stride element
+                    // are not bounded by the byte count either;
+                    // the shared expansion budget spent by
+                    // every recursive decode bounds those (see
+                    // `MAX_CONST_TOTAL_ELEMS`).
                     if stride.bytes() == 1
                         && matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
                     {
@@ -6254,6 +6280,9 @@ impl Converter {
     ) -> Option<sm::ConstValue> {
         if depth > MAX_CONST_DEPTH {
             return None;
+        }
+        if depth == 0 {
+            self.const_budget = MAX_CONST_TOTAL_ELEMS;
         }
         // A pointee type passing through a coroutine-closure
         // type cannot be asked its kind (see `guarded_ty_kind`)
@@ -8453,6 +8482,21 @@ const MAX_CONST_DEPTH: usize = 32;
 /// Byte arrays materialise as the raw `Bytes` value, whose size
 /// is the allocation's own.
 const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
+
+/// Total number of values one constant's materialisation may
+/// produce, summed over every nesting level. The per-array
+/// bound and the over-bound presence check bound a single
+/// array by its own declared length or by the bytes backing
+/// it, but neither bounds the product over nested arrays: an
+/// element type with a nonzero stride can contain zero-sized
+/// arrays whose declared lengths multiply without occupying
+/// allocation bytes -- a `[([[(); 4096]; 4096], bool); 5000]`
+/// static is 5,000 bytes of storage whose element-wise decode
+/// would produce tens of billions of values. The shared
+/// budget spent by every recursive decode answers that: a
+/// constant whose expansion exceeds it stays undecoded, the
+/// same fallback as any other undecodable constant.
+const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
 
 /// Pointer width in bytes on the target this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
