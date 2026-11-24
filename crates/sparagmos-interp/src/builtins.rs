@@ -10894,7 +10894,7 @@ impl<'a> Interpreter<'a> {
                 if tag == "str" {
                     let s = self.resolve_string(frames, &vals[0])?;
                     Ok(Value::Uint(s.len() as u128))
-                } else if tag.starts_with('[') && tag.ends_with(']') && !tag.contains(';') {
+                } else if is_slice_tag(tag) {
                     // A slice: element count × element size.
                     let elem = &tag[1..tag.len() - 1];
                     let (elem_size, _) = self.layout_of(elem).ok_or_else(|| {
@@ -10930,7 +10930,7 @@ impl<'a> Interpreter<'a> {
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 if tag == "str" {
                     Ok(Value::Uint(1))
-                } else if tag.starts_with('[') && tag.ends_with(']') && !tag.contains(';') {
+                } else if is_slice_tag(tag) {
                     let elem = &tag[1..tag.len() - 1];
                     let (_, align) = self.layout_of(elem).ok_or_else(|| {
                         unsupported(format!(
@@ -19854,7 +19854,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
         }
         if base_ty.starts_with('[') && target_ty.starts_with('[') {
-            if base_ty.contains(';') && !target_ty.contains(';') {
+            if !is_slice_tag(base_ty) && is_slice_tag(target_ty) {
                 // An array viewed as a slice.
                 let len = value.len().ok_or_else(|| {
                     InterpError::type_mismatch(
@@ -27283,8 +27283,7 @@ impl<'a> Interpreter<'a> {
     fn default_value(&self, tag: &str) -> Option<Value> {
         let tag = tag.trim();
         if let Some(inner) = generic_first_arg(tag, "std::boxed::Box<") {
-            let pointee = if inner.starts_with('[') && inner.ends_with(']') && !inner.contains(';')
-            {
+            let pointee = if is_slice_tag(inner) {
                 // `Box<[T]>`: its `Default` is an empty boxed
                 // slice -- the pointee an empty
                 // `Vec::into_boxed_slice` builds.

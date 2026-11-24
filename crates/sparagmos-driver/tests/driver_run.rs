@@ -29512,3 +29512,107 @@ fn debug_mode_lldb_command_formats_are_honored() {
         );
     }
 }
+
+// ----- slice-tag predicate unification (Issue #403) -----
+
+const SIZE_OF_VAL_SLICE_OF_ARRAYS_SRC: &str = r#"
+fn main() {
+    let a: [[i32; 2]; 3] = [[1, 2], [3, 4], [5, 6]];
+    let s: &[[i32; 2]] = &a;
+    println!("full {}", std::mem::size_of_val(s));
+    println!("part {}", std::mem::size_of_val(&a[..2]));
+    let v: Vec<[u16; 4]> = vec![[1, 2, 3, 4], [5, 6, 7, 8]];
+    println!("vec {}", std::mem::size_of_val(&v[..]));
+    let deep: &[[[i32; 1]; 2]] = &[[[1], [2]], [[3], [4]]];
+    println!("deep {}", std::mem::size_of_val(deep));
+}
+"#;
+
+#[test]
+fn run_mode_size_of_val_slice_of_arrays() {
+    // The element type of a slice may itself be an array: the
+    // semicolon inside `[i32; 2]` sits one bracket level deeper
+    // and does not make `[[i32; 2]]` an array tag. `size_of_val`
+    // judged slice-ness with a raw `!contains(';')` and refused
+    // these as not runtime-supported (expected values verified
+    // against a native 1.100.0 build of the same source).
+    run_ok(
+        "size-of-val-slice-of-arrays",
+        SIZE_OF_VAL_SLICE_OF_ARRAYS_SRC,
+        "full 24\npart 16\nvec 16\ndeep 16\n",
+    );
+}
+
+const ALIGN_OF_VAL_SLICE_OF_ARRAYS_SRC: &str = r#"
+fn main() {
+    let a: [[i32; 2]; 3] = [[1, 2], [3, 4], [5, 6]];
+    let s: &[[i32; 2]] = &a;
+    println!("full {}", std::mem::align_of_val(s));
+    let v: Vec<[u16; 4]> = vec![[1, 2, 3, 4]];
+    println!("vec {}", std::mem::align_of_val(&v[..]));
+    let w: &[[u8; 3]] = &[[1, 2, 3], [4, 5, 6]];
+    println!("bytes {}", std::mem::align_of_val(w));
+}
+"#;
+
+#[test]
+fn run_mode_align_of_val_slice_of_arrays() {
+    // The `align_of_val` twin of the size case above: same raw
+    // predicate, same misjudgment of a slice of arrays.
+    run_ok(
+        "align-of-val-slice-of-arrays",
+        ALIGN_OF_VAL_SLICE_OF_ARRAYS_SRC,
+        "full 4\nvec 2\nbytes 1\n",
+    );
+}
+
+const BOX_DEFAULT_SLICE_OF_ARRAYS_SRC: &str = r#"
+fn main() {
+    let b: Box<[[i32; 2]]> = Default::default();
+    println!("slice {} {:?}", b.len(), b);
+    let c: Box<[i32; 2]> = Default::default();
+    println!("array {:?}", c);
+    let d: Box<[[u8; 3]]> = Box::default();
+    println!("via-box {} {:?}", d.len(), d);
+}
+"#;
+
+#[test]
+fn run_mode_box_default_slice_of_arrays() {
+    // `Box<[[i32; 2]]>::default()` is an empty boxed slice, but
+    // the pointee check in `default_value` judged slice-ness
+    // with a raw `!contains(';')`, fell through to the array
+    // default of the outer tag, and gave up as unsupported.
+    // The `Box<[i32; 2]>` line pins the array direction: an
+    // array pointee still defaults elementwise.
+    run_ok(
+        "box-default-slice-of-arrays",
+        BOX_DEFAULT_SLICE_OF_ARRAYS_SRC,
+        "slice 0 []\narray [0, 0]\nvia-box 0 []\n",
+    );
+}
+
+const AS_REF_SLICE_OF_ARRAYS_SRC: &str = r#"
+fn main() {
+    let a: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+    let s: &[[i32; 2]] = a.as_ref();
+    println!("asref {} {:?}", s.len(), s);
+    let t: &[[i32; 2]] = std::borrow::Borrow::borrow(&a);
+    println!("borrow {} {:?}", t.len(), t);
+}
+"#;
+
+#[test]
+fn run_mode_as_ref_slice_of_arrays() {
+    // The array-to-slice view in `view_value_as` used the same
+    // raw `contains(';')` pair to recognize its case; it now
+    // goes through `is_slice_tag` on both sides like the other
+    // consumers. (The pre-unification code reached the same
+    // output here through the reference fallback, so this test
+    // pins the behavior while the predicate is unified.)
+    run_ok(
+        "as-ref-slice-of-arrays",
+        AS_REF_SLICE_OF_ARRAYS_SRC,
+        "asref 2 [[1, 2], [3, 4]]\nborrow 2 [[1, 2], [3, 4]]\n",
+    );
+}
