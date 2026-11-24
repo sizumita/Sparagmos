@@ -6876,6 +6876,12 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Zip<")
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Filter<")
+                    || self_ty.starts_with("std::iter::FilterMap<")
+                    || self_ty.starts_with("std::str::Split<")
+                    || self_ty.starts_with("std::str::RSplit<")
+                    || self_ty.starts_with("std::str::SplitTerminator<")
+                    || self_ty.starts_with("std::str::RSplitTerminator<")
+                    || self_ty.starts_with("std::str::SplitInclusive<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::path::Components")
                     || self_ty.starts_with("std::path::Ancestors")
@@ -13753,6 +13759,11 @@ fn value_fingerprint(value: &Value) -> u64 {
                 return Ok(result);
             }
         }
+        if self_ty.starts_with("std::iter::FilterMap<") {
+            if let Some(result) = self.filter_map_next(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
         let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
@@ -14001,6 +14012,11 @@ fn value_fingerprint(value: &Value) -> u64 {
                 return Ok(result);
             }
         }
+        if self_ty.starts_with("std::iter::FilterMap<") {
+            if let Some(result) = self.filter_map_next_back(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
         let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.next_back_on_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
@@ -14088,6 +14104,114 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
     }
 
+    /// The place-based front step of a `FilterMap` (see
+    /// `filter_next` for the shape this mirrors): pull inner
+    /// items in place, apply the closure to each by value, and
+    /// yield the first `Some` it returns; an item whose closure
+    /// returns `None` is dropped as it is pulled. The closure
+    /// is an `FnMut`, so it is called with a reference to its
+    /// own field's storage. Declines a state that does not live
+    /// in a place, like `map_next` does.
+    fn filter_map_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(closure_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        loop {
+            let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
+            let Some(item) = option_payload_opt(item) else {
+                return Ok(Some(none_value()));
+            };
+            let callable = self.read_resolved(frames, &closure_target)?;
+            let env_ref = self.target_ref_value(frames, &closure_target)?;
+            let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+            match option_payload(mapped)? {
+                Some(y) => return Ok(Some(some_value(y))),
+                None => continue,
+            }
+        }
+    }
+
+    /// The place-based back step of a `FilterMap`: the mirror
+    /// of `filter_map_next` over the inner iterator's back
+    /// step.
+    fn filter_map_next_back(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(closure_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        loop {
+            let item = self.iterator_next_back_at(frames, inner_ty, &inner_target)?;
+            let Some(item) = option_payload_opt(item) else {
+                return Ok(Some(none_value()));
+            };
+            let callable = self.read_resolved(frames, &closure_target)?;
+            let env_ref = self.target_ref_value(frames, &closure_target)?;
+            let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+            match option_payload(mapped)? {
+                Some(y) => return Ok(Some(some_value(y))),
+                None => continue,
+            }
+        }
+    }
+
+    /// One front or back step of a `str` split iterator (the
+    /// `Split` family: `Split`, `RSplit`, `SplitTerminator`,
+    /// `RSplitTerminator`, `SplitInclusive`), replaying core's
+    /// `SplitInternal` state machine on the state the
+    /// constructor's converted body built: the one-field
+    /// wrapper holds `[start, end, matcher, allow_trailing_empty,
+    /// finished]`, and the five types differ only in which
+    /// internal step each direction runs (the terminators in
+    /// the constructor's recorded `allow_trailing_empty`).
+    /// Only the `char` pattern's searcher is modelled -- the
+    /// search is a substring search for the needle's UTF-8
+    /// encoding, which is exact because a char's encoding never
+    /// occurs inside another char's -- and any other searcher
+    /// shape is the generic unsupported error, as before.
+    fn str_split_step(
+        &mut self,
+        state: &Value,
+        self_ty: &str,
+        back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let Some(mut parts) = StrSplitParts::decode(state) else {
+            return Err(unsupported(format!(
+                "Iterator::next for {self_ty} is not runtime-supported"
+            )));
+        };
+        let reversed = self_ty.starts_with("std::str::RSplit<")
+            || self_ty.starts_with("std::str::RSplitTerminator<");
+        let inclusive = self_ty.starts_with("std::str::SplitInclusive<");
+        let item = match (back == reversed, inclusive) {
+            (true, false) => parts.next(),
+            (true, true) => parts.next_inclusive(),
+            (false, false) => parts.next_back(),
+            (false, true) => parts.next_back_inclusive(),
+        };
+        let new_state = parts.encode(state);
+        Ok(match item {
+            Some(piece) => (new_state, some_value(Value::Str(piece))),
+            None => (new_state, none_value()),
+        })
+    }
+
     /// The place-based back step of a `Map` (see `map_next`):
     /// step the inner iterator in place from the back, then apply
     /// the closure to the yielded item. Declines a state that
@@ -14134,6 +14258,9 @@ fn value_fingerprint(value: &Value) -> u64 {
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        if is_str_split_ty(self_ty) {
+            return self.str_split_step(&state, self_ty, true);
+        }
         if self_ty.starts_with("std::vec::Drain<")
             || self_ty.starts_with("alloc::vec::Drain<")
         {
@@ -14321,6 +14448,45 @@ fn value_fingerprint(value: &Value) -> u64 {
                             other.kind_name(),
                         ))
                     }
+                }
+            }
+        }
+        if self_ty.starts_with("std::iter::FilterMap<") {
+            // The value-level back step, used when the
+            // FilterMap does not live in a place (see
+            // `filter_map_next_back`): pull inner items from
+            // the back, apply the closure to each by value, and
+            // yield the first `Some` it returns. The closure is
+            // applied with a reference to the value itself, as
+            // in the front step's value-level arm.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "FilterMap state",
+                    "[iterator, closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let closure = fields[1].clone();
+            loop {
+                let (new_inner, item) =
+                    self.next_back_on_state(frames, inner_ty, inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload_opt(item) else {
+                    return Ok((
+                        rebuild_state(&state, vec![inner, closure]),
+                        none_value(),
+                    ));
+                };
+                let mapped =
+                    self.call_callable_sync(frames, &closure, None, vec![x])?;
+                if let Some(y) = option_payload(mapped)? {
+                    return Ok((
+                        rebuild_state(&state, vec![inner, closure]),
+                        some_value(y),
+                    ));
                 }
             }
         }
@@ -15293,6 +15459,9 @@ fn value_fingerprint(value: &Value) -> u64 {
                 )),
             };
         }
+        if is_str_split_ty(self_ty) {
+            return self.str_split_step(state, self_ty, false);
+        }
         let fields = iterator_fields(state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
@@ -15740,6 +15909,43 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             }
             (vec![inner, predicate], result)
+        } else if self_ty.starts_with("std::iter::FilterMap<") {
+            // `FilterMap` is (inner iterator, closure): the
+            // step pulls inner items, applies the closure to
+            // each by value, and yields the first `Some` it
+            // returns; an item whose closure returns `None` is
+            // dropped as it is pulled, exactly as core's loop
+            // drops it. This is the value-level step, used when
+            // the FilterMap does not live in a place (see
+            // `filter_map_next`): the closure is applied with a
+            // reference to the closure value itself, so capture
+            // reads resolve and writes to by-value captures are
+            // the explicit constant-aggregate error inside the
+            // call.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "FilterMap state",
+                    "[iterator, closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let closure = fields[1].clone();
+            let mut result = none_value();
+            loop {
+                let (new_inner, item) = self.next_on_state(frames, inner_ty, &inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload_opt(item) else {
+                    break;
+                };
+                let mapped = self.call_callable_sync(frames, &closure, None, vec![x])?;
+                if let Some(y) = option_payload(mapped)? {
+                    result = some_value(y);
+                    break;
+                }
+            }
+            (vec![inner, closure], result)
         } else if self_ty.starts_with("std::iter::SkipWhile<") {
             // `SkipWhile` is (inner iterator, done flag,
             // predicate) — core's own field layout: the
@@ -16794,6 +17000,24 @@ fn value_fingerprint(value: &Value) -> u64 {
                 return Err(InterpError::type_mismatch(
                     "Filter state",
                     "[iterator, predicate]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (_, upper) =
+                self.size_hint_parts(frames, inner_ty, fields[0].clone())?;
+            return Ok(hint(0, upper));
+        }
+        if self_ty.starts_with("std::iter::FilterMap<") {
+            // `FilterMap::size_hint` is `(0, inner upper)`, as
+            // `Filter`'s is: the closure may drop every
+            // remaining item, so the lower bound is zero, and
+            // no more items can come out than go in, so the
+            // upper bound is the inner iterator's.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "FilterMap state",
+                    "[iterator, closure]",
                     format!("{} field(s)", fields.len()),
                 ));
             }
@@ -21762,6 +21986,11 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::path::Components")
         || self_ty.starts_with("std::iter::Once<")
+        || self_ty.starts_with("std::str::Split<")
+        || self_ty.starts_with("std::str::RSplit<")
+        || self_ty.starts_with("std::str::SplitTerminator<")
+        || self_ty.starts_with("std::str::RSplitTerminator<")
+        || self_ty.starts_with("std::str::SplitInclusive<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
@@ -21779,6 +22008,7 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::iter::Cloned<")
         || self_ty.starts_with("std::iter::Map<")
         || self_ty.starts_with("std::iter::Filter<")
+        || self_ty.starts_with("std::iter::FilterMap<")
     {
         return first_generic_arg(self_ty).is_some_and(iterator_next_back_modelled);
     }
@@ -22970,6 +23200,277 @@ fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
             "ADT value",
             other.kind_name(),
         )),
+    }
+}
+
+/// Whether a rendered tag names one of the `str` split
+/// iterators whose state machine `str_split_step` replays
+/// (`Split`, `RSplit`, `SplitTerminator`, `RSplitTerminator`,
+/// `SplitInclusive` -- the `<` keeps `Split` from also matching
+/// `SplitInclusive` / `SplitTerminator`).
+fn is_str_split_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("std::str::Split<")
+        || self_ty.starts_with("std::str::RSplit<")
+        || self_ty.starts_with("std::str::SplitTerminator<")
+        || self_ty.starts_with("std::str::RSplitTerminator<")
+        || self_ty.starts_with("std::str::SplitInclusive<")
+}
+
+/// The decoded state of a `str` split iterator: core's
+/// `SplitInternal` fields plus the `CharSearcher` fields the
+/// step machine reads. The searcher's needle is kept as its
+/// UTF-8 encoding; the fields the machine does not read (the
+/// needle char, its size, the encoding array) are carried as
+/// their original values so the rebuilt state is field-exact.
+struct StrSplitParts {
+    start: usize,
+    end: usize,
+    haystack: String,
+    finger: usize,
+    finger_back: usize,
+    needle: Vec<u8>,
+    needle_value: Value,
+    utf8_size_value: Value,
+    utf8_encoded_value: Value,
+    allow_trailing_empty: bool,
+    finished: bool,
+}
+
+impl StrSplitParts {
+    /// Decode the state value, or `None` when it is not the
+    /// char-searcher split state (another pattern's searcher,
+    /// whose step stays unsupported).
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 5 {
+            return None;
+        }
+        let matcher = iterator_fields(&internal[2], "").ok()?;
+        if matcher.len() != 6 {
+            return None;
+        }
+        let Value::Str(haystack) = &matcher[0] else {
+            return None;
+        };
+        let as_usize = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Uint(x) => usize::try_from(*x).ok(),
+                _ => None,
+            }
+        };
+        let utf8_size = as_usize(&matcher[4])?;
+        if utf8_size == 0 || utf8_size > 4 {
+            return None;
+        }
+        let encoded = iterator_fields(&matcher[5], "").ok()?;
+        if encoded.len() != 4 {
+            return None;
+        }
+        let mut needle = Vec::with_capacity(utf8_size);
+        for slot in &encoded[..utf8_size] {
+            match slot {
+                Value::Uint(b) if *b <= 255 => needle.push(*b as u8),
+                _ => return None,
+            }
+        }
+        // The recorded encoding must be the needle char's own:
+        // the search below is a substring search for it.
+        if std::str::from_utf8(&needle).is_err() {
+            return None;
+        }
+        Some(StrSplitParts {
+            start: as_usize(&internal[0])?,
+            end: as_usize(&internal[1])?,
+            haystack: haystack.clone(),
+            finger: as_usize(&matcher[1])?,
+            finger_back: as_usize(&matcher[2])?,
+            needle,
+            needle_value: matcher[3].clone(),
+            utf8_size_value: matcher[4].clone(),
+            utf8_encoded_value: matcher[5].clone(),
+            allow_trailing_empty: internal[3] == Value::Bool(true),
+            finished: internal[4] == Value::Bool(true),
+        })
+    }
+
+    /// Rebuild the state value with the stepped fields, in the
+    /// exact shape `decode` read.
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded");
+        let new_matcher = rebuild_state(
+            &internal[2],
+            vec![
+                Value::Str(self.haystack.clone()),
+                Value::Uint(self.finger as u128),
+                Value::Uint(self.finger_back as u128),
+                self.needle_value.clone(),
+                self.utf8_size_value.clone(),
+                self.utf8_encoded_value.clone(),
+            ],
+        );
+        let new_internal = rebuild_state(
+            &outer[0],
+            vec![
+                Value::Uint(self.start as u128),
+                Value::Uint(self.end as u128),
+                new_matcher,
+                Value::Bool(self.allow_trailing_empty),
+                Value::Bool(self.finished),
+            ],
+        );
+        rebuild_state(state, vec![new_internal])
+    }
+
+    /// `CharSearcher::next_match`: the first needle occurrence
+    /// in `haystack[finger..finger_back]`; the finger advances
+    /// past it. A substring search for the needle's encoding
+    /// is the same search (see `str_split_step`).
+    fn next_match(&mut self) -> Option<(usize, usize)> {
+        let bytes = self.haystack.as_bytes();
+        let range = bytes.get(self.finger..self.finger_back)?;
+        let at = range
+            .windows(self.needle.len())
+            .position(|w| w == self.needle.as_slice());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger = found + self.needle.len();
+                Some((found, self.finger))
+            }
+            None => {
+                self.finger = self.finger_back;
+                None
+            }
+        }
+    }
+
+    /// `CharSearcher::next_match_back`: the last needle
+    /// occurrence in `haystack[finger..finger_back]`; the back
+    /// finger retreats to its start.
+    fn next_match_back(&mut self) -> Option<(usize, usize)> {
+        let bytes = self.haystack.as_bytes();
+        let Some(range) = bytes.get(self.finger..self.finger_back) else {
+            self.finger_back = self.finger;
+            return None;
+        };
+        let at = range
+            .windows(self.needle.len())
+            .rposition(|w| w == self.needle.as_slice());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger_back = found;
+                Some((found, found + self.needle.len()))
+            }
+            None => {
+                self.finger_back = self.finger;
+                None
+            }
+        }
+    }
+
+    /// `SplitInternal::get_end`.
+    fn get_end(&mut self) -> Option<String> {
+        if !self.finished {
+            self.finished = true;
+            if self.allow_trailing_empty || self.end > self.start {
+                return Some(self.haystack[self.start..self.end].to_string());
+            }
+        }
+        None
+    }
+
+    /// `SplitInternal::next`.
+    fn next(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        match self.next_match() {
+            Some((a, _)) => {
+                let elt = self.haystack[self.start..a].to_string();
+                self.start = a + self.needle.len();
+                Some(elt)
+            }
+            None => self.get_end(),
+        }
+    }
+
+    /// `SplitInternal::next_inclusive`.
+    fn next_inclusive(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        match self.next_match() {
+            Some((_, b)) => {
+                let elt = self.haystack[self.start..b].to_string();
+                self.start = b;
+                Some(elt)
+            }
+            None => self.get_end(),
+        }
+    }
+
+    /// The post-dance half of `SplitInternal::next_back` /
+    /// `next_back_inclusive`: one back match, or the final
+    /// piece (which the back steps yield unconditionally).
+    fn back_match(&mut self, inclusive: bool) -> Option<String> {
+        match self.next_match_back() {
+            Some((a, b)) => {
+                let elt = self.haystack[b..self.end].to_string();
+                self.end = if inclusive { b } else { a };
+                Some(elt)
+            }
+            None => {
+                self.finished = true;
+                Some(self.haystack[self.start..self.end].to_string())
+            }
+        }
+    }
+
+    /// `SplitInternal::next_back`, including its
+    /// `allow_trailing_empty` dance (the recursive call in
+    /// core is the one `back_match` call here).
+    fn next_back(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(false) {
+                Some(elt) if !elt.is_empty() => return Some(elt),
+                _ => {
+                    if self.finished {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.back_match(false)
+    }
+
+    /// `SplitInternal::next_back_inclusive`: the mirror of
+    /// `next_back` over `back_match`'s inclusive form.
+    fn next_back_inclusive(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(true) {
+                Some(elt) if !elt.is_empty() => return Some(elt),
+                _ => {
+                    if self.finished {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.back_match(true)
     }
 }
 
