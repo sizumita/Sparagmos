@@ -7967,6 +7967,20 @@ impl<'a> Interpreter<'a> {
                     && (target == "std::string::String" || target == "str" || target == "&str")
                 {
                     Ok(value)
+                } else if target == "std::string::String"
+                    && (generic_first_arg(source, "std::boxed::Box<") == Some("str")
+                        || generic_first_arg(source, "alloc::boxed::Box<") == Some("str"))
+                {
+                    // `String: From<Box<str>>`: the string moves
+                    // out of the box, releasing its allocation.
+                    match self.unbox_take(&value) {
+                        Some(s @ Value::Str(_)) => Ok(s),
+                        _ => Err(InterpError::type_mismatch(
+                            "From::from to String",
+                            "boxed string value",
+                            value.kind_name(),
+                        )),
+                    }
                 } else if matches!(value, Value::Int(_) | Value::Uint(_)) && is_integer_tag(target)
                 {
                     // The `From` impls between integer types are the
@@ -8356,6 +8370,44 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(self.rc_new_handle(Value::Tuple(elements)))
+                } else if [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
+                {
+                    // `Rc<str>` / `Arc<str>`: `From<&str>` and
+                    // `From<String>` hand over the string itself;
+                    // `From<Box<str>>` hands over the box
+                    // aggregate `new_box` builds around it, so
+                    // the string moves out of the box (releasing
+                    // its allocation) before the handle is built.
+                    let text = if matches!(value, Value::Str(_)) {
+                        value
+                    } else if generic_first_arg(source, "std::boxed::Box<") == Some("str")
+                        || generic_first_arg(source, "alloc::boxed::Box<") == Some("str")
+                    {
+                        match self.unbox_take(&value) {
+                            Some(s @ Value::Str(_)) => s,
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to a counted string",
+                                    "boxed string value",
+                                    value.kind_name(),
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(InterpError::type_mismatch(
+                            "From::from to a counted string",
+                            "string value",
+                            value.kind_name(),
+                        ));
+                    };
+                    Ok(self.rc_new_handle(text))
                 } else if target == "std::net::Ipv4Addr"
                     && (source == "[u8; 4]" || source == "u32")
                 {
@@ -17953,6 +18005,23 @@ fn value_fingerprint(value: &Value) -> u64 {
                 )
             }
         })
+    }
+
+    /// Take the pointee out of a `Box` value a conversion
+    /// consumes (`From<Box<T>>` and its kin): the box aggregate
+    /// `new_box` builds, over the allocation holding the
+    /// pointee. The box's allocation is released — the box is
+    /// gone once its pointee has moved out — and the pointee is
+    /// returned. `None` when the value is not a box over a live
+    /// allocation, or the box pointer carries a projection.
+    fn unbox_take(&self, value: &Value) -> Option<Value> {
+        let (id, projection) = box_alloc_pointer(value)?;
+        if !projection.is_empty() {
+            return None;
+        }
+        let pointee = self.alloc_value(id)?;
+        self.free_alloc(id);
+        Some(pointee)
     }
 
     /// The `Box<[T]>` a sequence value's elements move into: the

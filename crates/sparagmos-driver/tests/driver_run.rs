@@ -32108,3 +32108,86 @@ fn run_mode_thread_name() {
          plain-name=None\n",
     );
 }
+
+const STRING_FROM_BOXED_STR_SRC: &str = r#"
+fn main() {
+    let b: Box<str> = Box::from("plain");
+    let s = String::from(b);
+    println!("[{}] len={}", s, s.len());
+    let orig = String::from("héllo wörld");
+    let b = orig.into_boxed_str();
+    let mut s = String::from(b);
+    s.push_str("!");
+    println!("{}", s);
+    let e: Box<str> = Box::from("");
+    let es = String::from(e);
+    println!("empty len={} is_empty={}", es.len(), es.is_empty());
+    let b2: Box<str> = "abc".into();
+    let s2: String = b2.into();
+    println!("{}", s2);
+}
+"#;
+
+#[test]
+fn run_mode_string_from_boxed_str() {
+    // `String: From<Box<str>>` (and the blanket `Into` twin):
+    // the text moves out of the box into the string, which is
+    // then an ordinary owned string (it can grow). The box's
+    // allocation is released by the move.
+    let dir = temp_dir("strfrombox");
+    let src = fixture(&dir, "strfrombox.rs", STRING_FROM_BOXED_STR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "String::from(Box<str>) program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[plain] len=5\nhéllo wörld!\nempty len=0 is_empty=true\nabc\n",
+        "String::from(Box<str>) stdout mismatch; stderr={stderr}"
+    );
+}
+
+const COUNTED_STR_FROM_BOXED_STR_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let b: Box<str> = Box::from("rc-test");
+    let r: Rc<str> = Rc::from(b);
+    let r2 = r.clone();
+    println!("rc: {} {} strong={}", r, r2, Rc::strong_count(&r));
+    let b: Box<str> = Box::from("arc-test");
+    let a: Arc<str> = Arc::from(b);
+    println!("arc: {} len={}", a, a.len());
+    let r: Rc<str> = Rc::from("borrowed");
+    println!("rc-ref: {}", r);
+    let r2: Rc<str> = Rc::from(String::from("owned"));
+    println!("rc-string: {}", r2);
+    let a: Arc<str> = Arc::from("borrowed");
+    println!("arc-ref: {}", a);
+}
+"#;
+
+#[test]
+fn run_mode_counted_str_from_boxed_str() {
+    // `Rc<str>` / `Arc<str>` conversions: `From<Box<str>>`
+    // moves the text out of the box into a fresh counted
+    // handle; `From<&str>` and `From<String>` hand the string
+    // itself over to the handle.
+    let dir = temp_dir("countedstr");
+    let src = fixture(&dir, "countedstr.rs", COUNTED_STR_FROM_BOXED_STR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc<str>/Arc<str> conversion program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "rc: rc-test rc-test strong=2\narc: arc-test len=8\nrc-ref: borrowed\nrc-string: owned\narc-ref: borrowed\n",
+        "Rc<str>/Arc<str> conversion stdout mismatch; stderr={stderr}"
+    );
+}
