@@ -3472,6 +3472,70 @@ fn run_mode_dyn_bound_projection_projection_target_arg_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_TUPLE_TARGET_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Source {
+    type Item;
+}
+impl Source for () {
+    type Item = u32;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T>(std::marker::PhantomData<T>);
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Source>
+where
+    Wrap<(T::Item,)>: Carrier<(u32,)>,
+{
+    field: <<Wrap<(T::Item,)> as Carrier<(u32,)>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_tuple_target_arg_runs() {
+    // The implementation parameter `A` appears in both
+    // the self type (`Carrier<A> for Wrap<A>`) and the
+    // trait argument, and the target at the self type is
+    // a tuple holding a projection: matching binds `A`
+    // to `(<() as Source>::Item,)` through the self type
+    // and compares it against the trait argument's
+    // `(u32,)` -- the very tuple the binding denotes,
+    // since the projection resolves to `u32`. The
+    // disagreement check inspected only the binding's
+    // outermost shape, saw a tuple rather than a
+    // projection, and treated the disagreement as
+    // conclusive, so the screen rejected the holder and
+    // `main`. A disagreement over a binding that
+    // contains an unresolved projection anywhere inside
+    // it is inconclusive rather than proof the outer
+    // projection cannot normalize -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-tuple-target-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_tuple_target_arg.rs",
+        DYN_BOUND_PROJECTION_TUPLE_TARGET_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the tuple-target-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {

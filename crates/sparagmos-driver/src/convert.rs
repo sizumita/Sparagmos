@@ -1693,6 +1693,75 @@ fn const_contains_param(c: &TyConst) -> bool {
     }
 }
 
+/// Whether a type is or contains a projection (an alias
+/// of any kind) — at the top, or nested inside a compound
+/// shape the way `ty_contains_param` finds a parameter
+/// nested in one. A binding disagreement over such a type
+/// rests on ground the structural match does not check,
+/// the same way a disagreement over the projection itself
+/// does (see `bind_impl_arg`).
+fn ty_contains_alias(ty: &Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(TyKind::Alias(..)) => true,
+        Some(TyKind::RigidTy(rigid)) => match rigid {
+            RigidTy::Adt(_, args)
+            | RigidTy::FnDef(_, args)
+            | RigidTy::Closure(_, args)
+            | RigidTy::Coroutine(_, args)
+            | RigidTy::CoroutineClosure(_, args)
+            | RigidTy::CoroutineWitness(_, args) => {
+                args.0.iter().any(generic_arg_contains_alias)
+            }
+            RigidTy::Ref(_, inner, _)
+            | RigidTy::RawPtr(inner, _)
+            | RigidTy::Slice(inner)
+            | RigidTy::Pat(inner, _) => ty_contains_alias(&inner),
+            RigidTy::Array(elem, len) => ty_contains_alias(&elem) || const_contains_alias(&len),
+            RigidTy::Tuple(ts) => ts.iter().any(ty_contains_alias),
+            RigidTy::FnPtr(sig) => sig
+                .skip_binder()
+                .inputs_and_output
+                .iter()
+                .any(ty_contains_alias),
+            RigidTy::Dynamic(preds, _) => preds.iter().any(|pred| match &pred.value {
+                ExistentialPredicate::Trait(tref) => {
+                    tref.generic_args.0.iter().any(generic_arg_contains_alias)
+                }
+                ExistentialPredicate::Projection(p) => {
+                    p.generic_args.0.iter().any(generic_arg_contains_alias)
+                        || match &p.term {
+                            TermKind::Type(t) => ty_contains_alias(t),
+                            TermKind::Const(c) => const_contains_alias(c),
+                        }
+                }
+                ExistentialPredicate::AutoTrait(_) => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a generic argument is or contains a projection
+/// (see `ty_contains_alias`).
+fn generic_arg_contains_alias(arg: &GenericArgKind) -> bool {
+    match arg {
+        GenericArgKind::Type(t) => ty_contains_alias(t),
+        GenericArgKind::Const(c) => const_contains_alias(c),
+        GenericArgKind::Lifetime(_) => false,
+    }
+}
+
+/// Whether a constant's unevaluated arguments mention a
+/// type that is or contains a projection (see
+/// `ty_contains_alias`).
+fn const_contains_alias(c: &TyConst) -> bool {
+    match c.kind() {
+        TyConstKind::Unevaluated(_, args) => args.0.iter().any(generic_arg_contains_alias),
+        _ => false,
+    }
+}
+
 /// Whether an implementation with the trait-reference
 /// self type `impl_self` applies to the resolved self
 /// type `target`, recording the implementation's generic
@@ -2206,25 +2275,30 @@ fn bind_impl_arg(
                     }
                 }
             }
-            // A disagreement one side of which is a
-            // projection the resolution could not settle
-            // (see the parameter arm of
+            // A disagreement one side of which is or
+            // contains a projection the resolution could
+            // not settle (see the parameter arm of
             // `match_impl_self_ty`, which binds the
             // resolved form when it can) rests on ground
             // the match does not check: the projection may
             // denote the very type it is compared against,
             // so the disagreement proves nothing about
-            // whether the outer projection normalizes.
+            // whether the outer projection normalizes. The
+            // containment is recursive (see
+            // `ty_contains_alias`): a projection nested
+            // inside a compound binding -- a tuple holding
+            // `T::Item`, bound as one argument -- is the
+            // same unchecked ground as the projection
+            // itself, and an outermost-shape check alone
+            // misses it.
             // Record the resolution as inconclusive the
             // way an unsettled disagreement among the
             // matching implementations is recorded (see
             // `RESOLUTION_INCONCLUSIVE`); the
             // implementation itself does not stand as a
             // candidate on unchecked ground.
-            let unresolved_projection = |a: &GenericArgKind| {
-                matches!(a, GenericArgKind::Type(t)
-                    if matches!(guarded_ty_kind(t), Some(TyKind::Alias(..))))
-            };
+            let unresolved_projection =
+                |a: &GenericArgKind| generic_arg_contains_alias(a);
             if unresolved_projection(prev) || unresolved_projection(&arg) {
                 note_resolution_inconclusive();
             }
