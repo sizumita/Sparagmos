@@ -108,9 +108,18 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the
   cache is saved): the stage-3 harness extracts those sources from
-  the tree to build run-make-support. The survey itself is
-  unaffected — it reads only `tests/` and the compiletest /
-  bootstrap sources.
+  the tree to build run-make-support. It also includes `src/etc`
+  (run-make-support's `htmldocck()` helper executes
+  `src/etc/htmldocck.py` from the source root) and
+  `src/librustdoc/html/static/css` (read directly by the rustdoc
+  themes recipe); without them those recipes fail on the native
+  side of stage 3. The survey itself is unaffected — it reads
+  only `tests/` and the compiletest / bootstrap sources.
+- The stage-3 recipe environment carries
+  `DOC_RUST_LANG_ORG_CHANNEL` (`https://doc.rust-lang.org/` plus
+  the pinned version, matching what bootstrap exports for
+  compiletest on the stable channel): `htmldocck.py` refuses to
+  start without it.
 
 ## Hosted-runner calibration
 

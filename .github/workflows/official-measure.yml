@@ -94,9 +94,15 @@ jobs:
           # survey's own set before the cache is saved. src/stage0,
           # also extracted, is a file directly under src/ and is
           # already included by the cone-mode parent rules.
+          # src/etc carries htmldocck.py, which run-make-support's
+          # `htmldocck()` helper executes from the source root, and
+          # src/librustdoc/html/static/css is read directly by the
+          # rustdoc themes recipe; without them those recipes fail
+          # on the native side of stage 3.
           git -C "$RUST_SURVEY_DIR" sparse-checkout add \
             src/tools/run-make-support src/build_helper \
-            src/rustdoc-json-types
+            src/rustdoc-json-types src/etc \
+            src/librustdoc/html/static/css
           ls -la "$SURVEY_JSON"
 
       - name: Upload survey
