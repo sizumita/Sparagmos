@@ -29031,3 +29031,81 @@ fn debug_mode_deref_applies_after_projection_steps() {
         "the base value must not be dereferenced: {stdout}"
     );
 }
+
+const DEBUG_CHAINED_ARRAY_CAST_SRC: &str = r#"fn main() {
+    let a: [u32; 1] = [1065353216];
+    let r: &[u32; 1] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_chained_array_casts_keep_the_backing_element_type() {
+    // A second array-pointer cast before the dereference
+    // re-spells the pending view but does not reinterpret
+    // the storage: materialization reads the bytes through
+    // the final cast's element type, starting from the
+    // backing's actual element type -- not the intermediate
+    // cast's, which renders the stored integer unchanged,
+    // and not a byte-count comparison against the
+    // intermediate array's extent.
+    let dir = temp_dir("debug-chained-array-cast");
+    let src = fixture(&dir, "chained_array_cast.rs", DEBUG_CHAINED_ARRAY_CAST_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const [f32; 1])\nprint *((r as *const [f32; 1]) as *const [f32; 1])\nprint *((r as *const [u8; 4]) as *const [f32; 1])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = [1]", "$2 = [1]", "$3 = [1]"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("<error"),
+        "chained array casts must not error: {stdout}"
+    );
+}
+
+const DEBUG_DEREF_PAREN_PROJECTED_SRC: &str = r#"fn main() {
+    let v: i32 = 42;
+    let t: (&i32,) = (&v,);
+    zzz();
+    let _ = t;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_deref_of_parenthesised_projection_projects_first() {
+    // `*(t).0` groups the projection with the parenthesised
+    // base: the field step applies to the tuple and the
+    // leading dereference reads the field's pointee -- the
+    // same order the unparenthesised `*t.0` takes. Appending
+    // the dereference before the trailing projection
+    // dereferences the tuple itself.
+    let dir = temp_dir("debug-deref-paren");
+    let src = fixture(&dir, "deref_paren.rs", DEBUG_DEREF_PAREN_PROJECTED_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *t.0\nprint *(t).0\nwhatis *(t).0\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 42", "$2 = 42", "type = i32"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("type mismatch in dereference"),
+        "the parenthesised base must not be dereferenced: {stdout}"
+    );
+}

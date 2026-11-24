@@ -1941,7 +1941,19 @@ fn evaluate_expr(
                 // pointee. Any other cast supersedes a pending
                 // view.
                 let (v, d) = if is_array_pointer_desc(target) {
-                    ev.pending_array_view = Some((target.clone(), ev.desc.clone()));
+                    // A further array-pointer cast before the
+                    // view materializes re-spells the view but
+                    // does not reinterpret the storage: the
+                    // pending view keeps the descriptor the
+                    // first cast recorded, the type the stored
+                    // bytes actually hold, so materialization
+                    // reinterprets from that type rather than
+                    // from the intermediate cast's.
+                    let source = match &ev.pending_array_view {
+                        Some((_, recorded)) => recorded.clone(),
+                        None => ev.desc.clone(),
+                    };
+                    ev.pending_array_view = Some((target.clone(), source));
                     (ev.value.clone(), Some(target.clone()))
                 } else {
                     ev.pending_array_view = None;
@@ -5254,12 +5266,16 @@ fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
         } else {
             parse_expr(inner)?
         };
-        // The leading dereferences apply to the parenthesised
-        // value as a whole, after its own steps.
+        // Trailing projections apply to the parenthesised
+        // value first (`*(t).0` projects the tuple, then
+        // dereferences the field -- the unparenthesised form
+        // below orders its steps the same way); the leading
+        // dereferences apply to the projected value as a
+        // whole, after those steps.
+        parse_steps(&rest[close + 1..], &mut parsed.steps)?;
         for _ in 0..derefs {
             parsed.steps.push(ExprStep::Deref);
         }
-        parse_steps(&rest[close + 1..], &mut parsed.steps)?;
         return Ok(parsed);
     }
     // A base name: a plain identifier, or a path of identifiers
