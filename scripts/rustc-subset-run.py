@@ -6868,15 +6868,10 @@ def stage4_ui_attempt(rec, view, path, revision, all_revisions,
             res["bucket"] = bucket_reason(reason)
             res["sparagmos"] = {"exit_code": 2}
             return res
-        if gproc["exit_code"] != 0:
-            res["status"] = "fail"
-            res["reason"] = "guest rustdoc failed: " + (
-                first_error_line(gproc["stderr"])
-                or first_error_line(gproc["stdout"])
-                or f"exit {gproc['exit_code']}")
-            res["bucket"] = "exit-code mismatch"
-            res["sparagmos"] = {"exit_code": gproc["exit_code"]}
-            return res
+        # Every other exit status is the guest rustdoc's own:
+        # the verdict judges it against the pass/fail mode and
+        # the declared failure-status (a check-fail test is
+        # *supposed* to exit nonzero), then compares the output.
         ok, why = stage4_ui_verdict(view, path, gproc, explicit,
                                     revision, gbase)
         if not ok:

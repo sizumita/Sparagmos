@@ -4102,3 +4102,118 @@ class Stage4RustdocTests(unittest.TestCase):
         self.assertEqual(res["status"], "not-attempted")
         self.assertEqual(res["bucket"],
                          "not attempted (rustdoc artifact tree)")
+
+    # -- UI guest exit statuses --------------------------------------
+    #
+    # The guest rustdoc's own exit status belongs to the UI
+    # verdict: a check-fail test is supposed to exit nonzero, so
+    # anything but the driver's reserved exit 2 must reach
+    # stage4_ui_verdict instead of failing the record up front.
+
+    def ui_diag(self, line, rendered="error: boom\n"):
+        p = self.rust_dir / "tests/rustdoc-ui/x.rs"
+        diag = {"message": "boom", "code": None, "level": "error",
+                "spans": [{"file_name": str(p), "line_start": line,
+                           "column_start": 1, "is_primary": True,
+                           "label": None,
+                           "suggested_replacement": None,
+                           "expansion": None}],
+                "children": [], "rendered": rendered}
+        return json.dumps(diag) + "\n"
+
+    def run_ui_record(self, text, native_proc, guest_proc,
+                      snapshot=None):
+        rec = self.write_rec("rustdoc-ui", "tests/rustdoc-ui/x.rs",
+                             text)
+        if snapshot is not None:
+            (self.rust_dir / "tests/rustdoc-ui/x.stderr").write_text(
+                snapshot)
+
+        def fake_run_cmd(argv, **kw):
+            if argv[0] == FAKE_TC_PATHS["rustdoc"]:
+                return native_proc
+            return guest_proc
+
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        fake_run_cmd), \
+                unittest.mock.patch.object(
+                    run, "stage4_guest_probe",
+                    lambda db, rd: {"state": "ok", "reason": ""}), \
+                unittest.mock.patch.object(
+                    run, "stage4_artifacts_dir",
+                    lambda: Path("/artifacts")), \
+                unittest.mock.patch.object(
+                    run, "stage4_main_rs",
+                    lambda rd: Path("/artifacts/main.rs")):
+            return run.process_test(rec, self.rust_dir,
+                                    Path("/driver"), stage4=True)
+
+    def test_ui_check_fail_guest_reproducing_native_passes(self):
+        proc = {"exit_code": 1, "stdout": "",
+                "stderr": self.ui_diag(1), "timeout": False}
+        res = self.run_ui_record("bad();\n//~^ ERROR boom\n",
+                                 proc, dict(proc),
+                                 snapshot="error: boom\n")
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["bucket"], "")
+
+    def test_ui_check_fail_guest_silent_success_fails(self):
+        native = {"exit_code": 1, "stdout": "",
+                  "stderr": self.ui_diag(1), "timeout": False}
+        guest = {"exit_code": 0, "stdout": "", "stderr": "",
+                 "timeout": False}
+        res = self.run_ui_record("bad();\n//~^ ERROR boom\n",
+                                 native, guest,
+                                 snapshot="error: boom\n")
+        self.assertEqual(res["status"], "fail")
+        self.assertIn("did not emit an error", res["reason"])
+        self.assertEqual(res["bucket"], "exit-code mismatch")
+
+    def test_ui_check_fail_guest_wrong_output_fails_on_output(self):
+        native = {"exit_code": 1, "stdout": "",
+                  "stderr": self.ui_diag(1), "timeout": False}
+        guest = {"exit_code": 1, "stdout": "",
+                 "stderr": self.ui_diag(1, "error: bam\n"),
+                 "timeout": False}
+        res = self.run_ui_record("bad();\n//~^ ERROR boom\n",
+                                 native, guest,
+                                 snapshot="error: boom\n")
+        self.assertEqual(res["status"], "fail")
+        self.assertTrue(res["reason"].startswith(
+            "guest rustdoc failure:"))
+        self.assertIn("snapshot", res["reason"])
+        self.assertEqual(res["bucket"], "stdout mismatch")
+
+    def test_ui_failure_status_guest_matching_status_passes(self):
+        proc = {"exit_code": 7, "stdout": "",
+                "stderr": self.ui_diag(2), "timeout": False}
+        res = self.run_ui_record(
+            "//@ failure-status: 7\nbad();\n//~^ ERROR boom\n",
+            proc, dict(proc), snapshot="error: boom\n")
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["bucket"], "")
+
+    def test_ui_check_pass_guest_failure_is_a_verdict_failure(self):
+        native = {"exit_code": 0, "stdout": "", "stderr": "",
+                  "timeout": False}
+        guest = {"exit_code": 1, "stdout": "",
+                 "stderr": "error: nope\n", "timeout": False}
+        res = self.run_ui_record(
+            "//@ check-pass\n/// hi\npub fn f() {}\n",
+            native, guest)
+        self.assertEqual(res["status"], "fail")
+        self.assertIn("test compilation failed", res["reason"])
+        self.assertEqual(res["bucket"], "exit-code mismatch")
+
+    def test_ui_guest_driver_unsupported_stays_unsupported(self):
+        native = {"exit_code": 1, "stdout": "",
+                  "stderr": self.ui_diag(1), "timeout": False}
+        guest = {"exit_code": 2, "stdout": "",
+                 "stderr": "sparagmos-driver run: unsupported: "
+                           "frobnicate\n",
+                 "timeout": False}
+        res = self.run_ui_record("bad();\n//~^ ERROR boom\n",
+                                 native, guest,
+                                 snapshot="error: boom\n")
+        self.assertEqual(res["status"], "unsupported")
+        self.assertIn("unsupported: frobnicate", res["reason"])
