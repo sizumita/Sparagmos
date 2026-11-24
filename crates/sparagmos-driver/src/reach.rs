@@ -71,7 +71,7 @@ use crate::convert::{
 use crate::report::{FnOutcome, FnReport};
 
 /// Cap on collected bodies per program; see the module docs.
-pub const MAX_COLLECTED_BODIES: usize = 1024;
+pub const MAX_COLLECTED_BODIES: usize = 4096;
 
 /// Cap on the expanded size (node count) of one demanded
 /// instance's generic arguments, where the size of a type is the
