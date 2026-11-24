@@ -80,7 +80,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   runner with `--stages all`: stages 1 and 2 plus the stage-3
   procedure harness, which attempts the `procedure` records
   (run-make recipes — each recipe runs natively as the oracle, then
-  under the driver with tool interception). A second matrix repeats
+  under the driver with tool interception; the cargo suites
+  `run-make-cargo` and `build-std` are out of stage-3 scope and
+  recorded as not attempted, because their recipes drive cargo
+  itself and cargo orchestration — workspace resolution,
+  build-script and proc-macro processes, and the real compiler
+  artifacts cargo consumes — is not modelled by the harness). A second matrix repeats
   the pass with `--jit` for metric 4; the JIT pass does not attempt
   procedure records (the runner never combines stage 3 with
   `--jit`), so they remain in metric 4's denominator as not

@@ -5015,6 +5015,18 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
     interception), never by real child processes: exit 0 is a
     pass, the driver's named-unsupported exit 2 is an
     unsupported result, and any other exit is a failure.
+
+    The cargo suites (run-make-cargo, build-std) are not
+    attempted at all: their recipes drive cargo itself, and
+    cargo orchestration -- workspace resolution, build-script
+    and proc-macro processes, and the real compiler artifacts
+    (rmeta/rlib, object files) cargo consumes -- is outside
+    what the harness models (the interpreter's process model
+    starts no child processes, and the conversion machinery's
+    artifacts are registry placeholders, not files a real
+    tool chain can consume). They are recorded as out of
+    stage-3 scope, like the revisions and no-recipe cases
+    (issue #359).
     """
     out["stage"] = 3
     test_dir = rust_dir / rec["path"]
@@ -5036,6 +5048,13 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
     if header.revisions():
         out["reason"] = "recipe declares revisions (stage 3 runs the plain recipe only)"
         out["bucket"] = "out of stage-3 scope (revisions)"
+        return
+    if rec["suite"] in ("run-make-cargo", "build-std"):
+        out["reason"] = (
+            "recipe drives cargo (suite " + rec["suite"] + "); "
+            "cargo orchestration is not modelled by the stage-3 "
+            "harness (issue #359)")
+        out["bucket"] = "out of stage-3 scope (cargo)"
         return
     try:
         flat, rlib = ensure_stage3_support(rust_dir)
