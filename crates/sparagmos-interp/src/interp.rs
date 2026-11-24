@@ -22216,12 +22216,21 @@ fn assign_projected(
     let composed;
     let (projection, ty) = if projection_needs_composition(projection) {
         composed = compose_projection(slot, projection, func, place);
-        // A composed projection's steps no longer correspond
-        // to the declared types step by step (an index run
-        // flattened into one step spans several element types),
-        // so the type walk only follows an uncomposed
-        // projection.
-        (&composed[..], None)
+        if composed.as_slice() == projection {
+            // Composition left the steps nested as written
+            // (the element at the run's head is itself an
+            // aggregate, so the steps do not compose): the
+            // declared types still correspond step by step,
+            // so the type evidence stands.
+            (&composed[..], ty)
+        } else {
+            // A composed projection's steps no longer
+            // correspond to the declared types step by step
+            // (an index run flattened into one step spans
+            // several element types), so the type walk only
+            // follows an uncomposed projection.
+            (&composed[..], None)
+        }
     } else {
         (projection, ty)
     };
@@ -22939,9 +22948,14 @@ pub(crate) fn navigate_mut_grow<'x>(
     let composed;
     let (projection, ty) = if projection_needs_composition(projection) {
         composed = compose_projection(slot, projection, func, place);
-        // As in `assign_projected`: the type walk only follows
-        // an uncomposed projection.
-        (&composed[..], None)
+        // As in `assign_projected`: the type walk follows the
+        // projection when composition left it unchanged, and
+        // only a rewritten projection drops the evidence.
+        if composed.as_slice() == projection {
+            (&composed[..], ty)
+        } else {
+            (&composed[..], None)
+        }
     } else {
         (projection, ty)
     };
@@ -26193,6 +26207,54 @@ mod resolved_route_tests {
                     ]),
                 ],
             })
+        );
+    }
+
+    /// Nested index steps into an array of partially
+    /// materialised structs: the index run's head element is
+    /// itself an aggregate, so composition leaves the steps
+    /// nested as written, and the type evidence survives into
+    /// the navigation (see `assign_projected`): writing the
+    /// element struct's second field extends that struct; it
+    /// does not descend into the first field.
+    #[test]
+    fn nested_index_field_write_extends_the_struct() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![Value::Tuple(vec![
+            partial_struct(),
+        ])]));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(0), RefProj::Index(0), RefProj::Field(1)],
+        };
+        let root_ty = Ty::Array(
+            Box::new(Ty::Array(Box::new(Ty::Adt("probe::S".to_string())), 1)),
+            1,
+        );
+        interp
+            .write_resolved_typed(&mut frames, &target, Value::Int(30), Some(&root_ty))
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Tuple(vec![Value::Tuple(vec![Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }])]))
         );
     }
 
