@@ -1575,22 +1575,35 @@ def _proc_tree(root_pid):
     return members, total
 
 
-def _kill_process_tree(root_pid, pgid=None):
+def _kill_process_tree(root_pid, pgid=None, extra_pids=()):
     """SIGKILL the whole process tree rooted at root_pid,
     descendants first, so nothing in the tree survives to hold the
     record's output pipes (or the host's memory) open. When pgid is
     given (the bounded path's child leads its own process group
-    with pgid == its pid), the group is killed as a whole first:
-    the group outlives the root, so descendants reparented after
-    the root's death are still reached even when the /proc scan
-    races their exit."""
+    with pgid == its pid), the group is killed as a whole: the
+    group outlives the root, so descendants reparented after the
+    root's death are still reached even when the /proc scan races
+    their exit.
+
+    The tree is captured before the group kill, and extra_pids --
+    members the watchdog discovered in earlier polls -- are killed
+    individually as well. A descendant that made its own session is
+    in neither the root's group nor, once the root dies and it is
+    reparented, the /proc tree; only a pid remembered from while
+    the root lived still reaches it."""
+    members, _rss = _proc_tree(root_pid)
     if pgid is not None:
         try:
             os.killpg(pgid, signal.SIGKILL)
         except OSError:
             pass
-    members, _rss = _proc_tree(root_pid)
-    for pid in reversed(members):
+    seen = set(members)
+    targets = list(members)
+    for pid in extra_pids:
+        if pid not in seen:
+            seen.add(pid)
+            targets.append(pid)
+    for pid in reversed(targets):
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -1633,7 +1646,10 @@ def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
     descendants stay reachable through the group after the root
     exits: a descendant that inherits the output pipes and outlives
     the root can neither hide its RSS from the poll nor keep the
-    post-kill drain waiting past its deadline."""
+    post-kill drain waiting past its deadline. Members the polls
+    have seen are remembered for the kill, so a descendant that
+    escapes into its own session is still killed when the bound or
+    the deadline lands."""
     limit = mem_limit_mb * 1024 * 1024
     p = subprocess.Popen(argv, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, cwd=cwd, env=env,
@@ -1643,20 +1659,28 @@ def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
     mem_exceeded = False
     timed_out = False
     stdout = stderr = b""
+    # Every member the polls have ever seen. A member that leaves
+    # the tree (its own session, then reparented when the root
+    # dies) drops out of _proc_tree, but its pid stays killable
+    # through this set when the bound or the deadline lands.
+    known_members = set()
     while True:
         try:
             stdout, stderr = p.communicate(timeout=_MEM_POLL_SECONDS)
             break
         except subprocess.TimeoutExpired:
-            _members, rss = _proc_tree(p.pid)
+            members, rss = _proc_tree(p.pid)
+            known_members.update(members)
             if rss > limit:
                 mem_exceeded = True
-                _kill_process_tree(p.pid, pgid=p.pid)
+                _kill_process_tree(p.pid, pgid=p.pid,
+                                   extra_pids=known_members)
                 stdout, stderr = _drain_after_kill(p)
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
-                _kill_process_tree(p.pid, pgid=p.pid)
+                _kill_process_tree(p.pid, pgid=p.pid,
+                                   extra_pids=known_members)
                 stdout, stderr = _drain_after_kill(p)
                 break
     return {

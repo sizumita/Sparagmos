@@ -1103,6 +1103,39 @@ class RunCmdMemoryLimitTests(unittest.TestCase):
         self.assertTrue(res["mem_exceeded"])
         self.assertFalse(res["timeout"])
 
+    def test_own_session_descendant_is_killed_by_the_bound(self):
+        # The child makes its own session, so it sits outside the
+        # root's process group. While the root lives the watchdog
+        # still sees it in the ppid tree, but the moment the group
+        # kill lands, the root dies, the child is reparented, and a
+        # fresh /proc scan can no longer find it. The kill must
+        # spend the pids the polls remembered, not only what a
+        # post-kill scan can still see.
+        child = ("x = bytearray(40 * 1024 * 1024)\n"
+                 "for i in range(0, len(x), 4096):\n"
+                 "    x[i] = 1\n"
+                 "import time\n"
+                 "time.sleep(60)\n")
+        code = ("import subprocess, sys, time\n"
+                f"child = subprocess.Popen([sys.executable, '-c', "
+                f"{child!r}], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL)\n"
+                "print(child.pid, flush=True)\n"
+                "time.sleep(60)\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=60, mem_limit_mb=24)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+        child_pid = int(res["stdout"].strip())
+        deadline = time.monotonic() + 5
+        while (Path(f"/proc/{child_pid}").exists()
+               and time.monotonic() < deadline):
+            time.sleep(0.1)
+        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
     def test_timeout_still_reported_with_the_bound_set(self):
         res = run.run_cmd(
             [sys.executable, "-c", "import time; time.sleep(60)"],
