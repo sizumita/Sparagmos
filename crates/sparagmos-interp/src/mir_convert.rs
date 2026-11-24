@@ -246,20 +246,7 @@ fn ptr_pointee(t: &mir::Ty) -> Option<&mir::Ty> {
 }
 
 pub(crate) fn f16_to_f64(bits: u16) -> f64 {
-    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((bits >> 10) & 0x1f) as i32;
-    let frac = (bits & 0x3ff) as f64;
-    let v = match exp {
-        0 => frac * 2f64.powi(-24),
-        31 => {
-            if frac == 0.0 {
-                return sign * f64::INFINITY;
-            }
-            return f64::NAN;
-        }
-        e => (1024.0 + frac) * 2f64.powi(e - 25),
-    };
-    sign * v
+    crate::f128::f16_bits_to_f64(bits)
 }
 
 impl MirProgram {
@@ -4670,11 +4657,18 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Constant, ConvertError> {
         match scalar {
             mir::Scalar::Float { bits, ty } => match ty {
-                mir::FloatTy::F16 => Ok(ir::Constant::Float(f16_to_f64(*bits as u16))),
-                mir::FloatTy::F32 => {
-                    Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
-                }
-                mir::FloatTy::F64 => Ok(ir::Constant::Float(f64::from_bits(*bits as u64))),
+                mir::FloatTy::F16 => Ok(ir::Constant::Float(
+                    f16_to_f64(*bits as u16),
+                    ir::FloatTy::F16,
+                )),
+                mir::FloatTy::F32 => Ok(ir::Constant::Float(
+                    crate::f128::f32_bits_to_f64_exact(*bits as u32),
+                    ir::FloatTy::F32,
+                )),
+                mir::FloatTy::F64 => Ok(ir::Constant::Float(
+                    f64::from_bits(*bits as u64),
+                    ir::FloatTy::F64,
+                )),
                 mir::FloatTy::F128 => Ok(ir::Constant::Float128(*bits)),
             },
             mir::Scalar::Ptr { .. } => Err(ConvertError::UnsupportedConstant {
@@ -7150,7 +7144,7 @@ let inner = match (&src, target) {
                 bits: width,
                 signed: false,
             }),
-            ir::Constant::Float(_) => match width {
+            ir::Constant::Float(..) => match width {
                 16 | 32 | 64 => Some(S::Float { bits: width }),
                 _ => None,
             },
@@ -7181,7 +7175,7 @@ let inner = match (&src, target) {
                         bits: ew,
                         signed: false,
                     },
-                    ir::Constant::Float(_) => match ew {
+                    ir::Constant::Float(..) => match ew {
                         16 | 32 | 64 => S::Float { bits: ew },
                         _ => return None,
                     },
@@ -7202,8 +7196,8 @@ let inner = match (&src, target) {
                                 ir::Constant::Uint(_)
                             )
                             | (
-                                ir::Constant::Float(_),
-                                ir::Constant::Float(_)
+                                ir::Constant::Float(..),
+                                ir::Constant::Float(..)
                             )
                             | (ir::Constant::Bool(_), ir::Constant::Bool(_))
                     )

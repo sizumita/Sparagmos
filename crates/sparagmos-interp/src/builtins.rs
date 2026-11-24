@@ -3803,11 +3803,23 @@ fn exec_float16_method(
         O::IsSignNegative => Value::Bool(x.is_sign_negative()),
         O::Abs => round(x.abs()),
         O::Sqrt => round(x.sqrt()),
-        O::Floor => round(x.floor()),
-        O::Ceil => round(x.ceil()),
+        // The rounding family evaluates at `f32` precision, like
+        // the libm family: the native `f16` operations promote to
+        // `f32`, whose rounding instructions quiet a signaling NaN
+        // (payload preserved), while the host `f64` library
+        // floor / ceil / trunc return a signaling NaN unchanged.
+        // For `f16` inputs the `f32` results are exact, so no
+        // finite result changes. `round_ties_even` at `f64`
+        // precision likewise leaves a signaling NaN unchanged on
+        // this host, so it takes the `f32` path too; `round` and
+        // `fract` at `f64` already quiet signaling NaNs and match
+        // the native results bit for bit (measured over the f16
+        // probe battery), so they stay at `f64`.
+        O::Floor => round(x32.floor() as f64),
+        O::Ceil => round(x32.ceil() as f64),
         O::Round => round(x.round()),
-        O::RoundTiesEven => round(x.round_ties_even()),
-        O::Trunc => round(x.trunc()),
+        O::RoundTiesEven => round(x32.round_ties_even() as f64),
+        O::Trunc => round(x32.trunc() as f64),
         O::Fract => round(x.fract()),
         O::Recip => round(x.recip()),
         O::Signum => round(x.signum()),
@@ -3992,7 +4004,7 @@ fn exec_float_method(
             }
         };
         return Ok(Value::Float(if f32_width {
-            f32::from_bits(bits as u32) as f64
+            crate::f128::f32_bits_to_f64_exact(bits as u32)
         } else {
             f64::from_bits(bits as u64)
         }));
@@ -4126,7 +4138,7 @@ fn exec_float_method(
             })
         }
         O::ToBits => Value::Uint(if f32_width {
-            (x as f32).to_bits() as u128
+            crate::f128::f64_to_f32_bits_exact(x) as u128
         } else {
             x.to_bits() as u128
         }),

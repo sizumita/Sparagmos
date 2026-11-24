@@ -14067,11 +14067,11 @@ impl<'a> Interpreter<'a> {
                         *slot = Value::Float(crate::f128::f16_bits_to_f64(bits as u16));
                     }
                     (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
-                        let bits = splice(u128::from((*f as f32).to_bits()));
-                        *slot = Value::Float(f32::from_bits(bits as u32) as f64);
+                        let bits = splice(u128::from(crate::f128::f64_to_f32_bits_exact(*f)));
+                        *slot = Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32));
                     }
                     (ByteScalar::Float(FloatTy::F32), Value::Uninit) => {
-                        *slot = Value::Float(f32::from_bits(splice(0) as u32) as f64);
+                        *slot = Value::Float(crate::f128::f32_bits_to_f64_exact(splice(0) as u32));
                     }
                     (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => {
                         let bits = splice(u128::from(f.to_bits()));
@@ -14760,24 +14760,7 @@ impl<'a> Interpreter<'a> {
     fn place_result_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
         let mut ty = body.local_ty(place.local)?.clone();
         for elem in &place.projection {
-            ty = match (elem, &ty) {
-                (ProjectionElem::Deref, Ty::Ref(inner)) => (**inner).clone(),
-                (ProjectionElem::Field(i), Ty::Tuple(ts)) => ts.get(*i)?.clone(),
-                (ProjectionElem::Index(_), Ty::Array(elem, _)) => (**elem).clone(),
-                (ProjectionElem::Index(_), Ty::Slice(elem)) => (**elem).clone(),
-                (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _)) => {
-                    (**elem).clone()
-                }
-                (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => (**elem).clone(),
-                (ProjectionElem::Downcast(_), t) => t.clone(),
-                (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
-                    Ty::Array(elem.clone(), 0)
-                }
-                (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
-                    Ty::Slice(elem.clone())
-                }
-                _ => return None,
-            };
+            ty = projection_step_ty(&ty, elem)?;
         }
         Some(ty)
     }
@@ -15740,7 +15723,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Float(round_to_f16(*v)))
             }
             (Some(Ty::Float(FloatTy::F32)), Value::Float(v)) => {
-                Ok(Value::Float((*v as f32) as f64))
+                if v.is_nan() {
+                    // The rounding above would quiet a signaling
+                    // NaN; a place holds the value's exact form,
+                    // so narrow and re-widen through the bit-exact
+                    // pair instead.
+                    Ok(Value::Float(crate::f128::f32_bits_to_f64_exact(
+                        crate::f128::f64_to_f32_bits_exact(*v),
+                    )))
+                } else {
+                    Ok(Value::Float((*v as f32) as f64))
+                }
             }
             (Some(Ty::Float(FloatTy::F64)), Value::Float(_)) => Ok(value),
             (Some(Ty::Float(FloatTy::F128)), Value::Float128(_)) => Ok(value),
@@ -16282,7 +16275,7 @@ impl<'a> Interpreter<'a> {
             Constant::Bool(b) => Value::Bool(*b),
             Constant::Int(v) => Value::Int(*v),
             Constant::Uint(v) => Value::Uint(*v),
-            Constant::Float(v) => Value::Float(*v),
+            Constant::Float(v, _) => Value::Float(*v),
             Constant::Float128(bits) => Value::Float128(*bits),
             Constant::VTablePtr(id) => Value::Ref(RefTarget::Address(*id)),
             Constant::FatPtr { addr, meta } => Value::FatRef {
@@ -16488,7 +16481,7 @@ impl<'a> Interpreter<'a> {
                 None => Ok(Value::Uninit),
                 Some(bits) => match size {
                     2 => Ok(Value::Float(crate::mir_convert::f16_to_f64(bits as u16))),
-                    4 => Ok(Value::Float(f64::from(f32::from_bits(bits as u32)))),
+                    4 => Ok(Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32))),
                     8 => Ok(Value::Float(f64::from_bits(bits as u64))),
                     16 => Ok(Value::Float128(bits)),
                     _ => Err(InterpError::type_mismatch(
@@ -17561,7 +17554,7 @@ impl<'a> Interpreter<'a> {
             }
             (ScalarShape::Float { bits }, Value::Float(f)) => Ok(match bits {
                 16 => u128::from(f64_to_f16_bits(*f)),
-                32 => u128::from((*f as f32).to_bits()),
+                32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
                 _ => u128::from(f.to_bits()),
             }),
             (ScalarShape::Bool, Value::Bool(b)) => Ok(u128::from(*b)),
@@ -17844,7 +17837,11 @@ impl<'a> Interpreter<'a> {
             }
             ScalarShape::Float { bits: w } => Ok(Value::Float(match w {
                 16 => crate::mir_convert::f16_to_f64(bits as u16),
-                32 => f64::from(f32::from_bits(bits as u32)),
+                // Rebuilding a value from its bit pattern is
+                // transport: widen exactly, as `flatten_scalar`
+                // narrows exactly, so a signaling NaN pattern
+                // survives a transmute round trip.
+                32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
                 _ => f64::from_bits(bits as u64),
             })),
             ScalarShape::Ptr => Ok(self.materialized_ptr(bits as u64)),
@@ -18501,7 +18498,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Cast(operand, ty) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                eval_cast(&v, ty)
+                let src_ty = cast_src_ty(body, operand);
+                eval_cast(&v, src_ty.as_ref(), ty)
             }
             Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
@@ -18661,7 +18659,7 @@ impl<'a> Interpreter<'a> {
                                 )
                             })?
                         };
-                        eval_cast(&Value::Int(discr), ty)
+                        eval_cast(&Value::Int(discr), None, ty)
                     }
                     other => Err(InterpError::type_mismatch(
                         "enum-to-integer transmute",
@@ -19897,7 +19895,7 @@ fn byte_patch_tree(current: &Value, bytes: &[u8]) -> Option<Value> {
             Value::Float(_) => {
                 let bits = take(pos)?;
                 Some(Value::Float(match width {
-                    32 => f64::from(f32::from_bits(bits as u32)),
+                    32 => crate::f128::f32_bits_to_f64_exact(bits as u32),
                     _ => f64::from_bits(bits as u64),
                 }))
             }
@@ -19941,7 +19939,7 @@ fn tree_to_bytes(value: &Value, total: usize) -> Option<Vec<u8>> {
             Value::Int(i) => (*i as u128) & bit_mask(width),
             Value::Uint(u) => *u & bit_mask(width),
             Value::Float(f) => match width {
-                32 => u128::from((*f as f32).to_bits()),
+                32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
                 _ => u128::from(f.to_bits()),
             },
             Value::Bool(b) => u128::from(*b),
@@ -22879,8 +22877,17 @@ fn f64_to_f16_bits(v: f64) -> u16 {
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let mant = bits & ((1u64 << 52) - 1);
     if exp == 0x7ff {
-        // Infinity / NaN (a NaN keeps a nonzero payload marker).
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+        // Infinity / NaN. A NaN keeps its sign and the top-aligned
+        // payload of its `f64` storage form (an `f16` NaN is stored
+        // as its exact widening, so this recovers the pattern bit
+        // for bit, signaling NaNs included); a payload entirely
+        // below the `f16` window keeps the quiet marker so the
+        // result stays a NaN.
+        if mant == 0 {
+            return sign | 0x7c00;
+        }
+        let payload = (mant >> 42) as u16;
+        return sign | 0x7c00 | if payload == 0 { 0x0200 } else { payload };
     }
     let e = exp - 1023;
     if e > 15 {
@@ -23118,7 +23125,77 @@ fn synthetic_addr(v: &Value) -> u128 {
     BASE + (h % (1 << 40)) * 65536
 }
 
-pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
+/// One step of the declared-type walk over a projection: the
+/// type of the value denoted after applying `elem` to a value of
+/// type `ty`, when the local's declared type alone determines
+/// it. This is the step set `place_result_ty` judges by.
+fn projection_step_ty(ty: &Ty, elem: &ProjectionElem) -> Option<Ty> {
+    match (elem, ty) {
+        (ProjectionElem::Deref, Ty::Ref(inner)) => Some((**inner).clone()),
+        (ProjectionElem::Field(i), Ty::Tuple(ts)) => ts.get(*i).cloned(),
+        (ProjectionElem::Index(_), Ty::Array(elem, _)) => Some((**elem).clone()),
+        (ProjectionElem::Index(_), Ty::Slice(elem)) => Some((**elem).clone()),
+        (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _)) => {
+            Some((**elem).clone())
+        }
+        (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => {
+            Some((**elem).clone())
+        }
+        (ProjectionElem::Downcast(_), t) => Some(t.clone()),
+        (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
+            Some(Ty::Array(elem.clone(), 0))
+        }
+        (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
+            Some(Ty::Slice(elem.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The declared type of the value a cast's source place denotes,
+/// walked over the place's own projection: a tuple field, an
+/// array element and a dereferenced pointer (a reference and a
+/// raw pointer share the `Ty::Ref` representation) all name
+/// their element / pointee type, so a cast from such a place is
+/// a genuine conversion at that width, not a transport of the
+/// base local's stored form. `None` when a step's type is not
+/// determined by the local's declared type alone (a field of an
+/// ADT, a deref of an ADT-typed local such as a `Box`).
+pub(crate) fn cast_place_ty(body: &Body, place: &Place) -> Option<Ty> {
+    let mut ty = body.local_ty(place.local)?.clone();
+    for elem in &place.projection {
+        ty = projection_step_ty(&ty, elem)?;
+    }
+    Some(ty)
+}
+
+/// The source type a constant records for itself, when it
+/// records one: a float constant keeps its own width beside the
+/// widened stored value (see `Constant::Float`). Other constants
+/// record no width in this IR.
+pub(crate) fn constant_ty(c: &Constant) -> Option<Ty> {
+    match c {
+        Constant::Float(_, ty) => Some(Ty::Float(*ty)),
+        Constant::Float128(_) => Some(Ty::Float(FloatTy::F128)),
+        _ => None,
+    }
+}
+
+/// The declared type of a cast's source operand: a place source
+/// resolves through the place's declared type (see
+/// [`cast_place_ty`]); a constant source answers with the type
+/// the constant itself records (see [`constant_ty`]). Without a
+/// source type, `eval_cast`'s float arms keep the stored form,
+/// which is the exact widening of the source value.
+pub(crate) fn cast_src_ty(body: &Body, operand: &Operand) -> Option<Ty> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => cast_place_ty(body, place),
+        Operand::Constant(c) => constant_ty(c),
+        _ => None,
+    }
+}
+
+pub(crate) fn eval_cast(v: &Value, src_ty: Option<&Ty>, ty: &Ty) -> InterpResult<Value> {
     match ty {
         Ty::Int(it) => {
             // A float source saturates; it does not wrap like an
@@ -23218,9 +23295,60 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
                 (Value::Uint(a), FloatTy::F16) => round_to_f16(*a as f64),
                 (Value::Uint(a), FloatTy::F32) => (*a as f32) as f64,
                 (Value::Uint(a), FloatTy::F64) => *a as f64,
-                (Value::Float(a), FloatTy::F16) => round_to_f16(*a),
-                (Value::Float(a), FloatTy::F32) => (*a as f32) as f64,
-                (Value::Float(a), FloatTy::F64) => *a,
+                (Value::Float(a), FloatTy::F16) => {
+                    if a.is_nan()
+                        && matches!(
+                            src_ty,
+                            Some(Ty::Float(FloatTy::F32)) | Some(Ty::Float(FloatTy::F64))
+                        )
+                    {
+                        // A narrowing conversion carries the payload
+                        // across top-aligned and quiets the NaN, as
+                        // the hardware conversion does; the result is
+                        // stored as the exact widening of that `f16`
+                        // pattern.
+                        let bits = a.to_bits();
+                        let sign = if bits >> 63 != 0 { 0x8000u16 } else { 0 };
+                        let payload = ((bits >> 42) & 0x3ff) as u16;
+                        f128::f16_bits_to_f64(sign | 0x7c00 | payload | 0x0200)
+                    } else {
+                        round_to_f16(*a)
+                    }
+                }
+                (Value::Float(a), FloatTy::F32) => {
+                    if matches!(
+                        src_ty,
+                        Some(Ty::Float(FloatTy::F16)) | Some(Ty::Float(FloatTy::F32))
+                    ) {
+                        // Widening `f16` to `f32` (or an `f32`
+                        // identity cast): the stored form already
+                        // is the exact widening at the target width,
+                        // NaN payloads included — the native
+                        // conversion preserves a signaling NaN here
+                        // rather than quieting it, which the host
+                        // `f64` -> `f32` conversion would not.
+                        *a
+                    } else {
+                        (*a as f32) as f64
+                    }
+                }
+                (Value::Float(a), FloatTy::F64) => {
+                    // A widening conversion from `f16` / `f32` quiets
+                    // a NaN, as the hardware conversion does; the sign
+                    // and the top-aligned payload are preserved. The
+                    // stored form is the exact widening, so only the
+                    // quiet bit changes.
+                    if a.is_nan()
+                        && matches!(
+                            src_ty,
+                            Some(Ty::Float(FloatTy::F16)) | Some(Ty::Float(FloatTy::F32))
+                        )
+                    {
+                        f64::from_bits(a.to_bits() | (1u64 << 51))
+                    } else {
+                        *a
+                    }
+                }
                 (other, _) => {
                     return Err(InterpError::type_mismatch(
                         "cast",

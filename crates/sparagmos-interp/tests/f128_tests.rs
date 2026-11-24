@@ -254,3 +254,55 @@ fn f16_helpers() {
         assert_eq!(f128::f64_to_f16_bits(f128::f16_bits_to_f64(bits)), bits);
     }
 }
+
+#[test]
+fn f16_nan_patterns_round_trip() {
+    // Every NaN pattern — signaling and quiet, both signs, payloads
+    // at the extraction boundaries — survives the trip through the
+    // stored `f64` form bit-exactly: the widening is payload-aligned
+    // and the narrowing is its exact inverse, so neither the sign
+    // nor the signaling bit is lost.
+    for bits in [
+        0x7c01u16, 0x7d00, 0x7dff, 0x7e00, 0x7e01, 0x7fff, 0xfc01, 0xfd00, 0xfdff, 0xfe00, 0xfe01,
+        0xffff,
+    ] {
+        assert_eq!(f128::f64_to_f16_bits(f128::f16_bits_to_f64(bits)), bits);
+    }
+    // The widening itself: sign preserved, payload at the top of
+    // the `f64` fraction, quiet bit NOT forced.
+    assert_eq!(
+        f128::f16_bits_to_f64(0x7c01).to_bits(),
+        0x7ff0_0400_0000_0000
+    );
+    assert_eq!(
+        f128::f16_bits_to_f64(0xfc01).to_bits(),
+        0xfff0_0400_0000_0000
+    );
+    assert_eq!(
+        f128::f16_bits_to_f64(0x7e01).to_bits(),
+        0x7ff8_0400_0000_0000
+    );
+}
+
+#[test]
+fn f32_nan_patterns_round_trip() {
+    // The `f32` storage pair follows the same rule: a NaN keeps
+    // its sign, payload and signaling bit in both directions.
+    for bits in [
+        0x7f80_0001u32,
+        0x7fbf_ffff,
+        0x7fc0_0000,
+        0x7fdf_ffff,
+        0xff80_0001,
+        0xffc0_0000,
+    ] {
+        assert_eq!(
+            f128::f64_to_f32_bits_exact(f128::f32_bits_to_f64_exact(bits)),
+            bits
+        );
+    }
+    assert_eq!(
+        f128::f32_bits_to_f64_exact(0x7f80_0001).to_bits(),
+        0x7ff0_0000_2000_0000
+    );
+}

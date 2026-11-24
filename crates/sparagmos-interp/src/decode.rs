@@ -60,8 +60,8 @@ use std::rc::Rc;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    describe_resolved, eval_binary, eval_cast, eval_unary, navigate_mut, operand_pointee_ty,
-    project_value, Frame, Interpreter,
+    cast_place_ty, cast_src_ty, constant_ty, describe_resolved, eval_binary, eval_cast, eval_unary,
+    navigate_mut, operand_pointee_ty, project_value, Frame, Interpreter,
 };
 use crate::ir::{
     BasicBlock, BinOp, Body, Constant, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
@@ -164,8 +164,11 @@ pub(crate) enum DSrc {
         desc: Rc<str>,
         place: Place,
     },
-    /// A constant operand evaluated once at decode time.
-    Const(Value),
+    /// A constant operand evaluated once at decode time, with
+    /// the source type the constant records for itself (a float
+    /// constant's width; see `constant_ty`): a cast consuming the
+    /// predecoded constant still converts at that width.
+    Const(Value, Option<Ty>),
     /// Any other operand, evaluated by the original path.
     Operand(Operand),
 }
@@ -348,7 +351,7 @@ impl<'a> Interpreter<'a> {
             Operand::Constant(c) => {
                 if constant_is_pure(c) {
                     if let Ok(value) = self.eval_constant(c) {
-                        return DSrc::Const(value);
+                        return DSrc::Const(value, constant_ty(c));
                     }
                 }
                 DSrc::Operand(op.clone())
@@ -576,7 +579,7 @@ impl<'a> Interpreter<'a> {
         src: &DSrc,
     ) -> InterpResult<Value> {
         match src {
-            DSrc::Const(value) => Ok(value.clone()),
+            DSrc::Const(value, _) => Ok(value.clone()),
             DSrc::Operand(op) => self.eval_operand(frames, body, op),
             DSrc::Local(idx) => self.read_local(frames, body, *idx),
             DSrc::MoveLocal(idx) => {
@@ -682,7 +685,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
             DSrc::Operand(op) => operand_pointee_ty(body, op),
-            DSrc::LocalProj { .. } | DSrc::MoveLocalProj { .. } | DSrc::Const(_) => None,
+            DSrc::LocalProj { .. } | DSrc::MoveLocalProj { .. } | DSrc::Const(..) => None,
         }
     }
 
@@ -807,7 +810,18 @@ impl<'a> Interpreter<'a> {
             }
             DRvalue::Cast(src, ty) => {
                 let v = self.eval_src(frames, body, src)?;
-                eval_cast(&v, ty)
+                let src_ty = match src {
+                    DSrc::Local(local) | DSrc::MoveLocal(local) => {
+                        body.local_ty(Local(*local as usize)).cloned()
+                    }
+                    DSrc::LocalProj { place, .. } | DSrc::MoveLocalProj { place, .. } => {
+                        cast_place_ty(body, place)
+                    }
+                    DSrc::Operand(operand) => cast_src_ty(body, operand),
+                    DSrc::Const(_, ty) => ty.clone(),
+                    _ => None,
+                };
+                eval_cast(&v, src_ty.as_ref(), ty)
             }
             DRvalue::Len(dplace, place) => {
                 let value = self.read_dplace(frames, body, dplace)?;
@@ -887,7 +901,7 @@ impl<'a> Interpreter<'a> {
                                 )
                             })?
                         };
-                        eval_cast(&Value::Int(discr), ty)
+                        eval_cast(&Value::Int(discr), None, ty)
                     }
                     other => Err(InterpError::type_mismatch(
                         "enum-to-integer transmute",

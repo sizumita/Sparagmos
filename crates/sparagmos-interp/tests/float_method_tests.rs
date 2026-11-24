@@ -1008,3 +1008,39 @@ fn f16_libm_family_matches_native_values() {
         ])
     );
 }
+
+#[test]
+fn f16_round_ties_even_quiets_signaling_nan() {
+    // Native `f16` rounding operations promote to `f32`, whose
+    // rounding instructions quiet a signaling NaN with its payload
+    // preserved: 0x7c01 -> 0x7e01. Evaluating `round_ties_even` at
+    // `f64` precision leaves the signaling bit set on this host,
+    // so it takes the same `f32` path as floor / ceil / trunc.
+    for (input, want) in [(0x7c01u16, 0x7e01u16), (0x7dff, 0x7fff), (0xfc01, 0xfe01)] {
+        assert_eq!(
+            run_f16(
+                "core::f16::<impl f16>::round_ties_even",
+                vec![const_f16(input)]
+            ),
+            want,
+            "round_ties_even({input:#06x})"
+        );
+    }
+    // Ties and ordinary values still round at `f16` precision:
+    // 0.5 -> 0 (to even), 1.5 -> 2, 2.5 -> 2 (to even), -0.5 -> -0.
+    for (input, want) in [
+        (0x3800u16, 0x0000u16),
+        (0x3e00, 0x4000),
+        (0x4100, 0x4000),
+        (0xb800, 0x8000),
+    ] {
+        assert_eq!(
+            run_f16(
+                "core::f16::<impl f16>::round_ties_even",
+                vec![const_f16(input)]
+            ),
+            want,
+            "round_ties_even({input:#06x})"
+        );
+    }
+}

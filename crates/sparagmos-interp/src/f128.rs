@@ -1103,6 +1103,42 @@ pub fn from_f64(bits: u64) -> u128 {
     pack(sign, &mant, exp2, false)
 }
 
+/// Exact widening of an `f32` bit pattern to the stored `f64`
+/// form: the payload moves to the top of the wider fraction and
+/// the signaling bit survives (the host `f32 as f64` conversion
+/// quiets a signaling NaN). Finite values widen exactly through
+/// the host conversion, subnormals included.
+pub fn f32_bits_to_f64_exact(bits: u32) -> f64 {
+    let v = f32::from_bits(bits);
+    if v.is_nan() {
+        let sign = ((bits >> 31) as u64) << 63;
+        let frac = (bits & 0x007f_ffff) as u64;
+        f64::from_bits(sign | 0x7ff0_0000_0000_0000 | frac << 29)
+    } else {
+        v as f64
+    }
+}
+
+/// Narrow a stored float back to `f32` bits. The interpreter
+/// stores an `f32` value widened to `f64`, which is exact, so the
+/// readback is the payload-preserving inverse of that widening:
+/// a NaN keeps its sign, payload and signaling bit (the host
+/// `f64 as f32` conversion would quiet a signaling NaN). Only
+/// values that really are `f32` widenings may go through here;
+/// a genuine `f64` -> `f32` cast is a conversion, not a readback,
+/// and keeps the host semantics (which do quiet).
+pub fn f64_to_f32_bits_exact(a: f64) -> u32 {
+    let bits = a.to_bits();
+    let sign = ((bits >> 63) as u32) << 31;
+    if a.is_nan() {
+        let payload = (bits >> 29) as u32 & 0x007f_ffff;
+        if payload != 0 {
+            return sign | 0x7f80_0000 | payload;
+        }
+    }
+    (a as f32).to_bits()
+}
+
 /// Exact widening of an `f32` bit pattern to `f128`.
 pub fn from_f32(bits: u32) -> u128 {
     let sign = bits >> 31 != 0;
@@ -1138,7 +1174,15 @@ pub fn f64_to_f16_bits(v: f64) -> u16 {
         return if frac == 0 {
             sign_bit | 0x7c00
         } else {
-            sign_bit | 0x7e00 // canonical quiet NaN
+            // NaN: carry the sign and the payload across, top-aligned
+            // (the stored form of an `f16` NaN is its exact widening,
+            // whose payload sits in the top 10 mantissa bits, so this
+            // recovers it bit for bit, signaling NaNs included). A
+            // payload entirely below that window cannot come from a
+            // stored `f16` value; keep the quiet marker so the result
+            // stays a NaN rather than collapsing to infinity.
+            let payload = (frac >> 42) as u16;
+            sign_bit | 0x7c00 | if payload == 0 { 0x0200 } else { payload }
         };
     }
     if exp == 0 && frac == 0 {
@@ -1152,7 +1196,10 @@ pub fn f64_to_f16_bits(v: f64) -> u16 {
     pack_generic(sign, &mant, exp2, false, 11, 15, 5) as u16
 }
 
-/// The `f64` value of an `f16` bit pattern (exact).
+/// The `f64` value of an `f16` bit pattern (exact). A NaN widens
+/// with its sign and payload carried top-aligned, so the signaling /
+/// quiet distinction and the payload survive the round trip through
+/// the `f64` storage form bit for bit.
 pub fn f16_bits_to_f64(bits: u16) -> f64 {
     let sign = if bits >> 15 != 0 { -1.0 } else { 1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -1161,7 +1208,10 @@ pub fn f16_bits_to_f64(bits: u16) -> f64 {
         if bits & 0x3ff == 0 {
             return sign * f64::INFINITY;
         }
-        return f64::NAN;
+        let sign_bit = if bits >> 15 != 0 { 1u64 << 63 } else { 0 };
+        return f64::from_bits(
+            sign_bit | 0x7ff0_0000_0000_0000 | ((u64::from(bits & 0x3ff)) << 42),
+        );
     }
     if exp == 0 {
         // Subnormal: frac * 2^-24.

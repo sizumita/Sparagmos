@@ -72,6 +72,15 @@ fn const_i32(v: i32) -> mir::Operand {
     )))
 }
 
+fn const_u32(v: u32) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Int {
+            data: v as u128,
+            size: 4,
+        },
+    )))
+}
+
 fn block(stmts: Vec<mir::Statement>, kind: mir::TerminatorKind) -> mir::BasicBlockData {
     let mut bb = mir::BasicBlockData::new(mir::Terminator::new(kind));
     bb.statements = stmts;
@@ -356,4 +365,390 @@ fn float_to_float_cast_narrows() {
         ],
     );
     assert_eq!(v, Value::Float(0.1f32 as f64));
+}
+// ----- projected cast sources (PR #419 Codex follow-up) -----
+
+fn f16_ty() -> mir::Ty {
+    mir::Ty::Float(mir::FloatTy::F16)
+}
+
+fn u8_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U8)
+}
+
+/// Bit-exact float comparison: `Value`'s derived equality is
+/// `f64` equality, under which a NaN never equals itself, so
+/// NaN-carrying cast results are judged by their bit pattern.
+fn assert_float_bits(v: Value, bits: u64) {
+    match v {
+        Value::Float(f) => assert_eq!(f.to_bits(), bits),
+        other => panic!("expected a Float value, got {other:?}"),
+    }
+}
+
+fn const_u8(v: u8) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Int {
+            data: v as u128,
+            size: 1,
+        },
+    )))
+}
+
+#[test]
+fn cast_tuple_field_f64_to_f16_quiets_snan() {
+    // The cast reads a tuple field: the source is a genuine `f64`
+    // narrowing, so the signaling NaN is quieted with its payload
+    // carried across (native `f64` sNaN -> `f16` = 0x7e01), not
+    // transported bit-exactly (0x7c01).
+    let tuple_ty = mir::Ty::Tuple(vec![f64_ty(), u8_ty()]);
+    let v = run(
+        "cast_tuple_field_f64_f16",
+        &[f16_ty(), tuple_ty],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Tuple),
+                    vec![
+                        const_f64(f64::from_bits(0x7ff0_0400_0000_0000)),
+                        const_u8(7),
+                    ],
+                ),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(place(1).field(0, f64_ty())),
+                    f16_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_array_elem_f64_to_f16_quiets_snan() {
+    // Same narrowing through an array element read by constant
+    // index.
+    let array_ty = mir::Ty::Array(Box::new(f64_ty()), mir::ArrayLen::Known(2));
+    let elem = mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset: 0,
+            min_length: 2,
+            from_end: false,
+        }],
+    };
+    let v = run(
+        "cast_array_elem_f64_f16",
+        &[f16_ty(), array_ty],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Array(f64_ty())),
+                    vec![
+                        const_f64(f64::from_bits(0x7ff0_0400_0000_0000)),
+                        const_f64(0.0),
+                    ],
+                ),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(elem),
+                    f16_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_tuple_field_f32_to_f16_quiets_snan() {
+    // An `f32` signaling NaN (payload in the top window) narrows
+    // to the quiet `f16` pattern 0x7e01 natively; through a tuple
+    // field the cast must agree.
+    let tuple_ty = mir::Ty::Tuple(vec![f32_ty(), u8_ty()]);
+    let v = run(
+        "cast_tuple_field_f32_f16",
+        &[f16_ty(), tuple_ty],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Tuple),
+                    vec![const_f32(f32::from_bits(0x7f80_2000)), const_u8(7)],
+                ),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(place(1).field(0, f32_ty())),
+                    f16_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_tuple_field_f16_to_f64_quiets_snan() {
+    // Widening an `f16` signaling NaN to `f64` sets the quiet bit
+    // (native materialized cast), even when the source is read
+    // out of a tuple field.
+    let tuple_ty = mir::Ty::Tuple(vec![f16_ty(), u8_ty()]);
+    let v = run(
+        "cast_tuple_field_f16_f64",
+        &[f64_ty(), tuple_ty],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Tuple),
+                    vec![const_f16_bits(0x7c01), const_u8(7)],
+                ),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(place(1).field(0, f16_ty())),
+                    f64_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_deref_f16_to_f32_preserves_snan() {
+    // Widening an `f16` signaling NaN to `f32` preserves it
+    // (native: 0x7f802000); through a dereference the cast must
+    // still know the source is `f16`, not host-convert the stored
+    // `f64` form (which would quiet it to 0x7fc02000).
+    let ref_ty = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(f16_ty()),
+        mir::Mutability::Not,
+    );
+    let v = run(
+        "cast_deref_f16_f32",
+        &[f32_ty(), f16_ty(), ref_ty],
+        vec![
+            assign(place(1), mir::Rvalue::Use(const_f16_bits(0x7c01))),
+            assign(
+                place(2),
+                mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(place(2).deref()),
+                    f32_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
+}
+
+#[test]
+fn cast_array_elem_f32_to_f16_quiets_snan() {
+    // The same `f32` narrowing through an array element read by
+    // constant index.
+    let array_ty = mir::Ty::Array(Box::new(f32_ty()), mir::ArrayLen::Known(2));
+    let elem = mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset: 0,
+            min_length: 2,
+            from_end: false,
+        }],
+    };
+    let v = run(
+        "cast_array_elem_f32_f16",
+        &[f16_ty(), array_ty],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Array(f32_ty())),
+                    vec![const_f32(f32::from_bits(0x7f80_2000)), const_f32(0.0)],
+                ),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    mir::Operand::Copy(elem),
+                    f16_ty(),
+                ),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+// ----- constant cast sources (PR #419 Codex follow-up, round 2) -----
+
+#[test]
+fn cast_const_f64_to_f16_quiets_snan() {
+    // A cast that consumes an `f64` constant directly is a genuine
+    // narrowing: the signaling NaN is quieted with its payload
+    // carried across (native `f64` sNaN -> `f16` = 0x7e01), exactly
+    // as when the identical value is read from a local. It must not
+    // be transported bit-exactly (0x7c01) just because the operand
+    // was never materialized in a local.
+    let v = run(
+        "cast_const_f64_f16",
+        &[f16_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f64(f64::from_bits(0x7ff0_0400_0000_0000)),
+                f16_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f32_to_f16_quiets_snan() {
+    // The same narrowing from an `f32` constant consumed directly.
+    let v = run(
+        "cast_const_f32_f16",
+        &[f16_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f32(f32::from_bits(0x7f80_2000)),
+                f16_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f16_to_f32_preserves_snan() {
+    // Widening an `f16` signaling NaN constant to `f32` preserves
+    // it (native: 0x7f802000); the cast must know the constant's
+    // source is `f16`, not host-convert the stored `f64` form
+    // (which would quiet it to 0x7fc02000).
+    let v = run(
+        "cast_const_f16_f32",
+        &[f32_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f16_bits(0x7c01),
+                f32_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f16_to_f64_quiets_snan() {
+    // Widening an `f16` signaling NaN constant to `f64` sets the
+    // quiet bit (native materialized cast), as it does for a local
+    // or projected source.
+    let v = run(
+        "cast_const_f16_f64",
+        &[f64_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f16_bits(0x7c01),
+                f64_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+// ----- f32 transmute reconstruction (PR #419 Codex follow-up, round 4) -----
+
+#[test]
+fn transmute_u32_to_f32_preserves_snan() {
+    // Reconstructing an `f32` from a bit pattern (a transmute) is
+    // transport, not a conversion: a signaling NaN pattern must be
+    // stored exactly (the exact widening of 0x7f802000), not quieted
+    // to 0x7fc02000 by the host widening that rebuilds the value.
+    for (bits, want) in [
+        (0x7f80_2000u32, 0x7ff0_0400_0000_0000u64),
+        (0xff80_2000, 0xfff0_0400_0000_0000),
+    ] {
+        let v = run(
+            "transmute_u32_f32_snan",
+            &[f32_ty()],
+            vec![assign(
+                place(0),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, const_u32(bits), f32_ty()),
+            )],
+        );
+        assert_float_bits(v, want);
+    }
+}
+
+#[test]
+fn transmute_f32_round_trip_preserves_snan() {
+    // An `f16` signaling NaN widened to `f32` (bits 0x7f802000),
+    // transmuted to `u32` and back: every step is transport, so the
+    // pattern survives the round trip unchanged.
+    let v = run(
+        "transmute_f32_u32_f32_snan",
+        &[f32_ty(), f32_ty(), u32_ty()],
+        vec![
+            assign(
+                place(1),
+                mir::Rvalue::Cast(
+                    mir::CastKind::FloatToFloat,
+                    const_f16_bits(0x7c01),
+                    f32_ty(),
+                ),
+            ),
+            assign(
+                place(2),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, move_(1), u32_ty()),
+            ),
+            assign(
+                place(0),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, move_(2), f32_ty()),
+            ),
+        ],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
+}
+
+#[test]
+fn const_f32_snan_transports_exactly() {
+    // An `f32` signaling-NaN constant moved into a place is
+    // transport: the stored form is the exact widening of its bit
+    // pattern (0x7f802000), not the host-quieted form (0x7fc02000).
+    let v = run(
+        "const_f32_snan_use",
+        &[f32_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Use(const_f32(f32::from_bits(0x7f80_2000))),
+        )],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
 }
