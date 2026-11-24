@@ -5073,17 +5073,6 @@ impl Converter {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
                     Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
-                        // The shortcut materialises the whole
-                        // pointee allocation: charge its bytes
-                        // against the expansion budget. Over
-                        // budget, the constant keeps its exact
-                        // `ByRef` identity instead of copying.
-                        if !self.spend_const_budget(pointee.bytes.len()) {
-                            return sm::ConstValue::ByRef {
-                                alloc_id,
-                                offset: 0,
-                            };
-                        }
                         return match pointee.raw_bytes().map(String::from_utf8) {
                             Ok(Ok(s)) => sm::ConstValue::Str(s),
                             _ => {
@@ -5097,15 +5086,6 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
-                            // As for the string shortcut above:
-                            // the whole-pointee copy is charged
-                            // against the expansion budget.
-                            if !self.spend_const_budget(pointee.bytes.len()) {
-                                return sm::ConstValue::ByRef {
-                                    alloc_id,
-                                    offset: 0,
-                                };
-                            }
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Slice {
                                     meta: data.len() as u64,
@@ -5123,15 +5103,6 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
-                            // As for the string shortcut above:
-                            // the whole-pointee copy is charged
-                            // against the expansion budget.
-                            if !self.spend_const_budget(pointee.bytes.len()) {
-                                return sm::ConstValue::ByRef {
-                                    alloc_id,
-                                    offset: 0,
-                                };
-                            }
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Bytes(data),
                                 Err(_) => {
