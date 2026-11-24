@@ -6113,16 +6113,25 @@ impl ToolRegistry {
         for (rel, bytes) in tree {
             let target = dir.join(rel);
             if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
                 // The materialised tree copies every recorded
                 // neighbouring file verbatim -- a private file
                 // beside the crate root among them -- so it
                 // must not stand in the shared temporary
                 // directory under the default permissions:
-                // keep every directory of it owner-only (the
-                // restriction is re-applied on each visit, so
-                // a directory an older run left at this pid's
-                // name is tightened too).
+                // keep every directory of it owner-only. The
+                // mode is set at creation time, not tightened
+                // afterwards: a create-then-tighten sequence
+                // leaves a window in which a concurrent
+                // observer sees the tree at the default mode
+                // (a parallel test run caught exactly that in
+                // CI). The restriction below is still applied
+                // on each visit, so a directory an older run
+                // left at this pid's name is tightened too.
+                use std::os::unix::fs::DirBuilderExt as _;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent);
                 for ancestor in parent.ancestors() {
                     if !ancestor.starts_with(&base) {
                         break;
