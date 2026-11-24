@@ -109,6 +109,30 @@ denominator. Runs on every push to `main` and on manual dispatch.
   silently become the official denominator. Attempting the
   procedure records through stage 3 changes no count here: the
   denominator stays 24,937 and `procedure` stays 551.
+- Environment applicability is judged against one reference
+  environment: the host target `x86_64-unknown-linux-gnu` and the
+  pinned official Rust 1.100.0 release toolchain (stable channel,
+  by its own version string; the release build configuration).
+  The runner evaluates `//@ ignore-*`, `only-*`, and `needs-*`
+  directives the way compiletest evaluates them for that
+  environment -- the host cfg set, compiletest's target rules,
+  queries to the pinned rustc, and the release configuration --
+  and records a test whose conditions do not hold as not
+  attempted (bucket `out of environment`, with the unmet
+  condition as the reason); it stays in the denominator as a
+  fail, and a condition that cannot be decided is recorded as
+  `not attempted (unevaluatable condition)`. The hosted
+  environment has the same properties (`ubuntu-latest` is
+  x86_64-linux-gnu and the toolchain is the pinned release), so
+  the unmet prerequisites -- other targets, the nightly channel,
+  a rustc built with debug assertions, Enzyme, or offload
+  support, the host target's unsupported sanitizers, and
+  dlltool's windows-gnu target rule -- fail identically in CI
+  and no workflow change satisfies them. Judging `only-*`
+  records under their own target, or replacing the pinned
+  toolchain with a differently configured build, would change
+  the environment the records are judged against; that is a
+  methodology change, not an environment fix (issue #382).
 - The cached source tree's sparse checkout additionally includes
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the
