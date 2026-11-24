@@ -6910,6 +6910,7 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
             _ if head.starts_with("print/") => {
                 let format = match &head["print/".len()..] {
                     "d" => Some(PrintFormat::Decimal),
+                    "u" => Some(PrintFormat::Unsigned),
                     "x" => Some(PrintFormat::Hex),
                     "t" => Some(PrintFormat::Binary),
                     "c" => Some(PrintFormat::Char),

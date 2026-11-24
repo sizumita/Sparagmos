@@ -29109,3 +29109,109 @@ fn debug_mode_deref_of_parenthesised_projection_projects_first() {
         "the parenthesised base must not be dereferenced: {stdout}"
     );
 }
+
+const DEBUG_DATA_PTR_CAST_SRC: &str = r#"fn main() {
+    let a: [u32; 1] = [1065353216];
+    let s: &[u32] = &a;
+    zzz();
+    let _ = s;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_data_ptr_cast_recovers_source_element_layout() {
+    // A fat pointer's `data_ptr` carries a pointer-to-scalar
+    // descriptor, not an array one: the cast's source element
+    // type is the scalar it names, recovered when the backing
+    // value is the element aggregate. Without that recovery
+    // the reinterpretation is skipped (the stored integer
+    // prints unchanged) and a wider-element-count cast
+    // misreports the backing extent in element units.
+    let dir = temp_dir("debug-data-ptr-cast");
+    let src = fixture(&dir, "data_ptr_cast.rs", DEBUG_DATA_PTR_CAST_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(s.data_ptr as *const [f32; 1])\nprint *(s.data_ptr as *const [u16; 2])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = [1]", "$2 = [0, 16256]"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("<error"),
+        "data_ptr casts must not error: {stdout}"
+    );
+}
+
+const DEBUG_LLDB_NEG_HEX_SRC: &str = r#"fn main() {
+    let b: i8 = -1;
+    zzz();
+    let _ = b;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_lldb_hex_format_applies_to_negative_values() {
+    // A hexadecimal registration reads the stored bits at the
+    // registered width for negative values too: -1 in an
+    // 8-bit hex format is 0xff (the reading lldb gives),
+    // not a fall back to the decimal rendering.
+    let dir = temp_dir("debug-lldb-neg-hex");
+    let src = fixture(&dir, "lldb_neg_hex.rs", DEBUG_LLDB_NEG_HEX_SRC);
+    let out = debug_driver_lldb(&dir, &src, "type-format hex i8\nbreak 3\nrun\nprint b\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("= 0xff"),
+        "hex registration must mask a negative i8 to its width: {stdout}"
+    );
+    assert!(
+        !stdout.contains("= -1"),
+        "the decimal rendering must not survive the hex registration: {stdout}"
+    );
+}
+
+const DEBUG_LLDB_COMMAND_FORMAT_SRC: &str = r#"fn main() {
+    let b: i8 = -1;
+    let c: char = 'a';
+    zzz();
+    let _ = (b, c);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_lldb_command_formats_are_honored() {
+    // A per-command format prescribes the print's own
+    // reading: `print/u` reads a negative value unsigned at
+    // its width (255, not -1), and `print/d` of a char reads
+    // its code point (97, not the character summary) -- the
+    // semantics the runner's translation now carries into
+    // the session instead of dropping the format.
+    let dir = temp_dir("debug-lldb-command-format");
+    let src = fixture(
+        &dir,
+        "lldb_command_format.rs",
+        DEBUG_LLDB_COMMAND_FORMAT_SRC,
+    );
+    let out = debug_driver_lldb(
+        &dir,
+        &src,
+        "break 4\nrun\nprint/u b\nprint/d c\nprint/d b\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["(i8) b = 255", "(char) c = 97", "(i8) b = -1"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}

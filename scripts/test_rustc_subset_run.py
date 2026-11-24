@@ -3102,10 +3102,16 @@ class DebuggerHarnessTests(unittest.TestCase):
             "repr slice")
         self.assertEqual(
             run.translate_debugger_command("lldb", "up"), "up")
-        # A decimal-formatted print is the plain print.
+        # A formatted print keeps its format: the session
+        # script's `print/<fmt>` lines carry it to the
+        # renderer (an unsigned print of a negative value
+        # differs observably from the plain print).
         self.assertEqual(
             run.translate_debugger_command("lldb", "v/d noPadding8"),
-            "v noPadding8")
+            "print/d noPadding8")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "p/u b"),
+            "print/u b")
         self.assertIsNone(
             run.translate_debugger_command("lldb", "v/x x"))
         # The `b` breakpoint abbreviation, by file:line and by

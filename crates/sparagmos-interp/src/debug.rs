@@ -110,6 +110,10 @@ pub struct DebugPrint {
 pub enum PrintFormat {
     /// `print/d`: signed decimal (a char prints as its code point).
     Decimal,
+    /// `print/u`: unsigned decimal, read at the value's own
+    /// width (a negative value prints as its two's-complement
+    /// reading at that width).
+    Unsigned,
     /// `print/x`: hexadecimal.
     Hex,
     /// `print/t`: binary.
@@ -1558,8 +1562,10 @@ fn scalar_value_from_bytes(bytes: &[u8], desc: &Desc) -> Option<Value> {
 }
 
 /// The element descriptor a cast's source value carries: the
-/// pointee array/slice element of the source descriptor, or
-/// `u8` for a byte-form pointee.
+/// pointee array/slice element of the source descriptor, the
+/// scalar a pointer-to-scalar descriptor names when the
+/// backing value is an element aggregate, or `u8` for a
+/// byte-form pointee.
 fn cast_source_elem(pointee: &Value, source: Option<&Desc>) -> Option<Desc> {
     if matches!(pointee, Value::Bytes(_)) {
         return Some(Desc::Int("u8"));
@@ -1568,6 +1574,15 @@ fn cast_source_elem(pointee: &Value, source: Option<&Desc>) -> Option<Desc> {
     let inner = pointer_pointee(desc).unwrap_or(desc);
     match inner {
         Desc::Array(elem, _) | Desc::Slice(elem) => Some((**elem).clone()),
+        // A pointer to a scalar over an element aggregate --
+        // the form a fat pointer's `data_ptr` projection
+        // produces -- names the storage's element type
+        // directly: the scalar is what each stored element
+        // holds. A scalar pointee itself is not an aggregate
+        // and keeps the plain view.
+        scalar if is_scalar_desc(scalar) && matches!(pointee, Value::Tuple(_)) => {
+            Some(scalar.clone())
+        }
         _ => None,
     }
 }
@@ -2088,6 +2103,20 @@ fn evaluate_print(
             }
         }
     }
+    // A per-command format (`p/u b`) prescribes this print's
+    // own reading of the value, overriding the registered
+    // type format as it does in lldb itself.
+    if let Some(format) = print.format {
+        if let Some(formatted) =
+            lldb_command_format_scalar(&value, ev.tag.as_deref(), desc.as_ref(), format)
+        {
+            if let Some(first) = lldb.first_mut() {
+                if first.starts_with("= ") {
+                    *first = format!("= {formatted}");
+                }
+            }
+        }
+    }
     // lldb's `(Type) name = value` head line, for a print whose
     // rendering is the bare summary form: checks that name the
     // printed variable — statics printed by path, in
@@ -2171,12 +2200,61 @@ fn lldb_format_scalar(
     Some(match format {
         LldbNumFormat::Decimal => format!("{v}"),
         LldbNumFormat::Unsigned => format!("{}", (v as u128) & mask),
-        LldbNumFormat::Hex => {
-            if v < 0 {
-                return None;
+        LldbNumFormat::Hex => format!("0x{:x}", (v as u128) & mask),
+    })
+}
+
+/// The rendering a per-command print format (`p/u`, `p/d`,
+/// `p/x`, `p/t` in a debugger command) prescribes for a
+/// printed scalar in an lldb session: the format names how
+/// this print reads the value, overriding both the default
+/// summary and any registered type format. The unsigned and
+/// radix forms read the stored bits at the value's own
+/// width (its descriptor's, or the recorded tag's when the
+/// descriptor is gone); the decimal form reads a signed
+/// value as signed and any other scalar as its stored
+/// number, so a char prints as its code point rather than
+/// its character summary. Returns `None` for values and
+/// formats the reading does not cover (a character format,
+/// non-scalars, unknown widths), leaving the default
+/// rendering in place.
+fn lldb_command_format_scalar(
+    value: &Value,
+    tag: Option<&str>,
+    desc: Option<&Desc>,
+    format: PrintFormat,
+) -> Option<String> {
+    let (signed_v, bits) = match value {
+        Value::Int(v) => (*v, *v as u128),
+        Value::Uint(v) => (*v as i128, *v),
+        _ => return None,
+    };
+    let width = scalar_desc_bit_width(desc).or(match tag {
+        Some("i8" | "u8") => Some(8),
+        Some("i16" | "u16") => Some(16),
+        Some("i32" | "u32") => Some(32),
+        Some("i64" | "u64" | "isize" | "usize") => Some(64),
+        Some("i128" | "u128") => Some(128),
+        Some("char") => Some(32),
+        _ => None,
+    })?;
+    let mask: u128 = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    Some(match format {
+        PrintFormat::Decimal => {
+            if matches!(value, Value::Int(_)) {
+                format!("{signed_v}")
+            } else {
+                format!("{bits}")
             }
-            format!("0x{:x}", (v as u128) & mask)
         }
+        PrintFormat::Unsigned => format!("{}", bits & mask),
+        PrintFormat::Hex => format!("0x{:x}", bits & mask),
+        PrintFormat::Binary => format!("0b{:b}", bits & mask),
+        PrintFormat::Char => return None,
     })
 }
 
@@ -3265,6 +3343,7 @@ fn render_gdb(
             None,
             top_char || matches!(desc, Some(Desc::Char)),
             format,
+            scalar_desc_bit_width(desc),
             DebugDialect::Gdb,
         ),
         Value::Tuple(fields) => {
@@ -4432,6 +4511,7 @@ fn render_lldb_compact(
             None,
             top_char || matches!(desc, Some(Desc::Char)),
             None,
+            scalar_desc_bit_width(desc),
             DebugDialect::Lldb,
         ),
         Value::Tuple(fields) => {
@@ -5055,17 +5135,26 @@ fn escape_str(s: &str) -> String {
 /// floats with Rust's `{}` (which agrees with gdb's rendering of
 /// the simple decimals the checks use), a char as
 /// `<codepoint> '<char>'`, unit as `()`.
+/// The bit width a scalar descriptor's layout occupies,
+/// for the width-sensitive print formats (`print/u` reads a
+/// value at its own width).
+fn scalar_desc_bit_width(desc: Option<&Desc>) -> Option<u32> {
+    desc.and_then(desc_scalar_width)
+        .map(|bytes| (bytes * 8) as u32)
+}
+
 fn render_scalar(
     value: &Value,
     ty: Option<&Ty>,
     char_hint: bool,
     format: Option<PrintFormat>,
+    width: Option<u32>,
     dialect: DebugDialect,
 ) -> Option<String> {
     match value {
         Value::Bool(b) => Some(b.to_string()),
         Value::Unit => Some("()".to_string()),
-        Value::Int(v) => Some(format_int(*v as u128, true, format)),
+        Value::Int(v) => Some(format_int(*v as u128, true, format, width)),
         Value::Uint(v) => {
             if char_hint && format.is_none() {
                 let c = char::from_u32(*v as u32)?;
@@ -5080,7 +5169,7 @@ fn render_scalar(
                 });
             }
             let signed = matches!(format, Some(PrintFormat::Decimal));
-            Some(format_int(*v, signed, format))
+            Some(format_int(*v, signed, format, width))
         }
         Value::Float(v) => Some(format_float(*v)),
         Value::Float128(bits) => {
@@ -5096,10 +5185,20 @@ fn render_scalar(
     }
 }
 
-fn format_int(bits: u128, signed: bool, format: Option<PrintFormat>) -> String {
+fn format_int(bits: u128, signed: bool, format: Option<PrintFormat>, width: Option<u32>) -> String {
     match format {
         Some(PrintFormat::Hex) => format!("{bits:#x}"),
         Some(PrintFormat::Binary) => format!("{bits:#b}"),
+        Some(PrintFormat::Unsigned) => {
+            // The unsigned reading of the stored bits at the
+            // value's own width: a sign-extended negative
+            // value masks back to its two's-complement form.
+            let masked = match width {
+                Some(w) if w < 128 => bits & ((1u128 << w) - 1),
+                _ => bits,
+            };
+            format!("{masked}")
+        }
         _ => {
             if signed {
                 // Values are stored sign-extended to 128 bits, so

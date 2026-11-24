@@ -2845,15 +2845,20 @@ def _translate_lldb_command(cmd):
         return f"v {expr}"
     m = re.match(r"^(?:v|print|p)/([a-z])\s+(.+)$", cmd)
     if m:
-        # A formatted print: the decimal forms are the
-        # session's own renderings; other formats are outside
-        # the attempted scope.
+        # A formatted print: the format is part of the
+        # command's own semantics -- an unsigned print reads
+        # a negative value at its width, a decimal print of
+        # a char reads its code point -- so it is carried
+        # into the session script (the `print/<fmt>` lines
+        # the gdb dialect already uses) rather than dropped.
+        # Formats outside the session's set stay outside the
+        # attempted scope.
         if m.group(1) not in "du":
             return None
         expr = m.group(2).strip()
         if not _debugger_expr_ok(expr):
             return None
-        return f"v {expr}"
+        return f"print/{m.group(1)} {expr}"
     m = re.match(r"^(?:v|print|p|expr|expression)\s+(.+)$", cmd)
     if m:
         expr = m.group(1).strip()

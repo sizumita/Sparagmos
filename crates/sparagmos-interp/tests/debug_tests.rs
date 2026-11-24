@@ -1017,7 +1017,7 @@ fn named_length_program() -> Program {
                         variant: 0,
                         operands: vec![
                             Operand::const_int(7),
-                            Operand::Constant(Constant::Float(2.5)),
+                            Operand::Constant(Constant::Float(2.5, FloatTy::F64)),
                         ],
                         field_index: None,
                         units_from: None,
