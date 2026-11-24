@@ -1898,6 +1898,52 @@ fn run_mode_dyn_bound_projection_supertrait_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
 }
 
+const DYN_BOUND_SUPERTRAIT_INHERITED_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Child: Trait<Assoc = u32> {}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn take(h: Holder<dyn Child>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Child> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_supertrait_inherited_runs() {
+    // The binding is inherited rather than written on the
+    // object: `Child`'s own supertrait bound fixes
+    // `Trait::Assoc = u32`, and `dyn Child` spells no
+    // binding itself. Forming the object type elaborates
+    // the principal trait's supertrait bindings into the
+    // object's existential predicates, so a projection
+    // predicate binding `Trait::Assoc` is present in the
+    // object's own predicate list and the screen's
+    // exemption applies as it stands — measured on the
+    // pinned 1.100.0 toolchain (the program runs and
+    // prints 42); this test pins that elaboration.
+    let dir = temp_dir("dyn-bound-supertrait-inherited");
+    let src = fixture(
+        &dir,
+        "dyn_bound_supertrait_inherited.rs",
+        DYN_BOUND_SUPERTRAIT_INHERITED_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the inherited-binding projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const DYN_BOUND_PROJECTION_ALIAS_SRC: &str = r#"
 trait Trait {
     type Assoc;
