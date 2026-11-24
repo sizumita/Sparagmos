@@ -27123,6 +27123,40 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
                 ],
             }
         }
+        // `rustc_errors::DiagCtxtFlags::default()` is the
+        // derived `Default` of the diagnostics context flags
+        // (rustc_errors' lib.rs): every field takes its own
+        // default, in declaration order -- `can_emit_warnings:
+        // false`, `treat_err_as_bug: None`,
+        // `eagerly_emit_delayed_bugs: false`, `macro_backtrace:
+        // false`, `deduplicate_diagnostics: false`,
+        // `track_diagnostics: false`. This is the fourth runtime
+        // value the rustdoc entry program asks for (diagnostics
+        // context setup), so it is modelled here like the other
+        // hand-modelled defaults. The rendered tag carries the
+        // naming crate's prefix when the type is named through an
+        // explicit `extern crate` item
+        // (`<caller>::rustc_errors::DiagCtxtFlags`); from inside
+        // the compiler crates it is the bare path. Both spellings
+        // denote this one ADT.
+        _ if tag == "rustc_errors::DiagCtxtFlags"
+            || tag.ends_with("::rustc_errors::DiagCtxtFlags") =>
+        {
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Bool(false),
+                    Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    },
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                ],
+            }
+        }
         _ if tag.starts_with("std::vec::Vec<") => Value::Enum {
             variant: 0,
             fields: Vec::new(),
