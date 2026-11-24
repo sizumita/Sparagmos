@@ -1158,6 +1158,18 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// the finding.)
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
+    // A lint error recorded at a body materialization is a
+    // finding of its own: rustc lints every local body, so the
+    // body need not be one the collector collects for the
+    // diagnostic to be a compilation error (see
+    // `convert::with_body_materialization`).
+    if let Some(key) = crate::convert::materialization_lint() {
+        return Some(format!(
+            "materialization of `{key}` emitted a lint error \
+             (rustc lints every local body; see the diagnostics \
+             above)"
+        ));
+    }
     let mut walk = RequiredConstWalk {
         tcx,
         visited: std::collections::HashSet::new(),
@@ -1343,6 +1355,41 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         // available here at all.
         if !tcx.should_codegen_locally(instance) {
             return;
+        }
+        // A body the collector collects is one rustc itself
+        // materializes in its own pipeline, so the evaluation
+        // diagnostics of materializing it are compilation errors
+        // there too: the validity errors of its constant
+        // operands are the shape this check adds (evaluation
+        // errors proper are also found by the required-constant
+        // evaluation below, and lint errors are recorded
+        // separately, for every local body). The driver's speculative
+        // body fetches discount those diagnostics at the fetch
+        // (a body the collector never reaches must not fail the
+        // compilation — Issue #417) but record the body's key;
+        // a hit here turns the record into the verdict. Both the
+        // instance's own key and its definition's are consulted:
+        // a generic definition's body is materialized once,
+        // under the definition's key, and its diagnostics are
+        // properties of every instance of it.
+        {
+            use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
+            let key = with_resolve_crate_name!(with_no_trimmed_paths!(
+                tcx.def_path_str_with_args(instance.def.def_id(), instance.args)
+            ));
+            let def_key = with_resolve_crate_name!(with_no_trimmed_paths!(
+                tcx.def_path_str(instance.def.def_id())
+            ));
+            if crate::convert::materialization_emitted(&key)
+                || crate::convert::materialization_emitted(&def_key)
+            {
+                self.finding = Some(format!(
+                    "materialization of `{key}` emitted diagnostics \
+                     (rustc reports them for the bodies it collects; \
+                     see the diagnostics above)"
+                ));
+                return;
+            }
         }
         // Shim instances are handled by kind. Drop glue and
         // fn-pointer shim bodies are walked: a type's destructor

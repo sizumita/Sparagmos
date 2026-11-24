@@ -318,7 +318,9 @@ struct Record {
 fn fetch_body_contained(
     inst: &Instance,
 ) -> Result<Option<mir::Body>, &'static str> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inst.body())) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::convert::with_body_materialization(&inst.name(), || inst.body())
+    })) {
         Ok(body) => Ok(body),
         Err(payload) => {
             if let Some(reason) = stable_mir_panic_reason(&*payload) {
@@ -470,7 +472,10 @@ pub fn collect_reachable(
                         RecordKind::NoBody {
                             reason: "collection limit reached".to_string(),
                         }
-                    } else if let Some(cbody) = inst.body() {
+                    } else if let Some(cbody) = crate::convert::with_body_materialization(
+                        &inst.name(),
+                        || inst.body(),
+                    ) {
                         bodies_taken += 1;
                         queue.push_back(cbody.clone());
                         walked_bodies.push(cbody.clone());

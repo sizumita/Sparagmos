@@ -27895,3 +27895,291 @@ fn run_mode_libc_isatty() {
         "piped streams, a regular file and an unissued descriptor are not terminals; stderr={stderr}"
     );
 }
+
+const EAGER_CONST_UNREACHABLE_FN_SRC: &str = r#"
+struct Fail<T>(std::marker::PhantomData<T>);
+impl<T> Fail<T> {
+    const C: u32 = panic!("fail const evaluated");
+}
+fn bad() {
+    if false {
+        let _ = Fail::<i32>::C;
+    }
+}
+fn main() {
+    println!("ok");
+}
+"#;
+
+#[test]
+fn convert_mode_eager_const_in_unreachable_fn_body_converts() {
+    // Issue #417: `bad` is a non-generic local function, so the
+    // item loop materializes its body even though nothing calls
+    // it, and materializing a body makes the Stable MIR builder
+    // evaluate every constant operand in it. The failing
+    // constant's evaluation report used to stay in the session's
+    // error count and fail the whole conversion, even though
+    // rustc never collects `bad`, never evaluates the constant,
+    // and compiles the crate. A body materialization's
+    // evaluation diagnostics are not a verdict; the
+    // required-constant check over the collector's instances is.
+    let dir = temp_dir("eager-const-unreachable-fn");
+    let src = fixture(
+        &dir,
+        "eager_const_unreachable_fn.rs",
+        EAGER_CONST_UNREACHABLE_FN_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing constant in an unreachable function's body must \
+         not fail conversion; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_eager_const_in_unreachable_fn_body_executes() {
+    // The same program through run mode: conversion must not be
+    // poisoned either, and the program runs and prints.
+    let dir = temp_dir("eager-const-unreachable-fn-run");
+    let src = fixture(
+        &dir,
+        "eager_const_unreachable_fn_run.rs",
+        EAGER_CONST_UNREACHABLE_FN_SRC,
+    );
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "run mode must execute the program; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("ok"),
+        "the program's output must be produced; stdout={stdout}"
+    );
+}
+
+const EAGER_CONST_DEAD_GENERIC_CALL_SRC: &str = r#"
+struct Fail<T>(std::marker::PhantomData<T>);
+impl<T> Fail<T> {
+    const C: u32 = panic!("fail const evaluated");
+}
+fn bad<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn unused() {
+    bad::<i32>();
+}
+fn main() {
+    println!("ok");
+}
+"#;
+
+#[test]
+fn convert_mode_eager_const_behind_dead_generic_call_converts() {
+    // Issue #417's isolated shape: conversion demands
+    // `bad::<i32>` because the unreachable `unused` calls it,
+    // and materializing that body evaluates `Fail::<i32>::C`.
+    // The mono collector roots nothing at `unused`, so rustc
+    // compiles the crate; conversion must too.
+    let dir = temp_dir("eager-const-dead-generic-call");
+    let src = fixture(
+        &dir,
+        "eager_const_dead_generic_call.rs",
+        EAGER_CONST_DEAD_GENERIC_CALL_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing constant in a body demanded only from dead code \
+         must not fail conversion; stderr={stderr}"
+    );
+}
+
+const EAGER_CONST_DEMANDED_SRC: &str = r#"
+struct Fail<T>(std::marker::PhantomData<T>);
+impl<T> Fail<T> {
+    const C: u32 = panic!("fail const evaluated");
+}
+fn bad<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn main() {
+    bad::<i32>();
+}
+"#;
+
+#[test]
+fn convert_mode_eager_const_in_demanded_body_still_fails() {
+    // Control: the same constant in a body the collector does
+    // collect — `main` calls `bad::<i32>` directly — is a
+    // required constant of a collected instance, so its failure
+    // is a compilation error. The verdict comes from the
+    // required-constant check; discounting the materialization's
+    // own report must not turn this into a conversion.
+    let dir = temp_dir("eager-const-demanded");
+    let src = fixture(
+        &dir,
+        "eager_const_demanded.rs",
+        EAGER_CONST_DEMANDED_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant of a collected instance must \
+         fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+const MATERIALIZATION_LINT_ENTRY_SRC: &str = r#"
+fn main() {
+    let array = [std::env::args().len()];
+    array[1];
+}
+"#;
+
+#[test]
+fn convert_mode_materialization_lint_in_entry_body_still_fails() {
+    // Materializing `main`'s body runs the MIR lint passes over
+    // it, and the known-panics lint reports the out-of-bounds
+    // index at deny level. That diagnostic is a compilation
+    // error under rustc (it lints the bodies it materializes),
+    // so the discount for speculative materializations must not
+    // swallow it: the verdict records it as a lint finding.
+    let dir = temp_dir("materialization-lint-entry");
+    let src = fixture(
+        &dir,
+        "materialization_lint_entry.rs",
+        MATERIALIZATION_LINT_ENTRY_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a lint error in the entry body's materialization must \
+         fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed"),
+        "the failure must be the driver's compilation failure; \
+         stderr={stderr}"
+    );
+}
+
+const MATERIALIZATION_LINT_DEAD_FN_SRC: &str = r#"
+fn bad() {
+    let array = [std::env::args().len()];
+    array[1];
+}
+fn main() {
+    println!("ok");
+}
+"#;
+
+#[test]
+fn convert_mode_materialization_lint_in_dead_body_still_fails() {
+    // The same lint in a function nothing calls: unlike a
+    // failing constant (which rustc evaluates only for the
+    // bodies it collects), the lint is reported for every local
+    // body rustc builds, so this is a compilation error too —
+    // the lint registry is not scoped to collected instances.
+    let dir = temp_dir("materialization-lint-dead-fn");
+    let src = fixture(
+        &dir,
+        "materialization_lint_dead_fn.rs",
+        MATERIALIZATION_LINT_DEAD_FN_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a lint error in a dead function's materialization must \
+         fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed"),
+        "the failure must be the driver's compilation failure; \
+         stderr={stderr}"
+    );
+}
+
+const MATERIALIZATION_VALIDITY_ENTRY_SRC: &str = r#"
+use std::cell::Cell;
+use std::mem::ManuallyDrop;
+
+#[repr(C)]
+struct S {
+    x: u32,
+    y: E,
+}
+
+#[repr(u32)]
+enum E {
+    A,
+    B(U)
+}
+
+union U {
+    cell: ManuallyDrop<Cell<u32>>,
+}
+
+const C: S = {
+    let mut s = S { x: 0, y: E::A };
+    let p = &mut s.x as *mut u32;
+    unsafe { *p.add(1) = 1 };
+    s
+};
+
+fn main() {
+    let _: &'static _ = &C;
+}
+"#;
+
+#[test]
+fn convert_mode_materialization_validity_in_entry_body_still_fails() {
+    // Materializing `main`'s body evaluates its constant
+    // operands, and validating `&C`'s value fails (interior
+    // mutability in read-only memory, E0080). The constant is
+    // an operand of a body the collector collects, so the
+    // evaluation-class record becomes a finding even though
+    // evaluating the constant itself succeeds — the required-
+    // constant check alone does not validate.
+    let dir = temp_dir("materialization-validity-entry");
+    let src = fixture(
+        &dir,
+        "materialization_validity_entry.rs",
+        MATERIALIZATION_VALIDITY_ENTRY_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a validity error in the entry body's materialization \
+         must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
