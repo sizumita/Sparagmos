@@ -13614,12 +13614,27 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let place_desc = format!("allocation #{id}");
-                // The navigation's root type: the allocation's
-                // element type, seen as the element sequence the
-                // block's stored tuple is (an element-block
-                // projection starts by indexing into it); a plain
-                // allocation's root is the pointee value itself.
-                let alloc_root = root_ty.cloned().or_else(|| self.alloc_ty(*id));
+                // The navigation's root type: the projection is
+                // rooted at the allocation, so the type walked
+                // alongside it is the allocation's own declared
+                // type — the record its creation point made,
+                // which retargeting a pointer at the same storage
+                // does not move (see `record_alloc_ty`). The
+                // caller's evidence names the type at the
+                // *pointer's* target, which for a pointer to a
+                // field inside the allocation is that field's
+                // type, not the root's: walking the root-relative
+                // projection from it misaligns the type walk and
+                // the descent can land in a sibling. The caller's
+                // type remains the fallback for an allocation
+                // with no type on record, where it names the root
+                // in the flows that supply it: a plain
+                // allocation's root is the pointee value itself;
+                // an element block's root is its element type,
+                // seen as the element sequence the block's stored
+                // tuple is (an element-block projection starts by
+                // indexing into it).
+                let alloc_root = self.alloc_ty(*id).or_else(|| root_ty.cloned());
                 let alloc_root = match alloc_root {
                     Some(element_ty) if self.is_elem_block(*id) => {
                         Some(Ty::Slice(Box::new(element_ty)))
@@ -26255,6 +26270,77 @@ mod resolved_route_tests {
                     Value::Int(30),
                 ],
             }])]))
+        );
+    }
+
+    /// A write through a pointer to a field inside an
+    /// allocation whose declared type is on record: the
+    /// caller's type evidence is the pointee type (`Inner`),
+    /// but the resolved projection is rooted at the allocation
+    /// (`Outer`), so the navigation roots at the allocation's
+    /// own type. Writing the inner struct's second field
+    /// extends that struct; it does not descend into the first
+    /// field and corrupt it.
+    #[test]
+    fn interior_pointer_alloc_write_uses_the_allocations_type() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::Inner".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        program.adt_field_tys.insert(
+            "probe::Outer".to_string(),
+            vec![vec![
+                Some(Ty::Int(IntTy::I32)),
+                Some(Ty::Adt("probe::Inner".to_string())),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Int(7),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+        });
+        interp.record_alloc_ty(id, Ty::Adt("probe::Outer".to_string()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Field(1)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(30),
+                Some(&Ty::Adt("probe::Inner".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Int(7),
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                            Value::Int(30),
+                        ],
+                    },
+                ],
+            })
         );
     }
 
