@@ -2534,6 +2534,156 @@ fn run_mode_dyn_bound_projection_nested_const_arg_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_UNEVALUATED_CONST_TARGET_SRC: &str = r#"
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<3> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<{ N + 0 }>, const N: usize> {
+    field: <<T as Carrier<{ N + 0 }>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<(), 3> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_unevaluated_const_target_runs() {
+    // The intermediate projection's trait reference
+    // carries an unevaluated constant: `Carrier<{ N + 0 }>`
+    // with `N` Holder's own parameter, instantiated at 3.
+    // Matching the implementation `Carrier<3> for ()`
+    // compared the concrete `3` against the unevaluated
+    // expression and rejected the implementation, so the
+    // screen rejected the holder and main. An unevaluated
+    // constant cannot be compared without evaluating it,
+    // which the screen never does, so the comparison is
+    // inconclusive: the implementation stays a candidate
+    // and its assigned type resolves the projection --
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-unevaluated-const-target");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_unevaluated_const_target.rs",
+        DYN_BOUND_PROJECTION_UNEVALUATED_CONST_TARGET_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the unevaluated-const-target projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_UNEVALUATED_CONST_IMPL_SRC: &str = r#"
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<{ 1 + 2 }> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier<3>> {
+    field: <<T as Carrier<3>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_unevaluated_const_impl_runs() {
+    // The mirror image: the implementation's constant is
+    // the unevaluated one (`Carrier<{ 1 + 2 }> for ()`)
+    // and the projection's is the concrete `3`. The
+    // comparison is just as inconclusive in this
+    // direction, so the implementation stays a candidate
+    // -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-unevaluated-const-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_unevaluated_const_impl.rs",
+        DYN_BOUND_PROJECTION_UNEVALUATED_CONST_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the unevaluated-const-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const UNNORMALIZABLE_PROJECTION_CONST_MISMATCH_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier<const N: usize> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<4> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+fn f(_: <<() as Carrier<3>>::Item as Trait>::Assoc) where (): Carrier<3> {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_const_mismatch_is_not_demanded() {
+    // The inconclusive treatment reaches only
+    // unevaluated constants: two concrete constants that
+    // differ (`Carrier<4>` implemented, `Carrier<3>`
+    // projected) are still a proven mismatch, no
+    // implementation assigns the item, and the function
+    // carrying the projection is accounted not demanded
+    // with the screen's reason while main still converts.
+    // The false where-clause is a trivial bound, the
+    // form the ctor case above also takes: without it
+    // the definition itself fails WF checking.
+    let dir = temp_dir("projection-const-mismatch-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_const_mismatch.rs",
+        UNNORMALIZABLE_PROJECTION_CONST_MISMATCH_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the const-mismatch projection function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
 const DYN_BOUND_PROJECTION_LIFETIME_ARG_SRC: &str = r#"
 trait Trait {
     type Assoc;

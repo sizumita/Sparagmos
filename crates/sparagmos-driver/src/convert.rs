@@ -1899,7 +1899,14 @@ fn match_impl_arg(
 /// unevaluated constant on each side matches another for
 /// the same definition whose arguments match in turn, so
 /// a parameter nested inside one is resolved (or bound)
-/// the same way.
+/// the same way. Any other comparison an unevaluated
+/// constant takes part in is inconclusive rather than a
+/// mismatch: telling `{ N + 0 }` from the concrete `3`
+/// takes evaluating it, which the screen never does, so
+/// the implementation stays a candidate and the
+/// assigned-type agreement check decides -- the lifetime
+/// match in `match_impl_arg` treats its inconclusive
+/// comparisons the same way.
 fn match_impl_const(
     iconst: &TyConst,
     tconst: &TyConst,
@@ -1925,13 +1932,15 @@ fn match_impl_const(
             bind_impl_arg(bindings, param.index, GenericArgKind::Const(tconst.clone()))
         }
         TyConstKind::Unevaluated(idef, iargs) => match tconst.kind() {
-            TyConstKind::Unevaluated(tdef, targs) => {
-                idef.def_id() == tdef.def_id()
-                    && match_impl_args(&iargs, &targs, ambient, bindings, depth)
+            TyConstKind::Unevaluated(tdef, targs) if idef.def_id() == tdef.def_id() => {
+                match_impl_args(&iargs, &targs, ambient, bindings, depth)
             }
-            _ => false,
+            _ => true,
         },
-        kind => kind == tconst.kind(),
+        kind => match tconst.kind() {
+            TyConstKind::Unevaluated(..) => true,
+            _ => kind == tconst.kind(),
+        },
     }
 }
 
