@@ -267,7 +267,22 @@ pub fn resolve_instance_guarded(
     let (result, emitted) = with_instance_resolution_contained(&key, || {
         Instance::resolve(def, args)
     });
-    let inst = result.ok()?.ok()?;
+    let inst = match result {
+        Ok(resolved) => resolved.ok()?,
+        Err(_payload) => {
+            // This resolver contains the panic: it becomes the
+            // "instance resolution failed" outcome, so the
+            // resolver consumes the panic's hook record, as
+            // every other containment in this module does. The
+            // record is first-wins and the location-based
+            // classification of a later panic peeks at the slot
+            // without clearing it, so a record left standing
+            // here would be read as that later panic's own and
+            // misclassify it.
+            let _ = take_captured_panic();
+            return None;
+        }
+    };
     if emitted {
         note_resolution_emission(&inst.name());
         return None;
@@ -285,7 +300,15 @@ pub fn resolve_closure_guarded(
     let (result, emitted) = with_instance_resolution_contained(&key, || {
         Instance::resolve_closure(def, args, kind)
     });
-    let inst = result.ok()?.ok()?;
+    let inst = match result {
+        Ok(resolved) => resolved.ok()?,
+        Err(_payload) => {
+            // Contained panic: consume its hook record, exactly
+            // as in `resolve_instance_guarded`.
+            let _ = take_captured_panic();
+            return None;
+        }
+    };
     if emitted {
         note_resolution_emission(&inst.name());
         return None;
