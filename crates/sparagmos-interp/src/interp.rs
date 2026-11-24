@@ -4964,7 +4964,7 @@ impl<'a> Interpreter<'a> {
         ))
     }
 
-    fn dyn_callable(
+    pub(crate) fn dyn_callable(
         &self,
         frames: &[Frame],
         value: &Value,

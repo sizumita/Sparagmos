@@ -8410,17 +8410,32 @@ impl<'a> Interpreter<'a> {
                     && (source.starts_with("std::vec::Vec<")
                         || source.starts_with("&[")
                         || source.starts_with("&mut [")
-                        || source.starts_with('['))
+                        || source.starts_with('[')
+                        || matches!(
+                            generic_first_arg(source, "std::boxed::Box<"),
+                            Some(pt) if is_slice_tag(pt)
+                        )
+                        || matches!(
+                            generic_first_arg(source, "alloc::boxed::Box<"),
+                            Some(pt) if is_slice_tag(pt)
+                        ))
                 {
                     // `Rc<[T]>: From<Vec<T>>` / `From<&[T]>` /
-                    // `From<[T; N]>` (and the `Arc` twins): a fresh counted handle
+                    // `From<[T; N]>` / `From<Box<[T]>>` (and the
+                    // `Arc` twins): a fresh counted handle
                     // over the element sequence. The slice
                     // pointee lives in the allocation store as
                     // the element tuple, the shape every slice
                     // consumer of a reference-counted handle
                     // derives the length from (see the handle
-                    // arm of `unsize_to_slice`).
-                    let resolved = self.resolve_value(frames, &value)?;
+                    // arm of `unsize_to_slice`). A boxed source
+                    // hands over its pointee (releasing the box's
+                    // allocation); every other source resolves
+                    // as it is.
+                    let resolved = match self.unbox_take(&value) {
+                        Some(pointee) => pointee,
+                        None => self.resolve_value(frames, &value)?,
+                    };
                     let elements = match resolved {
                         Value::Enum { fields, .. } => fields,
                         Value::Tuple(items) => items,
@@ -8549,21 +8564,44 @@ impl<'a> Interpreter<'a> {
                             value,
                         ],
                     })
-                } else if matches!(value, Value::Str(_))
-                    && [
-                        "std::rc::Rc<",
-                        "alloc::rc::Rc<",
-                        "std::sync::Arc<",
-                        "alloc::sync::Arc<",
-                    ]
-                    .iter()
-                    .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
+                } else if [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
                 {
-                    // `Rc<str>` / `Arc<str>`: `From<&str>` (and
-                    // `From<String>` / `From<Box<str>>`, whose
-                    // values are the same string in this model): a
-                    // fresh counted handle over the string.
-                    Ok(self.rc_new_handle(value))
+                    // `Rc<str>` / `Arc<str>`: `From<&str>` and
+                    // `From<String>` hand over the string itself;
+                    // `From<Box<str>>` hands over the box
+                    // aggregate `new_box` builds around it, so
+                    // the string moves out of the box (releasing
+                    // its allocation) before the handle is built.
+                    let text = if matches!(value, Value::Str(_)) {
+                        value
+                    } else if generic_first_arg(source, "std::boxed::Box<") == Some("str")
+                        || generic_first_arg(source, "alloc::boxed::Box<") == Some("str")
+                    {
+                        match self.unbox_take(&value) {
+                            Some(s @ Value::Str(_)) => s,
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to a counted string",
+                                    "boxed string value",
+                                    value.kind_name(),
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(InterpError::type_mismatch(
+                            "From::from to a counted string",
+                            "string value",
+                            value.kind_name(),
+                        ));
+                    };
+                    Ok(self.rc_new_handle(text))
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -10507,6 +10545,15 @@ impl<'a> Interpreter<'a> {
                     Pred(Value),
                 }
                 let resolved = self.resolve_value(frames, &vals[1])?;
+                // A trait-object predicate is resolved through
+                // the dyn callable machinery in the match below;
+                // it records the environment its base denotes
+                // here (a borrowed object's own reference, or the
+                // reference into an owned object's box), and, for
+                // an owned object, the object value to hand back
+                // as the final state for the call's drop glue.
+                let mut dyn_pred_env: Option<Value> = None;
+                let mut dyn_pred_final: Option<Value> = None;
                 let needle = match resolved {
                     Value::Str(_) | Value::Bytes(_) => Needle::Text(text_of(&vals[1])?),
                     Value::Uint(v) => {
@@ -10540,6 +10587,70 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     Value::FnPtr(_) | Value::Closure { .. } => Needle::Pred(resolved),
+                    Value::DynRef { .. } => {
+                        // A trait-object predicate: `&dyn Fn`,
+                        // `&mut dyn FnMut`, or an owned
+                        // `Box<dyn FnMut>`. Resolve the object to
+                        // the callable behind it and the
+                        // environment its base denotes, the way
+                        // the interpreter's own dyn method calls
+                        // do.
+                        let (callable, env) = self.dyn_callable(frames, &resolved)?;
+                        match callable {
+                            Value::FnPtr(_) | Value::Closure { .. } => {
+                                match &env {
+                                    // A borrowed object: the
+                                    // environment is the reference
+                                    // to the closure's own storage,
+                                    // used directly on every
+                                    // invocation (no allocation of
+                                    // the predicate's own, and
+                                    // nothing to drop).
+                                    Value::Ref(target)
+                                        if !matches!(target, RefTarget::Value(..)) =>
+                                    {
+                                        dyn_pred_env = Some(env);
+                                    }
+                                    _ => {
+                                        // An owned object over a
+                                        // box: the closure lives in
+                                        // the box's allocation, so
+                                        // invoke through that
+                                        // allocation, and hand the
+                                        // object itself back as the
+                                        // final state for the call's
+                                        // drop glue (its base denotes
+                                        // the same storage the
+                                        // invocations write through).
+                                        if let Value::DynRef { base, .. } = &resolved {
+                                            if let Some((id, projection)) =
+                                                box_alloc_pointer(base)
+                                            {
+                                                if projection.is_empty() {
+                                                    dyn_pred_env = Some(Value::Ref(
+                                                        RefTarget::Alloc {
+                                                            id,
+                                                            projection: Vec::new(),
+                                                        },
+                                                    ));
+                                                    dyn_pred_final =
+                                                        Some(resolved.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Needle::Pred(callable)
+                            }
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "str pattern argument",
+                                    "string, char, char set or predicate value",
+                                    resolved.kind_name(),
+                                ))
+                            }
+                        }
+                    }
                     ref other => {
                         // A `&[char]` pattern arrives as a fat
                         // reference over the character tuple.
@@ -10623,6 +10734,7 @@ impl<'a> Interpreter<'a> {
                         // fail as a write to a constant
                         // aggregate.
                         let borrowed_env = match &needle {
+                            Needle::Pred(_) if dyn_pred_env.is_some() => dyn_pred_env.clone(),
                             Needle::Pred(_) => match &vals[1] {
                                 Value::Ref(target)
                                     if !matches!(target, RefTarget::Value(..)) =>
@@ -10764,6 +10876,17 @@ impl<'a> Interpreter<'a> {
                                 self.note_consumed_iter_final(final_pred);
                             }
                             self.free_alloc(id);
+                        }
+                        if let Some(final_dyn) = dyn_pred_final {
+                            // An owned trait-object predicate was
+                            // invoked through its box's storage;
+                            // the object value denotes that storage,
+                            // so it is the final state the call's
+                            // drop glue consumes. (Noting it here,
+                            // before the outcome propagates, puts it
+                            // on the unwind path as well, exactly
+                            // like the by-value hand-back above.)
+                            self.note_consumed_iter_final(final_dyn);
                         }
                         outcome?
                     }

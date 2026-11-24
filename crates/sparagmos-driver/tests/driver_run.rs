@@ -16377,6 +16377,61 @@ fn main() {
 }
 "#;
 
+const FROM_BOXED_STR_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let boxed = String::from("abc").into_boxed_str();
+    let rc: Rc<str> = boxed.into();
+    let boxed2 = String::from("xy").into_boxed_str();
+    let arc: Arc<str> = boxed2.into();
+    let boxed3 = String::from("zz").into_boxed_str();
+    let s: String = boxed3.into();
+    println!("{rc} {arc} {s} {} {}", rc.len(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_from_boxed_str_to_counted_and_string() {
+    // `From<Box<str>>` for `Rc<str>` / `Arc<str>` / `String`: the
+    // source value is the box aggregate `String::into_boxed_str`
+    // builds around the string, not the string itself, so the
+    // conversion takes the pointee out of the box (releasing its
+    // allocation) instead of rejecting the shape. Before the fix
+    // all three conversions were "not runtime-supported".
+    run_ok(
+        "from-boxed-str",
+        FROM_BOXED_STR_SRC,
+        "abc xy zz 3 1\n",
+    );
+}
+
+const FROM_BOXED_SLICE_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let boxed = vec![1, 2, 3].into_boxed_slice();
+    let rc: Rc<[i32]> = boxed.into();
+    let boxed2 = vec![4, 5].into_boxed_slice();
+    let arc: Arc<[i32]> = boxed2.into();
+    println!("{:?} {} {:?} {}", rc, rc.len(), arc, arc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_boxed_slice_to_counted_slice() {
+    // `From<Box<[T]>>` for `Rc<[T]>` / `Arc<[T]>`: the counted
+    // handle is built over the box's pointee (the element tuple),
+    // the same take as for the boxed string.
+    run_ok(
+        "from-boxed-slice",
+        FROM_BOXED_SLICE_SRC,
+        "[1, 2, 3] 3 [4, 5] 2\n",
+    );
+}
+
 #[test]
 fn run_mode_array_into_iter_collect_into_boxed_and_counted_slices() {
     // `array::IntoIter` is a modelled iterator, so its `collect`
@@ -34387,6 +34442,104 @@ fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
             "the abort must be named on stderr ({name}); stderr={stderr}"
         );
     }
+}
+
+const STR_PATTERN_DYN_PRED_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let a = "b".contains(&mut pred as &mut dyn FnMut(char) -> bool);
+    let b = "b".contains(&mut pred as &mut dyn FnMut(char) -> bool);
+    let is_b = |c: char| c == 'b';
+    let c = "ab".contains(&is_b as &dyn Fn(char) -> bool);
+    let d = "ab".starts_with(&is_b as &dyn Fn(char) -> bool);
+    println!("{a} {b} {c} {d}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_dyn_predicate() {
+    // A trait-object predicate (`&mut dyn FnMut` / `&dyn Fn`)
+    // resolves through the dyn callable machinery: the callable
+    // behind the object is invoked with the environment the
+    // object's base denotes -- the caller's closure storage -- so
+    // the counter advances across invocations and across separate
+    // searches (1, then 2), exactly as for a concrete borrowed
+    // predicate. Before the fix the object fell into the
+    // character-slice fallback and the search failed with a type
+    // mismatch ("found dyn reference").
+    run_ok(
+        "str-pattern-dyn-pred",
+        STR_PATTERN_DYN_PRED_SRC,
+        "false true true false\n",
+    );
+}
+
+const STR_PATTERN_BOXED_DYN_PRED_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let mut n = 0;
+    let boxed: Box<dyn FnMut(char) -> bool> = Box::new(move |_| {
+        n += 1;
+        n == 2
+    });
+    let a = "ab".contains(boxed);
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed2: Box<dyn FnMut(char) -> bool> = Box::new(move |c: char| {
+        let _ = &rc2;
+        c == 'b'
+    });
+    let b = "ab".contains(boxed2);
+    println!("{a} {b} count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_dyn_predicate() {
+    // An owned `Box<dyn FnMut>` predicate is invoked through the
+    // box's allocation (its `FnMut` state persists across the
+    // per-character invocations, so the counter reaches 2), and
+    // the object is dropped when the search returns: the second
+    // predicate's `Rc` capture is released, returning the strong
+    // count to 1.
+    run_ok(
+        "str-pattern-boxed-dyn-pred",
+        STR_PATTERN_BOXED_DYN_PRED_SRC,
+        "true true count=1\n",
+    );
+}
+
+const STR_PATTERN_BOXED_DYN_PRED_UNWIND_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed: Box<dyn FnMut(char) -> bool> = Box::new(move |c: char| {
+        let _ = &rc2;
+        if c == 'b' {
+            panic!("boom");
+        }
+        false
+    });
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(boxed)));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_dyn_predicate_drops_on_unwind() {
+    // The owned trait-object predicate is dropped on the unwind
+    // path too: the panicking search still hands the object back
+    // for the call's drop glue, so the capture's strong count
+    // returns to 1 behind the guest's `catch_unwind`.
+    run_ok(
+        "str-pattern-boxed-dyn-pred-unwind",
+        STR_PATTERN_BOXED_DYN_PRED_UNWIND_SRC,
+        "caught=true count=1\n",
+    );
 }
 
 const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
