@@ -3301,6 +3301,10 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
         "exit_code": conv["exit_code"],
         "converted": conv["converted"],
         "skipped": conv["skipped"],
+        "target_converted": conv.get("target_converted"),
+        "target_skipped": conv.get("target_skipped"),
+        "not_demanded": conv.get("not_demanded"),
+        "target_not_demanded": conv.get("target_not_demanded"),
         "skip_totals": conv["skip_totals"],
         "ice": conv["ice"],
     }
@@ -3687,6 +3691,9 @@ def snapshot_flags(path, text):
 
 _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
 _TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M)
+_NOT_DEMANDED_RE = re.compile(r"^not demanded: (\d+)$", re.M)
+_TARGET_NOT_DEMANDED_RE = re.compile(
+    r"^target-crate not demanded: (\d+)$", re.M)
 
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
@@ -3694,7 +3701,10 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
-    skipped counts (None when no report was printed), skip_totals
+    skipped counts (None when no report was printed), the
+    target-crate converted/skipped counts and the whole-program and
+    target-crate not-demanded counts (each None when the driver
+    printed no such line), skip_totals
     ([(kind, count)] from the report's `unsupported:` section, most
     frequent first), compilation_failed (the embedded rustc cleanly
     rejected the program: the driver's own marker, rustc's
@@ -3738,6 +3748,10 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         "timeout": res["timeout"],
         "converted": None,
         "skipped": None,
+        "target_converted": None,
+        "target_skipped": None,
+        "not_demanded": None,
+        "target_not_demanded": None,
         "skip_totals": [],
         "compilation_failed": (
             "sparagmos-driver: compilation failed" in res["stderr"]
@@ -3769,10 +3783,16 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     if m:
         out["converted"] = int(m.group(1))
         out["skipped"] = int(m.group(2))
+        nm = _NOT_DEMANDED_RE.search(res["stdout"])
+        if nm:
+            out["not_demanded"] = int(nm.group(1))
         tm = _TARGET_RE.search(res["stdout"])
         if tm:
             out["target_converted"] = int(tm.group(1))
             out["target_skipped"] = int(tm.group(2))
+            tnm = _TARGET_NOT_DEMANDED_RE.search(res["stdout"])
+            if tnm:
+                out["target_not_demanded"] = int(tnm.group(1))
             ttotals = []
             in_tsection = False
             for line in res["stdout"].splitlines():
@@ -4260,6 +4280,10 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         "exit_code": conv["exit_code"],
         "converted": conv["converted"],
         "skipped": conv["skipped"],
+        "target_converted": conv.get("target_converted"),
+        "target_skipped": conv.get("target_skipped"),
+        "not_demanded": conv.get("not_demanded"),
+        "target_not_demanded": conv.get("target_not_demanded"),
         "skip_totals": conv["skip_totals"],
         "ice": conv["ice"],
     }
