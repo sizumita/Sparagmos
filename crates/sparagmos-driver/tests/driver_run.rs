@@ -670,6 +670,120 @@ fn run_mode_shared_tuple_byte_array_under_budget_reads_back() {
 }
 
 #[test]
+fn run_mode_cstr_table_over_budget_stays_undecoded() {
+    // A table of references to one shared 1 MiB `CStr`: each
+    // element's decode reaches the `CStr` payload copy in
+    // `decode_adt`, so the copies are charged against the
+    // shared expansion budget and the table stays undecoded
+    // instead of materialising one 1 MiB copy per element.
+    let lit = "a".repeat(1048576);
+    let src = format!(
+        "use std::ffi::CStr; static BIG: &CStr = c\"{lit}\"; static TABLE: [&CStr; 5000] = [BIG; 5000]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[0].to_bytes().len()); }}"
+    );
+    let dir = temp_dir("cstr-table-over-budget");
+    let src = fixture(&dir, "cstr_table_over_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared CStr table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_cstr_table_under_budget_reads_back() {
+    // The same shared-`CStr` table shape at a size the budget
+    // covers still materialises and reads back exactly.
+    let lit = "b".repeat(4096);
+    let src = format!(
+        "use std::ffi::CStr; static BIG: &CStr = c\"{lit}\"; static TABLE: [&CStr; 100] = [BIG; 100]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[99].to_bytes().len()); }}"
+    );
+    let dir = temp_dir("cstr-table-under-budget");
+    let src = fixture(&dir, "cstr_table_under_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget shared CStr table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "100 4096\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_str_newtype_table_over_budget_stays_undecoded() {
+    // A table of references to one shared newtype over `str`:
+    // each element's decode copies the trailing `str` field's
+    // bytes, so the copies are charged against the shared
+    // expansion budget and the table stays undecoded.
+    let lit = "a".repeat(1048576);
+    let src = format!(
+        "struct MyStr(str); static S: &str = \"{lit}\"; static BIG: &MyStr = unsafe {{ std::mem::transmute::<&str, &MyStr>(S) }}; static TABLE: [&MyStr; 5000] = [BIG; 5000]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[0].0.len()); }}"
+    );
+    let dir = temp_dir("str-newtype-table-over-budget");
+    let src = fixture(&dir, "str_newtype_table_over_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared str-newtype table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_bytes_newtype_table_over_budget_stays_undecoded() {
+    // A table of references to one shared newtype over `[u8]`:
+    // each element's decode copies the trailing slice field's
+    // bytes, so the copies are charged against the shared
+    // expansion budget and the table stays undecoded.
+    let src = "struct MyBytes([u8]); static SLICE: &[u8] = &[7u8; 1048576]; static BIG: &MyBytes = unsafe { std::mem::transmute::<&[u8], &MyBytes>(SLICE) }; static TABLE: [&MyBytes; 5000] = [BIG; 5000]; fn main() { println!(\"{} {}\", TABLE.len(), TABLE[0].0.len()); }";
+    let dir = temp_dir("bytes-newtype-table-over-budget");
+    let src = fixture(&dir, "bytes_newtype_table_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared bytes-newtype table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_several_large_literals_each_decode() {
+    // Several string literals in one body, each comfortably
+    // under the expansion budget on its own: every root
+    // constant starts with a full budget, so all of them
+    // decode -- the third must not be rejected for what the
+    // first two spent.
+    let a = "a".repeat(400000);
+    let b = "a".repeat(400001);
+    let c = "a".repeat(400002);
+    let src = format!(
+        "fn main() {{ let s0 = \"{a}\"; let s1 = \"{b}\"; let s2 = \"{c}\"; println!(\"{{}} {{}} {{}}\", s0.len(), s1.len(), s2.len()); }}"
+    );
+    let dir = temp_dir("several-large-literals");
+    let src = fixture(&dir, "several_large_literals.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "each under-budget literal must decode; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "400000 400001 400002\n",
+        "decoded literal lengths must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the

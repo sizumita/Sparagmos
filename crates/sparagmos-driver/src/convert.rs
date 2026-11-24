@@ -638,7 +638,9 @@ pub struct Converter {
         std::collections::HashSet<(rustc_public::DefId, String)>,
     /// Expansion budget remaining for the constant currently
     /// being decoded (see `MAX_CONST_TOTAL_ELEMS`): reset at the
-    /// root of every `decode_const` / `decode_ref` tree and spent
+    /// root of every decoded constant (`const_from_alloc`, and
+    /// at the root of every `decode_const` / `decode_ref` tree
+    /// reached from one) and spent
     /// once per `decode_const` call, so one constant's total
     /// materialised size is bounded however its element counts
     /// nest. Arms that copy a byte payload spend the copied
@@ -4830,6 +4832,16 @@ impl Converter {
         ty: &rustc_public::ty::Ty,
         alloc: &Allocation,
     ) -> sm::ConstValue {
+        // Every root constant starts with a full expansion
+        // budget (see `MAX_CONST_TOTAL_ELEMS`). The aggregate
+        // path below reaches a reset at the root of
+        // `decode_const` / `decode_ref`, but the scalar and
+        // reference paths do not: without a reset here, a
+        // reference constant's fat-pointer charge would spend
+        // whatever earlier constants in the same body left
+        // behind, so whether a constant decodes would depend
+        // on the constants visited before it.
+        self.const_budget = MAX_CONST_TOTAL_ELEMS;
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
         // `guarded_ty_kind`); the value is a zero-sized closure
@@ -4903,19 +4915,28 @@ impl Converter {
                     ty: float_ty(f),
                 })
             }
-            TyKind::RigidTy(RigidTy::Str) => match alloc.raw_bytes() {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => sm::ConstValue::Str(s),
+            TyKind::RigidTy(RigidTy::Str) => {
+                // The copy below materialises the allocation's
+                // bytes: charge them against the expansion
+                // budget, like every other byte-copying decode.
+                if !self.spend_const_budget(alloc.bytes.len()) {
+                    self.err("ConstantKind::Allocated (str over the expansion budget)");
+                    return sm::ConstValue::ZeroSized;
+                }
+                match alloc.raw_bytes() {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => sm::ConstValue::Str(s),
+                        Err(_) => {
+                            self.err("ConstantKind::Allocated (invalid UTF-8 str)");
+                            sm::ConstValue::ZeroSized
+                        }
+                    },
                     Err(_) => {
-                        self.err("ConstantKind::Allocated (invalid UTF-8 str)");
+                        self.err("ConstantKind::Allocated (unreadable str)");
                         sm::ConstValue::ZeroSized
                     }
-                },
-                Err(_) => {
-                    self.err("ConstantKind::Allocated (unreadable str)");
-                    sm::ConstValue::ZeroSized
                 }
-            },
+            }
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
                 self.ref_const(&inner, alloc)
             }
@@ -4962,10 +4983,10 @@ impl Converter {
         let Some(data) = raw.get(..meta as usize) else {
             return FatPointerRead::NotFat;
         };
-        let data = data.to_vec();
         if !self.spend_const_budget(data.len()) {
             return FatPointerRead::OverBudget;
         }
+        let data = data.to_vec();
         FatPointerRead::Data(data, meta)
     }
 
@@ -5052,6 +5073,17 @@ impl Converter {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
                     Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
+                        // The shortcut materialises the whole
+                        // pointee allocation: charge its bytes
+                        // against the expansion budget. Over
+                        // budget, the constant keeps its exact
+                        // `ByRef` identity instead of copying.
+                        if !self.spend_const_budget(pointee.bytes.len()) {
+                            return sm::ConstValue::ByRef {
+                                alloc_id,
+                                offset: 0,
+                            };
+                        }
                         return match pointee.raw_bytes().map(String::from_utf8) {
                             Ok(Ok(s)) => sm::ConstValue::Str(s),
                             _ => {
@@ -5065,6 +5097,15 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
+                            // As for the string shortcut above:
+                            // the whole-pointee copy is charged
+                            // against the expansion budget.
+                            if !self.spend_const_budget(pointee.bytes.len()) {
+                                return sm::ConstValue::ByRef {
+                                    alloc_id,
+                                    offset: 0,
+                                };
+                            }
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Slice {
                                     meta: data.len() as u64,
@@ -5082,6 +5123,15 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
+                            // As for the string shortcut above:
+                            // the whole-pointee copy is charged
+                            // against the expansion budget.
+                            if !self.spend_const_budget(pointee.bytes.len()) {
+                                return sm::ConstValue::ByRef {
+                                    alloc_id,
+                                    offset: 0,
+                                };
+                            }
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Bytes(data),
                                 Err(_) => {
@@ -5256,6 +5306,14 @@ impl Converter {
                 // A `str` value in non-reference position is the
                 // trailing unsized field of an ADT (a newtype over
                 // `str`): its bytes run to the end of the allocation.
+                // The copy is charged against the shared expansion
+                // budget before it is made: a table of references
+                // to one shared value of such a type reaches this
+                // arm once per element, so uncharged copies would
+                // add up past the budget.
+                if !self.spend_const_budget(alloc.bytes.len().saturating_sub(offset)) {
+                    return None;
+                }
                 let raw = alloc.raw_bytes().ok()?;
                 let bytes = raw.get(offset..)?;
                 String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
@@ -5271,6 +5329,12 @@ impl Converter {
                     elem.kind(),
                     TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                 ) {
+                    // Charged like the `str` arm above: the tail
+                    // copy spends its length against the shared
+                    // expansion budget.
+                    if !self.spend_const_budget(bytes.len()) {
+                        return None;
+                    }
                     return Some(sm::ConstValue::Bytes(bytes.to_vec()));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
@@ -5447,7 +5511,16 @@ impl Converter {
             // decode them as the byte string they are, like the
             // `[u8]` trailing-slice decode below.
             let raw = alloc.raw_bytes().ok()?;
-            let bytes = raw.get(offset..)?.to_vec();
+            let bytes = raw.get(offset..)?;
+            // The payload copy is charged against the shared
+            // expansion budget before it is made: a table of
+            // references to one shared `CStr` reaches this arm
+            // once per element, so uncharged copies would add
+            // up past the budget.
+            if !self.spend_const_budget(bytes.len()) {
+                return None;
+            }
+            let bytes = bytes.to_vec();
             return Some(sm::ConstValue::Adt {
                 variant: 0,
                 fields: vec![sm::ConstValue::Bytes(bytes)],
@@ -6075,10 +6148,11 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let bytes = alloc.bytes.get(offset..)?.to_vec();
-        if !self.spend_const_budget(bytes.len()) {
+        let tail = alloc.bytes.get(offset..)?;
+        if !self.spend_const_budget(tail.len()) {
             return None;
         }
+        let bytes = tail.to_vec();
         let mut relocs = Vec::new();
         for (o, _) in &alloc.provenance.ptrs {
             let o = *o as usize;
