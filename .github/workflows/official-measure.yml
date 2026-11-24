@@ -85,7 +85,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v3
+          key: rust-survey-1.100.0-v4
 
       - name: Fetch rust tree and generate survey (on cache miss)
         run: |
@@ -246,7 +246,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v3
+          key: rust-survey-1.100.0-v4
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -413,7 +413,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v3
+          key: rust-survey-1.100.0-v4
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -487,7 +487,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v3
+          key: rust-survey-1.100.0-v4
           fail-on-cache-miss: true
 
       - name: Download shard results
