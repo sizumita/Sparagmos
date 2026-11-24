@@ -818,6 +818,10 @@ pub struct Interpreter<'a> {
     /// report). Interior-mutable: most execution paths hold only
     /// `&self`.
     panic_hook: std::cell::RefCell<Option<Value>>,
+    /// The backtrace style installed by
+    /// `std::panic::set_backtrace_style`; recorded for the
+    /// (currently unconverted) backtrace machinery.
+    backtrace_style: std::cell::RefCell<Option<Value>>,
     /// The caller-location stamp of the panic currently being
     /// raised, stashed by the panic entry-point builtins (they
     /// receive it as a trailing argument) for the hook's
@@ -1622,6 +1626,7 @@ impl<'a> Interpreter<'a> {
             pending_asm_outgoing: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
+            backtrace_style: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
             in_panic_hook: false,
             hook_fired_depth: None,
@@ -4543,6 +4548,10 @@ impl<'a> Interpreter<'a> {
     /// Install the guest's panic hook (see
     /// [`Interpreter::panic_hook`]); the default-hook marker
     /// restores the default (no hook called).
+    pub(crate) fn set_backtrace_style(&self, style: Value) {
+        *self.backtrace_style.borrow_mut() = Some(style);
+    }
+
     pub(crate) fn set_panic_hook(&self, hook: Value) {
         if is_default_hook(&hook) {
             *self.panic_hook.borrow_mut() = None;

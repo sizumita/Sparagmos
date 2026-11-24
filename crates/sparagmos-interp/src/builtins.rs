@@ -782,6 +782,12 @@ pub enum Builtin {
     CallerLocation,
     /// `std::panic::set_hook(hook)`: install the panic hook.
     PanicSetHook,
+    /// `std::panic::set_backtrace_style(style)`: record the
+    /// backtrace style the guest configured. No converted
+    /// reader exists (std reads it inside its own unconverted
+    /// backtrace machinery), so recording it is observationally
+    /// exact.
+    PanicSetBacktraceStyle,
     /// `std::panic::take_hook()`: take the panic hook, leaving
     /// the default in its place.
     PanicTakeHook,
@@ -2569,6 +2575,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::TestMainEnvArgs
         }
         "std::panic::set_hook" => Builtin::PanicSetHook,
+        "std::panic::set_backtrace_style" => Builtin::PanicSetBacktraceStyle,
         "std::panic::take_hook" => Builtin::PanicTakeHook,
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,
@@ -6207,6 +6214,11 @@ impl<'a> Interpreter<'a> {
                 self.set_panic_hook(vals.into_iter().next().expect("one argument"));
                 Ok(Value::Unit)
             }
+            Builtin::PanicSetBacktraceStyle => {
+                arity(1)?;
+                self.set_backtrace_style(vals.into_iter().next().expect("one argument"));
+                Ok(Value::Unit)
+            }
             Builtin::PanicTakeHook => {
                 arity(0)?;
                 Ok(self.take_panic_hook())
@@ -8223,6 +8235,33 @@ impl<'a> Interpreter<'a> {
                             value.kind_name(),
                         )),
                     }
+                } else if target
+                    == "tracing_subscriber::filter::env::directive::Directive"
+                    && source == "tracing_core::metadata::LevelFilter"
+                {
+                    // `Directive: From<LevelFilter>` is
+                    // `Self { level, ..Self::default() }`
+                    // (tracing-subscriber 0.3.23,
+                    // `src/filter/env/directive.rs`): the given
+                    // level in the last field, `None` span and
+                    // target and an empty field-match vector
+                    // before it, in declaration order.
+                    let none = || Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    };
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            none(),
+                            Value::Enum {
+                                variant: 0,
+                                fields: Vec::new(),
+                            },
+                            none(),
+                            value,
+                        ],
+                    })
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -27024,6 +27063,13 @@ fn generic_first_arg<'a>(tag: &'a str, prefix: &str) -> Option<&'a str> {
     split_top_level(inner).into_iter().next()
 }
 
+/// All top-level generic arguments of a rendered tag with the
+/// given prefix, in declaration order.
+fn generic_args<'a>(tag: &'a str, prefix: &str) -> Option<Vec<&'a str>> {
+    let inner = tag.strip_prefix(prefix)?.strip_suffix('>')?;
+    Some(split_top_level(inner))
+}
+
 /// Two fresh SipHash keys for a new `std::hash::RandomState`,
 /// drawn the way the modelled time builtins draw from the host:
 /// the wall clock's nanoseconds, a per-process counter and the
@@ -27100,6 +27146,14 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
         "()" => Value::Unit,
         "std::string::String" => Value::Str(String::new()),
+        // `rustc_hash::FxBuildHasher` is a unit struct; its
+        // derived `Default` is the unit value. It is the hasher
+        // the compiler's own hash collections are built with, so
+        // the hash-collection defaults recurse into it.
+        "rustc_hash::FxBuildHasher" => Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        },
         // `rustc_session::config::ErrorOutputType::default()` is
         // the `#[default]` variant with its field defaults:
         // `HumanReadable { kind: HumanReadableErrorType { short:
@@ -27146,6 +27200,30 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
         // (`<caller>::rustc_errors::DiagCtxtFlags`); from inside
         // the compiler crates it is the bare path. Both spellings
         // denote this one ADT.
+        // `tracing_subscriber::filter::env::Builder::default()`
+        // is the hand-written `Default` of the `EnvFilter`
+        // builder (tracing-subscriber 0.3.23,
+        // `src/filter/env/builder.rs`): `regex: true` (span
+        // field values may be matched with regular expressions),
+        // `env: None`, `default_directive: None`. The rustdoc
+        // entry program builds its tracing filter through this
+        // default, so it is modelled here like the other
+        // hand-modelled defaults. The rendered tag carries the
+        // naming crate's prefix when the type is named through
+        // an explicit `extern crate` item; both spellings denote
+        // this one ADT.
+        _ if tag == "tracing_subscriber::filter::env::builder::Builder"
+            || tag.ends_with("::tracing_subscriber::filter::env::builder::Builder") =>
+        {
+            let none = || Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            };
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Bool(true), none(), none()],
+            }
+        }
         _ if tag == "rustc_errors::DiagCtxtFlags"
             || tag.ends_with("::rustc_errors::DiagCtxtFlags") =>
         {
@@ -27304,7 +27382,7 @@ impl<'a> Interpreter<'a> {
             let pointee = self.default_value(inner)?;
             return Some(self.rc_new_handle(pointee));
         }
-        if tag == "std::hash::RandomState" {
+        if tag == "std::hash::RandomState" || tag == "core::hash::RandomState" {
             // `RandomState::default()` is `RandomState::new()`:
             // the struct value holding two fresh hash keys, the
             // shape the collected `new` body builds.
@@ -27314,7 +27392,162 @@ impl<'a> Interpreter<'a> {
                 fields: vec![Value::Uint(u128::from(k0)), Value::Uint(u128::from(k1))],
             });
         }
+        if tag.starts_with("std::collections::HashMap<")
+            || tag.starts_with("std::collections::HashSet<")
+        {
+            return self.hash_collection_default(tag);
+        }
+        if tag.starts_with("indexmap::set::IndexSet<")
+            || tag.starts_with("indexmap::map::IndexMap<")
+            || tag.starts_with("indexmap::IndexMap<")
+        {
+            return self.index_collection_default(tag);
+        }
         default_value_for_tag(tag)
+    }
+
+    /// `Default::default()` for the std hash collections: the
+    /// empty table the collected `new` bodies build, assembled
+    /// directly. `HashMap` / `HashSet` wrap hashbrown's map,
+    /// whose table is a `RawTableInner` with `bucket_mask == 0`
+    /// -- the empty singleton, which hashbrown identifies by the
+    /// mask alone -- no items and no growth left, its control
+    /// pointer aimed at a group of `EMPTY` control bytes. The
+    /// collected bodies aim it at hashbrown's static empty
+    /// group; a fresh block of `EMPTY` bytes serves the same
+    /// reads (a mask-0 table's probes read only that group),
+    /// and every growth and drop path keys off the mask, never
+    /// the pointer's identity. The hasher field is the hasher
+    /// type's own default, recursively; the allocator must be
+    /// the global one, the only allocator whose value is the
+    /// unit-like `Global`. Any other shape keeps the explicit
+    /// unsupported error.
+    fn hash_collection_default(&self, tag: &str) -> Option<Value> {
+        let (is_set, args) =
+            if let Some(args) = generic_args(tag, "std::collections::HashMap<") {
+                (false, args)
+            } else if let Some(args) = generic_args(tag, "std::collections::HashSet<") {
+                (true, args)
+            } else {
+                return None;
+            };
+        let (hasher_tag, alloc_tag) = match (is_set, args.len()) {
+            (false, 4) => (args[2], args[3]),
+            (true, 3) => (args[1], args[2]),
+            _ => return None,
+        };
+        if alloc_tag != "std::alloc::Global" && alloc_tag != "alloc::alloc::Global" {
+            return None;
+        }
+        let hasher = self.default_value(hasher_tag)?;
+        let raw_table = self.empty_raw_table();
+        let hashbrown_map = Value::Enum {
+            variant: 0,
+            fields: vec![hasher, raw_table],
+        };
+        if is_set {
+            let hashbrown_set = Value::Enum {
+                variant: 0,
+                fields: vec![hashbrown_map],
+            };
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![hashbrown_set],
+            })
+        } else {
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![hashbrown_map],
+            })
+        }
+    }
+
+    /// The empty hashbrown `RawTable` value: a `RawTableInner`
+    /// with `bucket_mask == 0` (the empty singleton), no items
+    /// and no growth left, its control pointer aimed at a fresh
+    /// block of `EMPTY` control bytes, then the unit-like
+    /// global allocator and the phantom marker. Shared by the
+    /// std and indexmap collection defaults.
+    fn empty_raw_table(&self) -> Value {
+        let ctrl_id = self.alloc_insert(Value::Bytes(vec![0xFF; 64]));
+        self.mark_elem_block(ctrl_id);
+        let unit = || Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        };
+        let raw_table_inner = Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Uint(0),
+                // `ctrl`: the `NonNull<u8>` over the empty group.
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Ref(RefTarget::Alloc {
+                        id: ctrl_id,
+                        projection: Vec::new(),
+                    })],
+                },
+                Value::Uint(0),
+                Value::Uint(0),
+            ],
+        };
+        Value::Enum {
+            variant: 0,
+            fields: vec![raw_table_inner, unit(), unit()],
+        }
+    }
+
+    /// `Default::default()` for indexmap's collections: the
+    /// empty value the collected constructors build.
+    /// `IndexMap { core: Core { indices, entries },
+    /// hash_builder }`, where `indices` is hashbrown's
+    /// `hash_table::HashTable` (a single-field wrapper over the
+    /// same empty `RawTable` as the std collections) and
+    /// `entries` is an empty `Vec`; `IndexSet` wraps the map.
+    /// The hasher field is the hasher type's own default,
+    /// recursively; any other shape keeps the explicit
+    /// unsupported error.
+    fn index_collection_default(&self, tag: &str) -> Option<Value> {
+        let (is_set, args) =
+            if let Some(args) = generic_args(tag, "indexmap::set::IndexSet<") {
+                (true, args)
+            } else if let Some(args) = generic_args(tag, "indexmap::map::IndexMap<")
+                .or_else(|| generic_args(tag, "indexmap::IndexMap<"))
+            {
+                (false, args)
+            } else {
+                return None;
+            };
+        let hasher_tag = match (is_set, args.len()) {
+            (true, 2) => args[1],
+            (false, 3) => args[2],
+            _ => return None,
+        };
+        let hasher = self.default_value(hasher_tag)?;
+        let indices = Value::Enum {
+            variant: 0,
+            fields: vec![self.empty_raw_table()],
+        };
+        let entries = Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        };
+        let core = Value::Enum {
+            variant: 0,
+            fields: vec![indices, entries],
+        };
+        let index_map = Value::Enum {
+            variant: 0,
+            fields: vec![core, hasher],
+        };
+        if is_set {
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![index_map],
+            })
+        } else {
+            Some(index_map)
+        }
     }
 
     pub(crate) fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
