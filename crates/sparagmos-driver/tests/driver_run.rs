@@ -8926,6 +8926,40 @@ fn main() {
 }
 "#;
 
+const TRANSMUTE_FN_PTR_NICHE_SRC: &str = r#"
+unsafe extern "C" fn hello() { println!("hello"); }
+fn main() {
+    let none = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(0) };
+    println!("none={}", none.is_none());
+    let some = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(1) };
+    println!("some={}", some.is_some());
+    let null = unsafe { std::mem::transmute::<*const usize, Option<unsafe extern "C" fn()>>(std::ptr::null()) };
+    println!("null={}", null.is_none());
+    let p: unsafe extern "C" fn() = hello;
+    let bits = unsafe { std::mem::transmute::<unsafe extern "C" fn(), usize>(p) };
+    let back = unsafe { std::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(bits) };
+    match back { Some(f) => unsafe { f() }, None => println!("none") }
+    let optbits = unsafe { std::mem::transmute::<Option<unsafe extern "C" fn()>, usize>(Some(p)) };
+    println!("round={}", optbits == bits);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fn_ptr_niche_payload() {
+    // A function pointer has the pointer-width scalar leaf,
+    // so a niche-encoded enum over one (`Option<fn()>`)
+    // transmutes from an integer or a raw pointer: the null
+    // pattern is the niche variant, any other pattern is the
+    // payload variant. A real function pointer flattens to
+    // its synthetic address and the reverse construction
+    // recovers the very function value, which still calls.
+    run_ok(
+        "transmute-fn-ptr-niche",
+        TRANSMUTE_FN_PTR_NICHE_SRC,
+        "none=true\nsome=true\nnull=true\nhello\nround=true\n",
+    );
+}
+
 #[test]
 fn run_mode_transmute_fat_pointer_words() {
     // A fat pointer transmutes to its two words and back: the

@@ -6650,6 +6650,12 @@ let inner = match (&src, target) {
             mir::Ty::RawPtr(..) | mir::Ty::Ref(..) if is_thin_ptr_ty(ty) => {
                 Some(S::Ptr)
             }
+            // A function pointer flattens to its synthetic
+            // address, like a thin data pointer: the pointer's
+            // own bit pattern is the payload, which is what a
+            // niche-encoded enum over a function pointer
+            // (`Option<fn()>`) stores.
+            mir::Ty::FnPtr(..) => Some(S::Ptr),
             // A fat pointer flattens to its two words (see
             // [`ir::ScalarShape::FatPtr`]): the data pointer's
             // synthetic address in the low word and the metadata

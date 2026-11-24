@@ -552,7 +552,12 @@ pub enum ScalarShape {
     /// holding the pattern — the same reading the pointer <->
     /// integer transmutes give a bare pointer, extended to the
     /// pointer payloads of wrapper and niche-encoded shapes
-    /// (`NonNull<T>`, `Option<NonNull<T>>`).
+    /// (`NonNull<T>`, `Option<NonNull<T>>`). A function pointer
+    /// takes this same leaf: its bit pattern is its synthetic
+    /// address, and a pattern a function value was exposed at
+    /// constructs that function value back (see
+    /// `Interpreter::exposed_fn_ptrs`), which is what a
+    /// niche-encoded `Option<fn()>` payload holds.
     Ptr,
     /// An array of a scalar element shape: element `i` occupies
     /// bits `[i * elem_bits, (i + 1) * elem_bits)`.
