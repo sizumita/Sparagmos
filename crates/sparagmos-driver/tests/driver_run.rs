@@ -27849,3 +27849,49 @@ fn run_mode_error_output_type_default() {
         "ErrorOutputType::default() must be the HumanReadable default; stderr={stderr}"
     );
 }
+
+// ----- libc isatty (rustdoc execution path) ---------------------------------
+
+// Session setup in compiler programs asks whether the standard
+// streams are terminals (colour configuration); the answer comes
+// from the body-less libc `isatty`, served by the interpreter's
+// foreign-helper table: descriptors 0/1/2 are the host process's
+// own streams, file-model descriptors are answered from the host
+// file table, and unissued descriptors are not terminals. The
+// expected line is the native output of the same program with
+// both standard streams captured through pipes.
+const LIBC_ISATTY_SRC: &str = r#"
+use std::ffi::c_int;
+use std::os::unix::io::AsRawFd;
+
+extern "C" {
+    fn isatty(fd: c_int) -> c_int;
+}
+
+fn main() {
+    let path = std::env::temp_dir().join("sparagmos-isatty-probe.txt");
+    let f = std::fs::File::create(&path).unwrap();
+    let (o, e, d, x) = unsafe { (isatty(1), isatty(2), isatty(f.as_raw_fd()), isatty(9999)) };
+    drop(f);
+    let _ = std::fs::remove_file(&path);
+    println!("stdout={o} stderr={e} file={d} bogus={x}");
+}
+"#;
+
+#[test]
+fn run_mode_libc_isatty() {
+    let dir = temp_dir("libc-isatty");
+    let src = fixture(&dir, "libc_isatty.rs", LIBC_ISATTY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "stdout=0 stderr=0 file=0 bogus=0\n",
+        "piped streams, a regular file and an unissued descriptor are not terminals; stderr={stderr}"
+    );
+}
