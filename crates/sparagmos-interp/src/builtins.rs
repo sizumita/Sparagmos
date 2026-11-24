@@ -8365,7 +8365,14 @@ impl<'a> Interpreter<'a> {
                         // reference would alias the source, and
                         // writes or drops on either side would
                         // show through the other.
-                        let (elements, _len) = self.slice_elements(frames, &value)?;
+                        let (elements, len) = self.slice_elements(frames, &value)?;
+                        let elements = self.clone_source_elements(
+                            frames,
+                            &value,
+                            elements,
+                            len,
+                            elem_ty,
+                        );
                         let elements = self.clone_boxed_slice_elements(
                             &mut *frames,
                             &elements,
@@ -8400,7 +8407,7 @@ impl<'a> Interpreter<'a> {
                                     // itself would alias the
                                     // source, and later writes to
                                     // it would show through the box.
-                                    let (elements, _len) =
+                                    let (elements, len) =
                                         self.slice_elements(frames, &held)?;
                                     // The snapshot copies the
                                     // elements' `Value`
@@ -8416,6 +8423,13 @@ impl<'a> Interpreter<'a> {
                                     // clone models do (the
                                     // `slice::to_vec` treatment)
                                     // before boxing them.
+                                    let elements = self.clone_source_elements(
+                                        frames,
+                                        &held,
+                                        elements,
+                                        len,
+                                        elem_ty,
+                                    );
                                     let elements = self.clone_boxed_slice_elements(
                                         &mut *frames,
                                         &elements,
@@ -13891,6 +13905,77 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
     }
 
+    /// Pair every element of a boxed-slice conversion's
+    /// source snapshot with its live source reference (see
+    /// [`Self::clone_source_element_ref`]), for the
+    /// custom-`Clone` dispatch in
+    /// [`Self::clone_boxed_slice_element`]. Scalar elements
+    /// never dispatch to a `Clone` body and hold nothing that
+    /// can, so their conversions name no references.
+    fn clone_source_elements(
+        &self,
+        frames: &[Frame],
+        receiver: &Value,
+        elements: Vec<Value>,
+        len: u128,
+        elem_ty: Option<&str>,
+    ) -> Vec<(Value, Option<RefTarget>)> {
+        let named = matches!(elem_ty, Some(ty) if !matches!(
+            ty,
+            "bool" | "char" | "str" | "()"
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                | "f16" | "f32" | "f64" | "f128"
+        ));
+        elements
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let source_ref = if named {
+                    self.clone_source_element_ref(frames, receiver, i, len, &e)
+                } else {
+                    None
+                };
+                (e, source_ref)
+            })
+            .collect()
+    }
+
+    /// The live reference to element `idx` of the sequence a
+    /// conversion is cloning from: the element's own place in
+    /// the source storage (the resolution
+    /// [`Self::index_place_ref`] performs for an indexed
+    /// read), so a `Clone` body invoked on it that mutates
+    /// through `&self` -- an inline `Cell` or `RefCell` --
+    /// writes the source element, exactly as the same body
+    /// called on the element directly would. `None` when the
+    /// source is not place-backed, or when the place does not
+    /// denote exactly the snapshotted element (an element
+    /// whose store the source's MIR elided reaches the
+    /// snapshot as its canonical value, not as the storage's
+    /// uninitialised slot): the dispatch then keeps the
+    /// snapshot argument it has always used.
+    fn clone_source_element_ref(
+        &self,
+        frames: &[Frame],
+        receiver: &Value,
+        idx: usize,
+        len: u128,
+        snapshot: &Value,
+    ) -> Option<RefTarget> {
+        let refr = self.index_place_ref(frames, receiver, idx, Some(len)).ok()??;
+        let Value::Ref(target) = &refr else {
+            return None;
+        };
+        let resolved = self.deref_value(frames, &refr).ok()?;
+        let stored = self.read_resolved(frames, &resolved).ok()?;
+        if stored == *snapshot {
+            Some(target.clone())
+        } else {
+            None
+        }
+    }
+
     /// Clone one element of a slice being re-owned by a
     /// `From<&[T]>` / borrowed-`Cow<[T]>` conversion to
     /// `Box<[T]>`, where the element type tag `elem_ty` is
@@ -13924,7 +14009,15 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// An element type whose `Clone` body the program
     /// collected clones through that body, exactly as a direct
     /// `Clone::clone` call on the element would (see the
-    /// dispatch in the body below).
+    /// dispatch in the body below). The body's `&self` is the
+    /// element's own source reference when the caller could
+    /// name one (`value_ref`, propagated into fields by the
+    /// aggregate recursion): a body that mutates through
+    /// `&self` -- an inline `Cell` or `RefCell` -- writes the
+    /// source element, as the same body called on the element
+    /// directly would. Without a named reference the argument
+    /// is the snapshot itself, the treatment such a body has
+    /// always had here.
     /// Any other element goes through the shape-only owned
     /// clone. `glue` is the element type's drop glue when the
     /// caller baked one: the aggregate recursion below uses it
@@ -13934,6 +14027,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
+        value_ref: Option<&RefTarget>,
         elem_ty: Option<&str>,
         glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
@@ -13960,14 +14054,24 @@ fn value_fingerprint(value: &Value) -> u64 {
                 || ty.starts_with("alloc::boxed::Box<")
             {
                 if let Some((id, projection)) = box_alloc_pointer(value) {
-                    let pointee =
-                        self.read_resolved(frames, &Resolved::Alloc { id, projection })?;
+                    let pointee = self.read_resolved(
+                        frames,
+                        &Resolved::Alloc {
+                            id,
+                            projection: projection.clone(),
+                        },
+                    )?;
                     let inner_ty = generic_first_arg(ty, "std::boxed::Box<")
                         .or_else(|| generic_first_arg(ty, "alloc::boxed::Box<"));
                     let pointee_glue = glue.and_then(|g| g.pointee_plan());
+                    // The pointee's own reference is its
+                    // allocation target: a `Clone` body invoked
+                    // on it sees the pointee's storage.
+                    let pointee_ref = RefTarget::Alloc { id, projection };
                     let cloned = self.clone_boxed_slice_element(
                         frames,
                         &pointee,
+                        Some(&pointee_ref),
                         inner_ty,
                         pointee_glue.as_ref(),
                     )?;
@@ -14028,15 +14132,22 @@ fn value_fingerprint(value: &Value) -> u64 {
                 for spelling in ["std::clone::Clone", "core::clone::Clone"] {
                     let name = format!("<{ty} as {spelling}>::clone");
                     if self.program().get(&name).is_some() {
-                        return self.call_sync(
-                            frames,
-                            &name,
-                            vec![Value::Ref(RefTarget::value(value.clone()))],
-                        );
+                        // The body's `&self`: the element's own
+                        // source reference when the caller named
+                        // one, so a body that mutates through
+                        // `&self` writes the source element; the
+                        // snapshot itself otherwise.
+                        let arg = match value_ref {
+                            Some(target) => Value::Ref(target.clone()),
+                            None => Value::Ref(RefTarget::value(value.clone())),
+                        };
+                        return self.call_sync(frames, &name, vec![arg]);
                     }
                 }
             }
-            if let Some(cloned) = self.clone_typed_aggregate(frames, value, ty, glue)? {
+            if let Some(cloned) =
+                self.clone_typed_aggregate(frames, value, value_ref, ty, glue)?
+            {
                 return Ok(cloned);
             }
         }
@@ -14045,7 +14156,10 @@ fn value_fingerprint(value: &Value) -> u64 {
 
     /// Clone every element of a boxed-slice conversion's
     /// source snapshot (see [`Self::clone_boxed_slice_element`]),
-    /// dropping the elements cloned so far when a later
+    /// each element paired with its live source reference when
+    /// the conversion could name one (see
+    /// [`Self::clone_source_elements`]), dropping the elements
+    /// cloned so far when a later
     /// element's clone unwinds with a guest panic: the real
     /// construction's guard drops the initialized prefix
     /// before the panic propagates. `elem_glue` is the
@@ -14056,14 +14170,20 @@ fn value_fingerprint(value: &Value) -> u64 {
     fn clone_boxed_slice_elements(
         &mut self,
         frames: &mut Vec<Frame>,
-        elements: &[Value],
+        elements: &[(Value, Option<RefTarget>)],
         elem_ty: Option<&str>,
         elem_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Vec<Value>> {
         let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
             Vec::with_capacity(elements.len());
-        for e in elements {
-            match self.clone_boxed_slice_element(frames, e, elem_ty, elem_glue) {
+        for (e, e_ref) in elements {
+            match self.clone_boxed_slice_element(
+                frames,
+                e,
+                e_ref.as_ref(),
+                elem_ty,
+                elem_glue,
+            ) {
                 Ok(v) => cloned.push((v, elem_glue.cloned())),
                 Err(err) => return Err(self.drop_cloned_prefix(frames, cloned, err)),
             }
@@ -14080,7 +14200,12 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// natively. A non-panic failure of the original clone left
     /// nothing mid-construction to clean up: it propagates
     /// untouched. A part whose glue the caller could not name
-    /// is discarded as before.
+    /// is discarded as before. The parts arrive in the order
+    /// they drop: an initialized slice or vector prefix drops
+    /// in element order, while a partially built aggregate's
+    /// fields are construction temporaries, which drop in
+    /// reverse initialization order -- the aggregate callers
+    /// reverse their prefix before handing it over.
     fn drop_cloned_prefix(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -14127,6 +14252,11 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// is left to the shape-only clone whole, since its field
     /// positions cannot be aligned with the declared ones.
     ///
+    /// `value_ref` is the aggregate's own source reference
+    /// when the caller could name one: each field's reference
+    /// is the aggregate's with the field's step appended, so a
+    /// field's `Clone` body sees the field's own storage.
+    ///
     /// `glue` is the aggregate type's drop glue when the
     /// caller baked one: when a field's clone unwinds with a
     /// guest panic, the fields cloned so far drop with their
@@ -14137,6 +14267,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
+        value_ref: Option<&RefTarget>,
         ty: &str,
         glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Option<Value>> {
@@ -14152,15 +14283,22 @@ fn value_fingerprint(value: &Value) -> u64 {
                     Vec::with_capacity(items.len());
                 for (i, (f, t)) in items.iter().zip(field_tys.iter()).enumerate() {
                     let field_glue = glue.and_then(|g| g.field_plan(None, i));
+                    let field_ref =
+                        value_ref.and_then(|t| t.projected(RefProj::Field(i)));
                     match self.clone_boxed_slice_element(
                         frames,
                         f,
+                        field_ref.as_ref(),
                         Some(t),
                         field_glue.as_ref(),
                     ) {
                         Ok(v) => cloned.push((v, field_glue)),
                         Err(err) => {
-                            return Err(self.drop_cloned_prefix(frames, cloned, err))
+                            // The fields cloned so far are
+                            // construction temporaries: they drop
+                            // in reverse initialization order.
+                            cloned.reverse();
+                            return Err(self.drop_cloned_prefix(frames, cloned, err));
                         }
                     }
                 }
@@ -14175,16 +14313,22 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let elem_glue = glue.and_then(|g| g.elem_plan());
                 let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
                     Vec::with_capacity(items.len());
-                for f in items {
+                for (i, f) in items.iter().enumerate() {
+                    let elem_ref =
+                        value_ref.and_then(|t| t.projected(RefProj::Index(i)));
                     match self.clone_boxed_slice_element(
                         frames,
                         f,
+                        elem_ref.as_ref(),
                         Some(elem),
                         elem_glue.as_ref(),
                     ) {
                         Ok(v) => cloned.push((v, elem_glue.clone())),
                         Err(err) => {
-                            return Err(self.drop_cloned_prefix(frames, cloned, err))
+                            // Construction temporaries, as in
+                            // the tuple arm above.
+                            cloned.reverse();
+                            return Err(self.drop_cloned_prefix(frames, cloned, err));
                         }
                     }
                 }
@@ -14204,10 +14348,13 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Value::Enum { variant, fields } => {
                     let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
                         Vec::with_capacity(fields.len());
-                    for f in fields {
+                    for (i, f) in fields.iter().enumerate() {
+                        let elem_ref =
+                            value_ref.and_then(|t| t.projected(RefProj::Index(i)));
                         match self.clone_boxed_slice_element(
                             frames,
                             f,
+                            elem_ref.as_ref(),
                             Some(elem),
                             elem_glue.as_ref(),
                         ) {
@@ -14225,10 +14372,13 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Value::SparseVec { elems, len, .. } => {
                     let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
                         Vec::with_capacity(elems.len());
-                    for f in elems {
+                    for (i, f) in elems.iter().enumerate() {
+                        let elem_ref =
+                            value_ref.and_then(|t| t.projected(RefProj::Index(i)));
                         match self.clone_boxed_slice_element(
                             frames,
                             f,
+                            elem_ref.as_ref(),
                             Some(elem),
                             elem_glue.as_ref(),
                         ) {
@@ -14266,14 +14416,22 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let field_ty = self.adt_field_tag(ty, *variant as usize, i);
                 let field_glue =
                     glue.and_then(|g| g.field_plan(Some(*variant as usize), i));
+                let field_ref =
+                    value_ref.and_then(|t| t.projected(RefProj::Field(i)));
                 match self.clone_boxed_slice_element(
                     frames,
                     f,
+                    field_ref.as_ref(),
                     field_ty.as_deref(),
                     field_glue.as_ref(),
                 ) {
                     Ok(v) => cloned.push((v, field_glue)),
-                    Err(err) => return Err(self.drop_cloned_prefix(frames, cloned, err)),
+                    Err(err) => {
+                        // Construction temporaries, as in the
+                        // tuple arm above.
+                        cloned.reverse();
+                        return Err(self.drop_cloned_prefix(frames, cloned, err));
+                    }
                 }
             }
             return Ok(Some(Value::Enum {

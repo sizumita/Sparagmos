@@ -213,6 +213,51 @@ impl RefTarget {
             projection,
         }
     }
+
+    /// This target with one more projection step appended: the
+    /// target denoting the sub-value the step reaches within
+    /// the value this target denotes. `None` for the targets
+    /// that denote no storage (the null and address-only
+    /// pointers).
+    pub fn projected(&self, step: RefProj) -> Option<RefTarget> {
+        match self {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Place {
+                    frame: *frame,
+                    local: *local,
+                    projection,
+                })
+            }
+            RefTarget::Value(value, projection) => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Value(value.clone(), projection))
+            }
+            RefTarget::Static { name, projection } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                })
+            }
+            RefTarget::Alloc { id, projection } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                })
+            }
+            RefTarget::Null | RefTarget::Address(_) => None,
+        }
+    }
 }
 
 /// Which formatting trait an `rt::Argument` was built for; mirrors

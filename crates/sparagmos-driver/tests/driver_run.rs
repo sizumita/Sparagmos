@@ -7792,6 +7792,151 @@ fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_counted_prefix() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SOURCE_REF_SRC: &str = r#"
+use std::cell::{Cell, RefCell};
+
+struct S {
+    counter: Cell<i32>,
+}
+
+impl Clone for S {
+    fn clone(&self) -> Self {
+        self.counter.set(self.counter.get() + 1);
+        S { counter: Cell::new(self.counter.get()) }
+    }
+}
+
+struct R {
+    log: RefCell<Vec<i32>>,
+}
+
+impl Clone for R {
+    fn clone(&self) -> Self {
+        self.log.borrow_mut().push(1);
+        R { log: RefCell::new(self.log.borrow().clone()) }
+    }
+}
+
+fn main() {
+    // The conversion's source slice is place-backed here, so
+    // the elements' Clone bodies receive the source elements
+    // themselves: the mutations they make through &self land
+    // on the source, as a direct clone() call's would.
+    let src = [S { counter: Cell::new(10) }];
+    let s: &[S] = &src;
+    let boxed: Box<[S]> = Box::from(s);
+    println!("src={} boxed={}", src[0].counter.get(), boxed[0].counter.get());
+    // Through aggregate recursion: a tuple element's field.
+    let src2 = [(S { counter: Cell::new(20) }, 5u32)];
+    let s2: &[(S, u32)] = &src2;
+    let boxed2: Box<[(S, u32)]> = Box::from(s2);
+    println!(
+        "nested src={} boxed={}",
+        src2[0].0.counter.get(),
+        boxed2[0].0.counter.get()
+    );
+    // A RefCell mutation through &self.
+    let src3 = [R { log: RefCell::new(vec![]) }];
+    let s3: &[R] = &src3;
+    let boxed3: Box<[R]> = Box::from(s3);
+    println!(
+        "refcell src len={} first={} boxed len={} first={}",
+        src3[0].log.borrow().len(),
+        src3[0].log.borrow()[0],
+        boxed3[0].log.borrow().len(),
+        boxed3[0].log.borrow()[0]
+    );
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_custom_clone_gets_source_ref() {
+    let dir = temp_dir("boxed-from-slice-ref-custom-clone-source-ref");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_custom_clone_source_ref.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SOURCE_REF_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a custom Clone that mutates through &self must run against the source element; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "src=11 boxed=11\nnested src=21 boxed=21\nrefcell src len=1 first=1 boxed len=1 first=1\n"
+    );
+}
+
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_DROP_ORDER_SRC: &str = r#"
+struct G(i32);
+impl Clone for G {
+    fn clone(&self) -> Self { G(self.0) }
+}
+impl Drop for G {
+    fn drop(&mut self) {
+        println!("drop G{}", self.0);
+    }
+}
+
+struct P;
+impl Clone for P {
+    fn clone(&self) -> Self { panic!("clone P panics") }
+}
+
+struct T {
+    a: G,
+    b: G,
+    c: P,
+}
+impl Clone for T {
+    fn clone(&self) -> Self {
+        T { a: self.a.clone(), b: self.b.clone(), c: self.c.clone() }
+    }
+}
+
+fn main() {
+    // A tuple element whose third field's clone panics: the
+    // two cloned fields are construction temporaries and drop
+    // in reverse initialization order; the source tuple's own
+    // fields later drop in declaration order.
+    let src = [(G(0), G(1), P)];
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _boxed: Box<[(G, G, P)]> = Box::from(&src[..]);
+    }));
+    println!("caught={}", r.is_err());
+    // The same for a struct element's fields.
+    let src2 = [T { a: G(0), b: G(1), c: P }];
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _boxed2: Box<[T]> = Box::from(&src2[..]);
+    }));
+    println!("caught2={}", r2.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_aggregate_fields_in_reverse() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-panic-aggregate-drop-order");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_panic_aggregate_drop_order.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_DROP_ORDER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwinding aggregate field clone must drop the cloned fields in reverse order; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop G1\ndrop G0\ncaught=true\ndrop G1\ndrop G0\ncaught2=true\ndrop G0\ndrop G1\ndrop G0\ndrop G1\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");
