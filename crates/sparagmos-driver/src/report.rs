@@ -47,6 +47,15 @@ impl FnReport {
 #[derive(Clone, Debug, Default)]
 pub struct ConversionReport {
     pub functions: Vec<FnReport>,
+    /// Definitions counted as converted that have no body: an
+    /// un-demanded data constructor (accounted converted in
+    /// `apply_instance_demands`, because its uses are aggregate
+    /// rvalues in already-converted callers) and a trivial constant
+    /// (accounted by `account_trivial_const`, because its value is
+    /// folded into every use site). Neither has a body to convert;
+    /// the count is reported separately so the converted total can
+    /// be split into with-body and without-body parts.
+    pub bodyless_converted: usize,
 }
 
 impl ConversionReport {
@@ -61,6 +70,11 @@ impl ConversionReport {
             .iter()
             .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
             .count()
+    }
+    /// Definitions counted as converted without a body (see the
+    /// field's documentation).
+    pub fn bodyless_converted_count(&self) -> usize {
+        self.bodyless_converted
     }
     /// Unsupported-variant totals across all skipped functions.
     pub fn unsupported_totals(&self) -> BTreeMap<String, usize> {

@@ -1084,6 +1084,17 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertEqual(res["status"], "unsupported")
         self.assertIn("skipped", res["reason"])
 
+    def test_driver_record_carries_not_demanded_counts(self):
+        rec = self.write_test("//@ check-pass\nfn main() {}\n")
+        res = self.run_with_conv(
+            rec, conv(target_converted=6, target_skipped=0,
+                      not_demanded=4, target_not_demanded=2))
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["driver"]["target_converted"], 6)
+        self.assertEqual(res["driver"]["target_skipped"], 0)
+        self.assertEqual(res["driver"]["not_demanded"], 4)
+        self.assertEqual(res["driver"]["target_not_demanded"], 2)
+
     def test_multi_file_not_attempted(self):
         rec = self.write_test("//@ check-pass\nfn main() {}\n")
         rec["single_file"] = False
@@ -1330,6 +1341,43 @@ class ConvertSideTests(unittest.TestCase):
         finally:
             run.run_cmd = orig
         return seen[0], out
+
+    def run_stdout(self, stdout):
+        orig = run.run_cmd
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=()):
+            return {"exit_code": 0, "timeout": False,
+                    "stdout": stdout, "stderr": ""}
+
+        run.run_cmd = stub
+        try:
+            return run.convert_side(Path("t.rs"), "2021",
+                                    Path("/fake/driver"))
+        finally:
+            run.run_cmd = orig
+
+    def test_not_demanded_lines_are_parsed(self):
+        out = self.run_stdout(
+            "sparagmos-driver: t.rs (Stable MIR, 1.100.0)\n"
+            "fn main: blocks=1 locals=2 args=0 [converted]\n"
+            "converted: 10, skipped: 0\n"
+            "not demanded: 4\n"
+            "target-crate converted: 6, skipped: 0\n"
+            "target-crate not demanded: 2\n")
+        self.assertEqual(out["converted"], 10)
+        self.assertEqual(out["skipped"], 0)
+        self.assertEqual(out["target_converted"], 6)
+        self.assertEqual(out["target_skipped"], 0)
+        self.assertEqual(out["not_demanded"], 4)
+        self.assertEqual(out["target_not_demanded"], 2)
+
+    def test_counts_default_to_none_without_report_lines(self):
+        out = self.run_stdout("converted: 1, skipped: 0\n")
+        self.assertIsNone(out["not_demanded"])
+        self.assertIsNone(out["target_not_demanded"])
+        self.assertIsNone(out["target_converted"])
+        self.assertIsNone(out["target_skipped"])
 
     def test_aux_specs_become_aux_args(self):
         argv, out = self.run_argv(

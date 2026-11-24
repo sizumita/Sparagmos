@@ -2123,6 +2123,7 @@ fn apply_instance_demands(
             let entry = &mut report.functions[dfn.report_idx];
             if dfn.ctor {
                 entry.outcome = FnOutcome::Converted;
+                report.bodyless_converted += 1;
             } else {
                 let reason = match &entry.outcome {
                     FnOutcome::Skipped { reasons } if reasons.len() == 1 => {
@@ -4325,6 +4326,7 @@ fn demand_dyn_instances(
 /// to convert. The constant is therefore accounted as converted,
 /// with no body, instead of being reported as a missing body.
 fn account_trivial_const(report: &mut ConversionReport, name: String) {
+    report.bodyless_converted += 1;
     report.functions.push(FnReport {
         name,
         blocks: 0,
@@ -7574,6 +7576,10 @@ fn print_convert_report(c: &Collected, input: &str) {
         "converted: {}, skipped: {}",
         c.report.converted_count(),
         c.report.skipped_count()
+    );
+    println!(
+        "converted without a body: {}",
+        c.report.bodyless_converted_count()
     );
     let not_demanded = c.report.not_demanded_count();
     if not_demanded > 0 {
