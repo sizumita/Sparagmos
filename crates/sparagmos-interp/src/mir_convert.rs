@@ -9046,6 +9046,7 @@ let inner = match (&src, target) {
             consumed_glue: None,
             skipped_glue: None,
             elem_glue: None,
+            receiver_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -9099,6 +9100,7 @@ let inner = match (&src, target) {
             consumed_glue: None,
             skipped_glue: None,
             elem_glue: None,
+            receiver_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -9176,6 +9178,7 @@ let inner = match (&src, target) {
             consumed_glue: None,
             skipped_glue: None,
             elem_glue: None,
+            receiver_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -10359,6 +10362,37 @@ let inner = match (&src, target) {
                         } else {
                             None
                         };
+                        // A `Clone::clone` call on a closure
+                        // clones the environment capture by
+                        // capture in the modelled clone: build
+                        // the closure type's glue now (see
+                        // `receiver_glue` in `ir`), so the
+                        // interpreter can drop the captures
+                        // cloned so far when a later capture's
+                        // clone panics. The `Self` type is the
+                        // callee's first generic argument. A
+                        // trivial glue has nothing to run; a
+                        // glue that cannot be accounted for
+                        // keeps the plain call, the treatment
+                        // these calls have always had.
+                        let receiver_glue = if matches!(
+                            kind,
+                            crate::builtins::Builtin::CloneClone
+                        ) {
+                            raw_generic_args
+                                .first()
+                                .and_then(|ty| match ty {
+                                    mir::Ty::Closure(..) => {
+                                        self.drop_glue(ty)
+                                    }
+                                    _ => None,
+                                })
+                                .filter(|glue| {
+                                    glue.root != ir::DropPlan::Trivial
+                                })
+                        } else {
+                            None
+                        };
                         // A `box_assume_init_into_vec_unsafe` call
                         // asserts its source array is fully
                         // initialized; an element slot that still
@@ -10393,6 +10427,7 @@ let inner = match (&src, target) {
                                 consumed_glue,
                                 skipped_glue,
                                 elem_glue,
+                                receiver_glue,
                                 cmp_discriminants,
                                 result_unsize,
                                 unique_elem,

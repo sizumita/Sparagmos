@@ -7984,6 +7984,79 @@ fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_counted_prefix() {
     );
 }
 
+const CLOSURE_CLONE_PANIC_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+
+struct Boom(i32);
+
+impl Clone for Boom {
+    fn clone(&self) -> Self {
+        panic!("boom clone");
+    }
+}
+
+fn main() {
+    // A direct .clone() of a closure whose second capture's
+    // Clone panics: the capture cloned before it drops during
+    // unwinding, restoring the strong count.
+    let rc = Rc::new(Cell::new(7));
+    let rc_in = rc.clone();
+    let boom = Boom(3);
+    let f = move || {
+        let _ = rc_in.get();
+        let _ = &boom;
+    };
+    println!("direct before: {}", Rc::strong_count(&rc));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = f.clone();
+        println!("direct no panic");
+    }));
+    println!("direct caught: {}", r.is_err());
+    println!("direct after: {}", Rc::strong_count(&rc));
+    drop(f);
+    println!("direct final: {}", Rc::strong_count(&rc));
+
+    // The boxed-slice conversion of the same closure shape
+    // drops its cloned prefix the same way.
+    let rc2 = Rc::new(Cell::new(7));
+    let rc2_in = rc2.clone();
+    let boom2 = Boom(4);
+    let f2 = move || {
+        let _ = rc2_in.get();
+        let _ = &boom2;
+    };
+    let src = [f2];
+    println!("boxed before: {}", Rc::strong_count(&rc2));
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[_]> = Box::from(&src[..]);
+        println!("boxed no panic");
+    }));
+    println!("boxed caught: {}", r2.is_err());
+    println!("boxed after: {}", Rc::strong_count(&rc2));
+}
+"#;
+
+#[test]
+fn run_mode_closure_clone_panic_drops_cloned_captures() {
+    let dir = temp_dir("closure-clone-panic");
+    let src = fixture(
+        &dir,
+        "closure_clone_panic.rs",
+        CLOSURE_CLONE_PANIC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a panicking capture clone must drop the captures cloned before it; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "direct before: 2\ndirect caught: true\ndirect after: 2\ndirect final: 1\nboxed before: 2\nboxed caught: true\nboxed after: 2\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SOURCE_REF_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 

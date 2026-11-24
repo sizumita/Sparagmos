@@ -2903,6 +2903,7 @@ impl<'a> Interpreter<'a> {
                     consumed_glue,
                     skipped_glue,
                     elem_glue,
+                    receiver_glue,
                     cmp_discriminants,
                     result_unsize,
                     unique_elem,
@@ -3010,6 +3011,7 @@ impl<'a> Interpreter<'a> {
                             unique_elem.as_ref(),
                             skipped_glue.as_ref(),
                             elem_glue.as_ref(),
+                            receiver_glue.as_ref(),
                         );
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
@@ -3999,6 +4001,7 @@ impl<'a> Interpreter<'a> {
             None,
             None,
             None,
+            None,
         )?;
         match target {
             Some(bb) => {
@@ -4525,6 +4528,7 @@ impl<'a> Interpreter<'a> {
                     &canonical,
                     &generic_args,
                     arg_values,
+                    None,
                     None,
                     None,
                     None,

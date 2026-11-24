@@ -4832,7 +4832,10 @@ impl<'a> Interpreter<'a> {
     /// `TerminatorKind::CallBuiltin::skipped_glue`), and
     /// `elem_glue` the conversion-baked element glue of a
     /// boxed-slice `From` / `Into` conversion (see
-    /// `TerminatorKind::CallBuiltin::elem_glue`).
+    /// `TerminatorKind::CallBuiltin::elem_glue`), and
+    /// `receiver_glue` the conversion-baked glue of a closure
+    /// receiver of a `Clone::clone` call (see
+    /// `TerminatorKind::CallBuiltin::receiver_glue`).
     pub(crate) fn exec_builtin(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4844,6 +4847,7 @@ impl<'a> Interpreter<'a> {
         unique_elem: Option<&Value>,
         skipped_glue: Option<&crate::ir::DropGlue>,
         elem_glue: Option<&crate::ir::DropGlue>,
+        receiver_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -4910,7 +4914,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -4930,6 +4934,7 @@ impl<'a> Interpreter<'a> {
         unique_elem: Option<&Value>,
         skipped_glue: Option<&crate::ir::DropGlue>,
         elem_glue: Option<&crate::ir::DropGlue>,
+        receiver_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -9926,7 +9931,7 @@ impl<'a> Interpreter<'a> {
             Builtin::CloneClone => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                self.clone_modelled_value(frames, self_ty, name, &vals[0])
+                self.clone_modelled_value(frames, self_ty, name, &vals[0], receiver_glue)
             }
             Builtin::DefaultDefault => {
                 arity(0)?;
@@ -13746,6 +13751,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         self_ty: &str,
         name: &str,
         arg: &Value,
+        receiver_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         // Cloning an mpsc handle creates another live
         // handle: the channel's handle count must move
@@ -13825,6 +13831,14 @@ fn value_fingerprint(value: &Value) -> u64 {
                 // environment. An instance with no recorded
                 // environment shape keeps the value copy
                 // below.
+                //
+                // A direct `Clone::clone` call hands over the
+                // receiver glue conversion baked for the
+                // closure type (`receiver_glue`): when a
+                // capture's clone panics, the captures cloned
+                // before it drop with their own glue before
+                // the panic propagates. A caller with no baked
+                // glue keeps the discard treatment.
                 if let Value::Closure { .. } = value {
                     let source_ref = match arg {
                         Value::Ref(target) => Some(target.clone()),
@@ -13835,7 +13849,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                         &value,
                         source_ref.as_ref(),
                         self_ty,
-                        None,
+                        receiver_glue,
                     )? {
                         return Ok(cloned);
                     }
@@ -15951,6 +15965,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                         &elem_ty,
                         "std::clone::Clone::clone",
                         &x,
+                        None,
                     )?;
                     Ok((rebuild_state(&state, vec![new_inner]), some_value(cloned)))
                 }
@@ -17443,6 +17458,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                         &elem_ty,
                         "std::clone::Clone::clone",
                         &x,
+                        None,
                     )?;
                     (vec![new_inner], some_value(cloned))
                 }

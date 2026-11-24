@@ -632,6 +632,7 @@ fn run_steps(local_tys: Vec<Ty>, steps: Vec<Step>) -> String {
                         consumed_glue: None,
                         skipped_glue: None,
                         elem_glue: None,
+                        receiver_glue: None,
                         cmp_discriminants: None,
                         result_unsize: None,
                         unique_elem: None,

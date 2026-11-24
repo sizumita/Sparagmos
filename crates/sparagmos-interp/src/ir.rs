@@ -1802,6 +1802,20 @@ pub enum TerminatorKind {
         /// or cannot be accounted for (the prefix is then
         /// discarded as before).
         elem_glue: Option<DropGlue>,
+        /// Drop glue of the receiver's `Self` type when the
+        /// callee is `Clone::clone` and `Self` is a closure
+        /// type: the modelled clone clones the environment
+        /// capture by capture, and when a later capture's
+        /// clone panics, the captures cloned so far drop with
+        /// their own glue before the panic propagates, exactly
+        /// as the real field-wise construction's guard drops
+        /// them. Conversion builds the closure type's
+        /// [`DropGlue`] (its captures' glue, see
+        /// `DropGlueBuilder`). `None` for every other builtin,
+        /// when `Self` is not a closure type, and when the
+        /// glue is trivial or cannot be accounted for (the
+        /// cloned captures are then discarded as before).
+        receiver_glue: Option<DropGlue>,
         /// Discriminant values of the comparison's `Self` type,
         /// baked by conversion for the `PartialOrd` / `Ord`
         /// comparison builtins: their structural comparison orders
