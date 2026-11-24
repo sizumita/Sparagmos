@@ -615,6 +615,64 @@ class ProcessTestTests(unittest.TestCase):
 
 
 
+class RustdocHostToolScopeTests(unittest.TestCase):
+    """rustdoc-check suites judged by host-side tooling (issue #365).
+
+    The classification returns before any file or process side is
+    touched, so the records need no fixture files.
+    """
+
+    def rec(self, suite):
+        return {"suite": suite, "path": f"tests/{suite}/t.rs",
+                "nature": "rustdoc-check", "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def run_rec(self, suite, jit=False):
+        return run.process_test(self.rec(suite), Path("/nonexistent"),
+                                Path("/fake/driver"), jit=jit)
+
+    def test_rustdoc_js_suites_need_a_host_javascript_engine(self):
+        for suite in ("rustdoc-js", "rustdoc-js-std"):
+            res = self.run_rec(suite)
+            self.assertEqual(res["status"], "not-attempted")
+            self.assertEqual(res["bucket"],
+                             "not attempted (host JavaScript engine)")
+            self.assertIn("tester.js", res["reason"])
+            self.assertIn("issue #365", res["reason"])
+
+    def test_rustdoc_gui_needs_a_host_browser(self):
+        res = self.run_rec("rustdoc-gui")
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "not attempted (host browser)")
+        self.assertIn("browser-ui-test", res["reason"])
+        self.assertIn("issue #365", res["reason"])
+
+    def test_classification_applies_to_the_jit_pass_too(self):
+        res = self.run_rec("rustdoc-js", jit=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (host JavaScript engine)")
+
+    def test_helper_classifies_only_the_host_tool_suites(self):
+        # main's carry-through for records no stage selects
+        # consults the same helper, so pin its contract directly.
+        self.assertIsNotNone(run.rustdoc_host_tool_scope(self.rec("rustdoc-js")))
+        self.assertIsNotNone(run.rustdoc_host_tool_scope(self.rec("rustdoc-gui")))
+        self.assertIsNone(run.rustdoc_host_tool_scope(self.rec("rustdoc-html")))
+        exec_rec = self.rec("rustdoc-js")
+        exec_rec["nature"] = "exec"
+        self.assertIsNone(run.rustdoc_host_tool_scope(exec_rec))
+
+    def test_rustdoc_html_keeps_the_generic_nature_bucket(self):
+        # The html/ui/json suites are the rustdoc stage's own
+        # territory (issue #364); until it dispatches them they
+        # keep the generic out-of-scope bucket.
+        for suite in ("rustdoc-html", "rustdoc-ui", "rustdoc-json"):
+            res = self.run_rec(suite)
+            self.assertEqual(res["status"], "not-attempted")
+            self.assertEqual(res["bucket"], "out of stage-1 scope (nature)")
+
+
 class CompileExpectationTests(unittest.TestCase):
     def test_ui_default_is_check_fail(self):
         h = header("fn main() { let x: u8 = \"s\"; }\n")
