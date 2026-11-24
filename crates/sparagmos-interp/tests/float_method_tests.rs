@@ -781,6 +781,7 @@ fn registry_resolves_f16_methods() {
         ("rem_euclid", O::RemEuclid),
         ("exp", O::Exp),
         ("mul_add", O::MulAdd),
+        ("copysign", O::CopySign),
     ] {
         for prefix in ["core", "std"] {
             let name = format!("{prefix}::f16::<impl f16>::{method}");
@@ -1041,6 +1042,37 @@ fn f16_round_ties_even_quiets_signaling_nan() {
             ),
             want,
             "round_ties_even({input:#06x})"
+        );
+    }
+}
+
+#[test]
+fn f16_copysign_takes_the_sign_and_keeps_the_payload() {
+    // The result is self's magnitude bits with the sign
+    // argument's sign bit: a signaling NaN keeps its payload
+    // (0x7c01 with a negative sign source is 0xfc01, not the
+    // quieted 0xfe01), signed zeros and infinities follow the
+    // sign argument, and the sign source's own payload never
+    // leaks into the result. Measured natively.
+    for (mag, sign, want) in [
+        (0x3c00u16, 0x0000u16, 0x3c00u16), // 1.0, +0.0
+        (0x3c00, 0x8000, 0xbc00),          // 1.0, -0.0
+        (0x0000, 0x8000, 0x8000),          // +0.0, -0.0
+        (0x8000, 0x3c00, 0x0000),          // -0.0, +1.0
+        (0x7c01, 0x8000, 0xfc01),          // sNaN payload, negative
+        (0xfc01, 0x0000, 0x7c01),          // sNaN payload, positive
+        (0x7e00, 0xbc00, 0xfe00),          // qNaN, -1.5
+        (0x7c00, 0x8000, 0xfc00),          // +inf, -0.0
+        (0x3c00, 0x7dff, 0x3c00),          // sign source payload ignored
+        (0x3c00, 0xfdff, 0xbc00),
+    ] {
+        assert_eq!(
+            run_f16(
+                "core::f16::<impl f16>::copysign",
+                vec![const_f16(mag), const_f16(sign)]
+            ),
+            want,
+            "copysign({mag:#06x}, {sign:#06x})"
         );
     }
 }

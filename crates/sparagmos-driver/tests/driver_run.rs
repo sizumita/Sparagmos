@@ -5351,6 +5351,64 @@ fn run_mode_f16_nan_transport() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
+const F16_COPYSIGN_SRC: &str = r##"#![feature(f16)]
+fn emit(m: u16, s: u16) {
+    println!("{}", f16::from_bits(m).copysign(f16::from_bits(s)).to_bits());
+}
+fn main() {
+    emit(0x3c00, 0x0000);
+    emit(0x3c00, 0x8000);
+    emit(0x0000, 0x8000);
+    emit(0x8000, 0x3c00);
+    emit(0x7c01, 0x8000);
+    emit(0xfc01, 0x0000);
+    emit(0x7e00, 0xbc00);
+    emit(0x7c00, 0x8000);
+    println!("{}", 1.5f32.copysign(-0.0f32).to_bits());
+    println!("{}", f32::from_bits(0x7f800001).copysign(-1.0f32).to_bits());
+    println!("{}", (-2.5f32).copysign(0.0f32).to_bits());
+    println!("{}", 1.5f64.copysign(-0.0f64).to_bits());
+    println!("{}", f64::from_bits(0x7ff0000000000001).copysign(-1.0f64).to_bits());
+    println!("{}", (-2.5f64).copysign(0.0f64).to_bits());
+}
+"##;
+
+#[test]
+fn run_mode_f16_copysign() {
+    // `copysign` takes the sign from the sign argument and keeps
+    // the magnitude's bits exactly — NaN payloads (signaling
+    // included) pass through unquieted, signed zeros and
+    // infinities follow the sign argument. All widths are served
+    // by the float-method builtin; the values below were measured
+    // natively on the pinned toolchain.
+    let dir = temp_dir("f16copysign");
+    let src = fixture(&dir, "f16copysign.rs", F16_COPYSIGN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "copysign program must run to completion; stderr={stderr}"
+    );
+    let expected = "\
+15360
+48128
+32768
+0
+64513
+31745
+65024
+64512
+3217031168
+4286578689
+1075838976
+13832806255468478464
+18442240474082181121
+4612811918334230528
+";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
 #[test]
 fn run_mode_null_and_fn_pointer_constants_execute() {
     let dir = temp_dir("nullptr");
