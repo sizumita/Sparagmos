@@ -15634,6 +15634,39 @@ impl<'a> Interpreter<'a> {
         )
     }
 
+    /// The first `count` bytes of the scalar storage
+    /// `target` denotes, read under the storage's declared
+    /// layout (see `storage_byte`): a float storage yields
+    /// its own width's bytes, not the widened model's. `None`
+    /// when the target does not denote the storage itself (an
+    /// empty projection) as a scalar with a known layout, or
+    /// a byte position holds no definite storage byte.
+    pub(crate) fn scalar_storage_layout_bytes(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        count: usize,
+    ) -> Option<Vec<u8>> {
+        let (projection, _, root_ty, _, _) =
+            self.byte_view_base(frames, target)?;
+        if !projection.is_empty() {
+            return None;
+        }
+        let layout = self.byte_layout_of_ty(&root_ty)?;
+        if !matches!(layout, ByteLayout::Scalar(_)) {
+            return None;
+        }
+        let scalar = self.read_resolved(frames, target).ok()?;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            match self.storage_byte(&scalar, &layout, i) {
+                Some(Ok(StorageByte::Byte(b))) => out.push(b),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
     /// Whether the position a fat dereference left in `target`
     /// is the storage of a scalar-backed slice whose element
     /// type is `elem_ty`: the element is then the scalar the

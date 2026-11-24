@@ -15157,6 +15157,86 @@ fn run_mode_slice_iter_enumerate_const_ptr_o3() {
     assert_eq!(stdout, "done\n", "stdout={stdout}");
 }
 
+const SLICE_SCALAR_BACKED_BOOL_SRC: &str = r#"
+fn main() {
+    let t = true;
+    let s = std::slice::from_ref(&t);
+    let mut it = s.iter();
+    println!("first {:?}", it.next());
+    println!("second {:?}", it.next());
+    let f = false;
+    let mut sum = 0;
+    for v in std::slice::from_ref(&f) {
+        if *v {
+            sum += 1;
+        }
+    }
+    println!("sum {sum}");
+    println!("idx {}", s[0]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_bool_element() {
+    // A one-byte element of the storage's own type is the
+    // scalar itself, not its byte: `slice::from_ref(&true)`
+    // iterated as a byte snapshot yields `Uint(1)`, whose
+    // pointee cannot be read as the `bool` the iterator
+    // promises. Expected output is the native result of the
+    // same source.
+    let dir = temp_dir("slice-scalar-backed-bool");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_BOOL_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "first Some(true)\nsecond None\nsum 0\nidx true\n",
+        "stdout={stdout}"
+    );
+}
+
+const SLICE_SCALAR_BACKED_FLOAT_VIEW_SRC: &str = r#"
+#![feature(f16)]
+fn main() {
+    let x: f32 = 1.0;
+    let bs = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u8, 4) };
+    let mut it = bs.iter();
+    println!("b0 {:?}", it.next());
+    println!("b1 {:?}", it.next());
+    println!("b2 {:?}", it.next());
+    println!("b3 {:?}", it.next());
+    let y: f64 = 1.0;
+    let bs8 = unsafe { std::slice::from_raw_parts(&y as *const f64 as *const u8, 8) };
+    let v: Vec<u8> = bs8.iter().copied().collect();
+    println!("f64 {v:?}");
+    let h: f16 = 1.0;
+    let bsh = unsafe { std::slice::from_raw_parts(&h as *const f16 as *const u8, 2) };
+    let vh: Vec<u8> = bsh.iter().copied().collect();
+    println!("f16 {vh:?}");
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_float_byte_view() {
+    // A byte view over a float's storage reads the bytes of
+    // the float's own width under its declared layout, not
+    // the widened model form's: a four-byte view of `1.0f32`
+    // iterates as [0, 0, 128, 63]. Expected output is the
+    // native result of the same source.
+    let dir = temp_dir("slice-scalar-backed-float-view");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_FLOAT_VIEW_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "b0 Some(0)\nb1 Some(0)\nb2 Some(128)\nb3 Some(63)\nf64 [0, 0, 0, 0, 0, 0, 240, 63]\nf16 [0, 60]\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }

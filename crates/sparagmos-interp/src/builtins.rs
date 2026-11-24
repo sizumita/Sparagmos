@@ -20093,12 +20093,41 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return None;
         }
         let (size, _) = self.layout_of(elem_tag)?;
+        if *len == 1
+            && !matches!(elem_tag.trim(), "u8" | "i8")
+            && self.target_is_scalar_storage(frames, &target, size as usize)
+        {
+            // One element of the storage's own width: the
+            // element is the scalar itself. (Judged before the
+            // byte reading below, whose one-byte case it
+            // subsumes: a `bool` element — the
+            // `slice::from_ref(&true)` shape — is the scalar,
+            // not its byte.)
+            return Some(vec![scalar]);
+        }
         if size == 1 {
-            // Byte elements: the storage's own bytes, up to the
-            // fat length.
+            // Byte elements: the storage's own bytes under its
+            // declared layout, up to the fat length (a float
+            // storage's bytes are its own width's, not the
+            // widened model's).
+            let layout_bytes =
+                self.scalar_storage_layout_bytes(frames, &target, *len as usize);
             let mut out = Vec::new();
             for i in 0..(*len as usize) {
-                out.push(Value::Uint(scalar_storage_byte(&scalar, i)? as u128));
+                let byte = match &layout_bytes {
+                    Some(bytes) => *bytes.get(i)?,
+                    None => {
+                        if matches!(scalar, Value::Float(_) | Value::Float128(_)) {
+                            // A float storage whose declared
+                            // layout is not at hand has no honest
+                            // byte reading: its model form is
+                            // widened.
+                            return None;
+                        }
+                        scalar_storage_byte(&scalar, i)?
+                    }
+                };
+                out.push(Value::Uint(byte as u128));
             }
             return Some(out);
         }
