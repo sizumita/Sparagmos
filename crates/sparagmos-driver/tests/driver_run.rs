@@ -2719,6 +2719,109 @@ fn run_mode_dyn_bound_projection_assoc_default_overridden_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_EQUAL_SELF_PARAM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<A>(A);
+impl<A> Carrier for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<A> {
+    field: <<Wrap<A> as Carrier>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_equal_self_param_runs() {
+    // The implementation's self type and the field's are
+    // the same `Wrap<A>` -- the implementation's parameter
+    // and the holder's, identically indexed, so interned
+    // identity calls them equal. Accepting the match on
+    // identity alone binds nothing, the instantiation the
+    // assigned-type read performs has no argument for the
+    // implementation's parameter, and the screen rejects
+    // the holder and `main`. Matching a
+    // parameter-mentioning self type structurally binds
+    // the parameter through the ambient frame -- natively
+    // the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-equal-self-param");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_equal_self_param.rs",
+        DYN_BOUND_PROJECTION_EQUAL_SELF_PARAM_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the equal-self-param projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_CONDITIONAL_IMPL_SRC: &str = r#"
+trait Bound {}
+impl Bound for u8 {}
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<T: Bound> Carrier for T {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_conditional_impl_runs() {
+    // Two implementations structurally match the self
+    // type `()` and assign the item different trait
+    // objects: a blanket one conditional on `T: Bound` --
+    // which `()` does not satisfy -- and an unconditional
+    // one for `()` itself. Structural matching checks no
+    // predicates, so both match and their disagreement
+    // resolves nothing, and the screen rejects the holder
+    // and `main`. The conditional implementation may not
+    // apply at all, and in a program that compiles it
+    // cannot apply alongside the unconditional one
+    // (coherence), so the unconditional assignment is the
+    // applicable one -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-conditional-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_conditional_impl.rs",
+        DYN_BOUND_PROJECTION_CONDITIONAL_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the conditional-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {

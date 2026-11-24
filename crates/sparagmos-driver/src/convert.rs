@@ -1297,6 +1297,14 @@ fn impls_of_trait(trait_def: rustc_public::DefId) -> Vec<ImplDef> {
 /// which neither substitutes into nor normalizes the
 /// screened definitions — the same class of question
 /// `trait_has_impls`' table building already poses.
+///
+/// Agreement among the matching implementations decides
+/// the value, with one refinement for disagreement (see
+/// `decide_impl_assigned_ty`): a conditional
+/// implementation — one declaring predicates the
+/// structural match does not check — matches self types
+/// it may not apply to, so its disagreement with an
+/// unconditional implementation proves nothing.
 fn projection_impl_assigned_ty(
     alias: &rustc_public::ty::AliasTy,
     ambient: Option<&GenericArgs>,
@@ -1307,7 +1315,7 @@ fn projection_impl_assigned_ty(
         return None;
     };
     let resolved_self = resolve_screen_self_ty(self_ty, ambient, depth + 1)?;
-    let mut assigned: Option<Ty> = None;
+    let mut candidates: Vec<(Ty, ImplDef)> = Vec::new();
     for impl_def in impls_of_trait(trait_def) {
         let tref = impl_def.trait_impl().value;
         // A projection carrying fewer arguments than the
@@ -1377,13 +1385,62 @@ fn projection_impl_assigned_ty(
                 trait_item_default_ty(alias, &GenericArgs(trait_args))?
             }
         };
-        match assigned {
-            None => assigned = Some(ty),
-            Some(prev) if prev == ty => {}
+        candidates.push((ty, impl_def));
+    }
+    decide_impl_assigned_ty(candidates)
+}
+
+/// The assigned type the matching implementations decide
+/// on (see `projection_impl_assigned_ty`): the one type
+/// they all assign, when they agree. On disagreement, the
+/// unconditional implementations — ones declaring no
+/// predicates — decide among themselves: a conditional
+/// implementation matches structurally without its
+/// predicates being checked, so it may not apply to this
+/// self type at all, and in a program that compiles it
+/// cannot apply alongside an unconditional one (coherence
+/// forbids overlapping implementations), which makes the
+/// unconditional agreement the applicable value and the
+/// conditional disagreement no evidence against it. When
+/// the unconditional implementations disagree among
+/// themselves, or none is unconditional, the candidates
+/// determine nothing.
+fn decide_impl_assigned_ty(candidates: Vec<(Ty, ImplDef)>) -> Option<Ty> {
+    if let Some((first, _)) = candidates.first() {
+        if candidates.iter().all(|(ty, _)| ty == first) {
+            return Some(*first);
+        }
+    }
+    let mut unconditional: Option<Ty> = None;
+    for (ty, impl_def) in &candidates {
+        if impl_is_conditional(impl_def) {
+            continue;
+        }
+        match unconditional {
+            None => unconditional = Some(*ty),
+            Some(prev) if prev == *ty => {}
             Some(_) => return None,
         }
     }
-    assigned
+    unconditional
+}
+
+/// Whether an implementation's applicability is
+/// conditional: it declares predicates — parameter bounds
+/// or where-clauses — that structural matching does not
+/// check, so it may not apply to a self type it matches.
+/// The query posed is the definition query for the
+/// implementation's explicit clauses (its predicates),
+/// which neither substitutes into nor normalizes the
+/// screened definitions — the same class of question
+/// `impl_item_assigned_ty` poses.
+fn impl_is_conditional(impl_def: &ImplDef) -> bool {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, impl_def.def_id());
+        Some(!tcx.explicit_clauses_of(internal).clauses.is_empty())
+    })
+    .unwrap_or(false)
 }
 
 /// The generic arguments instantiating an implementation
@@ -1484,6 +1541,75 @@ fn trait_item_default_ty(
     })
 }
 
+/// Whether a type mentions a generic parameter -- a type
+/// or constant parameter, anywhere inside it. Lifetime
+/// parameters do not count: the instantiation an
+/// implementation match feeds reads an unbound lifetime as
+/// erased (see `impl_instantiation_args`), so a lifetime
+/// needs no binding the way a type or a constant does.
+/// The walk poses no query beyond the kind questions the
+/// guarded form answers.
+fn ty_contains_param(ty: &Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(TyKind::Param(_)) => true,
+        Some(TyKind::RigidTy(rigid)) => match rigid {
+            RigidTy::Adt(_, args)
+            | RigidTy::FnDef(_, args)
+            | RigidTy::Closure(_, args)
+            | RigidTy::Coroutine(_, args)
+            | RigidTy::CoroutineClosure(_, args)
+            | RigidTy::CoroutineWitness(_, args) => args.0.iter().any(generic_arg_contains_param),
+            RigidTy::Ref(_, inner, _)
+            | RigidTy::RawPtr(inner, _)
+            | RigidTy::Slice(inner)
+            | RigidTy::Pat(inner, _) => ty_contains_param(&inner),
+            RigidTy::Array(elem, len) => ty_contains_param(&elem) || const_contains_param(&len),
+            RigidTy::Tuple(ts) => ts.iter().any(ty_contains_param),
+            RigidTy::FnPtr(sig) => sig
+                .skip_binder()
+                .inputs_and_output
+                .iter()
+                .any(ty_contains_param),
+            RigidTy::Dynamic(preds, _) => preds.iter().any(|pred| match &pred.value {
+                ExistentialPredicate::Trait(tref) => {
+                    tref.generic_args.0.iter().any(generic_arg_contains_param)
+                }
+                ExistentialPredicate::Projection(p) => {
+                    p.generic_args.0.iter().any(generic_arg_contains_param)
+                        || match &p.term {
+                            TermKind::Type(t) => ty_contains_param(t),
+                            TermKind::Const(c) => const_contains_param(c),
+                        }
+                }
+                ExistentialPredicate::AutoTrait(_) => false,
+            }),
+            _ => false,
+        },
+        Some(TyKind::Alias(_, alias)) => alias.args.0.iter().any(generic_arg_contains_param),
+        _ => false,
+    }
+}
+
+/// Whether a generic argument mentions a generic
+/// parameter (see `ty_contains_param`).
+fn generic_arg_contains_param(arg: &GenericArgKind) -> bool {
+    match arg {
+        GenericArgKind::Type(t) => ty_contains_param(t),
+        GenericArgKind::Const(c) => const_contains_param(c),
+        GenericArgKind::Lifetime(_) => false,
+    }
+}
+
+/// Whether a constant mentions a generic parameter (see
+/// `ty_contains_param`).
+fn const_contains_param(c: &TyConst) -> bool {
+    match c.kind() {
+        TyConstKind::Param(_) => true,
+        TyConstKind::Unevaluated(_, args) => args.0.iter().any(generic_arg_contains_param),
+        _ => false,
+    }
+}
+
 /// Whether an implementation with the trait-reference
 /// self type `impl_self` applies to the resolved self
 /// type `target`, recording the implementation's generic
@@ -1538,7 +1664,21 @@ fn match_impl_self_ty(
             bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target))
         }
         TyKind::RigidTy(irigid) => {
-            if impl_self == target {
+            // An interned-identity agreement settles the
+            // match only when the implementation's self
+            // type mentions no parameter. The two sides'
+            // parameters belong to different items -- the
+            // implementation's own and the walked frame's --
+            // and identically indexed ones compare equal
+            // without binding anything, leaving the
+            // instantiation the assigned-type read performs
+            // (see `impl_instantiation_args`) without the
+            // argument it needs. A parameter-mentioning
+            // self type is matched structurally instead, so
+            // its parameters bind through the ambient frame
+            // the way any other's do.
+            let identity_decides = !ty_contains_param(impl_self);
+            if identity_decides && impl_self == target {
                 return true;
             }
             // A nested target position can still hold a
@@ -1553,7 +1693,7 @@ fn match_impl_self_ty(
                 }
                 _ => *target,
             };
-            if *impl_self == resolved_target {
+            if identity_decides && *impl_self == resolved_target {
                 return true;
             }
             let Some(TyKind::RigidTy(trigid)) = guarded_ty_kind(&resolved_target) else {
