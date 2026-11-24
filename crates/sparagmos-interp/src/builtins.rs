@@ -27136,6 +27136,23 @@ fn single_value_for_tag(tag: &str) -> Option<Value> {
     None
 }
 
+/// Whether `tag` renders `tracing_subscriber`'s
+/// `DirectiveSet<T>` for some element type `T`: the bare
+/// spelling, or the spelling with a naming crate's prefix
+/// from an explicit `extern crate` item (see the tag-key
+/// note on the `ErrorOutputType` arm of
+/// `default_value_for_tag`).
+fn is_directive_set_tag(tag: &str) -> bool {
+    const HEAD: &str = "tracing_subscriber::filter::directive::DirectiveSet<";
+    if !tag.ends_with('>') {
+        return false;
+    }
+    tag.starts_with(HEAD)
+        || tag
+            .split_once("::")
+            .is_some_and(|(_, rest)| rest.starts_with(HEAD))
+}
+
 fn default_value_for_tag(tag: &str) -> Option<Value> {
     let tag = tag.trim();
     Some(match tag {
@@ -27222,6 +27239,74 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
             Value::Enum {
                 variant: 0,
                 fields: vec![Value::Bool(true), none(), none()],
+            }
+        }
+        // `tracing_subscriber::filter::directive::DirectiveSet::
+        // default()` is the hand-written `Default` of the
+        // directive set (tracing-subscriber 0.3.23,
+        // `src/filter/directive.rs`): an empty `directives`
+        // collection and `max_level: LevelFilter::OFF`. The
+        // collection is the crate's `FilterVec`, a
+        // `smallvec::SmallVec<[T; 8]>` under the `smallvec`
+        // feature both compiler consumers (librustdoc and
+        // rustc_log) enable; a fresh `SmallVec` is
+        // `{ capacity: 0, data: <inline, uninitialised> }`
+        // (smallvec 1.15.1: the capacity word alone selects
+        // the inline variant at this size, and the `union`
+        // feature the compiler workspace builds smallvec with
+        // makes the data word the two-field union value,
+        // inline field first). `LevelFilter` is tracing-core
+        // 0.1.36's one-field struct over `Option<Level>`, and
+        // `OFF` is its `None` case. The shape does not depend
+        // on the element type, so the arm serves every
+        // `DirectiveSet<T>` spelling: the rustdoc entry
+        // program asks for the `StaticDirective` set, and the
+        // `EnvFilter` dynamics set is the same impl. The
+        // rendered tag carries the naming crate's prefix when
+        // the type is named through an explicit `extern crate`
+        // item; both spellings denote this one ADT.
+        _ if is_directive_set_tag(tag) => {
+            let none = Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            };
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    // `directives`: the empty `SmallVec`.
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Uint(0),
+                            // The union value, both fields
+                            // present: the inline field holds
+                            // the uninitialised buffer (a
+                            // `ManuallyDrop` over a `MaybeUninit`
+                            // in its uninitialised union form);
+                            // the heap field is never read while
+                            // the capacity word selects the
+                            // inline variant.
+                            Value::Enum {
+                                variant: 0,
+                                fields: vec![
+                                    Value::Enum {
+                                        variant: 0,
+                                        fields: vec![Value::Enum {
+                                            variant: 0,
+                                            fields: vec![Value::Uninit],
+                                        }],
+                                    },
+                                    Value::Tuple(vec![Value::Uninit, Value::Uint(0)]),
+                                ],
+                            },
+                        ],
+                    },
+                    // `max_level`: `LevelFilter::OFF`.
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![none],
+                    },
+                ],
             }
         }
         _ if tag == "rustc_errors::DiagCtxtFlags"
@@ -31248,4 +31333,91 @@ fn exp_body(digits: &str, upper: bool) -> String {
         format!("{}.{}", &mantissa[..1], &mantissa[1..])
     };
     format!("{mantissa}{}{exp}", if upper { 'E' } else { 'e' })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value `DirectiveSet::default()` is modelled with:
+    /// the empty directive set -- an empty inline `SmallVec`
+    /// (capacity word 0, the union data word holding the
+    /// uninitialised inline buffer) and `max_level` at
+    /// `LevelFilter::OFF` (the `None` case of its `Option`
+    /// field). See the `DirectiveSet` arm of
+    /// `default_value_for_tag`.
+    fn expected_directive_set_default() -> Value {
+        Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        Value::Uint(0),
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Enum {
+                                    variant: 0,
+                                    fields: vec![Value::Enum {
+                                        variant: 0,
+                                        fields: vec![Value::Uninit],
+                                    }],
+                                },
+                                Value::Tuple(vec![Value::Uninit, Value::Uint(0)]),
+                            ],
+                        },
+                    ],
+                },
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    }],
+                },
+            ],
+        }
+    }
+
+    /// The rustdoc entry program asks for
+    /// `DirectiveSet<StaticDirective>::default()` (the
+    /// eleventh stop on the rustdoc execution path). Without
+    /// the `default_value_for_tag` arm the tag resolves to
+    /// `None` here and the `Default::default` builtin raises
+    /// the runtime-support error the chain stops on, so this
+    /// test fails with the arm removed.
+    #[test]
+    fn directive_set_default_is_the_empty_set() {
+        let expected = expected_directive_set_default();
+        // The spelling the rustdoc chain stops on.
+        assert_eq!(
+            default_value_for_tag(
+                "tracing_subscriber::filter::directive::DirectiveSet<tracing_subscriber::filter::directive::StaticDirective>"
+            ),
+            Some(expected.clone())
+        );
+        // The same tag named through an explicit `extern
+        // crate` item (the naming crate's prefix).
+        assert_eq!(
+            default_value_for_tag(
+                "rustc_log::tracing_subscriber::filter::directive::DirectiveSet<tracing_subscriber::filter::directive::StaticDirective>"
+            ),
+            Some(expected.clone())
+        );
+        // The `EnvFilter` dynamics set is the same generic
+        // impl with the same empty shape.
+        assert_eq!(
+            default_value_for_tag(
+                "tracing_subscriber::filter::directive::DirectiveSet<tracing_subscriber::filter::env::directive::Directive>"
+            ),
+            Some(expected)
+        );
+        // The public wrapper is a different `Default` impl
+        // and stays unmodelled.
+        assert_eq!(
+            default_value_for_tag("tracing_subscriber::filter::targets::Targets"),
+            None
+        );
+    }
 }
