@@ -2486,15 +2486,18 @@ def bucket_reason(reason):
 # the same breakpoints, the same command flow, and the same check
 # matching, with the session served by the execution engine.
 #
-# Only the scalar scope is attempted (the reachability census's
-# D0/D1 categories): files whose applicable variants carry no
-# session at all are judged by the conversion probe the
-# compile-check category uses, and sessions are attempted only
-# when every command and print expression stays within line
-# stops and scalar prints. Anything beyond that (aggregate
-# rendering, type queries, call expressions, pretty-printer
-# forms, the `repr` pseudo-command's custom inspection) keeps a
-# not-attempted bucket.
+# The attempted scope covers the census's D0/D1 categories and
+# the D2 aggregate band: files whose applicable variants carry
+# no session at all are judged by the conversion probe the
+# compile-check category uses, and sessions are attempted when
+# every command and print expression stays within the session
+# vocabulary — line stops, scalar and aggregate prints (locals
+# and statics, the latter also before `run`), type queries
+# (`whatis`/`ptype`), the `repr` pseudo-command, counted steps,
+# frame navigation, function and file breakpoints, and the
+# `info functions`/`info locals` listings. Anything beyond
+# that (call expressions, `printf`, `sizeof`, info queries
+# other than functions/locals) keeps a not-attempted bucket.
 # ---------------------------------------------------------------------------
 
 DEBUGGER_VARIANT_DIRECTIVES = frozenset({
@@ -2620,11 +2623,63 @@ def debugger_check_output(check_lines, output_lines):
     return (not missing), missing
 
 
-# A print expression within the attempted scope: dereferences, a
-# variable name, and numeric field/index steps — the grammar the
-# debugger interface's expression evaluator speaks.
-_DEBUGGER_EXPR_RE = re.compile(
-    r"^\s*\**\s*[A-Za-z_][A-Za-z0-9_]*(\s*\.\d+|\s*\[\d+\])*\s*$")
+# A print expression within the attempted scope: the grammar
+# the debugger interface's expression evaluator speaks —
+# leading dereferences, a base name (a plain variable name, or
+# a `::` path naming a static) or a parenthesised sub-expression
+# (optionally a cast, `<expr> as <type>`), then numeric or
+# named field steps and index steps.
+_DEBUGGER_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+def _debugger_expr_ok(expr):
+    """Whether `expr` stays within the print-expression grammar
+    (see the note above)."""
+    s = expr.strip()
+    while s.startswith("*"):
+        s = s[1:].lstrip()
+    if s.startswith("("):
+        depth = 0
+        close = None
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close is None:
+            return False
+        inner = s[1:close]
+        if " as " in inner:
+            lhs, _, ty = inner.partition(" as ")
+            if not ty.strip() or not _debugger_expr_ok(lhs):
+                return False
+        elif not _debugger_expr_ok(inner):
+            return False
+        s = s[close + 1:]
+    else:
+        m = re.match(_DEBUGGER_IDENT + r"(?:::" + _DEBUGGER_IDENT + r")*", s)
+        if not m:
+            return False
+        s = s[m.end():]
+    while True:
+        s = s.lstrip()
+        if not s:
+            return True
+        if s.startswith("."):
+            m = re.match(r"\.(" + _DEBUGGER_IDENT + r"|\d+)", s)
+            if not m:
+                return False
+            s = s[m.end():]
+        elif s.startswith("["):
+            m = re.match(r"\[\d+\]", s)
+            if not m:
+                return False
+            s = s[m.end():]
+        else:
+            return False
 
 
 def _translate_gdb_command(cmd):
@@ -2632,8 +2687,12 @@ def _translate_gdb_command(cmd):
     script the driver's debug entry point speaks (see
     parse_debug_script there), or None when the command is
     outside the attempted scope. Session-shaping `set` commands
-    that cannot change scalar output become script comments."""
-    if cmd in ("run", "r"):
+    that cannot change scalar output become script comments. A
+    translation may span several script lines (a counted step
+    repeats its step line)."""
+    if cmd in ("run", "r") or re.match(r"^(?:run|r)\s+\S", cmd):
+        # `run <args>`: the arguments reach the session as the
+        # driver's guest arguments (see _fill_result_debugger).
         return "run"
     if cmd in ("continue", "c"):
         return "continue"
@@ -2641,8 +2700,16 @@ def _translate_gdb_command(cmd):
         return "next"
     if cmd in ("step", "s"):
         return "step"
+    m = re.match(r"^(next|n|step|s)\s+(\d+)$", cmd)
+    if m:
+        head = "next" if m.group(1) in ("next", "n") else "step"
+        return "\n".join([head] * int(m.group(2)))
     if cmd == "finish":
         return "finish"
+    if cmd == "up":
+        return "up"
+    if cmd == "down":
+        return "down"
     if cmd.startswith(("set print ", "set language ", "set pagination ",
                        "set confirm ", "set charset ")):
         return f"# inert: {cmd}"
@@ -2651,12 +2718,45 @@ def _translate_gdb_command(cmd):
     m = re.match(r"^(?:frame|f)\s+(\d+)$", cmd)
     if m:
         return f"frame {m.group(1)}"
-    m = re.match(r"^(?:print|p)(?:/([a-z]))?\s+(.+)$", cmd)
+    m = re.match(r"^repr\s+(.+)$", cmd)
+    if m:
+        expr = m.group(1).strip()
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"repr {expr}"
+    m = re.match(r"^(whatis|ptype)\s+(.+)$", cmd)
+    if m:
+        expr = m.group(2).strip()
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"{m.group(1)} {expr}"
+    m = re.match(r"^break\s+(.+)$", cmd)
+    if m:
+        arg = m.group(1).strip()
+        if arg.isdigit():
+            return f"break {arg}"
+        fm = re.match(r"^(.+\.rs):(\d+)$", arg)
+        if fm:
+            return f"break-at {fm.group(1)}:{fm.group(2)}"
+        if re.fullmatch(_DEBUGGER_IDENT + r"(?:::" + _DEBUGGER_IDENT + r")+", arg):
+            return f"break-fn {arg}"
+        return None
+    m = re.match(r"^info\s+functions(?:\s+(.*))?$", cmd)
+    if m:
+        rest = (m.group(1) or "").strip()
+        quiet = rest == "-q" or rest.startswith("-q ")
+        if quiet:
+            rest = rest[2:].strip()
+        head = "info-functions-q" if quiet else "info-functions"
+        return f"{head} {rest if rest else '-'}"
+    if cmd == "info locals":
+        return "info-locals"
+    m = re.match(r"^(?:print|p)\s*(?:/([a-z]))?\s+(.+)$", cmd)
     if m:
         fmt, expr = m.group(1), m.group(2).strip()
         if fmt is not None and fmt not in "dxtcu":
             return None
-        if not _DEBUGGER_EXPR_RE.match(expr):
+        if not _debugger_expr_ok(expr):
             return None
         return f"print/{fmt} {expr}" if fmt else f"print {expr}"
     return None
@@ -2665,7 +2765,7 @@ def _translate_gdb_command(cmd):
 def _translate_lldb_command(cmd):
     """One lldb command of a test file, as a session script line,
     or None when outside the attempted scope."""
-    if cmd in ("run", "r"):
+    if cmd in ("run", "r") or re.match(r"^(?:run|r)\s+\S", cmd):
         return "run"
     if cmd in ("continue", "c"):
         return "continue"
@@ -2675,19 +2775,96 @@ def _translate_lldb_command(cmd):
         return "step"
     if cmd == "finish":
         return "finish"
+    if cmd == "up":
+        return "up"
+    if cmd == "down":
+        return "down"
     if cmd.startswith("settings set "):
+        return f"# inert: {cmd}"
+    if cmd.startswith("type format add"):
+        # A display-format registration for a char-family
+        # type: the session's format table (see the driver's
+        # `type-format` script lines) renders values of the
+        # type through the format. Registrations naming other
+        # types, or formats outside the numeric set, stay
+        # session-shaping comments.
+        m = re.match(
+            r"^type format add\s+(?:--format|-f)\s+(\S+)\s+(.+)$", cmd)
+        if m:
+            fmt_word, types_text = m.group(1), m.group(2)
+            fmt = {"d": "dec", "decimal": "dec", "u": "unsigned",
+                   "x": "hex", "hex": "hex"}.get(fmt_word)
+            if fmt is not None:
+                types = re.findall(r"'([^']*)'|\"([^\"]*)\"|(\S+)",
+                                   types_text)
+                lines = []
+                for single, double, bare in types:
+                    ty = single or double or bare
+                    if ty in ("char", "i8", "u8", "signed char",
+                              "unsigned char"):
+                        lines.append(f"type-format {fmt} {ty}")
+                if lines:
+                    return "\n".join(lines)
         return f"# inert: {cmd}"
     if cmd == "frame select":
         return "show-line"
     m = re.match(r"^frame\s+select\s+(\d+)$", cmd)
     if m:
         return f"frame {m.group(1)}"
+    m = re.match(r"^repr\s+(.+)$", cmd)
+    if m:
+        expr = m.group(1).strip()
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"repr {expr}"
+    m = re.match(r"^whatis\s+(.+)$", cmd)
+    if m:
+        expr = m.group(1).strip()
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"whatis {expr}"
+    m = re.match(r"^b\s+(.+)$", cmd)
+    if m:
+        # lldb's `b` abbreviation of `breakpoint set`: by
+        # file:line, or by function path (the suite quotes the
+        # path form).
+        arg = m.group(1).strip().strip('"').strip("'")
+        fm = re.match(r"^(.+\.rs):(\d+)$", arg)
+        if fm:
+            return f"break-at {fm.group(1)}:{fm.group(2)}"
+        if re.fullmatch(_DEBUGGER_IDENT + r"(?:::" + _DEBUGGER_IDENT + r")+", arg):
+            return f"break-fn {arg}"
+        return None
+    m = re.match(r"^(?:fr|frame)\s+(?:v|variable|var)\s+(.+)$", cmd)
+    if m:
+        expr = m.group(1).strip()
+        if expr.startswith("-"):
+            return None
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"v {expr}"
+    m = re.match(r"^(?:v|print|p)/([a-z])\s+(.+)$", cmd)
+    if m:
+        # A formatted print: the format is part of the
+        # command's own semantics -- an unsigned print reads
+        # a negative value at its width, a decimal print of
+        # a char reads its code point -- so it is carried
+        # into the session script (the `print/<fmt>` lines
+        # the gdb dialect already uses) rather than dropped.
+        # Formats outside the session's set stay outside the
+        # attempted scope.
+        if m.group(1) not in "du":
+            return None
+        expr = m.group(2).strip()
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"print/{m.group(1)} {expr}"
     m = re.match(r"^(?:v|print|p|expr|expression)\s+(.+)$", cmd)
     if m:
         expr = m.group(1).strip()
         if expr.startswith("-"):
             return None
-        if not _DEBUGGER_EXPR_RE.match(expr):
+        if not _debugger_expr_ok(expr):
             return None
         return f"v {expr}"
     return None
@@ -2705,7 +2882,7 @@ def translate_debugger_command(debugger, command):
 
 def sparagmos_debug_side(path, edition, driver_bin, dialect, script_text,
                          rustc_args=(), aux_specs=(), env_extra=None,
-                         env_remove=()):
+                         env_remove=(), guest_args=()):
     """Run one debugger session through the driver's `debug`
     entry point. Returns (result, kind, reason) in
     sparagmos_side's convention: kind "result" carries the
@@ -2722,6 +2899,8 @@ def sparagmos_debug_side(path, edition, driver_bin, dialect, script_text,
             argv += ["--rustc-arg", a]
         for spec in aux_specs:
             argv += ["--aux", aux_spec_arg(spec)]
+        for a in guest_args:
+            argv += ["--guest-arg", a]
         argv += ["--debug-script", script_path, "--debug-dialect", dialect]
         env = dict(BOOTSTRAP_ENV)
         if env_extra:
@@ -2821,6 +3000,22 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
             out["reason"] = "; ".join(skip_reasons)
             out["bucket"] = "out of environment"
         return
+    # The session executes pass-disabled MIR (the session args
+    # append `-Zmir-opt-level=0` below): a record that declares
+    # a revision written against that same reduced pipeline
+    # (its compile-flags disable MIR passes) is judged on that
+    # revision -- the default-pipeline revision describes a
+    # binary whose stepping the session's pipeline does not
+    # produce (the stepping tests' two revisions exist
+    # precisely to separate the two pipelines' stop lines).
+    if len(applicable) > 1:
+        def _pipeline_reduced(view):
+            flags = " ".join(view.values("compile-flags"))
+            return ("mir-enable-passes=-" in flags
+                    or "mir-opt-level=0" in flags)
+        reduced = [a for a in applicable if _pipeline_reduced(a[1])]
+        if reduced:
+            applicable = reduced
 
     def assembly(view, revision):
         """The revision's driver-invocation assembly, put
@@ -2911,9 +3106,22 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
                     out["bucket"] = "not attempted (debugger feature)"
                     return
                 script_lines.append(line)
+            # The session's guest arguments: a `run <args>`
+            # command's arguments, which the driver's debug
+            # entry point takes as the program's argv (the
+            # session itself starts the program once, with
+            # these arguments, as compiletest's debugger run
+            # does).
+            guest_args = []
+            for command in commands:
+                m = re.match(r"^(?:run|r)\s+(.+)$", command.strip())
+                if m:
+                    guest_args = m.group(1).split()
+                    break
             sessions.append((revision, view, debugger, commands, checks,
-                             "\n".join(script_lines) + "\n"))
-    for revision, view, debugger, commands, checks, script in sessions:
+                             "\n".join(script_lines) + "\n", guest_args))
+    for revision, view, debugger, commands, checks, script, guest_args \
+            in sessions:
         if not commands:
             # compiletest would feed the debugger no commands at
             # all: the program never starts, no output is produced,
@@ -2944,7 +3152,8 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
         res, kind, reason = sparagmos_debug_side(
             path, edition, driver_bin, debugger, script,
             rustc_args=args, aux_specs=aux_specs,
-            env_extra=env, env_remove=env_remove)
+            env_extra=env, env_remove=env_remove,
+            guest_args=guest_args)
         if kind == "timeout":
             out["reason"] = reason
             out["bucket"] = "timeout"

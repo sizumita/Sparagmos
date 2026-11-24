@@ -780,6 +780,20 @@ fn convert_all(
             Some((conv.static_key(def), ty))
         })
         .collect();
+    // The statics' declared types as rendered type tags, keyed
+    // like the type table above: the debugger interface's
+    // record of each static's full instance type (see
+    // `ir::Program::static_debug_tags`).
+    out.static_debug_tags = program
+        .static_tys
+        .iter()
+        .map(|(def, ty)| {
+            (
+                conv.static_key(def),
+                crate::builtins::ty_tag(ty, conv.names),
+            )
+        })
+        .collect();
     // The definition-location stamps, keyed by the program key
     // of the body each belongs to (the `DefId` a function's
     // calls and constants resolve through), in the same

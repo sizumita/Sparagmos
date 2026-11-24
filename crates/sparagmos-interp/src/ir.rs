@@ -2082,6 +2082,16 @@ pub struct Program {
     /// the driver. Consulted when a pointer offset over a static
     /// must be denominated in the declared type's element size.
     pub static_tys: std::collections::HashMap<String, Ty>,
+    /// Declared types of the program's statics rendered as type
+    /// tags (the rendering [`crate::builtins::ty_tag`] produces,
+    /// the same form the debug variable table records for
+    /// locals), keyed like [`Self::static_tys`]. The IR type
+    /// table loses what a debugger knows about a static — a
+    /// `char`'s identity, an integer's width, an instance's
+    /// generic arguments — so the debugger interface renders a
+    /// printed static (and answers `whatis` for it) from this
+    /// tag instead.
+    pub static_debug_tags: std::collections::HashMap<String, String>,
     /// Declared field types of the program's ADT definitions,
     /// keyed by the ADT's definition name (the tag a [`Ty::Adt`]
     /// carries): per variant, per field, the field's declared

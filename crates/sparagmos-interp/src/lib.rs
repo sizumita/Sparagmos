@@ -70,7 +70,10 @@ pub use ir::{
     Place, Program,
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp, UnwindAction,
 };
-pub use debug::{DebugCommand, DebugDialect, DebugPrint, DebugRun, DebugSession, PrintFormat};
+pub use debug::{
+    DebugCommand, DebugDialect, DebugPrint, DebugRun, DebugSession, LldbFormats,
+    LldbNumFormat, PrintFormat,
+};
 pub use mir_convert::{
     convert_program, debug_mir, interpret_mir, interpret_mir_captured,
     interpret_mir_captured_with_config, interpret_mir_captured_with_report, program_key_of,
