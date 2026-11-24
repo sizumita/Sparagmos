@@ -22542,6 +22542,75 @@ fn run_mode_tool_interception_non_utf8_argument_is_unsupported() {
     );
 }
 
+const ADDED_MODULE_CANDIDATE_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    let tree = dir.join("mtree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("modprobe.rs"),
+        "mod helper; fn main() { println!(\"value {}\", helper::v()); }\n",
+    )
+    .unwrap();
+    std::fs::write(tree.join("helper.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&tree)
+        .arg(tree.join("modprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Every recorded file stands unchanged, but a second
+    // module candidate appears beside the one the build
+    // resolved: the live tree no longer describes the
+    // recorded conversion (a fresh conversion of it fails
+    // with E0761), while the program the build produced
+    // is unchanged.
+    std::fs::create_dir_all(tree.join("helper")).unwrap();
+    std::fs::write(
+        tree.join("helper").join("mod.rs"),
+        "pub fn v() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let out = Command::new(tree.join("modprobe")).output().unwrap();
+    assert!(out.status.success(), "run failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "value 1\n");
+    println!("added module candidate guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_added_module_candidate_uses_snapshot() {
+    let dir = temp_dir("tool-added-module-candidate");
+    let src = fixture(
+        &dir,
+        "added_module_candidate_guest.rs",
+        ADDED_MODULE_CANDIDATE_GUEST_SRC,
+    );
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The added `helper/mod.rs` ends the recorded tree's
+    // intact reading, so the run converts the recorded
+    // snapshot (which holds only `helper.rs`) and the
+    // built program runs as built.
+    assert_eq!(
+        stdout, "added module candidate guest ok\n",
+        "stderr={stderr}"
+    );
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());

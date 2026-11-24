@@ -5778,19 +5778,86 @@ fn collect_source_tree(
 }
 
 /// Whether the tree standing at `root`'s directory still
-/// holds every file of `tree` with the bytes the build
-/// converted. Files the recipe has since ADDED beside
-/// them do not take part: an added file cannot change
-/// what the recorded conversion read -- a module the
-/// root names resolved to a recorded file at build
-/// time, or the build would have failed -- so only the
-/// recorded files' survival matters.
+/// denotes the conversion the build made: every file of
+/// `tree` holds the bytes the build converted, and no
+/// source file has been added beside them. An addition
+/// can change what a re-conversion reads even when every
+/// recorded file stands unchanged -- a `mod helper;` the
+/// build resolved to the recorded `helper.rs` gains a
+/// second candidate when `helper/mod.rs` appears beside
+/// it, and converting the live tree then fails with
+/// E0761 although the program the build produced is
+/// unchanged -- so an added `.rs` file anywhere in the
+/// tree ends the intact reading too, and the run falls
+/// back to the recorded snapshot (see
+/// `tree_has_added_source_file`).
 fn source_tree_intact(root: &std::path::Path, tree: &SourceTree) -> bool {
     let Some(base) = root.parent() else {
         return false;
     };
-    tree.iter()
+    if !tree
+        .iter()
         .all(|(rel, bytes)| std::fs::read(base.join(rel)).is_ok_and(|now| now == *bytes))
+    {
+        return false;
+    }
+    let recorded: std::collections::HashSet<&std::path::Path> =
+        tree.iter().map(|(rel, _)| rel.as_path()).collect();
+    let mut budget = SOURCE_TREE_MAX_FILES;
+    !tree_has_added_source_file(base, base, 0, &recorded, &mut budget)
+}
+
+/// Whether a `.rs` file the recorded tree does not hold
+/// has appeared anywhere under `dir` (recursing from
+/// `base`): the addition scan behind `source_tree_intact`.
+/// Only `.rs` files take part -- they are the files whose
+/// presence steers source resolution (`mod` candidates
+/// and `#[path]` targets). An added file of any other
+/// kind cannot change what a conversion reads: a file
+/// the build's conversion did read (an `include!` input,
+/// say) stood in the tree at build time, and so stands
+/// recorded. The scan gives up -- reports no addition --
+/// once it has looked at more entries than the snapshot
+/// bounds allow: a tree that large was never recorded
+/// whole (see `snapshot_source_tree`), and its runs keep
+/// the recorded-files-only reading rather than falling
+/// back to a snapshot that does not hold the tree.
+fn tree_has_added_source_file(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    recorded: &std::collections::HashSet<&std::path::Path>,
+    budget: &mut usize,
+) -> bool {
+    if depth > SOURCE_TREE_MAX_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable directory contributes nothing.
+        return false;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let path = entry.path();
+        if path.is_dir() {
+            if tree_has_added_source_file(base, &path, depth + 1, recorded, budget) {
+                return true;
+            }
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            if !recorded.contains(rel) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// One artifact a tool invocation produced, as the registry
