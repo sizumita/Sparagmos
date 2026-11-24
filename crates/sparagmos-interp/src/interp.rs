@@ -22069,18 +22069,19 @@ fn value_complete_for_ty_at(
 /// descent presumes the stored field is a wrapper layer around
 /// the value the rest of the projection addresses. Type
 /// evidence can refute that presumption, in one case: the
-/// slot's declared type is a single-variant ADT with at least
-/// two declared fields (a struct), and the stored field is not
-/// a *complete* value of that type. Then the stored field is
-/// the struct's own first field and the slot is the struct's
-/// value being initialized field by field: the write belongs
-/// to the slot's own next field, which the ordinary field arm
-/// grows into place. Every other declared shape leaves the
-/// descent standing: a one-field ADT's step can only address
-/// its sole field's interior, and a multi-variant ADT's
-/// one-field stored form is one variant's payload, which field
-/// steps address transparently. With no type evidence the
-/// stored form decides, as before.
+/// variant the stored value selects (the only variant, for a
+/// struct) declares at least two fields, and the stored field
+/// is not a *complete* value of that type. Then the stored
+/// field is the selected variant's own first field and the
+/// slot is that variant's value materialised field by field,
+/// its remaining fields elided or not yet written: the step
+/// belongs to the slot's own fields, which the ordinary field
+/// arm grows into place (and a read answers through the
+/// canonical-value fallback). Every other declared shape
+/// leaves the descent standing: a step into a variant with at
+/// most one declared field can only address its sole field's
+/// interior. With no type evidence the stored form decides,
+/// as before.
 /// The declared type of a wrapper's payload after a
 /// sanctioned descent: the payload is a value of the slot's
 /// declared type (the retargeted-pointer case), except when
@@ -22111,8 +22112,13 @@ fn wrapper_descent_sanctioned(
     ty: Option<&Ty>,
     slot: &Value,
 ) -> bool {
-    let (Some(program), Some(Ty::Adt(name)), Value::Enum { fields, .. }) =
-        (program, ty, slot)
+    let (
+        Some(program),
+        Some(Ty::Adt(name)),
+        Value::Enum {
+            variant, fields, ..
+        },
+    ) = (program, ty, slot)
     else {
         return true;
     };
@@ -22126,7 +22132,20 @@ fn wrapper_descent_sanctioned(
         // judgment above stands as before.)
         return false;
     };
-    if variants.len() != 1 || variants[0].len() <= 1 {
+    // The declared shape that decides is the *selected*
+    // variant's: the stored form is a value of that variant,
+    // and the step addresses its fields. A variant declaring
+    // at most one field leaves the descent standing. A variant
+    // declaring more fields makes the one-field stored form
+    // that variant's own partially materialised value, and the
+    // completeness check decides, exactly as for a struct.
+    let Some(selected) = variants.get(*variant as usize) else {
+        // The stored variant is not among the declared ones:
+        // there is no evidence the stored form is a wrapper,
+        // so the descent does not stand.
+        return false;
+    };
+    if selected.len() <= 1 {
         return true;
     }
     value_complete_for_ty(program, &fields[0], &Ty::Adt(name.clone()))
@@ -25908,6 +25927,78 @@ mod resolved_route_tests {
             frame_pos: 0,
             local: 1,
             projection: vec![RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp
+                .read_resolved_ref(&frames, &target)
+                .expect("read")
+                .into_owned(),
+            Value::Unit,
+        );
+        assert_eq!(
+            interp.read_resolved(&frames, &target).expect("read"),
+            Value::Unit,
+        );
+    }
+
+    fn e_program() -> Program {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::E".to_string(),
+            vec![
+                vec![
+                    Some(Ty::Tuple(vec![
+                        Ty::Int(IntTy::I32),
+                        Ty::Int(IntTy::I32),
+                    ])),
+                    Some(Ty::Unit),
+                ],
+                vec![Some(Ty::Int(IntTy::I32))],
+            ],
+        );
+        let mut body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::E".to_string())],
+            vec![],
+        );
+        let mut zst1 = std::collections::HashMap::new();
+        zst1.insert(
+            vec![ZstPathStep::Downcast(0), ZstPathStep::Field(1)],
+            Value::Unit,
+        );
+        body.zst_fields = vec![std::collections::HashMap::new(), zst1];
+        program.add_function(body);
+        program
+    }
+
+    /// The elided-field read of an enum place: the selected
+    /// variant declares a second, zero-sized field that was
+    /// never stored. The wrapper descent is judged against the
+    /// *selected variant's* declared fields, exactly as for a
+    /// struct: the stored first field is the variant's own, not
+    /// a wrapper payload, so the descent refuses and the
+    /// recorded canonical value answers -- a sibling's contents
+    /// are not the field's value.
+    #[test]
+    fn borrowed_read_of_elided_enum_field_is_canonical() {
+        let program = e_program();
+        let interp = Interpreter::new(&program);
+        let body = program.get("main").unwrap();
+        let frames = vec![s2_frame()];
+        let place = Place {
+            local: Local(1),
+            projection: vec![ProjectionElem::Downcast(0), ProjectionElem::Field(1)],
+        };
+        assert_eq!(
+            interp.read_place(&frames, body, &place).expect("read"),
+            Value::Unit,
+            "the elided variant field must read as its canonical value"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Downcast(0), RefProj::Field(1)],
         };
         assert_eq!(
             interp
