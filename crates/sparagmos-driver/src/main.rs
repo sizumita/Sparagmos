@@ -811,11 +811,11 @@ fn closure_instance_kind(item: &rustc_public::CrateItem) -> ClosureAttempt {
                     "closure kind is not recoverable from its generic arguments".to_string(),
                 );
             };
-            match Instance::resolve_closure(def, &args, kind) {
-                Ok(instance) => ClosureAttempt::Instance(instance),
-                Err(e) => {
-                    ClosureAttempt::Unsupported(format!("closure instance resolution failed: {e}"))
-                }
+            match sparagmos_driver::convert::resolve_closure_guarded(def, &args, kind) {
+                Some(instance) => ClosureAttempt::Instance(instance),
+                None => ClosureAttempt::Unsupported(
+                    "closure instance resolution failed".to_string(),
+                ),
             }
         }
         _ => ClosureAttempt::NotClosure,
@@ -1020,9 +1020,9 @@ fn collect_local_instances(
         }
         for (def, args) in targets {
             let referenced = def.def_id();
-            let inst = match Instance::resolve(def, &args) {
-                Ok(inst) => inst,
-                Err(_) => {
+            let inst = match sparagmos_driver::convert::resolve_instance_guarded(def, &args) {
+                Some(inst) => inst,
+                None => {
                     if deferred_defs.contains(&referenced)
                         && unresolved_seen.insert((referenced, format!("{args:?}")))
                     {
@@ -1405,9 +1405,9 @@ fn collect_closure_instances(
                     }
                     continue;
                 };
-                let inst = match Instance::resolve_closure(def, &args, kind) {
-                    Ok(inst) => inst,
-                    Err(_) => {
+                let inst = match sparagmos_driver::convert::resolve_closure_guarded(def, &args, kind) {
+                    Some(inst) => inst,
+                    None => {
                         if unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             *target_demands
                                 .entry(referenced)
@@ -1648,9 +1648,9 @@ fn collect_const_closure_instances(
                     }
                     return;
                 };
-                let inst = match Instance::resolve_closure(*def, args, kind) {
-                    Ok(inst) => inst,
-                    Err(_) => {
+                let inst = match sparagmos_driver::convert::resolve_closure_guarded(*def, args, kind) {
+                    Some(inst) => inst,
+                    None => {
                         if unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             fail_all(
                                 &mut *target_demands,
@@ -2029,11 +2029,11 @@ fn collect_coroutine_instances(
                 }
                 // Obtain the instance body: resolution first,
                 // the definition's own body as the fallback.
-                let ibody = match Instance::resolve(
+                let ibody = match sparagmos_driver::convert::resolve_instance_guarded(
                     rustc_public::ty::FnDef(referenced),
                     &args,
                 ) {
-                    Ok(inst) => {
+                    Some(inst) => {
                         if !seen.insert((referenced, inst)) {
                             continue;
                         }
@@ -2060,7 +2060,7 @@ fn collect_coroutine_instances(
                         }
                         fetch_instance_body(&inst)
                     }
-                    Err(_) => {
+                    None => {
                         if !unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             continue;
                         }
@@ -2307,7 +2307,7 @@ fn register_trait_key_aliases(
             let mut pending: HashSet<sparagmos_mir::DefId> = HashSet::new();
             for (def, args) in sparagmos_driver::reach::call_targets(source) {
                 let referenced = def.def_id();
-                let Ok(inst) = Instance::resolve(def, &args) else {
+                let Some(inst) = sparagmos_driver::convert::resolve_instance_guarded(def, &args) else {
                     continue;
                 };
                 if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Virtual { .. }) {
@@ -2367,7 +2367,7 @@ fn register_trait_key_aliases(
                 if !is_fmt_trait_method(&referenced_name) {
                     continue;
                 }
-                let Ok(inst) = Instance::resolve(def, &args) else {
+                let Some(inst) = sparagmos_driver::convert::resolve_instance_guarded(def, &args) else {
                     continue;
                 };
                 if matches!(
@@ -2773,8 +2773,64 @@ fn type_tree_has_alias(ty: &Ty, depth: usize) -> bool {
         TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
             type_tree_has_alias(&inner, depth + 1)
         }
+        // A function pointer's signature is part of the type
+        // tree for this screen's purpose: folding a substituted
+        // field type back to Stable MIR normalizes the aliases
+        // inside the signature exactly like the ones in an ADT's
+        // arguments (a query cache's fingerprint function type,
+        // `fn(&mut StableHashState, &QueryCache::Value) ->
+        // Fingerprint`, is the shape that reached the fold
+        // through a vtable struct's function-pointer field).
+        TyKind::RigidTy(RigidTy::FnPtr(..)) => fn_sig_tree_has_alias(ty, depth),
+        TyKind::RigidTy(RigidTy::FnDef(_, args)) => {
+            args.0.iter().any(|a| match a {
+                GenericArgKind::Type(t) => type_tree_has_alias(t, depth + 1),
+                _ => false,
+            }) || fn_sig_tree_has_alias(ty, depth)
+        }
+        // A trait object's projection bindings carry types the
+        // same fold normalizes; walk the predicates' arguments
+        // and type terms.
+        TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => bounds.iter().any(|b| match &b.value {
+            rustc_public::ty::ExistentialPredicate::Trait(t) => t
+                .generic_args
+                .0
+                .iter()
+                .any(|a| match a {
+                    GenericArgKind::Type(t) => type_tree_has_alias(t, depth + 1),
+                    _ => false,
+                }),
+            rustc_public::ty::ExistentialPredicate::Projection(p) => {
+                p.generic_args.0.iter().any(|a| match a {
+                    GenericArgKind::Type(t) => type_tree_has_alias(t, depth + 1),
+                    _ => false,
+                }) || matches!(&p.term, rustc_public::ty::TermKind::Type(t)
+                        if type_tree_has_alias(t, depth + 1))
+            }
+            _ => false,
+        }),
         _ => false,
     }
+}
+
+/// Whether the signature of a function-shaped type (a function
+/// pointer or a function definition) mentions an alias in any
+/// input or output type, at the next depth of
+/// [`type_tree_has_alias`]. An unreadable signature counts as
+/// mentioning one: the screen's safe direction is to skip the
+/// substitution.
+fn fn_sig_tree_has_alias(ty: &Ty, depth: usize) -> bool {
+    let Some(kind) = sparagmos_driver::convert::guarded_ty_kind(ty) else {
+        return true;
+    };
+    let Some(sig) = kind.fn_sig() else {
+        return true;
+    };
+    let sig = sig.skip_binder();
+    sig.inputs()
+        .iter()
+        .any(|t| type_tree_has_alias(t, depth + 1))
+        || type_tree_has_alias(&sig.output(), depth + 1)
 }
 
 /// Collect every ADT instantiation in the type tree of `ty` —
@@ -2898,8 +2954,7 @@ fn resolve_drop_instance(
     self_args: &GenericArgs,
 ) -> Option<rustc_public::mir::mono::Instance> {
     let positional = |args: &GenericArgs| {
-        Instance::resolve(*impl_fn, args)
-            .ok()
+        sparagmos_driver::convert::resolve_instance_guarded(*impl_fn, args)
             .filter(|inst| inst.has_body())
     };
     let unified = (|| -> Option<GenericArgs> {
@@ -2917,8 +2972,7 @@ fn resolve_drop_instance(
         Some(GenericArgs(impl_args))
     })();
     match unified {
-        Some(impl_args) => Instance::resolve(*impl_fn, &impl_args)
-            .ok()
+        Some(impl_args) => sparagmos_driver::convert::resolve_instance_guarded(*impl_fn, &impl_args)
             .filter(|inst| inst.has_body())
             .or_else(|| positional(self_args)),
         None => positional(self_args),
@@ -3476,20 +3530,18 @@ fn demand_clone_instances(
             // shim instance: `has_body` reports false for
             // shims, but `body()` still hands over the
             // synthesized body, which is all conversion needs.
-            let resolved = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {
-                    Instance::resolve(def, &args)
-                        .ok()
-                        .and_then(|inst| {
-                        sparagmos_driver::convert::with_body_materialization(
-                            &inst.name(),
-                            || inst.body(),
-                        )
-                        .map(|body| (inst, body))
-                    })
-                }),
-            );
-            let Ok(Some((inst, sm_body))) = resolved else {
+            let resolved = sparagmos_driver::convert::resolve_instance_guarded(def, &args).and_then(|inst| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sparagmos_driver::convert::with_body_materialization(
+                        &inst.name(),
+                        || inst.body(),
+                    )
+                    .map(|body| (inst, body))
+                }))
+                .ok()
+                .flatten()
+            });
+            let Some((inst, sm_body)) = resolved else {
                 continue;
             };
             let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
@@ -3679,20 +3731,18 @@ fn demand_wake_instances(
             // Instance resolution goes through the compiler's
             // internals and can panic on exotic targets; isolate
             // it exactly as the clone demand does.
-            let resolved = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {
-                    Instance::resolve(item, &args)
-                        .ok()
-                        .and_then(|inst| {
-                        sparagmos_driver::convert::with_body_materialization(
-                            &inst.name(),
-                            || inst.body(),
-                        )
-                        .map(|body| (inst, body))
-                    })
-                }),
-            );
-            let Ok(Some((inst, sm_body))) = resolved else {
+            let resolved = sparagmos_driver::convert::resolve_instance_guarded(item, &args).and_then(|inst| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sparagmos_driver::convert::with_body_materialization(
+                        &inst.name(),
+                        || inst.body(),
+                    )
+                    .map(|body| (inst, body))
+                }))
+                .ok()
+                .flatten()
+            });
+            let Some((inst, sm_body)) = resolved else {
                 continue;
             };
             let def_id = conv.instance_def_id(inst.def.def_id(), &inst);

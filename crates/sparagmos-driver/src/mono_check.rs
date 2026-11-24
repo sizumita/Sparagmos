@@ -1390,6 +1390,22 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 ));
                 return;
             }
+            // The same discipline for demand-path instance
+            // resolution (see `convert::resolve_instance_guarded`):
+            // a resolution diagnostic discounted at the resolve
+            // is a finding when the collector collects the
+            // instance, under the instance's key or its
+            // definition's, for the same reason as above.
+            if crate::convert::resolution_emitted(&key)
+                || crate::convert::resolution_emitted(&def_key)
+            {
+                self.finding = Some(format!(
+                    "resolution of `{key}` emitted diagnostics \
+                     (rustc reports them for the instances it collects; \
+                     see the diagnostics above)"
+                ));
+                return;
+            }
         }
         // Shim instances are handled by kind. Drop glue and
         // fn-pointer shim bodies are walked: a type's destructor

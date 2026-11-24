@@ -410,7 +410,7 @@ pub fn collect_reachable(
                 // below, and the trait method through the formatter
                 // function's own body in turn.
                 if is_fmt_argument_constructor(&canonical) {
-                    if let Ok(inst) = Instance::resolve(def, &args) {
+                    if let Some(inst) = crate::convert::resolve_instance_guarded(def, &args) {
                         if let Ok(Some(ctor_body)) = fetch_body_contained(&inst) {
                             // The walk queue demands the formatter
                             // function through the pipeline above;
@@ -445,12 +445,9 @@ pub fn collect_reachable(
                     let Some(kind) = closure_kind(&cargs) else {
                         continue;
                     };
-                    let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Instance::resolve_closure(cdef, &cargs, kind)
-                    }));
-                    let inst = match resolved {
-                        Ok(Ok(inst)) => inst,
-                        _ => {
+                    let inst = match crate::convert::resolve_closure_guarded(cdef, &cargs, kind) {
+                        Some(inst) => inst,
+                        None => {
                             let key = (cdef_id, format!("{cargs:?}"));
                             if unresolved_seen.insert(key) {
                                 records.push(Record {
@@ -508,9 +505,9 @@ pub fn collect_reachable(
                 }
                 continue;
             }
-            let inst = match Instance::resolve(def, &args) {
-                Ok(inst) => inst,
-                Err(_) => {
+            let inst = match crate::convert::resolve_instance_guarded(def, &args) {
+                Some(inst) => inst,
+                None => {
                     let key = (def_id, format!("{args:?}"));
                     if unresolved_seen.insert(key) {
                         records.push(Record {
@@ -1307,10 +1304,7 @@ fn fold_instance_tra_specialized(
         if scanned >= 16 {
             break;
         }
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Instance::resolve(d, &a)
-        }));
-        let Ok(Ok(inst)) = resolved else {
+        let Some(inst) = crate::convert::resolve_instance_guarded(d, &a) else {
             continue;
         };
         if !visited.insert(inst.name().to_string()) {
