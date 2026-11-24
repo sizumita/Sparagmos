@@ -5055,8 +5055,13 @@ impl Converter {
                 let size = alloc.bytes.len();
                 if size <= MAX_CACHED_ALLOC_BYTES {
                     if self.alloc_cache_bytes + size > MAX_CACHED_ALLOC_BYTES {
-                        self.alloc_cache.clear();
-                        self.alloc_cache_bytes = 0;
+                        // The byte counter covers both caches, so
+                        // resetting it must drop both: clearing only
+                        // this map would leave cached static
+                        // initialisers retained but unaccounted, and
+                        // they could then accumulate far past the cap
+                        // across one root decode.
+                        self.clear_alloc_caches();
                     }
                     self.alloc_cache_bytes += size;
                     self.alloc_cache.insert(key, alloc.clone());
@@ -6725,10 +6730,25 @@ impl Converter {
                     }
                 }
                 if let Some(def) = &static_def {
+                    // A static seed that cannot be built because the
+                    // expansion budget ran out must not fall back to
+                    // the snapshot decode below: the snapshot names
+                    // only the pointee's current value, so the
+                    // pointer loses the static's identity -- a
+                    // second, identical pointer in the same constant
+                    // that did decode as a static reference would
+                    // not share storage with it, and writes through
+                    // one would not be observed through the other.
+                    // An ordinary failure to determine the
+                    // projection keeps the snapshot, as before.
+                    self.const_budget_failed = false;
                     if let Some(c) =
                         self.decode_static_ref(def, inner, &target, target_off, depth)
                     {
                         return Some(c);
+                    }
+                    if self.const_budget_failed {
+                        return None;
                     }
                 }
                 // A byte-sized pointee whose target allocation

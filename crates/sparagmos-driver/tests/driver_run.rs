@@ -835,6 +835,145 @@ fn run_mode_erased_pointer_pair_under_budget_reads_back() {
 }
 
 #[test]
+fn run_mode_static_ref_pair_over_budget_stays_undecoded() {
+    // Two `*mut u32` pointers to one field of a large static
+    // in one constant: building the static-reference seed for
+    // each pointer charges the whole 600,000-byte static
+    // against the shared expansion budget, so the second seed
+    // does not fit. The constant must stay undecoded: falling
+    // back to a snapshot of the pointee for the second pointer
+    // would detach it from the static's storage, so a write
+    // through the first pointer was not observed through the
+    // second (the run printed `v=1` before this fix; the
+    // native program prints `v=99`).
+    let src = "static mut S: ([u8; 600000], u32) = ([7; 600000], 1); struct Pair(*mut u32, *mut u32); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(unsafe { core::ptr::addr_of_mut!(S.1) }, unsafe { core::ptr::addr_of_mut!(S.1) }); fn main() { unsafe { *PAIR.0 = 99; println!(\"v={}\", *PAIR.1); } }";
+    let dir = temp_dir("static-ref-pair-over-budget");
+    let src = fixture(&dir, "static_ref_pair_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget static-ref pair must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_pair_under_budget_shares_storage() {
+    // The same static-field pointer pair at a size whose two
+    // seed charges fit the shared budget: both pointers decode
+    // as static references to the one storage, and a write
+    // through the first is observed through the second,
+    // exactly as in the native program.
+    let src = "static mut S: ([u8; 400000], u32) = ([7; 400000], 1); struct Pair(*mut u32, *mut u32); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(unsafe { core::ptr::addr_of_mut!(S.1) }, unsafe { core::ptr::addr_of_mut!(S.1) }); fn main() { unsafe { *PAIR.0 = 99; println!(\"v={}\", *PAIR.1); } }";
+    let dir = temp_dir("static-ref-pair-under-budget");
+    let src = fixture(&dir, "static_ref_pair_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget static-ref pair must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "v=99\n",
+        "both pointers must denote the static's shared storage"
+    );
+}
+
+#[test]
+fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
+    // One root constant -- a 21-element table of one-byte
+    // slices -- whose elements alternate between ten distinct
+    // 128 MiB statics and two 100 MiB promoted arrays, in an
+    // order that keeps evicting the promoted allocations from
+    // the backing-allocation caches. The two caches (promoted
+    // allocations, static initialisers) share one byte counter
+    // capped at 256 MiB; resetting that counter while dropping
+    // only the promoted-allocation cache left every cached
+    // static initialiser retained but unaccounted, and the
+    // driver's peak RSS grew to about 5.7 GiB. With both
+    // caches dropped together the peak stays near 3.4 GiB
+    // (the compiler itself holds one copy of each backing
+    // allocation). The decoded values must stay exact either
+    // way. The RSS bound is asserted on Linux only, from the
+    // child's VmHWM; elsewhere the run's output is the check.
+    let mut src = String::new();
+    for i in 1..=10 {
+        src.push_str(&format!(
+            "static S{i}: [u8; 134217728] = [{}; 134217728]; ",
+            10 + i
+        ));
+    }
+    src.push_str("const BIG1: [u8; 104857600] = [21; 104857600]; ");
+    src.push_str("const BIG2: [u8; 104857600] = [22; 104857600]; ");
+    let sl = |name: &str| format!("unsafe {{ std::slice::from_raw_parts({name}.as_ptr(), 1) }}");
+    let mut elems = vec![sl("S1"), sl("BIG1"), sl("BIG2")];
+    let mut m = 1;
+    for i in 2..=10 {
+        elems.push(sl(&format!("S{i}")));
+        elems.push(sl(&format!("BIG{m}")));
+        m = 3 - m;
+    }
+    src.push_str(&format!("static TABLE: [&[u8]; 21] = [{}]; ", elems.join(", ")));
+    src.push_str("fn main() { println!(\"{} {} {} {} {} {} {}\", TABLE[0][0], TABLE[3][0], TABLE[1][0], TABLE[2][0], TABLE[19][0], TABLE[20][0], TABLE.len()); }");
+    let dir = temp_dir("slice-table-cache-cap");
+    let src_path = fixture(&dir, "slice_table_cache_cap.rs", &src);
+    // Spawn with output redirected to files so the child's
+    // peak RSS can be polled from /proc while it runs.
+    let out_path = dir.join("stdout.txt");
+    let err_path = dir.join("stderr.txt");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src_path)
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("failed to run sparagmos-driver");
+    let pid = child.id();
+    let mut peak_kib: u64 = 0;
+    let status = loop {
+        #[cfg(target_os = "linux")]
+        if let Ok(proc_status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in proc_status.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Ok(kib) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
+                        peak_kib = peak_kib.max(kib);
+                    }
+                }
+            }
+        }
+        match child.try_wait().expect("failed to poll sparagmos-driver") {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let stdout = std::fs::read_to_string(&out_path).unwrap();
+    let stderr = std::fs::read_to_string(&err_path).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the slice table across large statics must run; stderr={stderr}"
+    );
+    assert_eq!(
+        stdout, "11 12 21 22 20 21 21\n",
+        "decoded slices must match the source program"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        peak_kib < 4_500 * 1024,
+        "peak RSS {peak_kib} KiB must stay bounded by the shared cache cap: \
+         cached static initialisers must not outlive their accounting"
+    );
+}
+
+#[test]
 fn run_mode_large_reference_table_reads_back() {
     // A 400,000-element table of references to one promoted
     // value: the table's allocation carries 400,000
