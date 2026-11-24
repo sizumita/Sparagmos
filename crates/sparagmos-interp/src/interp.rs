@@ -14426,7 +14426,7 @@ impl<'a> Interpreter<'a> {
     /// The recorded type tag of field `field` of variant
     /// `variant` of the ADT instance `name`, from its debug
     /// shape; `None` when no shape is recorded.
-    fn adt_field_tag(&self, name: &str, variant: usize, field: usize) -> Option<String> {
+    pub(crate) fn adt_field_tag(&self, name: &str, variant: usize, field: usize) -> Option<String> {
         self.program()
             .adt_debug_shapes
             .get(name)?

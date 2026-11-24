@@ -7198,6 +7198,108 @@ fn run_mode_boxed_slice_from_slice_ref_keeps_counted_identity() {
     );
 }
 
+
+const BOXED_SLICE_FROM_SLICE_REF_NESTED_COUNTED_SRC: &str = r#"use std::borrow::Cow;
+use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Clone)]
+struct Wrap {
+    rc: Rc<Cell<i32>>,
+    n: i32,
+}
+
+fn main() {
+    // Tuple elements: the counted handle sits inside an
+    // aggregate, in either field position.
+    let src: Vec<(Rc<Cell<i32>>,)> = vec![(Rc::new(Cell::new(1)),), (Rc::new(Cell::new(2)),)];
+    let boxed: Box<[(Rc<Cell<i32>>,)]> = Box::from(&src[..]);
+    println!("tuple1 ptr_eq: {}", Rc::ptr_eq(&src[0].0, &boxed[0].0));
+    boxed[0].0.set(42);
+    println!("tuple1 shared mutation: src[0]={}", src[0].0.get());
+    println!("tuple1 strong: {}", Rc::strong_count(&src[0].0));
+    drop(boxed);
+    println!("tuple1 strong after drop: {}", Rc::strong_count(&src[0].0));
+
+    let psrc: Vec<(i32, Rc<Cell<i32>>)> = vec![(7, Rc::new(Cell::new(2))), (8, Rc::new(Cell::new(3)))];
+    let pboxed: Box<[(i32, Rc<Cell<i32>>)]> = Box::from(&psrc[..]);
+    println!("tuple2 ptr_eq: {}", Rc::ptr_eq(&psrc[0].1, &pboxed[0].1));
+    println!("tuple2 plain field: {}", pboxed[0].0);
+    pboxed[0].1.set(4);
+    println!("tuple2 shared mutation: psrc[0]={}", psrc[0].1.get());
+
+    // Option element holding a counted handle.
+    let osrc: Vec<Option<Rc<Cell<i32>>>> = vec![Some(Rc::new(Cell::new(7))), None];
+    let oboxed: Box<[Option<Rc<Cell<i32>>>]> = Box::from(&osrc[..]);
+    let (s, b) = (osrc[0].as_ref().unwrap(), oboxed[0].as_ref().unwrap());
+    println!("option ptr_eq: {}", Rc::ptr_eq(s, b));
+    b.set(9);
+    println!("option shared mutation: osrc[0]={}", s.get());
+    println!("option strong: {}", Rc::strong_count(s));
+    println!("option none: {}", oboxed[1].is_none());
+
+    // Vec element: its elements share identity, its storage
+    // does not alias the source's.
+    let vsrc: Vec<Vec<Rc<Cell<i32>>>> = vec![vec![Rc::new(Cell::new(3))]];
+    let mut vboxed: Box<[Vec<Rc<Cell<i32>>>]> = Box::from(&vsrc[..]);
+    println!("vec ptr_eq: {}", Rc::ptr_eq(&vsrc[0][0], &vboxed[0][0]));
+    vboxed[0][0].set(11);
+    println!("vec shared mutation: vsrc[0][0]={}", vsrc[0][0].get());
+    println!("vec strong: {}", Rc::strong_count(&vsrc[0][0]));
+    vboxed[0].push(Rc::new(Cell::new(4)));
+    println!("vec lens: src={} boxed={}", vsrc[0].len(), vboxed[0].len());
+
+    // Struct element with a counted field.
+    let wsrc: Vec<Wrap> = vec![Wrap { rc: Rc::new(Cell::new(5)), n: 1 }];
+    let wboxed: Box<[Wrap]> = Box::from(&wsrc[..]);
+    println!("struct ptr_eq: {}", Rc::ptr_eq(&wsrc[0].rc, &wboxed[0].rc));
+    wboxed[0].rc.set(6);
+    println!("struct shared mutation: wsrc[0]={}", wsrc[0].rc.get());
+    println!("struct strong: {}", Rc::strong_count(&wsrc[0].rc));
+    println!("struct plain field: {}", wboxed[0].n);
+
+    // Array element, judged through a second conversion of
+    // the same source: the two boxes share the counted
+    // allocations iff the element clone preserves identity.
+    let asrc: Vec<[Rc<Cell<i32>>; 2]> = vec![[Rc::new(Cell::new(8)), Rc::new(Cell::new(9))]];
+    let b1: Box<[[Rc<Cell<i32>>; 2]]> = Box::from(&asrc[..]);
+    let b2: Box<[[Rc<Cell<i32>>; 2]]> = Box::from(&asrc[..]);
+    println!("array ptr_eq: {}", Rc::ptr_eq(&b1[0][1], &b2[0][1]));
+    b1[0][1].set(10);
+    println!("array shared mutation: b2[0][1]={}", b2[0][1].get());
+    println!("array ptr_eq first: {}", Rc::ptr_eq(&b1[0][0], &b2[0][0]));
+
+    // The borrowed-Cow conversion clones its elements the
+    // same way.
+    let csrc: Vec<(Rc<Cell<i32>>,)> = vec![(Rc::new(Cell::new(12)),), (Rc::new(Cell::new(13)),)];
+    let cow: Cow<'_, [(Rc<Cell<i32>>,)]> = Cow::Borrowed(&csrc[..]);
+    let cboxed: Box<[(Rc<Cell<i32>>,)]> = Box::from(cow);
+    println!("cow ptr_eq: {}", Rc::ptr_eq(&csrc[0].0, &cboxed[0].0));
+    println!("cow strong: {}", Rc::strong_count(&csrc[0].0));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_keeps_nested_counted_identity() {
+    let dir = temp_dir("boxed-from-slice-ref-nested-counted");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_nested_counted.rs",
+        BOXED_SLICE_FROM_SLICE_REF_NESTED_COUNTED_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from &[T] must preserve counted-handle identity inside aggregate elements; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "tuple1 ptr_eq: true\ntuple1 shared mutation: src[0]=42\ntuple1 strong: 2\ntuple1 strong after drop: 1\ntuple2 ptr_eq: true\ntuple2 plain field: 7\ntuple2 shared mutation: psrc[0]=4\noption ptr_eq: true\noption shared mutation: osrc[0]=9\noption strong: 2\noption none: true\nvec ptr_eq: true\nvec shared mutation: vsrc[0][0]=11\nvec strong: 2\nvec lens: src=1 boxed=2\nstruct ptr_eq: true\nstruct shared mutation: wsrc[0]=6\nstruct strong: 2\nstruct plain field: 1\narray ptr_eq: true\narray shared mutation: b2[0][1]=10\narray ptr_eq first: true\ncow ptr_eq: true\ncow strong: 2\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");

@@ -13903,6 +13903,10 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// mutation, the counts themselves). A `Box<U>` element
     /// re-owns its pointee with the pointee's tag known, so a
     /// counted pointee is judged the same way one level down.
+    /// An aggregate element is cloned field by field with
+    /// each field's own tag propagated (see
+    /// [`Self::clone_typed_aggregate`]), so a counted handle
+    /// nested inside it is judged by the same discipline.
     /// Any other element goes through the shape-only owned
     /// clone.
     fn clone_boxed_slice_element(
@@ -13913,6 +13917,7 @@ fn value_fingerprint(value: &Value) -> u64 {
     ) -> InterpResult<Value> {
         if let Some(ty) = elem_ty {
             if ty.starts_with("std::rc::Rc<")
+                || ty.starts_with("alloc::rc::Rc<")
                 || ty.starts_with("std::sync::Arc<")
                 || ty.starts_with("alloc::sync::Arc<")
             {
@@ -13921,6 +13926,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                     return Ok(value.clone());
                 }
             } else if ty.starts_with("std::rc::Weak<")
+                || ty.starts_with("alloc::rc::Weak<")
                 || ty.starts_with("std::sync::Weak<")
                 || ty.starts_with("alloc::sync::Weak<")
             {
@@ -13941,8 +13947,119 @@ fn value_fingerprint(value: &Value) -> u64 {
                     return Ok(self.new_box(cloned));
                 }
             }
+            if let Some(cloned) = self.clone_typed_aggregate(frames, value, ty)? {
+                return Ok(cloned);
+            }
         }
         self.clone_owned_value(frames, value)
+    }
+
+    /// The aggregate case of [`Self::clone_boxed_slice_element`]:
+    /// clone `value`, whose rendered type tag is `ty`, field by
+    /// field with the fields' own tags propagated into the
+    /// recursion, so a reference-counted handle nested inside
+    /// the aggregate keeps its allocation identity instead of
+    /// being deep-copied by the shape-only recursion. `Ok(None)`
+    /// when the (value, tag) pair is not an aggregate shape
+    /// this judgment covers -- the caller then applies the
+    /// shape-only owned clone, exactly as before.
+    ///
+    /// The field tags come from the tag itself for tuples,
+    /// arrays and `Vec`s, and from the instance's recorded
+    /// debug shape for any other ADT; a field whose tag cannot
+    /// be determined is cloned shape-only. An ADT value
+    /// carrying fewer fields than its recorded variant
+    /// declares (a union's value carries only its live field)
+    /// is left to the shape-only clone whole, since its field
+    /// positions cannot be aligned with the declared ones.
+    fn clone_typed_aggregate(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        ty: &str,
+    ) -> InterpResult<Option<Value>> {
+        // Tuples and arrays ride as a `Value::Tuple` of their
+        // elements.
+        if let Value::Tuple(items) = value {
+            if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+                let field_tys = split_top_level(inner);
+                if field_tys.len() != items.len() {
+                    return Ok(None);
+                }
+                let cloned = items
+                    .iter()
+                    .zip(field_tys.iter())
+                    .map(|(f, t)| self.clone_boxed_slice_element(frames, f, Some(t)))
+                    .collect::<InterpResult<Vec<_>>>()?;
+                return Ok(Some(Value::Tuple(cloned)));
+            }
+            if let Some(inner) = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+                let Some(elem) = array_elem_tag(inner) else {
+                    return Ok(None);
+                };
+                let cloned = items
+                    .iter()
+                    .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                    .collect::<InterpResult<Vec<_>>>()?;
+                return Ok(Some(Value::Tuple(cloned)));
+            }
+            return Ok(None);
+        }
+        // A `Vec`'s elements all share the element tag, in
+        // either of the value forms a vector takes.
+        if let Some(elem) = generic_first_arg(ty, "std::vec::Vec<")
+            .or_else(|| generic_first_arg(ty, "alloc::vec::Vec<"))
+        {
+            match value {
+                Value::Enum { variant, fields } => {
+                    let cloned = fields
+                        .iter()
+                        .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                        .collect::<InterpResult<Vec<_>>>()?;
+                    return Ok(Some(Value::Enum {
+                        variant: *variant,
+                        fields: cloned,
+                    }));
+                }
+                Value::SparseVec { elems, len, .. } => {
+                    let cloned = elems
+                        .iter()
+                        .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                        .collect::<InterpResult<Vec<_>>>()?;
+                    // The clone owns fresh storage of exactly
+                    // the declared length, the discipline the
+                    // `Clone::clone` model applies to the same
+                    // shape.
+                    let cap = (*len).max(cloned.len() as u128);
+                    return Ok(Some(Value::SparseVec {
+                        elems: cloned,
+                        len: *len,
+                        cap,
+                    }));
+                }
+                _ => return Ok(None),
+            }
+        }
+        // Any other ADT: the recorded debug shape of the
+        // instance names each field's tag.
+        if let Value::Enum { variant, fields } = value {
+            if self.adt_field_tag(ty, *variant as usize, fields.len()).is_some() {
+                return Ok(None);
+            }
+            let cloned = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let field_ty = self.adt_field_tag(ty, *variant as usize, i);
+                    self.clone_boxed_slice_element(frames, f, field_ty.as_deref())
+                })
+                .collect::<InterpResult<Vec<_>>>()?;
+            return Ok(Some(Value::Enum {
+                variant: *variant,
+                fields: cloned,
+            }));
+        }
+        Ok(None)
     }
 
     /// Clone an owned value the way this module's `Clone::clone`
@@ -27993,6 +28110,22 @@ fn is_integer_tag(tag: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
             | "usize"
     )
+}
+
+/// The element tag inside a rendered array type (`T; N`):
+/// the part before the top-level semicolon, or `None` when
+/// there is none (a slice's inside is not an array's).
+fn array_elem_tag(inner: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => return Some(inner[..i].trim()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Split a rendered type list on the commas that sit at nesting
