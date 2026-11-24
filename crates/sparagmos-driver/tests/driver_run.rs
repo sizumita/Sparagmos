@@ -15237,6 +15237,50 @@ fn run_mode_slice_scalar_backed_float_byte_view() {
     );
 }
 
+const SLICE_SCALAR_BACKED_SIGNED_BYTE_SRC: &str = r#"
+fn main() {
+    let n = -1i8;
+    let s = std::slice::from_ref(&n);
+    let mut it = s.iter();
+    println!("first {:?}", it.next());
+    println!("second {:?}", it.next());
+    let m = -128i8;
+    for v in std::slice::from_ref(&m) {
+        println!("elem {v}");
+    }
+    let x: u32 = 0x80FF_7F01;
+    let bs = unsafe { std::slice::from_raw_parts(&x as *const u32 as *const i8, 4) };
+    let v: Vec<i8> = bs.iter().copied().collect();
+    println!("view {v:?}");
+    let p = 127i8;
+    let s2 = std::slice::from_ref(&p);
+    println!("pos {:?}", s2.iter().next());
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_signed_byte_element() {
+    // A byte element of a signed type denotes the byte's
+    // signed value: `slice::from_ref(&-1i8)` snapshotted as
+    // an unsigned byte yields `Uint(255)`, which a consumer
+    // resolving the yielded reference directly (the
+    // formatting path) prints as 255 instead of -1. The same
+    // holds for a signed byte view over a wider storage.
+    // Expected output is the native result of the same
+    // source.
+    let dir = temp_dir("slice-scalar-backed-signed-byte");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_SIGNED_BYTE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "first Some(-1)\nsecond None\nelem -128\nview [1, 127, -1, -128]\npos Some(127)\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }

@@ -20109,7 +20109,12 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             // Byte elements: the storage's own bytes under its
             // declared layout, up to the fat length (a float
             // storage's bytes are its own width's, not the
-            // widened model's).
+            // widened model's). An `i8` element denotes the
+            // byte's signed value: a consumer that resolves the
+            // yielded reference directly (the formatting path)
+            // reads the snapshot as the element itself, so an
+            // unsigned construction would print 255 for -1.
+            let signed = elem_tag.trim() == "i8";
             let layout_bytes =
                 self.scalar_storage_layout_bytes(frames, &target, *len as usize);
             let mut out = Vec::new();
@@ -20127,7 +20132,11 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                         scalar_storage_byte(&scalar, i)?
                     }
                 };
-                out.push(Value::Uint(byte as u128));
+                out.push(if signed {
+                    Value::Int(i128::from(byte as i8))
+                } else {
+                    Value::Uint(u128::from(byte))
+                });
             }
             return Some(out);
         }
