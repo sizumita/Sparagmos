@@ -22225,6 +22225,12 @@ fn assign_projected(
     } else {
         (projection, ty)
     };
+    // The pre-passes' head navigations carry the type evidence
+    // the caller supplied (when the projection was not
+    // composed): a shape-only head walk can take the wrapper
+    // descent into a partially materialised aggregate's first
+    // field and splice the byte into a sibling the write does
+    // not address.
     if let Some((&RefProj::ByteOffset(disp), head)) = projection.split_last() {
         // A byte written through a pointer displaced into a
         // scalar's storage, with no index step after the
@@ -22233,9 +22239,15 @@ fn assign_projected(
         // written is what makes the position a byte position.
         if disp >= 0 {
             if let Some(byte) = value_as_storage_byte(&value) {
-                if let Ok(head_slot) =
-                    navigate_mut_grow(slot, head, func, place, grow, program, None)
-                {
+                if let Ok(head_slot) = navigate_mut_grow(
+                    slot,
+                    head,
+                    func,
+                    place,
+                    grow,
+                    program,
+                    ty.clone(),
+                ) {
                     if splice_scalar_storage_byte(head_slot, disp as usize, byte) {
                         return Ok(());
                     }
@@ -22254,9 +22266,15 @@ fn assign_projected(
             _ => (idx, head, false),
         };
         if let Some(byte) = value_as_storage_byte(&value) {
-            if let Ok(head_slot) =
-                navigate_mut_grow(slot, head, func, place, grow, program, None)
-            {
+            if let Ok(head_slot) = navigate_mut_grow(
+                slot,
+                head,
+                func,
+                place,
+                grow,
+                program,
+                ty.clone(),
+            ) {
                 // The splice is a byte position inside a scalar's
                 // storage. It applies when the projection is
                 // byte-displaced (its shape says so outright), or
@@ -22283,7 +22301,8 @@ fn assign_projected(
         // the element-list value, so the write applies the
         // `Vec::set_len` storage change to the vector value
         // the head denotes.
-        let head_slot = navigate_mut_grow(slot, head, func, place, grow, program, None)?;
+        let head_slot =
+            navigate_mut_grow(slot, head, func, place, grow, program, ty.clone())?;
         return assign_vec_len(head_slot, value, place);
     }
     let target = navigate_mut_grow(slot, projection, func, place, grow, program, ty)?;
@@ -26116,6 +26135,61 @@ mod resolved_route_tests {
                         Value::Uninit,
                         Value::Uninit,
                         Value::Int(1000),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    /// A byte-sized typed write to an unwritten array field
+    /// of a partially materialised struct: the byte-splice
+    /// pre-pass navigates the head with the type evidence, so
+    /// it cannot take the shape-only wrapper descent into the
+    /// first field and splice the byte into that sibling's
+    /// scalar storage; the ordinary navigation materialises
+    /// the array field instead.
+    #[test]
+    fn byte_splice_prepass_keeps_sibling() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S5".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 4)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Index(3)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Uint(7),
+                Some(&Ty::Adt("probe::S5".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Tuple(vec![
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uint(7),
                     ]),
                 ],
             })
