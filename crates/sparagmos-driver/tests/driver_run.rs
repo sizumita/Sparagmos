@@ -7133,6 +7133,71 @@ fn run_mode_boxed_slice_from_slice_ref_clones_elements() {
     );
 }
 
+
+const BOXED_SLICE_FROM_SLICE_REF_COUNTED_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
+
+fn main() {
+    // Reference-counted elements clone as handles on the
+    // same allocation, never as deep copies of the counted
+    // allocation.
+    let src: Vec<Rc<Cell<i32>>> = vec![Rc::new(Cell::new(1)), Rc::new(Cell::new(2))];
+    let boxed: Box<[Rc<Cell<i32>>]> = Box::from(&src[..]);
+    println!("rc ptr_eq: {}", Rc::ptr_eq(&src[0], &boxed[0]));
+    boxed[0].set(42);
+    println!("rc shared mutation: src[0]={}", src[0].get());
+    println!("rc strong: {}", Rc::strong_count(&src[0]));
+    drop(boxed);
+    println!("rc strong after box drop: {}", Rc::strong_count(&src[0]));
+    println!("rc still alive: {}", src[0].get());
+
+    let asrc: Vec<Arc<Cell<i32>>> = vec![Arc::new(Cell::new(7))];
+    let aboxed: Box<[Arc<Cell<i32>>]> = Box::from(&asrc[..]);
+    println!("arc ptr_eq: {}", Arc::ptr_eq(&asrc[0], &aboxed[0]));
+    aboxed[0].set(9);
+    println!("arc shared mutation: asrc[0]={}", asrc[0].get());
+    println!("arc strong: {}", Arc::strong_count(&asrc[0]));
+
+    let wsrc: Vec<Weak<Cell<i32>>> = vec![Rc::downgrade(&src[1])];
+    println!("weak_count before: {}", Rc::weak_count(&src[1]));
+    let wboxed: Box<[Weak<Cell<i32>>]> = Box::from(&wsrc[..]);
+    println!("weak_count after: {}", Rc::weak_count(&src[1]));
+    println!("weak upgrade ok: {}", wboxed[0].upgrade().map(|r| r.get()) == Some(2));
+    drop(wboxed);
+    println!("weak_count after drop: {}", Rc::weak_count(&src[1]));
+
+    let bsrc: Vec<Box<Rc<Cell<i32>>>> = vec![Box::new(Rc::new(Cell::new(5)))];
+    let bboxed: Box<[Box<Rc<Cell<i32>>>]> = Box::from(&bsrc[..]);
+    println!("box-rc ptr_eq: {}", Rc::ptr_eq(&bsrc[0], &bboxed[0]));
+    bboxed[0].set(6);
+    println!("box-rc shared mutation: bsrc[0]={}", bsrc[0].get());
+    println!("box-rc strong: {}", Rc::strong_count(&bsrc[0]));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_keeps_counted_identity() {
+    let dir = temp_dir("boxed-from-slice-ref-counted");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_counted.rs",
+        BOXED_SLICE_FROM_SLICE_REF_COUNTED_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[Rc<T>]> from &[Rc<T>] must share the counted allocations; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "rc ptr_eq: true\nrc shared mutation: src[0]=42\nrc strong: 2\nrc strong after box drop: 1\nrc still alive: 42\narc ptr_eq: true\narc shared mutation: asrc[0]=9\narc strong: 2\nweak_count before: 1\nweak_count after: 2\nweak upgrade ok: true\nweak_count after drop: 1\nbox-rc ptr_eq: true\nbox-rc shared mutation: bsrc[0]=6\nbox-rc strong: 2\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");

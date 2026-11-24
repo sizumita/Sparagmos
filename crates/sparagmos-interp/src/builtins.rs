@@ -8344,6 +8344,12 @@ impl<'a> Interpreter<'a> {
                     // reading the source's own fields).
                     let pointee_ty =
                         generic_first_arg(target, "std::boxed::Box<").and_then(ty_from_tag);
+                    // The element type tag, for the
+                    // reference-counted judgment in the element
+                    // clones below.
+                    let elem_ty = generic_first_arg(target, "std::boxed::Box<")
+                        .and_then(|pt| pt.strip_prefix('['))
+                        .and_then(|pt| pt.strip_suffix(']'));
                     if source.starts_with("&[") {
                         // The argument is the slice reference
                         // itself. Snapshot its elements and
@@ -8357,7 +8363,7 @@ impl<'a> Interpreter<'a> {
                         let (elements, _len) = self.slice_elements(frames, &value)?;
                         let elements = elements
                             .iter()
-                            .map(|e| self.clone_owned_value(frames, e))
+                            .map(|e| self.clone_boxed_slice_element(frames, e, elem_ty))
                             .collect::<InterpResult<Vec<_>>>()?;
                         self.boxed_slice_value(
                             Value::Tuple(elements),
@@ -8405,7 +8411,13 @@ impl<'a> Interpreter<'a> {
                                     // before boxing them.
                                     let elements = elements
                                         .iter()
-                                        .map(|e| self.clone_owned_value(frames, e))
+                                        .map(|e| {
+                                            self.clone_boxed_slice_element(
+                                                frames,
+                                                e,
+                                                elem_ty,
+                                            )
+                                        })
                                         .collect::<InterpResult<Vec<_>>>()?;
                                     self.boxed_slice_value(
                                         Value::Tuple(elements),
@@ -13874,6 +13886,63 @@ fn value_fingerprint(value: &Value) -> u64 {
             // (slices are `Clone` through their reference).
             other => Ok(other.clone()),
         }
+    }
+
+    /// Clone one element of a slice being re-owned by a
+    /// `From<&[T]>` / borrowed-`Cow<[T]>` conversion to
+    /// `Box<[T]>`, where the element type tag `elem_ty` is
+    /// known. A reference-counted element (`Rc` / `Arc` /
+    /// `Weak`) clones the way the `Clone::clone` model clones
+    /// the handle itself: the clone is another live handle on
+    /// the SAME allocation, with the matching count moved --
+    /// the shape-only [`Self::clone_owned_value`] must not be
+    /// applied to it, because its field-wise recursion reaches
+    /// the handle's `NonNull` field, mistakes it for a built
+    /// box, and deep-copies the counted allocation, which
+    /// breaks allocation identity (`ptr_eq`, shared interior
+    /// mutation, the counts themselves). A `Box<U>` element
+    /// re-owns its pointee with the pointee's tag known, so a
+    /// counted pointee is judged the same way one level down.
+    /// Any other element goes through the shape-only owned
+    /// clone.
+    fn clone_boxed_slice_element(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_ty: Option<&str>,
+    ) -> InterpResult<Value> {
+        if let Some(ty) = elem_ty {
+            if ty.starts_with("std::rc::Rc<")
+                || ty.starts_with("std::sync::Arc<")
+                || ty.starts_with("alloc::sync::Arc<")
+            {
+                if let Some(id) = rc_handle_id(value) {
+                    self.rc_inc_strong(id)?;
+                    return Ok(value.clone());
+                }
+            } else if ty.starts_with("std::rc::Weak<")
+                || ty.starts_with("std::sync::Weak<")
+                || ty.starts_with("alloc::sync::Weak<")
+            {
+                if let Some(id) = rc_handle_id(value) {
+                    self.rc_inc_weak(id)?;
+                    return Ok(value.clone());
+                }
+            } else if ty.starts_with("std::boxed::Box<")
+                || ty.starts_with("alloc::boxed::Box<")
+            {
+                if let Some((id, projection)) = box_alloc_pointer(value) {
+                    let pointee =
+                        self.read_resolved(frames, &Resolved::Alloc { id, projection })?;
+                    let inner_ty = generic_first_arg(ty, "std::boxed::Box<")
+                        .or_else(|| generic_first_arg(ty, "alloc::boxed::Box<"));
+                    let cloned =
+                        self.clone_boxed_slice_element(frames, &pointee, inner_ty)?;
+                    return Ok(self.new_box(cloned));
+                }
+            }
+        }
+        self.clone_owned_value(frames, value)
     }
 
     /// Clone an owned value the way this module's `Clone::clone`
