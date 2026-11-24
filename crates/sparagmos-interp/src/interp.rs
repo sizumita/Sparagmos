@@ -318,6 +318,10 @@ pub(crate) enum Resolved {
 /// reaches a point where it would block (see
 /// [`Interpreter::drain_threads`]).
 pub(crate) struct ThreadSlot {
+    /// The name the thread's `std::thread::Builder` set (read
+    /// back by `std::thread::Thread::name`); `None` for an
+    /// unnamed thread.
+    pub name: Option<String>,
     pub callable: Option<Value>,
     /// The thread's outcome: its return value, or the panic
     /// payload it ended with (kept whole, so `join`'s error can
@@ -6622,11 +6626,33 @@ impl<'a> Interpreter<'a> {
         self.threads.borrow_mut().insert(
             id,
             ThreadSlot {
+                name: None,
                 callable: Some(callable),
                 outcome: None,
             },
         );
         id
+    }
+
+    /// Record the name a `std::thread::Builder` gave the thread
+    /// `id` (see `Builtin::ThreadBuilderSpawn`).
+    pub(crate) fn set_thread_name(&self, id: u64, name: Option<String>) {
+        if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
+            slot.name = name;
+        }
+    }
+
+    /// The name of the thread `id`: the main thread (id 1) is
+    /// `main`; a spawned thread carries the name registered for
+    /// it at spawn time, or none.
+    pub(crate) fn thread_name(&self, id: u64) -> Option<String> {
+        if id == 1 {
+            return Some("main".to_string());
+        }
+        self.threads
+            .borrow()
+            .get(&id)
+            .and_then(|slot| slot.name.clone())
     }
 
     /// Whether the thread has been spawned but not yet run.

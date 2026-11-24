@@ -29876,3 +29876,141 @@ fn run_mode_as_ref_slice_of_arrays() {
         "asref 2 [[1, 2], [3, 4]]\nborrow 2 [[1, 2], [3, 4]]\n",
     );
 }
+
+// ----- body-less std surface on the rustdoc path (Issue #427) ---------------
+
+// `std::io::Stderr::lock` and `std::io::Stdout::lock` have no MIR
+// body in the distributed std; the interpreter serves them as
+// builtins returning the handle itself (writes dispatch on the
+// receiver type). Compiler programs lock the standard streams to
+// emit diagnostics.
+const STD_STREAM_LOCK_SRC: &str = r#"
+use std::io::Write;
+
+fn main() {
+    let mut err_lock = std::io::stderr().lock();
+    writeln!(err_lock, "to-stderr-lock").unwrap();
+    drop(err_lock);
+    let mut out_lock = std::io::stdout().lock();
+    writeln!(out_lock, "to-stdout-lock").unwrap();
+    drop(out_lock);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_std_stream_lock() {
+    let dir = temp_dir("std-stream-lock");
+    let src = fixture(&dir, "case.rs", STD_STREAM_LOCK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "to-stdout-lock\ndone\n",
+        "stdout lock writes must reach guest stdout; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr, "to-stderr-lock\n",
+        "stderr lock writes must reach guest stderr"
+    );
+}
+
+// `std::path::Path::is_file` / `is_dir` have no MIR body in the
+// distributed std; the interpreter answers them from host
+// metadata (a failed metadata read is `false`, as in std).
+const PATH_IS_FILE_DIR_SRC: &str = r#"
+fn main() {
+    let dir = std::env::temp_dir().join("sparagmos-is-file-probe");
+    let file = dir.join("probe.txt");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&file, b"x").unwrap();
+    println!("file: is_file={} is_dir={}", file.is_file(), file.is_dir());
+    println!("dir: is_file={} is_dir={}", dir.is_file(), dir.is_dir());
+    let missing = dir.join("missing-427");
+    println!(
+        "missing: is_file={} is_dir={}",
+        missing.is_file(),
+        missing.is_dir()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+"#;
+
+#[test]
+fn run_mode_path_is_file_is_dir() {
+    run_ok(
+        "path-is-file-dir",
+        PATH_IS_FILE_DIR_SRC,
+        "file: is_file=true is_dir=false\n\
+         dir: is_file=false is_dir=true\n\
+         missing: is_file=false is_dir=false\n",
+    );
+}
+
+// `core::slice::copy_from_slice_impl::len_mismatch_fail` has no
+// MIR body in the distributed core; the interpreter raises the
+// panic itself, with core's exact message as a `String` payload.
+const COPY_FROM_SLICE_LEN_MISMATCH_SRC: &str = r#"
+fn main() {
+    let r = std::panic::catch_unwind(|| {
+        let src = [1u8, 2, 3];
+        let mut dst = [0u8; 2];
+        dst.copy_from_slice(&src);
+    });
+    println!("caught={}", r.is_err());
+    if let Err(e) = r {
+        if let Some(s) = e.downcast_ref::<String>() {
+            println!("payload={}", s);
+        }
+    }
+}
+"#;
+
+#[test]
+fn run_mode_copy_from_slice_len_mismatch() {
+    run_ok(
+        "copy-from-slice-len-mismatch",
+        COPY_FROM_SLICE_LEN_MISMATCH_SRC,
+        "caught=true\n\
+         payload=copy_from_slice: source slice length (3) does not match \
+         destination slice length (2)\n",
+    );
+}
+
+// `std::thread::Thread::name` has no MIR body in the distributed
+// std; the interpreter answers it from the names registered at
+// spawn time (the `Builder` name field), with `main` for the
+// main thread and `None` for an unnamed spawned thread.
+const THREAD_NAME_SRC: &str = r#"
+fn main() {
+    println!("main-name={:?}", std::thread::current().name());
+    let named = std::thread::Builder::new()
+        .name("worker-1".to_string())
+        .spawn(|| {
+            println!("worker-name={:?}", std::thread::current().name());
+        })
+        .unwrap();
+    named.join().unwrap();
+    let plain = std::thread::spawn(|| {
+        println!("plain-name={:?}", std::thread::current().name());
+    });
+    plain.join().unwrap();
+}
+"#;
+
+#[test]
+fn run_mode_thread_name() {
+    run_ok(
+        "thread-name",
+        THREAD_NAME_SRC,
+        "main-name=Some(\"main\")\n\
+         worker-name=Some(\"worker-1\")\n\
+         plain-name=None\n",
+    );
+}

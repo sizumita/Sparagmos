@@ -344,6 +344,13 @@ pub enum Builtin {
     /// `std::path::Path::is_absolute(&self) -> bool`: the path
     /// has a root component.
     PathIsAbsolute,
+    /// `std::path::Path::is_file`: host metadata query (follows
+    /// symlinks, as `std::fs::metadata` does); `false` when the
+    /// metadata cannot be read, as in std.
+    PathIsFile,
+    /// `std::path::Path::is_dir`: as `PathIsFile`, for a
+    /// directory.
+    PathIsDir,
     /// `std::path::Path::_join(&self, &Path) -> PathBuf`: the
     /// owned path with the argument pushed onto it (the leaf
     /// under `Path::join`).
@@ -400,6 +407,12 @@ pub enum Builtin {
     /// it are modelled by the `Write` builtins, which dispatch on
     /// the receiver type, not on the handle's contents.
     Stdout,
+    /// `std::io::Stdout::lock` / `std::io::Stderr::lock`: the
+    /// locked handle. The lock value is the handle itself in this
+    /// model: writes through it are modelled by the `Write`
+    /// builtins, which dispatch on the receiver type, and the
+    /// guard's unlock on drop has no observable effect.
+    StdStreamLock,
     /// `std::io::Write::write_fmt(&mut self, Arguments)` for the
     /// modelled receivers (the std handles and `Vec<u8>`).
     WriteFmt,
@@ -692,6 +705,10 @@ pub enum Builtin {
     /// raise a guest panic with the message core's branch order
     /// selects for the failing range.
     SliceIndexFail,
+    /// `core::slice::copy_from_slice_impl::len_mismatch_fail(
+    /// dst_len, src_len)`: raise a guest panic with core's
+    /// message (a `String` payload, as `panic!` produces).
+    LenMismatchFail,
     /// `core::slice::memchr::memchr(needle, haystack) ->
     /// Option<usize>` (and `memrchr`, searching from the
     /// back): a linear scan over the haystack's elements.
@@ -732,6 +749,10 @@ pub enum Builtin {
     ThreadCurrent,
     /// `std::thread::Thread::id(&thread)`: the thread's id value.
     ThreadIdOf,
+    /// `std::thread::Thread::name(&thread)`: the thread's name
+    /// (the main thread is `main`; a spawned thread carries the
+    /// name its `Builder` set, or none).
+    ThreadName,
     /// `std::thread::sleep(dur)` / `sleep_ms(ms)`: a cooperative
     /// scheduling point (pending threads run to completion); the
     /// passage of time itself is not observable in the value model.
@@ -2299,6 +2320,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::string::String::from_utf8" => Builtin::StringFromUtf8,
         "std::fs::write::inner" => Builtin::FsWriteInner,
         "std::path::Path::is_absolute" => Builtin::PathIsAbsolute,
+        "std::path::Path::is_file" => Builtin::PathIsFile,
+        "std::path::Path::is_dir" => Builtin::PathIsDir,
         "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
         "std::path::Path::_join" => Builtin::PathJoin,
         "std::path::Path::parent" => Builtin::PathParent,
@@ -2353,6 +2376,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::sys::fs::symlink" => Builtin::FsSys(FsSysOp::Symlink),
         "std::process::exit" => Builtin::ProcessExit,
         "std::io::stdout" => Builtin::Stdout,
+        "std::io::Stdout::lock" | "std::io::Stderr::lock" => Builtin::StdStreamLock,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
         "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
         "std::fmt::format" => Builtin::Format,
@@ -2633,6 +2657,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::thread::scope" => Builtin::ThreadScope,
         "std::thread::current" => Builtin::ThreadCurrent,
         "std::thread::Thread::id" => Builtin::ThreadIdOf,
+        "std::thread::Thread::name" => Builtin::ThreadName,
         "std::thread::sleep" | "std::thread::sleep_ms" => Builtin::ThreadSleep,
         "std::thread::yield_now" => Builtin::ThreadYield,
         // The mpsc surface: the channel state lives in the
@@ -2716,6 +2741,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::result::unwrap_failed" | "core::result::unwrap_failed" => Builtin::ResultUnwrapFailed,
         "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
         "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
+        "core::slice::copy_from_slice_impl::len_mismatch_fail" => Builtin::LenMismatchFail,
         "core::slice::memchr::memchr" => Builtin::Memchr { reverse: false },
         "core::slice::memchr::memrchr" => Builtin::Memchr { reverse: true },
         "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,
@@ -5239,6 +5265,11 @@ impl<'a> Interpreter<'a> {
                     fields: vec![Value::Unit],
                 })
             }
+            Builtin::StdStreamLock => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.read_resolved(frames, &target)
+            }
             Builtin::WriteFmt => {
                 arity(2)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
@@ -5616,14 +5647,22 @@ impl<'a> Interpreter<'a> {
                 self.spawn_callable(callable)
             }
             Builtin::ThreadBuilderSpawn => {
-                // `(builder, f)`: the builder carries nothing the
-                // model observes beyond what its fields hold; the
-                // callable is the second argument. `Builder::spawn`
-                // returns `io::Result<JoinHandle>`: the model's
-                // spawn cannot fail, so the handle is the `Ok`.
+                // `(builder, f)`: the builder's name field is
+                // registered for the new thread (so
+                // `Thread::name` observes it); the callable is the
+                // second argument. `Builder::spawn` returns
+                // `io::Result<JoinHandle>`: the model's spawn
+                // cannot fail, so the handle is the `Ok`.
                 arity(2)?;
-                let callable = vals.into_iter().nth(1).expect("arity checked");
-                Ok(ok_result(self.spawn_callable(callable)?))
+                let mut vals = vals.into_iter();
+                let builder = vals.next().expect("arity checked");
+                let callable = vals.next().expect("arity checked");
+                let thread_name = builder_thread_name(&builder);
+                let handle = self.spawn_callable(callable)?;
+                if let Some(id) = join_handle_id(&handle) {
+                    self.set_thread_name(id, thread_name);
+                }
+                Ok(ok_result(handle))
             }
             Builtin::ThreadScopedSpawn => {
                 // `(&scope, f)`: the scope's identity is not
@@ -5688,6 +5727,22 @@ impl<'a> Interpreter<'a> {
                     Some(id) => Ok(id_handle(id)),
                     None => Err(InterpError::type_mismatch(
                         "Thread::id",
+                        "a thread value",
+                        thread.kind_name(),
+                    )),
+                }
+            }
+            Builtin::ThreadName => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let thread = self.read_resolved(frames, &target)?;
+                match channel_handle_id(&thread) {
+                    Some(id) => Ok(match self.thread_name(id) {
+                        Some(name) => some_value(Value::Str(name)),
+                        None => none_value(),
+                    }),
+                    None => Err(InterpError::type_mismatch(
+                        "Thread::name",
                         "a thread value",
                         thread.kind_name(),
                     )),
@@ -7583,6 +7638,23 @@ impl<'a> Interpreter<'a> {
                 let bytes = self.path_bytes(frames, &vals[0])?;
                 Ok(Value::Bool(bytes.first() == Some(&b'/')))
             }
+            Builtin::PathIsFile | Builtin::PathIsDir => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                let is_file = matches!(kind, Builtin::PathIsFile);
+                Ok(Value::Bool(
+                    match std::fs::metadata(host_path(&bytes)) {
+                        Ok(md) => {
+                            if is_file {
+                                md.is_file()
+                            } else {
+                                md.is_dir()
+                            }
+                        }
+                        Err(_) => false,
+                    },
+                ))
+            }
             Builtin::PathJoin => {
                 arity(2)?;
                 let base = self.path_bytes(frames, &vals[0])?;
@@ -9201,6 +9273,14 @@ impl<'a> Interpreter<'a> {
                 Err(InterpError::panic_string_payload(
                     slice_index_fail_message(start, end, len),
                 ))
+            }
+            Builtin::LenMismatchFail => {
+                arity(2)?;
+                let dst_len = as_u128(&vals[0], name)?;
+                let src_len = as_u128(&vals[1], name)?;
+                Err(InterpError::panic_string_payload(format!(
+                    "copy_from_slice: source slice length ({src_len}) does not match destination slice length ({dst_len})"
+                )))
             }
             Builtin::RangeErrorReport => {
                 arity(2)?;
@@ -24524,6 +24604,26 @@ fn join_handle_id(value: &Value) -> Option<u64> {
             _ => return None,
         }
     }
+}
+
+/// The thread name a `std::thread::Builder` value carries (its
+/// first field, an `Option<String>` in the real field shape), as
+/// host text. `None` for an unnamed builder or a value of an
+/// unexpected shape.
+fn builder_thread_name(builder: &Value) -> Option<String> {
+    let Value::Enum { variant: 0, fields } = builder else {
+        return None;
+    };
+    let name_field = fields.first()?;
+    let Value::Enum {
+        variant: 1,
+        fields: name_fields,
+    } = name_field
+    else {
+        return None;
+    };
+    let bytes = string_aggregate_bytes(name_fields.first()?)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn some_value(value: Value) -> Value {
