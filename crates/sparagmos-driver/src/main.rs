@@ -168,6 +168,9 @@ struct Collected {
     /// `Converter::fn_abis`).
     fn_abis: std::collections::HashMap<sparagmos_mir::DefId, sparagmos_mir::Abi>,
     def_names: Vec<String>,
+    /// Sparagmos ids of the definitions the compiler classifies
+    /// as compiler intrinsics (see `Converter::intrinsic_defs`).
+    intrinsic_defs: std::collections::HashSet<sparagmos_mir::DefId>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
     adt_discriminants: sparagmos_mir::AdtDiscriminants,
@@ -1116,6 +1119,32 @@ fn collect_local_instances(
                 continue;
             }
             if !inst.has_body() {
+                // A compiler intrinsic the interpreter models
+                // is served by the builtin, the way a demanded
+                // data constructor is served by its callers'
+                // aggregate rvalues: there is no body to
+                // convert, and the demand is met. The model is
+                // looked up by the intrinsic's own name (see
+                // `builtins::intrinsic_lookup`): an intrinsic
+                // the guest crate declares itself is named by
+                // its declaration site, which the qualified
+                // registry never matches. An intrinsic with no
+                // model stays an unmet demand.
+                if matches!(
+                    inst.kind,
+                    rustc_public::mir::mono::InstanceKind::Intrinsic
+                ) {
+                    conv.note_intrinsic(&inst);
+                    let canonical = sparagmos_interp::builtins::canonical_name(
+                        &inst.def.def_id().name(),
+                    );
+                    if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+                        for owner in &owners {
+                            demands.entry(*owner).or_default().converted += 1;
+                        }
+                        continue;
+                    }
+                }
                 let reason = match inst.kind {
                     rustc_public::mir::mono::InstanceKind::Intrinsic => {
                         "compiler intrinsic (no fallback body)"
@@ -5452,6 +5481,7 @@ fn collect() -> ControlFlow<()> {
         local_report_count,
         entry_def_id,
         def_names: conv.def_names.clone(),
+        intrinsic_defs: conv.intrinsic_defs.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),
@@ -6437,6 +6467,7 @@ fn build_program(
             name.clone(),
         );
     }
+    program.intrinsic_defs = c.intrinsic_defs.clone();
     program.fn_abis = c.fn_abis.clone();
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();

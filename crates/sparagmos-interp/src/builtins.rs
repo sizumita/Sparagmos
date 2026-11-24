@@ -2245,6 +2245,39 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// Models for compiler intrinsics the guest crate declares
+/// itself with `#[rustc_intrinsic]` (the shape of the
+/// `no_core` / minicore test crates, which redeclare the
+/// intrinsics they exercise instead of linking core's). The
+/// declaration site's own module path is part of the callee's
+/// name (`simd_bitmask::simd_bitmask`), so the registry —
+/// keyed by the `core::intrinsics` spelling — never matches
+/// it directly.
+///
+/// A compiler intrinsic's identity is its item name: rustc
+/// accepts a `#[rustc_intrinsic]` declaration only under the
+/// name of a real intrinsic, so the last path segment of the
+/// callee's name names the intrinsic, and the registry lookup
+/// of the `core::intrinsics` path built from that segment is
+/// the check that the interpreter models it. Like
+/// [`foreign_helper_lookup`], this lookup is deliberately
+/// absent from [`lookup`]: it is consulted only where a
+/// callee is already known to have no converted body (the
+/// driver's demand collection, which asks only about
+/// instances Stable MIR itself classifies as intrinsics,
+/// conversion's external-callee path — gated on the same
+/// classification, which the driver records in the program —
+/// and the interpreter's name-based dispatch of the builtin
+/// nodes conversion emitted), so a collected body always
+/// wins over the model, and an ordinary body-less function
+/// that merely shares an intrinsic's name keeps its recorded
+/// conversion failure instead of being served by the model.
+pub fn intrinsic_lookup(canonical: &str) -> Option<Builtin> {
+    let last = canonical.rsplit("::").next().unwrap_or(canonical);
+    lookup(&format!("core::intrinsics::{last}"))
+        .or_else(|| lookup(&format!("core::intrinsics::simd::{last}")))
+}
+
 /// A successful `core::fmt::Result` value (`Ok(())`).
 fn fmt_result_ok() -> Value {
     Value::Enum {
@@ -3169,6 +3202,13 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::unaligned_volatile_load"
         | "core::intrinsics::unaligned_volatile_load" => Builtin::AtomicLoad,
         "std::intrinsics::volatile_store" | "core::intrinsics::volatile_store" => {
+            Builtin::VolatileStore
+        }
+        // A nontemporal store is a plain store in this
+        // interpreter: the nontemporal hint only relaxes the
+        // cache behaviour of the access, which no observer of
+        // the sequential execution can distinguish.
+        "std::intrinsics::nontemporal_store" | "core::intrinsics::nontemporal_store" => {
             Builtin::VolatileStore
         }
         "std::intrinsics::unaligned_volatile_store"
@@ -4762,6 +4802,7 @@ impl<'a> Interpreter<'a> {
         }
         let kind = lookup(name)
             .or_else(|| foreign_helper_lookup(name))
+            .or_else(|| intrinsic_lookup(name))
             .or_else(|| fmt_trait_method(name))
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
         // The closure-taking consumers evaluate their callable

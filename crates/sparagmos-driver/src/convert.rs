@@ -249,6 +249,16 @@ pub struct Converter {
     /// diagnostics key on the referenced name.
     instance_ids: HashMap<(rustc_public::DefId, Instance), u32>,
     pub def_names: Vec<String>,
+    /// Sparagmos ids of the definitions the compiler classifies
+    /// as compiler intrinsics (`InstanceKind::Intrinsic`), as
+    /// recorded by [`Converter::note_intrinsic`]. Handed to the
+    /// interpreter with the converted program: its name-only
+    /// intrinsic fallback may serve a body-less callee only
+    /// when the callee's definition is in this set, so an
+    /// ordinary function that merely shares an intrinsic's name
+    /// keeps its recorded conversion failure instead of being
+    /// silently served by the builtin.
+    pub intrinsic_defs: std::collections::HashSet<sm::DefId>,
     /// Discriminant values of every enum ADT converted so far,
     /// keyed by the converted `DefId` (variant index -> value).
     /// Handed to the interpreter with the converted program: its
@@ -2985,6 +2995,7 @@ impl Converter {
             def_ids: HashMap::new(),
             instance_ids: HashMap::new(),
             def_names: Vec::new(),
+            intrinsic_defs: std::collections::HashSet::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
@@ -3038,6 +3049,15 @@ impl Converter {
         self.def_ids.insert(id, idx);
         self.def_names.push(id.name());
         sm::DefId::new(0, idx)
+    }
+
+    /// Record that the compiler classifies the instance `inst`
+    /// as a compiler intrinsic (see `intrinsic_defs`). The id
+    /// recorded is the instance id the program's call operands
+    /// carry, so the interpreter's gate compares like with like.
+    pub fn note_intrinsic(&mut self, inst: &Instance) {
+        let id = self.instance_def_id(inst.def.def_id(), inst);
+        self.intrinsic_defs.insert(id);
     }
 
     pub fn crate_def_id<D: CrateDef>(&mut self, def: &D) -> sm::DefId {

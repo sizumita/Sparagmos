@@ -525,6 +525,53 @@ fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
     );
 }
 
+const INTRINSIC_NAMED_TAIL_CALL_SRC: &str = r#"
+#![allow(incomplete_features)]
+#![feature(explicit_tail_calls)]
+fn atomic_fence() {
+    become atomic_fence()
+}
+fn main() {
+    atomic_fence();
+    println!("main done");
+}
+"#;
+
+#[test]
+fn run_mode_unconverted_body_named_like_an_intrinsic_exits_two() {
+    // An ordinary function that merely shares a compiler
+    // intrinsic's name (`atomic_fence`) and whose body failed
+    // conversion (here: skipped for its tail call, exactly as in
+    // `run_mode_tail_call_body_is_skipped_and_call_exits_two`)
+    // must keep its recorded conversion failure. The intrinsic
+    // fallback serves body-less intrinsic declarations, never a
+    // body that exists; when `external_builtin` consulted it,
+    // this call was diverted to `Builtin::AtomicFence` and the
+    // run silently completed (exit 0, "main done" printed).
+    let dir = temp_dir("intrinsicname");
+    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_TAIL_CALL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "calling the unconverted body is unsupported (exit 2), not silently served by the intrinsic's builtin; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("no converted body"),
+        "the reason names the unconverted body: {stderr}"
+    );
+    assert!(
+        stderr.contains("atomic_fence"),
+        "the reason names the skipped function: {stderr}"
+    );
+    assert!(
+        !stdout.contains("main done"),
+        "the run must not complete past the diverted call: {stdout}"
+    );
+}
+
 
 #[test]
 fn run_mode_async_closure_call_runs() {
@@ -6349,6 +6396,100 @@ fn convert_mode_simd_intrinsic_with_vector_args_converts() {
         out.status.code(),
         Some(0),
         "a valid SIMD monomorphization must convert; stderr={stderr}"
+    );
+}
+
+// ----- locally declared compiler intrinsics (Issue #384) --------------------
+
+// The `no_core` / minicore test crates declare the intrinsics
+// they exercise themselves with `#[rustc_intrinsic]` instead of
+// linking core's, so the callee is named by the declaration
+// site's own path and the qualified builtin registry never
+// matches it. A modelled intrinsic is served by its builtin
+// (its identity is its item name); an unmodelled one stays an
+// unmet demand.
+const LOCAL_INTRINSICS_SRC: &str = r#"
+#![feature(intrinsics, repr_simd)]
+#[rustc_intrinsic]
+unsafe fn simd_add<T>(x: T, y: T) -> T;
+#[rustc_intrinsic]
+unsafe fn simd_reduce_add_ordered<T, U>(x: T, init: U) -> U;
+#[rustc_intrinsic]
+unsafe fn nontemporal_store<T>(ptr: *mut T, val: T);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct I32x4([i32; 4]);
+fn main() {
+    let c = unsafe { simd_add(I32x4([1, 2, 3, 4]), I32x4([5, 6, 7, 8])) };
+    let sum: i32 = unsafe { simd_reduce_add_ordered(c, 0i32) };
+    println!("{sum}");
+    let mut v: u32 = 0;
+    unsafe { nontemporal_store(&mut v as *mut u32, 42u32) };
+    println!("{v}");
+}
+"#;
+
+const LOCAL_UNMODELLED_INTRINSIC_SRC: &str = r#"
+#![feature(intrinsics)]
+#[rustc_intrinsic]
+fn prefetch_read_data<T, const LOCALITY: i32>(data: *const T);
+fn main() {
+    let v: u32 = 0;
+    prefetch_read_data::<u32, 0>(&v as *const u32);
+}
+"#;
+
+fn target_crate_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with("target-crate converted:"))
+        .expect("the summary prints a target-crate line")
+}
+
+#[test]
+fn run_mode_locally_declared_intrinsics_run() {
+    let dir = temp_dir("local-intrinsics");
+    let src = fixture(&dir, "local_intrinsics.rs", LOCAL_INTRINSICS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "36\n42\n");
+}
+
+#[test]
+fn convert_mode_locally_declared_intrinsics_convert() {
+    let dir = temp_dir("local-intrinsics-convert");
+    let src = fixture(&dir, "local_intrinsics.rs", LOCAL_INTRINSICS_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        target_crate_line(&stdout).ends_with("skipped: 0"),
+        "a crate whose intrinsics are all modelled must convert fully; stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("compiler intrinsic (no fallback body)"),
+        "no local intrinsic may be left unmet; stdout={stdout}"
+    );
+}
+
+#[test]
+fn convert_mode_locally_declared_unmodelled_intrinsic_stays_skipped() {
+    let dir = temp_dir("local-intrinsic-unmodelled");
+    let src = fixture(
+        &dir,
+        "local_unmodelled.rs",
+        LOCAL_UNMODELLED_INTRINSIC_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        target_crate_line(&stdout).ends_with("skipped: 1"),
+        "an intrinsic with no interpreter model must not be credited; stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("compiler intrinsic (no fallback body)"),
+        "the skip must keep the intrinsic reason; stdout={stdout}"
     );
 }
 
