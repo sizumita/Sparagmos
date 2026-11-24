@@ -8960,6 +8960,36 @@ fn run_mode_transmute_fn_ptr_niche_payload() {
     );
 }
 
+const TRANSMUTE_FN_ADDR_AS_DATA_PTR_SRC: &str = r#"
+fn hello() { println!("hello called"); }
+fn main() {
+    let bits = hello as usize;
+    let arr: [*const u8; 1] = unsafe { std::mem::transmute(bits) };
+    let p = arr[0];
+    let q = p.wrapping_add(1);
+    println!("diff={}", (q as usize).wrapping_sub(p as usize));
+    let opt: Option<fn()> = unsafe { std::mem::transmute(bits) };
+    match opt { Some(f) => f(), None => println!("none") }
+    let f2: fn() = unsafe { std::mem::transmute(bits) };
+    f2();
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fn_addr_into_data_ptr_stays_data_ptr() {
+    // The address a function pointer was exposed at is just
+    // an integer: transmuted into a data-pointer destination
+    // it constructs a data pointer (pointer arithmetic
+    // applies), not the callable value. The callable reading
+    // is specific to function-pointer destinations, where
+    // the same bits still recover the function.
+    run_ok(
+        "transmute-fn-addr-data-ptr",
+        TRANSMUTE_FN_ADDR_AS_DATA_PTR_SRC,
+        "diff=1\nhello called\nhello called\n",
+    );
+}
+
 #[test]
 fn run_mode_transmute_fat_pointer_words() {
     // A fat pointer transmutes to its two words and back: the

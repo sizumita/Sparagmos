@@ -1575,7 +1575,7 @@ fn scalar_leaf_is_int(shape: &ir::ScalarShape) -> bool {
 /// denotes.
 fn scalar_shape_has_ptr_leaf(shape: &ir::ScalarShape) -> bool {
     match shape {
-        ir::ScalarShape::Ptr => true,
+        ir::ScalarShape::Ptr | ir::ScalarShape::FnPtr => true,
         ir::ScalarShape::AdtField { inner, .. } => {
             scalar_shape_has_ptr_leaf(inner)
         }
@@ -3738,7 +3738,9 @@ impl<'a> Converter<'a> {
     /// pointer exception in [`Self::deref_vector_shape`]).
     fn shape_contains_ptr(shape: &ir::ScalarShape) -> bool {
         match shape {
-            ir::ScalarShape::Ptr | ir::ScalarShape::FatPtr(_) => true,
+            ir::ScalarShape::Ptr
+            | ir::ScalarShape::FnPtr
+            | ir::ScalarShape::FatPtr(_) => true,
             ir::ScalarShape::Fields { fields, .. } => {
                 fields.iter().any(|(_, s)| Self::shape_contains_ptr(s))
             }
@@ -6654,8 +6656,10 @@ let inner = match (&src, target) {
             // address, like a thin data pointer: the pointer's
             // own bit pattern is the payload, which is what a
             // niche-encoded enum over a function pointer
-            // (`Option<fn()>`) stores.
-            mir::Ty::FnPtr(..) => Some(S::Ptr),
+            // (`Option<fn()>`) stores. The leaf is its own
+            // kind so construction recovers the callable value
+            // only at function-pointer destinations.
+            mir::Ty::FnPtr(..) => Some(S::FnPtr),
             // A fat pointer flattens to its two words (see
             // [`ir::ScalarShape::FatPtr`]): the data pointer's
             // synthetic address in the low word and the metadata

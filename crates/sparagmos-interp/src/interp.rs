@@ -1071,7 +1071,8 @@ pub struct Interpreter<'a> {
     /// has been exposed as an integer (see
     /// [`Self::note_exposed_target`]): a function pointer's
     /// integer form denotes the function itself, not a place,
-    /// so constructing a pointer shape from that address
+    /// so constructing a function-pointer shape from that
+    /// address
     /// recovers the callable value -- the same round-trip
     /// contract `exposed_targets` gives data pointers --
     /// instead of an address-only data reference sitting in
@@ -18079,6 +18080,12 @@ impl<'a> Interpreter<'a> {
                 }
                 _ => None,
             },
+            (ScalarShape::FnPtr, ScalarShape::FnPtr) => match value {
+                Value::FnPtr(_) | Value::Closure { .. } => {
+                    Some(value.clone())
+                }
+                _ => None,
+            },
             (
                 ScalarShape::AdtField {
                     index: si,
@@ -18329,7 +18336,7 @@ impl<'a> Interpreter<'a> {
                     ))
                 }
             }
-            (ScalarShape::Ptr, _) => match synthetic_address(value) {
+            (ScalarShape::Ptr | ScalarShape::FnPtr, _) => match synthetic_address(value) {
                 Some(addr) => {
                     self.note_exposed_target(addr as u64, value);
                     Ok(addr & bit_mask(64))
@@ -18534,10 +18541,18 @@ impl<'a> Interpreter<'a> {
                 })),
             }
             ScalarShape::Ptr => {
+                // A data-pointer leaf constructs a data
+                // pointer, even when the pattern is an address
+                // a function value was exposed at: the callable
+                // reading belongs to function-pointer
+                // destinations (the `FnPtr` leaf below) only.
+                Ok(self.materialized_ptr(bits as u64))
+            }
+            ScalarShape::FnPtr => {
                 // An address a function pointer was exposed
                 // at reconstructs that function value (see
                 // the `exposed_fn_ptrs` field); any other
-                // pattern is a data pointer as usual.
+                // pattern is an address-only pointer as usual.
                 if let Some(v) =
                     self.exposed_fn_ptrs.borrow().get(&(bits as u64))
                 {
