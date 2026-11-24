@@ -396,6 +396,19 @@ pub enum Constant {
     /// slice length): evaluates to a fat reference over an
     /// address-only base.
     FatPtr { addr: u64, meta: u64 },
+    /// A fat pointer constant to a `dyn Trait` value (see
+    /// `sparagmos_mir::ConstValue::DynRef`): evaluates to the
+    /// data pointer's value wrapped in the vtable identity the
+    /// constant carries -- the concrete type's name, the trait
+    /// bounds, and the concrete type's drop glue -- exactly the
+    /// value a runtime unsizing cast of the data pointer builds
+    /// (see [`UnsizeMeta::Dyn`]).
+    DynRef {
+        base: Box<Constant>,
+        concrete: String,
+        traits: Vec<String>,
+        glue: Option<DropGlue>,
+    },
     /// A function item constant: evaluates to the callable value
     /// naming the function.
     FnDef(String),

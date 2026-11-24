@@ -1120,6 +1120,19 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
         // and address comparisons depend on it.
         return Some(0);
     }
+    // A dyn fat pointer over an address-only base denotes that
+    // base address: over the null pointer it is the null
+    // pointer (address 0, as above), and over a stored integer
+    // address it is that address -- the vtable word does not
+    // move the data pointer.
+    if let Value::DynRef { base, .. } = value {
+        if let Value::Ref(RefTarget::Address(addr)) = &**base {
+            return Some(*addr as u128);
+        }
+        if matches!(&**base, Value::Ref(RefTarget::Null)) {
+            return Some(0);
+        }
+    }
     address_key(value).map(|key| hash_address_key(&key))
 }
 
@@ -11401,6 +11414,16 @@ impl<'a> Interpreter<'a> {
         ) {
             return synthetic_address(value);
         }
+        // A dyn fat pointer over an address-only base has the
+        // base's address (see `synthetic_address`).
+        if let Value::DynRef { base, .. } = value {
+            if matches!(
+                &**base,
+                Value::Ref(RefTarget::Address(_)) | Value::Ref(RefTarget::Null)
+            ) {
+                return synthetic_address(value);
+            }
+        }
         match self.canonical_address_key(frames, value, leaf_ty) {
             Some(key) => Some(hash_address_key(&key)),
             None => synthetic_address(value),
@@ -16386,6 +16409,17 @@ impl<'a> Interpreter<'a> {
             Constant::FatPtr { addr, meta } => Value::FatRef {
                 base: Box::new(Value::Ref(RefTarget::Address(*addr))),
                 len: u128::from(*meta),
+            },
+            Constant::DynRef {
+                base,
+                concrete,
+                traits,
+                glue,
+            } => Value::DynRef {
+                base: Box::new(self.eval_constant(base)?),
+                concrete: concrete.clone(),
+                traits: traits.clone(),
+                drop_glue: glue.clone().map(Box::new),
             },
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
             Constant::Closure(def, env) => Value::Closure {
@@ -22774,7 +22808,8 @@ pub(crate) fn eval_binary(
     // the size-aware resolution ([`Interpreter::pointer_address`])
     // so that element positions in a zero-sized sequence compare
     // equal, as they do natively; a fat pointer's equality also
-    // compares the metadata word (its length). Ordering is
+    // compares the metadata word (its length, or a dyn pointer's
+    // vtable identity). Ordering is
     // defined on the resolved addresses, which is deterministic
     // within a run -- except between two pointers into the same
     // storage, whose order is their position order (see
@@ -22797,9 +22832,27 @@ pub(crate) fn eval_binary(
                 // does not inherit).
                 Value::Ref(RefTarget::Null) => Some((0, None)),
                 Value::FatRef { len, .. } => addr_of(v).map(|a| (a, Some(*len))),
-                Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
-                    addr_of(v).map(|a| (a, None))
-                }
+                // A dyn fat pointer's metadata word is its vtable,
+                // whose identity in this model is the (concrete
+                // type, trait set) pair the value carries. The data
+                // address alone does not distinguish two dyn
+                // pointers over one address -- the null address
+                // included -- with different vtables, which native
+                // wide-pointer equality keeps distinct, so the
+                // comparison key carries a hash of that identity
+                // alongside the address (the address itself, for
+                // null checks and `PtrToInt`, stays the base's).
+                Value::DynRef {
+                    concrete, traits, ..
+                } => addr_of(v).map(|a| {
+                    (
+                        a,
+                        Some(hash_address_key(&format!(
+                            "vtable:{concrete}:{traits:?}"
+                        ))),
+                    )
+                }),
+                Value::Ref(_) | Value::FnPtr(_) => addr_of(v).map(|a| (a, None)),
                 // A non-capturing closure value is a function
                 // pointer; it compares by its body identity.
                 Value::Closure { .. } => addr_of(v).map(|a| (a, None)),

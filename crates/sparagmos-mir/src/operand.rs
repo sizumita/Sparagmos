@@ -135,6 +135,27 @@ pub enum ConstValue {
     /// in a const context. Only the pointer identity and the
     /// metadata are observable; there is no pointee to read.
     FatPtr { addr: u64, meta: u64 },
+    /// A fat reference (or raw pointer) to a `dyn Trait` value in
+    /// constant position: the data pointer constant plus the
+    /// vtable identity. Vtables are not materialised in this
+    /// model; the vtable is represented by what it is a table
+    /// *for* -- the concrete pointee type and the trait bounds
+    /// the pointer answers to. The concrete type rides as a type,
+    /// not a name, so conversion renders its name and builds its
+    /// drop glue with the same machinery a runtime unsizing cast
+    /// uses (see `sparagmos_interp::ir::UnsizeMeta::Dyn`).
+    /// `traits` holds the bounds of the `dyn` type the pointer
+    /// was decoded from, as the name strings of [`Ty::Dynamic`].
+    /// `base` is the data pointer constant in the shape the sized
+    /// value's own reference takes: a [`ConstValue::Ref`]
+    /// snapshot of the pointee, a [`ConstValue::StaticRef`] when
+    /// the pointee is a static's storage, or an address-only /
+    /// null value when the stored data word has no provenance.
+    DynRef {
+        base: Box<ConstValue>,
+        concrete: Ty,
+        traits: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

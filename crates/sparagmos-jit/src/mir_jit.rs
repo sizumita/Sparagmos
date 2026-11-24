@@ -3957,6 +3957,9 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::FatPtr { .. } => {
                 return Err(self.err("fat pointer constant"));
             }
+            mir::ConstValue::DynRef { .. } => {
+                return Err(self.err("dyn reference constant"));
+            }
         })
     }
 

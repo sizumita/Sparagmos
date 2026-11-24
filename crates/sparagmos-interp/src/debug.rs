@@ -533,6 +533,9 @@ fn collect_static_seeds(
                 collect_constant(value, seeds);
             }
             crate::ir::Constant::Ref(inner) => collect_constant(inner, seeds),
+            crate::ir::Constant::DynRef { base, .. } => {
+                collect_constant(base, seeds)
+            }
             crate::ir::Constant::Tuple(items)
             | crate::ir::Constant::SliceVal(items) => {
                 for item in items {

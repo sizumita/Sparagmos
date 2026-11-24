@@ -1623,6 +1623,7 @@ fn is_pointer_constant(v: &ir::Operand) -> bool {
                 | ir::Constant::StaticRef { .. }
                 | ir::Constant::VTablePtr(_)
                 | ir::Constant::FatPtr { .. }
+                | ir::Constant::DynRef { .. }
                 | ir::Constant::FnDef(_)
                 | ir::Constant::Closure(..)
         )
@@ -4669,6 +4670,32 @@ impl<'a> Converter<'a> {
                 addr: *addr,
                 meta: *meta,
             },
+            mir::ConstValue::DynRef {
+                base,
+                concrete,
+                traits,
+            } => {
+                // The data pointer constant converts as a
+                // reference to the concrete type the vtable
+                // names: the context a sized reference constant
+                // of that type carries, so the pointee's scalar
+                // leaves keep their signedness. The value carries
+                // the concrete type's drop glue from here, like
+                // a vtable's drop shim (see `UnsizeMeta::Dyn`).
+                let base_ctx = mir::Ty::Ref(
+                    mir::Region::Erased,
+                    Box::new(concrete.clone()),
+                    mir::Mutability::Not,
+                );
+                let base = self.convert_const_value(base, Some(&base_ctx))?;
+                let glue = DropGlueBuilder::build(self, concrete);
+                ir::Constant::DynRef {
+                    base: Box::new(base),
+                    concrete: self.concrete_ty_name(concrete),
+                    traits: traits.clone(),
+                    glue,
+                }
+            }
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
                     kind: "by-reference constant".to_string(),

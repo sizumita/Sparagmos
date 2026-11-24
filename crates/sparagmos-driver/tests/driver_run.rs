@@ -33761,3 +33761,184 @@ fn run_mode_counted_str_from_boxed_str() {
         "Rc<str>/Arc<str> conversion stdout mismatch; stderr={stderr}"
     );
 }
+
+const DYN_CONST_DISPATCH_SRC: &str = r#"
+trait Sub { fn x(&self) -> u32; }
+struct NoSub;
+impl Sub for NoSub { fn x(&self) -> u32 { 7 } }
+static NO_SUB: NoSub = NoSub;
+enum Kind { Global(&'static (dyn Sub + Send + Sync)), Other }
+struct Dispatch { subscriber: Kind }
+static mut GLOBAL_DISPATCH: Dispatch = Dispatch { subscriber: Kind::Global(&NO_SUB) };
+fn get_global() -> &'static Dispatch { unsafe { &*std::ptr::addr_of!(GLOBAL_DISPATCH) } }
+fn main() {
+    match &get_global().subscriber {
+        Kind::Global(s) => println!("x={}", s.x()),
+        Kind::Other => println!("other"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_dyn_ref_constant_in_static_initializer() {
+    // A `&dyn Trait` field inside a static's initializer (the
+    // `tracing_core::dispatcher::GLOBAL_DISPATCH` shape): the
+    // constant is a fat pointer whose data word names a static
+    // and whose vtable word names the concrete type. Decoding
+    // it needs the constant form for that pair; without it the
+    // whole initializer -- and every body whose constants touch
+    // it, like `get_global` here -- stays unconverted.
+    let dir = temp_dir("dyn-const-dispatch");
+    let src = fixture(&dir, "dyn_const_dispatch.rs", DYN_CONST_DISPATCH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a dyn reference constant in a static initializer must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x=7\n");
+}
+
+#[test]
+fn summary_mode_dyn_ref_constant_in_static_initializer_is_converted() {
+    // The conversion-side accounting of the same shape: the
+    // body that reads the dispatch static through `addr_of!`
+    // converts (it was skipped with a `ConstantKind::Allocated`
+    // reason for the raw-pointer constant).
+    let dir = temp_dir("dyn-const-dispatch-summary");
+    let src = fixture(&dir, "dyn_const_dispatch.rs", DYN_CONST_DISPATCH_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::get_global:"))
+        .unwrap_or_else(|| panic!("summary lists get_global: {stdout}"));
+    assert!(
+        line.contains("[converted]"),
+        "get_global is converted: {line}"
+    );
+    assert!(
+        !stdout.contains("target-crate unsupported:"),
+        "no target-crate function stays skipped: {stdout}"
+    );
+}
+
+const DYN_CONST_SHAPES_SRC: &str = r#"
+trait Sub { fn x(&self) -> u32; }
+struct Val(u32);
+impl Sub for Val { fn x(&self) -> u32 { self.0 } }
+static VAL: Val = Val(42);
+static DIRECT: &(dyn Sub + Send + Sync) = &VAL;
+struct Holder(Val);
+static HOLDER: Holder = Holder(Val(5));
+static INTO_FIELD: &(dyn Sub + Send + Sync) = &HOLDER.0;
+fn main() {
+    let local: &dyn Sub = &Val(9);
+    println!("local={}", local.x());
+    println!("direct={}", DIRECT.x());
+    println!("field={}", INTO_FIELD.x());
+    let raw: *const dyn Sub = &VAL;
+    println!("raw={}", unsafe { (*raw).x() });
+    let a: &dyn Sub = &VAL;
+    println!("eq={}", std::ptr::eq(a, DIRECT));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_ref_constant_shapes() {
+    // The other constant positions a `&dyn` fat pointer takes:
+    // a promoted operand constant in a body (a snapshot base),
+    // a static holding the pointer itself (a static-reference
+    // base), a pointer into another static's field (a projected
+    // static reference), a raw-pointer constant, and pointer
+    // identity between two constants naming the same vtable.
+    let dir = temp_dir("dyn-const-shapes");
+    let src = fixture(&dir, "dyn_const_shapes.rs", DYN_CONST_SHAPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn reference constants in every position must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "local=9\ndirect=42\nfield=5\nraw=42\neq=true\n"
+    );
+}
+
+#[test]
+fn run_mode_null_dyn_ref_constant_is_null() {
+    // A null `dyn` pointer formed in a const context: the
+    // operand constant's allocation carries the vtable
+    // provenance on its second word and no provenance on its
+    // null data word. It decodes as a dyn reference over the
+    // null pointer, and the value's address is the null
+    // address: `is_null` observes it.
+    let dir = temp_dir("dyn-ref-const-null");
+    let src = fixture(
+        &dir,
+        "dyn_ref_const_null.rs",
+        "trait Sub { fn x(&self) -> u32; }
+         struct NoSub;
+         impl Sub for NoSub { fn x(&self) -> u32 { 7 } }
+         const N: *const dyn Sub =
+             std::ptr::null::<NoSub>() as *const dyn Sub;
+         fn main() {
+             println!(\"null={}\", N.is_null());
+             println!(\"addr={}\", N as *const () as usize);
+         }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a null dyn reference constant must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "null=true\naddr=0\n");
+}
+
+#[test]
+fn run_mode_dyn_ptr_equality_compares_vtable_identity() {
+    // Two dyn fat pointers over the same data address (the null
+    // address, or one integer address) but with different
+    // vtables are different pointers natively: `ptr::eq` and
+    // `==` compare the metadata word as well as the address.
+    // The data address of such a pointer is the base's address
+    // (null checks and address extraction keep observing it);
+    // only the comparison distinguishes the vtables.
+    let dir = temp_dir("dyn-ptr-eq-vtable");
+    let src = fixture(
+        &dir,
+        "dyn_ptr_eq_vtable.rs",
+        "trait T { fn v(&self) -> u32; }
+         impl T for u8 { fn v(&self) -> u32 { 1 } }
+         impl T for u16 { fn v(&self) -> u32 { 2 } }
+         fn main() {
+             let a = std::ptr::null::<u8>() as *const dyn T;
+             let b = std::ptr::null::<u16>() as *const dyn T;
+             let c = std::ptr::null::<u8>() as *const dyn T;
+             println!(\"eq_ab={} eq_ac={}\", std::ptr::eq(a, b), std::ptr::eq(a, c));
+             println!(\"direct_ab={} direct_ac={}\", a == b, a == c);
+             let x = 0x1000usize as *const u8 as *const dyn T;
+             let y = 0x1000usize as *const u16 as *const dyn T;
+             let z = 0x1000usize as *const u8 as *const dyn T;
+             println!(\"eq_xy={} eq_xz={}\", std::ptr::eq(x, y), std::ptr::eq(x, z));
+             println!(\"null_a={} null_x={}\", a.is_null(), x.is_null());
+             println!(\"addr_x={:#x}\", x as *const u8 as usize);
+         }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn pointer equality must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq_ab=false eq_ac=true\ndirect_ab=false direct_ac=true\neq_xy=false eq_xz=true\nnull_a=true null_x=false\naddr_x=0x1000\n"
+    );
+}

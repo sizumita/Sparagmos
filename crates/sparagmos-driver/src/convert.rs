@@ -6074,6 +6074,13 @@ impl Converter {
         if guarded_ty_kind(inner).is_none() {
             return None;
         }
+        // A `dyn` pointee makes the pointer a fat pointer: the
+        // second word is the vtable, whose provenance names the
+        // concrete type the data word denotes. The pair has its
+        // own decoder (see `decode_dyn_ref`).
+        if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+            return self.decode_dyn_ref(inner, alloc, offset, depth);
+        }
         let prov = alloc
             .provenance
             .ptrs
@@ -6275,6 +6282,94 @@ impl Converter {
                 Some(sm::ConstValue::Ref(Box::new(pointee)))
             }
         }
+    }
+
+    /// Decode a fat reference (or raw pointer) whose pointee is
+    /// a `dyn` trait type at `offset` in `alloc`, as a
+    /// [`sm::ConstValue::DynRef`]: the data pointer decoded as a
+    /// reference to the concrete type, paired with the vtable
+    /// identity -- the concrete type itself and the bounds of
+    /// the `dyn` type the pointer was decoded from. The vtable
+    /// identity comes from the provenance of the fat pointer's
+    /// second word, which names the (concrete type, trait) pair
+    /// the vtable serves; without that provenance the pointer's
+    /// dispatch identity is unknowable and the constant stays
+    /// undecoded (`None`, the caller's fallbacks apply, exactly
+    /// as before this decoder existed).
+    fn decode_dyn_ref(
+        &mut self,
+        inner: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        let vtable_prov = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .find(|(o, _)| *o as usize == offset + PTR_SIZE);
+        let Some(vtable_prov) = vtable_prov else {
+            // No vtable provenance: the pointer's dispatch
+            // identity is unknowable. A data word that names an
+            // allocation stays undecoded, as before; a data word
+            // with no provenance of its own is the address-only
+            // (or null) value a thin pointer decodes to -- a
+            // dangling fat pointer minted from raw integers,
+            // whose only observable property is its address.
+            let has_data_prov = alloc
+                .provenance
+                .ptrs
+                .iter()
+                .any(|(o, _)| *o as usize == offset);
+            if has_data_prov {
+                return None;
+            }
+            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            return Some(if addr == 0 {
+                sm::ConstValue::NullPtr
+            } else {
+                sm::ConstValue::IntPtr(addr as u64)
+            });
+        };
+        let mir::alloc::GlobalAlloc::VTable(concrete_ty, _) =
+            mir::alloc::GlobalAlloc::from(vtable_prov.1.0)
+        else {
+            return None;
+        };
+        // The bounds the pointer answers to, in the name form
+        // body conversion gives this same `dyn` type.
+        let sm::Ty::Dynamic(traits, _, _) = self.ty(inner) else {
+            return None;
+        };
+        // The data pointer, decoded exactly as a reference
+        // constant of the concrete type decodes: the recursive
+        // call follows the data word's own provenance (a static
+        // reference when the pointee is a static's storage, a
+        // snapshot otherwise). A data word with no provenance is
+        // a null or dangling address, as for a thin pointer.
+        let has_data_prov = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .any(|(o, _)| *o as usize == offset);
+        let base = if has_data_prov {
+            self.decode_ref(&concrete_ty, alloc, offset, depth + 1)?
+        } else {
+            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            if addr == 0 {
+                sm::ConstValue::NullPtr
+            } else {
+                sm::ConstValue::IntPtr(addr as u64)
+            }
+        };
+        Some(sm::ConstValue::DynRef {
+            base: Box::new(base),
+            concrete: self.ty(&concrete_ty),
+            traits,
+        })
     }
 
     /// Decode a reference whose provenance names the static
