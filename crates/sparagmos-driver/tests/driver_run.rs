@@ -389,6 +389,190 @@ fn run_mode_large_byte_table_wrapped_static() {
     );
 }
 
+/// Build a guest source holding a 5,000-element `u32` table
+/// (past the driver's element-wise constant bound of 4,096):
+/// `decl` declares the table (with `ELEMS` as the element list)
+/// and `main` is the caller's entry point.
+fn large_u32_table_src(decl: &str, main: &str) -> String {
+    let elems: Vec<String> = (0..5000)
+        .map(|i| ((i * 3 + 1) % 1009).to_string())
+        .collect();
+    let mut src = decl.replace("ELEMS", &elems.join(", "));
+    src.push_str(main);
+    src
+}
+
+#[test]
+fn run_mode_large_u32_table_static() {
+    // A static `u32` table past the element-wise constant
+    // bound: its elements are present in the allocation, so it
+    // decodes element by element and reads back exactly, both
+    // by value and through a reference. Before the presence
+    // check, the constant kept its `ByRef` identity and the
+    // interpreter rejected the whole body.
+    let src = large_u32_table_src(
+        "static TABLE: [u32; 5000] = [ELEMS];",
+        "fn main() { let mut sum: u64 = 0; for i in 0..5000 { sum += TABLE[i] as u64; } let r: &[u32; 5000] = &TABLE; println!(\"{} {} {}\", sum, r[1234], TABLE[4999]); }",
+    );
+    let dir = temp_dir("large-u32-table");
+    let src = fixture(&dir, "large_u32_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large u32 table must run; stderr={stderr}"
+    );
+    let expect_sum: u64 = (0..5000).map(|i| ((i * 3 + 1) % 1009) as u64).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{} {} {}\n",
+            expect_sum,
+            (1234 * 3 + 1) % 1009,
+            (4999 * 3 + 1) % 1009
+        ),
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_u32_table_const() {
+    // The same table as a `const` item: the constant operand's
+    // allocation decodes by the same presence rule.
+    let src = large_u32_table_src(
+        "const TABLE: [u32; 5000] = [ELEMS];",
+        "fn main() { println!(\"{} {}\", TABLE[42], TABLE[4999]); }",
+    );
+    let dir = temp_dir("large-u32-table-const");
+    let src = fixture(&dir, "large_u32_table_const.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large u32 const table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} {}\n", (42 * 3 + 1) % 1009, (4999 * 3 + 1) % 1009),
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_pair_table_static() {
+    // Elements with a stride larger than the element payloads
+    // (a `(u16, u16)` pair): the presence check runs on the
+    // strided byte count, and each pair decodes structurally.
+    let elems: Vec<String> = (0..5000).map(|i| format!("({i}, {})", i * 2)).collect();
+    let src = format!(
+        "static TABLE: [(u16, u16); 5000] = [{}]; fn main() {{ println!(\"{{}} {{}} {{}} {{}}\", TABLE[0].0, TABLE[0].1, TABLE[4999].0, TABLE[4999].1); }}",
+        elems.join(", ")
+    );
+    let dir = temp_dir("large-pair-table");
+    let src = fixture(&dir, "large_pair_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large pair table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0 0 4999 9998\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_f64_table_static() {
+    // A static `f64` table past the bound, computed in a const
+    // block; the spot values are exact binary fractions, so the
+    // printed forms are stable.
+    let src = "static TABLE: [f64; 5000] = { let mut t = [0.0f64; 5000]; let mut i = 0usize; while i < 5000 { t[i] = (i as f64) * 0.5 - 3.0; i += 1; } t }; fn main() { println!(\"{} {} {}\", TABLE[0], TABLE[2500], TABLE[4999]); }";
+    let dir = temp_dir("large-f64-table");
+    let src = fixture(&dir, "large_f64_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large f64 table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-3 1247 2496.5\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_bool_table_static() {
+    // A 9,000-element `bool` table: one byte per element, so
+    // the allocation-presence check is what admits it past the
+    // element bound.
+    let src = "static TABLE: [bool; 9000] = { let mut t = [false; 9000]; let mut i = 0usize; while i < 9000 { t[i] = i % 3 == 0; i += 1; } t }; fn main() { let mut n = 0u32; for b in TABLE.iter() { if *b { n += 1; } } println!(\"{} {} {}\", n, TABLE[3], TABLE[4]); }";
+    let dir = temp_dir("large-bool-table");
+    let src = fixture(&dir, "large_bool_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large bool table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3000 true false\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_u32_table_nested_static() {
+    // The same table as a field of a struct static, behind a
+    // scalar field: the decode runs at a nonzero offset into
+    // the allocation, and the presence check accounts for it.
+    let src = "struct Wrap { tag: u32, table: [u32; 5000] } static W: Wrap = Wrap { tag: 77, table: { let mut t = [0u32; 5000]; let mut i = 0usize; while i < 5000 { t[i] = (i as u32) * 5 + 2; i += 1; } t } }; fn main() { println!(\"{} {} {}\", W.tag, W.table[0], W.table[4999]); }";
+    let dir = temp_dir("large-u32-table-nested");
+    let src = fixture(&dir, "large_u32_table_nested.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested large u32 table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "77 2 24997\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_str_ref_table_static() {
+    // A 5,000-element table of references: each element
+    // decodes through its provenance entry, past the bound.
+    let src = "static NAMES: [&str; 5000] = [\"xy\"; 5000]; fn main() { let mut total = 0usize; for s in NAMES.iter() { total += s.len(); } println!(\"{} {}\", total, NAMES[4999]); }";
+    let dir = temp_dir("large-str-ref-table");
+    let src = fixture(&dir, "large_str_ref_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large str ref table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10000 xy\n",
+        "decoded table values must match the source program"
+    );
+}
+
 #[test]
 fn run_mode_materialised_constant_shapes() {
     // Struct constants, a reference into the middle of an array

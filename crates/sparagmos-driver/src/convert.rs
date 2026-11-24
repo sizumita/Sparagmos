@@ -5209,36 +5209,51 @@ impl Converter {
                 };
                 if layout_count != count { return None; }
                 if count > MAX_CONST_ARRAY_ELEMS {
-                    // Past the element-wise bound, a byte array
-                    // still materialises -- as the raw bytes
-                    // themselves, the form byte arrays take in
-                    // reference position (and byte slices take in
-                    // value position above). The `Bytes` value's
-                    // size is bounded by the allocation, which
-                    // the host already holds, so the resource
+                    // Past the element-wise bound, an array still
+                    // materialises when its elements are provably
+                    // present in the allocation: a byte array as
+                    // the raw bytes themselves -- the form byte
+                    // arrays take in reference position, and byte
+                    // slices in value position above -- and any
+                    // other element type element by element,
+                    // exactly as under the bound. The resource
                     // concern behind the bound -- a declared
                     // length decoupled from the allocation,
                     // expanded into one constant per element --
-                    // does not apply. Any other element type
-                    // keeps the bound and stays undecoded.
-                    if stride.bytes() != 1
-                        || !matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
+                    // is answered by the presence check itself:
+                    // the element-wise decode below only runs
+                    // when `count * stride` bytes lie inside the
+                    // allocation from `offset`, so the work is
+                    // bounded by bytes the host already holds.
+                    // A zero stride proves nothing about the
+                    // count, so zero-sized elements keep the
+                    // bound and stay undecoded.
+                    if stride.bytes() == 1
+                        && matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
                     {
+                        // Read the array's own byte range, not
+                        // the whole allocation: a static's
+                        // storage is routinely padded past the
+                        // value with uninitialised bytes, which
+                        // must not fail the decode -- but an
+                        // uninitialised byte inside the array
+                        // does.
+                        let end = offset.checked_add(count as usize)?;
+                        let range = alloc.bytes.get(offset..end)?;
+                        let mut bytes = Vec::with_capacity(count as usize);
+                        for byte in range {
+                            bytes.push((*byte)?);
+                        }
+                        return Some(sm::ConstValue::Bytes(bytes));
+                    }
+                    let stride_bytes = stride.bytes();
+                    if stride_bytes == 0 {
                         return None;
                     }
-                    // Read the array's own byte range, not the
-                    // whole allocation: a static's storage is
-                    // routinely padded past the value with
-                    // uninitialised bytes, which must not fail
-                    // the decode -- but an uninitialised byte
-                    // inside the array does.
-                    let end = offset.checked_add(count as usize)?;
-                    let range = alloc.bytes.get(offset..end)?;
-                    let mut bytes = Vec::with_capacity(count as usize);
-                    for byte in range {
-                        bytes.push((*byte)?);
+                    let total = (count as u128).checked_mul(stride_bytes as u128)?;
+                    if offset as u128 + total > alloc.bytes.len() as u128 {
+                        return None;
                     }
-                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let mut elems = Vec::new();
                 for i in 0..count {
@@ -8428,12 +8443,15 @@ const MAX_CONST_DEPTH: usize = 32;
 /// Resource bound on array constants materialised element by
 /// element in `decode_const`, mirroring `unique_const_value`'s
 /// bound: an array length is guest-controlled input (`[(); usize::MAX]`
-/// is a legal constant whose allocation is empty), and past this
-/// many elements the value is not materialised element by element
-/// — the decode fails and reference constants keep their `ByRef`
+/// is a legal constant whose allocation is empty), so past this
+/// many elements the decode only proceeds when the elements are
+/// provably present in the allocation — the expansion is then
+/// bounded by bytes the host already holds, not by the declared
+/// length. Arrays that fail that check (and zero-sized-element
+/// arrays, whose bytes prove nothing) keep their `ByRef`
 /// identity instead of the host process aborting on allocation.
-/// Byte arrays are the one exception: they materialise as the
-/// raw `Bytes` value, whose size is the allocation's own.
+/// Byte arrays materialise as the raw `Bytes` value, whose size
+/// is the allocation's own.
 const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
 
 /// Pointer width in bytes on the target this driver runs for
