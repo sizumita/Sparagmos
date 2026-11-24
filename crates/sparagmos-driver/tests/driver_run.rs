@@ -22761,6 +22761,15 @@ fn run_mode_tool_interception_guest_env_file_is_private() {
     let src = fixture(&dir, "env_file_guest.rs", ENV_FILE_GUEST_SRC);
     let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
     let started = std::time::SystemTime::now();
+    // The driver is spawned with its temporary directory
+    // pointed at a watch directory of this test's own: the
+    // shared temporary directory can hold millions of
+    // entries on a busy host, and sweeping it can take
+    // longer than the run itself, which would leave the
+    // file unobserved even though it stood owner-only for
+    // the whole run.
+    let watch = dir.join("tmp-watch");
+    std::fs::create_dir_all(&watch).unwrap();
     let mut child = Command::new(driver)
         .arg("run")
         .arg(&src)
@@ -22768,11 +22777,12 @@ fn run_mode_tool_interception_guest_env_file_is_private() {
         .arg(driver)
         .arg("--guest-arg")
         .arg(driver)
+        .env("TMPDIR", &watch)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("failed to spawn sparagmos-driver");
-    // The guest environment file stands in the shared
+    // The guest environment file stands in the driver's
     // temporary directory for the whole artifact run; watch
     // for it while the driver works and record the
     // permissions of every one created during this run.
@@ -22782,7 +22792,7 @@ fn run_mode_tool_interception_guest_env_file_is_private() {
         .expect("failed to poll the driver")
         .is_none()
     {
-        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        if let Ok(entries) = std::fs::read_dir(&watch) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !name.starts_with("sparagmos-artifact-env-") {
@@ -22817,6 +22827,112 @@ fn run_mode_tool_interception_guest_env_file_is_private() {
     assert!(
         seen.iter().all(|(_, mode)| *mode == 0o600),
         "guest environment files were not owner-only: {seen:?}"
+    );
+}
+
+const STDERR_FILE_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "p.rs",
+        "fn main() { print!(\"child out\"); eprint!(\"child err\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(dir.join("p")).output().unwrap();
+    assert!(out.status.success(), "run failed");
+    // The built program's streams arrive byte for byte:
+    // its stderr in particular keeps its missing trailing
+    // newline on the way through the stderr channel.
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "child out");
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "child err");
+    println!("stderr file guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_guest_stderr_file_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_dir("tool-stderr-file");
+    let src = fixture(&dir, "stderr_file_guest.rs", STDERR_FILE_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let started = std::time::SystemTime::now();
+    // As in the environment-file test: watch a temporary
+    // directory of this test's own (see there for why).
+    let watch = dir.join("tmp-watch");
+    std::fs::create_dir_all(&watch).unwrap();
+    let mut child = Command::new(driver)
+        .arg("run")
+        .arg(&src)
+        .arg("--tool-program")
+        .arg(driver)
+        .arg("--guest-arg")
+        .arg(driver)
+        .env("TMPDIR", &watch)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sparagmos-driver");
+    // The guest stderr channel stands in the driver's
+    // temporary directory for the whole artifact run; watch
+    // for it while the driver works and record the
+    // permissions of every one created during this run.
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    while child
+        .try_wait()
+        .expect("failed to poll the driver")
+        .is_none()
+    {
+        if let Ok(entries) = std::fs::read_dir(&watch) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with("sparagmos-artifact-stderr-") {
+                    continue;
+                }
+                let Ok(md) = entry.metadata() else { continue };
+                if md.modified().map(|m| m < started).unwrap_or(true) {
+                    continue; // a leftover of an earlier run
+                }
+                let mode = md.permissions().mode() & 0o777;
+                if !seen.contains(&(name.clone(), mode)) {
+                    seen.push((name, mode));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let out = child
+        .wait_with_output()
+        .expect("failed to read the driver's output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "stderr file guest ok\n", "stderr={stderr}");
+    assert!(
+        !seen.is_empty(),
+        "no guest stderr channel was observed during the run"
+    );
+    // The channel carries the guest's stderr -- the
+    // recipe's diagnostics and any secrets among them:
+    // every one observed must be owner-only.
+    assert!(
+        seen.iter().all(|(_, mode)| *mode == 0o600),
+        "guest stderr channels were not owner-only: {seen:?}"
     );
 }
 

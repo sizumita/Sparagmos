@@ -152,7 +152,11 @@ denominator. Runs on every push to `main` and on manual dispatch.
   created owner-only under an unpredictable name in the
   shared temporary directory, since it is the driver's
   whole environment, inherited credentials included. The
-  re-conversion likewise runs in the producing
+  program's stderr likewise travels through a channel
+  file created owner-only under an unpredictable name,
+  since a recipe's diagnostics can carry the same kind
+  of contents. The re-conversion likewise runs in the
+  producing
   invocation's working directory, so its relative
   compilation paths (a forwarded `--extern` path, a `-L`
   directory) denote the files they denoted at build time,

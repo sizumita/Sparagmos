@@ -7135,7 +7135,13 @@ fn tool_run(
 /// recorded program's own stderr travels through the file
 /// named by `--guest-stderr-file` and is relayed byte for
 /// byte, while the subprocess's stderr carries only the
-/// driver's own lines. That separation is also what tells a
+/// driver's own lines. The channel file is allocated
+/// owner-only under an unpredictable name before the
+/// subprocess starts (see `create_private_temp_file`), as
+/// the environment file is: the program's stderr can carry
+/// the recipe's own diagnostics and secrets, so it is no
+/// more exposed to other accounts than the environment is.
+/// That separation is also what tells a
 /// driver failure from the program's own exit: the run
 /// subprocess exits 2 both when it cannot run the recorded
 /// program and when the program itself exits 2, but only
@@ -7207,16 +7213,21 @@ fn artifact_run(
             "tool interception: artifact `{program}` is not a binary this run produced"
         ));
     }
-    // The recorded program's stderr gets its own channel
-    // (a scratch file this run names), so nothing of it is
-    // filtered or rewritten on its way to the recipe.
-    static ARTIFACT_RUN_SEQ: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let seq = ARTIFACT_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stderr_path = std::env::temp_dir().join(format!(
-        "sparagmos-artifact-stderr-{}-{seq}",
-        std::process::id()
-    ));
+    // The recorded program's stderr gets its own channel,
+    // so nothing of it is filtered or rewritten on its way
+    // to the recipe. The channel is a private temporary
+    // file (see `create_private_temp_file`), allocated
+    // before the subprocess starts: it stands owner-only
+    // under an unpredictable name for the whole run, so
+    // the guest's stderr is never readable by another
+    // account while it stands, and the subprocess writes
+    // into the file that is already there, keeping its
+    // permissions.
+    let (stderr_path, stderr_file) =
+        create_private_temp_file("artifact-stderr").map_err(|e| {
+            format!("tool interception: cannot allocate the guest stderr channel: {e}")
+        })?;
+    drop(stderr_file);
     // The environment the recorded program runs under, as a
     // complete assignment: this process's environment (the
     // guest's own, which the interpreter answers its
@@ -7304,6 +7315,8 @@ fn artifact_run(
     // unsupported rather than silently lossy.
     for arg in &request.args {
         if std::str::from_utf8(arg).is_err() {
+            let _ = std::fs::remove_file(&stderr_path);
+            let _ = std::fs::remove_file(&env_path);
             return Err(format!(
                 "tool interception: running artifact `{program}`: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
             ));
@@ -7620,6 +7633,15 @@ fn execute(
         let mut relay_to_stderr = true;
         if let Some(path) = guest_stderr_file {
             relay_to_stderr = std::fs::write(path, run.stderr.as_bytes()).is_err();
+            if !relay_to_stderr {
+                // The caller allocated the channel
+                // owner-only (see `artifact_run`), and
+                // writing into the standing file keeps
+                // that; restate it so the channel is
+                // owner-only even when this write itself
+                // had to create the file.
+                restrict_to_owner(std::path::Path::new(path), 0o600);
+            }
         }
         if relay_to_stderr {
             let mut err = std::io::stderr().lock();
