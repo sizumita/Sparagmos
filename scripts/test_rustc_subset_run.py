@@ -1072,6 +1072,37 @@ class RunCmdMemoryLimitTests(unittest.TestCase):
         self.assertTrue(res["mem_exceeded"])
         self.assertFalse(res["timeout"])
 
+    def test_pipe_holding_descendant_does_not_outlive_the_timeout(self):
+        # The root exits at once; its child keeps the output pipes
+        # and sleeps on. The bounded path must still return at the
+        # record timeout: the child sits in the root's process
+        # group, so the deadline kill reaches it and the post-kill
+        # drain cannot wait out its sleep.
+        code = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(6)'])\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=1, mem_limit_mb=512)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertTrue(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_ballooning_descendant_after_root_exit_is_killed(self):
+        # The root exits at once; its child balloons. Once the root
+        # is reaped the child drops out of the ppid tree, but it
+        # keeps the root's process group, so the watchdog still
+        # sees its RSS and the bound still kills it.
+        code = ("import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, '-c', "
+                f"{self.BALLOON!r}])\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=30, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+
     def test_timeout_still_reported_with_the_bound_set(self):
         res = run.run_cmd(
             [sys.executable, "-c", "import time; time.sleep(60)"],

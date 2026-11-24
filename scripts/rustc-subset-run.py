@@ -1506,17 +1506,31 @@ def header_bucket(reason):
 
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 _MEM_POLL_SECONDS = 0.25
+# Grace for draining a killed child's output pipes. After the
+# process group is SIGKILLed every pipe writer in it is dead and
+# the drain returns at once; the grace only bites when a descendant
+# escaped the group (its own session) and still holds a pipe, in
+# which case the drain gives up rather than stalling the shard.
+_DRAIN_SECONDS = 5
 
 
 def _proc_tree(root_pid):
     """(member_pids, total_rss_bytes) of the process tree rooted at
     root_pid, from one /proc scan. ([], 0) when /proc is unavailable
-    or the root is already gone."""
+    or nothing of the tree survives.
+
+    Members are the root's descendants (by ppid) plus every process
+    in the root's process group. The bounded path starts its child
+    as a group leader (pgid == root_pid), and descendants keep that
+    group when the root dies and they are reparented, so the group
+    half keeps a ballooning descendant visible -- and killable --
+    after the root itself is gone."""
     try:
         names = os.listdir("/proc")
     except OSError:
         return [], 0
     ppid = {}
+    pgrp = {}
     for name in names:
         if not name.isdigit():
             continue
@@ -1527,25 +1541,30 @@ def _proc_tree(root_pid):
         except OSError:
             continue
         # Field 2 (comm) is parenthesised and may itself contain
-        # spaces or parens; ppid is the second field after the
-        # final ')'.
+        # spaces or parens; ppid and pgrp are the second and third
+        # fields after the final ')'.
         fields = stat[stat.rfind(b")") + 2:].split()
         try:
             ppid[pid] = int(fields[1])
+            pgrp[pid] = int(fields[2])
         except (ValueError, IndexError):
             continue
-    if root_pid not in ppid:
-        return [], 0
     members = []
-    seen = {root_pid}
-    frontier = [root_pid]
-    while frontier:
-        cur = frontier.pop()
-        members.append(cur)
-        for pid, parent in ppid.items():
-            if parent == cur and pid not in seen:
-                seen.add(pid)
-                frontier.append(pid)
+    seen = set()
+    if root_pid in ppid:
+        seen.add(root_pid)
+        frontier = [root_pid]
+        while frontier:
+            cur = frontier.pop()
+            members.append(cur)
+            for pid, parent in ppid.items():
+                if parent == cur and pid not in seen:
+                    seen.add(pid)
+                    frontier.append(pid)
+    for pid, group in pgrp.items():
+        if group == root_pid and pid not in seen:
+            seen.add(pid)
+            members.append(pid)
     total = 0
     for pid in members:
         try:
@@ -1556,16 +1575,49 @@ def _proc_tree(root_pid):
     return members, total
 
 
-def _kill_process_tree(root_pid):
+def _kill_process_tree(root_pid, pgid=None):
     """SIGKILL the whole process tree rooted at root_pid,
     descendants first, so nothing in the tree survives to hold the
-    record's output pipes (or the host's memory) open."""
+    record's output pipes (or the host's memory) open. When pgid is
+    given (the bounded path's child leads its own process group
+    with pgid == its pid), the group is killed as a whole first:
+    the group outlives the root, so descendants reparented after
+    the root's death are still reached even when the /proc scan
+    races their exit."""
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
     members, _rss = _proc_tree(root_pid)
     for pid in reversed(members):
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+def _drain_after_kill(p):
+    """Collect a killed child's remaining output, bounded by
+    _DRAIN_SECONDS. A descendant that escaped the process group
+    (its own session) can hold a pipe open past the kill; rather
+    than wait for it indefinitely, close the pipes and keep
+    whatever output was captured before the deadline."""
+    try:
+        return p.communicate(timeout=_DRAIN_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        stdout = e.output or b""
+        stderr = e.stderr or b""
+        for stream in (p.stdout, p.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        try:
+            p.wait(timeout=_DRAIN_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        return stdout, stderr
 
 
 def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
@@ -1575,11 +1627,18 @@ def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
     result carries mem_exceeded=True (exit_code is the kill's
     return code). The timeout keeps its usual meaning and result
     shape; a child that stays inside the bound returns its own
-    outcome unchanged."""
+    outcome unchanged.
+
+    The child leads its own process group (start_new_session), so
+    descendants stay reachable through the group after the root
+    exits: a descendant that inherits the output pipes and outlives
+    the root can neither hide its RSS from the poll nor keep the
+    post-kill drain waiting past its deadline."""
     limit = mem_limit_mb * 1024 * 1024
     p = subprocess.Popen(argv, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, cwd=cwd, env=env,
-                         stdin=subprocess.DEVNULL)
+                         stdin=subprocess.DEVNULL,
+                         start_new_session=True)
     deadline = time.monotonic() + timeout
     mem_exceeded = False
     timed_out = False
@@ -1592,13 +1651,13 @@ def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
             _members, rss = _proc_tree(p.pid)
             if rss > limit:
                 mem_exceeded = True
-                _kill_process_tree(p.pid)
-                stdout, stderr = p.communicate()
+                _kill_process_tree(p.pid, pgid=p.pid)
+                stdout, stderr = _drain_after_kill(p)
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
-                _kill_process_tree(p.pid)
-                stdout, stderr = p.communicate()
+                _kill_process_tree(p.pid, pgid=p.pid)
+                stdout, stderr = _drain_after_kill(p)
                 break
     return {
         "exit_code": None if timed_out else p.returncode,
