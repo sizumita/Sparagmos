@@ -656,6 +656,29 @@ pub struct Converter {
     /// rather than fall back to the declared type's decode
     /// (see `decode_ref`).
     const_budget_failed: bool,
+    /// Materialised memory allocations by provenance id,
+    /// shared within one root constant's decode tree and
+    /// cleared wherever `const_budget` resets. Resolving a
+    /// pointer's target through rustc_public materialises the
+    /// whole allocation; a table of references into one shared
+    /// allocation reaches that resolution once per element, so
+    /// without the cache the materialisation alone costs the
+    /// backing size per element -- the same unbounded shape
+    /// the expansion budget exists to bound, one layer down.
+    /// Byte-capped (see `MAX_CACHED_ALLOC_BYTES`): past the
+    /// cap the cache is cleared rather than grown, so one
+    /// constant cannot pin every allocation it merely touches.
+    alloc_cache: std::collections::HashMap<usize, std::rc::Rc<Allocation>>,
+    /// Initialiser allocations of statics, keyed by the static's
+    /// Sparagmos def id: the static arm of `decode_ref` otherwise
+    /// re-evaluates (and thereby re-materialises) the initialiser for
+    /// every reference into the static, so a table of many short
+    /// slices into one large static pays the backing size per
+    /// element. Shares the byte cap and the root-clear discipline of
+    /// `alloc_cache` (see `clear_alloc_caches`).
+    static_inits: std::collections::HashMap<sm::DefId, std::rc::Rc<Allocation>>,
+    /// Total bytes held in `alloc_cache` and `static_inits`.
+    alloc_cache_bytes: usize,
 }
 
 impl Default for Converter {
@@ -3181,6 +3204,14 @@ fn instance_item_body(
 
 /// The outcome of probing a reference constant's allocation for
 /// the fat-pointer shape (see `Converter::read_fat_pointer`).
+/// A resolved provenance target (see `Converter::resolve_alloc`):
+/// a memory allocation, shared through the converter's cache,
+/// or any other global allocation in its bare form.
+enum ResolvedAlloc {
+    Memory(std::rc::Rc<Allocation>),
+    Other(mir::alloc::GlobalAlloc),
+}
+
 enum FatPointerRead {
     /// Not a fat pointer: no provenance, a non-memory target, or
     /// no readable in-bounds length word.
@@ -3241,6 +3272,9 @@ impl Converter {
             const_fn_mentions_seen: std::collections::HashSet::new(),
             const_budget: MAX_CONST_TOTAL_ELEMS,
             const_budget_failed: false,
+            alloc_cache: std::collections::HashMap::new(),
+            static_inits: std::collections::HashMap::new(),
+            alloc_cache_bytes: 0,
         }
     }
 
@@ -3317,7 +3351,7 @@ impl Converter {
         if static_is_foreign(&def) {
             return;
         }
-        let Ok(alloc) = def.eval_initializer() else {
+        let Some(alloc) = self.static_initializer(&def) else {
             return;
         };
         let Some(init) = self.decode_const(&ty, &alloc, 0, 0) else {
@@ -4851,6 +4885,7 @@ impl Converter {
         // behind, so whether a constant decodes would depend
         // on the constants visited before it.
         self.const_budget = MAX_CONST_TOTAL_ELEMS;
+        self.clear_alloc_caches();
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
         // `guarded_ty_kind`); the value is a zero-sized closure
@@ -4968,34 +5003,103 @@ impl Converter {
         }
     }
 
+    /// Resolve the allocation provenance `prov` names. A
+    /// memory allocation is served from `alloc_cache` when
+    /// this decode tree has already materialised it, and is
+    /// recorded there when it fits the cache's byte cap;
+    /// anything else comes back as the bare `GlobalAlloc` for
+    /// the caller to match on.
+    /// Drop both backing-allocation caches and reset their shared
+    /// byte accounting. Called wherever the constant-expansion
+    /// budget resets (the root of every decoded constant), so cached
+    /// materialisations live for one root decode.
+    fn clear_alloc_caches(&mut self) {
+        self.alloc_cache.clear();
+        self.static_inits.clear();
+        self.alloc_cache_bytes = 0;
+    }
+
+    /// The initialiser allocation of the static `def`, evaluated at
+    /// most once per root decode: `eval_initializer` materialises
+    /// the whole allocation on every call, so resolving each element
+    /// of a large table of references into one static through it
+    /// would copy the backing once per element.
+    fn static_initializer(
+        &mut self,
+        def: &mir::mono::StaticDef,
+    ) -> Option<std::rc::Rc<Allocation>> {
+        let key = self.crate_def_id(def);
+        if let Some(alloc) = self.static_inits.get(&key) {
+            return Some(alloc.clone());
+        }
+        let alloc = std::rc::Rc::new(def.eval_initializer().ok()?);
+        let len = alloc.bytes.len();
+        if self.alloc_cache_bytes + len > MAX_CACHED_ALLOC_BYTES {
+            self.clear_alloc_caches();
+        }
+        if len <= MAX_CACHED_ALLOC_BYTES {
+            self.alloc_cache_bytes += len;
+            self.static_inits.insert(key, alloc.clone());
+        }
+        Some(alloc)
+    }
+
+    fn resolve_alloc(&mut self, prov: &Prov) -> ResolvedAlloc {
+        let key = prov.0.to_index();
+        if let Some(alloc) = self.alloc_cache.get(&key) {
+            return ResolvedAlloc::Memory(alloc.clone());
+        }
+        match mir::alloc::GlobalAlloc::from(prov.0) {
+            mir::alloc::GlobalAlloc::Memory(alloc) => {
+                let alloc = std::rc::Rc::new(alloc);
+                let size = alloc.bytes.len();
+                if size <= MAX_CACHED_ALLOC_BYTES {
+                    if self.alloc_cache_bytes + size > MAX_CACHED_ALLOC_BYTES {
+                        self.alloc_cache.clear();
+                        self.alloc_cache_bytes = 0;
+                    }
+                    self.alloc_cache_bytes += size;
+                    self.alloc_cache.insert(key, alloc.clone());
+                }
+                ResolvedAlloc::Memory(alloc)
+            }
+            other => ResolvedAlloc::Other(other),
+        }
+    }
+
+    /// The memory allocation provenance `prov` names, if it
+    /// names one (see `resolve_alloc`).
+    fn memory_alloc(&mut self, prov: &Prov) -> Option<std::rc::Rc<Allocation>> {
+        match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(alloc) => Some(alloc),
+            ResolvedAlloc::Other(_) => None,
+        }
+    }
+
     /// Read a fat-pointer allocation: provenance points at the data
     /// allocation, the second word is the length metadata.
     fn read_fat_pointer(&mut self, alloc: &Allocation) -> FatPointerRead {
         let Some((_, prov)) = alloc.provenance.ptrs.first() else {
             return FatPointerRead::NotFat;
         };
-        let target = mir::alloc::GlobalAlloc::from(prov.0);
-        let mir::alloc::GlobalAlloc::Memory(target) = target else {
+        let Some(target) = self.memory_alloc(prov) else {
             return FatPointerRead::NotFat;
         };
         let Ok(meta) = alloc.read_partial_uint(8..16) else {
             return FatPointerRead::NotFat;
         };
         let meta = meta as u64;
-        let Ok(raw) = target.raw_bytes() else {
-            return FatPointerRead::NotFat;
-        };
         // The data is exactly the metadata's byte count: the
         // backing allocation may extend past it (the file path
         // allocation behind a `Location` constant carries a
-        // trailing NUL byte, for one).
-        let Some(data) = raw.get(..meta as usize) else {
+        // trailing NUL byte, for one), so read only that range
+        // rather than copying the whole backing allocation.
+        let Some(data) = alloc_bytes_in(&target, 0..meta as usize) else {
             return FatPointerRead::NotFat;
         };
         if !self.spend_const_budget(data.len()) {
             return FatPointerRead::OverBudget;
         }
-        let data = data.to_vec();
         FatPointerRead::Data(data, meta)
     }
 
@@ -5076,9 +5180,7 @@ impl Converter {
         // Thin-pointer shape: follow the provenance to the pointee.
         if let Some((_, prov)) = alloc.provenance.ptrs.first() {
             let alloc_id = prov.0.to_index() as u64;
-            if let mir::alloc::GlobalAlloc::Memory(pointee) =
-                mir::alloc::GlobalAlloc::from(prov.0)
-            {
+            if let Some(pointee) = self.memory_alloc(prov) {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
                     Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
@@ -5226,6 +5328,7 @@ impl Converter {
         // A constant whose expansion exhausts it stays undecoded.
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.clear_alloc_caches();
         }
         if !self.spend_const_budget(1) {
             return None;
@@ -5298,17 +5401,15 @@ impl Converter {
                 if !self.spend_const_budget(alloc.bytes.len().saturating_sub(offset)) {
                     return None;
                 }
-                let raw = alloc.raw_bytes().ok()?;
-                let bytes = raw.get(offset..)?;
-                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+                let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
+                String::from_utf8(bytes).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 // Likewise a slice in non-reference position is a
                 // trailing unsized field (the `[u8]` inside `CStr`
                 // is the canonical case): its elements run to the
                 // end of the allocation.
-                let raw = alloc.raw_bytes().ok()?;
-                let bytes = raw.get(offset..)?;
+                let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
                 if matches!(
                     elem.kind(),
                     TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
@@ -5319,7 +5420,7 @@ impl Converter {
                     if !self.spend_const_budget(bytes.len()) {
                         return None;
                     }
-                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
                 if stride == 0 || bytes.len() % stride != 0 {
@@ -5494,17 +5595,16 @@ impl Converter {
             // the `&[u8]` casts its own methods perform) — so
             // decode them as the byte string they are, like the
             // `[u8]` trailing-slice decode below.
-            let raw = alloc.raw_bytes().ok()?;
-            let bytes = raw.get(offset..)?;
+            let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
             // The payload copy is charged against the shared
-            // expansion budget before it is made: a table of
-            // references to one shared `CStr` reaches this arm
-            // once per element, so uncharged copies would add
-            // up past the budget.
+            // expansion budget: a table of references to one
+            // shared `CStr` reaches this arm once per element,
+            // so uncharged copies would add up past the budget.
+            // Only the tail from `offset` is copied, not the
+            // whole allocation before it.
             if !self.spend_const_budget(bytes.len()) {
                 return None;
             }
-            let bytes = bytes.to_vec();
             return Some(sm::ConstValue::Adt {
                 variant: 0,
                 fields: vec![sm::ConstValue::Bytes(bytes)],
@@ -6167,27 +6267,32 @@ impl Converter {
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
-        match mir::alloc::GlobalAlloc::from(prov.0) {
-            mir::alloc::GlobalAlloc::Memory(target) => {
+        match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(target) => {
                 let block = self.decode_erased_alloc(&target, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
-            mir::alloc::GlobalAlloc::Static(def) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
                 if static_is_foreign(&def) {
                     return None;
                 }
-                let init = def.eval_initializer().ok()?;
+                let init = self.static_initializer(&def)?;
                 let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
-            mir::alloc::GlobalAlloc::Function(inst) => self.fn_pointer_value(&inst),
-            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Function(inst)) => {
+                self.fn_pointer_value(&inst)
+            }
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::TypeId { ty: tid_ty }) => {
                 let (lo, _) = type_id_segments(&tid_ty);
                 Some(sm::ConstValue::IntPtr(lo))
             }
-            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
                 Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)))
             }
+            // `resolve_alloc` returns memory allocations in
+            // the `Memory` variant, never wrapped in `Other`.
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => None,
         }
     }
 
@@ -6413,6 +6518,7 @@ impl Converter {
         }
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.clear_alloc_caches();
         }
         // A pointee type passing through a coroutine-closure
         // type cannot be asked its kind (see `guarded_ty_kind`)
@@ -6460,8 +6566,8 @@ impl Converter {
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
-        let (target, static_def) = match mir::alloc::GlobalAlloc::from(prov.0) {
-            mir::alloc::GlobalAlloc::Memory(target) => (target, None),
+        let (target, static_def) = match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(target) => (target, None),
             // A reference to a static: the pointee is the static's
             // own storage. The decoded value is the static's
             // initializer allocation (the value the storage holds
@@ -6469,12 +6575,12 @@ impl Converter {
             // static's identity so the interpreter can route reads
             // and writes through the program-level statics store
             // instead of a per-constant snapshot.
-            mir::alloc::GlobalAlloc::Static(def) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
                 if static_is_foreign(&def) {
                     return self
                         .decode_foreign_static_ref(&def, inner, alloc, offset, target_off, depth);
                 }
-                let init = def.eval_initializer().ok()?;
+                let init = self.static_initializer(&def)?;
                 (init, Some(def))
             }
             // A pointer at a function item: the item is zero-sized,
@@ -6482,10 +6588,10 @@ impl Converter {
             // covers both references to function items reached
             // through pointer-typed fields and pointers to functions
             // stored under a cast (`&(foo as *const u8)`).
-            mir::alloc::GlobalAlloc::Function(inst) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Function(inst)) => {
                 return self.fn_pointer_value(&inst);
             }
-            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::TypeId { ty: tid_ty }) => {
                 // A `TypeId` value is a 128-bit hash of the type,
                 // stored as two pointer-sized segments whose first
                 // segment's provenance is this symbolic allocation.
@@ -6513,8 +6619,13 @@ impl Converter {
             // equality / ordering, `ptr::eq` on trait objects), so
             // it decodes to a stable identity number for the
             // (concrete type, trait) pair.
-            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
                 return Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)));
+            }
+            // `resolve_alloc` returns memory allocations in
+            // the `Memory` variant, never wrapped in `Other`.
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => {
+                return None;
             }
         };
         match inner.kind() {
@@ -6524,12 +6635,11 @@ impl Converter {
                 // slot), as for the slice arm below: the backing
                 // allocation may extend past the string.
                 let len = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
-                let raw = target.raw_bytes().ok()?;
-                let bytes = raw.get(target_off..target_off + len)?;
+                let bytes = alloc_bytes_in(&target, target_off..target_off + len)?;
                 if !self.spend_const_budget(bytes.len()) {
                     return None;
                 }
-                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+                String::from_utf8(bytes).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
@@ -6547,12 +6657,11 @@ impl Converter {
                     }
                 }
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
-                    let raw = target.raw_bytes().ok()?;
-                    let bytes = raw.get(target_off..target_off + count)?;
+                    let bytes = alloc_bytes_in(&target, target_off..target_off + count)?;
                     if !self.spend_const_budget(bytes.len()) {
                         return None;
                     }
-                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
                 if stride == 0 && count > 0 { return None; }
@@ -6572,12 +6681,11 @@ impl Converter {
             {
                 // Byte arrays keep the established `Bytes` form (the
                 // fmt pieces template is the canonical case).
-                let raw = target.raw_bytes().ok()?;
-                let bytes = raw.get(target_off..)?;
+                let bytes = alloc_bytes_in(&target, target_off..target.bytes.len())?;
                 if !self.spend_const_budget(bytes.len()) {
                     return None;
                 }
-                Some(sm::ConstValue::Bytes(bytes.to_vec()))
+                Some(sm::ConstValue::Bytes(bytes))
             }
             _ => {
                 // A type-erased pointee: the declared type is
@@ -6641,13 +6749,13 @@ impl Converter {
                             | RigidTy::Bool
                     )
                 ) {
-                    if let Ok(raw) = target.raw_bytes() {
-                        if raw.len() > target_off + 1 {
-                            if !self.spend_const_budget(raw.len() - target_off) {
+                    if let Some(raw) = alloc_bytes_in(&target, target_off..target.bytes.len()) {
+                        if raw.len() > 1 {
+                            if !self.spend_const_budget(raw.len()) {
                                 return None;
                             }
                             return Some(sm::ConstValue::Ref(Box::new(
-                                sm::ConstValue::Bytes(raw[target_off..].to_vec()),
+                                sm::ConstValue::Bytes(raw),
                             )));
                         }
                     }
@@ -8646,6 +8754,10 @@ const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
 /// multiply that block's copies past the budget either.
 const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
 
+/// Cap on the total bytes held in the converter's per-constant
+/// allocation cache (see `Converter::alloc_cache`).
+const MAX_CACHED_ALLOC_BYTES: usize = 1 << 28;
+
 /// Pointer width in bytes on the target this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
 const PTR_SIZE: usize = 8;
@@ -8732,6 +8844,22 @@ fn prov_at(alloc: &Allocation, offset: usize) -> Option<&Prov> {
     ptrs.get(idx)
         .filter(|(o, _)| *o == offset)
         .map(|(_, prov)| prov)
+}
+
+/// Collect the bytes of `alloc` in `range` into a fresh
+/// vector, failing when the range is out of bounds or any
+/// byte inside it is uninitialised. Unlike
+/// `Allocation::raw_bytes`, which copies the whole
+/// allocation and fails on any uninitialised byte anywhere
+/// in it, this reads only the requested range: a fat pointer
+/// into a large shared allocation -- one element of a big
+/// table of short slices into one promoted array -- must
+/// not copy the entire backing allocation per element (a
+/// 400,000-element table of one-byte slices into a 16 MiB
+/// array copied terabytes in aggregate while charging only
+/// the one-byte results against the expansion budget).
+fn alloc_bytes_in(alloc: &Allocation, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
+    alloc.bytes.get(range)?.iter().copied().collect()
 }
 
 fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {

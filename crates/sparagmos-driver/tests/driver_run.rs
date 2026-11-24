@@ -862,6 +862,82 @@ fn run_mode_large_reference_table_reads_back() {
 }
 
 #[test]
+fn run_mode_slice_table_into_shared_array_reads_requested_ranges() {
+    // Slices at different offsets into one shared backing
+    // array decode exactly the requested byte ranges: the
+    // fat-pointer decode reads `target.bytes` over the
+    // element's range only, so values at nonzero offsets and
+    // a slice ending at the backing's last byte come back
+    // byte-exact.
+    let src = "static BIG: [u8; 4096] = { let mut a = [0u8; 4096]; let mut i = 0; while i < 4096 { a[i] = (i % 251) as u8; i += 1; } a }; static TABLE: [&[u8]; 3] = unsafe { [std::slice::from_raw_parts(BIG.as_ptr(), 1), std::slice::from_raw_parts(BIG.as_ptr().add(100), 3), std::slice::from_raw_parts(BIG.as_ptr().add(4000), 96)] }; fn main() { println!(\"{} {} {} {}\", TABLE[0][0], TABLE[1][2], TABLE[2][95], TABLE[2].len()); }";
+    let dir = temp_dir("slice-table-ranges");
+    let src = fixture(&dir, "slice_table_ranges.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a slice table into a shared array must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0 102 79 96\n",
+        "slices must read back the requested ranges of the backing array"
+    );
+}
+
+#[test]
+fn run_mode_large_slice_table_into_shared_static_reads_back() {
+    // A 400,000-element table of one-byte slices into one
+    // promoted 16 MiB static: the expansion budget charges
+    // only the requested byte per element, but decoding used
+    // to materialise the whole backing allocation for every
+    // element (over 6 TB of transient copies in total), so
+    // the run could not finish. The static's initialiser is
+    // now evaluated once per root decode and each element
+    // reads only its requested range.
+    let src = "static BIG: [u8; 16777216] = [7; 16777216]; static TABLE: [&[u8]; 400000] = [unsafe { std::slice::from_raw_parts(BIG.as_ptr(), 1) }; 400000]; fn main() { println!(\"{} {} {}\", TABLE[0][0], TABLE[399999][0], TABLE.len()); }";
+    let dir = temp_dir("large-slice-table-static");
+    let src = fixture(&dir, "large_slice_table_static.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large slice table into a shared static must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7 400000\n",
+        "decoded slice values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_slice_table_into_shared_const_reads_back() {
+    // The same table shape with a `const` backing array: the
+    // elements resolve through the memory-allocation arm,
+    // whose materialisation is cached per root decode, so
+    // 1,000 elements into one 16 MiB allocation decode
+    // without re-materialising the backing per element.
+    let src = "const BIGC: [u8; 16777216] = [7; 16777216]; static TABLE: [&[u8]; 1000] = [unsafe { std::slice::from_raw_parts(BIGC.as_ptr(), 1) }; 1000]; fn main() { println!(\"{} {} {}\", TABLE[0][0], TABLE[999][0], TABLE.len()); }";
+    let dir = temp_dir("large-slice-table-const");
+    let src = fixture(&dir, "large_slice_table_const.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large slice table into a shared const must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7 1000\n",
+        "decoded slice values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the
