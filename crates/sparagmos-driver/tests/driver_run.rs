@@ -33899,3 +33899,46 @@ fn run_mode_null_dyn_ref_constant_is_null() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "null=true\naddr=0\n");
 }
+
+#[test]
+fn run_mode_dyn_ptr_equality_compares_vtable_identity() {
+    // Two dyn fat pointers over the same data address (the null
+    // address, or one integer address) but with different
+    // vtables are different pointers natively: `ptr::eq` and
+    // `==` compare the metadata word as well as the address.
+    // The data address of such a pointer is the base's address
+    // (null checks and address extraction keep observing it);
+    // only the comparison distinguishes the vtables.
+    let dir = temp_dir("dyn-ptr-eq-vtable");
+    let src = fixture(
+        &dir,
+        "dyn_ptr_eq_vtable.rs",
+        "trait T { fn v(&self) -> u32; }
+         impl T for u8 { fn v(&self) -> u32 { 1 } }
+         impl T for u16 { fn v(&self) -> u32 { 2 } }
+         fn main() {
+             let a = std::ptr::null::<u8>() as *const dyn T;
+             let b = std::ptr::null::<u16>() as *const dyn T;
+             let c = std::ptr::null::<u8>() as *const dyn T;
+             println!(\"eq_ab={} eq_ac={}\", std::ptr::eq(a, b), std::ptr::eq(a, c));
+             println!(\"direct_ab={} direct_ac={}\", a == b, a == c);
+             let x = 0x1000usize as *const u8 as *const dyn T;
+             let y = 0x1000usize as *const u16 as *const dyn T;
+             let z = 0x1000usize as *const u8 as *const dyn T;
+             println!(\"eq_xy={} eq_xz={}\", std::ptr::eq(x, y), std::ptr::eq(x, z));
+             println!(\"null_a={} null_x={}\", a.is_null(), x.is_null());
+             println!(\"addr_x={:#x}\", x as *const u8 as usize);
+         }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn pointer equality must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq_ab=false eq_ac=true\ndirect_ab=false direct_ac=true\neq_xy=false eq_xz=true\nnull_a=true null_x=false\naddr_x=0x1000\n"
+    );
+}

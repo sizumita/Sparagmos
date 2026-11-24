@@ -22808,7 +22808,8 @@ pub(crate) fn eval_binary(
     // the size-aware resolution ([`Interpreter::pointer_address`])
     // so that element positions in a zero-sized sequence compare
     // equal, as they do natively; a fat pointer's equality also
-    // compares the metadata word (its length). Ordering is
+    // compares the metadata word (its length, or a dyn pointer's
+    // vtable identity). Ordering is
     // defined on the resolved addresses, which is deterministic
     // within a run -- except between two pointers into the same
     // storage, whose order is their position order (see
@@ -22831,9 +22832,27 @@ pub(crate) fn eval_binary(
                 // does not inherit).
                 Value::Ref(RefTarget::Null) => Some((0, None)),
                 Value::FatRef { len, .. } => addr_of(v).map(|a| (a, Some(*len))),
-                Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
-                    addr_of(v).map(|a| (a, None))
-                }
+                // A dyn fat pointer's metadata word is its vtable,
+                // whose identity in this model is the (concrete
+                // type, trait set) pair the value carries. The data
+                // address alone does not distinguish two dyn
+                // pointers over one address -- the null address
+                // included -- with different vtables, which native
+                // wide-pointer equality keeps distinct, so the
+                // comparison key carries a hash of that identity
+                // alongside the address (the address itself, for
+                // null checks and `PtrToInt`, stays the base's).
+                Value::DynRef {
+                    concrete, traits, ..
+                } => addr_of(v).map(|a| {
+                    (
+                        a,
+                        Some(hash_address_key(&format!(
+                            "vtable:{concrete}:{traits:?}"
+                        ))),
+                    )
+                }),
+                Value::Ref(_) | Value::FnPtr(_) => addr_of(v).map(|a| (a, None)),
                 // A non-capturing closure value is a function
                 // pointer; it compares by its body identity.
                 Value::Closure { .. } => addr_of(v).map(|a| (a, None)),
