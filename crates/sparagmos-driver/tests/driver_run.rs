@@ -559,6 +559,75 @@ fn run_mode_shared_byte_block_refs_under_budget() {
 }
 
 #[test]
+fn run_mode_over_budget_fat_pointer_prefix_stays_undecoded() {
+    // A fat-pointer constant whose recorded length is a prefix
+    // of a larger backing allocation, at a size the shared
+    // expansion budget cannot pay for: the constant must stay
+    // undecoded. Reading the whole backing allocation instead
+    // (the plain-pointee shortcut) would silently replace the
+    // recorded length 1,048,577 with the allocation's 1,048,578.
+    let lit = "a".repeat(1048578);
+    let src = format!(
+        "const RAW: &[u8; 1048578] = b\"{lit}\"; const fn prefix(arr: &'static [u8; 1048578]) -> &'static [u8] {{ unsafe {{ std::slice::from_raw_parts(arr.as_ptr(), 1048577) }} }} const S: &[u8] = prefix(RAW); fn main() {{ println!(\"{{}}\", S.len()); }}"
+    );
+    let dir = temp_dir("over-budget-fat-prefix");
+    let src = fixture(&dir, "over_budget_fat_prefix.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget fat-pointer prefix must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_over_budget_str_prefix_stays_undecoded() {
+    // The `&str` form of the same shape: the recorded length
+    // is a prefix of the backing allocation and over the
+    // budget, so the constant stays undecoded rather than
+    // materialising with the allocation's length.
+    let lit = "a".repeat(1048578);
+    let src = format!(
+        "const RAW: &[u8; 1048578] = b\"{lit}\"; const fn prefix_str(arr: &'static [u8; 1048578]) -> &'static str {{ unsafe {{ std::str::from_utf8_unchecked(std::slice::from_raw_parts(arr.as_ptr(), 1048577)) }} }} const T: &str = prefix_str(RAW); fn main() {{ println!(\"{{}}\", T.len()); }}"
+    );
+    let dir = temp_dir("over-budget-str-prefix");
+    let src = fixture(&dir, "over_budget_str_prefix.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget str prefix must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_fat_pointer_prefix_under_budget_reads_back() {
+    // The same prefix shape at a size the budget covers still
+    // materialises with its recorded length, not the backing
+    // allocation's.
+    let lit = "a".repeat(600000);
+    let src = format!(
+        "const RAW: &[u8; 600000] = b\"{lit}\"; const fn prefix(arr: &'static [u8; 600000]) -> &'static [u8] {{ unsafe {{ std::slice::from_raw_parts(arr.as_ptr(), 500000) }} }} const S: &[u8] = prefix(RAW); fn main() {{ println!(\"{{}} {{}}\", S.len(), S[499999]); }}"
+    );
+    let dir = temp_dir("fat-prefix-under-budget");
+    let src = fixture(&dir, "fat_prefix_under_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget fat-pointer prefix must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "500000 97\n",
+        "the recorded prefix length must be preserved"
+    );
+}
+
+#[test]
 fn run_mode_large_pair_table_static() {
     // Elements with a stride larger than the element payloads
     // (a `(u16, u16)` pair): the presence check runs on the

@@ -3169,6 +3169,22 @@ fn instance_item_body(
     })
 }
 
+/// The outcome of probing a reference constant's allocation for
+/// the fat-pointer shape (see `Converter::read_fat_pointer`).
+enum FatPointerRead {
+    /// Not a fat pointer: no provenance, a non-memory target, or
+    /// no readable in-bounds length word.
+    NotFat,
+    /// A fat pointer whose payload the remaining expansion
+    /// budget cannot pay for. The length metadata is known, so a
+    /// fallback that rereads the pointee without it would
+    /// silently change the constant's value.
+    OverBudget,
+    /// The pointee bytes (exactly the metadata's byte count)
+    /// and the metadata itself.
+    Data(Vec<u8>, u64),
+}
+
 impl Converter {
     pub fn new() -> Self {
         TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -4924,23 +4940,33 @@ impl Converter {
 
     /// Read a fat-pointer allocation: provenance points at the data
     /// allocation, the second word is the length metadata.
-    fn read_fat_pointer(&mut self, alloc: &Allocation) -> Option<(Vec<u8>, u64)> {
-        let (_, prov) = alloc.provenance.ptrs.first()?;
+    fn read_fat_pointer(&mut self, alloc: &Allocation) -> FatPointerRead {
+        let Some((_, prov)) = alloc.provenance.ptrs.first() else {
+            return FatPointerRead::NotFat;
+        };
         let target = mir::alloc::GlobalAlloc::from(prov.0);
         let mir::alloc::GlobalAlloc::Memory(target) = target else {
-            return None;
+            return FatPointerRead::NotFat;
         };
-        let meta = alloc.read_partial_uint(8..16).ok()? as u64;
-        let raw = target.raw_bytes().ok()?;
+        let Ok(meta) = alloc.read_partial_uint(8..16) else {
+            return FatPointerRead::NotFat;
+        };
+        let meta = meta as u64;
+        let Ok(raw) = target.raw_bytes() else {
+            return FatPointerRead::NotFat;
+        };
         // The data is exactly the metadata's byte count: the
         // backing allocation may extend past it (the file path
         // allocation behind a `Location` constant carries a
         // trailing NUL byte, for one).
-        let data = raw.get(..meta as usize)?.to_vec();
+        let Some(data) = raw.get(..meta as usize) else {
+            return FatPointerRead::NotFat;
+        };
+        let data = data.to_vec();
         if !self.spend_const_budget(data.len()) {
-            return None;
+            return FatPointerRead::OverBudget;
         }
-        Some((data, meta))
+        FatPointerRead::Data(data, meta)
     }
 
     /// Constants of reference type. The allocation of a reference
@@ -4967,8 +4993,8 @@ impl Converter {
         // shortcut; every other shape falls through to the decoder
         // below (a raw-byte slice of wider or non-scalar elements
         // has no value form in the interpreter).
-        if let Some((data, meta)) = self.read_fat_pointer(alloc) {
-            match &inner_kind {
+        match self.read_fat_pointer(alloc) {
+            FatPointerRead::Data(data, meta) => match &inner_kind {
                 Some(TyKind::RigidTy(RigidTy::Str)) => {
                     return match String::from_utf8(data) {
                         Ok(s) => sm::ConstValue::Str(s),
@@ -4987,7 +5013,35 @@ impl Converter {
                     return sm::ConstValue::Slice { data, meta };
                 }
                 _ => {}
+            },
+            FatPointerRead::OverBudget => {
+                // The allocation is a fat pointer whose payload
+                // the expansion budget refused. The plain-pointee
+                // shortcuts below would read the whole backing
+                // allocation and silently replace the recorded
+                // length with the allocation's own, so a reference
+                // of one of those shapes keeps its exact `ByRef`
+                // identity (stays undecoded) instead. Other shapes
+                // have no such shortcut and fall through as
+                // before.
+                let drops_meta = match &inner_kind {
+                    Some(TyKind::RigidTy(RigidTy::Str)) => true,
+                    Some(TyKind::RigidTy(RigidTy::Slice(elem))) => matches!(
+                        elem.kind(),
+                        TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                    ),
+                    _ => false,
+                };
+                if drops_meta {
+                    if let Some((_, prov)) = alloc.provenance.ptrs.first() {
+                        return sm::ConstValue::ByRef {
+                            alloc_id: prov.0.to_index() as u64,
+                            offset: 0,
+                        };
+                    }
+                }
             }
+            FatPointerRead::NotFat => {}
         }
         // Thin-pointer shape: follow the provenance to the pointee.
         if let Some((_, prov)) = alloc.provenance.ptrs.first() {
