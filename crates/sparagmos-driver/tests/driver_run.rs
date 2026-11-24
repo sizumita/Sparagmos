@@ -34264,6 +34264,70 @@ fn run_mode_str_pattern_predicate_drops_by_value_captures() {
     );
 }
 
+const STR_PATTERN_PRED_PANIC_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+struct Guard(Rc<i32>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        println!("guard dropped, count now {}", Rc::strong_count(&self.0));
+    }
+}
+
+fn main() {
+    // A by-value predicate that panics is dropped by the
+    // callee's cleanup as the call unwinds, for each of the
+    // three searches.
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let pred = move |_: char| -> bool { let _ = &rc2; panic!("boom") };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(pred)));
+    println!("contains caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+    let rc3 = rc.clone();
+    let pred2 = move |_: char| -> bool { let _ = &rc3; panic!("boom") };
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".starts_with(pred2)));
+    println!("starts caught={} count={}", r2.is_err(), Rc::strong_count(&rc));
+    let rc4 = rc.clone();
+    let pred3 = move |_: char| -> bool { let _ = &rc4; panic!("boom") };
+    let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".ends_with(pred3)));
+    println!("ends caught={} count={}", r3.is_err(), Rc::strong_count(&rc));
+    // A capture with a real destructor runs it during the unwind.
+    let rc5 = Rc::new(5);
+    let g = Guard(rc5.clone());
+    let pred4 = move |_: char| -> bool { let _ = &g; panic!("boom") };
+    let r4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(pred4)));
+    println!("guard caught={} count={}", r4.is_err(), Rc::strong_count(&rc5));
+    // A borrowed predicate that panics is NOT dropped by the
+    // call; its owner still holds it after the catch.
+    let rc6 = Rc::new(6);
+    let rc6c = rc6.clone();
+    let mut pred5 = move |_: char| -> bool { let _ = &rc6c; panic!("boom") };
+    let r5 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(&mut pred5)));
+    println!("borrowed caught={} count={}", r5.is_err(), Rc::strong_count(&rc6));
+    drop(pred5);
+    println!("borrowed after owner drop count={}", Rc::strong_count(&rc6));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_drops_by_value_captures_on_unwind() {
+    // A by-value predicate was moved into the search, so when
+    // an invocation panics the caller's cleanup cannot drop
+    // it -- the callee's cleanup must, exactly as on the
+    // success path. Before the fix the search propagated the
+    // panic before handing the predicate's final state back,
+    // and the `CallBuiltin` dispatch only ran the attached
+    // `consumed_glue` on success, so each panicking call
+    // leaked the predicate's captures (the counts stayed
+    // elevated). A borrowed predicate keeps its owner and is
+    // not dropped by the call on either path.
+    run_ok(
+        "str-pattern-pred-panic-drop",
+        STR_PATTERN_PRED_PANIC_DROP_SRC,
+        "contains caught=true count=1\nstarts caught=true count=1\nends caught=true count=1\nguard dropped, count now 2\nguard caught=true count=1\nborrowed caught=true count=2\nborrowed after owner drop count=1\n",
+    );
+}
+
 const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
 fn main() {
     let mut n = 0;

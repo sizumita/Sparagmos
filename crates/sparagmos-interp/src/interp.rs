@@ -2982,7 +2982,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         *self.consumed_iter_final.borrow_mut() = None;
-                        let mut result = self.exec_builtin(
+                        let builtin_outcome = self.exec_builtin(
                             frames,
                             body,
                             name,
@@ -2991,9 +2991,37 @@ impl<'a> Interpreter<'a> {
                             cmp_discriminants.as_deref(),
                             unique_elem.as_ref(),
                             skipped_glue.as_ref(),
-                        )?;
+                        );
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
+                        let mut result = match builtin_outcome {
+                            Ok(result) => result,
+                            Err(err) => {
+                                // The builtin consumed an owned
+                                // value and handed its final state
+                                // back for the glue attached to
+                                // the call, but the call is
+                                // unwinding (a guest panic inside
+                                // the builtin): the callee's
+                                // cleanup would drop the value on
+                                // this path too, so run the glue
+                                // synchronously against the handed-
+                                // back state before the error
+                                // propagates, or its destructors
+                                // never run. A destructor that
+                                // panics here is a double panic in
+                                // the guest (an abort); the error
+                                // already propagating is the one
+                                // that stands, so a glue failure
+                                // does not replace it.
+                                if let (Some(glue), Some(final_state)) =
+                                    (&consumed_glue, consumed_final)
+                                {
+                                    let _ = self.drop_value_sync(frames, final_state, glue);
+                                }
+                                return Err(err);
+                            }
+                        };
                         // A `From` / `Into` conversion into a
                         // `Box<dyn Trait>` returns the plain box
                         // aggregate from the modelled conversion;

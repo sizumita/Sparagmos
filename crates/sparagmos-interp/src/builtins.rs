@@ -10710,7 +10710,14 @@ impl<'a> Interpreter<'a> {
                                 Needle::Text(_) => unreachable!(),
                             })
                         };
-                        let result = match kind {
+                        // The outcome stays a `Result` until the
+                        // predicate's storage has been handed back
+                        // below: a predicate that panics unwinds
+                        // through the search, and the hand-back (and
+                        // the drop glue it feeds) is owed on that
+                        // path too -- the callee's cleanup drops a
+                        // by-value predicate however the call ends.
+                        let outcome: InterpResult<bool> = (|| match kind {
                             Builtin::StrContains => {
                                 let mut found = false;
                                 for c in haystack.chars() {
@@ -10719,17 +10726,17 @@ impl<'a> Interpreter<'a> {
                                         break;
                                     }
                                 }
-                                found
+                                Ok(found)
                             }
                             Builtin::StrStartsWith => match haystack.chars().next() {
-                                Some(c) => test(c)?,
-                                None => false,
+                                Some(c) => test(c),
+                                None => Ok(false),
                             },
                             _ => match haystack.chars().next_back() {
-                                Some(c) => test(c)?,
-                                None => false,
+                                Some(c) => test(c),
+                                None => Ok(false),
                             },
-                        };
+                        })();
                         if let Some(id) = pred_alloc {
                             // The call consumed the predicate:
                             // the callee's real body drops it on
@@ -10744,13 +10751,21 @@ impl<'a> Interpreter<'a> {
                             // haystack still drops it). A
                             // borrowed predicate has no
                             // allocation here and keeps its
-                            // owner, undropped.
+                            // owner, undropped. The hand-back
+                            // also runs when the search unwound
+                            // (a panicking predicate): the
+                            // outcome is only propagated after
+                            // the final state is recorded, and
+                            // the `CallBuiltin` dispatch runs the
+                            // attached glue on the error path as
+                            // well, as the callee's cleanup
+                            // would.
                             if let Some(final_pred) = self.alloc_value(id) {
                                 self.note_consumed_iter_final(final_pred);
                             }
                             self.free_alloc(id);
                         }
-                        result
+                        outcome?
                     }
                 };
                 Ok(Value::Bool(result))
