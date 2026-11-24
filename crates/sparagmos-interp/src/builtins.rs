@@ -10570,6 +10570,9 @@ impl<'a> Interpreter<'a> {
                 // reference into an owned object's box), and, for
                 // an owned object, the object value to hand back
                 // as the final state for the call's drop glue.
+                // A concrete boxed predicate records the same
+                // pair in the slice-fallback arm below: the
+                // reference into its box, and the box itself.
                 let mut dyn_pred_env: Option<Value> = None;
                 let mut dyn_pred_final: Option<Value> = None;
                 let needle = match resolved {
@@ -10670,34 +10673,75 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     ref other => {
-                        // A `&[char]` pattern arrives as a fat
-                        // reference over the character tuple.
-                        match self.slice_elements(frames, &vals[1]) {
-                            Ok((elems, _))
-                                if elems.iter().all(|e| matches!(e, Value::Uint(_))) =>
-                            {
-                                let mut set = Vec::with_capacity(elems.len());
-                                for e in &elems {
-                                    let Value::Uint(v) = e else { unreachable!() };
-                                    match char::from_u32(*v as u32) {
-                                        Some(c) => set.push(c),
-                                        None => {
-                                            return Err(InterpError::type_mismatch(
-                                                "str pattern argument",
-                                                "valid char pattern",
-                                                "out-of-range char value",
-                                            ))
+                        // A concrete boxed predicate
+                        // (`Box<closure>` or `Box<fn ptr>`) arrives
+                        // as the box aggregate over the allocation
+                        // holding the callable, which `resolve_value`
+                        // leaves in place. Resolve the callable
+                        // before the character-slice fallback below:
+                        // it is invoked through the box's
+                        // allocation, so an `FnMut`'s state persists
+                        // across the per-character invocations, and
+                        // the box itself is handed back as the final
+                        // state for the call's drop glue, exactly
+                        // like an owned trait-object predicate
+                        // above.
+                        let boxed_callable = match box_alloc_pointer(other) {
+                            Some((id, projection)) if projection.is_empty() => {
+                                match self.alloc_value(id) {
+                                    Some(pointee)
+                                        if matches!(
+                                            pointee,
+                                            Value::FnPtr(_) | Value::Closure { .. }
+                                        ) =>
+                                    {
+                                        Some((id, pointee))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        match boxed_callable {
+                            Some((id, pointee)) => {
+                                dyn_pred_env = Some(Value::Ref(RefTarget::Alloc {
+                                    id,
+                                    projection: Vec::new(),
+                                }));
+                                dyn_pred_final = Some(other.clone());
+                                Needle::Pred(pointee)
+                            }
+                            None => {
+                                // A `&[char]` pattern arrives as a fat
+                                // reference over the character tuple.
+                                match self.slice_elements(frames, &vals[1]) {
+                                    Ok((elems, _))
+                                        if elems.iter().all(|e| matches!(e, Value::Uint(_))) =>
+                                    {
+                                        let mut set = Vec::with_capacity(elems.len());
+                                        for e in &elems {
+                                            let Value::Uint(v) = e else { unreachable!() };
+                                            match char::from_u32(*v as u32) {
+                                                Some(c) => set.push(c),
+                                                None => {
+                                                    return Err(InterpError::type_mismatch(
+                                                        "str pattern argument",
+                                                        "valid char pattern",
+                                                        "out-of-range char value",
+                                                    ))
+                                                }
+                                            }
                                         }
+                                        Needle::Set(set)
+                                    }
+                                    _ => {
+                                        return Err(InterpError::type_mismatch(
+                                            "str pattern argument",
+                                            "string, char, char set or predicate value",
+                                            other.kind_name(),
+                                        ))
                                     }
                                 }
-                                Needle::Set(set)
-                            }
-                            _ => {
-                                return Err(InterpError::type_mismatch(
-                                    "str pattern argument",
-                                    "string, char, char set or predicate value",
-                                    other.kind_name(),
-                                ))
                             }
                         }
                     }

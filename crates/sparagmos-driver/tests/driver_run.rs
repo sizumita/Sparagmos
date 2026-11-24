@@ -34594,6 +34594,126 @@ fn run_mode_str_pattern_boxed_dyn_predicate_drops_on_unwind() {
     );
 }
 
+const STR_PATTERN_BOXED_PRED_SRC: &str = r#"
+fn is_b(c: char) -> bool {
+    c == 'b'
+}
+
+fn main() {
+    let a = "".contains(Box::new(|c: char| c == 'b'));
+    let b = "ab".contains(Box::new(|c: char| c == 'b'));
+    let c = "ab".contains(Box::new(is_b));
+    let d = "ab".starts_with(Box::new(|c: char| c == 'a'));
+    let e = "ab".ends_with(Box::new(|c: char| c == 'a'));
+    println!("{a} {b} {c} {d} {e}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate() {
+    // A concrete boxed predicate (`Box<closure>` / `Box<fn ptr>`)
+    // is a valid `Pattern`: the box aggregate over the callable's
+    // allocation is resolved to the callable before the
+    // character-slice fallback. Before the fix the box was left as
+    // an ADT value and the search failed with a type mismatch
+    // ("found ADT value").
+    run_ok(
+        "str-pattern-boxed-pred",
+        STR_PATTERN_BOXED_PRED_SRC,
+        "false true true true false\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_MUT_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let boxed = Box::new(move |_| {
+        n += 1;
+        n == 2
+    });
+    let a = "ab".contains(boxed);
+    println!("{a}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_mutates() {
+    // The boxed predicate is invoked through the box's
+    // allocation, so its `FnMut` state persists across the
+    // per-character invocations and the counter reaches 2 on the
+    // second character.
+    run_ok(
+        "str-pattern-boxed-pred-mut",
+        STR_PATTERN_BOXED_PRED_MUT_SRC,
+        "true\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed = Box::new(move |c: char| {
+        let _ = &rc2;
+        c == 'b'
+    });
+    let a = "".contains(boxed);
+    let rc3 = rc.clone();
+    let boxed2 = Box::new(move |c: char| {
+        let _ = &rc3;
+        c == 'b'
+    });
+    let b = "ab".contains(boxed2);
+    println!("{a} {b} count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_drops_captures() {
+    // The owned boxed predicate is handed back as the final state
+    // for the call's drop glue when the search returns, so its
+    // captures are dropped -- on an empty haystack (never invoked)
+    // and after a successful search alike -- and the `Rc` strong
+    // count returns to 1.
+    run_ok(
+        "str-pattern-boxed-pred-drop",
+        STR_PATTERN_BOXED_PRED_DROP_SRC,
+        "false true count=1\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_UNWIND_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed = Box::new(move |c: char| {
+        let _ = &rc2;
+        if c == 'b' {
+            panic!("boom");
+        }
+        false
+    });
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(boxed)));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_drops_on_unwind() {
+    // The hand-back also runs when the boxed predicate panics:
+    // the box is dropped on the unwind path, so the capture's
+    // strong count returns to 1 behind the guest's `catch_unwind`.
+    run_ok(
+        "str-pattern-boxed-pred-unwind",
+        STR_PATTERN_BOXED_PRED_UNWIND_SRC,
+        "caught=true count=1\n",
+    );
+}
+
 const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
 fn main() {
     let mut n = 0;
