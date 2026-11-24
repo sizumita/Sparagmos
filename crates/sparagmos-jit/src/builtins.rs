@@ -321,7 +321,15 @@ pub enum Builtin {
     RustDealloc,
     /// `alloc::alloc::__rust_realloc(ptr, old_size, align, new_size)`.
     RustRealloc,
-    /// `std::fmt::format(Arguments) -> String`.
+    /// `std::fmt::format(Arguments) -> String`. The nested
+    /// `format_inner` helper inside `format` shares this model:
+    /// it is neither generic nor `#[inline]`, so its MIR body is
+    /// not encoded in the distributed alloc rlib, yet the
+    /// `#[inline]` parent's body — inlined into optimized guest
+    /// code — calls it directly. Its observable behaviour is
+    /// exactly this builtin's (the `with_capacity` it performs
+    /// first is only a size hint; the `write_fmt` text is the
+    /// result).
     Format,
     /// `str::to_uppercase(&str) -> String`.
     StrToUppercase,
@@ -386,7 +394,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAllocZeroed,
         "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
         "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
-        "std::fmt::format" => Builtin::Format,
+        "std::fmt::format" | "std::fmt::format::format_inner"
+        | "alloc::fmt::format::format_inner" => Builtin::Format,
         "std::convert::From::from" => Builtin::FromFrom,
         "std::convert::Into::into" => Builtin::IntoInto,
         "std::ops::Deref::deref" => Builtin::Deref,

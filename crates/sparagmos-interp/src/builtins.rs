@@ -235,6 +235,73 @@ fn float_ty_name(ty: mir::FloatTy) -> &'static str {
     }
 }
 
+/// A type tag rendered from an IR type, in the spellings
+/// [`ty_tag`] gives the same types at the MIR level. `None`
+/// for the one IR type that does not determine its tag on its
+/// own: a `u32` local is a `u32` or a `char`, the two format
+/// differently, and conversion renders both as the same IR
+/// type (the caller disambiguates from the body's variable
+/// table when it can).
+fn ir_ty_tag(ty: &crate::ir::Ty) -> Option<String> {
+    use crate::ir::Ty as T;
+    Some(match ty {
+        T::Unit => "()".to_string(),
+        T::Bool => "bool".to_string(),
+        T::Int(t) => match t {
+            crate::ir::IntTy::I8 => "i8",
+            crate::ir::IntTy::I16 => "i16",
+            crate::ir::IntTy::I32 => "i32",
+            crate::ir::IntTy::I64 => "i64",
+            crate::ir::IntTy::I128 => "i128",
+            crate::ir::IntTy::Isize => "isize",
+        }
+        .to_string(),
+        T::Uint(crate::ir::UintTy::U32) => return None,
+        T::Uint(t) => match t {
+            crate::ir::UintTy::U8 => "u8",
+            crate::ir::UintTy::U16 => "u16",
+            crate::ir::UintTy::U32 => "u32",
+            crate::ir::UintTy::U64 => "u64",
+            crate::ir::UintTy::U128 => "u128",
+            crate::ir::UintTy::Usize => "usize",
+        }
+        .to_string(),
+        T::Float(t) => match t {
+            crate::ir::FloatTy::F16 => "f16",
+            crate::ir::FloatTy::F32 => "f32",
+            crate::ir::FloatTy::F64 => "f64",
+            crate::ir::FloatTy::F128 => "f128",
+        }
+        .to_string(),
+        T::Tuple(parts) => {
+            let parts: Option<Vec<String>> = parts.iter().map(ir_ty_tag).collect();
+            let parts = parts?;
+            if parts.len() == 1 {
+                format!("({},)", parts[0])
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        }
+        T::Adt(name) => name.clone(),
+        T::Ref(inner) => format!("&{}", ir_ty_tag(inner)?),
+        T::Slice(elem) => format!("[{}]", ir_ty_tag(elem)?),
+        T::Array(elem, n) => format!("[{}; {n}]", ir_ty_tag(elem)?),
+        T::Str => "str".to_string(),
+        T::FnPtr => "FnPtr".to_string(),
+        T::FnDef(name) => name.clone(),
+        T::Closure(name, _) => name.clone(),
+        T::Dynamic(bounds) => {
+            if bounds.is_empty() {
+                "dyn".to_string()
+            } else {
+                format!("dyn {}", bounds.join(" + "))
+            }
+        }
+        T::Coroutine(name) => name.clone(),
+        T::Never => "!".to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The builtin registry
 // ---------------------------------------------------------------------------
@@ -407,7 +474,15 @@ pub enum Builtin {
     /// arguments (the same model `format_arguments` implements)
     /// and deliver the text through the output's own `write_str`.
     FmtWrite,
-    /// `std::fmt::format(Arguments) -> String`.
+    /// `std::fmt::format(Arguments) -> String`. The nested
+    /// `format_inner` helper inside `format` shares this model:
+    /// it is neither generic nor `#[inline]`, so its MIR body is
+    /// not encoded in the distributed alloc rlib, yet the
+    /// `#[inline]` parent's body — inlined into optimized guest
+    /// code — calls it directly. Its observable behaviour is
+    /// exactly this builtin's (the `with_capacity` it performs
+    /// first is only a size hint; the `write_fmt` text is the
+    /// result).
     Format,
     /// `std::fmt::Arguments::from_str(&str)`.
     ArgumentsFromStr,
@@ -2355,7 +2430,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::io::stdout" => Builtin::Stdout,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
         "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
-        "std::fmt::format" => Builtin::Format,
+        "std::fmt::format" | "std::fmt::format::format_inner"
+        | "alloc::fmt::format::format_inner" => Builtin::Format,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
         }
@@ -21242,11 +21318,28 @@ fn dyn_box_pointee(
 /// aggregate denotes, when `value` has that shape: single-field
 /// wrappers around the triple of the erased value reference,
 /// the formatter function (whose name states the trait and the
-/// Self type), and a unit-shaped marker field. Any other shape
-/// is not a raw argument.
+/// Self type), and a unit-shaped marker field; a count argument
+/// (`ArgumentType::Count`) is the variant-1 single-field shape
+/// holding the count itself. Any other shape is not a raw
+/// argument.
 fn coerce_fmt_arg(value: &Value) -> Option<Value> {
     let mut current = value.clone();
     loop {
+        // `ArgumentType::Count(n)`: checked at every level of
+        // the wrapper descent, because the `Argument` struct
+        // wraps the `ArgumentType` enum in one more
+        // single-field layer.
+        if let Value::Enum {
+            variant: 1,
+            fields,
+        } = &current
+        {
+            if let [Value::Uint(n)] = fields.as_slice() {
+                if let Ok(n) = u16::try_from(*n) {
+                    return Some(Value::FmtCount(n));
+                }
+            }
+        }
         match current {
             Value::Enum { fields, .. } if fields.len() == 1 => {
                 current = fields.into_iter().next().expect("one field");
@@ -21261,6 +21354,15 @@ fn coerce_fmt_arg(value: &Value) -> Option<Value> {
                     Value::Enum { fields, .. } if fields.is_empty() => None,
                     other => Some(unwrap_newtype(other.clone())),
                 })?;
+                // The impl-segment form states the trait and
+                // the Self type in the name itself.
+                if let Some((trait_, ty)) = impl_segment_fmt(&formatter) {
+                    return Some(Value::FmtArg {
+                        target: Box::new(target),
+                        trait_,
+                        ty,
+                    });
+                }
                 let trait_ = [
                     ("Display", FmtTrait::Display),
                     ("Debug", FmtTrait::Debug),
@@ -21289,6 +21391,114 @@ fn coerce_fmt_arg(value: &Value) -> Option<Value> {
             _ => return None,
         }
     }
+}
+
+/// The (formatter name, erased value reference) pair a raw
+/// `core::fmt::rt::Argument` aggregate carries, when `value`
+/// has that shape: the same wrapper descent [`coerce_fmt_arg`]
+/// performs, without the instance-name interpretation of the
+/// formatter (which is what states the trait and the Self type
+/// there). `None` for any other shape.
+fn raw_argument_parts(value: &Value) -> Option<(String, Value)> {
+    let mut current = value;
+    loop {
+        match current {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                current = &fields[0];
+            }
+            Value::Enum { fields, .. } => {
+                let formatter = fields.iter().find_map(|f| match f {
+                    Value::FnPtr(name) => Some(name.clone()),
+                    _ => None,
+                })?;
+                let target = fields.iter().find_map(|f| match f {
+                    Value::FnPtr(_) => None,
+                    Value::Enum { fields, .. } if fields.is_empty() => None,
+                    other => Some(unwrap_newtype(other.clone())),
+                })?;
+                return Some((formatter, target));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The fmt trait a trait *name* denotes, among the nine
+/// traits a `format_args!` placeholder can name.
+fn fmt_trait_named(name: &str) -> Option<FmtTrait> {
+    Some(match name {
+        "Display" => FmtTrait::Display,
+        "Debug" => FmtTrait::Debug,
+        "Octal" => FmtTrait::Octal,
+        "LowerHex" => FmtTrait::LowerHex,
+        "UpperHex" => FmtTrait::UpperHex,
+        "Pointer" => FmtTrait::Pointer,
+        "Binary" => FmtTrait::Binary,
+        "LowerExp" => FmtTrait::LowerExp,
+        "UpperExp" => FmtTrait::UpperExp,
+        _ => return None,
+    })
+}
+
+/// The (trait, Self type) a formatter name in the
+/// *impl-segment* form states:
+/// `std::array::<impl std::fmt::Debug for [i32; 3]>::fmt` —
+/// the name a raw argument's formatter carries for an impl
+/// declared on an array / slice / primitive type inside a
+/// module, where the instance is named through its impl block
+/// rather than as `<Self as Trait>::fmt`. The segment states
+/// both the trait and the Self type, so no recovery is
+/// needed. `None` for other name forms.
+fn impl_segment_fmt(formatter: &str) -> Option<(FmtTrait, String)> {
+    let start = formatter.find("<impl ")?;
+    // The segment runs to its balancing `>`: the Self type
+    // may itself carry generic arguments.
+    let bytes = formatter.as_bytes();
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        match b {
+            b'<' => depth += 1,
+            // The `>` of a `->` arrow (a function-pointer Self
+            // type, `fn(i32) -> i32`) closes no segment.
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    if &formatter[end + 1..] != "::fmt" {
+        return None;
+    }
+    let inner = &formatter[start + "<impl ".len()..end];
+    let (trait_path, self_ty) = inner.split_once(" for ")?;
+    let trait_ = fmt_trait_named(trait_path.rsplit("::").next()?)?;
+    Some((trait_, self_ty.to_string()))
+}
+
+/// The fmt trait a *bare trait-item* formatter name denotes
+/// (`std::fmt::Display::fmt` and its `core::` spelling, and
+/// the eight other traits a `format_args!` placeholder can
+/// name). A body-less trait item's `FnDef` constant carries
+/// this plain name when no collected body names the instance
+/// that serves it — a library type's impl lives in the
+/// distributed rlib without a MIR body, so conversion cannot
+/// resolve the constant to the instance name an impl-qualified
+/// spelling would state. Unlike an instance name it states no
+/// Self type; the caller recovers that from the argument's
+/// target place.
+fn bare_fmt_trait(formatter: &str) -> Option<FmtTrait> {
+    let name = formatter
+        .strip_prefix("std::fmt::")
+        .or_else(|| formatter.strip_prefix("core::fmt::"))?
+        .strip_suffix("::fmt")?;
+    fmt_trait_named(name)
 }
 
 /// Unwrap one newtype layer: a single-field aggregate denotes
@@ -27864,10 +28074,82 @@ impl<'a> Interpreter<'a> {
     fn count_arg(&self, args: &[Value], idx: usize) -> InterpResult<u16> {
         match args.get(idx) {
             Some(Value::FmtCount(n)) => Ok(*n),
-            _ => Err(template_error(
+            // A raw `ArgumentType::Count` aggregate in an
+            // argument array a body built itself denotes the
+            // same count (see `coerce_fmt_arg`); the placeholder
+            // path coerces its arguments on use, and the count
+            // path does the same here.
+            Some(arg) => match coerce_fmt_arg(arg) {
+                Some(Value::FmtCount(n)) => Ok(n),
+                _ => Err(template_error(
+                    "indirect width/precision does not name a count argument",
+                )),
+            },
+            None => Err(template_error(
                 "indirect width/precision does not name a count argument",
             )),
         }
+    }
+
+    /// [`coerce_fmt_arg`] with the Self-type recovery a bare
+    /// trait-item formatter name needs. The formatter of a raw
+    /// argument whose impl body was never collected names only
+    /// the trait (`std::fmt::Display::fmt`), so the Self type
+    /// comes from the place the argument's erased reference
+    /// denotes: the frame body's declared type for that local,
+    /// refined by the variable table conversion recorded from
+    /// the body's debug info, which states the exact type
+    /// (generic arguments and `char` included) where the IR
+    /// type cannot — the IR renders `char` as `u32`. `None`
+    /// when the type cannot be stated exactly (a projected or
+    /// value-backed target, or a `u32` local no variable entry
+    /// disambiguates from `char`): the argument then keeps the
+    /// existing explicit error instead of a guessed rendering.
+    fn coerce_raw_fmt_arg(&self, frames: &[Frame], value: &Value) -> Option<Value> {
+        if let Some(coerced) = coerce_fmt_arg(value) {
+            return Some(coerced);
+        }
+        let (formatter, target) = raw_argument_parts(value)?;
+        let trait_ = bare_fmt_trait(&formatter)?;
+        let ty = self.fmt_arg_target_ty(frames, &target)?;
+        Some(Value::FmtArg {
+            target: Box::new(target),
+            trait_,
+            ty,
+        })
+    }
+
+    /// The declared type tag of the place a raw fmt argument's
+    /// erased reference denotes (see
+    /// [`Self::coerce_raw_fmt_arg`]).
+    fn fmt_arg_target_ty(&self, frames: &[Frame], target: &Value) -> Option<String> {
+        let Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            projection,
+        }) = target
+        else {
+            return None;
+        };
+        if !projection.is_empty() {
+            return None;
+        }
+        let frame = frames.iter().find(|f| f.id == *frame)?;
+        let body = self.program().get(&frame.func)?;
+        for entry in &body.debug_vars {
+            if let crate::ir::DebugVar::Place(l, proj) = &entry.source {
+                if *l == *local && proj.is_empty() {
+                    if let Some(ty) = &entry.ty {
+                        return Some(ty.clone());
+                    }
+                    if entry.is_char {
+                        return Some("char".to_string());
+                    }
+                }
+            }
+        }
+        let ty = body.local_tys.get(*local)?;
+        ir_ty_tag(ty)
     }
 
     fn format_arg(
@@ -27883,7 +28165,7 @@ impl<'a> Interpreter<'a> {
         // modelled value the `Argument::new_*` builtins produce;
         // both denote the same argument.
         if !matches!(arg, Value::FmtArg { .. }) {
-            if let Some(coerced) = coerce_fmt_arg(arg) {
+            if let Some(coerced) = self.coerce_raw_fmt_arg(frames.as_slice(), arg) {
                 return self.format_arg(frames, &coerced, options, indent);
             }
         }
@@ -28771,6 +29053,26 @@ impl<'a> Interpreter<'a> {
                     ))),
                 };
             }
+        }
+        // A function pointer's only formatting is its address:
+        // `Debug` for a function pointer prints the address it
+        // denotes, and `Pointer` is the same text. The model
+        // has no machine addresses; the synthetic address of
+        // the named function is the deterministic stand-in the
+        // pointer-identity model already assigns it, so two
+        // formattings of the same function agree and distinct
+        // functions differ, which is all a guest can observe.
+        if let Value::FnPtr(_) = value {
+            return match trait_ {
+                FmtTrait::Debug | FmtTrait::Pointer => {
+                    let address = crate::interp::synthetic_address(value).unwrap_or(0);
+                    Ok(format_pointer(address as u64, options))
+                }
+                FmtTrait::DebugNoop => Ok(String::new()),
+                _ => Err(unsupported(format!(
+                    "{trait_:?} formatting for a function pointer"
+                ))),
+            };
         }
         // References format as their pointee for every trait here.
         if matches!(value, Value::Ref(_)) {
