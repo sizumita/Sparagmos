@@ -1785,11 +1785,93 @@ fn match_impl_self_ty(
                             .zip(tv.inputs_and_output.iter())
                             .all(|(i, t)| match_impl_self_ty(i, t, ambient, bindings, depth))
                 }
+                (RigidTy::Dynamic(ipreds, _), RigidTy::Dynamic(tpreds, _)) => {
+                    // A generic implementation for a
+                    // trait object (`impl<A> Trait for
+                    // dyn Other<A>`) matches a concrete
+                    // object type predicate by predicate
+                    // (see `match_impl_dynamic_preds`):
+                    // the object's own bound variables are
+                    // what both lists' arguments are
+                    // written against, and the region
+                    // decides nothing the type match
+                    // turns on, the way regions inside
+                    // types are ignored throughout.
+                    match_impl_dynamic_preds(&ipreds, &tpreds, ambient, bindings, depth)
+                }
                 _ => false,
             }
         }
         _ => false,
     }
+}
+
+/// Whether an implementation's trait-object self type
+/// matches the target object type (see
+/// `match_impl_self_ty`): every existential predicate the
+/// implementation's object spells must have a counterpart
+/// of the same trait in the target's predicate list, with
+/// arguments matching the way trait arguments match and a
+/// projection predicate's term matching the way its kind
+/// matches, binding the implementation's parameters. The
+/// target may spell further predicates the implementation
+/// does not (an object type can carry bounds beyond the
+/// ones an implementation's self type names); only the
+/// implementation's own predicates constrain the match.
+/// A failed counterpart attempt leaves no bindings
+/// behind, so a later counterpart is tried against the
+/// bindings as they stood.
+fn match_impl_dynamic_preds(
+    ipreds: &[rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>],
+    tpreds: &[rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>],
+    ambient: Option<&GenericArgs>,
+    bindings: &mut HashMap<u32, GenericArgKind>,
+    depth: usize,
+) -> bool {
+    ipreds.iter().all(|ipred| {
+        tpreds.iter().any(|tpred| {
+            let saved = bindings.clone();
+            let matched = match (&ipred.value, &tpred.value) {
+                (ExistentialPredicate::Trait(itref), ExistentialPredicate::Trait(ttref)) => {
+                    itref.def_id.def_id() == ttref.def_id.def_id()
+                        && match_impl_args(
+                            &itref.generic_args,
+                            &ttref.generic_args,
+                            ambient,
+                            bindings,
+                            depth,
+                        )
+                }
+                (ExistentialPredicate::Projection(ip), ExistentialPredicate::Projection(tp)) => {
+                    ip.def_id.def_id() == tp.def_id.def_id()
+                        && match_impl_args(
+                            &ip.generic_args,
+                            &tp.generic_args,
+                            ambient,
+                            bindings,
+                            depth,
+                        )
+                        && match (&ip.term, &tp.term) {
+                            (TermKind::Type(it), TermKind::Type(tt)) => {
+                                match_impl_self_ty(it, tt, ambient, bindings, depth)
+                            }
+                            (TermKind::Const(ic), TermKind::Const(tc)) => {
+                                match_impl_const(ic, tc, ambient, bindings, depth)
+                            }
+                            _ => false,
+                        }
+                }
+                (ExistentialPredicate::AutoTrait(idef), ExistentialPredicate::AutoTrait(tdef)) => {
+                    idef.def_id() == tdef.def_id()
+                }
+                _ => false,
+            };
+            if !matched {
+                *bindings = saved;
+            }
+            matched
+        })
+    })
 }
 
 /// Whether the generic arguments of an implementation's

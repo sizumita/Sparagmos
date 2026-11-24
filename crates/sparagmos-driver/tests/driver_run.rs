@@ -2392,6 +2392,59 @@ fn run_mode_dyn_bound_projection_fn_ptr_impl_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_DYN_SELF_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Other<A> {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier for dyn Other<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier + ?Sized> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<dyn Other<u8>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Other<u8>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_dyn_self_impl_runs() {
+    // The intermediate projection's item is assigned by a
+    // generic implementation for a trait object:
+    // `impl<A> Carrier for dyn Other<A>`. Matching the
+    // implementation's self type against the concrete
+    // `dyn Other<u8>` reached the unsupported-shape
+    // fallback -- the self-type match had no trait-object
+    // arm -- resolving nothing, so the screen rejected
+    // the holder and main. Matching the object's
+    // existential predicates structurally binds
+    // `A := u8` and reaches `dyn Trait<Assoc = u32>`,
+    // whose binding the outer projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-dyn-self-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_dyn_self_impl.rs",
+        DYN_BOUND_PROJECTION_DYN_SELF_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the dyn-self-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC: &str = r#"
 trait Trait {
     type Assoc;
