@@ -8612,6 +8612,17 @@ impl<'a> Interpreter<'a> {
                                 ))
                             }
                         }
+                    } else if let Ok(s @ Value::Str(_)) =
+                        self.resolve_value(frames, &value)
+                    {
+                        // A borrowed `&str` whose value is a
+                        // reference into string storage (the
+                        // dereference of a `Box<str>`, an
+                        // `Rc<str>` or a `String`): follow the
+                        // reference to the string data and copy
+                        // it into the new handle. The borrowed
+                        // storage is not consumed.
+                        s
                     } else {
                         return Err(InterpError::type_mismatch(
                             "From::from to a counted string",

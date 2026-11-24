@@ -16407,6 +16407,44 @@ fn run_mode_from_boxed_str_to_counted_and_string() {
     );
 }
 
+const FROM_BORROWED_STR_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let b = String::from("abc").into_boxed_str();
+    let r: Rc<str> = Rc::from(&*b);
+    let a: Arc<str> = Arc::from(&*b);
+    println!("{r} {a} {}", &*b);
+    let s = String::from("xy");
+    let r2: Rc<str> = Rc::from(&*s);
+    println!("{r2} {s}");
+    let r3: Rc<str> = Rc::from(&*r);
+    println!("{r3} {}", Rc::strong_count(&r));
+    let e = String::new().into_boxed_str();
+    let r4: Rc<str> = Rc::from(&*e);
+    println!("empty={:?}", &*r4);
+}
+"#;
+
+#[test]
+fn run_mode_from_borrowed_str_to_counted_string() {
+    // `From<&str>` for `Rc<str>` / `Arc<str>` where the borrowed
+    // string arrives as a reference into string storage (the
+    // dereference of a `Box<str>`, a `String` or an `Rc<str>`),
+    // not as a string value: the conversion follows the
+    // reference to the string data and copies it into the new
+    // handle, leaving the borrowed storage alive. Before the
+    // fix these failed with "expected string value, found slice
+    // reference" (expected output verified against a native
+    // 1.100.0 build of the same source).
+    run_ok(
+        "from-borrowed-str",
+        FROM_BORROWED_STR_SRC,
+        "abc abc abc\nxy xy\nabc 1\nempty=\"\"\n",
+    );
+}
+
 const FROM_BOXED_SLICE_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
