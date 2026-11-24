@@ -355,6 +355,27 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   per-job startup probe, 1200 s for a checker-tool build);
   `SPARAGMOS_RUSTDOC_TIMEOUT` and its siblings can raise them,
   but the workflows do not;
+- bound every driver subprocess's resident memory: the runner
+  polls each driver process tree's RSS while it runs and kills
+  the tree when it crosses `SPARAGMOS_DRIVER_MEM_LIMIT_MB`
+  (built-in default 5120 MB; the workflows do not raise it),
+  recording the record as that record's own failure with bucket
+  `memory limit` and a reason naming the bound. The per-record
+  timeouts cannot express this bound: a driver that balloons
+  faster than its timeout (Issue #480's debugger session grew
+  at ~190 MB/s against a 240 s timeout) exhausts the hosted
+  runner's 16 GB and kills the whole shard job, and since a
+  shard's results are written only when it finishes, every
+  result in the shard is lost (Issue #483). The bound sits at
+  roughly twice the largest legitimate driver RSS measured
+  (~2.6 GB for a stage-4 guest run), and two `--jobs` slots at
+  the bound plus the native side and the runner stay inside
+  the 16 GB runner. Only driver subprocesses are bounded; the
+  native oracle's compiles and runs are the reference
+  toolchain's own and are not the runner's to cut off. The
+  bound is on RSS, not address space: the driver's virtual
+  size is ~10 GB at startup, so an address-space cap tight
+  enough to matter would stop it spawning its own threads;
 - free disk space before measuring and cache the Rust source tree,
   the survey, and cargo build outputs;
 - give every job an explicit `timeout-minutes` below the 6-hour

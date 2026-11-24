@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1020,6 +1021,151 @@ class JudgeCompileTests(unittest.TestCase):
         self.assertIn("minicore", reason)
 
 
+class RunCmdMemoryLimitTests(unittest.TestCase):
+    """run_cmd's per-record memory bound (Issue #483): the
+    watchdog kills a driver process tree whose RSS crosses the
+    bound and reports mem_exceeded, so one ballooning record
+    fails alone instead of taking the whole shard job (and its
+    results) down with it. The children here are small Python
+    balloons, not the driver."""
+
+    BALLOON = ("x = bytearray(400 * 1024 * 1024)\n"
+               "for i in range(0, len(x), 4096):\n"
+               "    x[i] = 1\n"
+               "import time\n"
+               "time.sleep(60)\n")
+
+    def test_unbounded_run_reports_no_mem_exceeded(self):
+        res = run.run_cmd([sys.executable, "-c", "print('hi')"],
+                          timeout=30)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hi\n")
+        self.assertFalse(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_bounded_run_inside_the_limit_is_unchanged(self):
+        res = run.run_cmd([sys.executable, "-c", "print('hi')"],
+                          timeout=30, mem_limit_mb=512)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hi\n")
+        self.assertFalse(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_ballooning_child_is_killed_by_the_bound(self):
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", self.BALLOON],
+                          timeout=60, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+        self.assertEqual(res["exit_code"], -9)
+
+    def test_ballooning_grandchild_is_killed_via_the_tree(self):
+        code = ("import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', "
+                f"{self.BALLOON!r}])\n"
+                "time.sleep(60)\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=60, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+
+    def test_pipe_holding_descendant_does_not_outlive_the_timeout(self):
+        # The root exits at once; its child keeps the output pipes
+        # and sleeps on. The bounded path must still return at the
+        # record timeout: the child sits in the root's process
+        # group, so the deadline kill reaches it and the post-kill
+        # drain cannot wait out its sleep.
+        code = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(6)'])\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=1, mem_limit_mb=512)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertTrue(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_ballooning_descendant_after_root_exit_is_killed(self):
+        # The root exits at once; its child balloons. Once the root
+        # is reaped the child drops out of the ppid tree, but it
+        # keeps the root's process group, so the watchdog still
+        # sees its RSS and the bound still kills it.
+        code = ("import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, '-c', "
+                f"{self.BALLOON!r}])\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=30, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+
+    def test_own_session_descendant_is_killed_by_the_bound(self):
+        # The child makes its own session, so it sits outside the
+        # root's process group. While the root lives the watchdog
+        # still sees it in the ppid tree, but the moment the group
+        # kill lands, the root dies, the child is reparented, and a
+        # fresh /proc scan can no longer find it. The kill must
+        # spend the pids the polls remembered, not only what a
+        # post-kill scan can still see.
+        child = ("x = bytearray(40 * 1024 * 1024)\n"
+                 "for i in range(0, len(x), 4096):\n"
+                 "    x[i] = 1\n"
+                 "import time\n"
+                 "time.sleep(60)\n")
+        code = ("import subprocess, sys, time\n"
+                f"child = subprocess.Popen([sys.executable, '-c', "
+                f"{child!r}], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL)\n"
+                "print(child.pid, flush=True)\n"
+                "time.sleep(60)\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=60, mem_limit_mb=24)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+        child_pid = int(res["stdout"].strip())
+        deadline = time.monotonic() + 5
+        while (Path(f"/proc/{child_pid}").exists()
+               and time.monotonic() < deadline):
+            time.sleep(0.1)
+        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
+    def test_timeout_still_reported_with_the_bound_set(self):
+        res = run.run_cmd(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=1, mem_limit_mb=512)
+        self.assertTrue(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+        self.assertIsNone(res["exit_code"])
+
+    def test_memory_limit_reason_buckets_as_memory_limit(self):
+        self.assertEqual(
+            run.bucket_reason("driver exceeded the per-record "
+                              "memory limit of 5120 MB"),
+            "memory limit")
+
+    def test_judge_compile_memory_limit(self):
+        conv = {"mem_exceeded": True, "timeout": False,
+                "exit_code": -9}
+        status, _reason, bucket = run.judge_compile("success", conv)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "memory limit")
+
+    def test_judge_jit_compile_memory_limit(self):
+        conv = {"mem_exceeded": True, "timeout": False,
+                "exit_code": -9}
+        status, _reason, bucket = run.judge_jit_compile("success",
+                                                        conv)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "memory limit")
+
+
 class ConcreteEditionTests(unittest.TestCase):
     def test_closed_range_takes_lower_bound(self):
         # compiletest's range is half-open and, with no requested
@@ -1526,7 +1672,7 @@ class ConvertSideTests(unittest.TestCase):
         seen = []
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             seen.append(argv)
             return {"exit_code": 0, "timeout": False,
                     "stdout": "converted: 1, skipped: 0\n",
@@ -1544,7 +1690,7 @@ class ConvertSideTests(unittest.TestCase):
         orig = run.run_cmd
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             return {"exit_code": 0, "timeout": False,
                     "stdout": stdout, "stderr": ""}
 
@@ -2822,7 +2968,7 @@ class GuestArgForwardingTests(unittest.TestCase):
         orig = run.run_cmd
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             captured["argv"] = list(argv)
             captured["env_extra"] = env_extra
             captured["env_remove"] = env_remove
@@ -3447,7 +3593,7 @@ class JitSideTests(unittest.TestCase):
         seen = []
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             seen.append(argv)
             return result
 
