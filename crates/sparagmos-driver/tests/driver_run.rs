@@ -14981,6 +14981,182 @@ fn run_mode_slice_iter_mut_scalar_backed_len() {
     );
 }
 
+const SLICE_SCALAR_BACKED_ACCESS_SRC: &str = r#"
+fn main() {
+    let mut x: i32 = 41;
+    {
+        let mut it = std::slice::from_mut(&mut x).iter_mut();
+        println!("n1 {:?}", it.next().map(|v| *v));
+        println!("n2 {:?}", it.next());
+        println!("nb {:?}", it.next_back());
+    }
+    println!("x {}", x);
+    let mut y: u64 = 900;
+    {
+        let mut it = std::slice::from_mut(&mut y).iter_mut();
+        if let Some(v) = it.next() { *v = 1234; }
+        println!("after {:?}", it.next());
+    }
+    println!("y {}", y);
+    let mut z: u64 = 77;
+    {
+        let s = std::slice::from_mut(&mut z);
+        let mut it = s.iter();
+        println!("hint {:?}", it.size_hint());
+        println!("back {:?}", it.next_back().map(|v| *v));
+        println!("front {:?}", it.next().map(|v| *v));
+        println!("len {}", std::iter::ExactSizeIterator::len(&it));
+    }
+    let w: u64 = 900;
+    let sr = std::slice::from_ref(&w);
+    println!("idx {}", sr[0]);
+    println!("ptr {}", unsafe { *sr.as_ptr() });
+    let mut sum = 0u64;
+    for v in sr { sum += *v; }
+    println!("sum {}", sum);
+    let mut it = sr.iter();
+    println!("first {:?}", it.next().map(|v| *v));
+    println!("second {:?}", it.next());
+    let n: i32 = -5;
+    println!("neg {}", std::slice::from_ref(&n)[0]);
+    let mut m: u32 = 0x01020304;
+    {
+        let sm = std::slice::from_mut(&mut m);
+        sm[0] = 0xAABBCCDD;
+    }
+    println!("m {:x}", m);
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_access() {
+    // Issue #413: over a slice formed on a scalar's own
+    // storage (`slice::from_ref` / `slice::from_mut` of a
+    // scalar place), three readings disagreed with the shape.
+    // The step machine's index-pair shortcut read the
+    // iterator's front and end pointers by their trailing
+    // index step only, dropping the end pointer's byte offset,
+    // so `next()` reported the one element as consumed. An
+    // element access appended a bare index step to the scalar
+    // place, which the projectors read as a byte of the
+    // storage (900 read back as 132). And the shared `Iter`
+    // construction rejected the scalar the snapshot read found
+    // where a container was expected. Expected output is the
+    // native result of the same source.
+    let dir = temp_dir("slice-scalar-backed-access");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_ACCESS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "n1 Some(41)\nn2 None\nnb None\nx 41\nafter None\ny 1234\nhint (1, Some(1))\nback Some(77)\nfront None\nlen 0\nidx 900\nptr 900\nsum 900\nfirst Some(900)\nsecond None\nneg -5\nm aabbccdd\n",
+        "stdout={stdout}"
+    );
+}
+
+const SLICE_SCALAR_BACKED_BYTE_VIEW_SRC: &str = r#"
+fn main() {
+    let w: u64 = 900;
+    let b0 = unsafe { *(&w as *const u64 as *const u8) };
+    let b1 = unsafe { *(&w as *const u64 as *const u8).add(1) };
+    println!("bytes {} {}", b0, b1);
+    let bs = unsafe { std::slice::from_raw_parts(&w as *const u64 as *const u8, 8) };
+    let mut itb = bs.iter();
+    println!("b0 {:?}", itb.next());
+    println!("b1 {:?}", itb.next());
+    println!("blen {}", bs.len());
+    println!("bidx {}", bs[1]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_byte_view() {
+    // The byte views of a scalar's storage keep their
+    // byte-wise reading (a byte pointer into the storage, and
+    // a byte slice over it): only an element the width of the
+    // storage denotes the scalar itself. Expected output is
+    // the native result of the same source.
+    let dir = temp_dir("slice-scalar-backed-byte-view");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_BYTE_VIEW_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "bytes 132 3\nb0 Some(132)\nb1 Some(3)\nblen 8\nbidx 3\n",
+        "stdout={stdout}"
+    );
+}
+
+const SLICE_SCALAR_BACKED_PUNNED_SRC: &str = r#"
+fn main() {
+    let w: u64 = 0x1_0000_0302;
+    println!("idx {}", unsafe { std::slice::from_raw_parts(&w as *const u64 as *const u32, 2) }[0]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_punned_view_declines() {
+    // A punned element width over a scalar's storage (u32
+    // elements over a u64) holds no elements as values: the
+    // access declines with an explicit error instead of
+    // reading a byte of the storage (the pre-#413 reading
+    // printed 2 here, the low byte, where the native element
+    // is 770).
+    let dir = temp_dir("slice-scalar-backed-punned");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_PUNNED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr={stderr}");
+    assert!(
+        stderr.contains("punned element width"),
+        "stderr={stderr}"
+    );
+}
+
+const SLICE_ITER_ENUMERATE_CONST_PTR_SRC: &str = r#"
+trait Dimension {
+    fn slice(&self) -> &[usize];
+}
+impl Dimension for () {
+    fn slice(&self) -> &[usize] { &[] }
+}
+impl Dimension for usize {
+    fn slice(&self) -> &[usize] {
+        unsafe { std::slice::from_raw_parts(self, 1) }
+    }
+}
+fn main() {
+    let tup = ();
+    let mut it = tup.slice().iter();
+    for (i, _) in 3usize.slice().iter().enumerate() {
+        if i == 0 { continue; }
+        it.next();
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_enumerate_const_ptr_o3() {
+    // The boundary of the scalar-backed first-element rule:
+    // a slice formed over a pointer to a constant value (the
+    // `from_raw_parts` over a promoted `&3` shape, at the
+    // opt level the shape's regression test compiles at) is
+    // not storage-backed — its element position is the
+    // appended index the offset machinery advances, and
+    // iterating it must keep working.
+    let dir = temp_dir("slice-iter-enumerate-const-ptr");
+    let src = fixture(&dir, "case.rs", SLICE_ITER_ENUMERATE_CONST_PTR_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "done\n", "stdout={stdout}");
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }

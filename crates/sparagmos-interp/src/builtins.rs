@@ -35,7 +35,8 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     box_alloc_pointer, channel_handle_id, eval_binary, eval_unary, float_to_int,
     float_to_uint, impl_qualified_self_type, project_value, rc_handle_id,
-    round_to_f16, synthetic_address, FmtBuilderKind, FmtBuilderState, FmtCapture,
+    round_to_f16, scalar_storage_byte, scalar_storage_len, synthetic_address,
+    FmtBuilderKind, FmtBuilderState, FmtCapture,
     Frame, Interpreter, Resolved, WakeDispatch,
 };
 use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy, UnOp};
@@ -7168,8 +7169,33 @@ impl<'a> Interpreter<'a> {
                 {
                     // `&Vec<T>` and `&[T]` iterate as `slice::Iter`,
                     // in the real field layout `slice_iter_value`
-                    // builds and `Iterator::next` consumes.
-                    let (elems, _) = self.slice_elements(frames, &value)?;
+                    // builds and `Iterator::next` consumes. A
+                    // scalar-backed slice (the `slice::from_ref`
+                    // shape) reads its elements from the scalar's
+                    // own storage.
+                    let (elems, _) = match self.slice_elements(frames, &value) {
+                        Ok(elems) => elems,
+                        Err(err) => {
+                            let elem_tag = slice_container_element_tag(self_ty)
+                                .or_else(|| {
+                                    slice_container_element_tag(
+                                        self_ty.strip_prefix('&').unwrap_or(self_ty),
+                                    )
+                                })
+                                .unwrap_or("");
+                            match self.scalar_backed_slice_elements(
+                                frames,
+                                &value,
+                                elem_tag,
+                            ) {
+                                Some(elems) => {
+                                    let len = elems.len() as u128;
+                                    (elems, len)
+                                }
+                                None => return Err(err),
+                            }
+                        }
+                    };
                     Ok(slice_iter_value(elems))
                 } else if self_ty.starts_with("&std::collections::BTreeSet<") {
                     let elems = self.btree_set_elements_of_ref(frames, &value)?;
@@ -10556,10 +10582,26 @@ impl<'a> Interpreter<'a> {
                         // unless the element type has a single
                         // value, in which case every element is
                         // that value and no storage is needed to
-                        // produce them.
+                        // produce them. A slice over a scalar's
+                        // own storage (the `slice::from_ref`
+                        // shape) reads its elements from the
+                        // storage itself.
                         let elem_tag =
                             generic_args.first().map(String::as_str).unwrap_or("");
-                        match self.storageless_slice_elements(frames, &vals[0], elem_tag) {
+                        match self
+                            .scalar_backed_slice_elements(frames, &vals[0], elem_tag)
+                            .map(|elems| {
+                                let len = elems.len() as u128;
+                                (elems, len)
+                            })
+                            .or_else(|| {
+                                self.storageless_slice_elements(
+                                    frames,
+                                    &vals[0],
+                                    elem_tag,
+                                )
+                            })
+                        {
                             Some(elems) => elems,
                             None => return Err(err),
                         }
@@ -16354,10 +16396,25 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
             let elem_size = slice_iter_elem_size(self_ty);
-            if let (Some(cur), Some(last)) = (
-                iter_ptr_index(&ptr_field, elem_size),
-                iter_ptr_index(&end, elem_size),
-            ) {
+            // The index-pair shortcut reads the pair's trailing
+            // index steps only: a pair carrying a byte-offset
+            // step (a real-pointer iterator over scalar-backed
+            // storage) denotes positions that reading drops,
+            // so it belongs to the real-pointer step below.
+            let index_pair = if iter_ptr_has_byte_offset(&ptr_field)
+                || iter_ptr_has_byte_offset(&end)
+            {
+                None
+            } else {
+                match (
+                    iter_ptr_index(&ptr_field, elem_size),
+                    iter_ptr_index(&end, elem_size),
+                ) {
+                    (Some(cur), Some(last)) => Some((cur, last)),
+                    _ => None,
+                }
+            };
+            if let Some((cur, last)) = index_pair {
                 if cur < last {
                     let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
                         .expect("index step checked");
@@ -16520,9 +16577,24 @@ fn value_fingerprint(value: &Value) -> u64 {
             } else {
                 let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
                 let elem_size = slice_iter_elem_size(self_ty);
-                if let (Some(cur), Some(last)) =
-                    (iter_ptr_index(&ptr_field, elem_size), iter_ptr_index(&end, elem_size))
+                // The index-pair shortcut, gated as in the
+                // shared iterator's step above: a pair carrying
+                // a byte-offset step belongs to the real-pointer
+                // step.
+                let index_pair = if iter_ptr_has_byte_offset(&ptr_field)
+                    || iter_ptr_has_byte_offset(&end)
                 {
+                    None
+                } else {
+                    match (
+                        iter_ptr_index(&ptr_field, elem_size),
+                        iter_ptr_index(&end, elem_size),
+                    ) {
+                        (Some(cur), Some(last)) => Some((cur, last)),
+                        _ => None,
+                    }
+                };
+                if let Some((cur, last)) = index_pair {
                     if cur < last {
                         let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
                             .expect("index step checked");
@@ -17777,8 +17849,31 @@ fn value_fingerprint(value: &Value) -> u64 {
         {
             // The real layout's pointer pair: the remaining count
             // is the distance between the two element pointers.
-            let (cur, end) = slice_iter_bounds(&state, self_ty)?;
-            let n = end.saturating_sub(cur) as u128;
+            // A pair carrying a byte-offset step (a real-pointer
+            // iterator over scalar-backed storage) denotes its
+            // positions as distances from the storage, which the
+            // index reading drops: its remaining count is the
+            // unified distance reading's.
+            let byte_offset_pair = iterator_fields(&state, self_ty)
+                .map(|fields| {
+                    fields.len() >= 2
+                        && (iter_ptr_has_byte_offset(&fields[0])
+                            || iter_ptr_has_byte_offset(&fields[1]))
+                })
+                .unwrap_or(false);
+            let n = if byte_offset_pair {
+                let elem_tag = first_generic_arg(self_ty).unwrap_or("");
+                let (_, rem) = self.slice_iter_front_and_remaining(
+                    frames,
+                    &state,
+                    self_ty,
+                    elem_tag,
+                )?;
+                rem as u128
+            } else {
+                let (cur, end) = slice_iter_bounds(&state, self_ty)?;
+                end.saturating_sub(cur) as u128
+            };
             return Ok(hint(n, Some(n)));
         }
         if self_ty_is(self_ty, "std::str::Chars")
@@ -19966,6 +20061,53 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             set.push(char::from_u32(*v as u32)?);
         }
         Some(set)
+    }
+
+    /// The element snapshot of a fat pointer whose base denotes
+    /// a scalar's own storage (the `slice::from_ref` /
+    /// `slice::from_mut` shape over a scalar place, or a raw
+    /// view of one): the storage is the element sequence
+    /// itself — one element of the scalar's own type, or the
+    /// storage's bytes for a byte element. `None` for any other
+    /// shape: a wider or narrower non-byte element over the
+    /// storage is a punned view the plain readings judge (and
+    /// reject) instead.
+    fn scalar_backed_slice_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_tag: &str,
+    ) -> Option<Vec<Value>> {
+        let Value::FatRef { base, len } = value else {
+            return None;
+        };
+        let target = self.deref_value(frames, base).ok()?;
+        // A base denoting an element position denotes that
+        // element of a container, not a scalar's storage: the
+        // sibling readings' shape.
+        if target_ends_at_element(&target) {
+            return None;
+        }
+        let scalar = self.read_resolved(frames, &target).ok()?;
+        if scalar_storage_len(&scalar).is_none() {
+            return None;
+        }
+        let (size, _) = self.layout_of(elem_tag)?;
+        if size == 1 {
+            // Byte elements: the storage's own bytes, up to the
+            // fat length.
+            let mut out = Vec::new();
+            for i in 0..(*len as usize) {
+                out.push(Value::Uint(scalar_storage_byte(&scalar, i)? as u128));
+            }
+            return Some(out);
+        }
+        if *len == 1 && self.target_is_scalar_storage(frames, &target, size as usize) {
+            // One element of the storage's own width: the
+            // element is the scalar itself.
+            return Some(vec![scalar]);
+        }
+        None
     }
 
     pub(crate) fn slice_elements(
@@ -23847,6 +23989,40 @@ fn elem_step_pos(projection: &[RefProj]) -> Option<usize> {
 }
 
 
+/// Whether a slice-iterator pointer's projection carries a
+/// byte-offset step: the pointer then denotes a position in
+/// element units past an index step (the shape a real-pointer
+/// iterator over a scalar-backed slice takes — its end
+/// pointer is the front place one element further on, spelled
+/// as a trailing byte offset), which the index reading
+/// `iter_ptr_index` silently drops. A pair carrying such a
+/// step is not an index pair: the steps that would read it
+/// as one must decline and let the distance reading
+/// (`slice_iter_front_and_remaining`) or the real-pointer
+/// step (`slice_iter_step_real`) judge it instead. (The
+/// length readings keep their index reading of such a pair:
+/// they only compare the two positions, and for a pair over
+/// a constant value — which no distance reading can measure
+/// — that comparison is the reading the modelled flow has
+/// always given.)
+fn iter_ptr_has_byte_offset(value: &Value) -> bool {
+    if let Value::Enum { fields, .. } = value {
+        if fields.len() == 1 {
+            return iter_ptr_has_byte_offset(&fields[0]);
+        }
+    }
+    let projection = match value {
+        Value::Ref(RefTarget::Place { projection, .. }) => projection,
+        Value::Ref(RefTarget::Static { projection, .. }) => projection,
+        Value::Ref(RefTarget::Alloc { projection, .. }) => projection,
+        Value::Ref(RefTarget::Value(_, projection)) => projection,
+        _ => return false,
+    };
+    projection
+        .iter()
+        .any(|step| matches!(step, RefProj::ByteOffset(_)))
+}
+
 /// The element index a slice-iterator pointer denotes. Two
 /// forms occur. The states the builtins build point into a
 /// value snapshot, the projection a lone trailing `Index`
@@ -24109,6 +24285,19 @@ fn step_slice_iter_back(
                 vec![fields[0].clone(), new_end(&fields), fields[2].clone()],
             ),
             Some(item),
+        ));
+    }
+    if iter_ptr_has_byte_offset(&fields[0]) || iter_ptr_has_byte_offset(&fields[1]) {
+        // A byte-offset pair (a real-pointer iterator over
+        // scalar-backed storage) is not an index pair: decline
+        // so the caller steps it through the real-pointer step.
+        // (The decline lives here, not in `slice_iter_bounds`:
+        // the length readings keep their index reading of such
+        // a pair, whose positions they only compare.)
+        return Err(InterpError::type_mismatch(
+            "slice::Iter state",
+            "element pointers into the element snapshot",
+            "pointers displaced by a byte offset",
         ));
     }
     let (cur, end) = slice_iter_bounds(state, self_ty)?;

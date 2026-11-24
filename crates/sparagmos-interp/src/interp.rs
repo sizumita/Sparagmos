@@ -8859,6 +8859,13 @@ impl<'a> Interpreter<'a> {
         // place's declared type at the `Deref` step and consumed
         // by the same following index step as `fat_cap`.
         let mut fat_elem_string: Option<bool> = None;
+        // The fat pointer's element type, read from the place's
+        // declared type at the `Deref` step like
+        // `fat_elem_string`: it judges whether an index step
+        // over the dereference denotes the base storage itself
+        // (a scalar-backed slice's one element; see the `Index`
+        // arm).
+        let mut fat_elem_ty: Option<Ty> = None;
         // The declared type of the value `cur` currently denotes,
         // tracked from the place's local type through reference
         // steps (field and index steps end the tracking: the
@@ -8961,6 +8968,7 @@ impl<'a> Interpreter<'a> {
                     }
                     fat_cap = None;
                     fat_elem_string = None;
+                    fat_elem_ty = None;
                     // The length slot of a `Vec` (field 1) read
                     // directly, the shape an inlined `Vec::len`
                     // inside a collected std body takes
@@ -9193,6 +9201,7 @@ impl<'a> Interpreter<'a> {
                     fat_skip = 0;
                     fat_anchor = None;
                     fat_elem_string = None;
+                    fat_elem_ty = None;
                     self.project_step(
                         frames,
                         cur,
@@ -9222,6 +9231,7 @@ impl<'a> Interpreter<'a> {
                     }
                     fat_cap = None;
                     fat_elem_string = None;
+                    let elem_ty = fat_elem_ty.take();
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some((**elem).clone())
@@ -9231,7 +9241,44 @@ impl<'a> Interpreter<'a> {
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
                         Some(composed) => composed,
                         None => {
-                            self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                            // A scalar-backed slice (see
+                            // `target_is_scalar_storage`): element
+                            // 0 is the base storage itself, so the
+                            // step does not move the position; the
+                            // bare index step the fallback adds
+                            // would denote a byte of the storage.
+                            if via_fat
+                                && self.fat_denotes_punned_scalar_element(
+                                    frames,
+                                    &cur,
+                                    elem_ty.as_ref(),
+                                )
+                            {
+                                return Err(InterpError::type_mismatch(
+                                    format!("element access in {place}"),
+                                    "an element the width of the scalar \
+                                     storage behind the slice",
+                                    "a punned element width",
+                                ));
+                            }
+                            if via_fat
+                                && idx == 0
+                                && self.fat_denotes_scalar_element(
+                                    frames,
+                                    &cur,
+                                    elem_ty.as_ref(),
+                                )
+                            {
+                                cur
+                            } else {
+                                self.project_step(
+                                    frames,
+                                    cur,
+                                    RefProj::Index(idx),
+                                    body,
+                                    place,
+                                )?
+                            }
                         }
                     }
                 }
@@ -9285,6 +9332,7 @@ impl<'a> Interpreter<'a> {
                     });
                     fat_cap = None;
                     fat_elem_string = None;
+                    let elem_ty = fat_elem_ty.take();
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some((**elem).clone())
@@ -9329,12 +9377,41 @@ impl<'a> Interpreter<'a> {
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
                         Some(composed) => composed,
                         None => {
-                            match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
-                        Some(composed) => composed,
-                        None => {
-                            self.project_step(frames, cur, RefProj::Index(idx), body, place)?
-                        }
-                    }
+                            // The scalar-backed rule of the
+                            // `Index` arm: element 0 is the base
+                            // storage itself.
+                            if via_fat
+                                && self.fat_denotes_punned_scalar_element(
+                                    frames,
+                                    &cur,
+                                    elem_ty.as_ref(),
+                                )
+                            {
+                                return Err(InterpError::type_mismatch(
+                                    format!("element access in {place}"),
+                                    "an element the width of the scalar \
+                                     storage behind the slice",
+                                    "a punned element width",
+                                ));
+                            }
+                            if via_fat
+                                && idx == 0
+                                && self.fat_denotes_scalar_element(
+                                    frames,
+                                    &cur,
+                                    elem_ty.as_ref(),
+                                )
+                            {
+                                cur
+                            } else {
+                                self.project_step(
+                                    frames,
+                                    cur,
+                                    RefProj::Index(idx),
+                                    body,
+                                    place,
+                                )?
+                            }
                         }
                     }
                 }
@@ -9383,6 +9460,7 @@ impl<'a> Interpreter<'a> {
                     };
                     fat_cap = None;
                     fat_elem_string = None;
+                    fat_elem_ty = None;
                     let (offset, sub_len) = match len {
                         Some(len) => subslice_offset_len(*from, *to, *from_end, len)?,
                         None => {
@@ -9421,6 +9499,7 @@ impl<'a> Interpreter<'a> {
                     buf_base = None;
                     fat_cap = None;
                     fat_elem_string = None;
+                    fat_elem_ty = None;
                     fat_skip = 0;
                     fat_anchor = None;
                     cur_variant = *variant as usize;
@@ -9446,6 +9525,19 @@ impl<'a> Interpreter<'a> {
                     fat_cap = match &value {
                         Value::FatRef { len, .. } => Some(*len),
                         _ => None,
+                    };
+                    fat_elem_ty = if fat_cap.is_some() {
+                        match &cur_ty {
+                            Some(Ty::Ref(inner)) => match &**inner {
+                                Ty::Slice(elem) | Ty::Array(elem, _) => {
+                                    Some((**elem).clone())
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    } else {
+                        None
                     };
                     fat_elem_string = match &value {
                         Value::FatRef { .. } if step_idx == 0 => body
@@ -11259,6 +11351,36 @@ impl<'a> Interpreter<'a> {
         value: Value,
         elem_string: Option<bool>,
     ) -> InterpResult<Value> {
+        // A target holding a scalar denotes the scalar's own
+        // storage: its first element is the scalar itself, so
+        // the first-element pointer is the pointer as it
+        // stands. Appending the element index the arms below
+        // add would denote a byte of the storage instead (the
+        // reading `project_value` gives a bare index step on a
+        // scalar), which is the shape a slice formed over a
+        // scalar place (`slice::from_ref` / `slice::from_mut`)
+        // takes through `as_ptr`. A constant value target is
+        // not storage: its element position is the appended
+        // index the arms below form, which the offset machinery
+        // advances, so the shortcut is for storage targets only.
+        if let Value::Ref(target) = &value {
+            let storage_backed = matches!(
+                target,
+                RefTarget::Place { .. }
+                    | RefTarget::Static { .. }
+                    | RefTarget::Alloc { .. }
+            );
+            if storage_backed {
+                if let Ok(resolved) = self.deref_value(frames, &value) {
+                    if matches!(
+                        self.read_resolved(frames, &resolved),
+                        Ok(v) if scalar_storage_len(&v).is_some()
+                    ) {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
         match value {
             Value::Ref(RefTarget::Place {
                 frame,
@@ -15473,6 +15595,110 @@ impl<'a> Interpreter<'a> {
             Err(InterpError::UninitializedRead { .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether `target` denotes a scalar value whose declared
+    /// type is a scalar of width `width`: the target's storage
+    /// is then exactly one element of that width (the shape
+    /// `slice::from_ref` / `slice::from_mut` over a scalar
+    /// place forms — the fat pointer's base is the scalar's own
+    /// place). The target must denote the storage itself (an
+    /// empty projection): a target ending at an element
+    /// position, or displaced into the storage, denotes a part
+    /// of some other value, which the sibling and byte readings
+    /// judge instead.
+    pub(crate) fn target_is_scalar_storage(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        width: usize,
+    ) -> bool {
+        let Some((projection, _, root_ty, _, _)) =
+            self.byte_view_base(frames, target)
+        else {
+            return false;
+        };
+        if !projection.is_empty() {
+            return false;
+        }
+        let root_width = match self.byte_layout_of_ty(&root_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind.width(),
+            _ => return false,
+        };
+        if root_width != width {
+            return false;
+        }
+        matches!(
+            self.read_resolved(frames, target),
+            Ok(v) if scalar_storage_len(&v).is_some()
+        )
+    }
+
+    /// Whether the position a fat dereference left in `target`
+    /// is the storage of a scalar-backed slice whose element
+    /// type is `elem_ty`: the element is then the scalar the
+    /// target denotes itself (see
+    /// [`Self::target_is_scalar_storage`]). An element type
+    /// with no scalar layout (an ADT, a reference, ...) never
+    /// denotes the storage.
+    fn fat_denotes_scalar_element(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem_ty: Option<&Ty>,
+    ) -> bool {
+        let Some(elem_ty) = elem_ty else {
+            return false;
+        };
+        let width = match self.byte_layout_of_ty(elem_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind.width(),
+            _ => return false,
+        };
+        self.target_is_scalar_storage(frames, target, width)
+    }
+
+    /// Whether the position a fat dereference left in `target`
+    /// is a scalar's own storage while the slice's element type
+    /// `elem_ty` is a scalar of a different width (and not a
+    /// byte): a punned view of the storage, whose elements the
+    /// storage does not hold as values. The bare index step's
+    /// reading of such a position is a byte of the storage, so
+    /// the access must decline explicitly rather than read one.
+    fn fat_denotes_punned_scalar_element(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem_ty: Option<&Ty>,
+    ) -> bool {
+        let Some(elem_ty) = elem_ty else {
+            return false;
+        };
+        let elem_width = match self.byte_layout_of_ty(elem_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind.width(),
+            _ => return false,
+        };
+        if elem_width == 1 {
+            return false;
+        }
+        let Some((projection, _, root_ty, _, _)) =
+            self.byte_view_base(frames, target)
+        else {
+            return false;
+        };
+        if !projection.is_empty() {
+            return false;
+        }
+        let root_width = match self.byte_layout_of_ty(&root_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind.width(),
+            _ => return false,
+        };
+        if root_width == elem_width {
+            return false;
+        }
+        matches!(
+            self.read_resolved(frames, target),
+            Ok(v) if scalar_storage_len(&v).is_some()
+        )
     }
 
     /// Read an integer of `bits` width at `target` by composing
@@ -21855,7 +22081,7 @@ fn vec_value_len(value: &Value) -> Option<u128> {
 /// their storage is the full 16 bytes; the guest only ever
 /// addresses the bytes of the value's own declared width, which
 /// are the low ones.
-fn scalar_storage_len(value: &Value) -> Option<usize> {
+pub(crate) fn scalar_storage_len(value: &Value) -> Option<usize> {
     match value {
         Value::Bool(_) => Some(1),
         Value::Float(_) => Some(8),
@@ -21872,7 +22098,7 @@ fn scalar_storage_len(value: &Value) -> Option<usize> {
 /// scalar value denotes this byte, the only element a scalar's
 /// storage has. `None` for a non-scalar value or an index past
 /// the storage.
-fn scalar_storage_byte(value: &Value, idx: usize) -> Option<u8> {
+pub(crate) fn scalar_storage_byte(value: &Value, idx: usize) -> Option<u8> {
     let len = scalar_storage_len(value)?;
     if idx >= len {
         return None;
