@@ -3530,6 +3530,17 @@ class Stage3ProcedureTests(unittest.TestCase):
         self.assertEqual(out["bucket"], "out of stage-3 scope (revisions)")
         self.assertEqual(calls, [])
 
+    def test_cargo_suites_are_out_of_scope(self):
+        self.write_recipe()
+        for suite in ("run-make-cargo", "build-std"):
+            self.rec["suite"] = suite
+            out, calls = self.run_procedure(None, None, None)
+            self.assertEqual(out["status"], "not-attempted")
+            self.assertEqual(out["bucket"],
+                             "out of stage-3 scope (cargo)")
+            self.assertIn("cargo", out["reason"])
+            self.assertEqual(calls, [])
+
     def test_native_failure_is_a_plain_failure(self):
         self.write_recipe()
         bad = {"exit_code": 1, "stdout": "",
