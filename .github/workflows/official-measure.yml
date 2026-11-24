@@ -6,11 +6,12 @@ name: Official Measurement
 # with the runner's --jit mode. This replaces the manual run on the
 # dev host; nothing about the official measurement is run by hand.
 #
-# The metric-2(b) pass runs all three runner stages (--stages all):
+# The metric-2(b) pass runs all four runner stages (--stages all):
 # stage 3 attempts the procedure records (the run-make recipes)
-# through the runner's procedure harness. The metric-4 (--jit) pass
-# does not attempt procedure records; they stay in its denominator
-# as not attempted, exactly as before.
+# through the runner's procedure harness, and stage 4 attempts the
+# rustdoc-check records through the runner's rustdoc harness. The
+# metric-4 (--jit) pass attempts neither; they stay in its
+# denominator as not attempted, exactly as before.
 #
 # A single hosted job cannot hold the whole measurement inside the
 # 6-hour job limit with headroom, so the survey is split into shards
@@ -50,6 +51,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_SURVEY_DIR: ${{ github.workspace }}/.ci/rust-1.100.0-survey
   SURVEY_JSON: ${{ github.workspace }}/.ci/subset-survey.json
+  # Where the stage-4 guest runs expect the rustdoc artifact tree
+  # (restored from its cache when populated; see the measure job).
+  SPARAGMOS_RUSTDOC_ARTIFACTS: ${{ github.workspace }}/.ci/rustdoc-artifacts-1.100.0
   # Hosted CPUs are slower than the dev host; per-record timeouts are
   # raised above the runner defaults (60s) so heavy records do not
   # fall over purely on CPU speed.
@@ -103,11 +107,16 @@ jobs:
           # `htmldocck()` helper executes from the source root, and
           # src/librustdoc/html/static/css is read directly by the
           # rustdoc themes recipe; without them those recipes fail
-          # on the native side of stage 3.
+          # on the native side of stage 3. The stage-4 harness
+          # likewise extracts src/etc/htmldocck.py and the
+          # jsondocck / jsondoclint sources from the tree and runs
+          # the guest rustdoc from src/tools/rustdoc/main.rs, so
+          # those are widened too.
           git -C "$RUST_SURVEY_DIR" sparse-checkout add \
             src/tools/run-make-support src/build_helper \
             src/rustdoc-json-types src/etc \
-            src/librustdoc/html/static/css
+            src/librustdoc/html/static/css src/tools/jsondocck \
+            src/tools/jsondoclint src/tools/rustdoc
           ls -la "$SURVEY_JSON"
 
       - name: Upload survey
@@ -251,8 +260,22 @@ jobs:
           RUSTC_BOOTSTRAP: "1"
         run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
 
+      # The stage-4 guest runs use the rustdoc artifact tree
+      # when its cache has been populated (building the tree
+      # compiles the whole compiler-crate closure from source
+      # and does not fit these jobs; see docs/CI.md). On a cache
+      # miss the directory simply stays absent and the runner
+      # records the oracle-passing rustdoc records as not
+      # attempted (rustdoc artifact tree unavailable).
+      - name: Restore rustdoc artifact tree
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.SPARAGMOS_RUSTDOC_ARTIFACTS }}
+          key: rustdoc-artifacts-1.100.0-v1
+
       # --stages all: stages 1+2 plus the stage-3 procedure
-      # harness, so the procedure records are attempted in the
+      # harness and the stage-4 rustdoc harness, so the
+      # procedure and rustdoc-check records are attempted in the
       # official metric-2(b) pass.
       - name: Run shard
         run: |
@@ -405,8 +428,9 @@ jobs:
         run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
 
       # No --stages here: the JIT pass keeps the default stages
-      # (1+2). Metric 4 does not attempt procedure records, and the
-      # runner refuses stage 3 under --jit in any case.
+      # (1+2). Metric 4 attempts neither procedure nor
+      # rustdoc-check records, and the runner refuses stages 3
+      # and 4 under --jit in any case.
       - name: Run shard (jit)
         run: |
           python3 scripts/ci-subset-tools.py shard \

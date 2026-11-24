@@ -43,8 +43,15 @@ nature="procedure" population (the run-make recipes): each recipe
 is compiled and run natively as the oracle, then run under the
 driver with tool interception, where the recipe's compiler
 invocations are answered by the driver's own conversion machinery
-(see the stage-3 section below). The official metric-2(b)
-measurement runs all three stages (`--stages all`). Everything
+(see the stage-3 section below). Stage 4 covers the
+nature="rustdoc-check" population (see the stage-4 section below):
+the pinned rustdoc is the oracle and rustdoc itself, converted and
+run by the driver from the rustdoc artifact tree, is the guest;
+both sides are judged by compiletest's rules for each suite
+(htmldocck for rustdoc-html, jsondocck and jsondoclint for
+rustdoc-json, the UI verdict for rustdoc-ui). The official
+metric-2(b) measurement runs all four stages (`--stages all`).
+Everything
 else in the denominator is reported as not attempted, with a reason;
 unattempted and failed tests alike count against the overall
 metric-2(b) rate, whose denominator is always the full subset
@@ -113,7 +120,9 @@ through as not attempted and count against the metric-4 rate,
 exactly as they count against metric 2(b). Stage 3 is never
 combined with `--jit`: metric 4 has no procedure attempt, so a
 `--jit` run carries procedure records as not attempted even when
-`--stages all` is given.
+`--stages all` is given. Stage 4 is never combined with `--jit`
+either: metric 4 has no rustdoc attempt, so a `--jit` run carries
+rustdoc-check records as not attempted.
 
 Usage:
     python3 scripts/rustc-subset-run.py \
@@ -121,7 +130,9 @@ Usage:
         --rust-dir ~/rust-1.100.0-survey \
         --driver-bin crates/sparagmos-driver/target/debug/sparagmos-driver \
         --out subset-run-results.json [--jobs 48] [--limit N]
-        [--stages 1|2|3|both|all] [--stage2-limit N] [--stage3-limit N] [--jit]
+        [--stages 1|2|3|4|both|all] [--stage2-limit N] [--stage3-limit N]
+        [--stage4-limit N] [--rustdoc-artifacts DIR] [--rustdoc-main FILE]
+        [--jit]
 """
 
 import argparse
@@ -3177,7 +3188,8 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
     out["status"] = "pass"
 
 
-def process_test(rec, rust_dir, driver_bin, stage2=False, stage3=False, jit=False):
+def process_test(rec, rust_dir, driver_bin, stage2=False, stage3=False,
+               stage4=False, jit=False):
     """Produce the result record for one survey record."""
     out = {
         "suite": rec["suite"],
@@ -3202,6 +3214,8 @@ def process_test(rec, rust_dir, driver_bin, stage2=False, stage3=False, jit=Fals
             fill_result_stage2(rec, rust_dir, driver_bin, out, jit=jit)
         elif stage3 and rec["nature"] == "procedure":
             fill_result_procedure(rec, rust_dir, driver_bin, out)
+        elif stage4 and rec["nature"] == "rustdoc-check":
+            fill_result_rustdoc(rec, rust_dir, driver_bin, out)
         else:
             fill_result(rec, rust_dir, driver_bin, out, jit=jit)
     except Exception as e:  # a runner bug must not lose the whole run
@@ -5464,6 +5478,1645 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
         out["bucket"] = "recipe failed under sparagmos"
 
 
+# ---------------------------------------------------------------------------
+# Stage 4: rustdoc-check records (Issue #364)
+# ---------------------------------------------------------------------------
+#
+# The rustdoc-check nature (1,735 records) is judged here, in the
+# shape compiletest itself uses for the suites that need no
+# JavaScript or browser environment:
+#
+#   rustdoc-html (802): the pinned rustdoc documents the test file
+#     (compiletest's document()), then the tree's own
+#     src/etc/htmldocck.py checks the generated HTML against the
+#     assertions written in the test file.
+#   rustdoc-json (194): document() with --output-format json,
+#     then the tree's own jsondocck checks the JSON against the
+#     directives in the test file and jsondoclint lints it.
+#   rustdoc-ui (440): the pinned rustdoc compiles the test file
+#     with compiletest's UI argument set (JSON diagnostics,
+#     -Zui-testing, ...); the verdict is compiletest's UI verdict
+#     ported below (pass/fail mode and failure status, snapshot
+#     compare of the rendered diagnostics, //~ annotations,
+#     error-pattern checks).
+#
+# The remaining suites (rustdoc-gui, rustdoc-js, rustdoc-js-std;
+# 299 records) run their tests in a browser / JavaScript
+# environment the subset runner does not provide; they are
+# recorded with an explicit scope bucket and stay in the
+# denominator (Issue #365 tracks that environment).
+#
+# The native run is the oracle, as in stages 1-3: a record whose
+# native rustdoc run does not satisfy compiletest's rules for its
+# suite is a plain failure, never a pass candidate. Only when
+# the native side passes does the guest side run: rustdoc itself,
+# converted and executed by the driver from the artifact tree
+# built by scripts/build-rustdoc-artifacts.sh (the MIR-carrying
+# compiler-crate builds; see docs/RUSTDOC-ARTIFACTS.md), judged
+# by the same rules against its own output.
+#
+# The guest program is the same for every record -- rustdoc's
+# own main and its dependency closure -- and its conversion does
+# not depend on the record's input, so the stage measures the
+# guest's startup once per runner process with a `--version`
+# probe and attributes the outcome to each record whose native
+# oracle passed: while the rustdoc execution chain stops during
+# startup, every such record is unsupported with that one
+# measured reason, instead of 1,436 identical per-record startup
+# failures being re-measured. When the probe passes, each
+# record's guest run is made for real. Guest runs are serialized
+# (one conversion of the rustdoc closure at a time bounds the
+# host memory, the way the stage-3 support build is serialized);
+# native runs stay parallel.
+#
+# Stage 4 is never combined with --jit, like stage 3: metric 4
+# has no rustdoc attempt, so a --jit run carries rustdoc-check
+# records as not attempted even when --stages all is given.
+
+RUSTDOC_SUITES_BROWSER = ("rustdoc-gui", "rustdoc-js", "rustdoc-js-std")
+
+STAGE4_NATIVE_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_TIMEOUT", 240)
+STAGE4_GUEST_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_GUEST_TIMEOUT",
+                                    1800)
+STAGE4_PROBE_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_PROBE_TIMEOUT",
+                                    1800)
+STAGE4_TOOL_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_TOOL_TIMEOUT", 1200)
+
+# Set by main() from --rustdoc-artifacts / --rustdoc-main; the
+# environment variables of the same names are the fallback, then
+# the conventional locations.
+_STAGE4_ARTIFACTS_ARG = None
+_STAGE4_MAIN_RS_ARG = None
+
+_stage4_tools_lock = threading.Lock()
+_stage4_tools_cache = {}
+_stage4_probe_lock = threading.Lock()
+_stage4_probe_cache = {}
+_stage4_guest_lock = threading.Lock()
+
+
+def stage4_artifacts_dir():
+    """The rustdoc artifact tree directory, or None when no usable
+    tree is configured. A tree is usable when it carries the two
+    artifacts the guest invocation binds (librustdoc.rlib and
+    librustc_driver.so)."""
+    cand = _STAGE4_ARTIFACTS_ARG or os.environ.get(
+        "SPARAGMOS_RUSTDOC_ARTIFACTS")
+    d = Path(cand).expanduser() if cand else (
+        Path.home() / "rustdoc-artifacts-1.100.0")
+    if (d / "librustdoc.rlib").is_file() \
+            and (d / "librustc_driver.so").is_file():
+        return d
+    return None
+
+
+def stage4_main_rs(rust_dir):
+    """rustdoc's own main.rs -- the guest program's entry source --
+    or None. Resolution order: --rustdoc-main, the environment,
+    the surveyed tree (CI widens its sparse checkout with
+    src/tools/rustdoc), then a full source tree."""
+    cand = _STAGE4_MAIN_RS_ARG or os.environ.get("SPARAGMOS_RUSTDOC_MAIN_RS")
+    paths = []
+    if cand:
+        paths.append(Path(cand).expanduser())
+    paths.append(rust_dir / "src" / "tools" / "rustdoc" / "main.rs")
+    paths.append(Path.home() / "rust-src-1.100.0" / "src" / "tools"
+                 / "rustdoc" / "main.rs")
+    for p in paths:
+        if p.is_file():
+            return p
+    return None
+
+
+def stage4_guest_cmd(driver_bin, main_rs, artifacts, guest_args):
+    """The driver invocation that runs the artifact tree's rustdoc
+    as the guest program (the invocation the rustdoc execution
+    chain was proven with; see docs/RUSTDOC-ARTIFACTS.md)."""
+    argv = [str(driver_bin), "run", str(main_rs), "--edition", "2024",
+            "--rustc-arg", "--extern", "--rustc-arg",
+            f"rustdoc={artifacts / 'librustdoc.rlib'}",
+            "--rustc-arg", "--extern", "--rustc-arg",
+            f"rustc_driver={artifacts / 'librustc_driver.so'}",
+            "--rustc-arg", "-L", "--rustc-arg",
+            f"dependency={artifacts}"]
+    for a in guest_args:
+        argv += ["--guest-arg", a]
+    return argv
+
+
+def stage4_guest_probe(driver_bin, rust_dir):
+    """Measure the guest rustdoc's startup once per process.
+
+    The converted program is identical for every record, so its
+    startup outcome is a property of the execution chain, not of
+    a record: {"state": ok | unsupported | fail | timeout |
+    unavailable, "reason": ...}. Cached per driver binary.
+    """
+    key = str(driver_bin)
+    with _stage4_probe_lock:
+        if key not in _stage4_probe_cache:
+            _stage4_probe_cache[key] = _stage4_guest_probe_run(
+                driver_bin, rust_dir)
+        return _stage4_probe_cache[key]
+
+
+def _stage4_guest_probe_run(driver_bin, rust_dir):
+    artifacts = stage4_artifacts_dir()
+    if artifacts is None:
+        return {"state": "unavailable",
+                "reason": "rustdoc artifact tree unavailable (no "
+                          "librustdoc.rlib / librustc_driver.so in "
+                          "the configured tree; build it with "
+                          "scripts/build-rustdoc-artifacts.sh)"}
+    main_rs = stage4_main_rs(rust_dir)
+    if main_rs is None:
+        return {"state": "unavailable",
+                "reason": "rustdoc main.rs not found "
+                          "(src/tools/rustdoc/main.rs)"}
+    with tempfile.TemporaryDirectory(prefix="stage4-probe-") as td:
+        res = run_cmd(stage4_guest_cmd(driver_bin, main_rs, artifacts,
+                                       ["--version"]),
+                      timeout=STAGE4_PROBE_TIMEOUT, cwd=td,
+                      env_extra=BOOTSTRAP_ENV)
+    if res["timeout"]:
+        return {"state": "timeout",
+                "reason": f"guest rustdoc startup probe timed out "
+                          f"after {STAGE4_PROBE_TIMEOUT}s"}
+    if res["exit_code"] == 0:
+        return {"state": "ok", "reason": ""}
+    if res["exit_code"] == 2:
+        reason = driver_reason(res["stderr"]) \
+            or driver_reason(res["stdout"])
+        return {"state": "unsupported", "reason": reason,
+                "exit_code": 2}
+    return {"state": "fail", "exit_code": res["exit_code"],
+            "reason": "guest rustdoc failed during the startup "
+                      "probe: "
+                      + (first_error_line(res["stderr"])
+                         or first_error_line(res["stdout"])
+                         or f"exit {res['exit_code']}")}
+
+
+def stage4_guest_gate(driver_bin, rust_dir):
+    """Resolve the guest startup probe into an attempt outcome.
+
+    Returns (proceed, result): when proceed is False, result is
+    the attempt's final stage-2-style result dict.
+    """
+    probe = stage4_guest_probe(driver_bin, rust_dir)
+    state = probe["state"]
+    if state == "ok":
+        return True, None
+    res = {"status": "not-attempted", "reason": probe["reason"],
+           "bucket": ""}
+    if state == "unavailable":
+        res["bucket"] = "not attempted (rustdoc artifact tree)"
+    elif state == "timeout":
+        res["bucket"] = "timeout"
+    elif state == "unsupported":
+        res["status"] = "unsupported"
+        res["bucket"] = bucket_reason(probe["reason"])
+        res["sparagmos"] = {"exit_code": 2}
+    elif state == "fail":
+        res["status"] = "fail"
+        res["bucket"] = bucket_reason(probe["reason"])
+    return False, res
+
+
+def _stage4_closure_lock(rust_dir, root_name):
+    """A standalone Cargo.lock for one checker tool, cut from the
+    tree's own Cargo.lock: the tool's dependency closure at the
+    versions the tree pins. Built standalone, the tools would
+    otherwise re-resolve their crates.io dependencies at today's
+    versions, whose APIs have drifted from the ones the tree's
+    sources are written against (jaq-std lost `funs` that way).
+    Cargo still trims entries only the workspace's feature
+    unification needed when it loads the lock; the pins hold.
+    Returns the lock text, or None when it cannot be derived.
+    """
+    show = subprocess.run(
+        ["git", "-C", str(rust_dir), "show", "HEAD:Cargo.lock"],
+        capture_output=True, text=True, timeout=120)
+    if show.returncode != 0:
+        return None
+    packages = []
+    blocks = show.stdout.split("\n[[package]]\n")
+    header = blocks[0]
+    for block in blocks[1:]:
+        name_m = re.search(r'^name = "([^"]+)"', block, re.M)
+        ver_m = re.search(r'^version = "([^"]+)"', block, re.M)
+        if not name_m or not ver_m:
+            continue
+        dep_m = re.search(r"^dependencies = \[(.*?)\]", block,
+                          re.M | re.S)
+        deps = re.findall(r'"([^"]+)"', dep_m.group(1)) if dep_m \
+            else []
+        packages.append({"name": name_m.group(1),
+                         "version": ver_m.group(1), "deps": deps,
+                         "block": block})
+    by_name = {}
+    for pk in packages:
+        by_name.setdefault(pk["name"], []).append(pk)
+
+    def resolve(dep):
+        parts = dep.split(" ")
+        cands = by_name.get(parts[0], [])
+        if len(parts) >= 2 and parts[1][:1].isdigit():
+            for c in cands:
+                if c["version"] == parts[1]:
+                    return c
+            return None
+        return cands[0] if len(cands) == 1 else None
+
+    roots = [pk for pk in packages if pk["name"] == root_name]
+    if len(roots) != 1:
+        return None
+    seen = {}
+    stack = [roots[0]]
+    while stack:
+        pk = stack.pop()
+        key = (pk["name"], pk["version"])
+        if key in seen:
+            continue
+        seen[key] = pk
+        for dep in pk["deps"]:
+            resolved = resolve(dep)
+            if resolved is not None:
+                stack.append(resolved)
+    out = [header.rstrip(), ""]
+    for pk in sorted(seen.values(),
+                     key=lambda x: (x["name"], x["version"])):
+        out.append("[[package]]")
+        out.append(pk["block"].rstrip())
+        out.append("")
+    return "\n".join(out)
+
+
+def stage4_checker_tools(rust_dir):
+    """The suites' checker tools from the pinned tree, prepared
+    once per process: src/etc/htmldocck.py (interpreted) and the
+    jsondocck / jsondoclint crates (built with the pinned
+    toolchain's cargo, the way stage 3 builds run-make-support).
+
+    Returns a dict: tool name -> path or None, plus "error" (the
+    extraction failure, if any) and "build_errors" (per-tool
+    build failure text). A None tool makes only its own suite
+    unjudgeable; the caller records that as not attempted.
+    """
+    key = str(rust_dir)
+    with _stage4_tools_lock:
+        if key not in _stage4_tools_cache:
+            _stage4_tools_cache[key] = _stage4_checker_tools_build(
+                rust_dir)
+        return _stage4_tools_cache[key]
+
+
+def _stage4_checker_tools_build(rust_dir):
+    digest = hashlib.sha256(str(rust_dir).encode()).hexdigest()[:16]
+    root = Path(tempfile.gettempdir()) / f"sparagmos-stage4-tools-{digest}"
+    tools = {
+        "htmldocck": root / "src" / "etc" / "htmldocck.py",
+        "jsondocck": root / "src" / "tools" / "jsondocck" / "target"
+                     / "debug" / "jsondocck",
+        "jsondoclint": root / "src" / "tools" / "jsondoclint" / "target"
+                       / "debug" / "jsondoclint",
+        "error": None,
+        "build_errors": {},
+    }
+    if all(tools[k] is not None and tools[k].exists()
+           for k in ("htmldocck", "jsondocck", "jsondoclint")):
+        return tools
+    root.mkdir(parents=True, exist_ok=True)
+    # Extract from the tree's git objects: the survey checkout is
+    # sparse and does not materialize these directories, but the
+    # blobs are in the object store (CI widens the checkout so
+    # the cached tree carries them).
+    archive = subprocess.run(
+        ["git", "-C", str(rust_dir), "archive", "HEAD",
+         "src/etc/htmldocck.py", "src/tools/jsondocck",
+         "src/tools/jsondoclint", "src/rustdoc-json-types"],
+        capture_output=True, timeout=120)
+    if archive.returncode != 0:
+        tools["error"] = ("stage-4 checker extraction failed: "
+                          + archive.stderr.decode("utf-8", "replace")
+                          [:300])
+        return tools
+    subprocess.run(["tar", "-x", "-C", str(root)], input=archive.stdout,
+                   check=True, timeout=120)
+    if not tools["htmldocck"].exists():
+        tools["error"] = ("stage-4 checker extraction produced no "
+                          "src/etc/htmldocck.py")
+        return tools
+    paths = stage3_toolchain_paths()
+    cargo = paths["cargo"]
+    for name in ("jsondocck", "jsondoclint"):
+        crate_dir = root / "src" / "tools" / name
+        lock = _stage4_closure_lock(rust_dir, name)
+        if lock is not None:
+            (crate_dir / "Cargo.lock").write_text(lock)
+        build = run_cmd([cargo, "build"], timeout=STAGE4_TOOL_TIMEOUT,
+                        cwd=crate_dir,
+                        env_extra={**BOOTSTRAP_ENV,
+                                   "RUSTC": paths["rustc"]})
+        if build["timeout"]:
+            tools["build_errors"][name] = f"{name} build timed out"
+            tools[name] = None
+        elif build["exit_code"] != 0 or not tools[name].exists():
+            tail = (build["stderr"] or "")[-400:]
+            tools["build_errors"][name] = f"{name} build failed: {tail}"
+            tools[name] = None
+    return tools
+
+
+def stage4_doc_flags(view, src_base=None, build_base=None):
+    """All doc-flags tokens visible in a directive view, expanded
+    like compile-flags (compiletest expands {{...}} variables in
+    every directive value before use)."""
+    flags = []
+    for v in view.values("doc-flags"):
+        if src_base is not None and build_base is not None:
+            v = expand_variables(v, src_base, str(build_base))
+        flags.extend(split_flags(v))
+    return flags
+
+
+def stage4_compile_and_doc_flags(view, src_base, build_base):
+    """(compile-flags, doc-flags) for one document() invocation:
+    directives.rs inserts --edition=<e> at the front of
+    compile-flags when the test declares an edition; a test
+    without one reaches rustdoc with no --edition flag."""
+    flags = compile_flags(view, src_base, str(build_base))
+    if view.values("edition"):
+        flags = [f"--edition={attempt_edition(view)}"] + flags
+    return flags, stage4_doc_flags(view, src_base, build_base)
+
+
+def stage4_extern_names(view):
+    """The crate names a test binds with --extern for its rustdoc
+    run: the names its aux-crate and proc-macro directives declare
+    (compiletest's build_all_auxiliary adds --extern for those;
+    aux-build crates are found through the -L directory instead).
+    """
+    names = set()
+    for value in view.values("aux-crate"):
+        parsed = parse_aux_crate_value(value)
+        if parsed:
+            names.add(parsed[1])
+    for value in view.values("proc-macro"):
+        _modifiers, fname = parse_proc_macro_value(value)
+        if fname:
+            names.add(Path(fname).stem.replace("-", "_"))
+    return names
+
+
+def stage4_prepare_aux(rec, header, path, workdir, revision=None,
+                       view=None):
+    """Resolve and natively build a record's auxiliary crates.
+
+    Returns (aux_dir, extern_args, error): error is None on
+    success, else a stage-2-style result dict fragment
+    (status/reason/bucket) -- a scope result when the record's
+    files cannot be accounted for, a plain failure when an
+    auxiliary crate does not build natively (compiletest fails
+    the test then, too). The crates are built once, natively,
+    and shared by both sides: the guest is rustdoc itself, and
+    auxiliary crates are inputs the host toolchain builds for it,
+    as in stage 3.
+    """
+    auxdir = Path(workdir) / "auxiliary"
+    auxdir.mkdir(parents=True, exist_ok=True)
+    if rec["single_file"]:
+        return auxdir, [], None
+    specs, err = resolve_aux_specs(path, revision=revision, top=view)
+    if err:
+        return None, None, {"status": "not-attempted", "reason": err,
+                            "bucket": "out of stage-4 scope (multi-file)"}
+    if not specs:
+        return None, None, {
+            "status": "not-attempted",
+            "reason": "multi-file / auxiliary crates (not in "
+                      "stage-4 scope)",
+            "bucket": "out of stage-4 scope (multi-file)"}
+    if view is None:
+        view = header.view(None)
+    extern_names = stage4_extern_names(view)
+    edition = attempt_edition(view)
+    lib = sysroot_lib()
+    helpers = test_helpers_args(path)
+    built = []
+    extern_args = []
+    for spec in specs:
+        spec = as_aux_spec(spec)
+        name, src = spec.name, spec.path
+        text = src.read_text(errors="ignore")
+        declared = declared_crate_type(text)
+        # compiletest builds every auxiliary crate under its
+        # file-stem name (path_to_crate_name in build_all_auxiliary);
+        # an aux-crate directive's name is only the --extern
+        # binding, never the built crate's own name -- rustdoc's
+        # output paths and cross-crate links use the real name.
+        eff_name = declared_crate_name(text) or \
+            src.stem.replace("-", "_")
+        aview = aux_header_view(text)
+        aux_no_pd = aview.has("no-prefer-dynamic")
+        aux_flags = compile_flags(aview, suite_root(src), str(workdir))
+        if screen_flags(aux_flags, targets={HOST_TARGET}):
+            aux_flags = []
+        linkable = [t for t in declared_crate_types(text)
+                    if t in ("rlib", "lib", "dylib", "proc-macro")]
+        if linkable:
+            effective = linkable[0]
+        elif declared is not None:
+            effective = declared
+        else:
+            effective = spec.crate_type or (
+                "rlib" if aux_no_pd else "dylib")
+        cmd = rustc_cmd() + ["--edition", spec.edition or edition,
+                             "--out-dir", str(auxdir)]
+        if lib:
+            cmd += ["-L", lib]
+        cmd += ["-L", f"dependency={auxdir}"]
+        cmd += helpers
+        if declared is None:
+            cmd += ["--crate-type", effective]
+        if declared_crate_name(text) is None:
+            cmd += ["--crate-name", eff_name]
+        if not aux_no_pd and not any(
+                "prefer-dynamic" in f for f in aux_flags):
+            cmd += ["-C", "prefer-dynamic"]
+        for prev_binding, prev_artifact in built:
+            if prev_artifact is not None:
+                cmd += ["--extern", f"{prev_binding}={prev_artifact}"]
+        cmd += sysroot_extern_args(src, ())
+        cmd += aux_flags
+        cmd += [str(src)]
+        apairs, aunset = view_env(aview, "rustc-env", "unset-rustc-env",
+                                  suite_root(src), str(workdir))
+        aenv = dict(BOOTSTRAP_ENV)
+        aenv.update({"RUSTC_ICE": "0", "RUST_BACKTRACE": "short"})
+        aenv.update(apairs)
+        aunset = list(dict.fromkeys([*aunset, "RUSTC_LOG_COLOR"]))
+        build = run_cmd(cmd, timeout=STAGE4_NATIVE_TIMEOUT,
+                        env_extra=aenv, env_remove=aunset)
+        if build["timeout"]:
+            return None, None, {
+                "status": "not-attempted",
+                "reason": "native auxiliary build timed out",
+                "bucket": "timeout"}
+        if build["exit_code"] != 0:
+            first = first_error_line(build["stderr"])
+            return None, None, {
+                "status": "fail",
+                "reason": f"native auxiliary build failed: {first}",
+                "bucket": "native rustdoc failure"}
+        artifact = (find_artifact(auxdir, eff_name)
+                    if effective in ("rlib", "lib", "dylib",
+                                     "proc-macro")
+                    else None)
+        # The binding a later auxiliary build sees: dependent
+        # sources name the crate by its real (declared or
+        # file-stem) name, never by an aux-crate directive's
+        # binding name -- that name exists only for the test
+        # file's own --extern, appended below.
+        binding = (f"{spec.modifiers}:{eff_name}"
+                   if spec.modifiers else eff_name)
+        built.append((binding, artifact))
+        if artifact is not None and name in extern_names:
+            bind_name = (f"{spec.modifiers}:{name}"
+                         if spec.modifiers else name)
+            extern_args += ["--extern", f"{bind_name}={artifact}"]
+    return auxdir, extern_args, None
+
+
+def stage4_document_args(view, path, base_dir, aux_dir, extern_args,
+                         kind, src_base):
+    """One document_inner argument list: -L <target lib> -L <aux
+    dir> -o <out dir> --deny warnings <file> -A internal_features
+    -Znext-solver=coherence, then compile-flags and doc-flags,
+    the JSON form for the rustdoc-json suite, and the --extern
+    bindings build_all_auxiliary appends last."""
+    paths = stage3_toolchain_paths()
+    args = ["-L", paths["target_lib"], "-L", str(aux_dir),
+            "-o", str(base_dir), "--deny", "warnings", str(path),
+            "-A", "internal_features", "-Znext-solver=coherence"]
+    cflags, dflags = stage4_compile_and_doc_flags(view, src_base,
+                                                  base_dir)
+    args += cflags
+    args += dflags
+    if kind == "json":
+        args += ["--output-format", "json", "-Zunstable-options"]
+    args += extern_args
+    return args
+
+
+def stage4_document(runner, header, path, base_dir, aux_dir,
+                    extern_args, kind, src_base, stack=()):
+    """document() with build-aux-docs expansion: each aux-build
+    file is documented first, with its own file's directives,
+    into the same root out dir; an aux failure is the attempt's
+    failure, as in document_inner. `runner` takes the rustdoc
+    argument list and returns a run_cmd result; the caller
+    supplies the native binary or the guest-via-driver form.
+    compiletest recurses without a depth cap; `stack` (the chain
+    of files currently being expanded) only breaks a cycle, and
+    re-documenting a file an ancestor already documented into
+    the same out dir would be idempotent anyway. (An aux file's
+    own auxiliary crates are approximated by the root test's
+    set, built once by stage4_prepare_aux.)"""
+    view = header.view(None)
+    if kind == "html" and view.has("build-aux-docs"):
+        if len(stack) > 32:
+            return {"exit_code": 1, "stdout": "", "timeout": False,
+                    "stderr": "build-aux-docs nesting too deep"}
+        for value in view.values("aux-build"):
+            fname = value.strip()
+            if not fname:
+                continue
+            aux_path = path.parent / "auxiliary" / fname
+            if not aux_path.exists():
+                aux_path = path.parent / fname
+            if not aux_path.exists():
+                return {"exit_code": 1, "stdout": "", "timeout": False,
+                        "stderr": f"auxiliary file not found: {fname}"}
+            if aux_path in stack:
+                continue
+            aux_header = Header(aux_path.read_text(errors="ignore"))
+            res = stage4_document(runner, aux_header, aux_path,
+                                  base_dir, aux_dir, extern_args, kind,
+                                  src_base, stack + (path,))
+            if res["timeout"] or res["exit_code"] != 0:
+                return res
+    out_dir = base_dir
+    if view.has("unique-doc-out-dir"):
+        out_dir = base_dir / "docs" / path.stem / "doc"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    args = stage4_document_args(view, path, out_dir, aux_dir,
+                                extern_args, kind, src_base)
+    return runner(args)
+
+
+def stage4_judge_documented(suite, path, out_dir, rust_dir):
+    """Judge one produced output directory with the suite's own
+    checker. Returns (ok, reason): ok is True/False for a judged
+    outcome, or None when the checker itself is unavailable in
+    this environment (the caller records not attempted then).
+    """
+    tools = stage4_checker_tools(rust_dir)
+    if tools["error"]:
+        return None, tools["error"]
+    if suite == "rustdoc-html":
+        # htmldocck reads the doc channel from its environment
+        # (bootstrap sets it for compiletest's runs).
+        res = run_cmd([sys.executable, str(tools["htmldocck"]),
+                       str(out_dir), str(path)],
+                      timeout=STAGE4_NATIVE_TIMEOUT,
+                      env_extra={"DOC_RUST_LANG_ORG_CHANNEL":
+                                 "https://doc.rust-lang.org/1.100.0"})
+        if res["timeout"]:
+            return False, "htmldocck timed out"
+        if res["exit_code"] != 0:
+            return False, "htmldocck failed: " + (
+                first_error_line(res["stdout"])
+                or first_error_line(res["stderr"]))
+        return True, ""
+    # rustdoc-json: jsondocck over the test file's directives,
+    # then jsondoclint over the produced JSON.
+    if tools["jsondocck"] is None:
+        return None, tools["build_errors"].get(
+            "jsondocck", "jsondocck unavailable")
+    if tools["jsondoclint"] is None:
+        return None, tools["build_errors"].get(
+            "jsondoclint", "jsondoclint unavailable")
+    res = run_cmd([str(tools["jsondocck"]), "--doc-dir", str(out_dir),
+                   "--template", str(path)],
+                  timeout=STAGE4_NATIVE_TIMEOUT)
+    if res["timeout"]:
+        return False, "jsondocck timed out"
+    if res["exit_code"] != 0:
+        return False, "jsondocck failed: " + (
+            first_error_line(res["stderr"])
+            or first_error_line(res["stdout"]))
+    stem = path.stem
+    json_file = out_dir / (stem.replace("-", "_") + ".json")
+    if not json_file.exists():
+        json_file = out_dir / (stem + ".json")
+    if not json_file.exists():
+        produced = sorted(out_dir.glob("*.json"))
+        if len(produced) == 1:
+            json_file = produced[0]
+        else:
+            return False, "rustdoc produced no JSON output file"
+    res = run_cmd([str(tools["jsondoclint"]), str(json_file)],
+                  timeout=STAGE4_NATIVE_TIMEOUT)
+    if res["timeout"]:
+        return False, "jsondoclint timed out"
+    if res["exit_code"] != 0:
+        return False, "jsondoclint failed: " + (
+            first_error_line(res["stderr"])
+            or first_error_line(res["stdout"]))
+    return True, ""
+
+
+def stage4_ui_args(view, path, base_dir, revision, all_revisions,
+                   extern_args, aux_dir, src_base, rust_dir):
+    """make_compile_args for one rustdoc-ui run (WillExecute::No,
+    CompilerKind::Rustdoc), in compiletest's argument order.
+    Returns (args, explicit_error_format): whether the test's own
+    compile-flags name an --error-format (compiletest then
+    compares the raw stderr instead of the rendered diagnostics).
+    doc-flags play no part here; document() is the only consumer.
+    """
+    cflags, _dflags = stage4_compile_and_doc_flags(view, src_base,
+                                                   base_dir)
+    cargo_home = os.environ.get("CARGO_HOME") or str(
+        Path.home() / ".cargo")
+    args = [str(path),
+            "-Zsimulate-remapped-rust-src-base=/rustc/FAKE_PREFIX",
+            "-Ztranslate-remapped-path-to-local-path=no",
+            "-Z", "ignore-directory-in-diagnostics-source-blocks="
+                  + cargo_home,
+            "-Z", "ignore-directory-in-diagnostics-source-blocks="
+                  + str(rust_dir / "vendor")]
+    if not any(f.startswith("--sysroot") for f in cflags):
+        sysroot = Path(stage3_toolchain_paths()["rustc"]).parent.parent
+        args += ["--sysroot", str(sysroot)]
+    if not any(f.startswith("--target") for f in cflags):
+        args.append(f"--target={HOST_TARGET}")
+    if revision is not None:
+        args += ["--cfg", normalize_revision(revision)]
+    # The auto --check-cfg is unconditional (unless the test opts
+    # out): compose_and_run_compiler appends
+    # `--check-cfg cfg(test,FALSE[,revisions])` to every run, and
+    # it is what activates the unexpected-cfg warnings several
+    # snapshots expect.
+    if not view.has("no-auto-check-cfg"):
+        check = "cfg(test,FALSE"
+        for rev in all_revisions:
+            check += "," + normalize_revision(rev)
+        check += ")"
+        args += ["--check-cfg", check]
+    explicit = any("--error-format" in f for f in cflags)
+    if not explicit:
+        args += ["--error-format", "json", "--json", "future-incompat"]
+    args += ["-Ccodegen-units=1", "-Zui-testing",
+             "-Zdeduplicate-diagnostics=no",
+             "-Zwrite-long-types-to-disk=no", "-Cstrip=debuginfo"]
+    args += ["-o", str(base_dir)]
+    args += ["-Znext-solver=coherence"]
+    args += ["-A", "internal_features", "-A", "incomplete_features",
+             "-A", "unused_parens", "-A", "unused_braces"]
+    args += cflags
+    if aux_dir is not None:
+        # A plain -L, as document() passes its aux dir: a
+        # dependency=-only path does not surface dylib auxiliary
+        # crates to the crate locator.
+        args += ["-L", str(aux_dir)]
+    args += extern_args
+    return args, explicit
+
+
+def _stage4_is_diagnostic(obj):
+    return isinstance(obj, dict) and "message" in obj \
+        and "level" in obj and "spans" in obj and "children" in obj
+
+
+def stage4_extract_rendered(output):
+    """compiletest's json::extract_rendered: the `rendered` text
+    of each JSON diagnostic in the output, with future-incompat
+    reports formatted, artifact / unused-extern notifications
+    dropped, and non-JSON lines (ICEs, panics) kept as-is."""
+    parts = []
+    for line in output.splitlines():
+        if not line.startswith("{"):
+            parts.append(line + "\n")
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if _stage4_is_diagnostic(obj):
+            if obj.get("rendered"):
+                parts.append(obj["rendered"])
+            continue
+        if isinstance(obj, dict) and isinstance(
+                obj.get("future_incompat_report"), list):
+            report = obj["future_incompat_report"]
+            if report:
+                body = "".join(
+                    "Future breakage diagnostic:\n"
+                    + ((item.get("diagnostic") or {}).get("rendered")
+                       or "Not rendered")
+                    for item in report)
+                parts.append(f"Future incompatibility report: {body}")
+            continue
+        if isinstance(obj, dict) and "artifact" in obj:
+            continue
+        if isinstance(obj, dict) and "unused_extern_names" in obj:
+            continue
+        parts.append(line + "\n")
+    return "".join(parts)
+
+
+_STAGE4_NORMALIZE_RULE_RE = re.compile(
+    r'^\s*"([^"]*)"\s+->\s+"([^"]*)"$')
+
+
+def stage4_normalize_rules(view, *names):
+    """A view's custom normalization rules for one stream, in
+    directive order: (regex, replacement) pairs parsed with
+    compiletest's parse_normalize_rule (the replacement's \\n
+    sequence becomes a real newline there)."""
+    rules = []
+    for name in names:
+        for v in view.values(name):
+            m = _STAGE4_NORMALIZE_RULE_RE.match(v.strip())
+            if not m:
+                continue
+            rules.append((m.group(1), m.group(2).replace("\\n", "\n")))
+    return rules
+
+
+def _stage4_group(match, name):
+    try:
+        value = match.group(int(name)) if name.isdigit() \
+            else match.group(name)
+    except (IndexError, Exception):
+        return ""
+    return value or ""
+
+
+_STAGE4_POSIX_CLASSES = {
+    "alnum": "a-zA-Z0-9",
+    "alpha": "a-zA-Z",
+    "ascii": "\\x00-\\x7f",
+    "blank": " \\t",
+    "cntrl": "\\x00-\\x1f\\x7f",
+    "digit": "0-9",
+    "graph": "!-~",
+    "lower": "a-z",
+    "print": " -~",
+    "punct": "!-/:-@\\[-`{-~",
+    "space": "\\s",
+    "upper": "A-Z",
+    "word": "\\w",
+    "xdigit": "0-9a-fA-F",
+}
+
+
+def _stage4_translate_posix(pattern):
+    """Replace POSIX class tokens ([:word:] and friends) with
+    the equivalent bracket body for Python's re."""
+    def repl(m):
+        body = _STAGE4_POSIX_CLASSES.get(m.group(1))
+        return body if body is not None else m.group(0)
+    return re.sub(r"\[:([a-z]+):\]", repl, pattern)
+
+
+def _stage4_apply_rule(text, pattern, template):
+    """One custom normalization: a Rust-regex replace_all whose
+    replacement template uses Rust syntax ($$ is a literal $, $N
+    / $name / ${name} are capture references)."""
+    try:
+        rx = re.compile(_stage4_translate_posix(pattern))
+    except re.error:
+        return text
+
+    def expand(m):
+        out = []
+        i = 0
+        while i < len(template):
+            c = template[i]
+            if c == "$" and i + 1 < len(template):
+                nxt = template[i + 1]
+                if nxt == "$":
+                    out.append("$")
+                    i += 2
+                    continue
+                if nxt == "{":
+                    j = template.find("}", i + 2)
+                    if j != -1:
+                        out.append(_stage4_group(m, template[i + 2:j]))
+                        i = j + 1
+                        continue
+                elif nxt.isalnum() or nxt == "_":
+                    j = i + 1
+                    while j < len(template) and (
+                            template[j].isalnum() or template[j] == "_"):
+                        j += 1
+                    out.append(_stage4_group(m, template[i + 1:j]))
+                    i = j
+                    continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    return rx.sub(expand, text)
+
+
+def _stage4_normalize_platform(output):
+    """normalize_platform_differences, approximated for a Linux
+    host: doubled backslashes collapse, backslash paths become
+    slash paths, CRLF becomes LF."""
+    output = output.replace("\\\\", "\\")
+
+    def fix(m):
+        return m.group(0).replace("\\", "/")
+
+    output = re.sub(
+        r"(?:\\[\w.\-_']+)+\.\w+"
+        r"|\$(?:DIR|SRC_DIR|TEST_BUILD_DIR|BUILD_DIR|LIB_DIR)"
+        r"(?:\\[\w.\-_ ']+)+",
+        fix, output)
+    return output.replace("\r\n", "\n")
+
+
+def stage4_normalize_output(output, path, base_dir, custom_rules,
+                            json_mode):
+    """compiletest's normalize_output for the Ui mode, in its
+    replacement order. `path` is the test file as invoked,
+    `base_dir` the run's output base directory, `json_mode` the
+    harness's JSON heuristic over the test's own flags. The
+    build-root replacement cannot appear in this runner's output
+    (nothing references a build root) and is omitted; the
+    remapped-parent replacement applies only to remap-src-base
+    tests, which the rustdoc-ui population does not carry.
+    """
+    normalized = output
+    normalized = normalized.replace(str(path.parent), "$DIR")
+    normalized = normalized.replace("/rustc/FAKE_PREFIX/library",
+                                    "$SRC_DIR")
+    normalized = normalized.replace("/rustc/FAKE_PREFIX/compiler",
+                                    "$COMPILER_DIR")
+    sysroot = Path(stage3_toolchain_paths()["rustc"]).parent.parent
+    rust_src = Path(os.path.realpath(
+        sysroot / "lib" / "rustlib" / "src" / "rust"))
+    normalized = normalized.replace(str(rust_src / "library"),
+                                    "$SRC_DIR_REAL")
+    rustc_src = Path(os.path.realpath(
+        sysroot / "lib" / "rustlib" / "rustc-src" / "rust"))
+    normalized = normalized.replace(str(rustc_src / "compiler"),
+                                    "$COMPILER_DIR_REAL")
+    normalized = normalized.replace(str(base_dir), "$TEST_BUILD_DIR")
+    canon = os.path.realpath(base_dir)
+    if canon != str(base_dir):
+        normalized = normalized.replace(canon, "$TEST_BUILD_DIR")
+    if json_mode:
+        normalized = normalized.replace("\\n", "\n")
+    normalized = re.sub(r"SRC_DIR(.+):\d+:\d+(: \d+:\d+)?",
+                        r"SRC_DIR\1:LL:COL", normalized)
+    normalized = _stage4_normalize_platform(normalized)
+    normalized = re.sub(
+        r"\$TEST_BUILD_DIR/([^\.]+)\.long-type-\d+\.txt",
+        lambda m: f"$TEST_BUILD_DIR/{m.group(1)}"
+                  ".long-type-$LONG_TYPE_HASH.txt",
+        normalized)
+    normalized = re.sub(
+        r"thread '(.*?)' \((rtid )?\d+\) panicked",
+        lambda m: f"thread '{m.group(1)}' ($TID) panicked",
+        normalized)
+    normalized = normalized.replace("\t", "\\t")
+    normalized = re.sub(r"\s*//(\[.*\])?~.*", "", normalized)
+    if re.search(r"_R.*?Cs[0-9a-zA-Z]+_", normalized):
+        normalized = re.sub(r"Cs[0-9a-zA-Z]+_", "CsCRATE_HASH_",
+                            normalized)
+    if re.search(r"\(_R.*?B[0-9a-zA-Z]_", normalized):
+        normalized = re.sub(r"B[0-9a-zA-Z]_", "B<REF>_", normalized)
+    # Ui mode: alloc ids are dropped altogether (the parallel
+    # frontend assigns them nondeterministically).
+    normalized = re.sub(
+        r"╾─*(a(lloc)?|A(LLOC)?)\d+(\+0x[0-9a-f]+)?(<imm>)?"
+        r"( ?\(\d+ ptr bytes\))?─*╼",
+        "╾ALLOC$ID╼", normalized)
+    normalized = re.sub(r"\b(alloc|ALLOC)\d+\b", "ALLOC$ID",
+                        normalized)
+    for pattern, template in custom_rules:
+        normalized = _stage4_apply_rule(normalized, pattern, template)
+    return normalized
+
+
+def stage4_json_mode(view):
+    """normalize_output's JSON heuristic over the test's own
+    flags (run-flags play no part for a rustdoc-ui compile)."""
+    cflags = " ".join(view.values("compile-flags"))
+    return any(s in cflags for s in (
+        "--error-format json", "--error-format pretty-json",
+        "--error-format=json", "--error-format=pretty-json",
+        "--output-format json", "--output-format=json"))
+
+
+_STAGE4_KIND_FROM_COMPILER = {
+    "help": "HELP",
+    "error": "ERROR",
+    "error: internal compiler error": "ERROR",
+    "note": "NOTE",
+    "failure-note": "NOTE",
+    "warning": "WARN",
+}
+
+_STAGE4_KIND_FROM_USER = {
+    "HELP": "HELP", "help": "HELP",
+    "ERROR": "ERROR", "error": "ERROR",
+    "NOTE": "NOTE", "note": "NOTE",
+    "SUGGESTION": "SUGGESTION",
+    "WARN": "WARN", "WARNING": "WARN", "warn": "WARN",
+    "warning": "WARN",
+    "RAW": "RAW",
+}
+
+
+def stage4_load_annotations(path, revision):
+    """compiletest's load_errors: the //~ annotations of one test
+    file (or of one revision of it), as dicts with line (None for
+    //~?), column, kind and msg."""
+    out = []
+    last_nonfollow = None
+    text = path.read_text(errors="ignore")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m = re.search(r"//(?:\[([\w\-,]+)\])?~(\?|\||[v^]*)", line)
+        if not m:
+            continue
+        revs = m.group(1)
+        if revision is not None and revs is not None:
+            if revision not in revs.split(","):
+                continue
+        elif revision is None and revs is not None:
+            raise ValueError(
+                "Only tests with revisions should use `//[X]~`")
+        rest = line[m.end():].lstrip()
+        km = re.match(r"[A-Za-z_]+", rest)
+        kind_str = km.group(0) if km else ""
+        kind = _STAGE4_KIND_FROM_USER.get(kind_str)
+        if kind is not None:
+            untrimmed = rest[len(kind_str):]
+        else:
+            kind = "UNKNOWN"
+            untrimmed = rest
+        msg = untrimmed[1:] if untrimmed.startswith(":") else untrimmed
+        msg = msg.strip()
+        adjust = m.group(2)
+        if adjust == "|":
+            line_num = last_nonfollow
+        elif adjust == "?":
+            line_num = None
+        elif adjust.startswith("v"):
+            line_num = lineno + len(adjust)
+        else:
+            line_num = lineno - len(adjust)
+        if adjust != "|":
+            last_nonfollow = line_num
+        out.append({"line": line_num, "column": m.start() + 1,
+                    "kind": kind, "msg": msg})
+    return out
+
+
+def _stage4_first_callsite(span, file_name):
+    if span.get("file_name") == file_name:
+        return span
+    expansion = span.get("expansion")
+    if expansion and expansion.get("span"):
+        return _stage4_first_callsite(expansion["span"], file_name)
+    return span
+
+
+def _stage4_push_actual(errors, diag, default_spans, file_name):
+    """compiletest's push_actual_errors for one diagnostic."""
+    spans_info = []
+    for span in diag.get("spans") or []:
+        cs = _stage4_first_callsite(span, file_name)
+        if cs.get("file_name") == file_name:
+            spans_info.append((bool(span.get("is_primary")), cs))
+    primary = [cs for (isp, cs) in spans_info if isp][:1]
+    if not primary:
+        primary = list(default_spans)
+    kind = _STAGE4_KIND_FROM_COMPILER.get(diag.get("level", ""))
+    if kind is None:
+        return
+    code = diag.get("code")
+    suffix = f" [{code['code']}]" if code and code.get("code") else ""
+
+    def msg_of(text):
+        return text + suffix
+
+    message = diag.get("message") or ""
+    lines = message.split("\n")
+    if message.endswith("\n"):
+        lines.pop()
+    if not lines:
+        lines = [""]
+    first = lines[0]
+    if not primary:
+        require = diag.get("level") != "failure-note" and not re.search(
+            r"aborting due to \d+ previous errors?|\d+ warnings? emitted",
+            first)
+        errors.append({"line": None, "column": None, "kind": kind,
+                       "msg": msg_of(first), "require": require})
+    else:
+        for span in primary:
+            errors.append({"line": span.get("line_start"),
+                           "column": span.get("column_start"),
+                           "kind": kind, "msg": msg_of(first),
+                           "require": True})
+    for nxt in lines[1:]:
+        if not primary:
+            errors.append({"line": None, "column": None, "kind": kind,
+                           "msg": msg_of(nxt), "require": False})
+        else:
+            for span in primary:
+                errors.append({"line": span.get("line_start"),
+                               "column": span.get("column_start"),
+                               "kind": kind, "msg": msg_of(nxt),
+                               "require": False})
+    for span in primary:
+        replacement = span.get("suggested_replacement")
+        if replacement is not None:
+            for idx, line in enumerate(replacement.split("\n")):
+                errors.append({"line": (span.get("line_start") or 0)
+                               + idx,
+                               "column": span.get("column_start"),
+                               "kind": "SUGGESTION", "msg": line,
+                               "require": line != ""})
+    for span in primary:
+        expansion = span.get("expansion")
+        if expansion:
+            _stage4_push_backtrace(errors, expansion, file_name)
+    for (_isp, cs) in spans_info:
+        label = cs.get("label")
+        if label is not None:
+            errors.append({"line": cs.get("line_start"),
+                           "column": cs.get("column_start"),
+                           "kind": "NOTE", "msg": label,
+                           "require": label != ""})
+    for child in diag.get("children") or []:
+        _stage4_push_actual(errors, child, primary, file_name)
+
+
+def _stage4_push_backtrace(errors, expansion, file_name):
+    span = expansion.get("span") or {}
+    if span.get("file_name") == file_name:
+        errors.append({
+            "line": span.get("line_start"),
+            "column": span.get("column_start"),
+            "kind": "NOTE",
+            "msg": f"in this expansion of "
+                   f"{expansion.get('macro_decl_name')}",
+            "require": True})
+    previous = span.get("expansion")
+    if previous:
+        _stage4_push_backtrace(errors, previous, file_name)
+
+
+def stage4_parse_actual_errors(file_name, output):
+    """compiletest's json::parse_output over one run's output:
+    the structured diagnostics for the test file, flattened;
+    non-JSON lines become RAW entries that need no annotation.
+    """
+    errors = []
+    for line in output.splitlines():
+        obj = None
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                obj = None
+        if _stage4_is_diagnostic(obj):
+            _stage4_push_actual(errors, obj, [], file_name)
+        else:
+            errors.append({"line": None, "column": None, "kind": "RAW",
+                           "msg": line, "require": False})
+    return errors
+
+
+def stage4_check_expected_errors(view, path, output_text, proc_ok,
+                                 revision, base_dir):
+    """compiletest's check_expected_errors. Returns a failure
+    reason, or None when the annotations and the actual
+    diagnostics agree."""
+    expected = stage4_load_annotations(path, revision)
+    if proc_ok and any(e["kind"] == "ERROR" for e in expected):
+        return "process did not return an error status"
+    if view.has("known-bug"):
+        if expected:
+            return "`known-bug` tests should not have an expected error"
+        return None
+    json_mode = stage4_json_mode(view)
+    actual = stage4_parse_actual_errors(str(path), output_text)
+    for a in actual:
+        a["msg"] = stage4_normalize_output(a["msg"], path, base_dir,
+                                           [], json_mode)
+    patterns = view.values("error-pattern")
+    expected_kinds = {"ERROR", "WARN"} | {e["kind"] for e in expected}
+    dont_require = set()
+    for v in view.values("dont-require-annotations"):
+        for token in re.split(r"[,\s]+", v.strip()):
+            k = _STAGE4_KIND_FROM_USER.get(token)
+            if k:
+                dont_require.add(k)
+    found = [False] * len(expected)
+    unexpected = []
+    for a in actual:
+        for pattern in patterns:
+            if pattern.strip() and pattern.strip() in a["msg"]:
+                return (f"error pattern '{pattern.strip()}' is found "
+                        "in structured diagnostics")
+        idx = None
+        for i, e in enumerate(expected):
+            if not found[i] and e["line"] == a["line"] \
+                    and e["kind"] == a["kind"] \
+                    and e["msg"] in a["msg"]:
+                idx = i
+                break
+        if idx is not None:
+            found[idx] = True
+        elif a["require"] and a["kind"] in expected_kinds \
+                and a["kind"] not in dont_require:
+            unexpected.append(a)
+    if unexpected:
+        a = unexpected[0]
+        return (f"unexpected {a['kind']} at line {a['line']}: "
+                f"{a['msg']}")
+    not_found = [e for i, e in enumerate(expected) if not found[i]]
+    if not_found:
+        e = not_found[0]
+        return (f"expected {e['kind']} at line {e['line']} not "
+                f"found: {e['msg']}")
+    return None
+
+
+def stage4_expected_output(path, revision, kind):
+    """The snapshot text compiletest compares against:
+    <stem>[.<revision>].<kind> next to the test file; an absent
+    file compares as empty."""
+    name = path.stem + (f".{revision}" if revision else "") \
+        + f".{kind}"
+    p = path.parent / name
+    if p.exists():
+        return p.read_text(errors="replace")
+    return ""
+
+
+def stage4_pass_fail_mode(view):
+    """compiletest's effective pass/fail mode for a UI test:
+    the declared *-pass / *-fail directive, default check-fail.
+    """
+    for name in ("check-pass", "build-pass", "run-pass", "check-fail",
+                 "build-fail", "run-fail", "run-crash",
+                 "run-fail-or-crash"):
+        if view.has(name):
+            return name
+    return "check-fail"
+
+
+def stage4_ui_verdict(view, path, proc, explicit, revision, base_dir):
+    """compiletest's UI verdict over one finished rustdoc run.
+    Returns (ok, reason). The run's exit code is judged against
+    the pass/fail mode and failure-status first, then the
+    snapshot compare, the //~ annotations and the error
+    patterns, in compiletest's order."""
+    mode = stage4_pass_fail_mode(view)
+    exit_code = proc["exit_code"]
+    if mode in ("check-pass", "build-pass"):
+        if exit_code != 0:
+            return False, ("test compilation failed although it "
+                           "shouldn't")
+    else:
+        if exit_code == 0:
+            return False, "rustdoc test did not emit an error"
+        if not view.has("dont-check-failure-status"):
+            declared = view.values("failure-status")
+            expected_status = int(declared[-1].strip()) \
+                if declared else 1
+            if exit_code != expected_status:
+                return False, (
+                    f"expected failure status ({expected_status}) "
+                    f"but received status {exit_code}")
+    json_mode = stage4_json_mode(view)
+    stderr_text = proc["stderr"] if explicit else \
+        stage4_extract_rendered(proc["stderr"])
+    rules_stderr = stage4_normalize_rules(
+        view, "normalize-stderr", "normalize-stderr-64bit")
+    rules_stdout = stage4_normalize_rules(view, "normalize-stdout")
+    normalized_stderr = stage4_normalize_output(
+        stderr_text, path, base_dir, rules_stderr, json_mode)
+    normalized_stdout = stage4_normalize_output(
+        proc["stdout"], path, base_dir, rules_stdout, json_mode)
+    diffs = []
+    if not view.has("dont-check-compiler-stdout"):
+        if normalized_stdout != stage4_expected_output(
+                path, revision, "stdout"):
+            diffs.append("stdout differs from the snapshot")
+    if not view.has("dont-check-compiler-stderr"):
+        kind = "64bit.stderr" if view.has("stderr-per-bitwidth") \
+            else "stderr"
+        if normalized_stderr != stage4_expected_output(
+                path, revision, kind):
+            diffs.append("stderr differs from the snapshot")
+    if diffs:
+        return False, "; ".join(diffs)
+    output_text = (proc["stdout"] + proc["stderr"]) \
+        if view.has("check-stdout") else proc["stderr"]
+    ann_err = stage4_check_expected_errors(
+        view, path, output_text, exit_code == 0, revision, base_dir)
+    if ann_err:
+        return False, ann_err
+    output_to_check = output_text
+    for pattern in view.values("error-pattern"):
+        if pattern.strip() not in output_to_check:
+            return False, f"error pattern '{pattern.strip()}' not found"
+    for pattern in view.values("regex-error-pattern"):
+        try:
+            hit = re.search(pattern, output_to_check)
+        except re.error:
+            hit = None
+        if not hit:
+            return False, (f"regex error pattern '{pattern}' "
+                           "not found")
+    for pattern in view.values("forbid-output"):
+        if pattern in output_to_check:
+            return False, "forbidden pattern found in compiler output"
+    return True, ""
+
+
+def _stage4_ui_fail_bucket(why):
+    """The stage-2-style bucket for a failed UI verdict: the
+    mode / failure-status complaints are about the exit code,
+    everything else (snapshots, annotations, patterns) is about
+    the output text."""
+    if (why.startswith("test compilation failed")
+            or why.startswith("rustdoc test did not emit")
+            or why.startswith("expected failure status")):
+        return "exit-code mismatch"
+    return "stdout mismatch"
+
+
+def stage4_ui_attempt(rec, view, path, revision, all_revisions,
+                      header, driver_bin, rust_dir):
+    """Judge one directive view of a rustdoc-ui record. Returns a
+    stage-2-style result dict."""
+    res = {"status": "not-attempted", "reason": "", "bucket": ""}
+    blocker = stage2_blocker(view, rec)
+    if blocker:
+        res["reason"] = blocker
+        res["bucket"] = header_bucket(blocker)
+        return res
+    status, why = applicability(view)
+    if status == "out-of-environment":
+        res["reason"] = why
+        res["bucket"] = "out of environment"
+        return res
+    if status == "unevaluatable":
+        res["reason"] = why
+        res["bucket"] = "not attempted (unevaluatable condition)"
+        return res
+    mode = stage4_pass_fail_mode(view)
+    if mode.startswith("run-"):
+        res["reason"] = (f"pass/fail mode {mode} executes the "
+                         "documented program, which stage 4 does "
+                         "not judge")
+        res["bucket"] = "out of stage-4 scope (run mode)"
+        return res
+    if view.has("run-rustfix"):
+        res["reason"] = ("run-rustfix (suggestion application and "
+                         "the .fixed comparison) is not attempted "
+                         "by stage 4")
+        res["bucket"] = "out of stage-4 scope (run-rustfix)"
+        return res
+    src_base = suite_root(path)
+    with tempfile.TemporaryDirectory(prefix="subset-rustdoc-ui-") as td:
+        base = Path(td)
+        screened = screen_flags(compile_flags(view, src_base, str(base)),
+                                targets={HOST_TARGET})
+        if screened:
+            res["reason"] = screened
+            res["bucket"] = "not attempted (compile-flags)"
+            return res
+        aux_dir, extern_args, aux_err = stage4_prepare_aux(
+            rec, header, path, base, revision=revision, view=view)
+        if aux_err is not None:
+            res.update(aux_err)
+            return res
+        env_pairs, env_unset = view_env(view, "rustc-env",
+                                        "unset-rustc-env",
+                                        src_base, str(base))
+        nenv = dict(BOOTSTRAP_ENV)
+        nenv.update({"RUSTC_ICE": "0", "RUST_BACKTRACE": "short"})
+        nenv.update(env_pairs)
+        env_unset = list(dict.fromkeys(
+            [*env_unset, "RUSTC_LOG_COLOR"]))
+        rustdoc = stage3_toolchain_paths()["rustdoc"]
+        nbase = base / "native"
+        nbase.mkdir()
+        args, explicit = stage4_ui_args(view, path, nbase, revision,
+                                        all_revisions, extern_args,
+                                        aux_dir, src_base, rust_dir)
+        if mode == "build-fail":
+            pre = run_cmd([rustdoc] + args,
+                          timeout=STAGE4_NATIVE_TIMEOUT, cwd=nbase,
+                          env_extra=nenv, env_remove=env_unset)
+            if pre["timeout"]:
+                res["reason"] = "native rustdoc timed out"
+                res["bucket"] = "timeout"
+                return res
+            if pre["exit_code"] != 0:
+                res["status"] = "fail"
+                res["reason"] = ("native rustdoc failure: "
+                                 "`build-fail` test is required to "
+                                 "pass check build, but check build "
+                                 "failed")
+                res["bucket"] = "native rustdoc failure"
+                return res
+        nproc = run_cmd([rustdoc] + args,
+                        timeout=STAGE4_NATIVE_TIMEOUT, cwd=nbase,
+                        env_extra=nenv, env_remove=env_unset)
+        if nproc["timeout"]:
+            res["reason"] = "native rustdoc timed out"
+            res["bucket"] = "timeout"
+            return res
+        ok, why = stage4_ui_verdict(view, path, nproc, explicit,
+                                    revision, nbase)
+        if not ok:
+            res["status"] = "fail"
+            res["reason"] = f"native rustdoc failure: {why}"
+            res["bucket"] = "native rustdoc failure"
+            res["native"] = {"exit_code": nproc["exit_code"]}
+            return res
+        proceed, gate = stage4_guest_gate(driver_bin, rust_dir)
+        if not proceed:
+            res.update(gate)
+            return res
+        artifacts = stage4_artifacts_dir()
+        main_rs = stage4_main_rs(rust_dir)
+        gbase = base / "guest"
+        gbase.mkdir()
+        gargs, _explicit = stage4_ui_args(view, path, gbase, revision,
+                                          all_revisions, extern_args,
+                                          aux_dir, src_base, rust_dir)
+        with _stage4_guest_lock:
+            gproc = run_cmd(
+                stage4_guest_cmd(driver_bin, main_rs, artifacts, gargs),
+                timeout=STAGE4_GUEST_TIMEOUT, cwd=gbase,
+                env_extra=nenv, env_remove=env_unset)
+        if gproc["timeout"]:
+            res["reason"] = (f"guest rustdoc timed out after "
+                             f"{STAGE4_GUEST_TIMEOUT}s")
+            res["bucket"] = "timeout"
+            return res
+        if gproc["exit_code"] == 2:
+            reason = driver_reason(gproc["stderr"]) \
+                or driver_reason(gproc["stdout"])
+            res["status"] = "unsupported"
+            res["reason"] = reason
+            res["bucket"] = bucket_reason(reason)
+            res["sparagmos"] = {"exit_code": 2}
+            return res
+        if gproc["exit_code"] != 0:
+            res["status"] = "fail"
+            res["reason"] = "guest rustdoc failed: " + (
+                first_error_line(gproc["stderr"])
+                or first_error_line(gproc["stdout"])
+                or f"exit {gproc['exit_code']}")
+            res["bucket"] = "exit-code mismatch"
+            res["sparagmos"] = {"exit_code": gproc["exit_code"]}
+            return res
+        ok, why = stage4_ui_verdict(view, path, gproc, explicit,
+                                    revision, gbase)
+        if not ok:
+            res["status"] = "fail"
+            res["reason"] = f"guest rustdoc failure: {why}"
+            res["bucket"] = _stage4_ui_fail_bucket(why)
+            res["sparagmos"] = {"exit_code": gproc["exit_code"]}
+            return res
+        res["status"] = "pass"
+        return res
+
+
+def fill_result_rustdoc_ui(rec, header, path, driver_bin, rust_dir,
+                           out):
+    """fill_result_stage2's aggregation shape for rustdoc-ui: a
+    record with revisions is judged once per revision and passes
+    only when every revision that runs passes."""
+    revs = header.revisions()
+    if not revs:
+        res = stage4_ui_attempt(rec, header.view(None), path, None,
+                                [], header, driver_bin, rust_dir)
+        for key in ("status", "reason", "bucket", "native",
+                    "sparagmos"):
+            if key in res:
+                out[key] = res[key]
+        return
+    per_rev = {}
+    for rev in revs:
+        per_rev[rev] = stage4_ui_attempt(
+            rec, header.view(rev), path, rev, revs, header,
+            driver_bin, rust_dir)
+    out["revisions"] = {
+        rev: {k: r[k] for k in ("status", "reason", "bucket")
+              if r.get(k)}
+        for rev, r in per_rev.items()
+    }
+    ran = {rev: r for rev, r in per_rev.items()
+           if r["bucket"] != "out of environment"}
+    if not ran:
+        first = next(iter(per_rev.values()))
+        out["reason"] = first["reason"]
+        out["bucket"] = "out of environment"
+        return
+    for rev, r in ran.items():
+        if r["status"] == "not-attempted":
+            out["reason"] = f"revision {rev}: {r['reason']}"
+            out["bucket"] = r["bucket"]
+            return
+    for wanted in ("fail", "unsupported"):
+        for rev, r in ran.items():
+            if r["status"] == wanted:
+                out["status"] = wanted
+                out["reason"] = (f"revision {rev}: {r['reason']}"
+                                 if r["reason"] else "")
+                out["bucket"] = r["bucket"]
+                for key in ("native", "sparagmos"):
+                    if key in r:
+                        out[key] = r[key]
+                return
+    out["status"] = "pass"
+
+
+def stage4_document_attempt(rec, header, path, suite, driver_bin,
+                            rust_dir, out):
+    """Judge one rustdoc-html / rustdoc-json record into `out`:
+    the native document() run is the oracle; the guest run is
+    judged by the same checker over its own output directory."""
+    kind = "json" if suite == "rustdoc-json" else "html"
+    view = header.view(None)
+    src_base = suite_root(path)
+    with tempfile.TemporaryDirectory(prefix="subset-rustdoc-") as td:
+        base = Path(td)
+        aux_dir, extern_args, aux_err = stage4_prepare_aux(
+            rec, header, path, base)
+        if aux_err is not None:
+            for key in ("status", "reason", "bucket"):
+                if key in aux_err:
+                    out[key] = aux_err[key]
+            return
+        env_pairs, env_unset = view_env(view, "rustc-env",
+                                        "unset-rustc-env",
+                                        src_base, str(base))
+        nenv = dict(BOOTSTRAP_ENV)
+        nenv.update(env_pairs)
+        rustdoc = stage3_toolchain_paths()["rustdoc"]
+        nbase = base / "native"
+        nbase.mkdir()
+
+        def native_runner(args):
+            return run_cmd([rustdoc] + args,
+                           timeout=STAGE4_NATIVE_TIMEOUT, cwd=nbase,
+                           env_extra=nenv, env_remove=env_unset)
+
+        nres = stage4_document(native_runner, header, path, nbase,
+                               aux_dir, extern_args, kind, src_base)
+        if nres["timeout"]:
+            out["reason"] = "native rustdoc timed out"
+            out["bucket"] = "timeout"
+            return
+        if nres["exit_code"] != 0:
+            out["status"] = "fail"
+            out["reason"] = "native rustdoc failure: " + (
+                first_error_line(nres["stderr"])
+                or f"exit {nres['exit_code']}")
+            out["bucket"] = "native rustdoc failure"
+            out["native"] = {"exit_code": nres["exit_code"]}
+            return
+        ok, why = stage4_judge_documented(suite, path, nbase, rust_dir)
+        if ok is None:
+            out["reason"] = why
+            out["bucket"] = "not attempted (stage-4 checker tools)"
+            return
+        if not ok:
+            out["status"] = "fail"
+            out["reason"] = f"native rustdoc failure: {why}"
+            out["bucket"] = "native rustdoc failure"
+            return
+        proceed, gate = stage4_guest_gate(driver_bin, rust_dir)
+        if not proceed:
+            for key in ("status", "reason", "bucket", "sparagmos"):
+                if key in gate:
+                    out[key] = gate[key]
+            return
+        artifacts = stage4_artifacts_dir()
+        main_rs = stage4_main_rs(rust_dir)
+        gbase = base / "guest"
+        gbase.mkdir()
+
+        def guest_runner(args):
+            return run_cmd(
+                stage4_guest_cmd(driver_bin, main_rs, artifacts, args),
+                timeout=STAGE4_GUEST_TIMEOUT, cwd=gbase,
+                env_extra=nenv, env_remove=env_unset)
+
+        with _stage4_guest_lock:
+            gres = stage4_document(guest_runner, header, path, gbase,
+                                   aux_dir, extern_args, kind,
+                                   src_base)
+        if gres["timeout"]:
+            out["reason"] = (f"guest rustdoc timed out after "
+                             f"{STAGE4_GUEST_TIMEOUT}s")
+            out["bucket"] = "timeout"
+            return
+        if gres["exit_code"] == 2:
+            reason = driver_reason(gres["stderr"]) \
+                or driver_reason(gres["stdout"])
+            out["status"] = "unsupported"
+            out["reason"] = reason
+            out["bucket"] = bucket_reason(reason)
+            out["sparagmos"] = {"exit_code": 2}
+            return
+        if gres["exit_code"] != 0:
+            out["status"] = "fail"
+            out["reason"] = "guest rustdoc failed: " + (
+                first_error_line(gres["stderr"])
+                or f"exit {gres['exit_code']}")
+            out["bucket"] = "exit-code mismatch"
+            out["sparagmos"] = {"exit_code": gres["exit_code"]}
+            return
+        ok, why = stage4_judge_documented(suite, path, gbase, rust_dir)
+        if ok is None:
+            out["reason"] = why
+            out["bucket"] = "not attempted (stage-4 checker tools)"
+            return
+        if not ok:
+            out["status"] = "fail"
+            out["reason"] = f"guest rustdoc output check failed: {why}"
+            out["bucket"] = "output mismatch"
+            return
+        out["status"] = "pass"
+
+
+def fill_result_rustdoc(rec, rust_dir, driver_bin, out):
+    """Stage-4 entry point for one rustdoc-check record."""
+    out["stage"] = 4
+    suite = rec["suite"]
+    if suite in RUSTDOC_SUITES_BROWSER:
+        out["reason"] = (f"suite {suite} runs its tests in a "
+                         "JavaScript / browser environment the "
+                         "subset runner does not provide "
+                         "(Issue #365)")
+        out["bucket"] = ("out of stage-4 scope "
+                         "(JavaScript/browser environment)")
+        return
+    path = rust_dir / rec["path"]
+    text = path.read_text(errors="ignore")
+    out["snapshot"] = snapshot_flags(path, text)
+    header = Header(text)
+    if suite == "rustdoc-ui":
+        fill_result_rustdoc_ui(rec, header, path, driver_bin,
+                               rust_dir, out)
+        return
+    view = header.view(None)
+    blocker = stage2_blocker(view, rec)
+    if blocker:
+        out["reason"] = blocker
+        out["bucket"] = header_bucket(blocker)
+        return
+    status, why = applicability(header)
+    if status == "out-of-environment":
+        out["reason"] = why
+        out["bucket"] = "out of environment"
+        return
+    if status == "unevaluatable":
+        out["reason"] = why
+        out["bucket"] = "not attempted (unevaluatable condition)"
+        return
+    if header.revisions():
+        out["reason"] = ("revisions are not supported in this "
+                         "suite (compiletest asserts this)")
+        out["bucket"] = "out of stage-4 scope (revisions)"
+        return
+    if view.has("should-fail"):
+        out["reason"] = ("should-fail is rejected by compiletest "
+                         "in this suite")
+        out["bucket"] = "out of stage-4 scope (should-fail)"
+        return
+    if view.has("check-test-line-numbers-match"):
+        out["reason"] = ("check-test-line-numbers-match is judged "
+                         "by the rustdoc --test line-number "
+                         "checker, not document()")
+        out["bucket"] = ("out of stage-4 scope "
+                         "(check-test-line-numbers-match)")
+        return
+    flags = compile_flags(view, suite_root(path), os.getcwd()) \
+        + stage4_doc_flags(view, suite_root(path), os.getcwd())
+    if "--test" in flags:
+        out["reason"] = ("--test in flags (compiletest directs "
+                         "these to the rustdoc-ui suite)")
+        out["bucket"] = "out of stage-4 scope (--test in flags)"
+        return
+    screened = screen_flags(flags, targets={HOST_TARGET})
+    if screened:
+        out["reason"] = screened
+        out["bucket"] = "not attempted (compile-flags)"
+        return
+    stage4_document_attempt(rec, header, path, suite, driver_bin,
+                            rust_dir, out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--survey-json", type=Path, required=True,
@@ -5479,16 +7132,32 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="only process the first N stage-1 candidates "
                          "(smoke runs); 0 = all")
-    ap.add_argument("--stages", choices=("1", "2", "3", "both", "all"),
+    ap.add_argument("--stages", choices=("1", "2", "3", "4", "both",
+                                         "all"),
                     default="both",
                     help="which stages to run (default: both; "
-                         "'both' is stages 1+2, 'all' adds stage 3)")
+                         "'both' is stages 1+2, 'all' adds stages "
+                         "3 and 4)")
     ap.add_argument("--stage2-limit", type=int, default=0,
                     help="only process the first N stage-2 candidates "
                          "(smoke runs); 0 = all")
     ap.add_argument("--stage3-limit", type=int, default=0,
                     help="only process the first N stage-3 candidates "
                          "(smoke runs); 0 = all")
+    ap.add_argument("--stage4-limit", type=int, default=0,
+                    help="only process the first N stage-4 candidates "
+                         "(smoke runs); 0 = all")
+    ap.add_argument("--rustdoc-artifacts", type=Path, default=None,
+                    help="rustdoc artifact tree for the stage-4 "
+                         "guest runs (default: the "
+                         "SPARAGMOS_RUSTDOC_ARTIFACTS environment "
+                         "variable, else ~/rustdoc-artifacts-1.100.0; "
+                         "see docs/RUSTDOC-ARTIFACTS.md)")
+    ap.add_argument("--rustdoc-main", type=Path, default=None,
+                    help="the guest rustdoc's main.rs (default: "
+                         "the surveyed tree's "
+                         "src/tools/rustdoc/main.rs, else a full "
+                         "source tree's)")
     ap.add_argument("--jit", action="store_true",
                     help="metric 4: judge through the JIT path "
                          "instead of the interpreter/convert path "
@@ -5512,6 +7181,15 @@ def main():
     # carried as not attempted instead of being judged through the
     # (interpreter) stage-3 harness.
     stage3_on = args.stages in ("3", "all") and not args.jit
+    # Stage 4 is never combined with --jit either, for the same
+    # reason: metric 4 has no rustdoc attempt.
+    stage4_on = args.stages in ("4", "all") and not args.jit
+
+    global _STAGE4_ARTIFACTS_ARG, _STAGE4_MAIN_RS_ARG
+    if args.rustdoc_artifacts is not None:
+        _STAGE4_ARTIFACTS_ARG = str(args.rustdoc_artifacts)
+    if args.rustdoc_main is not None:
+        _STAGE4_MAIN_RS_ARG = str(args.rustdoc_main)
 
     global _HOST_FACTS
     _HOST_FACTS = ToolchainFacts()
@@ -5558,6 +7236,10 @@ def main():
 
                 and not r["env_excluded"])
 
+    def is_candidate4(r):
+        return (r["nature"] == "rustdoc-check"
+                and not r["env_excluded"])
+
     all_candidates = ([r for r in records if is_candidate(r)]
                       if stage1_on else [])
     candidates = (all_candidates[:args.limit] if args.limit
@@ -5578,16 +7260,23 @@ def main():
     candidates3 = (all_candidates3[:args.stage3_limit]
                    if args.stage3_limit else all_candidates3)
     limited_out3 = all_candidates3[len(candidates3):]
+    all_candidates4 = ([r for r in records if is_candidate4(r)]
+                       if stage4_on else [])
+    candidates4 = (all_candidates4[:args.stage4_limit]
+                   if args.stage4_limit else all_candidates4)
+    limited_out4 = all_candidates4[len(candidates4):]
     others = [r for r in records
               if not is_candidate(r) and not r["env_excluded"]
               and not (stage2_on and is_candidate2(r))
               and not (stage2_on and is_candidate_debugger(r))
-              and not (stage3_on and is_candidate3(r))]
+              and not (stage3_on and is_candidate3(r))
+              and not (stage4_on and is_candidate4(r))]
 
     print(f"denominator: {denominator}; stage-1 candidates: "
           f"{len(candidates)}; stage-2 candidates: {len(candidates2)}; "
           f"debugger candidates: {len(candidates_dbg)}; "
           f"stage-3 candidates: {len(candidates3)}; "
+          f"stage-4 candidates: {len(candidates4)}; "
           f"other records carried as not-attempted: {len(others)}",
           flush=True)
 
@@ -5607,8 +7296,12 @@ def main():
         futs += [pool.submit(process_test, r, args.rust_dir,
                              args.driver_bin, stage3=True)
                  for r in candidates3]
+        futs += [pool.submit(process_test, r, args.rust_dir,
+                             args.driver_bin, stage4=True)
+                 for r in candidates4]
         total_jobs = (len(candidates) + len(candidates2)
-                      + len(candidates_dbg) + len(candidates3))
+                      + len(candidates_dbg) + len(candidates3)
+                      + len(candidates4))
 
         done = 0
         for fut in concurrent.futures.as_completed(futs):
@@ -5665,6 +7358,16 @@ def main():
             "reason": "beyond --stage3-limit (smoke run)",
             "bucket": "not attempted (smoke-run limit)",
             "mode": None, "stage": 3, "seconds": 0.0,
+        })
+
+    for r in limited_out4:
+        results.append({
+            "suite": r["suite"], "path": r["path"],
+            "nature": r["nature"], "single_file": r["single_file"],
+            "ffi": r["ffi"], "status": "not-attempted",
+            "reason": "beyond --stage4-limit (smoke run)",
+            "bucket": "not attempted (smoke-run limit)",
+            "mode": None, "stage": 4, "seconds": 0.0,
         })
 
     results.sort(key=lambda r: r["path"])

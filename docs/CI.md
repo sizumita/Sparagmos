@@ -77,7 +77,7 @@ denominator. Runs on every push to `main` and on manual dispatch.
   (`scripts/ci-subset-tools.py shard`, round-robin over path order so
   shards are balanced), and each shard runs as one matrix job with
   `scripts/rustc-subset-run.py`. The metric-2(b) pass runs the
-  runner with `--stages all`: stages 1 and 2 plus the stage-3
+  runner with `--stages all`: stages 1 and 2, the stage-3
   procedure harness, which attempts the `procedure` records
   (run-make recipes — each recipe runs natively as the oracle, then
   under the driver with tool interception; the cargo suites
@@ -85,16 +85,18 @@ denominator. Runs on every push to `main` and on manual dispatch.
   recorded as not attempted, because their recipes drive cargo
   itself and cargo orchestration — workspace resolution,
   build-script and proc-macro processes, and the real compiler
-  artifacts cargo consumes — is not modelled by the harness). A second matrix repeats
-  the pass with `--jit` for metric 4; the JIT pass does not attempt
-  procedure records (the runner never combines stage 3 with
-  `--jit`), so they remain in metric 4's denominator as not
+  artifacts cargo consumes — is not modelled by the harness),
+  and the stage-4 rustdoc harness, which attempts the
+  `rustdoc-check` records (see "Stage 4" below). A second
+  matrix repeats the pass with `--jit` for metric 4; the JIT
+  pass attempts neither procedure nor rustdoc records (the
+  runner never combines stages 3 or 4 with `--jit`), so they
+  remain in metric 4's denominator as not
   attempted.
-- The `rustdoc-check` records (1,735) are not attempted by any
-  stage yet. The rustdoc-html (802), rustdoc-ui (440), and
-  rustdoc-json (194) suites wait for the runner's rustdoc
-  stage (issue #364) and keep the generic out-of-scope bucket
-  until it dispatches them. The remaining 299 -- rustdoc-js
+- The `rustdoc-check` records (1,735) are attempted by the
+  stage-4 rustdoc harness for the rustdoc-html (802),
+  rustdoc-ui (440), and rustdoc-json (194) suites (see
+  "Stage 4" below). The remaining 299 -- rustdoc-js
   (79), rustdoc-js-std (68), and rustdoc-gui (152) -- are
   judged by host-side tooling even in compiletest itself: the
   js suites run the test's paired .js assertions under
@@ -203,7 +205,9 @@ denominator. Runs on every push to `main` and on manual dispatch.
   regenerated through the cache with a different population cannot
   silently become the official denominator. Attempting the
   procedure records through stage 3 changes no count here: the
-  denominator stays 24,937 and `procedure` stays 551.
+  denominator stays 24,937 and `procedure` stays 551. The same
+  holds for stage 4: the denominator stays 24,937 and
+  `rustdoc-check` stays 1,735.
 - Environment applicability is judged against one reference
   environment: the host target `x86_64-unknown-linux-gnu` and the
   pinned official Rust 1.100.0 release toolchain (stable channel,
@@ -237,13 +241,82 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `src/etc/htmldocck.py` from the source root) and
   `src/librustdoc/html/static/css` (read directly by the rustdoc
   themes recipe); without them those recipes fail on the native
-  side of stage 3. The survey itself is unaffected — it reads
-  only `tests/` and the compiletest / bootstrap sources.
+  side of stage 3. It also includes `src/tools/jsondocck`,
+  `src/tools/jsondoclint`, and `src/tools/rustdoc`: the stage-4
+  harness extracts `htmldocck.py` and the jsondocck /
+  jsondoclint sources from the tree and runs the guest rustdoc
+  from the tree's `src/tools/rustdoc/main.rs`. The survey itself
+  is unaffected — it reads only `tests/` and the
+  compiletest / bootstrap sources.
 - The stage-3 recipe environment carries
   `DOC_RUST_LANG_ORG_CHANNEL` (`https://doc.rust-lang.org/` plus
   the pinned version, matching what bootstrap exports for
   compiletest on the stable channel): `htmldocck.py` refuses to
   start without it.
+
+### Stage 4 (the rustdoc harness)
+
+Stage 4 attempts the `rustdoc-check` records (1,735) for the
+suites that need no JavaScript or browser environment:
+
+- `rustdoc-html` (802): the pinned rustdoc documents the test
+  file (compiletest's `document()`), and the tree's own
+  `src/etc/htmldocck.py` checks the generated HTML.
+- `rustdoc-json` (194): `document()` with `--output-format
+  json`, then the tree's own `jsondocck` and `jsondoclint`
+  check the produced JSON. Both tools are built once per job
+  from the tree's sources, against a `Cargo.lock` cut from the
+  tree's own lock (their crates.io dependencies are pinned by
+  the tree; a fresh resolution would drift to incompatible
+  versions).
+- `rustdoc-ui` (440): the pinned rustdoc compiles the test file
+  with compiletest's UI argument set; the verdict is
+  compiletest's UI verdict (pass/fail mode and failure status,
+  snapshot compare of the rendered diagnostics, `//~`
+  annotations, error patterns).
+
+The `rustdoc-gui`, `rustdoc-js`, and `rustdoc-js-std` suites
+(299 records) run in a browser / JavaScript environment; stage 4
+records them as out of scope with that reason, in the
+denominator (Issue #365 tracks the environment).
+
+The native rustdoc run is the oracle: a record whose native run
+does not satisfy compiletest's rules for its suite is a plain
+failure. Only when the native side passes does the guest side
+run — rustdoc itself, converted and executed by the driver from
+the rustdoc artifact tree (`scripts/build-rustdoc-artifacts.sh`;
+`docs/RUSTDOC-ARTIFACTS.md`). The guest program is the same for
+every record and its conversion does not depend on the record's
+input, so the harness measures the guest's startup once per job
+with a `--version` probe and attributes the outcome to each
+record whose oracle passed: while the rustdoc execution chain
+stops during startup, those records are `unsupported` with that
+measured reason; once the probe passes, each record's guest run
+is made for real and judged by the same rules.
+
+Failure buckets follow the rule of the other stages: a judged
+failure never carries the empty bucket (the pass arithmetic
+counts an empty bucket as a pass). A native-side failure is
+bucketed `native rustdoc failure`; a guest failure is bucketed
+by what mismatched -- `exit-code mismatch` for the run's exit
+status, `stdout mismatch` for a rustdoc-ui snapshot,
+annotation, or pattern mismatch, and `output mismatch` for a
+rustdoc-html / rustdoc-json checker failure over the guest's
+output directory.
+
+The artifact tree is not built inside the measurement jobs:
+building it compiles the whole compiler-crate closure from
+source (the tree is ~1.9 GB), which does not fit the prepare
+job's budget. The measure jobs restore it from a dedicated
+cache (`rustdoc-artifacts-1.100.0-v1`) into
+`.ci/rustdoc-artifacts-1.100.0` and point the runner at it with
+`SPARAGMOS_RUSTDOC_ARTIFACTS`. Until that cache is populated,
+official runs record each oracle-passing record as not
+attempted with the reason "rustdoc artifact tree unavailable" —
+the measured state of that environment, in the denominator.
+Local runs use the tree at `~/rustdoc-artifacts-1.100.0` (or
+`--rustdoc-artifacts`) and record the guest's measured startup
+outcome the same way.
 
 ## Hosted-runner calibration
 
@@ -270,6 +343,11 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   compile and for the native recipe run, 600 s for the driver run,
   1800 s for the one-time run-make-support build per job); they are
   not raised through the `SPARAGMOS_*_TIMEOUT` variables;
+- stage-4 records likewise use built-in timeouts (240 s for a
+  native rustdoc run, 1800 s for a guest run and for the one-time
+  per-job startup probe, 1200 s for a checker-tool build);
+  `SPARAGMOS_RUSTDOC_TIMEOUT` and its siblings can raise them,
+  but the workflows do not;
 - free disk space before measuring and cache the Rust source tree,
   the survey, and cargo build outputs;
 - give every job an explicit `timeout-minutes` below the 6-hour

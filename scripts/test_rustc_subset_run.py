@@ -3818,3 +3818,287 @@ class Stage3ProcedureTests(unittest.TestCase):
             env = run.stage3_recipe_env(Path("/rust"), Path("/build"),
                                         "run-make-cargo")
             self.assertEqual(env["CARGO"], "/tc/cargo")
+
+
+FAKE_TC_PATHS = {"rustc": "/tc/rustc", "rustdoc": "/tc/rustdoc",
+                 "cargo": "/tc/cargo", "sysroot_lib": "/tc/lib",
+                 "target_lib": "/tc/target-lib"}
+
+
+class Stage4RustdocTests(unittest.TestCase):
+    """Stage 4 (rustdoc-check): the pure verdict helpers are
+    exercised directly; the record flow is exercised with both
+    process sides stubbed."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.rust_dir = Path(self.td.name)
+        tc_patch = unittest.mock.patch.object(
+            run, "stage3_toolchain_paths", lambda: FAKE_TC_PATHS)
+        tc_patch.start()
+        self.addCleanup(tc_patch.stop)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def write_rec(self, suite, rel, text, single_file=True):
+        path = self.rust_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return {"suite": suite, "path": rel, "nature": "rustdoc-check",
+                "single_file": single_file, "ffi": False,
+                "env_excluded": False}
+
+    # -- pure helpers -------------------------------------------------
+
+    def test_extract_rendered(self):
+        diag = {"message": "m", "code": None, "level": "error",
+                "spans": [], "children": [],
+                "rendered": "error: m\n"}
+        artifact = {"artifact": "x.rlib"}
+        out = run.stage4_extract_rendered(
+            json.dumps(diag) + "\nplain line\n"
+            + json.dumps(artifact) + "\n")
+        self.assertEqual(out, "error: m\nplain line\n")
+
+    def test_load_annotations(self):
+        p = self.rust_dir / "t.rs"
+        p.write_text("fn main() {}\n"
+                     "//~^ ERROR first\n"
+                     "//~| NOTE second\n"
+                     "//~? WARNING anywhere\n"
+                     "let x; //~ ERROR inline\n")
+        anns = run.stage4_load_annotations(p, None)
+        self.assertEqual(
+            [(a["line"], a["kind"], a["msg"]) for a in anns],
+            [(1, "ERROR", "first"), (1, "NOTE", "second"),
+             (None, "WARN", "anywhere"), (5, "ERROR", "inline")])
+
+    def test_normalize_rules_and_apply(self):
+        view = header('//@ normalize-stdout: "finished in '
+                      '\\d+\\.\\d+s" -> "finished in $$TIME"\n')
+        rules = run.stage4_normalize_rules(view, "normalize-stdout")
+        self.assertEqual(rules, [("finished in \\d+\\.\\d+s",
+                                  "finished in $$TIME")])
+        out = run.stage4_normalize_output(
+            "done finished in 1.25s ok", Path("/x/t.rs"),
+            Path("/build"), rules, False)
+        self.assertIn("finished in $TIME", out)
+
+    def test_normalize_output_dir_and_annotations(self):
+        p = Path("/tree/tests/rustdoc-ui/t.rs")
+        out = run.stage4_normalize_output(
+            "/tree/tests/rustdoc-ui/t.rs:1:1: error //~ ERROR x\n"
+            "tab\there", p, Path("/build"), [], False)
+        self.assertTrue(out.startswith("$DIR/t.rs:1:1: error"))
+        self.assertIn("tab\\there", out)
+
+    def test_pass_fail_mode(self):
+        self.assertEqual(run.stage4_pass_fail_mode(header("")),
+                         "check-fail")
+        self.assertEqual(
+            run.stage4_pass_fail_mode(header("//@ build-pass\n")),
+            "build-pass")
+
+    def test_check_expected_errors_match_and_miss(self):
+        p = self.rust_dir / "t.rs"
+        p.write_text("bad(); //~ ERROR unknown thing\n")
+        view = header("bad(); //~ ERROR unknown thing\n")
+        diag = {"message": "unknown thing happened", "code": None,
+                "level": "error",
+                "spans": [{"file_name": str(p), "line_start": 1,
+                           "column_start": 1, "is_primary": True,
+                           "label": None,
+                           "suggested_replacement": None,
+                           "expansion": None}],
+                "children": [], "rendered": None}
+        output = json.dumps(diag) + "\n"
+        self.assertIsNone(run.stage4_check_expected_errors(
+            view, p, output, False, None, Path("/build")))
+        empty = ""
+        err = run.stage4_check_expected_errors(
+            view, p, empty, False, None, Path("/build"))
+        self.assertIn("not found", err)
+
+    def test_ui_verdict_modes(self):
+        p = self.rust_dir / "t.rs"
+        p.write_text("fn main() {}\n")
+        proc = {"exit_code": 1, "stdout": "", "stderr": "",
+                "timeout": False}
+        ok, why = run.stage4_ui_verdict(
+            header(""), p, proc, False, None, Path("/build"))
+        self.assertTrue(ok)
+        proc0 = dict(proc, exit_code=0)
+        ok, why = run.stage4_ui_verdict(
+            header(""), p, proc0, False, None, Path("/build"))
+        self.assertFalse(ok)
+        self.assertIn("did not emit an error", why)
+        ok, why = run.stage4_ui_verdict(
+            header("//@ check-pass\n"), p, proc, False, None,
+            Path("/build"))
+        self.assertFalse(ok)
+        proc7 = dict(proc, exit_code=7)
+        ok, why = run.stage4_ui_verdict(
+            header("//@ failure-status: 7\n"), p, proc7, False,
+            None, Path("/build"))
+        self.assertTrue(ok)
+        ok, why = run.stage4_ui_verdict(
+            header("//@ failure-status: 7\n"), p, proc, False,
+            None, Path("/build"))
+        self.assertFalse(ok)
+        self.assertIn("expected failure status (7)", why)
+
+    def test_ui_verdict_snapshot(self):
+        p = self.rust_dir / "t.rs"
+        p.write_text("bad();\n//~^ ERROR boom\n")
+        (self.rust_dir / "t.stderr").write_text("error: boom\n")
+        diag = {"message": "boom", "code": None, "level": "error",
+                "spans": [{"file_name": str(p), "line_start": 1,
+                           "column_start": 1, "is_primary": True,
+                           "label": None,
+                           "suggested_replacement": None,
+                           "expansion": None}],
+                "children": [],
+                "rendered": "error: boom\n"}
+        proc = {"exit_code": 1, "stdout": "",
+                "stderr": json.dumps(diag) + "\n", "timeout": False}
+        ok, why = run.stage4_ui_verdict(
+            header(""), p, proc, False, None, Path("/build"))
+        self.assertTrue(ok, why)
+        proc2 = dict(proc, stderr=json.dumps(
+            dict(diag, rendered="error: bam\n")) + "\n")
+        ok, why = run.stage4_ui_verdict(
+            header(""), p, proc2, False, None, Path("/build"))
+        self.assertFalse(ok)
+        self.assertIn("snapshot", why)
+
+    # -- record flow ---------------------------------------------------
+
+    def test_browser_suite_is_a_scope_result(self):
+        rec = self.write_rec("rustdoc-gui", "tests/rustdoc-gui/x.goml",
+                             "")
+        res = run.process_test(rec, self.rust_dir, Path("/driver"),
+                               stage4=True)
+        self.assertEqual(res["stage"], 4)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(
+            res["bucket"],
+            "out of stage-4 scope (JavaScript/browser environment)")
+
+    def test_rustdoc_record_without_stage4_is_carried(self):
+        rec = self.write_rec("rustdoc-html", "tests/rustdoc-html/x.rs",
+                             "/// hi\npub fn f() {}\n")
+        res = run.process_test(rec, self.rust_dir, Path("/driver"))
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "out of stage-1 scope (nature)")
+
+    def test_stage4_posix_classes_translate(self):
+        # Rust's regex crate accepts POSIX classes inside bracket
+        # expressions; Python's re needs the class body spelled
+        # out.
+        pat = run._stage4_translate_posix("[[:word:]:-]+")
+        self.assertIn(r"\w", pat)
+        out = run._stage4_apply_rule("abc 123 def",
+                                     "[[:digit:]]+", "N")
+        self.assertEqual(out, "abc N def")
+        # Unknown classes pass through untouched.
+        self.assertEqual(run._stage4_translate_posix("[[:foo:]]"),
+                         "[[:foo:]]")
+
+    def test_stage4_ui_fail_bucket_kinds(self):
+        self.assertEqual(
+            run._stage4_ui_fail_bucket(
+                "test compilation failed although it shouldn't"),
+            "exit-code mismatch")
+        self.assertEqual(
+            run._stage4_ui_fail_bucket(
+                "expected failure status (101) but received "
+                "status 1"),
+            "exit-code mismatch")
+        self.assertEqual(
+            run._stage4_ui_fail_bucket(
+                "stdout differs from the snapshot"),
+            "stdout mismatch")
+
+    def test_stage4_ui_args_auto_check_cfg(self):
+        # compose_and_run_compiler appends the auto --check-cfg
+        # to every run (it activates the unexpected-cfg
+        # warnings); a test opts out with no-auto-check-cfg.
+        text = "pub fn f() {}\n"
+        header = run.Header(text)
+        view = header.view(None)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            args, _explicit = run.stage4_ui_args(
+                view, base / "x.rs", base, None, [], [], base,
+                base, self.rust_dir)
+        self.assertIn("--check-cfg", args)
+        self.assertIn("cfg(test,FALSE)", args)
+        header2 = run.Header("//@ no-auto-check-cfg\n" + text)
+        view2 = header2.view(None)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            args2, _e = run.stage4_ui_args(
+                view2, base / "x.rs", base, None, [], [], base,
+                base, self.rust_dir)
+        self.assertNotIn("--check-cfg", args2)
+
+    def test_html_native_failure_is_a_plain_failure(self):
+        rec = self.write_rec("rustdoc-html", "tests/rustdoc-html/x.rs",
+                             "/// hi\npub fn f() {}\n")
+        bad = {"exit_code": 1, "stdout": "", "stderr": "error: nope",
+               "timeout": False}
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        lambda argv, **kw: bad):
+            res = run.process_test(rec, self.rust_dir, Path("/driver"),
+                                   stage4=True)
+        self.assertEqual(res["status"], "fail")
+        # A judged fail never carries the empty bucket: the
+        # pass arithmetic counts bucket == "" as a pass.
+        self.assertEqual(res["bucket"], "native rustdoc failure")
+        self.assertTrue(res["reason"].startswith(
+            "native rustdoc failure"))
+
+    def test_html_probe_unsupported_makes_record_unsupported(self):
+        rec = self.write_rec("rustdoc-html", "tests/rustdoc-html/x.rs",
+                             "/// hi\npub fn f() {}\n")
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        tools = {"htmldocck": Path("/tools/htmldocck.py"),
+                 "jsondocck": None, "jsondoclint": None,
+                 "error": None, "build_errors": {}}
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        lambda argv, **kw: ok), \
+                unittest.mock.patch.object(
+                    run, "stage4_checker_tools", lambda rd: tools), \
+                unittest.mock.patch.object(
+                    run, "stage4_guest_probe",
+                    lambda db, rd: {"state": "unsupported",
+                                    "reason": "unsupported: frobnicate"}):
+            res = run.process_test(rec, self.rust_dir, Path("/driver"),
+                                   stage4=True)
+        self.assertEqual(res["status"], "unsupported")
+        self.assertEqual(res["reason"], "unsupported: frobnicate")
+
+    def test_html_probe_unavailable_is_not_attempted(self):
+        rec = self.write_rec("rustdoc-html", "tests/rustdoc-html/x.rs",
+                             "/// hi\npub fn f() {}\n")
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        tools = {"htmldocck": Path("/tools/htmldocck.py"),
+                 "jsondocck": None, "jsondoclint": None,
+                 "error": None, "build_errors": {}}
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        lambda argv, **kw: ok), \
+                unittest.mock.patch.object(
+                    run, "stage4_checker_tools", lambda rd: tools), \
+                unittest.mock.patch.object(
+                    run, "stage4_guest_probe",
+                    lambda db, rd: {"state": "unavailable",
+                                    "reason": "no tree"}):
+            res = run.process_test(rec, self.rust_dir, Path("/driver"),
+                                   stage4=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (rustdoc artifact tree)")
