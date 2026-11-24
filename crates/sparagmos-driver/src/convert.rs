@@ -65,6 +65,137 @@ pub(crate) fn compiler_tcx() -> Option<rustc_middle::ty::TyCtxt<'static>> {
     COMPILER_TCX.with(|slot| slot.get())
 }
 
+/// Run `f` — a Stable MIR body materialization — with the
+/// diagnostics its eager constant evaluation emits discounted.
+///
+/// `Instance::body()` and its siblings hand back a body that is
+/// already monomorphized with every constant operand evaluated
+/// (rustc_public's body builder evaluates them as it converts).
+/// That evaluation is speculative from this driver's point of
+/// view: the driver materializes the bodies of items and
+/// instances the compiler's own monomorphization collector
+/// would never collect — unreachable local functions, instances
+/// demanded only from dead code, bodies fetched to inspect a
+/// shape — and a constant that fails evaluation there (a
+/// panicking associated constant behind `if false` is the shape
+/// of Issue #417) is reported by the const-eval query as a
+/// session error even though the body itself is still produced,
+/// with the constant left unevaluated. Left standing in the
+/// session's error count, that one report fails the whole
+/// compilation of a program rustc accepts.
+///
+/// The discount is scoped to body materialization on purpose.
+/// Which constant failures are compilation errors is decided by
+/// the driver's own authorities, never by a side effect of
+/// fetching a body: the front end for the constants it evaluates
+/// itself before collection begins (statics, constants in item
+/// types), and `mono_check`'s replay of the monomorphization
+/// collector for the required constants of the instances that
+/// collector actually collects. Diagnostics emitted outside a
+/// materialization keep their usual effect.
+///
+/// The discount is recorded, not forgotten, and it is scoped
+/// by the class of diagnostic. The diagnostics a materialization
+/// can emit fall in two classes with different verdicts:
+///
+/// - Lint errors (the known-panics reports are the known shape):
+///   rustc lints every local body it builds, collected or not,
+///   so a lint error from materializing a body is a compilation
+///   error under rustc too. These are never discounted into a
+///   conversion: the fetch records the body's key in the lint
+///   registry, and the compile verdict fails on any entry.
+/// - Evaluation errors (E0080, including the validity errors of
+///   a body's constant operands): rustc produces these only for
+///   the bodies its monomorphization collector actually
+///   collects. These are discounted at the fetch, but the
+///   body's key (the `def_path_str_with_args` form the Stable
+///   MIR name of the instance already has) is recorded, and
+///   `mono_check` — which replays the collector — turns a hit
+///   on a collected instance into a finding. Bodies the
+///   collector never reaches stay discounted for good.
+///
+/// The classes are told apart by whether the session gained a
+/// non-lint error during the fetch. A fetch that gains both
+/// classes at once is recorded as an evaluation error; for a
+/// collected body the collector replay still fails it, so the
+/// only residue is an uncollected body carrying both a lint
+/// violation and a failing constant, which converts.
+pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
+    let Some(tcx) = compiler_tcx() else {
+        return f();
+    };
+    let dcx = tcx.dcx();
+    let errors_before = dcx.err_count();
+    let non_lint_before = dcx.has_errors_excluding_lint_errors().is_some();
+    // Contained, not handled: a panic out of the fetch keeps its
+    // payload for the driver's own containment layers, but the
+    // diagnostics emitted before it belong to the same
+    // speculative materialization and are discounted either way.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if dcx.err_count() > errors_before {
+        let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
+        if non_lint_after && !non_lint_before {
+            note_materialization_emission(key);
+        } else {
+            note_materialization_lint(key);
+        }
+        dcx.reset_err_count();
+    }
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+thread_local! {
+    /// Keys of the bodies whose materialization emitted
+    /// evaluation diagnostics that `with_body_materialization`
+    /// discounted, in the `def_path_str_with_args` form (a
+    /// generic definition's own body is keyed by its plain def
+    /// path). Written during collection, read by the compile
+    /// verdict (`mono_check::check_required_consts`); one
+    /// compilation runs per process, so nothing clears it.
+    static MATERIALIZATION_EMISSIONS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// Keys of the bodies whose materialization emitted a lint
+    /// error. Same lifecycle as `MATERIALIZATION_EMISSIONS`.
+    static MATERIALIZATION_LINTS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn note_materialization_emission(key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    MATERIALIZATION_EMISSIONS.with(|set| {
+        set.borrow_mut().insert(key.to_string());
+    });
+}
+
+fn note_materialization_lint(key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    MATERIALIZATION_LINTS.with(|set| {
+        set.borrow_mut().insert(key.to_string());
+    });
+}
+
+/// Whether materializing the body named by `key` emitted
+/// evaluation diagnostics that were discounted at the fetch
+/// (see `with_body_materialization`).
+pub fn materialization_emitted(key: &str) -> bool {
+    MATERIALIZATION_EMISSIONS.with(|set| set.borrow().contains(key))
+}
+
+/// A body whose materialization emitted a lint error, if any:
+/// rustc lints every local body, so each one is a compilation
+/// error there (see `with_body_materialization`).
+pub fn materialization_lint() -> Option<String> {
+    MATERIALIZATION_LINTS.with(|set| set.borrow().iter().next().cloned())
+}
+
 /// Whether the running compilation's crate graph defines the
 /// `drop_glue` lang item. A crate compiled against a minicore
 /// (which defines only the lang items it names itself) has none:
@@ -970,16 +1101,17 @@ fn env_upvar_count(args: &GenericArgs) -> Option<usize> {
 /// back to the definition body, whose generic debug info does
 /// not describe the monomorphic environment either.
 fn instance_item_body(
+    key: &str,
     inst: Option<Instance>,
     def_body: impl FnOnce() -> Option<mir::Body>,
 ) -> Option<mir::Body> {
-    match inst {
+    with_body_materialization(key, || match inst {
         Some(inst) if matches!(inst.kind, InstanceKind::Item) => {
             inst.body().or_else(def_body)
         }
         Some(_) => None,
         None => def_body(),
-    }
+    })
 }
 
 impl Converter {
@@ -1168,7 +1300,7 @@ impl Converter {
         self.noting_track_caller = true;
         let stamp = std::panic::catch_unwind(
             std::panic::AssertUnwindSafe(|| {
-                inst.body()
+                with_body_materialization(&inst.name(), || inst.body())
                     .and_then(|body| self.def_location_stamp(&body))
             }),
         )
@@ -5578,12 +5710,14 @@ impl Converter {
                 let Some(ck) = closure_kind(args) else {
                     return;
                 };
+                let resolved = Instance::resolve_closure(*def, args, ck).ok();
+                let key = resolved
+                    .as_ref()
+                    .map(|inst| inst.name())
+                    .unwrap_or_else(|| def.name());
                 let body = std::panic::catch_unwind(
                     std::panic::AssertUnwindSafe(|| {
-                        instance_item_body(
-                            Instance::resolve_closure(*def, args, ck).ok(),
-                            || def.body(),
-                        )
+                        instance_item_body(&key, resolved, || def.body())
                     }),
                 );
                 let Ok(Some(body)) = body else {
@@ -5592,12 +5726,14 @@ impl Converter {
                 (def.name(), "closure", args, body)
             }
             TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
+                let resolved = Instance::resolve(FnDef(def.def_id()), args).ok();
+                let key = resolved
+                    .as_ref()
+                    .map(|inst| inst.name())
+                    .unwrap_or_else(|| def.name());
                 let body = std::panic::catch_unwind(
                     std::panic::AssertUnwindSafe(|| {
-                        instance_item_body(
-                            Instance::resolve(FnDef(def.def_id()), args).ok(),
-                            || def.body(),
-                        )
+                        instance_item_body(&key, resolved, || def.body())
                     }),
                 );
                 let Ok(Some(body)) = body else {

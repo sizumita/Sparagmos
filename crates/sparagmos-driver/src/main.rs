@@ -403,8 +403,23 @@ fn unimplemented_site_reason(
 /// for the payloads that identify themselves,
 /// `unimplemented_site_reason` for the bare "not implemented"
 /// ones); any other panic is resumed — this guard must never
-/// paper over an unrelated compiler failure.
-fn guard_stable_mir_query<T>(query: impl FnOnce() -> T) -> Result<T, String> {
+/// paper over an unrelated compiler failure. The query also
+/// runs as a body materialization where it fetches one, so the
+/// diagnostics its eager constant evaluation emits are
+/// discounted the same way (see
+/// `sparagmos_driver::convert::with_body_materialization`).
+fn guard_stable_mir_query<T>(
+    key: &str,
+    query: impl FnOnce() -> T,
+) -> Result<T, String> {
+    sparagmos_driver::convert::with_body_materialization(key, || {
+        guard_stable_mir_query_contained(query)
+    })
+}
+
+fn guard_stable_mir_query_contained<T>(
+    query: impl FnOnce() -> T,
+) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(value) => Ok(value),
         Err(payload) => {
@@ -468,7 +483,7 @@ fn convert_body_isolated(
 fn fetch_instance_body(
     inst: &Instance,
 ) -> Result<Option<rustc_public::mir::Body>, String> {
-    guard_stable_mir_query(|| inst.body())
+    guard_stable_mir_query(&inst.name(), || inst.body())
 }
 
 /// Whether this instance is a compiler-generated impl method
@@ -755,7 +770,7 @@ enum ClosureAttempt {
 /// of `closure_instance_kind` below only fires if a future
 /// Stable MIR implements the type conversion).
 fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
-    match guard_stable_mir_query(|| closure_instance_kind(item)) {
+    match guard_stable_mir_query("", || closure_instance_kind(item)) {
         Ok(attempt) => attempt,
         Err(reason) if reason == COROUTINE_CLOSURE_TYPE_REASON => {
             ClosureAttempt::CoroutineClosure
@@ -1633,7 +1648,10 @@ fn collect_const_closure_instances(
                     );
                     return;
                 }
-                let Some(ibody) = inst.body() else {
+                let Some(ibody) = sparagmos_driver::convert::with_body_materialization(
+                    &inst.name(),
+                    || inst.body(),
+                ) else {
                     fail_all(
                         &mut *target_demands,
                         &owners,
@@ -1823,7 +1841,10 @@ fn collect_const_fn_instances(
                     );
                     return;
                 }
-                let Some(ibody) = inst.body() else {
+                let Some(ibody) = sparagmos_driver::convert::with_body_materialization(
+                    &inst.name(),
+                    || inst.body(),
+                ) else {
                     fail_all(
                         &mut *target_demands,
                         &owners,
@@ -2003,7 +2024,7 @@ fn collect_coroutine_instances(
                         if !unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             continue;
                         }
-                        guard_stable_mir_query(|| def.body())
+                        guard_stable_mir_query(&def.name(), || def.body())
                     }
                 };
                 let ibody = match ibody {
@@ -3254,7 +3275,13 @@ fn demand_drop_instances(
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 resolve_drop_instance(&impl_fn, &cand_ty, &args)
                     .filter(|inst| inst.has_body())
-                    .and_then(|inst| inst.body().map(|body| (inst, body)))
+                    .and_then(|inst| {
+                        sparagmos_driver::convert::with_body_materialization(
+                            &inst.name(),
+                            || inst.body(),
+                        )
+                        .map(|body| (inst, body))
+                    })
             }));
             let Ok(Some((inst, sm_body))) = resolved else {
                 continue;
@@ -3412,7 +3439,13 @@ fn demand_clone_instances(
                 std::panic::AssertUnwindSafe(|| {
                     Instance::resolve(def, &args)
                         .ok()
-                        .and_then(|inst| inst.body().map(|body| (inst, body)))
+                        .and_then(|inst| {
+                        sparagmos_driver::convert::with_body_materialization(
+                            &inst.name(),
+                            || inst.body(),
+                        )
+                        .map(|body| (inst, body))
+                    })
                 }),
             );
             let Ok(Some((inst, sm_body))) = resolved else {
@@ -3609,7 +3642,13 @@ fn demand_wake_instances(
                 std::panic::AssertUnwindSafe(|| {
                     Instance::resolve(item, &args)
                         .ok()
-                        .and_then(|inst| inst.body().map(|body| (inst, body)))
+                        .and_then(|inst| {
+                        sparagmos_driver::convert::with_body_materialization(
+                            &inst.name(),
+                            || inst.body(),
+                        )
+                        .map(|body| (inst, body))
+                    })
                 }),
             );
             let Ok(Some((inst, sm_body))) = resolved else {
@@ -4112,7 +4151,12 @@ fn note_fn_shim(
             continue;
         }
         let Ok(Some(shim_body)) = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| inst.body()),
+            std::panic::AssertUnwindSafe(|| {
+                sparagmos_driver::convert::with_body_materialization(
+                    &inst.name(),
+                    || inst.body(),
+                )
+            }),
         ) else {
             continue;
         };
@@ -4199,7 +4243,12 @@ fn demand_dyn_instances(
                                     continue;
                                 };
                                 let Ok(Some(sbody)) = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| inst.body()),
+                                    std::panic::AssertUnwindSafe(|| {
+                                        sparagmos_driver::convert::with_body_materialization(
+                                            &inst.name(),
+                                            || inst.body(),
+                                        )
+                                    }),
                                 ) else {
                                     continue;
                                 };
@@ -4477,7 +4526,7 @@ fn collect() -> ControlFlow<()> {
                         // through. A constant whose own body is
                         // unavailable too is a trivial constant
                         // (see `account_trivial_const`).
-                        match guard_stable_mir_query(|| item.body()) {
+                        match guard_stable_mir_query(&item.name(), || item.body()) {
                             Ok(Some(body)) => {
                                 let report_idx = report.functions.len();
                                 convert_local_body(
@@ -4566,7 +4615,7 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
-        let body = match guard_stable_mir_query(|| instance.body()) {
+        let body = match guard_stable_mir_query(&instance.name(), || instance.body()) {
             Ok(Some(body)) => body,
             Ok(None) => {
                 if matches!(item.kind(), ItemKind::Const) {
@@ -5159,7 +5208,7 @@ fn collect() -> ControlFlow<()> {
         {
             continue;
         }
-        let has_default_body = guard_stable_mir_query(|| {
+        let has_default_body = guard_stable_mir_query("", || {
             rustc_public::ty::FnDef(dfn.def).has_body()
         })
         .unwrap_or(false);
@@ -5246,7 +5295,7 @@ fn collect() -> ControlFlow<()> {
                          (auxiliary crate function)"
                         .to_string())
                 } else {
-                    guard_stable_mir_query(|| fn_def.body())
+                    guard_stable_mir_query(&fn_def.name(), || fn_def.body())
                 };
                 convert_item(
                     &mut conv,
