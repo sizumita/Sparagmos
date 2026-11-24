@@ -2982,7 +2982,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         *self.consumed_iter_final.borrow_mut() = None;
-                        let mut result = self.exec_builtin(
+                        let builtin_outcome = self.exec_builtin(
                             frames,
                             body,
                             name,
@@ -2991,9 +2991,56 @@ impl<'a> Interpreter<'a> {
                             cmp_discriminants.as_deref(),
                             unique_elem.as_ref(),
                             skipped_glue.as_ref(),
-                        )?;
+                        );
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
+                        let mut result = match builtin_outcome {
+                            Ok(result) => result,
+                            Err(err) => {
+                                // The builtin consumed an owned
+                                // value and handed its final state
+                                // back for the glue attached to
+                                // the call, but the call is
+                                // unwinding (a guest panic inside
+                                // the builtin): the callee's
+                                // cleanup would drop the value on
+                                // this path too, so run the glue
+                                // synchronously against the handed-
+                                // back state before the error
+                                // propagates, or its destructors
+                                // never run. The cleanup's own
+                                // outcome is not discarded: a
+                                // destructor that panics here is a
+                                // double panic in the guest, which
+                                // natively aborts the run (it is
+                                // not a catchable panic, so it must
+                                // not be masked by the panic already
+                                // propagating), and any other
+                                // failure of the cleanup -- an abort
+                                // it raised itself, or a non-panic
+                                // interpreter failure -- propagates
+                                // as itself rather than vanishing.
+                                if let (Some(glue), Some(final_state)) =
+                                    (&consumed_glue, consumed_final)
+                                {
+                                    match self.drop_value_sync(frames, final_state, glue) {
+                                        Ok(()) => {}
+                                        Err(InterpError::Panic { message, .. }) => {
+                                            return Err(InterpError::Abort {
+                                                message: format!(
+                                                    "panic `{message}` raised while dropping \
+                                                     a value consumed by `{name}` as the call \
+                                                     unwound: panicking while unwinding aborts \
+                                                     the run"
+                                                ),
+                                            });
+                                        }
+                                        Err(other) => return Err(other),
+                                    }
+                                }
+                                return Err(err);
+                            }
+                        };
                         // A `From` / `Into` conversion into a
                         // `Box<dyn Trait>` returns the plain box
                         // aggregate from the modelled conversion;
@@ -4917,7 +4964,7 @@ impl<'a> Interpreter<'a> {
         ))
     }
 
-    fn dyn_callable(
+    pub(crate) fn dyn_callable(
         &self,
         frames: &[Frame],
         value: &Value,
@@ -15078,6 +15125,7 @@ impl<'a> Interpreter<'a> {
             let byte = ((bits >> (8 * k)) & 0xff) as u8;
             match self.splice_storage_byte(&mut base, &layout, pos + k, byte)? {
                 Ok(()) => {}
+                Err(ByteVerdict::Padding(_)) => {}
                 Err(verdict) => {
                     return Some(Err(self.byte_view_error(
                         verdict,
@@ -15243,6 +15291,12 @@ impl<'a> Interpreter<'a> {
         };
         Some(match verdict {
             Ok(()) => Ok(()),
+            // A byte written into padding is discarded: padding
+            // holds no value (the read side symmetrically
+            // yields the indeterminate value for it), and
+            // byte-wise copies over an aggregate write its
+            // padding bytes along with its fields.
+            Err(ByteVerdict::Padding(_)) => Ok(()),
             Err(verdict) => Err(self.byte_view_error(verdict, &func, &place_desc, false)),
         })
     }

@@ -71,7 +71,7 @@ use crate::convert::{
 use crate::report::{FnOutcome, FnReport};
 
 /// Cap on collected bodies per program; see the module docs.
-pub const MAX_COLLECTED_BODIES: usize = 1024;
+pub const MAX_COLLECTED_BODIES: usize = 8192;
 
 /// Cap on the expanded size (node count) of one demanded
 /// instance's generic arguments, where the size of a type is the
@@ -1172,6 +1172,23 @@ fn consumer_instance_needs_body(
                 if def.name() == "std::borrow::Cow"
         );
     }
+    // `Default::default`: the builtin constructs the pure
+    // shapes (`default_value_for_tag`: primitives, `String`,
+    // `Vec`, `Option`, cells, tuples, arrays) and the
+    // allocating wrappers (`Box` / `Rc` / `Arc`, `RandomState`)
+    // only. A derived (or manual) `Default` for any other ADT
+    // -- the regex builders above all -- is not served by the
+    // builtin at runtime, so the instance body is the only
+    // faithful execution and must be collected.
+    if matches!(
+        canonical,
+        "std::default::Default::default" | "core::default::Default::default"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+            return false;
+        };
+        return !default_self_served(ty);
+    }
     // Hash-collection iteration: the `next` / `into_iter`
     // builtins model iterator states for sequences, not a raw
     // table's control-byte walk, so hash iterator and hash
@@ -1185,9 +1202,12 @@ fn consumer_instance_needs_body(
             return false;
         };
         return if canonical.ends_with("next") {
-            hash_iterator_ty(ty)
+            hash_iterator_ty(ty) || str_iter_ty(ty) || foreign_adt_ty(ty)
         } else {
             hash_collection_ty(ty)
+                || drain_ty(ty)
+                || str_iter_ty(ty)
+                || foreign_adt_ty(ty)
         };
     }
     let iter_arg = match canonical {
@@ -1432,6 +1452,98 @@ fn is_fmt_argument_constructor(canonical: &str) -> bool {
     canonical.starts_with("core::fmt::rt::Argument::new_")
 }
 
+
+/// Whether the `Default` builtin serves this `Self` type
+/// structurally: the pure shapes of `default_value_for_tag`
+/// (anything that is not an ADT -- primitives, references,
+/// tuples, arrays -- recurses into element calls, which are
+/// judged on their own instances) plus the ADT names the
+/// builtin constructs directly.
+fn default_self_served(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return true;
+    };
+    matches!(
+        def.name().as_str(),
+        "std::string::String"
+            | "alloc::string::String"
+            | "std::vec::Vec"
+            | "alloc::vec::Vec"
+            | "std::option::Option"
+            | "core::option::Option"
+            | "std::marker::PhantomData"
+            | "core::marker::PhantomData"
+            | "std::cell::Cell"
+            | "core::cell::Cell"
+            | "std::cell::RefCell"
+            | "core::cell::RefCell"
+            | "std::boxed::Box"
+            | "alloc::boxed::Box"
+            | "std::rc::Rc"
+            | "alloc::rc::Rc"
+            | "std::sync::Arc"
+            | "alloc::sync::Arc"
+            | "std::hash::RandomState"
+    )
+}
+
+/// Whether `ty` is an ADT from outside the standard library
+/// (a crate's own iterator wrapper, a support crate's type):
+/// no builtin models its iteration step, so the real body is
+/// the only route.
+fn foreign_adt_ty(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    !name.starts_with("std::") && !name.starts_with("alloc::") && !name.starts_with("core::")
+}
+
+/// Whether `ty` is one of the `str` pattern iterators
+/// (`Split`, `Matches`, `Lines`, ...) whose `IntoIterator`
+/// identity the builtin does not serve: the blanket body is
+/// collected for them instead. `Chars` / `Bytes` are served
+/// by the builtin and stay excluded.
+fn str_iter_ty(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    if !name.contains("::str::") {
+        return false;
+    }
+    matches!(
+        name.rsplit("::").next(),
+        Some(
+            "Split"
+                | "RSplit"
+                | "SplitTerminator"
+                | "RSplitTerminator"
+                | "SplitN"
+                | "RSplitN"
+                | "SplitInclusive"
+                | "RSplitInclusive"
+                | "Matches"
+                | "MatchIndices"
+                | "CharIndices"
+                | "Lines"
+                | "SplitWhitespace"
+                | "SplitAsciiWhitespace"
+                | "EncodeUtf16"
+        )
+    )
+}
+
+/// Whether this `IntoIterator` `Self` type is a `Drain`-class
+/// iterator: its `into_iter` is the identity over a state the
+/// builtin sequence models do not produce, so the instance
+/// body is the faithful execution.
+fn drain_ty(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    def.name().rsplit("::").next() == Some("Drain")
+}
 
 /// The Stable MIR counterpart of the interpreter's modelled
 /// `next` shapes (see `iterator_next_modelled` in

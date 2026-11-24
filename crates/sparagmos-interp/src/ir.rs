@@ -1651,17 +1651,21 @@ pub enum TerminatorKind {
         /// `mem::drop` whose glue conversion cannot account for
         /// the dropped type stays `Unsupported` instead.
         drop_glue: Option<DropGlue>,
-        /// Drop glue of the first argument when the callee is a
-        /// modelled consumer of an owned iterator (`Iterator::collect`,
-        /// `FromIterator::from_iter`, the `Vec` from-iter shim,
-        /// `Iterator::count` / `fold` / `for_each`): the callee's
-        /// real body drops the iterator when it is done with it,
-        /// so conversion builds the iterator type's [`DropGlue`]
-        /// and the interpreter runs it against the iterator's
-        /// final state (handed back by the builtin) after the
-        /// call's own work, exactly like a [`TerminatorKind::Drop`]
-        /// for that value. `None` for every other builtin, and
-        /// when the iterator's glue is trivial or cannot be
+        /// Drop glue of a value the callee consumes, when the
+        /// callee is a modelled consumer of an owned iterator
+        /// (`Iterator::collect`, `FromIterator::from_iter`, the
+        /// `Vec` from-iter shim, `Iterator::count` / `fold` /
+        /// `for_each` — the consumed value is the first argument)
+        /// or a str-pattern search (`str::contains` and its
+        /// siblings — the consumed value is the pattern argument,
+        /// a by-value predicate): the callee's real body drops
+        /// the value when it is done with it, so conversion
+        /// builds the value type's [`DropGlue`] and the
+        /// interpreter runs it against the value's final state
+        /// (handed back by the builtin) after the call's own
+        /// work, exactly like a [`TerminatorKind::Drop`] for
+        /// that value. `None` for every other builtin, and when
+        /// the consumed value's glue is trivial or cannot be
         /// accounted for (the value is then discarded as before).
         consumed_glue: Option<DropGlue>,
         /// Drop glue of the item type when the callee is

@@ -10224,6 +10224,38 @@ let inner = match (&src, target) {
                         }
                         .and_then(|ty| self.drop_glue(ty))
                         .filter(|glue| glue.root != ir::DropPlan::Trivial);
+                        // A str-pattern search likewise consumes
+                        // its pattern inside the callee's real
+                        // body: a by-value predicate (a closure
+                        // passed to `str::contains` and its
+                        // siblings) is dropped there, captures
+                        // and all. Build the pattern argument
+                        // type's glue the same way, from the
+                        // argument operand's own type: a borrowed
+                        // predicate's reference type, a `char`,
+                        // a `&str` and a `&[char]` all have
+                        // trivial glue and stay unadorned, as do
+                        // constant arguments (a function item
+                        // carries no captures to drop).
+                        let consumed_glue = consumed_glue.or_else(|| {
+                            if matches!(
+                                kind,
+                                crate::builtins::Builtin::StrContains
+                                    | crate::builtins::Builtin::StrStartsWith
+                                    | crate::builtins::Builtin::StrEndsWith
+                            ) {
+                                args.get(1)
+                                    .and_then(|arg| {
+                                        self.operand_place_ty(body, arg)
+                                    })
+                                    .and_then(|ty| self.drop_glue(&ty))
+                                    .filter(|glue| {
+                                        glue.root != ir::DropPlan::Trivial
+                                    })
+                            } else {
+                                None
+                            }
+                        });
                         // An `Iterator::nth` call consumes the
                         // items its skip loop passes over: build
                         // the item type's glue now (see

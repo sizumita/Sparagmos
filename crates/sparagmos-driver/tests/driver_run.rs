@@ -16377,6 +16377,151 @@ fn main() {
 }
 "#;
 
+const FROM_BOXED_STR_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let boxed = String::from("abc").into_boxed_str();
+    let rc: Rc<str> = boxed.into();
+    let boxed2 = String::from("xy").into_boxed_str();
+    let arc: Arc<str> = boxed2.into();
+    let boxed3 = String::from("zz").into_boxed_str();
+    let s: String = boxed3.into();
+    println!("{rc} {arc} {s} {} {}", rc.len(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_from_boxed_str_to_counted_and_string() {
+    // `From<Box<str>>` for `Rc<str>` / `Arc<str>` / `String`: the
+    // source value is the box aggregate `String::into_boxed_str`
+    // builds around the string, not the string itself, so the
+    // conversion takes the pointee out of the box (releasing its
+    // allocation) instead of rejecting the shape. Before the fix
+    // all three conversions were "not runtime-supported".
+    run_ok(
+        "from-boxed-str",
+        FROM_BOXED_STR_SRC,
+        "abc xy zz 3 1\n",
+    );
+}
+
+const FROM_BORROWED_STR_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let b = String::from("abc").into_boxed_str();
+    let r: Rc<str> = Rc::from(&*b);
+    let a: Arc<str> = Arc::from(&*b);
+    println!("{r} {a} {}", &*b);
+    let s = String::from("xy");
+    let r2: Rc<str> = Rc::from(&*s);
+    println!("{r2} {s}");
+    let r3: Rc<str> = Rc::from(&*r);
+    println!("{r3} {}", Rc::strong_count(&r));
+    let e = String::new().into_boxed_str();
+    let r4: Rc<str> = Rc::from(&*e);
+    println!("empty={:?}", &*r4);
+}
+"#;
+
+#[test]
+fn run_mode_from_borrowed_str_to_counted_string() {
+    // `From<&str>` for `Rc<str>` / `Arc<str>` where the borrowed
+    // string arrives as a reference into string storage (the
+    // dereference of a `Box<str>`, a `String` or an `Rc<str>`),
+    // not as a string value: the conversion follows the
+    // reference to the string data and copies it into the new
+    // handle, leaving the borrowed storage alive. Before the
+    // fix these failed with "expected string value, found slice
+    // reference" (expected output verified against a native
+    // 1.100.0 build of the same source).
+    run_ok(
+        "from-borrowed-str",
+        FROM_BORROWED_STR_SRC,
+        "abc abc abc\nxy xy\nabc 1\nempty=\"\"\n",
+    );
+}
+
+const FROM_BOXED_SLICE_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let boxed = vec![1, 2, 3].into_boxed_slice();
+    let rc: Rc<[i32]> = boxed.into();
+    let boxed2 = vec![4, 5].into_boxed_slice();
+    let arc: Arc<[i32]> = boxed2.into();
+    println!("{:?} {} {:?} {}", rc, rc.len(), arc, arc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_boxed_slice_to_counted_slice() {
+    // `From<Box<[T]>>` for `Rc<[T]>` / `Arc<[T]>`: the counted
+    // handle is built over the box's pointee (the element tuple),
+    // the same take as for the boxed string.
+    run_ok(
+        "from-boxed-slice",
+        FROM_BOXED_SLICE_SRC,
+        "[1, 2, 3] 3 [4, 5] 2\n",
+    );
+}
+
+const FROM_VEC_RAW_PTRS_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let v = vec![Box::into_raw(Box::new(42))];
+    let rc: Rc<[*mut i32]> = v.into();
+    let a = unsafe { *rc[0] };
+    let v2 = vec![Box::into_raw(Box::new(7))];
+    let arc: Arc<[*mut i32]> = v2.into();
+    let b = unsafe { *arc[0] };
+    println!("{a} {b} {} {}", rc.len(), arc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_vec_of_raw_ptrs_to_counted_slice() {
+    // `From<Vec<T>>` for `Rc<[T]>` / `Arc<[T]>` where the
+    // vector's single element is an allocation-backed raw
+    // pointer: the vector's value has the same one-field shape
+    // as a box aggregate, so the counted-slice conversion must
+    // not unbox it -- the pointer stays the vector's element,
+    // and its pointee is untouched. (The boxed-source take is
+    // gated on the source type naming `Box`.)
+    run_ok(
+        "from-vec-raw-ptrs",
+        FROM_VEC_RAW_PTRS_SRC,
+        "42 7 1 1\n",
+    );
+}
+
+const FROM_VEC_RAW_PTR_FROM_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let p = Box::into_raw(Box::new(11));
+    let v = vec![p];
+    let rc: Rc<[*mut i32]> = Rc::from(v);
+    println!("{} {}", unsafe { *rc[0] }, rc.len());
+}
+"#;
+
+#[test]
+fn run_mode_from_vec_of_raw_ptr_to_counted_slice_via_from() {
+    // The `Rc::from(vec)` spelling of the same conversion.
+    run_ok(
+        "from-vec-raw-ptr-from",
+        FROM_VEC_RAW_PTR_FROM_SRC,
+        "11 1\n",
+    );
+}
+
 #[test]
 fn run_mode_array_into_iter_collect_into_boxed_and_counted_slices() {
     // `array::IntoIter` is a modelled iterator, so its `collect`
@@ -34108,4 +34253,624 @@ fn run_mode_btree_map_zst_iter_count() {
     // the sized case, and the elided ZST slots fill out to the
     // declared length.
     run_ok("btree-zst-iter", BTREE_ZST_ITER_SRC, "len=1 count=1\nget=true\n");
+}
+
+const STR_PATTERN_PRED_MUT_SRC: &str = r#"
+fn is_b(c: char) -> bool { c == 'b' }
+fn main() {
+    let mut n = 0;
+    let a = "ab".contains(move |_| { n += 1; n == 2 });
+    let mut m = 0;
+    let b = "ab".contains(move |_| { m += 1; m == 3 });
+    let mut k = 0;
+    let c = "ab".starts_with(move |_| { k += 1; k == 1 });
+    let d = "ab".contains(is_b);
+    println!("{a} {b} {c} {d}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_mutates_by_value_capture() {
+    // A str-pattern predicate is an `FnMut`: a `move` closure's
+    // by-value captures must live in mutable storage that persists
+    // across the per-character invocations, so the counter reaches
+    // 2 on the second character (and never reaches 3). With no
+    // environment reference the call machinery wraps a clone of the
+    // closure in a value target, and the capture write fails as a
+    // write to a constant aggregate.
+    run_ok(
+        "str-pattern-pred-mut",
+        STR_PATTERN_PRED_MUT_SRC,
+        "true false true true\n",
+    );
+}
+
+const STR_PATTERN_PRED_BORROWED_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let a = "b".contains(&mut pred);
+    let b = "b".contains(&mut pred);
+    let c = "b".contains(&mut pred);
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_borrowed_predicate_keeps_its_environment() {
+    // A borrowed predicate (`&mut pred`) keeps the caller's
+    // environment: the counter lives in the caller's closure, so
+    // it advances across separate `contains` calls (1, 2, 3) and
+    // only the second call sees it reach 2. Resolving the
+    // argument to a clone of the closure would give each call a
+    // fresh counter and report `false false false`.
+    run_ok(
+        "str-pattern-pred-borrowed",
+        STR_PATTERN_PRED_BORROWED_SRC,
+        "false true false\n",
+    );
+}
+
+const STR_PATTERN_PRED_ENDS_WITH_SRC: &str = r#"
+fn main() {
+    let mut e = 0;
+    let a = "ab".ends_with(move |_| { e += 1; e == 1 });
+    let mut v = 0;
+    let pred = move |_| { v += 1; v == 2 };
+    let b = "ab".contains(pred);
+    println!("{a} {b}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_ends_with_and_moved_variable() {
+    // The by-value predicate arrangement also covers `ends_with`
+    // (which consults the predicate for the last character) and a
+    // predicate held in a variable before being moved into the
+    // call.
+    run_ok(
+        "str-pattern-pred-ends-with",
+        STR_PATTERN_PRED_ENDS_WITH_SRC,
+        "true true\n",
+    );
+}
+
+const STR_PATTERN_CHAR_SLICE_SRC: &str = r#"
+fn main() {
+    let chars = ['a', 'b'];
+    let slice = unsafe { std::slice::from_raw_parts(&chars[0], 2) };
+    let a = "b".contains(slice);
+    let b = "a".contains(slice);
+    let c = "z".contains(slice);
+    let d = "b".contains(&chars[..]);
+    let e = "b".contains(&chars[0..2]);
+    let f = "b".contains(&chars[1..2]);
+    let g = "a".contains(&chars[1..2]);
+    println!("{a} {b} {c} {d} {e} {f} {g}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_char_slice_from_element_base() {
+    // A `&[char]` pattern whose fat base references an individual
+    // array element (the `from_raw_parts` slice) must be read as
+    // the whole set {'a', 'b'}: resolving the base first yields
+    // the scalar 'a', which would mistake the set for its first
+    // character and report `false` for the first query.
+    run_ok(
+        "str-pattern-char-slice",
+        STR_PATTERN_CHAR_SLICE_SRC,
+        "true true false true true true false\n",
+    );
+}
+const STR_PATTERN_PRED_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let pred = move |_: char| {
+        let _ = &rc2;
+        false
+    };
+    let r0 = "".contains(pred);
+    println!("empty: {r0} count={}", Rc::strong_count(&rc));
+    let rc3 = rc.clone();
+    let pred2 = move |_: char| {
+        let _ = &rc3;
+        false
+    };
+    let r1 = "ab".contains(pred2);
+    println!("nomatch: {r1} count={}", Rc::strong_count(&rc));
+    let rc4 = rc.clone();
+    let mut pred3 = move |_: char| {
+        let _ = &rc4;
+        true
+    };
+    let r2 = "ab".contains(&mut pred3);
+    println!("borrowed: {r2} count={}", Rc::strong_count(&rc));
+    drop(pred3);
+    println!("after owner drop: count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_drops_by_value_captures() {
+    // A by-value predicate is consumed by the search: the
+    // callee's real body drops it on the way out, so an `Rc`
+    // its captures own is released when the call returns --
+    // including for an empty haystack, where the predicate is
+    // never invoked. A borrowed predicate is not dropped by
+    // the call; its capture lives until the owner drops it.
+    run_ok(
+        "str-pattern-pred-drop",
+        STR_PATTERN_PRED_DROP_SRC,
+        "empty: false count=1\nnomatch: false count=1\nborrowed: true count=2\nafter owner drop: count=1\n",
+    );
+}
+
+const STR_PATTERN_PRED_PANIC_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+struct Guard(Rc<i32>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        println!("guard dropped, count now {}", Rc::strong_count(&self.0));
+    }
+}
+
+fn main() {
+    // A by-value predicate that panics is dropped by the
+    // callee's cleanup as the call unwinds, for each of the
+    // three searches.
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let pred = move |_: char| -> bool { let _ = &rc2; panic!("boom") };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(pred)));
+    println!("contains caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+    let rc3 = rc.clone();
+    let pred2 = move |_: char| -> bool { let _ = &rc3; panic!("boom") };
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".starts_with(pred2)));
+    println!("starts caught={} count={}", r2.is_err(), Rc::strong_count(&rc));
+    let rc4 = rc.clone();
+    let pred3 = move |_: char| -> bool { let _ = &rc4; panic!("boom") };
+    let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".ends_with(pred3)));
+    println!("ends caught={} count={}", r3.is_err(), Rc::strong_count(&rc));
+    // A capture with a real destructor runs it during the unwind.
+    let rc5 = Rc::new(5);
+    let g = Guard(rc5.clone());
+    let pred4 = move |_: char| -> bool { let _ = &g; panic!("boom") };
+    let r4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(pred4)));
+    println!("guard caught={} count={}", r4.is_err(), Rc::strong_count(&rc5));
+    // A borrowed predicate that panics is NOT dropped by the
+    // call; its owner still holds it after the catch.
+    let rc6 = Rc::new(6);
+    let rc6c = rc6.clone();
+    let mut pred5 = move |_: char| -> bool { let _ = &rc6c; panic!("boom") };
+    let r5 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(&mut pred5)));
+    println!("borrowed caught={} count={}", r5.is_err(), Rc::strong_count(&rc6));
+    drop(pred5);
+    println!("borrowed after owner drop count={}", Rc::strong_count(&rc6));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_drops_by_value_captures_on_unwind() {
+    // A by-value predicate was moved into the search, so when
+    // an invocation panics the caller's cleanup cannot drop
+    // it -- the callee's cleanup must, exactly as on the
+    // success path. Before the fix the search propagated the
+    // panic before handing the predicate's final state back,
+    // and the `CallBuiltin` dispatch only ran the attached
+    // `consumed_glue` on success, so each panicking call
+    // leaked the predicate's captures (the counts stayed
+    // elevated). A borrowed predicate keeps its owner and is
+    // not dropped by the call on either path.
+    run_ok(
+        "str-pattern-pred-panic-drop",
+        STR_PATTERN_PRED_PANIC_DROP_SRC,
+        "contains caught=true count=1\nstarts caught=true count=1\nends caught=true count=1\nguard dropped, count now 2\nguard caught=true count=1\nborrowed caught=true count=2\nborrowed after owner drop count=1\n",
+    );
+}
+
+const STR_PATTERN_PRED_DOUBLE_PANIC_SRC: &str = r#"
+use std::rc::Rc;
+
+struct Guard(Rc<i32>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        println!("guard dtor runs, count now {}", Rc::strong_count(&self.0));
+        panic!("dtor panic");
+    }
+}
+
+fn main() {
+    let rc = Rc::new(1);
+    let g = Guard(rc.clone());
+    let pred = move |_: char| -> bool { let _ = &g; panic!("boom") };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| SEARCH));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
+    // An owned predicate panics, and dropping it (the search's
+    // cleanup duty) panics again in a capture's destructor: a
+    // double panic, which natively aborts. The run must abort
+    // (101, the abort named on stderr) instead of letting the
+    // original panic reach the guest's `catch_unwind` -- before
+    // the fix the `CallBuiltin` dispatch discarded the cleanup
+    // glue's result, so the run printed `caught=true` and
+    // exited 0. Each of the three searches shares the dispatch,
+    // so each is exercised.
+    for (name, call) in [
+        ("contains", "\"ab\".contains(pred)"),
+        ("starts_with", "\"ab\".starts_with(pred)"),
+        ("ends_with", "\"ab\".ends_with(pred)"),
+    ] {
+        let dir = temp_dir(&format!("str-pattern-pred-double-panic-{name}"));
+        let src = fixture(
+            &dir,
+            "case.rs",
+            &STR_PATTERN_PRED_DOUBLE_PANIC_SRC.replace("SEARCH", call),
+        );
+        let out = run_driver(&src);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(101),
+            "a panic in the predicate cleanup must abort with 101 ({name}); stderr={stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "guard dtor runs, count now 2\n",
+            "only the cleanup destructor runs before the abort ({name}); stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("aborted"),
+            "the abort must be named on stderr ({name}); stderr={stderr}"
+        );
+    }
+}
+
+const STR_PATTERN_DYN_PRED_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let a = "b".contains(&mut pred as &mut dyn FnMut(char) -> bool);
+    let b = "b".contains(&mut pred as &mut dyn FnMut(char) -> bool);
+    let is_b = |c: char| c == 'b';
+    let c = "ab".contains(&is_b as &dyn Fn(char) -> bool);
+    let d = "ab".starts_with(&is_b as &dyn Fn(char) -> bool);
+    println!("{a} {b} {c} {d}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_dyn_predicate() {
+    // A trait-object predicate (`&mut dyn FnMut` / `&dyn Fn`)
+    // resolves through the dyn callable machinery: the callable
+    // behind the object is invoked with the environment the
+    // object's base denotes -- the caller's closure storage -- so
+    // the counter advances across invocations and across separate
+    // searches (1, then 2), exactly as for a concrete borrowed
+    // predicate. Before the fix the object fell into the
+    // character-slice fallback and the search failed with a type
+    // mismatch ("found dyn reference").
+    run_ok(
+        "str-pattern-dyn-pred",
+        STR_PATTERN_DYN_PRED_SRC,
+        "false true true false\n",
+    );
+}
+
+const STR_PATTERN_BOXED_DYN_PRED_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let mut n = 0;
+    let boxed: Box<dyn FnMut(char) -> bool> = Box::new(move |_| {
+        n += 1;
+        n == 2
+    });
+    let a = "ab".contains(boxed);
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed2: Box<dyn FnMut(char) -> bool> = Box::new(move |c: char| {
+        let _ = &rc2;
+        c == 'b'
+    });
+    let b = "ab".contains(boxed2);
+    println!("{a} {b} count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_dyn_predicate() {
+    // An owned `Box<dyn FnMut>` predicate is invoked through the
+    // box's allocation (its `FnMut` state persists across the
+    // per-character invocations, so the counter reaches 2), and
+    // the object is dropped when the search returns: the second
+    // predicate's `Rc` capture is released, returning the strong
+    // count to 1.
+    run_ok(
+        "str-pattern-boxed-dyn-pred",
+        STR_PATTERN_BOXED_DYN_PRED_SRC,
+        "true true count=1\n",
+    );
+}
+
+const STR_PATTERN_BOXED_DYN_PRED_UNWIND_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed: Box<dyn FnMut(char) -> bool> = Box::new(move |c: char| {
+        let _ = &rc2;
+        if c == 'b' {
+            panic!("boom");
+        }
+        false
+    });
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(boxed)));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_dyn_predicate_drops_on_unwind() {
+    // The owned trait-object predicate is dropped on the unwind
+    // path too: the panicking search still hands the object back
+    // for the call's drop glue, so the capture's strong count
+    // returns to 1 behind the guest's `catch_unwind`.
+    run_ok(
+        "str-pattern-boxed-dyn-pred-unwind",
+        STR_PATTERN_BOXED_DYN_PRED_UNWIND_SRC,
+        "caught=true count=1\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_SRC: &str = r#"
+fn is_b(c: char) -> bool {
+    c == 'b'
+}
+
+fn main() {
+    let a = "".contains(Box::new(|c: char| c == 'b'));
+    let b = "ab".contains(Box::new(|c: char| c == 'b'));
+    let c = "ab".contains(Box::new(is_b));
+    let d = "ab".starts_with(Box::new(|c: char| c == 'a'));
+    let e = "ab".ends_with(Box::new(|c: char| c == 'a'));
+    println!("{a} {b} {c} {d} {e}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate() {
+    // A concrete boxed predicate (`Box<closure>` / `Box<fn ptr>`)
+    // is a valid `Pattern`: the box aggregate over the callable's
+    // allocation is resolved to the callable before the
+    // character-slice fallback. Before the fix the box was left as
+    // an ADT value and the search failed with a type mismatch
+    // ("found ADT value").
+    run_ok(
+        "str-pattern-boxed-pred",
+        STR_PATTERN_BOXED_PRED_SRC,
+        "false true true true false\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_MUT_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let boxed = Box::new(move |_| {
+        n += 1;
+        n == 2
+    });
+    let a = "ab".contains(boxed);
+    println!("{a}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_mutates() {
+    // The boxed predicate is invoked through the box's
+    // allocation, so its `FnMut` state persists across the
+    // per-character invocations and the counter reaches 2 on the
+    // second character.
+    run_ok(
+        "str-pattern-boxed-pred-mut",
+        STR_PATTERN_BOXED_PRED_MUT_SRC,
+        "true\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_DROP_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed = Box::new(move |c: char| {
+        let _ = &rc2;
+        c == 'b'
+    });
+    let a = "".contains(boxed);
+    let rc3 = rc.clone();
+    let boxed2 = Box::new(move |c: char| {
+        let _ = &rc3;
+        c == 'b'
+    });
+    let b = "ab".contains(boxed2);
+    println!("{a} {b} count={}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_drops_captures() {
+    // The owned boxed predicate is handed back as the final state
+    // for the call's drop glue when the search returns, so its
+    // captures are dropped -- on an empty haystack (never invoked)
+    // and after a successful search alike -- and the `Rc` strong
+    // count returns to 1.
+    run_ok(
+        "str-pattern-boxed-pred-drop",
+        STR_PATTERN_BOXED_PRED_DROP_SRC,
+        "false true count=1\n",
+    );
+}
+
+const STR_PATTERN_BOXED_PRED_UNWIND_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let boxed = Box::new(move |c: char| {
+        let _ = &rc2;
+        if c == 'b' {
+            panic!("boom");
+        }
+        false
+    });
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(boxed)));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_boxed_concrete_predicate_drops_on_unwind() {
+    // The hand-back also runs when the boxed predicate panics:
+    // the box is dropped on the unwind path, so the capture's
+    // strong count returns to 1 behind the guest's `catch_unwind`.
+    run_ok(
+        "str-pattern-boxed-pred-unwind",
+        STR_PATTERN_BOXED_PRED_UNWIND_SRC,
+        "caught=true count=1\n",
+    );
+}
+
+const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let mut borrowed = &mut pred;
+    let a = "b".contains(&mut borrowed);
+    let b = "b".contains(&mut borrowed);
+    let c = "b".contains(&mut borrowed);
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_reference_chain() {
+    // The pattern may be a reference to a reference to the
+    // closure (`&mut borrowed`, where `borrowed: &mut pred`):
+    // the environment reference must denote the closure's own
+    // storage -- the innermost reference of the chain -- or
+    // the closure body's capture projections read the
+    // intermediate reference as a capture and the counter's
+    // increment fails as a type mismatch. The counter lives
+    // in the caller's closure, so it advances across the
+    // three calls and only the second sees it reach 2.
+    run_ok(
+        "str-pattern-pred-ref-chain",
+        STR_PATTERN_PRED_REF_CHAIN_SRC,
+        "false true false\n",
+    );
+}
+
+const STR_PATTERN_PRED_REF_CHAIN_VARIANTS_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| {
+        n += 1;
+        n == 2
+    };
+    let mut b1 = &mut pred;
+    let mut b2 = &mut b1;
+    let a = "b".contains(&mut b2);
+    let b = "b".contains(&mut b2);
+    println!("three-layer: {a} {b}");
+    let pred2 = |c: char| c == 'b';
+    let borrowed2 = &pred2;
+    let c = "b".contains(&borrowed2);
+    let d = "z".contains(&borrowed2);
+    println!("shared-chain: {c} {d}");
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let mut pred3 = move |_: char| {
+        let _ = &rc2;
+        true
+    };
+    let mut borrowed3 = &mut pred3;
+    let e = "ab".contains(&mut borrowed3);
+    println!("chain-borrowed: {e} count={}", Rc::strong_count(&rc));
+    drop(pred3);
+    println!("after owner drop: count={}", Rc::strong_count(&rc));
+    let mut k = 0;
+    let mut pred4 = move |_| {
+        k += 1;
+        k == 1
+    };
+    let mut borrowed4 = &mut pred4;
+    let f = "ab".starts_with(&mut borrowed4);
+    let g = "ab".ends_with(&mut borrowed4);
+    println!("chain-sw-ew: {f} {g}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_reference_chain_variants() {
+    // A three-layer chain, a shared-reference chain over a
+    // plain `Fn` closure, a chain through `starts_with` /
+    // `ends_with`, and a predicate borrowed through a chain
+    // keeping its owner: the call does not drop its captures,
+    // so the `Rc` count only falls when the owner drops it.
+    run_ok(
+        "str-pattern-pred-ref-chain-variants",
+        STR_PATTERN_PRED_REF_CHAIN_VARIANTS_SRC,
+        "three-layer: false true\nshared-chain: true false\nchain-borrowed: true count=2\nafter owner drop: count=1\nchain-sw-ew: true false\n",
+    );
+}
+
+const OS_STR_ELEMENT_BASE_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+
+fn show(label: &str, s: &OsStr) {
+    let owned = OsString::from(s);
+    let b = owned.as_bytes();
+    let sum: u32 = b.iter().map(|x| *x as u32).sum();
+    println!("{label}: len={} sum={}", b.len(), sum);
+}
+
+fn main() {
+    let arr: [u8; 3] = *b"abc";
+    let full = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 3)) };
+    show("len3", full);
+    let empty = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 0)) };
+    show("len0", empty);
+    let one = unsafe { OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(&arr[0], 1)) };
+    show("len1", one);
+    show("whole", OsStr::from_bytes(&arr[..]));
+}
+"#;
+
+#[test]
+fn run_mode_os_str_from_element_base_keeps_length() {
+    // An `OsStr` whose fat pointer references an individual
+    // byte of an array keeps the length its metadata states
+    // when it is cloned into an `OsString`: resolving the
+    // pointer to the byte alone would report a one-byte
+    // string for lengths 3 and 0 alike.
+    run_ok(
+        "os-str-element-base",
+        OS_STR_ELEMENT_BASE_SRC,
+        "len3: len=3 sum=294\nlen0: len=0 sum=0\nlen1: len=1 sum=97\nwhole: len=3 sum=294\n",
+    );
 }

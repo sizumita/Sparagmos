@@ -8031,9 +8031,13 @@ impl<'a> Interpreter<'a> {
                     )
                 };
                 let value = vals.into_iter().next().expect("arity checked");
-                // In this value model `String` and `str` data are the
-                // same value; the conversion is the identity on it.
-                if matches!(value, Value::Str(_))
+                // The reflexive impl (`impl<T> From<T> for T`) is
+                // the identity by definition; collected code names
+                // it whenever a generic conversion is instantiated
+                // at equal types.
+                if target == source && !target.is_empty() {
+                    Ok(value)
+                } else if matches!(value, Value::Str(_))
                     && (target == "std::string::String" || target == "str" || target == "&str")
                 {
                     Ok(value)
@@ -8406,17 +8410,50 @@ impl<'a> Interpreter<'a> {
                     && (source.starts_with("std::vec::Vec<")
                         || source.starts_with("&[")
                         || source.starts_with("&mut [")
-                        || source.starts_with('['))
+                        || source.starts_with('[')
+                        || matches!(
+                            generic_first_arg(source, "std::boxed::Box<"),
+                            Some(pt) if is_slice_tag(pt)
+                        )
+                        || matches!(
+                            generic_first_arg(source, "alloc::boxed::Box<"),
+                            Some(pt) if is_slice_tag(pt)
+                        ))
                 {
                     // `Rc<[T]>: From<Vec<T>>` / `From<&[T]>` /
-                    // `From<[T; N]>` (and the `Arc` twins): a fresh counted handle
+                    // `From<[T; N]>` / `From<Box<[T]>>` (and the
+                    // `Arc` twins): a fresh counted handle
                     // over the element sequence. The slice
                     // pointee lives in the allocation store as
                     // the element tuple, the shape every slice
                     // consumer of a reference-counted handle
                     // derives the length from (see the handle
-                    // arm of `unsize_to_slice`).
-                    let resolved = self.resolve_value(frames, &value)?;
+                    // arm of `unsize_to_slice`). A boxed source
+                    // hands over its pointee (releasing the box's
+                    // allocation); every other source resolves
+                    // as it is. The take is gated on the source
+                    // type naming a box: a vector's value has
+                    // the same one-field shape as a box
+                    // aggregate (a single allocation reference),
+                    // so the shape alone cannot decide -- an
+                    // ungated take unwraps a vector's buffer
+                    // and mistakes its contents for the element
+                    // sequence itself.
+                    let boxed_source = matches!(
+                        generic_first_arg(source, "std::boxed::Box<"),
+                        Some(pt) if is_slice_tag(pt)
+                    ) || matches!(
+                        generic_first_arg(source, "alloc::boxed::Box<"),
+                        Some(pt) if is_slice_tag(pt)
+                    );
+                    let resolved = match if boxed_source {
+                        self.unbox_take(&value)
+                    } else {
+                        None
+                    } {
+                        Some(pointee) => pointee,
+                        None => self.resolve_value(frames, &value)?,
+                    };
                     let elements = match resolved {
                         Value::Enum { fields, .. } => fields,
                         Value::Tuple(items) => items,
@@ -8440,44 +8477,6 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(self.rc_new_handle(Value::Tuple(elements)))
-                } else if [
-                    "std::rc::Rc<",
-                    "alloc::rc::Rc<",
-                    "std::sync::Arc<",
-                    "alloc::sync::Arc<",
-                ]
-                .iter()
-                .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
-                {
-                    // `Rc<str>` / `Arc<str>`: `From<&str>` and
-                    // `From<String>` hand over the string itself;
-                    // `From<Box<str>>` hands over the box
-                    // aggregate `new_box` builds around it, so
-                    // the string moves out of the box (releasing
-                    // its allocation) before the handle is built.
-                    let text = if matches!(value, Value::Str(_)) {
-                        value
-                    } else if generic_first_arg(source, "std::boxed::Box<") == Some("str")
-                        || generic_first_arg(source, "alloc::boxed::Box<") == Some("str")
-                    {
-                        match self.unbox_take(&value) {
-                            Some(s @ Value::Str(_)) => s,
-                            _ => {
-                                return Err(InterpError::type_mismatch(
-                                    "From::from to a counted string",
-                                    "boxed string value",
-                                    value.kind_name(),
-                                ))
-                            }
-                        }
-                    } else {
-                        return Err(InterpError::type_mismatch(
-                            "From::from to a counted string",
-                            "string value",
-                            value.kind_name(),
-                        ));
-                    };
-                    Ok(self.rc_new_handle(text))
                 } else if target == "std::net::Ipv4Addr"
                     && (source == "[u8; 4]" || source == "u32")
                 {
@@ -8545,6 +8544,55 @@ impl<'a> Interpreter<'a> {
                             value,
                         ],
                     })
+                } else if [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
+                {
+                    // `Rc<str>` / `Arc<str>`: `From<&str>` and
+                    // `From<String>` hand over the string itself;
+                    // `From<Box<str>>` hands over the box
+                    // aggregate `new_box` builds around it, so
+                    // the string moves out of the box (releasing
+                    // its allocation) before the handle is built.
+                    let text = if matches!(value, Value::Str(_)) {
+                        value
+                    } else if generic_first_arg(source, "std::boxed::Box<") == Some("str")
+                        || generic_first_arg(source, "alloc::boxed::Box<") == Some("str")
+                    {
+                        match self.unbox_take(&value) {
+                            Some(s @ Value::Str(_)) => s,
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to a counted string",
+                                    "boxed string value",
+                                    value.kind_name(),
+                                ))
+                            }
+                        }
+                    } else if let Ok(s @ Value::Str(_)) =
+                        self.resolve_value(frames, &value)
+                    {
+                        // A borrowed `&str` whose value is a
+                        // reference into string storage (the
+                        // dereference of a `Box<str>`, an
+                        // `Rc<str>` or a `String`): follow the
+                        // reference to the string data and copy
+                        // it into the new handle. The borrowed
+                        // storage is not consumed.
+                        s
+                    } else {
+                        return Err(InterpError::type_mismatch(
+                            "From::from to a counted string",
+                            "string value",
+                            value.kind_name(),
+                        ));
+                    };
+                    Ok(self.rc_new_handle(text))
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -10474,12 +10522,411 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let haystack = text_of(&vals[0])?;
-                let needle = text_of(&vals[1])?;
-                Ok(Value::Bool(match kind {
-                    Builtin::StrContains => haystack.contains(&needle),
-                    Builtin::StrStartsWith => haystack.starts_with(&needle),
-                    _ => haystack.ends_with(&needle),
-                }))
+                // The `Pattern` impls beyond `&str`: a `char`
+                // searches for that one character, a set of
+                // `char`s for any of them, and a predicate
+                // (`FnMut(char) -> bool`, arriving as a function
+                // pointer or a closure) is consulted per
+                // character -- the shapes collected std and
+                // regex code actually pass.
+                enum Needle {
+                    Text(String),
+                    One(char),
+                    Set(Vec<char>),
+                    Pred(Value),
+                }
+                let resolved = self.resolve_value(frames, &vals[1])?;
+                // A trait-object predicate is resolved through
+                // the dyn callable machinery in the match below;
+                // it records the environment its base denotes
+                // here (a borrowed object's own reference, or the
+                // reference into an owned object's box), and, for
+                // an owned object, the object value to hand back
+                // as the final state for the call's drop glue.
+                // A concrete boxed predicate records the same
+                // pair in the slice-fallback arm below: the
+                // reference into its box, and the box itself.
+                let mut dyn_pred_env: Option<Value> = None;
+                let mut dyn_pred_final: Option<Value> = None;
+                let needle = match resolved {
+                    Value::Str(_) | Value::Bytes(_) => Needle::Text(text_of(&vals[1])?),
+                    Value::Uint(v) => {
+                        // A `&[char]` pattern whose fat base
+                        // references an individual element (a
+                        // slice built with
+                        // `slice::from_raw_parts(&chars[0], 2)`,
+                        // say) resolves to that element's scalar
+                        // above. Detect the slice on the argument
+                        // itself and read it through
+                        // `slice_elements`, which preserves the
+                        // length and the sibling elements, before
+                        // accepting the scalar as the needle.
+                        let char_set = if matches!(vals[1], Value::FatRef { .. }) {
+                            self.char_set_of_slice(frames, &vals[1])
+                        } else {
+                            None
+                        };
+                        match char_set {
+                            Some(set) => Needle::Set(set),
+                            None => match char::from_u32(v as u32) {
+                                Some(c) => Needle::One(c),
+                                None => {
+                                    return Err(InterpError::type_mismatch(
+                                        "str pattern argument",
+                                        "valid char pattern",
+                                        "out-of-range char value",
+                                    ))
+                                }
+                            },
+                        }
+                    }
+                    Value::FnPtr(_) | Value::Closure { .. } => Needle::Pred(resolved),
+                    Value::DynRef { .. } => {
+                        // A trait-object predicate: `&dyn Fn`,
+                        // `&mut dyn FnMut`, or an owned
+                        // `Box<dyn FnMut>`. Resolve the object to
+                        // the callable behind it and the
+                        // environment its base denotes, the way
+                        // the interpreter's own dyn method calls
+                        // do.
+                        let (callable, env) = self.dyn_callable(frames, &resolved)?;
+                        match callable {
+                            Value::FnPtr(_) | Value::Closure { .. } => {
+                                match &env {
+                                    // A borrowed object: the
+                                    // environment is the reference
+                                    // to the closure's own storage,
+                                    // used directly on every
+                                    // invocation (no allocation of
+                                    // the predicate's own, and
+                                    // nothing to drop).
+                                    Value::Ref(target)
+                                        if !matches!(target, RefTarget::Value(..)) =>
+                                    {
+                                        dyn_pred_env = Some(env);
+                                    }
+                                    _ => {
+                                        // An owned object over a
+                                        // box: the closure lives in
+                                        // the box's allocation, so
+                                        // invoke through that
+                                        // allocation, and hand the
+                                        // object itself back as the
+                                        // final state for the call's
+                                        // drop glue (its base denotes
+                                        // the same storage the
+                                        // invocations write through).
+                                        if let Value::DynRef { base, .. } = &resolved {
+                                            if let Some((id, projection)) =
+                                                box_alloc_pointer(base)
+                                            {
+                                                if projection.is_empty() {
+                                                    dyn_pred_env = Some(Value::Ref(
+                                                        RefTarget::Alloc {
+                                                            id,
+                                                            projection: Vec::new(),
+                                                        },
+                                                    ));
+                                                    dyn_pred_final =
+                                                        Some(resolved.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Needle::Pred(callable)
+                            }
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "str pattern argument",
+                                    "string, char, char set or predicate value",
+                                    resolved.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                    ref other => {
+                        // A concrete boxed predicate
+                        // (`Box<closure>` or `Box<fn ptr>`) arrives
+                        // as the box aggregate over the allocation
+                        // holding the callable, which `resolve_value`
+                        // leaves in place. Resolve the callable
+                        // before the character-slice fallback below:
+                        // it is invoked through the box's
+                        // allocation, so an `FnMut`'s state persists
+                        // across the per-character invocations, and
+                        // the box itself is handed back as the final
+                        // state for the call's drop glue, exactly
+                        // like an owned trait-object predicate
+                        // above.
+                        let boxed_callable = match box_alloc_pointer(other) {
+                            Some((id, projection)) if projection.is_empty() => {
+                                match self.alloc_value(id) {
+                                    Some(pointee)
+                                        if matches!(
+                                            pointee,
+                                            Value::FnPtr(_) | Value::Closure { .. }
+                                        ) =>
+                                    {
+                                        Some((id, pointee))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        match boxed_callable {
+                            Some((id, pointee)) => {
+                                dyn_pred_env = Some(Value::Ref(RefTarget::Alloc {
+                                    id,
+                                    projection: Vec::new(),
+                                }));
+                                dyn_pred_final = Some(other.clone());
+                                Needle::Pred(pointee)
+                            }
+                            None => {
+                                // A `&[char]` pattern arrives as a fat
+                                // reference over the character tuple.
+                                match self.slice_elements(frames, &vals[1]) {
+                                    Ok((elems, _))
+                                        if elems.iter().all(|e| matches!(e, Value::Uint(_))) =>
+                                    {
+                                        let mut set = Vec::with_capacity(elems.len());
+                                        for e in &elems {
+                                            let Value::Uint(v) = e else { unreachable!() };
+                                            match char::from_u32(*v as u32) {
+                                                Some(c) => set.push(c),
+                                                None => {
+                                                    return Err(InterpError::type_mismatch(
+                                                        "str pattern argument",
+                                                        "valid char pattern",
+                                                        "out-of-range char value",
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                        Needle::Set(set)
+                                    }
+                                    _ => {
+                                        return Err(InterpError::type_mismatch(
+                                            "str pattern argument",
+                                            "string, char, char set or predicate value",
+                                            other.kind_name(),
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let result = match needle {
+                    Needle::Text(t) => match kind {
+                        Builtin::StrContains => haystack.contains(&t),
+                        Builtin::StrStartsWith => haystack.starts_with(&t),
+                        _ => haystack.ends_with(&t),
+                    },
+                    needle => {
+                        // Per-character needles: consult the
+                        // test for the first (contains / starts
+                        // with) or last (ends with) character the
+                        // semantics reach.
+                        //
+                        // A predicate is an `FnMut`: it may
+                        // mutate a by-value capture, and the
+                        // mutation must be visible to the next
+                        // character's invocation -- and, for a
+                        // borrowed predicate, to the caller
+                        // after the call. A borrowed predicate
+                        // (`&pred` / `&mut pred`) arrives as a
+                        // reference to the closure's own
+                        // storage, which serves as the
+                        // environment reference directly, so
+                        // capture writes land in the caller's
+                        // closure -- the arrangement the
+                        // place-based iterator predicates use
+                        // with their predicate field's storage.
+                        // The reference may also sit one or
+                        // more layers away from the closure: a
+                        // pattern like `&mut borrowed`, where
+                        // `borrowed: &mut pred`, hands the
+                        // search a reference to the place
+                        // holding the reference to the closure,
+                        // and the chain is followed to the
+                        // innermost reference, which denotes
+                        // the closure's storage itself.
+                        // (A reference to a value snapshot is
+                        // not storage, and falls through to the
+                        // by-value arrangement.) A predicate
+                        // passed by value was moved into this
+                        // call, so it gets storage of its own in
+                        // the allocation store for the call's
+                        // duration, and every invocation
+                        // receives a reference to that storage.
+                        // With no environment reference the call
+                        // machinery would wrap a clone of the
+                        // closure in a value target instead, and
+                        // a write to a capture through it would
+                        // fail as a write to a constant
+                        // aggregate.
+                        let borrowed_env = match &needle {
+                            Needle::Pred(_) if dyn_pred_env.is_some() => dyn_pred_env.clone(),
+                            Needle::Pred(_) => match &vals[1] {
+                                Value::Ref(target)
+                                    if !matches!(target, RefTarget::Value(..)) =>
+                                {
+                                    // Follow the chain one layer
+                                    // at a time: each layer's
+                                    // stored value, when it is
+                                    // itself a reference to
+                                    // storage, is the next
+                                    // environment candidate, and
+                                    // the last one denotes the
+                                    // closure's own storage. A
+                                    // layer that is a value
+                                    // snapshot denotes no
+                                    // storage, and the chain
+                                    // then falls through to the
+                                    // by-value arrangement.
+                                    let mut env = vals[1].clone();
+                                    let mut reaches_storage = true;
+                                    loop {
+                                        let stop = match &env {
+                                            Value::Ref(RefTarget::Null)
+                                            | Value::Ref(RefTarget::Address(_)) => true,
+                                            Value::Ref(_) => false,
+                                            _ => true,
+                                        };
+                                        if stop {
+                                            break;
+                                        }
+                                        match self.read_ref_once(frames, &env) {
+                                            Ok(Value::Ref(inner)) => {
+                                                if matches!(inner, RefTarget::Value(..)) {
+                                                    reaches_storage = false;
+                                                    break;
+                                                }
+                                                env = Value::Ref(inner);
+                                            }
+                                            Ok(_) => break,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    if reaches_storage {
+                                        Some(env)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let pred_alloc = match &needle {
+                            Needle::Pred(pred) if borrowed_env.is_none() => {
+                                Some(self.alloc_insert(pred.clone()))
+                            }
+                            _ => None,
+                        };
+                        let pred_env = borrowed_env.or_else(|| {
+                            pred_alloc.map(|id| {
+                                Value::Ref(RefTarget::Alloc {
+                                    id,
+                                    projection: Vec::new(),
+                                })
+                            })
+                        });
+                        let mut test = |c: char| -> InterpResult<bool> {
+                            Ok(match &needle {
+                                Needle::One(n) => c == *n,
+                                Needle::Set(set) => set.contains(&c),
+                                Needle::Pred(pred) => match self.call_callable_sync(
+                                    frames,
+                                    pred,
+                                    pred_env.clone(),
+                                    vec![Value::Uint(u128::from(c as u32))],
+                                )? {
+                                    Value::Bool(b) => b,
+                                    ref other => {
+                                        return Err(InterpError::type_mismatch(
+                                            "str pattern predicate",
+                                            "boolean result",
+                                            other.kind_name(),
+                                        ))
+                                    }
+                                },
+                                Needle::Text(_) => unreachable!(),
+                            })
+                        };
+                        // The outcome stays a `Result` until the
+                        // predicate's storage has been handed back
+                        // below: a predicate that panics unwinds
+                        // through the search, and the hand-back (and
+                        // the drop glue it feeds) is owed on that
+                        // path too -- the callee's cleanup drops a
+                        // by-value predicate however the call ends.
+                        let outcome: InterpResult<bool> = (|| match kind {
+                            Builtin::StrContains => {
+                                let mut found = false;
+                                for c in haystack.chars() {
+                                    if test(c)? {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                Ok(found)
+                            }
+                            Builtin::StrStartsWith => match haystack.chars().next() {
+                                Some(c) => test(c),
+                                None => Ok(false),
+                            },
+                            _ => match haystack.chars().next_back() {
+                                Some(c) => test(c),
+                                None => Ok(false),
+                            },
+                        })();
+                        if let Some(id) = pred_alloc {
+                            // The call consumed the predicate:
+                            // the callee's real body drops it on
+                            // the way out, captures and all, so
+                            // hand its final state back for the
+                            // drop conversion attached to the
+                            // call (see `consumed_glue` in `ir`);
+                            // the interpreter runs that glue
+                            // once this builtin returns. This
+                            // runs whether or not the predicate
+                            // was ever invoked (an empty
+                            // haystack still drops it). A
+                            // borrowed predicate has no
+                            // allocation here and keeps its
+                            // owner, undropped. The hand-back
+                            // also runs when the search unwound
+                            // (a panicking predicate): the
+                            // outcome is only propagated after
+                            // the final state is recorded, and
+                            // the `CallBuiltin` dispatch runs the
+                            // attached glue on the error path as
+                            // well, as the callee's cleanup
+                            // would.
+                            if let Some(final_pred) = self.alloc_value(id) {
+                                self.note_consumed_iter_final(final_pred);
+                            }
+                            self.free_alloc(id);
+                        }
+                        if let Some(final_dyn) = dyn_pred_final {
+                            // An owned trait-object predicate was
+                            // invoked through its box's storage;
+                            // the object value denotes that storage,
+                            // so it is the final state the call's
+                            // drop glue consumes. (Noting it here,
+                            // before the outcome propagates, puts it
+                            // on the unwind path as well, exactly
+                            // like the by-value hand-back above.)
+                            self.note_consumed_iter_final(final_dyn);
+                        }
+                        outcome?
+                    }
+                };
+                Ok(Value::Bool(result))
             }
             Builtin::SliceWindows => {
                 arity(2)?;
@@ -19187,6 +19634,40 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Ok(())
     }
 
+    /// The character set of a `&[char]` pattern argument, read
+    /// through `slice_elements` so the length and the sibling
+    /// elements survive even when the slice's base references an
+    /// individual element. `None` when the value is not a slice
+    /// whose every element is a character.
+    /// The bytes of a byte-slice argument, read through
+    /// `slice_elements` so the length and the sibling elements
+    /// survive even when the slice's base references an
+    /// individual element. `None` when the value is not a slice
+    /// whose every element is a byte.
+    fn byte_slice_of_fat_ref(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<Vec<u8>> {
+        let (elems, _) = self.slice_elements(frames, value).ok()?;
+        let mut bytes = Vec::with_capacity(elems.len());
+        for e in &elems {
+            let Value::Uint(v) = e else { return None };
+            bytes.push(u8::try_from(*v).ok()?);
+        }
+        Some(bytes)
+    }
+
+    fn char_set_of_slice(&self, frames: &[Frame], value: &Value) -> Option<Vec<char>> {
+        let (elems, _) = self.slice_elements(frames, value).ok()?;
+        let mut set = Vec::with_capacity(elems.len());
+        for e in &elems {
+            let Value::Uint(v) = e else { return None };
+            set.push(char::from_u32(*v as u32)?);
+        }
+        Some(set)
+    }
+
     pub(crate) fn slice_elements(
         &self,
         frames: &[Frame],
@@ -20993,6 +21474,20 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// program, argument, environment entry or directory): in
     /// this model an `OsStr` is its byte string.
     fn os_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        // A fat reference carries the byte string's length in
+        // its own metadata: read the bytes through
+        // `slice_elements` so the length and the sibling bytes
+        // survive. Resolving the value first would follow a
+        // base that references an individual byte to that byte
+        // alone, and a string of any length (including zero)
+        // would then be mistaken for the one-byte string the
+        // scalar shortcut below composes.
+        let from_fat_ref = matches!(value, Value::FatRef { .. });
+        if from_fat_ref {
+            if let Some(bytes) = self.byte_slice_of_fat_ref(frames, value) {
+                return Ok(bytes);
+            }
+        }
         let resolved0 = self.resolve_value(frames, value)?;
         // An owned byte-string aggregate in buffer form (an
         // `OsString` or `PathBuf` wrapping a `Buf` wrapping the
@@ -21017,6 +21512,17 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 Value::Bytes(b) => return Ok(b),
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     resolved = fields.into_iter().next().expect("length checked");
+                }
+                // A one-byte string read back through a byte
+                // pointer composes the scalar byte (the byte
+                // view's shaped read): the lone byte value at
+                // this position is the one-byte string. A fat
+                // reference never takes this shortcut: its
+                // metadata states the length, and the read at
+                // the top either honoured it or could not read
+                // the slice at all.
+                Value::Uint(v) if v <= 0xff && !from_fat_ref => {
+                    return Ok(vec![v as u8])
                 }
                 other => {
                     return Err(InterpError::type_mismatch(
