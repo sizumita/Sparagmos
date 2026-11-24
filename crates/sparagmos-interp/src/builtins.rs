@@ -14201,10 +14201,10 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// nothing mid-construction to clean up: it propagates
     /// untouched. A part whose glue the caller could not name
     /// is discarded as before. The parts arrive in the order
-    /// they drop: an initialized slice or vector prefix drops
-    /// in element order, while a partially built aggregate's
-    /// fields are construction temporaries, which drop in
-    /// reverse initialization order -- the aggregate callers
+    /// they drop: an initialized slice, vector or array prefix
+    /// drops in element order, while a partially built tuple's
+    /// or ADT's fields are construction temporaries, which
+    /// drop in reverse initialization order -- those callers
     /// reverse their prefix before handing it over.
     fn drop_cloned_prefix(
         &mut self,
@@ -14325,9 +14325,14 @@ fn value_fingerprint(value: &Value) -> u64 {
                     ) {
                         Ok(v) => cloned.push((v, elem_glue.clone())),
                         Err(err) => {
-                            // Construction temporaries, as in
-                            // the tuple arm above.
-                            cloned.reverse();
+                            // Not construction temporaries,
+                            // unlike the tuple arm above: the
+                            // real array clone initializes
+                            // element by element behind a guard
+                            // that drops the initialized prefix
+                            // in element order, as the slice and
+                            // vector prefixes do (measured
+                            // against native Rust).
                             return Err(self.drop_cloned_prefix(frames, cloned, err));
                         }
                     }

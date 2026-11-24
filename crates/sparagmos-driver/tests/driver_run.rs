@@ -7937,6 +7937,85 @@ fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_aggregate_fields_in_rev
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_ARRAY_DROP_ORDER_SRC: &str = r#"
+struct D(i32);
+impl Clone for D {
+    fn clone(&self) -> Self {
+        if self.0 == 3 {
+            panic!("clone D3 panics");
+        }
+        D(self.0 + 100)
+    }
+}
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop D{}", self.0);
+    }
+}
+
+fn main() {
+    // An array element whose third item's clone panics: the
+    // array clone's initialization guard drops the initialized
+    // prefix in element order.
+    {
+        let src = [[D(1), D(2), D(3)]];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _boxed: Box<[[D; 3]]> = Box::from(&src[..]);
+        }));
+        println!("array caught={}", r.is_err());
+    }
+    // A tuple element whose third field's clone panics: the
+    // cloned fields are construction temporaries and drop in
+    // reverse initialization order.
+    {
+        let src = [(D(1), D(2), D(3))];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _boxed: Box<[(D, D, D)]> = Box::from(&src[..]);
+        }));
+        println!("tuple caught={}", r.is_err());
+    }
+    // Slice elements directly: the initialized prefix drops
+    // in element order.
+    {
+        let src = [D(1), D(2), D(3)];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _boxed: Box<[D]> = Box::from(&src[..]);
+        }));
+        println!("slice caught={}", r.is_err());
+    }
+    // A Vec element whose third item's clone panics: element
+    // order as well.
+    {
+        let src = [vec![D(1), D(2), D(3)]];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _boxed: Box<[Vec<D>]> = Box::from(&src[..]);
+        }));
+        println!("vec caught={}", r.is_err());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_array_prefix_in_element_order() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-panic-array-drop-order");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_panic_array_drop_order.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_ARRAY_DROP_ORDER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwinding array element clone must drop the cloned prefix in element order while tuple fields drop in reverse; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop D101\ndrop D102\narray caught=true\ndrop D1\ndrop D2\ndrop D3\ndrop D102\ndrop D101\ntuple caught=true\ndrop D1\ndrop D2\ndrop D3\ndrop D101\ndrop D102\nslice caught=true\ndrop D1\ndrop D2\ndrop D3\ndrop D101\ndrop D102\nvec caught=true\ndrop D1\ndrop D2\ndrop D3\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");
