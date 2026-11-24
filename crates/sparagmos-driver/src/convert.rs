@@ -182,6 +182,179 @@ fn note_materialization_lint(key: &str) {
     });
 }
 
+/// Run `f` — an instance resolution on the demand or
+/// reachability path — with the diagnostics it emits
+/// discounted, reporting beside the outcome whether any were.
+///
+/// Resolution is speculative in the same way body
+/// materialization is (see `with_body_materialization`): the
+/// driver's demand passes resolve instances the compiler's
+/// own monomorphization collector never resolves in that form
+/// — the collector resolves with the `try_` variants and
+/// simply does not collect an item that fails to normalize —
+/// and a resolution can fail inside the compiler in ways that
+/// are reported as session diagnostics: an instance whose
+/// signature mentions an associated-type projection the
+/// erasing-regions folder cannot normalize (a query cache's
+/// fingerprint function-pointer type is the shape Issue #459
+/// isolated) makes the non-try normalization report an
+/// internal error, and left standing in the session's error
+/// count that one report fails the whole compilation of a
+/// program rustc accepts, even though the resolution itself
+/// was contained and recorded as failed by its caller. (The
+/// budget-4096 all-loss itself fired at a sibling speculative
+/// operation - the drop demand's field substitution, screened
+/// in `main::type_tree_has_alias` - whose delayed bug the
+/// same session poisoning carried; this guard closes the
+/// resolution side of the class.)
+///
+/// The discount follows the materialization discipline. When
+/// the run raised the session's non-lint error count, the
+/// error count is reset and the returned flag is set: a
+/// resolution that emitted diagnostics is a failed resolution
+/// whatever it returned, and the caller records it with its
+/// usual "instance resolution failed" reason. The caller also
+/// records the emission (see `resolution_emitted`) under the
+/// attempted instantiation's own name — never under the
+/// definition's argument-free key. Unlike a body
+/// materialization, whose diagnostics are properties of the
+/// one generic body fetched per definition, a resolution's
+/// outcome depends on the generic arguments attempted (the
+/// resolution query normalizes them), so a record keyed by
+/// the definition would condemn every other instantiation
+/// of it. `mono_check`'s collector replay turns a record on
+/// an instance the collector actually collects into a
+/// finding, so a diagnostic rustc would report for a
+/// collected instance still fails the compilation.
+/// Lint-class growth is never discounted — a resolution is
+/// not expected to lint at all, and leaving the growth
+/// standing keeps its usual effect, exactly as at a
+/// materialization.
+///
+/// A panic out of the resolution is discounted the same way;
+/// the payload is returned for the caller to resume or
+/// contain as it already does.
+fn with_instance_resolution_contained<R>(
+    f: impl FnOnce() -> R,
+) -> (Result<R, Box<dyn std::any::Any + Send>>, bool) {
+    let Some(tcx) = compiler_tcx() else {
+        return (Ok(f()), false);
+    };
+    let dcx = tcx.dcx();
+    let errors_before = dcx.err_count();
+    let non_lint_before = dcx.has_errors_excluding_lint_errors().is_some();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let mut emitted = false;
+    if dcx.err_count() > errors_before {
+        let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
+        if non_lint_after && !non_lint_before {
+            dcx.reset_err_count();
+            emitted = true;
+        }
+    }
+    (result, emitted)
+}
+
+/// Resolve a function item instance on the demand path under
+/// `with_instance_resolution_contained`, collapsing every
+/// failure — a resolution error, a contained panic, or
+/// diagnostics emitted on the way — to `None`: on the demand
+/// path each is the same "instance resolution failed"
+/// outcome, which the caller records as such. An emission is
+/// recorded under the resolved instance's own name when the
+/// resolution produced one before failing. When it produced
+/// none there is no record: an instantiation the resolution
+/// fails is one the collector's identical `try_resolve` does
+/// not collect either, so a record could never legitimately
+/// fire for it — and keyed by the definition instead, it
+/// would fire against every collected instantiation of the
+/// definition, condemning instantiations that resolve
+/// cleanly.
+pub fn resolve_instance_guarded(
+    def: rustc_public::ty::FnDef,
+    args: &rustc_public::ty::GenericArgs,
+) -> Option<Instance> {
+    let (result, emitted) = with_instance_resolution_contained(|| {
+        Instance::resolve(def, args)
+    });
+    let inst = match result {
+        Ok(resolved) => resolved.ok()?,
+        Err(_payload) => {
+            // This resolver contains the panic: it becomes the
+            // "instance resolution failed" outcome, so the
+            // resolver consumes the panic's hook record, as
+            // every other containment in this module does. The
+            // record is first-wins and the location-based
+            // classification of a later panic peeks at the slot
+            // without clearing it, so a record left standing
+            // here would be read as that later panic's own and
+            // misclassify it.
+            let _ = take_captured_panic();
+            return None;
+        }
+    };
+    if emitted {
+        note_resolution_emission(&inst.name());
+        return None;
+    }
+    Some(inst)
+}
+
+/// The closure counterpart of `resolve_instance_guarded`.
+pub fn resolve_closure_guarded(
+    def: rustc_public::ty::ClosureDef,
+    args: &rustc_public::ty::GenericArgs,
+    kind: rustc_public::ty::ClosureKind,
+) -> Option<Instance> {
+    let (result, emitted) = with_instance_resolution_contained(|| {
+        Instance::resolve_closure(def, args, kind)
+    });
+    let inst = match result {
+        Ok(resolved) => resolved.ok()?,
+        Err(_payload) => {
+            // Contained panic: consume its hook record, exactly
+            // as in `resolve_instance_guarded`.
+            let _ = take_captured_panic();
+            return None;
+        }
+    };
+    if emitted {
+        note_resolution_emission(&inst.name());
+        return None;
+    }
+    Some(inst)
+}
+
+thread_local! {
+    /// Keys of the instances whose demand-path resolution
+    /// emitted diagnostics that the resolution discount
+    /// recorded: only the resolved instance's own name (the
+    /// `def_path_str_with_args` form the collector replay
+    /// consults), and only when the resolution produced that
+    /// instance before failing. Written during collection,
+    /// read by the compile verdict
+    /// (`mono_check::check_required_consts`); one compilation
+    /// runs per process, so nothing clears it.
+    static RESOLUTION_EMISSIONS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn note_resolution_emission(key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    RESOLUTION_EMISSIONS.with(|set| {
+        set.borrow_mut().insert(key.to_string());
+    });
+}
+
+/// Whether resolving the instance named by `key` emitted
+/// diagnostics that were discounted at the resolution
+/// (see `resolve_instance_guarded`).
+pub fn resolution_emitted(key: &str) -> bool {
+    RESOLUTION_EMISSIONS.with(|set| set.borrow().contains(key))
+}
+
 /// Whether materializing the body named by `key` emitted
 /// evaluation diagnostics that were discounted at the fetch
 /// (see `with_body_materialization`).
@@ -3233,7 +3406,7 @@ impl Converter {
             return;
         }
         let symbol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let inst = Instance::resolve(FnDef(def), &GenericArgs(Vec::new())).ok()?;
+            let inst = resolve_instance_guarded(FnDef(def), &GenericArgs(Vec::new()))?;
             self.link_symbol_of(&inst)
         }))
         .ok()
@@ -3323,9 +3496,9 @@ impl Converter {
     /// id, which no converted body carries, so the call stays
     /// unresolved downstream.
     fn fn_def_id(&mut self, def: &FnDef, args: &GenericArgs) -> sm::DefId {
-        match Instance::resolve(*def, args) {
-            Ok(inst) => self.instance_def_id(def.def_id(), &inst),
-            Err(_) => self.def_id(def.def_id()),
+        match resolve_instance_guarded(*def, args) {
+            Some(inst) => self.instance_def_id(def.def_id(), &inst),
+            None => self.def_id(def.def_id()),
         }
     }
 
@@ -3350,7 +3523,7 @@ impl Converter {
         let raw = def.def_id();
         if !args_mention_params(args) {
             if let Some(kind) = closure_kind(args) {
-                if let Ok(inst) = Instance::resolve_closure(*def, args, kind) {
+                if let Some(inst) = resolve_closure_guarded(*def, args, kind) {
                     return self.instance_def_id(raw, &inst);
                 }
             }
@@ -3818,7 +3991,7 @@ impl Converter {
             builtin,
             Some(sparagmos_interp::builtins::Builtin::CallerLocation)
         ) {
-            let inst = Instance::resolve(def, &args).ok()?;
+            let inst = resolve_instance_guarded(def, &args)?;
             if !inst.requires_caller_location() {
                 return None;
             }
@@ -4117,7 +4290,7 @@ impl Converter {
         // or predicate-carrying functions): such a function is
         // simply not a resolvable call target.
         let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let inst = Instance::resolve(def, &GenericArgs(vec![])).ok()?;
+            let inst = resolve_instance_guarded(def, &GenericArgs(vec![]))?;
             Some(guarded_ty_kind(&inst.ty())?.fn_sig()?.skip_binder())
         }))
         .ok()??;
@@ -5093,7 +5266,7 @@ impl Converter {
             TyKind::RigidTy(RigidTy::FnDef(def, args)) => {
                 // A function item value is zero-sized: the type
                 // itself names the callable, no bytes are stored.
-                if let Ok(inst) = rustc_public::mir::mono::Instance::resolve(def, &args) {
+                if let Some(inst) = resolve_instance_guarded(def, &args) {
                     self.note_const_fn(&inst);
                 }
                 let d = self.fn_def_id(&def, &args);
@@ -7801,7 +7974,7 @@ impl Converter {
                 let Some(ck) = closure_kind(args) else {
                     return;
                 };
-                let resolved = Instance::resolve_closure(*def, args, ck).ok();
+                let resolved = resolve_closure_guarded(*def, args, ck);
                 let key = resolved
                     .as_ref()
                     .map(|inst| inst.name())
@@ -7817,7 +7990,7 @@ impl Converter {
                 (def.name(), "closure", args, body)
             }
             TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
-                let resolved = Instance::resolve(FnDef(def.def_id()), args).ok();
+                let resolved = resolve_instance_guarded(FnDef(def.def_id()), args);
                 let key = resolved
                     .as_ref()
                     .map(|inst| inst.name())
