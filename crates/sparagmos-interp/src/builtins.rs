@@ -8328,20 +8328,43 @@ impl<'a> Interpreter<'a> {
                     && (source.starts_with("std::vec::Vec<")
                         || source.starts_with("alloc::vec::Vec<")
                         || source.starts_with("std::borrow::Cow<")
-                        || source.starts_with("alloc::borrow::Cow<"))
+                        || source.starts_with("alloc::borrow::Cow<")
+                        || source.starts_with("&["))
                 {
                     // `From<Vec<T>> for Box<[T]>` is
                     // `Vec::into_boxed_slice` by definition, and
                     // `From<Cow<'_, [T]>> for Box<[T]>` hands over
                     // the Cow's owned vector, or a clone of the
-                    // borrowed slice's elements: the pointee is
-                    // the element sequence, not the source value
-                    // itself (boxing the aggregate would leave
-                    // every slice consumer of the box reading the
-                    // source's own fields).
+                    // borrowed slice's elements; `From<&[T]>`
+                    // likewise clones the source slice's
+                    // elements: the pointee is the element
+                    // sequence, not the source value itself
+                    // (boxing the aggregate -- or the reference --
+                    // would leave every slice consumer of the box
+                    // reading the source's own fields).
                     let pointee_ty =
                         generic_first_arg(target, "std::boxed::Box<").and_then(ty_from_tag);
-                    if source.starts_with("std::borrow::Cow<")
+                    if source.starts_with("&[") {
+                        // The argument is the slice reference
+                        // itself. Snapshot its elements and
+                        // re-own the ones that own allocations
+                        // (the `Box::from` clone semantics, as
+                        // in the borrowed-Cow arm below) before
+                        // boxing the snapshot: boxing the
+                        // reference would alias the source, and
+                        // writes or drops on either side would
+                        // show through the other.
+                        let (elements, _len) = self.slice_elements(frames, &value)?;
+                        let elements = elements
+                            .iter()
+                            .map(|e| self.clone_owned_value(frames, e))
+                            .collect::<InterpResult<Vec<_>>>()?;
+                        self.boxed_slice_value(
+                            Value::Tuple(elements),
+                            pointee_ty,
+                            "From::from to Box<[T]>",
+                        )
+                    } else if source.starts_with("std::borrow::Cow<")
                         || source.starts_with("alloc::borrow::Cow<")
                     {
                         match value {

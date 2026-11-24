@@ -7068,6 +7068,71 @@ fn run_mode_boxed_str_from_cow() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_SRC: &str = r#"
+fn main() {
+    // `From<&[T]> for Box<[T]>` clones the source slice's
+    // elements into the new allocation: neither side's later
+    // writes or drops are visible through the other.
+    let mut v: Vec<i32> = vec![1, 2, 3];
+    let b: Box<[i32]> = Box::from(&v[..]);
+    println!("readback: {:?}", b);
+    v[0] = 99;
+    println!("after source write: {:?}", b);
+    let mut b = b;
+    b[1] = 77;
+    println!("after box write: src={:?} box={:?}", v, b);
+    v.clear();
+    println!("after source clear: {:?}", b);
+
+    // Owning elements are cloned, not shared.
+    let mut src: Vec<Box<i32>> = vec![Box::new(1), Box::new(2)];
+    let bb: Box<[Box<i32>]> = Box::from(&src[..]);
+    *src[0] = 42;
+    println!("deep after elem write: {} {:?}", *bb[0], bb);
+    src[1] = Box::new(55);
+    println!("deep after elem replace: {} {:?}", *bb[1], bb);
+
+    let mut sv: Vec<String> = vec!["aa".to_string(), "bb".to_string()];
+    let s: Box<[String]> = Box::from(&sv[..]);
+    sv[0].push_str("ZZ");
+    println!("strings: {} {:?}", s[0], s);
+
+    // The `.into()` spelling of the same conversion.
+    let w: Vec<i32> = vec![5, 6];
+    let c: Box<[i32]> = (&w[..]).into();
+    println!("into: {:?}", c);
+
+    // The box outlives the source owner.
+    let owned: Box<[i32]>;
+    {
+        let tmp: Vec<i32> = vec![10, 20, 30];
+        owned = Box::from(&tmp[..]);
+    }
+    println!("after source drop: {:?}", owned);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clones_elements() {
+    let dir = temp_dir("boxed-from-slice-ref");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref.rs",
+        BOXED_SLICE_FROM_SLICE_REF_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from &[T] must clone the elements, not alias the source; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "readback: [1, 2, 3]\nafter source write: [1, 2, 3]\nafter box write: src=[99, 2, 3] box=[1, 77, 3]\nafter source clear: [1, 77, 3]\ndeep after elem write: 1 [1, 2]\ndeep after elem replace: 2 [1, 2]\nstrings: aa [\"aa\", \"bb\"]\ninto: [5, 6]\nafter source drop: [10, 20, 30]\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");
