@@ -15869,6 +15869,73 @@ fn run_mode_default_for_float_str_and_wrappers() {
     run_ok("wrapper-default", WRAPPER_DEFAULT_SRC, "defaults ok\n");
 }
 
+const HASH_COLLECTION_DEFAULT_SRC: &str = r#"
+use std::collections::{HashMap, HashSet};
+
+fn main() {
+    let e: HashSet<i32> = Default::default();
+    println!("empty contains={} len={}", e.contains(&9), e.len());
+    let mut s: HashSet<i32> = Default::default();
+    for i in 0..100 {
+        s.insert(i * 3);
+    }
+    println!(
+        "grown len={} has99={} has100={}",
+        s.len(),
+        s.contains(&99),
+        s.contains(&100)
+    );
+    let sum: i32 = s.iter().sum();
+    println!("iter sum={}", sum);
+    let mut m: HashMap<String, i32> = Default::default();
+    for i in 0..50 {
+        m.insert(format!("k{}", i), i);
+    }
+    *m.get_mut(&"k7".to_string()).unwrap() += 100;
+    m.remove(&"k0".to_string());
+    println!(
+        "map len={} k7={:?} k0={:?}",
+        m.len(),
+        m.get(&"k7".to_string()),
+        m.get(&"k0".to_string())
+    );
+    println!("values sum={}", m.values().sum::<i32>());
+}
+"#;
+
+/// `std::panic::set_backtrace_style` has no converted body
+/// (it writes a std-internal atomic); the runtime records
+/// the style. The rustdoc entry program installs its style
+/// during startup.
+const BACKTRACE_STYLE_SRC: &str = r#"#![feature(panic_backtrace_config)]
+fn main() {
+    std::panic::set_backtrace_style(std::panic::BacktraceStyle::Short);
+    std::panic::set_backtrace_style(std::panic::BacktraceStyle::Full);
+    println!("styled");
+}
+"#;
+
+#[test]
+fn run_mode_set_backtrace_style() {
+    run_ok("backtrace-style", BACKTRACE_STYLE_SRC, "styled\n");
+}
+
+#[test]
+fn run_mode_default_for_hash_collections() {
+    // `Default::default` for the std hash collections has no
+    // collected body (the trait path reaches the interpreter's
+    // name fallback), so the model assembles the empty table
+    // directly. The expected lines are the native 1.100.0
+    // output of the same source: probes of the empty table,
+    // growth out of the empty singleton, iteration, and
+    // mutation of a default-built map.
+    run_ok(
+        "hash-collection-default",
+        HASH_COLLECTION_DEFAULT_SRC,
+        "empty contains=false len=0\ngrown len=100 has99=true has100=false\niter sum=14850\nmap len=49 k7=Some(107) k0=None\nvalues sum=1325\n",
+    );
+}
+
 const NEXT_BACK_SLICE_SRC: &str = r#"
 fn main() {
     let v = vec![10, 20, 30, 40];
