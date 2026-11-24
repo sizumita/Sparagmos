@@ -1832,6 +1832,7 @@ pub enum FloatOp {
     MulAdd,
     DivEuclid,
     RemEuclid,
+    CopySign,
 }
 
 /// One integer bit intrinsic operation, selected by the
@@ -3545,6 +3546,7 @@ fn float_method_named(method: &str) -> Option<FloatOp> {
         "mul_add" => O::MulAdd,
         "div_euclid" => O::DivEuclid,
         "rem_euclid" => O::RemEuclid,
+        "copysign" => O::CopySign,
         "to_bits" => O::ToBits,
         "from_bits" => O::FromBits,
         _ => return None,
@@ -3694,6 +3696,7 @@ fn exec_float128_method(
         | O::MulAdd
         | O::DivEuclid
         | O::RemEuclid
+        | O::CopySign
         | O::Powf
         | O::ToDegrees
         | O::ToRadians => {
@@ -3784,7 +3787,8 @@ fn exec_float16_method(
         | O::Atan2
         | O::Hypot
         | O::DivEuclid
-        | O::RemEuclid => 2,
+        | O::RemEuclid
+        | O::CopySign => 2,
         _ => 1,
     })?;
     let x = as_float(&vals[0])?;
@@ -3950,6 +3954,17 @@ fn exec_float16_method(
         O::Powf => round(x32.powf(as_float(&vals[1])? as f32) as f64),
         O::Min => round(x.min(as_float(&vals[1])?)),
         O::Max => round(x.max(as_float(&vals[1])?)),
+        O::CopySign => {
+            let y = as_float(&vals[1])?;
+            // Bit composition, not arithmetic (the shape of
+            // core's own fallback body for `copysignf16`): the
+            // result keeps self's magnitude bits — a NaN payload
+            // included, unquieted — and takes the sign argument's
+            // sign bit.
+            let magnitude = f64_to_f16_bits(x) & 0x7fff;
+            let sign = f64_to_f16_bits(y) & 0x8000;
+            Value::Float(f16_bits_to_f64(magnitude | sign))
+        }
         O::FromBits => unreachable!("handled above"),
     })
 }
@@ -4019,7 +4034,8 @@ fn exec_float_method(
         | O::Atan2
         | O::Hypot
         | O::DivEuclid
-        | O::RemEuclid => 2,
+        | O::RemEuclid
+        | O::CopySign => 2,
         _ => 1,
     })?;
     let x = as_float(&vals[0])?;
@@ -4182,6 +4198,23 @@ fn exec_float_method(
                 (x as f32).max(y as f32) as f64
             } else {
                 x.max(y)
+            })
+        }
+        O::CopySign => {
+            let y = as_float(&vals[1])?;
+            // Bit composition at the method's own width (the
+            // shape of core's fallback bodies for `copysignf32` /
+            // `copysignf64`): self's magnitude bits, the sign
+            // argument's sign bit; a NaN payload passes through
+            // unquieted.
+            Value::Float(if f32_width {
+                let magnitude = crate::f128::f64_to_f32_bits_exact(x) & 0x7fff_ffff;
+                let sign = crate::f128::f64_to_f32_bits_exact(y) & 0x8000_0000;
+                crate::f128::f32_bits_to_f64_exact(magnitude | sign)
+            } else {
+                f64::from_bits(
+                    (x.to_bits() & !(1u64 << 63)) | (y.to_bits() & (1u64 << 63)),
+                )
             })
         }
         O::FromBits => unreachable!("handled above"),

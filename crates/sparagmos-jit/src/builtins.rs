@@ -211,6 +211,7 @@ pub enum FloatOp {
     MulAdd,
     DivEuclid,
     RemEuclid,
+    CopySign,
 }
 
 impl FloatOp {
@@ -272,6 +273,7 @@ impl FloatOp {
             47 => O::MulAdd,
             48 => O::DivEuclid,
             49 => O::RemEuclid,
+            50 => O::CopySign,
             _ => return None,
         })
     }
@@ -539,6 +541,7 @@ fn float_method_named(method: &str) -> Option<FloatOp> {
         "mul_add" => O::MulAdd,
         "div_euclid" => O::DivEuclid,
         "rem_euclid" => O::RemEuclid,
+        "copysign" => O::CopySign,
         _ => return None,
     };
     Some(op)
@@ -1784,6 +1787,7 @@ fn float_method_f64(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
         )),
         O::DivEuclid => bits(v.div_euclid(f64::from_bits(y as u64))),
         O::RemEuclid => bits(v.rem_euclid(f64::from_bits(y as u64))),
+        O::CopySign => (x & !(1i64 << 63)) | (y & (1i64 << 63)),
     }
 }
 
@@ -1845,6 +1849,7 @@ fn float_method_f32(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
         )),
         O::DivEuclid => bits(v.div_euclid(f32::from_bits(y as u32))),
         O::RemEuclid => bits(v.rem_euclid(f32::from_bits(y as u32))),
+        O::CopySign => (((x as u32) & 0x7fff_ffff) | ((y as u32) & 0x8000_0000)) as i64,
     }
 }
 
