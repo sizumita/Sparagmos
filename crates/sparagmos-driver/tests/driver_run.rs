@@ -27850,6 +27850,73 @@ fn run_mode_error_output_type_default() {
     );
 }
 
+// The rustdoc entry program's diagnostics context setup asks
+// for `DiagCtxtFlags::default()` (the fourth stop on the
+// rustdoc execution path); the value is the derived `Default`
+// of `rustc_errors::DiagCtxtFlags` -- every field at its own
+// default -- served by the interpreter's modelled
+// `Default::default`. The guest reads every field of the
+// default, then mutates three fields and reads them back; the
+// expected lines are the native 1.100.0 output of the same
+// program.
+const DIAG_CTXT_FLAGS_DEFAULT_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate rustc_errors;
+
+use std::num::NonZero;
+use rustc_errors::DiagCtxtFlags;
+
+fn show(f: DiagCtxtFlags) {
+    let err = match f.treat_err_as_bug {
+        None => "none",
+        Some(n) => {
+            if n.get() == 3 {
+                "some3"
+            } else {
+                "some?"
+            }
+        }
+    };
+    println!(
+        "warn={} err={} eager={} macro={} dedup={} track={}",
+        f.can_emit_warnings,
+        err,
+        f.eagerly_emit_delayed_bugs,
+        f.macro_backtrace,
+        f.deduplicate_diagnostics,
+        f.track_diagnostics
+    );
+}
+
+fn main() {
+    let mut f = DiagCtxtFlags::default();
+    show(f);
+    f.can_emit_warnings = true;
+    f.treat_err_as_bug = Some(NonZero::new(3usize).unwrap());
+    f.track_diagnostics = true;
+    show(f);
+}
+"#;
+
+#[test]
+fn run_mode_diag_ctxt_flags_default() {
+    let dir = temp_dir("diag-ctxt-flags-default");
+    let src = fixture(&dir, "case.rs", DIAG_CTXT_FLAGS_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "warn=false err=none eager=false macro=false dedup=false track=false\n\
+         warn=true err=some3 eager=false macro=false dedup=false track=true\n",
+        "DiagCtxtFlags::default() must be the all-defaults flags value; stderr={stderr}"
+    );
+}
+
 // ----- libc isatty (rustdoc execution path) ---------------------------------
 
 // Session setup in compiler programs asks whether the standard
