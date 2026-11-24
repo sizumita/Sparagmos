@@ -14244,7 +14244,7 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// shape-only owned clone, exactly as before.
     ///
     /// The field tags come from the tag itself for tuples,
-    /// arrays and `Vec`s, and from the instance's recorded
+    /// arrays, slices and `Vec`s, and from the instance's recorded
     /// debug shape for any other ADT; a field whose tag cannot
     /// be determined is cloned shape-only. An ADT value
     /// carrying fewer fields than its recorded variant
@@ -14307,7 +14307,17 @@ fn value_fingerprint(value: &Value) -> u64 {
                 )));
             }
             if let Some(inner) = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-                let Some(elem) = array_elem_tag(inner) else {
+                // An array tag `[T; N]` names its element
+                // before the top-level semicolon; a slice tag
+                // `[T]` -- the pointee of a `Box<[T]>` element,
+                // reached through the box arm of the caller --
+                // names it with the whole inside. Without the
+                // slice reading, a boxed slice's pointee fell
+                // to the shape-only clone, and its elements
+                // lost the type-aware judgments (counted
+                // handles deep-copied, custom `Clone` bodies
+                // bypassed).
+                let Some(elem) = array_elem_tag(inner).or_else(|| slice_pointee_elem_tag(ty)) else {
                     return Ok(None);
                 };
                 let elem_glue = glue.and_then(|g| g.elem_plan());
@@ -14327,7 +14337,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                         Err(err) => {
                             // Not construction temporaries,
                             // unlike the tuple arm above: the
-                            // real array clone initializes
+                            // real array or slice clone initializes
                             // element by element behind a guard
                             // that drops the initialized prefix
                             // in element order, as the slice and
@@ -14344,9 +14354,13 @@ fn value_fingerprint(value: &Value) -> u64 {
             return Ok(None);
         }
         // A `Vec`'s elements all share the element tag, in
-        // either of the value forms a vector takes.
+        // either of the value forms a vector takes. A
+        // `Box<[T]>` pointee built by `into_boxed_slice`
+        // keeps the vector's value form under the slice tag,
+        // so a slice tag names the same shared element here.
         if let Some(elem) = generic_first_arg(ty, "std::vec::Vec<")
             .or_else(|| generic_first_arg(ty, "alloc::vec::Vec<"))
+            .or_else(|| slice_pointee_elem_tag(ty))
         {
             let elem_glue = glue.and_then(|g| g.elem_plan());
             match value {
@@ -28511,6 +28525,18 @@ fn array_elem_tag(inner: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The element tag inside a rendered slice type (`[T]`):
+/// the whole inside, or `None` when the tag is not a
+/// bracket tag or its inside is an array's (`T; N` -- the
+/// semicolon reading [`array_elem_tag`] performs).
+fn slice_pointee_elem_tag(ty: &str) -> Option<&str> {
+    let inner = ty.strip_prefix('[')?.strip_suffix(']')?;
+    if array_elem_tag(inner).is_some() {
+        return None;
+    }
+    Some(inner.trim())
 }
 
 /// Split a rendered type list on the commas that sit at nesting

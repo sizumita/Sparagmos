@@ -7300,6 +7300,81 @@ fn run_mode_boxed_slice_from_slice_ref_keeps_nested_counted_identity() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_BOXED_SLICE_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Debug)]
+struct S {
+    v: i32,
+}
+
+thread_local! {
+    static CLONES: Cell<i32> = const { Cell::new(0) };
+}
+
+impl Clone for S {
+    fn clone(&self) -> Self {
+        CLONES.with(|c| c.set(c.get() + 1));
+        S { v: self.v + 100 }
+    }
+}
+
+fn main() {
+    // A `Box<[T]>` element: the pointee's tag is a slice tag,
+    // and its elements clone with their own types judged.
+    let inner: Box<[Rc<Cell<i32>>]> =
+        Box::from(&[Rc::new(Cell::new(1)), Rc::new(Cell::new(2))][..]);
+    let src: Vec<Box<[Rc<Cell<i32>>]>> = vec![inner];
+    let keep = src[0][0].clone();
+    let boxed: Box<[Box<[Rc<Cell<i32>>]>]> = Box::from(&src[..]);
+    println!("boxslice ptr_eq: {}", Rc::ptr_eq(&keep, &boxed[0][0]));
+    boxed[0][0].set(42);
+    println!("boxslice shared: keep={}", keep.get());
+    println!("boxslice strong: {}", Rc::strong_count(&keep));
+    println!("boxslice len: {}", boxed[0].len());
+    println!("boxslice second: {}", boxed[0][1].get());
+
+    // The same through a pointee built by into_boxed_slice
+    // (the vector's value form under the slice tag).
+    let vinner: Box<[Rc<Cell<i32>>]> =
+        vec![Rc::new(Cell::new(3)), Rc::new(Cell::new(4))].into_boxed_slice();
+    let vsrc: Vec<Box<[Rc<Cell<i32>>]>> = vec![vinner];
+    let vkeep = vsrc[0][1].clone();
+    let vboxed: Box<[Box<[Rc<Cell<i32>>]>]> = Box::from(&vsrc[..]);
+    println!("vecform ptr_eq: {}", Rc::ptr_eq(&vkeep, &vboxed[0][1]));
+    println!("vecform strong: {}", Rc::strong_count(&vkeep));
+
+    // Custom Clone elements inside the slice pointee run
+    // their Clone bodies, one per element per conversion.
+    let sinner: Box<[S]> = Box::from(&[S { v: 1 }, S { v: 2 }][..]);
+    let ssrc: Vec<Box<[S]>> = vec![sinner];
+    let sboxed: Box<[Box<[S]>]> = Box::from(&ssrc[..]);
+    println!("custom clones run: {}", CLONES.with(|c| c.get()));
+    println!("custom values: {} {}", sboxed[0][0].v, sboxed[0][1].v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_boxed_slice_elements() {
+    let dir = temp_dir("boxed-from-slice-ref-boxed-slice");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_boxed_slice.rs",
+        BOXED_SLICE_FROM_SLICE_REF_BOXED_SLICE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[Box<[T]>]> from &[Box<[T]>] must clone the pointee's elements with their types judged; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "boxslice ptr_eq: true\nboxslice shared: keep=42\nboxslice strong: 3\nboxslice len: 2\nboxslice second: 2\nvecform ptr_eq: true\nvecform strong: 3\ncustom clones run: 4\ncustom values: 201 202\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CHANNEL_SRC: &str = r#"use std::sync::mpsc::{channel, sync_channel, TryRecvError};
 
 fn state(r: &std::sync::mpsc::Receiver<i32>) -> &'static str {
