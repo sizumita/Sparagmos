@@ -34328,6 +34328,67 @@ fn run_mode_str_pattern_predicate_drops_by_value_captures_on_unwind() {
     );
 }
 
+const STR_PATTERN_PRED_DOUBLE_PANIC_SRC: &str = r#"
+use std::rc::Rc;
+
+struct Guard(Rc<i32>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        println!("guard dtor runs, count now {}", Rc::strong_count(&self.0));
+        panic!("dtor panic");
+    }
+}
+
+fn main() {
+    let rc = Rc::new(1);
+    let g = Guard(rc.clone());
+    let pred = move |_: char| -> bool { let _ = &g; panic!("boom") };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| SEARCH));
+    println!("caught={} count={}", r.is_err(), Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
+    // An owned predicate panics, and dropping it (the search's
+    // cleanup duty) panics again in a capture's destructor: a
+    // double panic, which natively aborts. The run must abort
+    // (101, the abort named on stderr) instead of letting the
+    // original panic reach the guest's `catch_unwind` -- before
+    // the fix the `CallBuiltin` dispatch discarded the cleanup
+    // glue's result, so the run printed `caught=true` and
+    // exited 0. Each of the three searches shares the dispatch,
+    // so each is exercised.
+    for (name, call) in [
+        ("contains", "\"ab\".contains(pred)"),
+        ("starts_with", "\"ab\".starts_with(pred)"),
+        ("ends_with", "\"ab\".ends_with(pred)"),
+    ] {
+        let dir = temp_dir(&format!("str-pattern-pred-double-panic-{name}"));
+        let src = fixture(
+            &dir,
+            "case.rs",
+            &STR_PATTERN_PRED_DOUBLE_PANIC_SRC.replace("SEARCH", call),
+        );
+        let out = run_driver(&src);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(101),
+            "a panic in the predicate cleanup must abort with 101 ({name}); stderr={stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "guard dtor runs, count now 2\n",
+            "only the cleanup destructor runs before the abort ({name}); stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("aborted"),
+            "the abort must be named on stderr ({name}); stderr={stderr}"
+        );
+    }
+}
+
 const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
 fn main() {
     let mut n = 0;

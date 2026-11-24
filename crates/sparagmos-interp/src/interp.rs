@@ -3008,16 +3008,35 @@ impl<'a> Interpreter<'a> {
                                 // synchronously against the handed-
                                 // back state before the error
                                 // propagates, or its destructors
-                                // never run. A destructor that
-                                // panics here is a double panic in
-                                // the guest (an abort); the error
-                                // already propagating is the one
-                                // that stands, so a glue failure
-                                // does not replace it.
+                                // never run. The cleanup's own
+                                // outcome is not discarded: a
+                                // destructor that panics here is a
+                                // double panic in the guest, which
+                                // natively aborts the run (it is
+                                // not a catchable panic, so it must
+                                // not be masked by the panic already
+                                // propagating), and any other
+                                // failure of the cleanup -- an abort
+                                // it raised itself, or a non-panic
+                                // interpreter failure -- propagates
+                                // as itself rather than vanishing.
                                 if let (Some(glue), Some(final_state)) =
                                     (&consumed_glue, consumed_final)
                                 {
-                                    let _ = self.drop_value_sync(frames, final_state, glue);
+                                    match self.drop_value_sync(frames, final_state, glue) {
+                                        Ok(()) => {}
+                                        Err(InterpError::Panic { message, .. }) => {
+                                            return Err(InterpError::Abort {
+                                                message: format!(
+                                                    "panic `{message}` raised while dropping \
+                                                     a value consumed by `{name}` as the call \
+                                                     unwound: panicking while unwinding aborts \
+                                                     the run"
+                                                ),
+                                            });
+                                        }
+                                        Err(other) => return Err(other),
+                                    }
                                 }
                                 return Err(err);
                             }
