@@ -8467,6 +8467,7 @@ let inner = match (&src, target) {
             let canonical = crate::builtins::canonical_name(&name);
             crate::builtins::lookup_qualified(&canonical).is_some()
                 || crate::builtins::foreign_helper_lookup(&canonical).is_some()
+                || crate::builtins::intrinsic_lookup(&canonical).is_some()
         })
     }
 
@@ -9924,6 +9925,14 @@ let inner = match (&src, target) {
                         // `lookup`, so no collected body is ever
                         // displaced by them.
                         .or_else(|| crate::builtins::foreign_helper_lookup(&canonical))
+                        // A compiler intrinsic the guest crate
+                        // declares itself (`#[rustc_intrinsic]`,
+                        // the minicore shape) is named by its
+                        // declaration site's path, which the
+                        // qualified registry never matches; the
+                        // intrinsic's own name is its identity
+                        // (see `builtins::intrinsic_lookup`).
+                        .or_else(|| crate::builtins::intrinsic_lookup(&canonical))
                         // A UFCS `fmt` trait call whose `Self`
                         // instance has no converted body is served
                         // by the structural fmt engine (see

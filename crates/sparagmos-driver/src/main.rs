@@ -1116,6 +1116,31 @@ fn collect_local_instances(
                 continue;
             }
             if !inst.has_body() {
+                // A compiler intrinsic the interpreter models
+                // is served by the builtin, the way a demanded
+                // data constructor is served by its callers'
+                // aggregate rvalues: there is no body to
+                // convert, and the demand is met. The model is
+                // looked up by the intrinsic's own name (see
+                // `builtins::intrinsic_lookup`): an intrinsic
+                // the guest crate declares itself is named by
+                // its declaration site, which the qualified
+                // registry never matches. An intrinsic with no
+                // model stays an unmet demand.
+                if matches!(
+                    inst.kind,
+                    rustc_public::mir::mono::InstanceKind::Intrinsic
+                ) {
+                    let canonical = sparagmos_interp::builtins::canonical_name(
+                        &inst.def.def_id().name(),
+                    );
+                    if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+                        for owner in &owners {
+                            demands.entry(*owner).or_default().converted += 1;
+                        }
+                        continue;
+                    }
+                }
                 let reason = match inst.kind {
                     rustc_public::mir::mono::InstanceKind::Intrinsic => {
                         "compiler intrinsic (no fallback body)"

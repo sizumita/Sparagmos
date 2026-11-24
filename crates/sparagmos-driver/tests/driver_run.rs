@@ -6352,6 +6352,100 @@ fn convert_mode_simd_intrinsic_with_vector_args_converts() {
     );
 }
 
+// ----- locally declared compiler intrinsics (Issue #384) --------------------
+
+// The `no_core` / minicore test crates declare the intrinsics
+// they exercise themselves with `#[rustc_intrinsic]` instead of
+// linking core's, so the callee is named by the declaration
+// site's own path and the qualified builtin registry never
+// matches it. A modelled intrinsic is served by its builtin
+// (its identity is its item name); an unmodelled one stays an
+// unmet demand.
+const LOCAL_INTRINSICS_SRC: &str = r#"
+#![feature(intrinsics, repr_simd)]
+#[rustc_intrinsic]
+unsafe fn simd_add<T>(x: T, y: T) -> T;
+#[rustc_intrinsic]
+unsafe fn simd_reduce_add_ordered<T, U>(x: T, init: U) -> U;
+#[rustc_intrinsic]
+unsafe fn nontemporal_store<T>(ptr: *mut T, val: T);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct I32x4([i32; 4]);
+fn main() {
+    let c = unsafe { simd_add(I32x4([1, 2, 3, 4]), I32x4([5, 6, 7, 8])) };
+    let sum: i32 = unsafe { simd_reduce_add_ordered(c, 0i32) };
+    println!("{sum}");
+    let mut v: u32 = 0;
+    unsafe { nontemporal_store(&mut v as *mut u32, 42u32) };
+    println!("{v}");
+}
+"#;
+
+const LOCAL_UNMODELLED_INTRINSIC_SRC: &str = r#"
+#![feature(intrinsics)]
+#[rustc_intrinsic]
+fn prefetch_read_data<T, const LOCALITY: i32>(data: *const T);
+fn main() {
+    let v: u32 = 0;
+    prefetch_read_data::<u32, 0>(&v as *const u32);
+}
+"#;
+
+fn target_crate_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with("target-crate converted:"))
+        .expect("the summary prints a target-crate line")
+}
+
+#[test]
+fn run_mode_locally_declared_intrinsics_run() {
+    let dir = temp_dir("local-intrinsics");
+    let src = fixture(&dir, "local_intrinsics.rs", LOCAL_INTRINSICS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "36\n42\n");
+}
+
+#[test]
+fn convert_mode_locally_declared_intrinsics_convert() {
+    let dir = temp_dir("local-intrinsics-convert");
+    let src = fixture(&dir, "local_intrinsics.rs", LOCAL_INTRINSICS_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        target_crate_line(&stdout).ends_with("skipped: 0"),
+        "a crate whose intrinsics are all modelled must convert fully; stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("compiler intrinsic (no fallback body)"),
+        "no local intrinsic may be left unmet; stdout={stdout}"
+    );
+}
+
+#[test]
+fn convert_mode_locally_declared_unmodelled_intrinsic_stays_skipped() {
+    let dir = temp_dir("local-intrinsic-unmodelled");
+    let src = fixture(
+        &dir,
+        "local_unmodelled.rs",
+        LOCAL_UNMODELLED_INTRINSIC_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        target_crate_line(&stdout).ends_with("skipped: 1"),
+        "an intrinsic with no interpreter model must not be credited; stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("compiler intrinsic (no fallback body)"),
+        "the skip must keep the intrinsic reason; stdout={stdout}"
+    );
+}
+
 #[test]
 fn convert_mode_simd_type_with_too_many_lanes_is_a_compile_failure() {
     let dir = temp_dir("mono-simd-lanes");

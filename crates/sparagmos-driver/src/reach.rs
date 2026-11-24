@@ -544,7 +544,26 @@ pub fn collect_reachable(
                 }
                 _ if !inst.has_body() => match inst.kind {
                     InstanceKind::Intrinsic => {
-                        no_body("compiler intrinsic (no fallback body)")
+                        // A compiler intrinsic the interpreter
+                        // models is served by the builtin, like
+                        // the builtin-owned definitions excluded
+                        // above; the model is looked up by the
+                        // intrinsic's own name (see
+                        // `builtins::intrinsic_lookup`), because
+                        // an intrinsic declared by another crate
+                        // is named by its declaration site, which
+                        // the qualified registry never matches.
+                        let canonical =
+                            sparagmos_interp::builtins::canonical_name(&def_name);
+                        if sparagmos_interp::builtins::intrinsic_lookup(&canonical)
+                            .is_some()
+                        {
+                            no_body(
+                                "implemented as an interpreter builtin; body not collected",
+                            )
+                        } else {
+                            no_body("compiler intrinsic (no fallback body)")
+                        }
                     }
                     _ if bodies_taken >= cap => {
                         limit_reached = true;
