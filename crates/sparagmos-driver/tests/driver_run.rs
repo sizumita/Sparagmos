@@ -22674,6 +22674,152 @@ fn run_mode_tool_interception_oversized_neighbour_file_stays_unread() {
     assert_eq!(stdout, "oversized neighbour guest ok\n", "stderr={stderr}");
 }
 
+const RENAMED_BINARY_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write("a.rs", "fn main() { println!(\"from a\"); }\n").unwrap();
+    std::fs::write("b.rs", "fn main() { println!(\"from b\"); }\n").unwrap();
+    for name in ["a", "b"] {
+        let out = Command::new(&rustc)
+            .arg("--edition=2021")
+            .arg("--out-dir")
+            .arg(".")
+            .arg(format!("{name}.rs"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Move b over a: the file at a's path is now b's file,
+    // and executing the path must run b's program, as it
+    // would natively.
+    std::fs::rename(dir.join("b"), dir.join("a")).unwrap();
+    let out = Command::new(dir.join("a")).output().unwrap();
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("ran a: {}", String::from_utf8(out.stdout).unwrap().trim());
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_renamed_binary_runs_the_replacement() {
+    let dir = temp_dir("tool-renamed-binary");
+    let src = fixture(&dir, "renamed_binary_guest.rs", RENAMED_BINARY_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The registry follows the file's identity across the
+    // rename: the path `a` now holds b's file, so the run
+    // executes b's program, not the program originally
+    // recorded under `a`.
+    assert_eq!(stdout, "ran a: from b\n", "stderr={stderr}");
+}
+
+const ENV_FILE_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write("p.rs", "fn main() { println!(\"child ran\"); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(dir.join("p")).output().unwrap();
+    assert!(out.status.success(), "run failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "child ran\n");
+    println!("env file guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_guest_env_file_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_dir("tool-env-file");
+    let src = fixture(&dir, "env_file_guest.rs", ENV_FILE_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let started = std::time::SystemTime::now();
+    let mut child = Command::new(driver)
+        .arg("run")
+        .arg(&src)
+        .arg("--tool-program")
+        .arg(driver)
+        .arg("--guest-arg")
+        .arg(driver)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sparagmos-driver");
+    // The guest environment file stands in the shared
+    // temporary directory for the whole artifact run; watch
+    // for it while the driver works and record the
+    // permissions of every one created during this run.
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    while child
+        .try_wait()
+        .expect("failed to poll the driver")
+        .is_none()
+    {
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with("sparagmos-artifact-env-") {
+                    continue;
+                }
+                let Ok(md) = entry.metadata() else { continue };
+                if md.modified().map(|m| m < started).unwrap_or(true) {
+                    continue; // a leftover of an earlier run
+                }
+                let mode = md.permissions().mode() & 0o777;
+                if !seen.contains(&(name.clone(), mode)) {
+                    seen.push((name, mode));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let out = child
+        .wait_with_output()
+        .expect("failed to read the driver's output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "env file guest ok\n", "stderr={stderr}");
+    assert!(
+        !seen.is_empty(),
+        "no guest environment file was observed during the run"
+    );
+    // The file holds the driver's whole environment,
+    // credentials included: every one observed must be
+    // owner-only.
+    assert!(
+        seen.iter().all(|(_, mode)| *mode == 0o600),
+        "guest environment files were not owner-only: {seen:?}"
+    );
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());

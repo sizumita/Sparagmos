@@ -135,13 +135,23 @@ denominator. Runs on every push to `main` and on manual dispatch.
   the recorded source tree (or its recorded snapshot, once
   the recipe has rewritten or deleted any of its files),
   the artifact a bare program name denotes is the one the
-  invocation's own `PATH` search finds, the program's
+  invocation's own `PATH` search finds, the artifact a path
+  denotes is the one whose recorded file identity (device
+  and inode) the file now at that path carries -- so
+  renaming one built binary over another makes the path run
+  the replacement, and a path whose file no recorded
+  identity matches is refused rather than answered with a
+  stale program -- the program's
   argv[0] is the name the recipe invoked it under, the
   re-conversion runs under the producing invocation's
   compilation environment (so `option_env!` and its kin see
   the build's values), and the program itself runs under
   the environment its invocation carried, applied as a
-  complete assignment once the conversion is done. The
+  complete assignment once the conversion is done. That
+  assignment travels to the run subprocess in a file
+  created owner-only under an unpredictable name in the
+  shared temporary directory, since it is the driver's
+  whole environment, inherited credentials included. The
   re-conversion likewise runs in the producing
   invocation's working directory, so its relative
   compilation paths (a forwarded `--extern` path, a `-L`

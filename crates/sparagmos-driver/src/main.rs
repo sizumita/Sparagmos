@@ -5962,6 +5962,13 @@ struct ToolArtifact {
     /// the same configuration its build used, not merely
     /// against the same libraries.
     rustc_args: Vec<String>,
+    /// The identity (device and inode) of the placeholder
+    /// file the producing invocation left at its output
+    /// path, as it stood when the build recorded it: how a
+    /// later execution lookup tells this artifact's file
+    /// from another's after the recipe renames one over the
+    /// other (see `ToolRegistry::get_for_run`).
+    file_id: Option<(u64, u64)>,
 }
 
 /// The artifact registry of one run (see `execute`): artifact
@@ -5996,7 +6003,19 @@ fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
         aux_specs: a.aux_specs.clone(),
         aux_pins: a.aux_pins.clone(),
         rustc_args: a.rustc_args.clone(),
+        file_id: a.file_id,
     }
+}
+
+/// The identity (device and inode numbers) of the file at
+/// `path`: what distinguishes one artifact's placeholder
+/// file from another's after a recipe moves files around,
+/// given every placeholder holds the same (empty) bytes.
+/// `None` when the file cannot be stat'ed.
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.dev(), md.ino()))
 }
 
 impl ToolRegistry {
@@ -6007,6 +6026,44 @@ impl ToolRegistry {
             .iter()
             .find(|(p, _)| p == path)
             .map(|(_, a)| cloned_artifact(a))
+    }
+
+    /// The artifact an execution of the file at `path` must
+    /// run. The registry's records are keyed by the path a
+    /// build produced its output at, but a recipe can move
+    /// files after building them -- `std::fs::rename` of one
+    /// artifact over another's path is the plain case -- and
+    /// the interpreter's filesystem builtins perform such
+    /// moves directly on the host, with no word to this
+    /// registry. So the lookup follows the file itself: when
+    /// the file now at `path` carries an identity a build
+    /// recorded, that build's artifact is the program the
+    /// path now denotes, wherever it was recorded under.
+    /// When the path's recorded artifact is no longer the
+    /// file there and no recorded identity matches, what
+    /// stands there is not an artifact this run produced,
+    /// and the execution is refused rather than answered
+    /// with a stale program. When the file cannot be
+    /// stat'ed (it is gone), the path record alone decides,
+    /// as before.
+    fn get_for_run(&self, path: &std::path::Path) -> Result<Option<ToolArtifact>, String> {
+        let entries = self.entries.lock().unwrap();
+        if let Some(id) = file_identity(path) {
+            if let Some((_, a)) = entries.iter().find(|(_, a)| a.file_id == Some(id)) {
+                return Ok(Some(cloned_artifact(a)));
+            }
+            if entries.iter().any(|(p, _)| p == path) {
+                return Err(format!(
+                    "tool interception: the file at `{}` was replaced after it was built; what stands there is not an artifact this run produced",
+                    path.display()
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(entries
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, a)| cloned_artifact(a)))
     }
 
     /// The source a conversion of `artifact` must read: the
@@ -6301,19 +6358,63 @@ fn run_convert_subprocess(
     Ok((status.code().unwrap_or(101), stdout, stderr))
 }
 
+/// Create a fresh file in the shared temporary directory
+/// that no other account can read or predict: the name
+/// carries the process id, a per-process sequence, and the
+/// wall-clock nanosecond stamp; the open is `create_new`,
+/// so an existing namesake is never truncated (the name is
+/// retried instead); and the permissions are owner-only
+/// from the moment the file exists. For files whose
+/// contents are worth keeping from other accounts on a
+/// shared host -- the guest environment file is the one
+/// here (see `write_guest_env_file`).
+fn create_private_temp_file(tag: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "sparagmos-{tag}-{}-{seq}-{nanos:x}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free private temporary file name",
+    ))
+}
+
 /// Write one complete environment assignment (the environment
 /// an interpreted program is to run under, as `artifact_run`
-/// computed it from the execution request) to `path`, in the
+/// computed it from the execution request) to a fresh private
+/// temporary file (see `create_private_temp_file`), in the
 /// length-prefixed binary form `read_guest_env_file` reads:
 /// a sequence of key/value records, each two u32-LE-length-
 /// prefixed byte strings. The assignment is complete, not a
 /// delta: the reader replaces its whole environment with it,
 /// so no variable from the conversion's environment can leak
-/// into the program's.
-fn write_guest_env_file(
-    path: &std::path::Path,
-    env: &[(Vec<u8>, Vec<u8>)],
-) -> std::io::Result<()> {
+/// into the program's. The file is private because the
+/// assignment is this process's whole environment --
+/// inherited credentials and tokens included -- and it
+/// stands in the shared temporary directory for the run's
+/// whole duration. Returns the file's path; the caller
+/// removes it once the run is over.
+fn write_guest_env_file(env: &[(Vec<u8>, Vec<u8>)]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
     let mut buf = Vec::new();
     for (key, value) in env {
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -6321,7 +6422,12 @@ fn write_guest_env_file(
         buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
         buf.extend_from_slice(value);
     }
-    std::fs::write(path, buf)
+    let (path, mut file) = create_private_temp_file("artifact-env")?;
+    if let Err(e) = file.write_all(&buf) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
 }
 
 /// Read back a file `write_guest_env_file` wrote.
@@ -6810,6 +6916,7 @@ fn tool_run(
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
         }
+        let file_id = file_identity(&path);
         registry.record(
             path,
             ToolArtifact {
@@ -6824,6 +6931,7 @@ fn tool_run(
                 aux_specs: aux.clone(),
                 aux_pins: aux_pins.clone(),
                 rustc_args: forward.clone(),
+                file_id,
             },
         );
     };
@@ -7043,10 +7151,14 @@ fn artifact_run(
         }
         None => absolutize(&cwd, &program),
     };
-    let Some(artifact) = registry.get(&path) else {
-        return Err(format!(
-            "tool interception: program `{program}` is not an artifact this run produced"
-        ));
+    let artifact = match registry.get_for_run(&path) {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            return Err(format!(
+                "tool interception: program `{program}` is not an artifact this run produced"
+            ));
+        }
+        Err(e) => return Err(e),
     };
     if artifact.crate_type.as_deref() != Some("bin") {
         return Err(format!(
@@ -7088,11 +7200,7 @@ fn artifact_run(
             None => guest_env.retain(|(k, _)| k != key),
         }
     }
-    let env_path = std::env::temp_dir().join(format!(
-        "sparagmos-artifact-env-{}-{seq}",
-        std::process::id()
-    ));
-    write_guest_env_file(&env_path, &guest_env).map_err(|e| {
+    let env_path = write_guest_env_file(&guest_env).map_err(|e| {
         format!("tool interception: cannot record the guest environment: {e}")
     })?;
     // The name the program reads as its argv[0]: the explicit
