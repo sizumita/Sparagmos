@@ -1651,7 +1651,17 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         | "std::str::Chars"
         | "core::str::Chars"
         | "std::str::Bytes"
-        | "core::str::Bytes" => true,
+        | "core::str::Bytes"
+        | "std::str::Split"
+        | "core::str::Split"
+        | "std::str::RSplit"
+        | "core::str::RSplit"
+        | "std::str::SplitTerminator"
+        | "core::str::SplitTerminator"
+        | "std::str::RSplitTerminator"
+        | "core::str::RSplitTerminator"
+        | "std::str::SplitInclusive"
+        | "core::str::SplitInclusive" => true,
         // A `Rev`'s back step is its inner iterator's front
         // step, so it is modelled exactly when the inner
         // iterator's `next` is.
@@ -1663,7 +1673,7 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         // `len` body, which for a pointer-pair state such as
         // `slice::Iter`'s is not executable; the builtin
         // computes it from the modelled size hint instead.)
-        "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Cloned" | "std::iter::Map" | "std::iter::Filter" => {
+        "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Cloned" | "std::iter::Map" | "std::iter::Filter" | "std::iter::FilterMap" => {
             first_type_arg(&args).is_some_and(iterator_back_modelled)
         }
         // A `Zip`'s back step composes the two sides' back

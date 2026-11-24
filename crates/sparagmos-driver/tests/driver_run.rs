@@ -16989,6 +16989,212 @@ fn run_mode_filter_next_back_and_composition() {
     );
 }
 
+const FILTER_MAP_SRC: &str = r#"
+fn keep_even_times_ten(x: i32) -> Option<i32> {
+    if x % 2 == 0 { Some(x * 10) } else { None }
+}
+
+fn main() {
+    let v = vec![1, 2, 3, 4, 5, 6];
+    let kept: Vec<i32> = v.iter().filter_map(|x| if *x % 2 == 0 { Some(*x * 10) } else { None }).collect();
+    println!("{kept:?}");
+    let kept2: Vec<i32> = (0..7).filter_map(keep_even_times_ten).collect();
+    println!("{kept2:?}");
+    let mut calls = 0;
+    let mut it = v.iter().filter_map(|x| { calls += 1; if *x % 3 == 0 { Some(*x) } else { None } });
+    println!("{:?}", it.next());
+    println!("{:?}", it.next());
+    println!("{:?}", it.next());
+    println!("calls={calls}");
+    let n = (0..10).filter_map(|x| if x > 100 { Some(x) } else { None }).count();
+    println!("n={n}");
+    let it2 = v.iter().filter_map(|x| Some(*x));
+    println!("hint={:?}", it2.size_hint());
+    let text = "a,,bb,ccc";
+    let base = 100usize;
+    let lens: Vec<usize> = text
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| if s.len() > 1 { Some(base + s.len()) } else { None })
+        .collect();
+    println!("{lens:?}");
+}
+"#;
+
+#[test]
+fn run_mode_filter_map_iteration() {
+    // The call count pins that the closure runs once per pulled
+    // element and that its capture writes persist across steps
+    // (the closure is called through its own storage); the
+    // split/filter/filter_map chain is the `parse_lossy` shape
+    // of the rustdoc execution chain (Issue #438), and the size
+    // hint is core's `(0, inner upper)`.
+    let dir = temp_dir("filter-map-iteration");
+    let src = fixture(&dir, "filter_map_iteration.rs", FILTER_MAP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "FilterMap over slice::Iter, Range and the Split chain must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[20, 40, 60]\n[0, 20, 40, 60]\nSome(3)\nSome(6)\nNone\ncalls=6\nn=0\nhint=(0, Some(6))\n[102, 103]\n",
+        "the closure's Some results are yielded in order, None results dropped"
+    );
+}
+
+const FILTER_MAP_BACK_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3, 4, 5, 6];
+    let mut it = v.iter().filter_map(|x| if *x % 2 == 0 { Some(*x) } else { None });
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    let mut rsum = 0;
+    for x in (0..10).filter_map(|x| if x % 2 == 0 { Some(x) } else { None }).rev() {
+        rsum += x;
+    }
+    println!("revsum={rsum}");
+    let out: Vec<i32> = v.iter().filter_map(|x| if *x % 2 == 1 { Some(*x * 2) } else { None }).collect();
+    println!("{out:?}");
+}
+"#;
+
+#[test]
+fn run_mode_filter_map_next_back_and_composition() {
+    // The interleaved steps pin that front and back pulls meet
+    // in the middle without re-yielding an element, exactly as
+    // the Filter test pins for its predicate.
+    let dir = temp_dir("filter-map-next-back");
+    let src = fixture(&dir, "filter_map_next_back.rs", FILTER_MAP_BACK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "FilterMap next_back and Rev composition must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some(2)\nSome(6)\nSome(4)\nNone\nNone\nrevsum=20\n[2, 6, 10]\n",
+        "front and back steps share one closure-gated sequence"
+    );
+}
+
+const STR_SPLIT_SRC: &str = r#"
+fn show(label: &str, v: Vec<&str>) {
+    println!("{label}={v:?}");
+}
+
+fn main() {
+    show("split", "a,,bb,ccc".split(',').collect());
+    show("split-trail", "a,b,".split(',').collect());
+    show("split-lead", ",a,b".split(',').collect());
+    show("split-empty", "".split(',').collect());
+    show("split-only", ",".split(',').collect());
+    show("rsplit", "a,,bb,ccc".rsplit(',').collect());
+    show("term", "a,,bb,ccc".split_terminator(',').collect());
+    show("term-trail", "a,b,".split_terminator(',').collect());
+    show("term-empty", "".split_terminator(',').collect());
+    show("rterm", "a,b,".rsplit_terminator(',').collect());
+    show("rterm-notrail", "a,b".rsplit_terminator(',').collect());
+    show("incl", "a,,bb,ccc".split_inclusive(',').collect());
+    show("incl-trail", "a,b,".split_inclusive(',').collect());
+    show("incl-empty", "".split_inclusive(',').collect());
+    show("mb", "α,ββ,γ".split(',').collect());
+    show("mb-needle", "aαbααc".split('α').collect());
+    show("mb-incl", "α,β".split_inclusive(',').collect());
+    let mut it = "a,b,c,d".split(',');
+    println!("i1={:?}", it.next());
+    println!("i2={:?}", it.next_back());
+    println!("i3={:?}", it.next());
+    println!("i4={:?}", it.next_back());
+    println!("i5={:?}", it.next());
+    println!("i6={:?}", it.next_back());
+    let mut it = "a,b,".split_terminator(',');
+    println!("t1={:?}", it.next_back());
+    println!("t2={:?}", it.next());
+    println!("t3={:?}", it.next_back());
+    let mut it = "a,bb,ccc".split_inclusive(',');
+    println!("s1={:?}", it.next());
+    println!("s2={:?}", it.next_back());
+    println!("s3={:?}", it.next());
+    println!("s4={:?}", it.next_back());
+    println!("s5={:?}", it.next());
+    let mut it = "a,b,c".rsplit(',');
+    println!("r1={:?}", it.next());
+    println!("r2={:?}", it.next_back());
+    println!("r3={:?}", it.next());
+    println!("r4={:?}", it.next_back());
+    println!("cnt={}", "a,,b".split(',').filter(|s| !s.is_empty()).filter_map(|s| Some(s.len())).count());
+    println!("sum={}", "1,2,3".split(',').filter_map(|s| s.parse::<i32>().ok()).sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_str_split_family() {
+    // The whole `SplitInternal` family over a `char` pattern:
+    // both directions, the terminators' trailing-empty rule,
+    // inclusive pieces, multi-byte haystacks and needles, and
+    // front/back interleaving on one state. Expected output
+    // was produced by the native 1.100.0 toolchain.
+    let dir = temp_dir("str-split-family");
+    let src = fixture(&dir, "str_split_family.rs", STR_SPLIT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the str split family must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"split=["a", "", "bb", "ccc"]
+split-trail=["a", "b", ""]
+split-lead=["", "a", "b"]
+split-empty=[""]
+split-only=["", ""]
+rsplit=["ccc", "bb", "", "a"]
+term=["a", "", "bb", "ccc"]
+term-trail=["a", "b"]
+term-empty=[]
+rterm=["b", "a"]
+rterm-notrail=["b", "a"]
+incl=["a,", ",", "bb,", "ccc"]
+incl-trail=["a,", "b,"]
+incl-empty=[]
+mb=["α", "ββ", "γ"]
+mb-needle=["a", "b", "", "c"]
+mb-incl=["α,", "β"]
+i1=Some("a")
+i2=Some("d")
+i3=Some("b")
+i4=Some("c")
+i5=None
+i6=None
+t1=Some("b")
+t2=Some("a")
+t3=None
+s1=Some("a,")
+s2=Some("ccc")
+s3=Some("bb,")
+s4=None
+s5=None
+r1=Some("c")
+r2=Some("a")
+r3=Some("b")
+r4=None
+cnt=2
+sum=6
+"#,
+        "every split variant yields core's pieces in core's order"
+    );
+}
+
 const ITER_MUT_SRC: &str = r#"
 fn bump(xs: &mut [i32]) {
     for x in xs {
