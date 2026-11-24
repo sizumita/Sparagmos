@@ -4826,9 +4826,14 @@ fn btree_walk(
         Value::Tuple(items) => items,
         _ => return None,
     };
-    if keys.len() < len || vals.len() < len {
-        return None;
-    }
+    // A slot within the length that was never stored is an
+    // elided zero-sized element (the representation the
+    // execution walker reconstructs with `btree_fill_elided`
+    // in builtins.rs): the stored array is shorter than the
+    // declared length, and every present slot holds the
+    // element type's sole value.
+    let keys = btree_fill_elided_slots(keys, len)?;
+    let vals = btree_fill_elided_slots(vals, len)?;
     let pairs: Vec<(Value, Value)> = (0..len)
         .map(|i| (unwrap_element(&keys[i]), unwrap_element(&vals[i])))
         .collect();
@@ -4853,6 +4858,46 @@ fn btree_walk(
     }
     btree_walk(interp, &edge_items[len], height - 1, total, out)?;
     Some(())
+}
+
+/// Whether a stored slot's value is zero-sized in form: a
+/// unit, an empty aggregate, or a wrapper over one (the same
+/// judgment as `btree_zst_shaped` in builtins.rs). A zero-sized
+/// element type has exactly one value, and every stored slot
+/// of it has this shape.
+fn btree_zst_shaped(value: &Value) -> bool {
+    match value {
+        Value::Unit => true,
+        Value::Tuple(items) => items.iter().all(btree_zst_shaped),
+        Value::Enum { fields, .. } => fields.iter().all(btree_zst_shaped),
+        _ => false,
+    }
+}
+
+/// Fill a B-tree node's key/value array out to the declared
+/// length, as the execution walker does (`btree_fill_elided`
+/// in builtins.rs): a slot within the length that was never
+/// stored is an elided zero-sized element -- the write
+/// machinery stores nothing for a value with no leaves, so a
+/// zero-sized element type (a set's marker value, a unit key)
+/// leaves the array shorter than the length, and every
+/// present slot holds the type's sole value in the same form
+/// the missing slots hold. An array with no stored slots at
+/// all holds only elided elements; their sole value is the
+/// unit the model stores for it. A short array whose present
+/// slots are not all zero-sized is a genuine hole in the node
+/// and stays unrenderable.
+fn btree_fill_elided_slots(slots: &[Value], len: usize) -> Option<Vec<Value>> {
+    if slots.len() >= len {
+        return Some(slots.to_vec());
+    }
+    if !slots.iter().all(btree_zst_shaped) {
+        return None;
+    }
+    let sole = slots.first().cloned().unwrap_or(Value::Unit);
+    let mut filled = slots.to_vec();
+    filled.resize(len, sole);
+    Some(filled)
 }
 
 /// The node aggregate an allocation (or a data field) holds:
@@ -6135,4 +6180,135 @@ fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
     parse_steps(&rest[i..], &mut steps)?;
     steps.extend((0..derefs).map(|_| ExprStep::Deref));
     Ok(ParsedExpr { base, steps })
+}
+
+#[cfg(test)]
+mod btree_elided_tests {
+    use super::*;
+
+    fn leaf_node(len: u128, keys: Vec<Value>, vals: Vec<Value>) -> Value {
+        Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Uninit,
+                Value::Uint(0),
+                Value::Uint(len),
+                Value::Tuple(keys),
+                Value::Tuple(vals),
+            ],
+        }
+    }
+
+    fn map_with_node(node: Value, size: u128) -> (Interpreter<'static>, Value) {
+        let program: &'static Program = Box::leak(Box::new(Program::default()));
+        let interp = Interpreter::new(program);
+        let id = interp.alloc_insert(node);
+        let noderef = Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Uint(0),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: Vec::new(),
+                    })],
+                },
+            ],
+        };
+        let root = Value::Enum {
+            variant: 1,
+            fields: vec![noderef],
+        };
+        let map = Value::Enum {
+            variant: 0,
+            fields: vec![root, Value::Uint(size)],
+        };
+        (interp, map)
+    }
+
+    /// A map's unit values are never stored: the node's value
+    /// array is empty at the declared length, and the entries
+    /// still read as the pairs the tree holds.
+    #[test]
+    fn elided_value_slots_are_filled() {
+        let (interp, map) = map_with_node(
+            leaf_node(2, vec![Value::Int(7), Value::Int(8)], Vec::new()),
+            2,
+        );
+        let (entries, size) = btree_entries(&interp, &map, false).expect("entries");
+        assert_eq!(size, 2);
+        assert_eq!(
+            entries,
+            vec![
+                (Value::Int(7), Value::Unit),
+                (Value::Int(8), Value::Unit),
+            ]
+        );
+    }
+
+    /// A set's marker values are elided the same way (the set
+    /// walk reads its inner map's pairs).
+    #[test]
+    fn elided_set_markers_are_filled() {
+        let (interp, map) = map_with_node(
+            leaf_node(2, vec![Value::Int(1), Value::Int(2)], Vec::new()),
+            2,
+        );
+        let set = Value::Enum {
+            variant: 0,
+            fields: vec![map],
+        };
+        let (entries, size) = btree_entries(&interp, &set, true).expect("entries");
+        assert_eq!(size, 2);
+        assert_eq!(
+            entries,
+            vec![
+                (Value::Int(1), Value::Unit),
+                (Value::Int(2), Value::Unit),
+            ]
+        );
+    }
+
+    /// Unit keys elide too: the key array is the short one.
+    #[test]
+    fn elided_key_slots_are_filled() {
+        let (interp, map) = map_with_node(leaf_node(1, Vec::new(), vec![Value::Int(1)]), 1);
+        let (entries, size) = btree_entries(&interp, &map, false).expect("entries");
+        assert_eq!(size, 1);
+        assert_eq!(entries, vec![(Value::Unit, Value::Int(1))]);
+    }
+
+    /// A short array whose present slots are not zero-sized is
+    /// a genuine hole in the node: the walk still refuses it.
+    #[test]
+    fn genuine_hole_stays_unrenderable() {
+        let (interp, map) = map_with_node(
+            leaf_node(2, vec![Value::Int(7)], vec![Value::Int(1), Value::Int(2)]),
+            2,
+        );
+        assert!(btree_entries(&interp, &map, false).is_none());
+    }
+
+    /// Fully stored arrays walk as before.
+    #[test]
+    fn stored_slots_walk_unchanged() {
+        let (interp, map) = map_with_node(
+            leaf_node(
+                2,
+                vec![Value::Int(7), Value::Int(8)],
+                vec![Value::Int(1), Value::Int(2)],
+            ),
+            2,
+        );
+        let (entries, size) = btree_entries(&interp, &map, false).expect("entries");
+        assert_eq!(size, 2);
+        assert_eq!(
+            entries,
+            vec![
+                (Value::Int(7), Value::Int(1)),
+                (Value::Int(8), Value::Int(2)),
+            ]
+        );
+    }
 }

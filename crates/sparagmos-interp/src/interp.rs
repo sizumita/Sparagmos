@@ -11480,9 +11480,24 @@ impl<'a> Interpreter<'a> {
                         return Ok(Cow::Owned(value));
                     }
                 }
+                // The projection's type walk is rooted at the
+                // local's declared type, exactly as the owned
+                // read's is (see `read_resolved_typed`): the
+                // caller's `ty` is the place's *result* type and
+                // judges only the uninitialized outcome below.
+                // Rooting the walk there instead would judge the
+                // wrapper descent against the result type -- for
+                // an elided field read, the field's own type --
+                // and let the descent take a sibling's contents
+                // for the field's value.
+                let root_ty = self
+                    .program()
+                    .get(&frame.func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
                 let value = match project_value_ref_ev(
                     Some(self.program()),
-                    ty.cloned(),
+                    root_ty,
                     base,
                     projection,
                     &frame.func,
@@ -25678,6 +25693,168 @@ mod write_bound_tests {
                 variant: 0,
                 fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_route_tests {
+    use super::*;
+    use crate::ir::{Body, Place, Program, Ty, ZstPathStep};
+
+    fn partial_struct() -> Value {
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+        }
+    }
+
+    /// A projected write into an allocation whose declared
+    /// pointee type is on record (the type the box construction
+    /// builtins record, or a caller's root type): the second
+    /// field's write extends the struct's own field vector; it
+    /// does not descend into the first field.
+    #[test]
+    fn typed_alloc_field_write_extends_the_struct() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(partial_struct());
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(30),
+                Some(&Ty::Adt("probe::S".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            })
+        );
+    }
+
+    /// A read-modify-write whose index step sits at the
+    /// materialisation bound errors like the plain write does
+    /// (see `write_bound_tests`), with the storage untouched.
+    #[test]
+    fn modify_resolved_at_materialisation_bound_errors() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(0), RefProj::Index(usize::MAX)],
+        };
+        let result = interp.modify_resolved(&mut frames, &target, |_| Ok(()));
+        assert!(result.is_err(), "modify at the bound must error");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+            })
+        );
+    }
+
+    fn s2_program() -> Program {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::S2".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Unit),
+            ]],
+        );
+        let mut body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::S2".to_string())],
+            vec![],
+        );
+        let mut zst1 = std::collections::HashMap::new();
+        zst1.insert(vec![ZstPathStep::Field(1)], Value::Unit);
+        body.zst_fields = vec![std::collections::HashMap::new(), zst1];
+        program.add_function(body);
+        program
+    }
+
+    fn s2_frame() -> Frame {
+        Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![Value::Uninit, partial_struct()],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }
+    }
+
+    /// The borrowing read of a never-stored zero-sized field:
+    /// the wrapper descent is judged against the struct's own
+    /// declared type (the walk's root), refuses, and the
+    /// recorded canonical value answers -- a sibling's contents
+    /// are not the field's value. The owned read of the same
+    /// place already answered this way.
+    #[test]
+    fn borrowed_read_of_elided_field_is_canonical() {
+        let program = s2_program();
+        let interp = Interpreter::new(&program);
+        let body = program.get("main").unwrap();
+        let frames = vec![s2_frame()];
+        let place = Place::from_index(1).field(1);
+        assert_eq!(
+            interp.read_place(&frames, body, &place).expect("read"),
+            Value::Unit,
+            "the elided field must read as its canonical value"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp
+                .read_resolved_ref(&frames, &target)
+                .expect("read")
+                .into_owned(),
+            Value::Unit,
+        );
+        assert_eq!(
+            interp.read_resolved(&frames, &target).expect("read"),
+            Value::Unit,
         );
     }
 }

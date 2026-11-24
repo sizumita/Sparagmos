@@ -172,3 +172,118 @@ fn elided_zst_field_read_is_canonical() {
         "the elided field must read as its canonical value"
     );
 }
+
+const U_DEF: mir::DefId = mir::DefId::new(0, 81);
+
+fn unit_ty() -> mir::Ty {
+    mir::Ty::Tuple(vec![])
+}
+fn u_ty() -> mir::Ty {
+    mir::Ty::Adt(U_DEF, vec![])
+}
+fn u_shape() -> mir::AdtShape {
+    mir::AdtShape {
+        kind: mir::AdtShapeKind::Struct,
+        variants: vec![vec![tuple2_ty(), unit_ty()]],
+    }
+}
+
+/// _1.0 = (10, 20); return _1.1 -- a unit field whose store is
+/// elided.
+fn f4_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[unit_ty(), u_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1).field(0, tuple2_ty()), tuple_agg(10, 20)),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(copy(place(1).field(1, unit_ty()))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    )
+}
+
+#[test]
+fn elided_unit_field_read_is_canonical() {
+    let mut prog = MirProgram::new();
+    prog.adt_discriminants.insert(U_DEF, vec![0]);
+    prog.adt_shapes.insert(U_DEF, u_shape());
+    prog.add("main", f4_body());
+    let v = interpret_mir(&prog, "main", vec![]).expect("run");
+    assert_eq!(v, Value::Unit, "the elided unit field must read as unit");
+}
+
+/// _1.0 = (10, 20); return (_1.1, _1.0.1)
+fn f5_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[mir::Ty::Tuple(vec![unit_ty(), i32_ty()]), u_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1).field(0, tuple2_ty()), tuple_agg(10, 20)),
+                assign(
+                    place(0),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![
+                            copy(place(1).field(1, unit_ty())),
+                            copy(place(1).field(0, tuple2_ty()).field(1, i32_ty())),
+                        ],
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    )
+}
+
+#[test]
+fn elided_unit_field_read_in_aggregate() {
+    let mut prog = MirProgram::new();
+    prog.adt_discriminants.insert(U_DEF, vec![0]);
+    prog.adt_shapes.insert(U_DEF, u_shape());
+    prog.add("main", f5_body());
+    let v = interpret_mir(&prog, "main", vec![]).expect("run");
+    assert_eq!(
+        v,
+        Value::Tuple(vec![Value::Unit, Value::Int(20)]),
+        "the elided unit field must read as unit beside its sibling"
+    );
+}
+
+/// _1.0 = (10, 20); _1.1 = (); return _1.0.1 -- the unit field
+/// is stored (as an empty aggregate) before the sibling read.
+fn f6_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[i32_ty(), u_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1).field(0, tuple2_ty()), tuple_agg(10, 20)),
+                assign(
+                    place(1).field(1, unit_ty()),
+                    mir::Rvalue::Aggregate(Box::new(mir::AggregateKind::Tuple), vec![]),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(copy(place(1).field(0, tuple2_ty()).field(1, i32_ty()))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    )
+}
+
+#[test]
+fn unit_field_write_keeps_siblings() {
+    let mut prog = MirProgram::new();
+    prog.adt_discriminants.insert(U_DEF, vec![0]);
+    prog.adt_shapes.insert(U_DEF, u_shape());
+    prog.add("main", f6_body());
+    let v = interpret_mir(&prog, "main", vec![]).expect("run");
+    assert_eq!(v, Value::Int(20), "first.1 must stay 20");
+}
