@@ -13613,7 +13613,6 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                grow_tuples_along(slot, projection);
                 let place_desc = format!("allocation #{id}");
                 // The navigation's root type: the allocation's
                 // element type, seen as the element sequence the
@@ -13627,6 +13626,7 @@ impl<'a> Interpreter<'a> {
                     }
                     other => other,
                 };
+                grow_tuples_along(slot, projection, Some(self.program()), alloc_root.clone());
                 assign_projected(
                     slot,
                     projection,
@@ -13828,7 +13828,14 @@ impl<'a> Interpreter<'a> {
                 let slot = store
                     .get_mut(id)
                     .ok_or_else(|| self.missing_alloc(*id))?;
-                grow_tuples_along(slot, projection);
+                let root_ty = self.alloc_ty(*id);
+                let root_ty = match root_ty {
+                    Some(element_ty) if self.is_elem_block(*id) => {
+                        Some(Ty::Slice(Box::new(element_ty)))
+                    }
+                    other => other,
+                };
+                grow_tuples_along(slot, projection, Some(self.program()), root_ty);
                 let place_desc = format!("allocation #{id}");
                 let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
                 f(slot)
@@ -21826,10 +21833,27 @@ fn splice_scalar_storage_byte(slot: &mut Value, idx: usize, byte: u8) -> bool {
 /// shape already determines the next slot; anything else (an
 /// `Uninit` slot above all) is left for navigation to
 /// materialise or refuse.
-fn grow_tuples_along(value: &mut Value, projection: &[RefProj]) {
+///
+/// The declared type rides along when the caller has it, so
+/// the wrapper-descent retries are judged by the same type
+/// evidence as the navigation itself (see
+/// `wrapper_descent_sanctioned`): growing inside a partially
+/// materialised aggregate's first field would mutate a sibling
+/// the write does not address, ahead of the correctly typed
+/// assignment. Without evidence the shape judgment stands.
+fn grow_tuples_along(
+    value: &mut Value,
+    projection: &[RefProj],
+    program: Option<&Program>,
+    ty: Option<Ty>,
+) {
     let Some((step, rest)) = projection.split_first() else {
         return;
     };
+    // The wrapper-descent judgment for this node, taken
+    // before the walk borrows the value mutably.
+    let sanctioned = wrapper_descent_sanctioned(program, ty.as_ref(), value);
+    let payload_ty = descent_payload_ty(program, ty.as_ref(), value);
     match (value, step) {
         (Value::Tuple(items), RefProj::Index(idx)) => {
             // The materialisation bound the navigation itself
@@ -21845,32 +21869,39 @@ fn grow_tuples_along(value: &mut Value, projection: &[RefProj]) {
             if *idx >= items.len() {
                 items.resize(*idx + 1, Value::Uninit);
             }
-            grow_tuples_along(&mut items[*idx], rest);
+            let elem_ty = stepped_index_ty(ty.as_ref());
+            grow_tuples_along(&mut items[*idx], rest, program, elem_ty);
         }
         (Value::Tuple(items), RefProj::Field(idx)) => {
+            let field_ty = stepped_field_ty(program, ty.as_ref(), 0, *idx);
             if let Some(item) = items.get_mut(*idx) {
-                grow_tuples_along(item, rest);
+                grow_tuples_along(item, rest, program, field_ty);
             }
         }
-        (Value::Enum { fields, .. }, RefProj::Field(idx)) => {
+        (Value::Enum { fields, variant }, RefProj::Field(idx)) => {
+            let variant = *variant as usize;
             if *idx < fields.len() {
-                grow_tuples_along(&mut fields[*idx], rest);
-            } else if fields.len() == 1 && wrapper_payload(&fields[0]) {
+                let field_ty = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                grow_tuples_along(&mut fields[*idx], rest, program, field_ty);
+            } else if fields.len() == 1 && wrapper_payload(&fields[0]) && sanctioned {
                 // The transparent-wrapper descent navigation
                 // performs: the step retries one level down.
-                grow_tuples_along(&mut fields[0], projection);
+                grow_tuples_along(&mut fields[0], projection, program, payload_ty);
             }
         }
-        (Value::Enum { fields, .. }, RefProj::Index(idx)) => {
+        (Value::Enum { fields, variant }, RefProj::Index(idx)) => {
+            let variant = *variant as usize;
             if fields.len() == 1
                 && matches!(fields[0], Value::Tuple(_) | Value::Bytes(_))
+                && sanctioned
             {
-                grow_tuples_along(&mut fields[0], projection);
+                grow_tuples_along(&mut fields[0], projection, program, payload_ty);
             } else if *idx < fields.len() {
-                grow_tuples_along(&mut fields[*idx], rest);
+                let field_ty = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                grow_tuples_along(&mut fields[*idx], rest, program, field_ty);
             }
         }
-        (value, RefProj::Downcast(_)) => grow_tuples_along(value, rest),
+        (value, RefProj::Downcast(_)) => grow_tuples_along(value, rest, program, ty),
         _ => {}
     }
 }
@@ -22077,7 +22108,9 @@ fn value_complete_for_ty_at(
 /// its remaining fields elided or not yet written: the step
 /// belongs to the slot's own fields, which the ordinary field
 /// arm grows into place (and a read answers through the
-/// canonical-value fallback). Every other declared shape
+/// canonical-value fallback). The same judgment applies to
+/// a tuple root, whose declared fields are its element types.
+/// Every other declared shape
 /// leaves the descent standing: a step into a variant with at
 /// most one declared field can only address its sole field's
 /// interior. With no type evidence the stored form decides,
@@ -22103,6 +22136,7 @@ fn descent_payload_ty(
         {
             adt_field_ty_in(program, adt, slot_variant, 0)
         }
+        (_, Some(Ty::Tuple(ts))) if ts.len() == 1 => ts.first().cloned(),
         _ => ty.cloned(),
     }
 }
@@ -22114,7 +22148,7 @@ fn wrapper_descent_sanctioned(
 ) -> bool {
     let (
         Some(program),
-        Some(Ty::Adt(name)),
+        Some(ty),
         Value::Enum {
             variant, fields, ..
         },
@@ -22122,33 +22156,45 @@ fn wrapper_descent_sanctioned(
     else {
         return true;
     };
-    let Some(variants) = adt_field_tys_of(program, name) else {
-        // The type is a named ADT the program's field table
-        // does not record: there is no evidence the stored
-        // form is a wrapper around a value of this type rather
-        // than the type's own partially materialised form, so
-        // the descent does not stand. (With no type evidence
-        // at all -- no program or a non-ADT type -- the shape
-        // judgment above stands as before.)
-        return false;
-    };
     // The declared shape that decides is the *selected*
-    // variant's: the stored form is a value of that variant,
-    // and the step addresses its fields. A variant declaring
-    // at most one field leaves the descent standing. A variant
-    // declaring more fields makes the one-field stored form
-    // that variant's own partially materialised value, and the
-    // completeness check decides, exactly as for a struct.
-    let Some(selected) = variants.get(*variant as usize) else {
-        // The stored variant is not among the declared ones:
-        // there is no evidence the stored form is a wrapper,
-        // so the descent does not stand.
-        return false;
+    // variant's field count (a tuple's element count, for a
+    // tuple root: a tuple materialised field by field has the
+    // same one-field stored form as a struct): the stored
+    // form is a value of that variant, and the step addresses
+    // its fields. Declaring at most one field leaves the
+    // descent standing. Declaring more fields makes the
+    // one-field stored form that variant's own partially
+    // materialised value, and the completeness check decides.
+    let (declared_len, slot_ty) = match ty {
+        Ty::Adt(name) => {
+            let Some(variants) = adt_field_tys_of(program, name) else {
+                // The type is a named ADT the program's field
+                // table does not record: there is no evidence
+                // the stored form is a wrapper around a value
+                // of this type rather than the type's own
+                // partially materialised form, so the descent
+                // does not stand. (With no type evidence at
+                // all -- no program or a non-ADT, non-tuple
+                // type -- the shape judgment above stands as
+                // before.)
+                return false;
+            };
+            let Some(selected) = variants.get(*variant as usize) else {
+                // The stored variant is not among the
+                // declared ones: there is no evidence the
+                // stored form is a wrapper, so the descent
+                // does not stand.
+                return false;
+            };
+            (selected.len(), Ty::Adt(name.clone()))
+        }
+        Ty::Tuple(ts) => (ts.len(), Ty::Tuple(ts.clone())),
+        _ => return true,
     };
-    if selected.len() <= 1 {
+    if declared_len <= 1 {
         return true;
     }
-    value_complete_for_ty(program, &fields[0], &Ty::Adt(name.clone()))
+    value_complete_for_ty(program, &fields[0], &slot_ty)
 }
 
 fn assign_projected(
@@ -23127,6 +23173,9 @@ pub(crate) fn navigate_mut_grow<'x>(
                                 == Some(1) =>
                         {
                             adt_field_ty_in(program, adt, slot_variant, 0)
+                        }
+                        (_, Some(Ty::Tuple(ts))) if ts.len() == 1 => {
+                            ts.first().cloned()
                         }
                         _ => ty.clone(),
                     };
@@ -26010,6 +26059,149 @@ mod resolved_route_tests {
         assert_eq!(
             interp.read_resolved(&frames, &target).expect("read"),
             Value::Unit,
+        );
+    }
+
+    /// A projected write to the second field's array element,
+    /// with the struct's declared type on record: the growth
+    /// pre-pass judges its wrapper-descent retry by the same
+    /// type evidence as the navigation, so it does not grow
+    /// an array inside the first field -- a sibling the write
+    /// does not address.
+    #[test]
+    fn alloc_growth_prepass_keeps_sibling_array() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S3".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Array(Box::new(Ty::Int(IntTy::I32)), 1),
+                ])),
+                Some(Ty::Array(Box::new(Ty::Int(IntTy::I32)), 4)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![
+                Value::Int(10),
+                Value::Tuple(vec![Value::Int(20)]),
+            ])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Index(3)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(1000),
+                Some(&Ty::Adt("probe::S3".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![
+                        Value::Int(10),
+                        Value::Tuple(vec![Value::Int(20)]),
+                    ]),
+                    Value::Tuple(vec![
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Int(1000),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    /// Successive projected writes to a tuple local: the
+    /// wrapper descent is judged against the tuple's declared
+    /// element types, exactly as for a struct, so the second
+    /// field's write extends the tuple's own storage; it does
+    /// not descend into the first field's aggregate, and the
+    /// unwritten field does not read as the first field's
+    /// contents.
+    #[test]
+    fn tuple_field_write_extends_the_tuple() {
+        let mut program = Program::new();
+        let body = Body::new(
+            "main",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Tuple(vec![
+                    Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]),
+                    Ty::Int(IntTy::I32),
+                ]),
+            ],
+            vec![],
+        );
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let mut frames = vec![Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![
+                Value::Uninit,
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }];
+        // The unwritten second field must not read as the
+        // first field's contents.
+        let unread = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        assert!(
+            interp.read_resolved(&frames, &unread).is_err(),
+            "the unwritten tuple field must not read through the wrapper descent"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(30))
+            .expect("write");
+        assert_eq!(
+            frames[0].locals[1],
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }
+        );
+        let readback = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(0), RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &readback).expect("read"),
+            Value::Int(20),
         );
     }
 }
