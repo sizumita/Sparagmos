@@ -5710,6 +5710,29 @@ const SOURCE_TREE_MAX_FILES: usize = 4096;
 const SOURCE_TREE_MAX_BYTES: usize = 64 << 20;
 const SOURCE_TREE_MAX_DEPTH: usize = 32;
 
+/// Read `path` holding at most `limit` bytes: `None` when
+/// the file cannot be opened or read, or when it holds
+/// more than `limit` bytes. The size stands checked from
+/// the metadata before any byte is read, and the read
+/// itself is capped at `limit + 1` bytes, so a file that
+/// grows between the check and the read is caught by the
+/// extra byte rather than allocated whole: a snapshot
+/// read must never take in more than its bound, however
+/// large a file in the tree stands on disk.
+fn read_bounded(path: &std::path::Path, limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if std::fs::metadata(path).ok()?.len() > limit as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Snapshot the source tree rooted at `root` (see
 /// `SourceTree`): the root's own bytes and, recursively,
 /// every regular file under the root's directory, in
@@ -5719,7 +5742,7 @@ fn snapshot_source_tree(root: &std::path::Path) -> SourceTree {
         .file_name()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("source.rs"));
-    let root_bytes = std::fs::read(root).unwrap_or_default();
+    let root_bytes = read_bounded(root, SOURCE_TREE_MAX_BYTES).unwrap_or_default();
     let mut tree: SourceTree = vec![(root_name, root_bytes)];
     if let Some(base) = root.parent() {
         let mut budget = (SOURCE_TREE_MAX_FILES, SOURCE_TREE_MAX_BYTES);
@@ -5760,12 +5783,28 @@ fn collect_source_tree(
                 return false;
             }
         } else if path.is_file() {
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if budget.0 == 0 || bytes.len() > budget.1 {
+            if budget.0 == 0 {
                 return false;
             }
+            // The size stands checked before any read: a
+            // file past the remaining byte budget ends the
+            // walk without its bytes ever being allocated,
+            // however large it stands on disk.
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() > budget.1 as u64 => return false,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            // The read itself stays bounded by the same
+            // budget, so a file that grows between the
+            // check and the read ends the walk the same
+            // way instead of being allocated whole; a file
+            // that cannot be read at all leaves the walk
+            // the same way, since a tree this walk cannot
+            // read whole is not one it can snapshot.
+            let Some(bytes) = read_bounded(&path, budget.1) else {
+                return false;
+            };
             budget.0 -= 1;
             budget.1 -= bytes.len();
             let Ok(rel) = path.strip_prefix(base) else {
@@ -5795,10 +5834,9 @@ fn source_tree_intact(root: &std::path::Path, tree: &SourceTree) -> bool {
     let Some(base) = root.parent() else {
         return false;
     };
-    if !tree
-        .iter()
-        .all(|(rel, bytes)| std::fs::read(base.join(rel)).is_ok_and(|now| now == *bytes))
-    {
+    if !tree.iter().all(|(rel, bytes)| {
+        read_bounded(&base.join(rel), bytes.len()).is_some_and(|now| now == *bytes)
+    }) {
         return false;
     }
     let recorded: std::collections::HashSet<&std::path::Path> =

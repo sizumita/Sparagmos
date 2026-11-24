@@ -22611,6 +22611,69 @@ fn run_mode_tool_interception_added_module_candidate_uses_snapshot() {
     );
 }
 
+const OVERSIZED_NEIGHBOUR_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    let tree = dir.join("bigtree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("bigprobe.rs"),
+        "fn main() { println!(\"value {}\", 7); }\n",
+    )
+    .unwrap();
+    // An unrelated file far past the snapshot byte budget
+    // stands in the crate's directory. The build's snapshot
+    // of the tree must leave it unread -- its size alone
+    // ends the whole-tree reading, before any of its bytes
+    // are allocated -- and the artifact must still run as
+    // built.
+    let blob = std::fs::File::create(tree.join("blob.bin")).unwrap();
+    blob.set_len(128 << 20).unwrap();
+    drop(blob);
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&tree)
+        .arg(tree.join("bigprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(tree.join("bigprobe")).output().unwrap();
+    assert!(out.status.success(), "run failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "value 7\n");
+    println!("oversized neighbour guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_oversized_neighbour_file_stays_unread() {
+    let dir = temp_dir("tool-oversized-neighbour");
+    let src = fixture(
+        &dir,
+        "oversized_neighbour_guest.rs",
+        OVERSIZED_NEIGHBOUR_GUEST_SRC,
+    );
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The oversized neighbour ends the snapshot's
+    // whole-tree reading on its size alone (the recorded
+    // tree keeps the root alone), the intact reading still
+    // holds for the recorded root, and the built program
+    // runs as built.
+    assert_eq!(stdout, "oversized neighbour guest ok\n", "stderr={stderr}");
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());
