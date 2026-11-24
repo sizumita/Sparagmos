@@ -4925,11 +4925,17 @@ fn btree_node_value(stored: &Value) -> Option<Value> {
 /// reads the raw table the way hashbrown lays it out in
 /// this model: one allocation holds the buckets and the
 /// control bytes; the control pointer's projection names
-/// the slot where the control bytes begin, the bucket
-/// region before it is split evenly among the buckets, and
-/// bucket `i`'s pair sits at the start of its reversed
-/// stride — the position the table's own pointer arithmetic
-/// materialised. A bucket is live when its slot holds a
+/// the slot where the control bytes begin, and the buckets
+/// sit in the slots before it, addressed from the control
+/// pointer the way the table's own pointer arithmetic
+/// addresses them: bucket `i`'s pair ends one bucket width
+/// further from the control bytes than bucket `i + 1`'s.
+/// The region is padded before its first bucket up to the
+/// control region's alignment, so the control offset only
+/// bounds the bucket width: the width is the region's even
+/// split when there is no padding, and otherwise one of
+/// the narrower widths whose padded region ends at the
+/// same offset. A bucket is live when its slot holds a
 /// pair and its control byte is a hash byte (below the
 /// empty/deleted sentinels).
 fn hash_entries(
@@ -4962,11 +4968,7 @@ fn hash_entries(
         }
     })?;
     let num_buckets = usize::try_from(mask + 1).ok()?;
-    if num_buckets == 0 || ctrl_index % num_buckets != 0 {
-        return None;
-    }
-    let stride = ctrl_index / num_buckets;
-    if stride == 0 {
+    if num_buckets == 0 {
         return None;
     }
     let stored = interp.alloc_base(id).ok()?;
@@ -4974,31 +4976,58 @@ fn hash_entries(
         Value::Tuple(items) => items,
         _ => return None,
     };
-    let mut entries = Vec::new();
-    for i in 0..num_buckets {
-        let pos = (num_buckets - 1 - i) * stride;
-        let slot = slots.get(pos)?;
-        if matches!(slot, Value::Uninit) {
-            continue;
+    // One walk at a candidate bucket width: the entries in
+    // bucket order, when every live control byte's bucket
+    // holds a pair and the live count is the item count.
+    let walk = |width: usize| -> Option<Vec<(Value, Value)>> {
+        let mut entries = Vec::new();
+        for i in 0..num_buckets {
+            let ctrl = slots.get(ctrl_index + i)?;
+            let ctrl_byte = match unwrap_element(ctrl) {
+                Value::Uint(b) => b,
+                _ => return None,
+            };
+            if ctrl_byte >= 0x80 {
+                continue;
+            }
+            let pos = ctrl_index.checked_sub((i + 1) * width)?;
+            let pair = match slots.get(pos)? {
+                Value::Tuple(items) if items.len() == 2 => items,
+                _ => return None,
+            };
+            entries.push((pair[0].clone(), pair[1].clone()));
         }
-        let ctrl = slots.get(ctrl_index + i)?;
-        let ctrl_byte = match unwrap_element(ctrl) {
-            Value::Uint(b) => b,
-            _ => return None,
-        };
-        if ctrl_byte >= 0x80 {
-            continue;
+        if entries.len() as u128 != size {
+            return None;
         }
-        let pair = match slot {
-            Value::Tuple(items) if items.len() == 2 => items,
-            _ => return None,
-        };
-        entries.push((pair[0].clone(), pair[1].clone()));
+        Some(entries)
+    };
+    // The even split first (exact for unpadded tables), then
+    // the remaining widths whose region — padded before its
+    // first bucket by less than the control alignment, at
+    // most 64 slots — ends at the same control offset,
+    // widest first.
+    let mut widths: Vec<usize> = Vec::new();
+    if ctrl_index % num_buckets == 0 && ctrl_index / num_buckets > 0 {
+        widths.push(ctrl_index / num_buckets);
     }
-    if entries.len() as u128 != size {
-        return None;
+    let widest = ctrl_index / num_buckets;
+    let narrowest = if ctrl_index >= 64 {
+        (ctrl_index - 64) / num_buckets + 1
+    } else {
+        1
+    };
+    for w in (narrowest..=widest).rev() {
+        if !widths.contains(&w) {
+            widths.push(w);
+        }
     }
-    Some((entries, size))
+    for width in widths {
+        if let Some(entries) = walk(width) {
+            return Some((entries, size));
+        }
+    }
+    None
 }
 
 /// The counts and pointee of a reference-counted handle value
@@ -6310,5 +6339,139 @@ mod btree_elided_tests {
                 (Value::Int(8), Value::Int(2)),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod hash_stride_tests {
+    use super::*;
+
+    /// A `HashMap` value over a hand-laid raw table
+    /// allocation: `width` slots per bucket, the control
+    /// bytes at `ctrl_index`, the `live` buckets holding the
+    /// given pairs (every other bucket empty), and the
+    /// table's declared item count.
+    fn hash_map(
+        num_buckets: usize,
+        width: usize,
+        ctrl_index: usize,
+        declared: u128,
+        live: &[(usize, Value, Value)],
+    ) -> (Interpreter<'static>, Value) {
+        let program: &'static Program = Box::leak(Box::new(Program::default()));
+        let interp = Interpreter::new(program);
+        let mut slots = vec![Value::Uninit; ctrl_index + num_buckets + 16];
+        for i in 0..num_buckets {
+            slots[ctrl_index + i] = Value::Uint(0xFF);
+        }
+        for (i, k, v) in live {
+            slots[ctrl_index - (i + 1) * width] = Value::Tuple(vec![k.clone(), v.clone()]);
+            slots[ctrl_index + i] = Value::Uint(0x2A);
+        }
+        let id = interp.alloc_insert(Value::Tuple(slots));
+        let ctrl = Value::Enum {
+            variant: 0,
+            fields: vec![Value::Ref(RefTarget::Alloc {
+                id,
+                projection: vec![RefProj::Index(ctrl_index)],
+            })],
+        };
+        let inner = Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Uint((num_buckets - 1) as u128),
+                ctrl,
+                Value::Uint(0),
+                Value::Uint(declared),
+            ],
+        };
+        let table = Value::Enum {
+            variant: 0,
+            fields: vec![inner],
+        };
+        let map = Value::Enum {
+            variant: 0,
+            fields: vec![Value::Unit, table],
+        };
+        let value = Value::Enum {
+            variant: 0,
+            fields: vec![map],
+        };
+        (interp, value)
+    }
+
+    /// Eight 3-slot buckets fill 24 slots ending at the
+    /// control bytes, which begin at 32 after the region's
+    /// front padding: the walk must use width 3, not the
+    /// even split 32 / 8 = 4.
+    #[test]
+    fn padded_region_walks_at_the_true_width() {
+        let (interp, map) = hash_map(
+            8,
+            3,
+            32,
+            3,
+            &[
+                (1, Value::Uint(1), Value::Uint(10)),
+                (3, Value::Uint(3), Value::Uint(30)),
+                (6, Value::Uint(6), Value::Uint(60)),
+            ],
+        );
+        let (entries, size) = hash_entries(&interp, &map, false).expect("entries");
+        assert_eq!(size, 3);
+        assert_eq!(
+            entries,
+            vec![
+                (Value::Uint(1), Value::Uint(10)),
+                (Value::Uint(3), Value::Uint(30)),
+                (Value::Uint(6), Value::Uint(60)),
+            ]
+        );
+    }
+
+    /// An unpadded region (eight 2-slot buckets, control at
+    /// 16) walks at the even split, as before.
+    #[test]
+    fn unpadded_region_walks_at_the_even_split() {
+        let (interp, map) = hash_map(
+            8,
+            2,
+            16,
+            3,
+            &[
+                (0, Value::Uint(1), Value::Uint(10)),
+                (2, Value::Uint(2), Value::Uint(20)),
+                (7, Value::Uint(7), Value::Uint(70)),
+            ],
+        );
+        let (entries, size) = hash_entries(&interp, &map, false).expect("entries");
+        assert_eq!(size, 3);
+        assert_eq!(
+            entries,
+            vec![
+                (Value::Uint(1), Value::Uint(10)),
+                (Value::Uint(2), Value::Uint(20)),
+                (Value::Uint(7), Value::Uint(70)),
+            ]
+        );
+    }
+
+    /// A table whose live buckets do not add up to the
+    /// declared item count stays unrenderable at every
+    /// candidate width.
+    #[test]
+    fn count_mismatch_stays_unrenderable() {
+        let (interp, map) = hash_map(
+            8,
+            3,
+            32,
+            4,
+            &[
+                (1, Value::Uint(1), Value::Uint(10)),
+                (3, Value::Uint(3), Value::Uint(30)),
+                (6, Value::Uint(6), Value::Uint(60)),
+            ],
+        );
+        assert!(hash_entries(&interp, &map, false).is_none());
     }
 }

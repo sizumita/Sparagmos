@@ -25822,6 +25822,70 @@ mod resolved_route_tests {
         }
     }
 
+    /// Successive projected writes to a local struct place:
+    /// the second field's write extends the struct's own
+    /// field vector; it does not descend into the first
+    /// field's aggregate and corrupt it.
+    #[test]
+    fn local_field_write_extends_the_struct() {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::S".to_string())],
+            vec![],
+        );
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let mut frames = vec![Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![Value::Uninit, partial_struct()],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }];
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(30))
+            .expect("write");
+        assert_eq!(
+            frames[0].locals[1],
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }
+        );
+        let readback = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(0), RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &readback).expect("read"),
+            Value::Int(20),
+        );
+    }
+
     /// The borrowing read of a never-stored zero-sized field:
     /// the wrapper descent is judged against the struct's own
     /// declared type (the walk's root), refuses, and the
