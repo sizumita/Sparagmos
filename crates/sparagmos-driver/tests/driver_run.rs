@@ -7300,6 +7300,71 @@ fn run_mode_boxed_slice_from_slice_ref_keeps_nested_counted_identity() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CHANNEL_SRC: &str = r#"use std::sync::mpsc::{channel, sync_channel, TryRecvError};
+
+fn state(r: &std::sync::mpsc::Receiver<i32>) -> &'static str {
+    match r.try_recv() {
+        Ok(_) => "got",
+        Err(TryRecvError::Empty) => "empty",
+        Err(TryRecvError::Disconnected) => "disconnected",
+    }
+}
+
+fn main() {
+    // A Sender element: the boxed clone is another live
+    // handle on the same channel.
+    let (tx, rx) = channel::<i32>();
+    let src = vec![tx];
+    let boxed: Box<[_]> = Box::from(&src[..]);
+    drop(boxed);
+    println!("sender after box drop: {}", state(&rx));
+    src[0].send(42).unwrap();
+    println!("sender recv: {}", rx.recv().unwrap());
+    drop(src);
+    println!("sender after src drop: {}", state(&rx));
+
+    // A SyncSender element, the same discipline.
+    let (stx, srx) = sync_channel::<i32>(4);
+    let ssrc = vec![stx];
+    let sboxed: Box<[_]> = Box::from(&ssrc[..]);
+    drop(sboxed);
+    println!("sync after box drop: {}", state(&srx));
+    ssrc[0].send(7).unwrap();
+    println!("sync recv: {}", srx.recv().unwrap());
+
+    // A sender nested in a tuple element: the count moves
+    // through the aggregate clone as well.
+    let (ntx, nrx) = channel::<i32>();
+    let nsrc = vec![(ntx,)];
+    let nboxed: Box<[_]> = Box::from(&nsrc[..]);
+    drop(nboxed);
+    println!("nested after box drop: {}", state(&nrx));
+    drop(nsrc);
+    println!("nested after src drop: {}", state(&nrx));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_keeps_channel_handles() {
+    let dir = temp_dir("boxed-from-slice-ref-channel");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_channel.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CHANNEL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[Sender<T>]> from &[Sender<T>] must clone the channel handles, not copy them; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sender after box drop: empty\nsender recv: 42\nsender after src drop: disconnected\nsync after box drop: empty\nsync recv: 7\nnested after box drop: empty\nnested after src drop: disconnected\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");

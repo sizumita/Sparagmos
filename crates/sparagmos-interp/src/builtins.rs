@@ -13907,6 +13907,10 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// each field's own tag propagated (see
     /// [`Self::clone_typed_aggregate`]), so a counted handle
     /// nested inside it is judged by the same discipline.
+    /// A channel handle element (`Sender` / `SyncSender` /
+    /// `Receiver`) likewise clones as another live handle on
+    /// the same channel, with the channel's handle count
+    /// moved the way [`Self::clone_modelled_value`] moves it.
     /// Any other element goes through the shape-only owned
     /// clone.
     fn clone_boxed_slice_element(
@@ -13945,6 +13949,26 @@ fn value_fingerprint(value: &Value) -> u64 {
                     let cloned =
                         self.clone_boxed_slice_element(frames, &pointee, inner_ty)?;
                     return Ok(self.new_box(cloned));
+                }
+            } else if ty.starts_with("std::sync::mpsc::Sender<")
+                || ty.starts_with("std::sync::mpsc::SyncSender<")
+                || ty.starts_with("std::sync::mpsc::Receiver<")
+            {
+                // A channel handle clones as another live
+                // handle on the same channel: the channel's
+                // handle count must move with the clone, or
+                // dropping the clone would disconnect the
+                // channel while the source handle still
+                // lives (the discipline `clone_modelled_value`
+                // applies to the same handles).
+                if let Some(id) = channel_handle_id(value) {
+                    let kind = if ty.starts_with("std::sync::mpsc::Receiver<") {
+                        "receiver"
+                    } else {
+                        "sender"
+                    };
+                    self.channel_handle_cloned(id, kind);
+                    return Ok(value.clone());
                 }
             }
             if let Some(cloned) = self.clone_typed_aggregate(frames, value, ty)? {
