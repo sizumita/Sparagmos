@@ -8363,7 +8363,7 @@ impl<'a> Interpreter<'a> {
                         let (elements, _len) = self.slice_elements(frames, &value)?;
                         let elements = elements
                             .iter()
-                            .map(|e| self.clone_boxed_slice_element(frames, e, elem_ty))
+                            .map(|e| self.clone_boxed_slice_element(&mut *frames, e, elem_ty))
                             .collect::<InterpResult<Vec<_>>>()?;
                         self.boxed_slice_value(
                             Value::Tuple(elements),
@@ -8413,7 +8413,7 @@ impl<'a> Interpreter<'a> {
                                         .iter()
                                         .map(|e| {
                                             self.clone_boxed_slice_element(
-                                                frames,
+                                                &mut *frames,
                                                 e,
                                                 elem_ty,
                                             )
@@ -13911,11 +13911,18 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// `Receiver`) likewise clones as another live handle on
     /// the same channel, with the channel's handle count
     /// moved the way [`Self::clone_modelled_value`] moves it.
+    /// A `Waker` / `LocalWaker` element clones through
+    /// [`Self::clone_waker_value`], the way
+    /// [`Self::clone_modelled_value`] clones the same values:
+    /// a `from_raw` waker's clone is its vtable's clone entry
+    /// (which is where the reference count moves), so a
+    /// shape-only copy would mint a second dropping handle
+    /// that never acquired a reference.
     /// Any other element goes through the shape-only owned
     /// clone.
     fn clone_boxed_slice_element(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         elem_ty: Option<&str>,
     ) -> InterpResult<Value> {
@@ -13970,6 +13977,20 @@ fn value_fingerprint(value: &Value) -> u64 {
                     self.channel_handle_cloned(id, kind);
                     return Ok(value.clone());
                 }
+            } else if ty == "std::task::Waker" || ty == "std::task::LocalWaker" {
+                // A waker clone is not a value copy: the
+                // modelled `From` waker clones the handle it
+                // carries, and a `from_raw` waker clones
+                // through its `RawWakerVTable` clone entry --
+                // the discipline `clone_waker_value`
+                // implements and `clone_modelled_value`
+                // delegates to for the same values. A
+                // shape-only copy would create another
+                // dropping handle without acquiring another
+                // reference, so dropping the boxed slice
+                // could release the waker's data while the
+                // source waker still lives.
+                return self.clone_waker_value(frames, value, "From::from to Box<[T]>");
             }
             if let Some(cloned) = self.clone_typed_aggregate(frames, value, ty)? {
                 return Ok(cloned);
@@ -13997,8 +14018,8 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// is left to the shape-only clone whole, since its field
     /// positions cannot be aligned with the declared ones.
     fn clone_typed_aggregate(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         ty: &str,
     ) -> InterpResult<Option<Value>> {
@@ -14013,7 +14034,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let cloned = items
                     .iter()
                     .zip(field_tys.iter())
-                    .map(|(f, t)| self.clone_boxed_slice_element(frames, f, Some(t)))
+                    .map(|(f, t)| self.clone_boxed_slice_element(&mut *frames, f, Some(t)))
                     .collect::<InterpResult<Vec<_>>>()?;
                 return Ok(Some(Value::Tuple(cloned)));
             }
@@ -14023,7 +14044,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 };
                 let cloned = items
                     .iter()
-                    .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                    .map(|f| self.clone_boxed_slice_element(&mut *frames, f, Some(elem)))
                     .collect::<InterpResult<Vec<_>>>()?;
                 return Ok(Some(Value::Tuple(cloned)));
             }
@@ -14038,7 +14059,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Value::Enum { variant, fields } => {
                     let cloned = fields
                         .iter()
-                        .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                        .map(|f| self.clone_boxed_slice_element(&mut *frames, f, Some(elem)))
                         .collect::<InterpResult<Vec<_>>>()?;
                     return Ok(Some(Value::Enum {
                         variant: *variant,
@@ -14048,7 +14069,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Value::SparseVec { elems, len, .. } => {
                     let cloned = elems
                         .iter()
-                        .map(|f| self.clone_boxed_slice_element(frames, f, Some(elem)))
+                        .map(|f| self.clone_boxed_slice_element(&mut *frames, f, Some(elem)))
                         .collect::<InterpResult<Vec<_>>>()?;
                     // The clone owns fresh storage of exactly
                     // the declared length, the discipline the
@@ -14075,7 +14096,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 .enumerate()
                 .map(|(i, f)| {
                     let field_ty = self.adt_field_tag(ty, *variant as usize, i);
-                    self.clone_boxed_slice_element(frames, f, field_ty.as_deref())
+                    self.clone_boxed_slice_element(&mut *frames, f, field_ty.as_deref())
                 })
                 .collect::<InterpResult<Vec<_>>>()?;
             return Ok(Some(Value::Enum {

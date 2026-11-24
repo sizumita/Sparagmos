@@ -7365,6 +7365,123 @@ fn run_mode_boxed_slice_from_slice_ref_keeps_channel_handles() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_WAKER_SRC: &str = r#"use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{RawWaker, RawWakerVTable, Wake, Waker};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+static WAKES: AtomicUsize = AtomicUsize::new(0);
+
+struct Counted;
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+unsafe fn clone_fn(data: *const ()) -> RawWaker {
+    let arc = Arc::from_raw(data as *const Counted);
+    let cloned = arc.clone();
+    let raw = Arc::into_raw(cloned) as *const ();
+    std::mem::forget(arc);
+    RawWaker::new(raw, &VTABLE)
+}
+unsafe fn wake_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+unsafe fn wake_by_ref_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    std::mem::forget(arc);
+}
+unsafe fn drop_fn(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Counted);
+    drop(arc);
+}
+
+static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
+
+fn make_waker(probe: &Arc<Counted>) -> Waker {
+    let raw = Arc::into_raw(probe.clone()) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+}
+
+struct MyWake;
+impl Wake for MyWake {
+    fn wake(self: Arc<Self>) {
+        WAKES.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        WAKES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    // A from_raw Waker element: the boxed clone must run
+    // the vtable clone entry, moving the Arc count.
+    let probe = Arc::new(Counted);
+    let src = [make_waker(&probe)];
+    println!("base count: {}", Arc::strong_count(&probe));
+    let boxed: Box<[Waker]> = Box::from(&src[..]);
+    println!("after box count: {}", Arc::strong_count(&probe));
+    boxed[0].wake_by_ref();
+    println!("wake_by_ref ok, count: {}", Arc::strong_count(&probe));
+    drop(boxed);
+    println!("after drop-box count: {}", Arc::strong_count(&probe));
+    println!("pointee drops so far: {}", DROPS.load(Ordering::SeqCst));
+    drop(src);
+    println!("after drop-src count: {}", Arc::strong_count(&probe));
+
+    // A from_raw Waker nested in a tuple element.
+    let probe2 = Arc::new(Counted);
+    let src2 = [(make_waker(&probe2), 7u32)];
+    let boxed2: Box<[(Waker, u32)]> = Box::from(&src2[..]);
+    println!("tuple: after box count: {}", Arc::strong_count(&probe2));
+    drop(boxed2);
+    println!("tuple: after drop-box count: {}", Arc::strong_count(&probe2));
+    println!("tuple: pointee drops so far: {}", DROPS.load(Ordering::SeqCst));
+    drop(src2);
+
+    // A modelled From<Arc<T: Wake>> Waker element: the
+    // boxed clone is another live handle on the same Arc.
+    let arc = Arc::new(MyWake);
+    let w: Waker = Waker::from(arc.clone());
+    println!("modelled base count: {}", Arc::strong_count(&arc));
+    let src3 = [w];
+    let boxed3: Box<[Waker]> = Box::from(&src3[..]);
+    println!("modelled after box count: {}", Arc::strong_count(&arc));
+    boxed3[0].wake_by_ref();
+    println!("modelled wakes: {}", WAKES.load(Ordering::SeqCst));
+    drop(boxed3);
+    println!("modelled after drop-box count: {}", Arc::strong_count(&arc));
+    src3[0].wake_by_ref();
+    println!("modelled wakes: {}", WAKES.load(Ordering::SeqCst));
+    drop(src3);
+    println!("modelled after drop-src count: {}", Arc::strong_count(&arc));
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_keeps_waker_handles() {
+    let dir = temp_dir("boxed-from-slice-ref-waker");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_waker.rs",
+        BOXED_SLICE_FROM_SLICE_REF_WAKER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[Waker]> from &[Waker] must clone the wakers, not copy them; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "base count: 2\nafter box count: 3\nwake_by_ref ok, count: 3\nafter drop-box count: 2\npointee drops so far: 0\nafter drop-src count: 1\ntuple: after box count: 3\ntuple: after drop-box count: 2\ntuple: pointee drops so far: 0\nmodelled base count: 2\nmodelled after box count: 3\nmodelled wakes: 1\nmodelled after drop-box count: 2\nmodelled wakes: 2\nmodelled after drop-src count: 1\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");
