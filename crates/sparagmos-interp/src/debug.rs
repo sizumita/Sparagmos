@@ -1578,9 +1578,12 @@ fn cast_source_elem(pointee: &Value, source: Option<&Desc>) -> Option<Desc> {
         // the form a fat pointer's `data_ptr` projection
         // produces -- names the storage's element type
         // directly: the scalar is what each stored element
-        // holds. A scalar pointee itself is not an aggregate
-        // and keeps the plain view.
-        scalar if is_scalar_desc(scalar) && matches!(pointee, Value::Tuple(_)) => {
+        // holds. A scalar backing value is a one-element
+        // storage of that same type.
+        scalar
+            if is_scalar_desc(scalar)
+                && (matches!(pointee, Value::Tuple(_)) || is_scalar_value(pointee)) =>
+        {
             Some(scalar.clone())
         }
         _ => None,
@@ -1603,7 +1606,12 @@ fn reinterpret_cast(
     count: Option<u64>,
 ) -> Option<Result<Value, String>> {
     let source_elem = cast_source_elem(pointee, source)?;
-    if source_elem == *target_elem {
+    // A scalar backing value is one element of storage: the
+    // view still has to materialize (its bytes read as the
+    // target's elements), where an aggregate already holding
+    // the target's element type needs no reinterpretation.
+    let scalar_backing = is_scalar_value(pointee);
+    if source_elem == *target_elem && !scalar_backing {
         return None;
     }
     let items: Vec<Value> = match pointee {
@@ -1612,6 +1620,7 @@ fn reinterpret_cast(
             .iter()
             .map(|b| Value::Uint(*b as u128))
             .collect(),
+        scalar if scalar_backing => vec![scalar.clone()],
         _ => return None,
     };
     let unsupported = || {
@@ -1679,6 +1688,16 @@ fn storage_scalar_desc(desc: &Desc) -> Option<Desc> {
     }
 }
 
+/// Whether a value is a scalar: the storage form a single
+/// arithmetic, boolean or character value takes, as opposed
+/// to an aggregate of elements.
+fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Bool(_) | Value::Int(_) | Value::Uint(_) | Value::Float(_)
+    )
+}
+
 /// Whether a descriptor names a scalar type, the family a
 /// byte reinterpretation can express.
 fn is_scalar_desc(desc: &Desc) -> bool {
@@ -1740,6 +1759,60 @@ fn reinterpret_scalar_pointee(
         ));
     }
     match scalar_value_from_bytes(&bytes[..width], target) {
+        Some(value) => Ok(value),
+        None => Err(unsupported()),
+    }
+}
+
+/// Read one element of a cast pointer's storage through
+/// the target layout: the indexing counterpart of
+/// `reinterpret_scalar_pointee`. The storage's bytes are the
+/// source type's, serialized the way `reinterpret_cast`
+/// serializes them; the element at `index` occupies the
+/// target-width slot at that offset, and an index past the
+/// storage the source occupies is an explicit error rather
+/// than a read of neighbouring memory.
+fn reinterpret_index(
+    storage: &Value,
+    source: &Desc,
+    target: &Desc,
+    index: usize,
+) -> Result<Value, String> {
+    let unsupported = || {
+        format!(
+            "cast changing pointee type from {} to {} is not supported",
+            desc_type_name(source).unwrap_or_else(|| "?".into()),
+            desc_type_name(target).unwrap_or_else(|| "?".into()),
+        )
+    };
+    let bytes = match storage {
+        Value::Tuple(items) => {
+            let mut bytes = Vec::new();
+            for item in items {
+                match scalar_value_bytes(item, source) {
+                    Some(bs) => bytes.extend(bs),
+                    None => return Err(unsupported()),
+                }
+            }
+            bytes
+        }
+        Value::Bytes(bytes) => bytes.clone(),
+        _ => match scalar_value_bytes(storage, source) {
+            Some(bytes) => bytes,
+            None => return Err(unsupported()),
+        },
+    };
+    let Some(width) = desc_scalar_width(target) else {
+        return Err(unsupported());
+    };
+    let offset = index * width;
+    if bytes.len() < offset + width {
+        return Err(format!(
+            "index {index} of a {width}-byte element over {} bytes of backing storage",
+            bytes.len()
+        ));
+    }
+    match scalar_value_from_bytes(&bytes[offset..offset + width], target) {
         Some(value) => Ok(value),
         None => Err(unsupported()),
     }
@@ -1953,23 +2026,36 @@ fn evaluate_expr(
             }
             ExprStep::Index(index) => {
                 materialize_array_view(interp, frames, &mut ev)?;
-                let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
-                ev.value = v;
-                ev.desc = d;
-                let next = ev.desc.as_ref().and_then(|d| match d {
-                    Desc::Array(elem, _) | Desc::Slice(elem) => {
-                        Some((**elem).clone())
-                    }
-                    _ => None,
-                });
-                ev.value = crate::interp::project_value(
-                    ev.value,
-                    &[RefProj::Index(*index)],
-                    "debugger",
-                    expr_text,
-                )
-                .map_err(|e| e.to_string())?;
-                ev.desc = next;
+                // A cast that changed the pointer's scalar
+                // pointee type recorded a reinterpretation for
+                // the dereference that consumes the pointer;
+                // indexing dereferences it too, and reads the
+                // element through the target layout at the
+                // target's width rather than projecting the
+                // storage's own elements.
+                if let Some((source, target)) = ev.pending_cast.take() {
+                    let (v, _) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
+                    ev.value = reinterpret_index(&v, &source, &target, *index)?;
+                    ev.desc = Some(target);
+                } else {
+                    let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
+                    ev.value = v;
+                    ev.desc = d;
+                    let next = ev.desc.as_ref().and_then(|d| match d {
+                        Desc::Array(elem, _) | Desc::Slice(elem) => {
+                            Some((**elem).clone())
+                        }
+                        _ => None,
+                    });
+                    ev.value = crate::interp::project_value(
+                        ev.value,
+                        &[RefProj::Index(*index)],
+                        "debugger",
+                        expr_text,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    ev.desc = next;
+                }
                 ev.char = false;
             }
             ExprStep::Cast(target) => {
@@ -1996,9 +2082,24 @@ fn evaluate_expr(
                     .as_ref()
                     .and_then(|(_, recorded)| recorded.as_ref())
                     .and_then(storage_scalar_desc);
+                // A pointer whose pointee is an array or slice
+                // of scalars holds its storage in the elements:
+                // a scalar target reinterprets the leading
+                // element's bytes, so the composition starts
+                // from the element type the descriptor records.
+                // (With a view pending, the recorded source --
+                // not this cast's spelling -- names the
+                // storage, as above.)
+                let desc_source_scalar = if ev.pending_array_view.is_none() {
+                    ev.desc.as_ref().and_then(storage_scalar_desc)
+                } else {
+                    None
+                };
                 let effective_source = match &source_pointee {
                     Some(s) if is_scalar_desc(s) => source_pointee.clone(),
-                    _ => view_source_scalar.or(source_pointee.clone()),
+                    _ => view_source_scalar
+                        .or(desc_source_scalar)
+                        .or(source_pointee.clone()),
                 };
                 // A cast to an array or slice pointer keeps
                 // the pointer value: only a step that consumes
@@ -2018,7 +2119,15 @@ fn evaluate_expr(
                     // from the intermediate cast's.
                     let source = match &ev.pending_array_view {
                         Some((_, recorded)) => recorded.clone(),
-                        None => ev.desc.clone(),
+                        // A pending scalar reinterpretation
+                        // names the storage's actual type: the
+                        // descriptor this cast replaces is the
+                        // intermediate cast's, whose pointee
+                        // the storage does not hold.
+                        None => match &ev.pending_cast {
+                            Some((first, _)) => Some(first.clone()),
+                            None => ev.desc.clone(),
+                        },
                     };
                     ev.pending_array_view = Some((target.clone(), source));
                     (ev.value.clone(), Some(target.clone()))

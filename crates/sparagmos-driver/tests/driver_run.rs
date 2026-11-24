@@ -29227,6 +29227,128 @@ fn debug_mode_cast_through_array_pointer_from_array_ref() {
     );
 }
 
+const DEBUG_SCALAR_THEN_ARRAY_CAST_SRC: &str = r#"fn main() {
+    let a: [u32; 1] = [1065353216];
+    let r: &[u32; 1] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_scalar_cast_then_array_view_uses_backing_type() {
+    // A scalar cast followed by an array-pointer cast keeps
+    // the backing storage's type for the view's
+    // materialization: the first cast records the pending
+    // reinterpretation from the array pointee's element, and
+    // the array view records that source rather than the
+    // intermediate cast's descriptor, whose pointee the
+    // storage does not hold.
+    let dir = temp_dir("debug-scalar-then-array-cast");
+    let src = fixture(
+        &dir,
+        "scalar_then_array_cast.rs",
+        DEBUG_SCALAR_THEN_ARRAY_CAST_SRC,
+    );
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *((r as *const f32) as *const [f32; 1])\nprint *((r as *const f32) as *const [u16; 2])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = [1]", "$2 = [0, 16256]"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("<error"),
+        "scalar-to-array cast chains must not error: {stdout}"
+    );
+}
+
+const DEBUG_CAST_INDEX_SRC: &str = r#"fn main() {
+    let a: [u32; 2] = [1065353216, 1073741824];
+    let s: &[u32] = &a;
+    zzz();
+    let _ = s;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_pointer_index_reinterprets_elements() {
+    // Indexing a cast pointer dereferences it, so the
+    // pending pointee reinterpretation applies to the
+    // indexed element as it does to a plain dereference --
+    // at the target type's width, so a narrower target
+    // strides through the storage at its own element size,
+    // and an index past the storage is an explicit error.
+    let dir = temp_dir("debug-cast-index");
+    let src = fixture(&dir, "cast_index.rs", DEBUG_CAST_INDEX_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(s.data_ptr as *const f32)\nprint (s.data_ptr as *const f32)[0]\nprint (s.data_ptr as *const f32)[1]\nprint (s.data_ptr as *const u16)[3]\nprint (s.data_ptr as *const f64)[1]\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 1", "$2 = 1", "$3 = 2", "$4 = 16384"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("index 1 of a 8-byte element over 8 bytes of backing storage"),
+        "an out-of-storage index must error explicitly: {stdout}"
+    );
+}
+
+const DEBUG_ARRAY_VIEW_SCALAR_BACKING_SRC: &str = r#"fn main() {
+    let v: u32 = 1065353216;
+    let r: &u32 = &v;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_array_view_over_scalar_backing_materializes() {
+    // An array view over a scalar pointee materializes the
+    // scalar's bytes as the target's elements: the backing
+    // is a one-element storage, not an aggregate the plain
+    // view can pass through, and even an element type equal
+    // to the scalar's own still forms the array value.
+    let dir = temp_dir("debug-array-view-scalar-backing");
+    let src = fixture(
+        &dir,
+        "array_view_scalar_backing.rs",
+        DEBUG_ARRAY_VIEW_SCALAR_BACKING_SRC,
+    );
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const [f32; 1])\nprint *(r as *const [u16; 2])\nprint *(r as *const [u32; 1])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = [1]", "$2 = [0, 16256]", "$3 = [1065353216]"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("<error"),
+        "array views over scalar backing must not error: {stdout}"
+    );
+}
+
 const DEBUG_UNION_PTR_FIELD_SRC: &str = r#"union U { bits: u32, value: f32, ptr: *const u32 }
 fn main() {
     let u = U { bits: 0x3f800000 };
