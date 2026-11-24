@@ -1665,6 +1665,13 @@ pub enum Builtin {
     /// The C library's `strtoull(s, endptr, base) ->
     /// c_ulonglong`, delegated like [`Builtin::LibcStrtol`].
     LibcStrtoull,
+    /// `isatty(fd)` (the libc function, reached as a body-less
+    /// extern declaration): 1 when the guest descriptor names a
+    /// terminal. Guest descriptors 0/1/2 are the host process's
+    /// own standard streams (the guest inherits them, as a
+    /// native child would); descriptors issued by the file
+    /// model are answered from the host file table.
+    LibcIsatty,
     /// The C library's `lgamma_r(x, signp) -> f64`: the
     /// natural log of the gamma function, with the sign of
     /// the gamma value written through `signp`. Delegated to
@@ -2170,6 +2177,7 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
         "strtoll" => Builtin::LibcStrtoll,
         "strtoul" => Builtin::LibcStrtoul,
         "strtoull" => Builtin::LibcStrtoull,
+        "isatty" => Builtin::LibcIsatty,
         "free" => Builtin::LibcFree,
         "lgamma_r" => Builtin::LgammaR,
         // The declaration site may name the item `lgamma` and
@@ -4909,6 +4917,20 @@ impl<'a> Interpreter<'a> {
                 let (arg, base) = self.strto_args(frames, name, &vals)?;
                 let v = unsafe { host_strtoull(arg.as_ptr(), std::ptr::null_mut(), base) };
                 Ok(Value::Uint(v as u128))
+            }
+            Builtin::LibcIsatty => {
+                arity(1)?;
+                let fd = as_i128(&vals[0], name)?;
+                let tty = match fd {
+                    0 => std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                    1 => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                    2 => std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                    f if f >= 3 => self
+                        .with_file(f as u64, |file| std::io::IsTerminal::is_terminal(&*file))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                Ok(Value::Int(i128::from(tty)))
             }
             Builtin::LgammaR => {
                 arity(2)?;
