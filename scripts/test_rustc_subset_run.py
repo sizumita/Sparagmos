@@ -1168,18 +1168,154 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("revisions", res["reason"])
 
-    def test_incremental_dep_graph_assertion_not_attempted(self):
+    def run_incremental_two_revisions(self, rec):
+        """Process an incremental record with a capturing
+        convert_side stub; returns the per-call rustc_args."""
+        calls = []
+
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
+            calls.append(list(rustc_args))
+            return conv()
+
+        orig = run.convert_side
+        run.convert_side = stub
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(len(calls), 2)
+        return calls
+
+    def run_incremental_stubbed(self, rec, by_rev):
+        """Process an incremental record with a convert_side stub
+        returning the given result per revision; returns
+        (result, per-call rustc_args)."""
+        calls = []
+
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
+            calls.append(list(rustc_args))
+            for rev, res in by_rev.items():
+                if rev in rustc_args or \
+                        any(a.endswith("=" + rev) for a in rustc_args):
+                    return res
+            raise AssertionError(f"no stub for {rustc_args}")
+
+        orig = run.convert_side
+        run.convert_side = stub
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+        return res, calls
+
+    def test_incremental_dep_graph_assertion_judged_sequentially(self):
+        # A rustc_clean assertion in the test file is checked by
+        # the driver's embedded rustc when the revisions run as
+        # sequential sessions over one shared incremental
+        # directory, so the record is judged -- with the same
+        # -Cincremental directory forwarded to every revision.
         rec = self.write_test(
             "//@ revisions: rpass1 rpass2\n"
             "#![feature(rustc_attrs)]\n"
             "#[rustc_clean(cfg=\"rpass2\")]\n"
             "pub fn f() {}\nfn main() {}\n",
             suite="incremental")
-        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
-                               stage2=True)
+        calls = self.run_incremental_two_revisions(rec)
+        incrs = [[a for a in c if a.startswith("-Cincremental=")]
+                 for c in calls]
+        self.assertTrue(all(len(i) == 1 for i in incrs))
+        self.assertEqual(incrs[0], incrs[1])
+
+    def test_incremental_mir_only_assertion_failure_not_attempted(self):
+        # A revision whose compilation fails solely on clean
+        # assertions over MIR dep nodes reports the harness's
+        # demand pattern -- conversion forces MIR bodies for every
+        # definition in the crate, the reference compilation only
+        # for codegen-reached items -- not the test, so the record
+        # is not attempted for that reason.
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#[rustc_clean(cfg=\"rpass2\")]\n"
+            "pub fn f() {}\nfn main() {}\n",
+            suite="incremental")
+        failed = conv(
+            exit_code=1, compilation_failed=True, converted=None,
+            stderr="error: `optimized_mir(f)` should be clean but "
+                   "is not\n"
+                   "error: aborting due to 1 previous error\n")
+        res, _calls = self.run_incremental_stubbed(
+            rec, {"rpass1": conv(), "rpass2": failed})
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("dep-graph", res["bucket"])
-        self.assertIn("rustc_clean", res["reason"])
+        self.assertIn("MIR dep nodes", res["reason"])
+
+    def test_incremental_mixed_assertion_failure_is_judged(self):
+        # A failure that also involves a non-MIR dep node is a
+        # genuine assertion outcome and stays judged.
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#[rustc_clean(cfg=\"rpass2\")]\n"
+            "pub fn f() {}\nfn main() {}\n",
+            suite="incremental")
+        failed = conv(
+            exit_code=1, compilation_failed=True, converted=None,
+            stderr="error: `optimized_mir(f)` should be clean but "
+                   "is not\n"
+                   "error: `hir_owner(f)` should be clean but is "
+                   "not\n"
+                   "error: aborting due to 2 previous errors\n")
+        res, _calls = self.run_incremental_stubbed(
+            rec, {"rpass1": conv(), "rpass2": failed})
+        self.assertEqual(res["status"], "fail")
+
+    def test_incremental_sequence_shares_lint_levels(self):
+        # The whole sequence runs with one lint level set: with
+        # per-revision levels (the adjustment pair only on
+        # success-expecting revisions) the second session does not
+        # load the first session's dep graph at all -- measured on
+        # tests/incremental/clean.rs -- so a failure-expecting
+        # revision in a sequence whose other revisions expect
+        # success receives the pair too, and its expected failure
+        # (here an ordinary compilation error) is judged.
+        rec = self.write_test(
+            "//@ revisions: rpass1 bfail2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#[rustc_clean(cfg=\"bfail2\")]\n"
+            "pub fn f() {}\nfn main() {}\n",
+            suite="incremental")
+        failed = conv(exit_code=1, compilation_failed=True,
+                      converted=None,
+                      stderr="error[E0308]: mismatched types\n")
+        res, calls = self.run_incremental_stubbed(
+            rec, {"rpass1": conv(), "bfail2": failed})
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            self.assertIn("unconditional_panic", args)
+            self.assertIn("arithmetic_overflow", args)
+
+    def test_incremental_commented_out_assertion_is_judged(self):
+        # A commented-out annotation is not an assertion rustc
+        # ever sees: it neither blocks the record (not even a
+        # partition assertion) nor makes its sessions sequential.
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "//? #[rustc_clean(cfg=\"rpass2\")]\n"
+            "/* #[rustc_partition_reused(module=\"t\", cfg=\"rpass2\")] */\n"
+            "pub fn f() {}\nfn main() {}\n",
+            suite="incremental")
+        calls = self.run_incremental_two_revisions(rec)
+        for c in calls:
+            self.assertFalse(any(a.startswith("-Cincremental=")
+                                 for a in c))
 
     def test_incremental_partition_assertion_not_attempted(self):
         rec = self.write_test(
@@ -1213,16 +1349,20 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertIn("dep-graph", res["bucket"])
         self.assertIn("a.rs", res["reason"])
 
-    def test_incremental_assert_incr_state_loaded_not_attempted(self):
+    def test_incremental_assert_incr_state_loaded_judged(self):
+        # Sequential sessions share one incremental directory, so
+        # the second session starts from the first session's cache
+        # and -Zassert-incr-state=loaded holds by construction.
         rec = self.write_test(
             "//@ revisions: bpass1 bpass2\n"
             "//@ [bpass2] compile-flags: -Zassert-incr-state=loaded\n"
             "fn main() {}\n",
             suite="incremental")
-        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
-                               stage2=True)
-        self.assertEqual(res["status"], "not-attempted")
-        self.assertIn("cache-state", res["bucket"])
+        calls = self.run_incremental_two_revisions(rec)
+        incrs = [[a for a in c if a.startswith("-Cincremental=")]
+                 for c in calls]
+        self.assertTrue(all(len(i) == 1 for i in incrs))
+        self.assertEqual(incrs[0], incrs[1])
 
     def test_incremental_assert_incr_state_not_loaded_is_judged(self):
         # =not-loaded asserts a fresh start, which an independent

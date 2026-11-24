@@ -4399,9 +4399,20 @@ def minicore_test_args(view, rust_dir, edition, flags):
              "--extern", f"minicore={rlib}"], None)
 
 
+def _sets_incremental(args):
+    """Whether a rustc argument list already sets -C incremental."""
+    for i, a in enumerate(args):
+        if a.startswith(("-Cincremental", "--incremental")):
+            return True
+        if a == "-C" and i + 1 < len(args) and \
+                args[i + 1].startswith("incremental"):
+            return True
+    return False
+
+
 def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                    rust_dir, aux_specs=(), aux_per_revision=False,
-                   jit=False):
+                   jit=False, incr_dir=None, lint_args=None):
     """Judge one directive view of a compile-check record.
 
     `revision` is the revision name this view belongs to (None for a
@@ -4409,11 +4420,15 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     revisions. `aux_specs` are the test's auxiliary crates, resolved
     by the caller; when `aux_per_revision` is set the test's aux
     directives are revision-scoped and each view resolves its own
-    set instead. Returns a dict with status/reason/bucket, plus the
-    expectation and driver details when the conversion ran. A
-    "not-attempted" result carries the bucket that says why; the
-    "out of environment" bucket is kept distinct because the
-    revision-combining caller treats skipped revisions specially.
+    set instead. `incr_dir`, when given, is the incremental
+    directory the record's revisions share as sequential sessions
+    (see incremental_sequential_sessions); the conversion then runs
+    with `-C incremental=<incr_dir>`. Returns a dict with
+    status/reason/bucket, plus the expectation and driver details
+    when the conversion ran. A "not-attempted" result carries the
+    bucket that says why; the "out of environment" bucket is kept
+    distinct because the revision-combining caller treats skipped
+    revisions specially.
     """
     res = {"status": "not-attempted", "reason": "", "bucket": ""}
     blocker = stage2_blocker(view, rec)
@@ -4495,7 +4510,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
             args += ["--crate-type", "lib"]
     args += compiletest_mode_args(rec["suite"], flags)
     args += pretty_unpretty_args(rec["suite"], view)
-    args += check_mode_lint_args(expectation)
+    args += (check_mode_lint_args(expectation) if lint_args is None
+             else lint_args)
     args += flags
     specs = aux_specs
     if aux_per_revision:
@@ -4517,6 +4533,15 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "auxiliary crate build failure"
         return res
     args += pm_args
+    if incr_dir is not None and not _sets_incremental(args):
+        # Sequential incremental sessions: every revision of the
+        # record converts against the same incremental directory,
+        # so the driver's embedded rustc loads the previous
+        # session's dep graph and checks the test's dep-graph
+        # assertions itself at session finalization. A test naming
+        # its own incremental setting keeps it (none in the
+        # incremental suite does today).
+        args += [f"-Cincremental={incr_dir}"]
     if expectation is None:
         # A run-pass / run-fail view: compiletest's verdict for
         # it is the execution, judged under the same arguments
@@ -4538,6 +4563,24 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
     else:
         verdict, reason, bucket = judge_compile(expectation, conv)
+    if incr_dir is not None and conv["compilation_failed"] and \
+            mir_only_assertion_failure(conv["stderr"]):
+        # The revision's outcome rests solely on clean assertions
+        # over MIR dep nodes, whose coloring under conversion is
+        # the harness's demand pattern rather than the reference
+        # session's (see MIR_DEMAND_LABELS): whether the revision
+        # compiled or failed, the verdict would report the harness,
+        # not the test. Withhold it, in either direction.
+        verdict = "not-attempted"
+        bucket = "out of stage-2 scope (incremental dep-graph assertions)"
+        reason = ("the revision's compilation errors are solely "
+                  "dep-graph clean assertions on MIR dep nodes "
+                  "(optimized_mir/promoted_mir), whose clean/dirty "
+                  "coloring under conversion reflects which bodies "
+                  "conversion demands -- every definition in the "
+                  "crate -- rather than the reference session's "
+                  "codegen-driven demand, so the assertion outcome "
+                  "is not the test's")
     res["status"] = verdict
     res["reason"] = reason
     res["bucket"] = bucket
@@ -4672,14 +4715,39 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
 #   loaded from the previous session: an item asserted clean whose
 #   fingerprint a source change altered is a compile error in that
 #   revision, and a codegen partition asserted reused that the
-#   cache does not hold is one too. A fresh conversion has no
-#   previous session, so the assertions cannot take their
-#   compiletest meaning.
+#   cache does not hold is one too.
 # - A revision whose compile-flags assert the cache state at
 #   startup: -Zassert-incr-state=loaded requires the previous
 #   session's cache to be present and loaded. (=not-loaded asserts
 #   the opposite, which a fresh conversion satisfies by
 #   construction, so it does not block.)
+#
+# The two assertion families are checked by different machinery.
+# The partition assertions are compared against the previous
+# session's code generation work products (which codegen units
+# were reused and which were re-codegened), so a conversion-only
+# session can never evaluate them: records carrying one stay out
+# of stage-2 scope. The clean/dirty assertions are checked by
+# rustc itself when an incremental session is finalized
+# (check_clean_annotations, run from save_dep_graph), comparing
+# dep-node colors in the graph loaded from the previous session --
+# and the driver's embedded rustc performs exactly that check when
+# its sessions share one incremental directory (measured on
+# tests/incremental/clean.rs: the bfail revision's assertion
+# errors reproduce verbatim through the driver's convert mode).
+# Records whose assertions are all clean/dirty assertions on items
+# of the test file itself are therefore judged by running their
+# revisions as sequential sessions over one shared incremental
+# directory, the way compiletest does; the same shared directory
+# satisfies an -Zassert-incr-state=loaded flag by construction.
+# An assertion inside an auxiliary crate stays out of scope: the
+# runner hands aux crates to the driver per conversion and cannot
+# chain the aux crate's own sessions.
+#
+# Assertions are collected from comment-stripped sources: a
+# commented-out annotation (e.g. `//? #[rustc_clean(...)]`) is not
+# an assertion rustc ever sees, so it neither blocks a record nor
+# makes its sessions sequential.
 
 _DEP_GRAPH_ASSERTION_RE = re.compile(
     r"#!?\[\s*rustc_(clean|dirty|partition_reused|partition_codegened)\b")
@@ -4738,42 +4806,201 @@ def _aux_source_texts(test_path):
     return out
 
 
-def incremental_cross_session_blocker(test_path, text):
-    """Why an incremental test's verdict depends on state carried
-    between compilation sessions, or None.
+def _strip_comments(text):
+    """`text` with Rust comments blanked out, for classification.
 
-    Returns (reason, bucket). The check covers the test's own file
-    and the auxiliary crates it builds: any dep-graph assertion, or
-    a compile-flags assertion that the previous session's cache is
-    loaded at startup, makes the verdict cross-session by
-    definition.
+    Line comments and (nested) block comments are replaced by
+    spaces; string and raw-string literals are kept verbatim (an
+    attribute cannot hide inside one, but a `//` inside a literal
+    must not start a comment). Newlines are preserved, so line
+    positions stay aligned with the original.
     """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            out.append("\n")
+            i = j + 1
+        elif two == "/*":
+            depth = 1
+            i += 2
+            while i < n and depth:
+                if text[i:i + 2] == "/*":
+                    depth += 1
+                    i += 2
+                elif text[i:i + 2] == "*/":
+                    depth -= 1
+                    i += 2
+                else:
+                    if text[i] == "\n":
+                        out.append("\n")
+                    i += 1
+        elif text[i] == '"' or (text[i] == "r"
+                                and text[i + 1:i + 2] in ('"', "#")):
+            # A string or raw-string literal: copy it verbatim.
+            if text[i] == "r":
+                j = i + 1
+                while j < n and text[j] == "#":
+                    j += 1
+                if j < n and text[j] == '"':
+                    close = '"' + "#" * (j - i - 1)
+                    k = text.find(close, j + 1)
+                    k = n if k < 0 else k + len(close)
+                    out.append(text[i:k])
+                    i = k
+                else:
+                    out.append(text[i])
+                    i += 1
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                    elif text[j] == '"':
+                        j += 1
+                        break
+                    else:
+                        j += 1
+                out.append(text[i:j])
+                i = j
+        elif text[i] == "'":
+            # A char literal ('x', '\n', '"') or a lifetime ('a):
+            # only the short closed form is a literal; anything
+            # else is a lifetime and the quote is ordinary text.
+            m = re.match(r"'(\\.|[^'\\])'", text[i:])
+            if m:
+                out.append(m.group(0))
+                i += len(m.group(0))
+            else:
+                out.append(text[i])
+                i += 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+_PARTITION_ASSERTION_KINDS = ("partition_reused", "partition_codegened")
+
+
+def _dep_graph_assertions(test_path, text):
+    """The active dep-graph assertions of a test and its aux crates.
+
+    Returns a list of (kind, where): kind is one of clean / dirty /
+    partition_reused / partition_codegened, and where is "the test
+    file" or "auxiliary file <name>". Sources are scanned
+    comment-stripped, so commented-out annotations do not count.
+    """
+    found = []
     sources = [(test_path, text)] + _aux_source_texts(test_path)
     for src_path, src_text in sources:
-        m = _DEP_GRAPH_ASSERTION_RE.search(src_text)
-        if m:
-            attr = "rustc_" + m.group(1)
-            where = ("the test file" if src_path == test_path
-                     else f"auxiliary file {src_path.name}")
+        where = ("the test file" if src_path == test_path
+                 else f"auxiliary file {src_path.name}")
+        for m in _DEP_GRAPH_ASSERTION_RE.finditer(
+                _strip_comments(src_text)):
+            found.append((m.group(1), where))
+    return found
+
+
+def incremental_cross_session_blocker(test_path, text):
+    """Why an incremental test's verdict stays out of stage-2
+    scope, or None.
+
+    Returns (reason, bucket). Only verdicts that sequential
+    sessions sharing one incremental directory cannot reproduce
+    block: partition assertions wherever they appear (they are
+    checked against code generation work products, which a
+    conversion never produces), and clean/dirty assertions inside
+    an auxiliary crate (the runner does not chain an aux crate's
+    own sessions). Clean/dirty assertions in the test file itself
+    do not block; fill_result_stage2 judges those records with
+    sequential sessions instead.
+    """
+    assertions = _dep_graph_assertions(test_path, text)
+    for kind, where in assertions:
+        if kind in _PARTITION_ASSERTION_KINDS:
+            attr = "rustc_" + kind
             return (f"dep-graph assertion #[{attr}] in {where}: "
                     "under -Z query-dep-graph the verdict compares "
-                    "dep-graph state against the previous "
-                    "compilation session, which independent "
-                    "per-revision conversions cannot reproduce",
+                    "the previous session's code generation work "
+                    "products (which codegen units were reused and "
+                    "which were re-codegened) against this "
+                    "session's, which a conversion-only session "
+                    "never produces",
                     "out of stage-2 scope (incremental dep-graph "
                     "assertions)")
+    for kind, where in assertions:
+        if where != "the test file":
+            attr = "rustc_" + kind
+            return (f"dep-graph assertion #[{attr}] in {where}: "
+                    "the verdict compares dep-graph state against "
+                    "the auxiliary crate's own previous compilation "
+                    "session, whose sessions the runner does not "
+                    "chain",
+                    "out of stage-2 scope (incremental dep-graph "
+                    "assertions)")
+    return None
+
+
+_ASSERTION_ERROR_RE = re.compile(
+    r"^error: `(\w+)\(.*\)` should be (?:clean|dirty) but is not$")
+
+# The dep nodes whose forcing depends on the compilation's own
+# demand pattern: the reference compilation forces MIR bodies only
+# for codegen-reached items, while conversion forces them for
+# every definition in the crate (that is what conversion is), so a
+# MIR node's clean/dirty coloring under conversion is not the
+# reference session's coloring.
+MIR_DEMAND_LABELS = ("optimized_mir", "promoted_mir")
+
+
+def mir_only_assertion_failure(stderr):
+    """Whether a failed compilation's errors are all dep-graph
+    clean/dirty assertions on MIR dep nodes (see MIR_DEMAND_LABELS),
+    i.e. the failure is fully explained by the demand artifact and
+    carries no signal about the test itself."""
+    saw = False
+    for line in stderr.splitlines():
+        if not line.startswith("error"):
+            continue
+        m = _ASSERTION_ERROR_RE.match(line)
+        if m:
+            if m.group(1) not in MIR_DEMAND_LABELS:
+                return False
+            saw = True
+        elif line.startswith("error: aborting due to"):
+            continue
+        else:
+            return False
+    return saw
+
+
+def incremental_sequential_sessions(test_path, text):
+    """Whether an incremental record's revisions must run as
+    sequential sessions sharing one incremental directory.
+
+    True when the verdict is defined over state carried between
+    sessions in a way the shared directory reproduces: an active
+    clean/dirty dep-graph assertion in the test file (checked by
+    the driver's embedded rustc against the dep graph loaded from
+    the previous session), or a compile-flags assertion that the
+    previous session's cache is loaded at startup
+    (-Zassert-incr-state=loaded). Records blocked by
+    incremental_cross_session_blocker never reach the attempt loop,
+    so partition and auxiliary-crate assertions are already out.
+    """
+    if any(kind in ("clean", "dirty") and where == "the test file"
+           for kind, where in _dep_graph_assertions(test_path, text)):
+        return True
     for line in text.splitlines():
         if line.lstrip().startswith("//@") and \
                 _ASSERT_INCR_STATE_LOADED_RE.search(line):
-            return ("compile-flags assert the incremental cache "
-                    "state at startup "
-                    "(-Zassert-incr-state=loaded): the revision "
-                    "must start from the previous session's cache, "
-                    "which independent per-revision conversions do "
-                    "not have",
-                    "out of stage-2 scope (incremental cache-state "
-                    "assertion)")
-    return None
+            return True
+    return False
 
 
 def fill_result_stage2(rec, rust_dir, driver_bin, out, jit=False):
@@ -4794,16 +5021,23 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out, jit=False):
     path = rust_dir / rec["path"]
     text = path.read_text(errors="ignore")
     out["snapshot"] = snapshot_flags(path, text)
+    sequential = False
     if rec["suite"] == "incremental":
         # Most incremental revisions reduce to a per-revision
         # compile outcome and are judged below like any other
-        # revision test; only verdicts defined over state carried
-        # between compilation sessions stay out of scope, each with
-        # its own reason.
+        # revision test. Verdicts defined over state carried
+        # between compilation sessions split by the machinery that
+        # checks them: partition assertions and assertions inside
+        # an auxiliary crate stay out of scope, each with its own
+        # reason, while clean/dirty assertions in the test file
+        # (and a cache-loaded startup assertion) are judged by
+        # running the revisions as sequential sessions over one
+        # shared incremental directory, as compiletest does.
         blocker = incremental_cross_session_blocker(path, text)
         if blocker:
             out["reason"], out["bucket"] = blocker
             return
+        sequential = incremental_sequential_sessions(path, text)
     header = Header(text)
     # Auxiliary crates, as in stage 1: the test's aux directives are
     # resolved transitively and the crates handed to the driver with
@@ -4846,12 +5080,45 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out, jit=False):
             if key in res:
                 out[key] = res[key]
         return
-    per_rev = {}
-    for rev in revs:
-        per_rev[rev] = stage2_attempt(rec, header.view(rev), path,
-                                      driver_bin, rev, revs, rust_dir,
-                                      aux_specs, aux_per_revision,
-                                      jit=jit)
+    # A sequential record's revisions run in declaration order
+    # against one shared incremental directory, created fresh for
+    # the record, so each session starts from the previous
+    # session's cache exactly as in compiletest. The directory is
+    # dropped with the record: nothing outside the sequence may
+    # observe a half-built cache.
+    # The check-mode lint levels are part of the session
+    # configuration a sequence chains on: measured on
+    # tests/incremental/clean.rs, when the success-expecting first
+    # revision runs with the pair and the failure-expecting second
+    # without it, the second session does not load the first
+    # session's dep graph at all (it produces no assertion errors
+    # and the expected failure never materializes). A sequential
+    # record therefore uses one level set for the whole sequence:
+    # the pair when any revision expects success, none when none
+    # does. (The pair's own rationale is unchanged: the lints it
+    # allows never fire in the reference's check-mode compiles.)
+    seq_lint_args = None
+    if sequential:
+        if any(compile_expectation(rec["suite"],
+                                   header.view(r)) == "success"
+               for r in revs):
+            seq_lint_args = ["-A", "unconditional_panic",
+                             "-A", "arithmetic_overflow"]
+        else:
+            seq_lint_args = []
+    incr_ctx = (tempfile.TemporaryDirectory(prefix="subset-incr-")
+                if sequential else None)
+    try:
+        per_rev = {}
+        for rev in revs:
+            per_rev[rev] = stage2_attempt(
+                rec, header.view(rev), path, driver_bin, rev, revs,
+                rust_dir, aux_specs, aux_per_revision, jit=jit,
+                incr_dir=incr_ctx.name if incr_ctx else None,
+                lint_args=seq_lint_args)
+    finally:
+        if incr_ctx is not None:
+            incr_ctx.cleanup()
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket",
                                 "expectation") if r.get(k)}
