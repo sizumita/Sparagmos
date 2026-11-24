@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1020,6 +1021,87 @@ class JudgeCompileTests(unittest.TestCase):
         self.assertIn("minicore", reason)
 
 
+class RunCmdMemoryLimitTests(unittest.TestCase):
+    """run_cmd's per-record memory bound (Issue #483): the
+    watchdog kills a driver process tree whose RSS crosses the
+    bound and reports mem_exceeded, so one ballooning record
+    fails alone instead of taking the whole shard job (and its
+    results) down with it. The children here are small Python
+    balloons, not the driver."""
+
+    BALLOON = ("x = bytearray(400 * 1024 * 1024)\n"
+               "for i in range(0, len(x), 4096):\n"
+               "    x[i] = 1\n"
+               "import time\n"
+               "time.sleep(60)\n")
+
+    def test_unbounded_run_reports_no_mem_exceeded(self):
+        res = run.run_cmd([sys.executable, "-c", "print('hi')"],
+                          timeout=30)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hi\n")
+        self.assertFalse(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_bounded_run_inside_the_limit_is_unchanged(self):
+        res = run.run_cmd([sys.executable, "-c", "print('hi')"],
+                          timeout=30, mem_limit_mb=512)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hi\n")
+        self.assertFalse(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+
+    def test_ballooning_child_is_killed_by_the_bound(self):
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", self.BALLOON],
+                          timeout=60, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+        self.assertEqual(res["exit_code"], -9)
+
+    def test_ballooning_grandchild_is_killed_via_the_tree(self):
+        code = ("import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', "
+                f"{self.BALLOON!r}])\n"
+                "time.sleep(60)\n")
+        start = time.monotonic()
+        res = run.run_cmd([sys.executable, "-c", code],
+                          timeout=60, mem_limit_mb=96)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(res["mem_exceeded"])
+        self.assertFalse(res["timeout"])
+
+    def test_timeout_still_reported_with_the_bound_set(self):
+        res = run.run_cmd(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=1, mem_limit_mb=512)
+        self.assertTrue(res["timeout"])
+        self.assertFalse(res["mem_exceeded"])
+        self.assertIsNone(res["exit_code"])
+
+    def test_memory_limit_reason_buckets_as_memory_limit(self):
+        self.assertEqual(
+            run.bucket_reason("driver exceeded the per-record "
+                              "memory limit of 5120 MB"),
+            "memory limit")
+
+    def test_judge_compile_memory_limit(self):
+        conv = {"mem_exceeded": True, "timeout": False,
+                "exit_code": -9}
+        status, _reason, bucket = run.judge_compile("success", conv)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "memory limit")
+
+    def test_judge_jit_compile_memory_limit(self):
+        conv = {"mem_exceeded": True, "timeout": False,
+                "exit_code": -9}
+        status, _reason, bucket = run.judge_jit_compile("success",
+                                                        conv)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "memory limit")
+
+
 class ConcreteEditionTests(unittest.TestCase):
     def test_closed_range_takes_lower_bound(self):
         # compiletest's range is half-open and, with no requested
@@ -1526,7 +1608,7 @@ class ConvertSideTests(unittest.TestCase):
         seen = []
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             seen.append(argv)
             return {"exit_code": 0, "timeout": False,
                     "stdout": "converted: 1, skipped: 0\n",
@@ -1544,7 +1626,7 @@ class ConvertSideTests(unittest.TestCase):
         orig = run.run_cmd
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             return {"exit_code": 0, "timeout": False,
                     "stdout": stdout, "stderr": ""}
 
@@ -2822,7 +2904,7 @@ class GuestArgForwardingTests(unittest.TestCase):
         orig = run.run_cmd
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             captured["argv"] = list(argv)
             captured["env_extra"] = env_extra
             captured["env_remove"] = env_remove
@@ -3447,7 +3529,7 @@ class JitSideTests(unittest.TestCase):
         seen = []
 
         def stub(argv, *, timeout, cwd=None, env_extra=None,
-                 env_remove=()):
+                 env_remove=(), mem_limit_mb=None):
             seen.append(argv)
             return result
 

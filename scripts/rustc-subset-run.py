@@ -124,6 +124,17 @@ combined with `--jit`: metric 4 has no procedure attempt, so a
 either: metric 4 has no rustdoc attempt, so a `--jit` run carries
 rustdoc-check records as not attempted.
 
+Every driver subprocess also runs under a per-record resident-
+memory bound (DRIVER_MEM_LIMIT_MB, default 5120 MB, overridable
+through SPARAGMOS_DRIVER_MEM_LIMIT_MB): run_cmd polls the driver
+process tree's RSS while it runs and kills the tree when it
+crosses the bound, and the record is recorded as that record's
+own failure with bucket "memory limit". The bound is the space
+analogue of the per-record timeouts: a driver that balloons
+faster than its timeout would otherwise exhaust the host's RAM
+and kill the whole measurement job (Issue #483). The native
+compiles and runs -- the reference oracle -- are not bounded.
+
 Usage:
     python3 scripts/rustc-subset-run.py \
         --survey-json subset-survey.json \
@@ -142,6 +153,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -170,6 +182,50 @@ def _env_timeout(name, default):
 NATIVE_COMPILE_TIMEOUT = _env_timeout("SPARAGMOS_NATIVE_COMPILE_TIMEOUT", 60)
 NATIVE_RUN_TIMEOUT = _env_timeout("SPARAGMOS_NATIVE_RUN_TIMEOUT", 30)
 DRIVER_TIMEOUT = _env_timeout("SPARAGMOS_DRIVER_TIMEOUT", 60)
+
+
+def _env_mem_limit_mb(name, default):
+    """Per-record driver memory limit override from the environment.
+
+    Follows the _env_timeout pattern: a workflow can raise the
+    bound through SPARAGMOS_DRIVER_MEM_LIMIT_MB; with nothing set,
+    the default below applies unchanged.
+    """
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# Per-record resident-memory bound for driver subprocesses, in MB,
+# summed over the driver's whole process tree. Driver invocations
+# have always carried a per-record *time* limit; this is the
+# matching space limit, enforced by run_cmd's watchdog (see
+# _run_cmd_mem_bounded). Without it, a record whose driver balloons
+# faster than its timeout -- Issue #480's debugger session grows at
+# ~190 MB/s, exhausting a 16 GB hosted runner in ~85 s against a
+# 240 s timeout -- kills the whole shard job, and with it every
+# result the shard had already produced. Over the bound, the tree
+# is killed and the record is recorded as that record's own failure
+# (bucket "memory limit"); it can never become a pass that way.
+#
+# The default, 5120 MB, is calibrated against measured legitimate
+# peaks and the hosted runner's size: the largest legitimate driver
+# RSS observed is the stage-4 guest probe's ~2.6 GB (collection-
+# budget-4096 conversions peak at ~1.56 GB), so the bound leaves
+# roughly 2x headroom; and with --jobs 2, two driver trees at the
+# bound (2 x 5 GB) plus the native side and the runner itself stay
+# inside the 16 GB hosted runner with room to spare.
+#
+# The bound is on RSS, not address space: the driver's virtual
+# size is ~10 GB at startup (thread-stack reservations), so an
+# RLIMIT_AS tight enough to matter stops the driver from spawning
+# its own threads at all (measured on the recursive-struct
+# session: prlimit --as=6G makes the driver panic in thread
+# spawn). RSS is also the quantity that actually exhausts the
+# host, so RSS is what is bounded.
+DRIVER_MEM_LIMIT_MB = _env_mem_limit_mb(
+    "SPARAGMOS_DRIVER_MEM_LIMIT_MB", 5120)
 
 # ---------------------------------------------------------------------------
 # Header directive parsing
@@ -1448,12 +1504,129 @@ def header_bucket(reason):
 # Process execution
 # ---------------------------------------------------------------------------
 
-def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=()):
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+_MEM_POLL_SECONDS = 0.25
+
+
+def _proc_tree(root_pid):
+    """(member_pids, total_rss_bytes) of the process tree rooted at
+    root_pid, from one /proc scan. ([], 0) when /proc is unavailable
+    or the root is already gone."""
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return [], 0
+    ppid = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # Field 2 (comm) is parenthesised and may itself contain
+        # spaces or parens; ppid is the second field after the
+        # final ')'.
+        fields = stat[stat.rfind(b")") + 2:].split()
+        try:
+            ppid[pid] = int(fields[1])
+        except (ValueError, IndexError):
+            continue
+    if root_pid not in ppid:
+        return [], 0
+    members = []
+    seen = {root_pid}
+    frontier = [root_pid]
+    while frontier:
+        cur = frontier.pop()
+        members.append(cur)
+        for pid, parent in ppid.items():
+            if parent == cur and pid not in seen:
+                seen.add(pid)
+                frontier.append(pid)
+    total = 0
+    for pid in members:
+        try:
+            with open(f"/proc/{pid}/statm") as f:
+                total += int(f.read().split()[1]) * _PAGE_SIZE
+        except (OSError, ValueError, IndexError):
+            continue
+    return members, total
+
+
+def _kill_process_tree(root_pid):
+    """SIGKILL the whole process tree rooted at root_pid,
+    descendants first, so nothing in the tree survives to hold the
+    record's output pipes (or the host's memory) open."""
+    members, _rss = _proc_tree(root_pid)
+    for pid in reversed(members):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _run_cmd_mem_bounded(argv, *, timeout, cwd, env, mem_limit_mb):
+    """run_cmd under a resident-memory bound on the child's whole
+    process tree: the tree's RSS is polled while the child runs,
+    and when it crosses mem_limit_mb the tree is killed and the
+    result carries mem_exceeded=True (exit_code is the kill's
+    return code). The timeout keeps its usual meaning and result
+    shape; a child that stays inside the bound returns its own
+    outcome unchanged."""
+    limit = mem_limit_mb * 1024 * 1024
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, cwd=cwd, env=env,
+                         stdin=subprocess.DEVNULL)
+    deadline = time.monotonic() + timeout
+    mem_exceeded = False
+    timed_out = False
+    stdout = stderr = b""
+    while True:
+        try:
+            stdout, stderr = p.communicate(timeout=_MEM_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            _members, rss = _proc_tree(p.pid)
+            if rss > limit:
+                mem_exceeded = True
+                _kill_process_tree(p.pid)
+                stdout, stderr = p.communicate()
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _kill_process_tree(p.pid)
+                stdout, stderr = p.communicate()
+                break
+    return {
+        "exit_code": None if timed_out else p.returncode,
+        "stdout": (stdout or b"").decode("utf-8", errors="replace"),
+        "stderr": (stderr or b"").decode("utf-8", errors="replace"),
+        "timeout": timed_out,
+        "mem_exceeded": mem_exceeded,
+    }
+
+
+def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=(),
+            mem_limit_mb=None):
+    """Run a command and return its outcome as a dict with
+    exit_code (None on timeout), stdout, stderr, timeout and
+    mem_exceeded. With mem_limit_mb set, the child's whole process
+    tree is additionally held under that resident-memory bound
+    (see _run_cmd_mem_bounded). The driver call sites pass
+    DRIVER_MEM_LIMIT_MB; every other invocation (the native
+    oracle's compiles and runs, toolchain queries, checker tools)
+    passes nothing and runs unbounded, exactly as before."""
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
     for key in env_remove:
         env.pop(key, None)
+    if mem_limit_mb is not None:
+        return _run_cmd_mem_bounded(argv, timeout=timeout, cwd=cwd,
+                                    env=env, mem_limit_mb=mem_limit_mb)
     try:
         p = subprocess.run(argv, capture_output=True, timeout=timeout,
                            cwd=cwd, env=env, stdin=subprocess.DEVNULL)
@@ -1462,6 +1635,7 @@ def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=()):
             "stdout": p.stdout.decode("utf-8", errors="replace"),
             "stderr": p.stderr.decode("utf-8", errors="replace"),
             "timeout": False,
+            "mem_exceeded": False,
         }
     except subprocess.TimeoutExpired as e:
         return {
@@ -1469,6 +1643,7 @@ def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=()):
             "stdout": (e.stdout or b"").decode("utf-8", errors="replace"),
             "stderr": (e.stderr or b"").decode("utf-8", errors="replace"),
             "timeout": True,
+            "mem_exceeded": False,
         }
 
 
@@ -2352,8 +2527,10 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
 
     kind is "result" (the run completed; the exit code is the
     guest program's own, passed through for the judge),
-    "unsupported" (driver exit 2), "timeout", or "driver-error"
-    (the driver died by a signal). `rustc_args` are the test's
+    "unsupported" (driver exit 2), "timeout", "memory-limit"
+    (the runner killed the driver for crossing the per-record
+    memory limit), or "driver-error" (the driver died by a
+    signal). `rustc_args` are the test's
     compile-flags, forwarded through the driver's `--rustc-arg`.
     Auxiliary crates are handed to the driver with `--aux`, in
     dependency order. `guest_args` are the test's run-flags,
@@ -2381,7 +2558,12 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
         env.update(env_extra)
     res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
-                  env_extra=env, env_remove=env_remove)
+                  env_extra=env, env_remove=env_remove,
+                  mem_limit_mb=DRIVER_MEM_LIMIT_MB)
+    if res.get("mem_exceeded"):
+        return None, "memory-limit", \
+            f"driver exceeded the per-record memory limit of " \
+            f"{DRIVER_MEM_LIMIT_MB} MB"
     if res["timeout"]:
         return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
     if res["exit_code"] == 2:
@@ -2472,6 +2654,8 @@ def bucket_reason(reason):
         return "call to function with no converted body (std/core not modelled)"
     if "without a reason line" in r:
         return "driver exit 2 without a run-mode reason (front-end failure)"
+    if "memory limit" in r:
+        return "memory limit"
     if "timeout" in r or "timed out" in r:
         return "timeout"
     if "native compile failed" in r:
@@ -2917,10 +3101,15 @@ def sparagmos_debug_side(path, edition, driver_bin, dialect, script_text,
         if env_extra:
             env.update(env_extra)
         res = run_cmd(argv, timeout=DRIVER_TIMEOUT, env_extra=env,
-                      env_remove=env_remove)
+                      env_remove=env_remove,
+                      mem_limit_mb=DRIVER_MEM_LIMIT_MB)
     finally:
         if script_path is not None:
             os.unlink(script_path)
+    if res.get("mem_exceeded"):
+        return None, "memory-limit", \
+            f"driver exceeded the per-record memory limit of " \
+            f"{DRIVER_MEM_LIMIT_MB} MB"
     if res["timeout"]:
         return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
     if res["exit_code"] == 0:
@@ -3076,6 +3265,12 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
                 out["reason"] = "driver timed out"
                 out["bucket"] = "timeout"
                 return
+            if conv.get("mem_exceeded"):
+                out["reason"] = ("driver exceeded the per-record "
+                                  "memory limit of "
+                                  f"{DRIVER_MEM_LIMIT_MB} MB")
+                out["bucket"] = "memory limit"
+                return
             if conv["compilation_failed"]:
                 out["reason"] = ("compilation failed: "
                                   + first_error_line(conv["stderr"]))
@@ -3168,6 +3363,10 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
         if kind == "timeout":
             out["reason"] = reason
             out["bucket"] = "timeout"
+            return
+        if kind == "memory-limit":
+            out["reason"] = reason
+            out["bucket"] = "memory limit"
             return
         if kind == "unsupported":
             out["reason"] = reason
@@ -3391,7 +3590,7 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
             out["reason"] = reason
             out["bucket"] = bucket_reason(reason)
             return
-        if kind in ("timeout", "driver-error"):
+        if kind in ("timeout", "driver-error", "memory-limit"):
             out["status"] = "fail"
             out["reason"] = reason
             out["bucket"] = bucket_reason(reason)
@@ -3702,7 +3901,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
             return res
-        if kind in ("timeout", "driver-error"):
+        if kind in ("timeout", "driver-error", "memory-limit"):
             res["status"] = "fail"
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
@@ -4021,10 +4220,12 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         env.update(env_extra)
     res = run_cmd(argv,
                   timeout=CONVERT_TIMEOUT, env_extra=env,
-                  env_remove=env_remove)
+                  env_remove=env_remove,
+                  mem_limit_mb=DRIVER_MEM_LIMIT_MB)
     out = {
         "exit_code": res["exit_code"],
         "timeout": res["timeout"],
+        "mem_exceeded": res.get("mem_exceeded", False),
         "converted": None,
         "skipped": None,
         "target_converted": None,
@@ -4128,6 +4329,11 @@ def judge_compile(expectation, conv):
     "unsupported" (conversion incomplete on a success-expecting test,
     the stage-1 analogue of the driver reporting exit 2).
     """
+    if conv.get("mem_exceeded"):
+        return ("fail",
+                f"driver exceeded the per-record memory limit of "
+                f"{DRIVER_MEM_LIMIT_MB} MB",
+                "memory limit")
     if conv["timeout"] or conv["exit_code"] is None:
         return ("fail",
                 f"driver timed out after {CONVERT_TIMEOUT}s",
@@ -4238,6 +4444,11 @@ def judge_jit_compile(expectation, conv):
     a compiler crash, so it is intercepted before judge_compile
     (which reads any non-0/1 exit as a crash) can see it.
     """
+    if conv.get("mem_exceeded"):
+        return ("fail",
+                f"driver exceeded the per-record memory limit of "
+                f"{DRIVER_MEM_LIMIT_MB} MB",
+                "memory limit")
     if conv["timeout"] or conv["exit_code"] is None:
         return ("fail",
                 f"driver timed out after {CONVERT_TIMEOUT}s",
@@ -4689,7 +4900,7 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
             return res
-        if kind in ("timeout", "driver-error"):
+        if kind in ("timeout", "driver-error", "memory-limit"):
             res["status"] = "fail"
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
@@ -5457,11 +5668,18 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
              "--edition", "2024",
              "--aux-lib", f"run_make_support={rlib}",
              "--tool-program", paths["rustc"]],
-            timeout=STAGE3_TIMEOUT, cwd=guest_out, env_extra=guest_env)
+            timeout=STAGE3_TIMEOUT, cwd=guest_out, env_extra=guest_env,
+            mem_limit_mb=DRIVER_MEM_LIMIT_MB)
         if got["timeout"]:
             out["status"] = "fail"
             out["reason"] = f"driver timed out after {STAGE3_TIMEOUT}s"
             out["bucket"] = bucket_reason(out["reason"])
+            return
+        if got.get("mem_exceeded"):
+            out["status"] = "fail"
+            out["reason"] = (f"driver exceeded the per-record memory "
+                             f"limit of {DRIVER_MEM_LIMIT_MB} MB")
+            out["bucket"] = "memory limit"
             return
         if got["exit_code"] == 0:
             out["status"] = "pass"
@@ -5644,11 +5862,17 @@ def _stage4_guest_probe_run(driver_bin, rust_dir):
         res = run_cmd(stage4_guest_cmd(driver_bin, main_rs, artifacts,
                                        ["--version"]),
                       timeout=STAGE4_PROBE_TIMEOUT, cwd=td,
-                      env_extra=BOOTSTRAP_ENV)
+                      env_extra=BOOTSTRAP_ENV,
+                      mem_limit_mb=DRIVER_MEM_LIMIT_MB)
     if res["timeout"]:
         return {"state": "timeout",
                 "reason": f"guest rustdoc startup probe timed out "
                           f"after {STAGE4_PROBE_TIMEOUT}s"}
+    if res.get("mem_exceeded"):
+        return {"state": "fail",
+                "reason": f"guest rustdoc startup probe exceeded "
+                          f"the per-record memory limit of "
+                          f"{DRIVER_MEM_LIMIT_MB} MB"}
     if res["exit_code"] == 0:
         return {"state": "ok", "reason": ""}
     if res["exit_code"] == 2:
@@ -6860,11 +7084,18 @@ def stage4_ui_attempt(rec, view, path, revision, all_revisions,
             gproc = run_cmd(
                 stage4_guest_cmd(driver_bin, main_rs, artifacts, gargs),
                 timeout=STAGE4_GUEST_TIMEOUT, cwd=gbase,
-                env_extra=nenv, env_remove=env_unset)
+                env_extra=nenv, env_remove=env_unset,
+                mem_limit_mb=DRIVER_MEM_LIMIT_MB)
         if gproc["timeout"]:
             res["reason"] = (f"guest rustdoc timed out after "
                              f"{STAGE4_GUEST_TIMEOUT}s")
             res["bucket"] = "timeout"
+            return res
+        if gproc.get("mem_exceeded"):
+            res["reason"] = (f"guest rustdoc exceeded the per-record "
+                             f"memory limit of "
+                             f"{DRIVER_MEM_LIMIT_MB} MB")
+            res["bucket"] = "memory limit"
             return res
         if gproc["exit_code"] == 2:
             reason = driver_reason(gproc["stderr"]) \
@@ -7010,7 +7241,8 @@ def stage4_document_attempt(rec, header, path, suite, driver_bin,
             return run_cmd(
                 stage4_guest_cmd(driver_bin, main_rs, artifacts, args),
                 timeout=STAGE4_GUEST_TIMEOUT, cwd=gbase,
-                env_extra=nenv, env_remove=env_unset)
+                env_extra=nenv, env_remove=env_unset,
+                mem_limit_mb=DRIVER_MEM_LIMIT_MB)
 
         with _stage4_guest_lock:
             gres = stage4_document(guest_runner, header, path, gbase,
@@ -7020,6 +7252,12 @@ def stage4_document_attempt(rec, header, path, suite, driver_bin,
             out["reason"] = (f"guest rustdoc timed out after "
                              f"{STAGE4_GUEST_TIMEOUT}s")
             out["bucket"] = "timeout"
+            return
+        if gres.get("mem_exceeded"):
+            out["reason"] = (f"guest rustdoc exceeded the per-record "
+                             f"memory limit of "
+                             f"{DRIVER_MEM_LIMIT_MB} MB")
+            out["bucket"] = "memory limit"
             return
         if gres["exit_code"] == 2:
             reason = driver_reason(gres["stderr"]) \
