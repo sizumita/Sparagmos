@@ -1746,7 +1746,37 @@ fn match_impl_self_ty(
                 }
                 None => target,
             };
-            bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target))
+            // A projection target is resolved before it
+            // is bound, the way a rigid self type's nested
+            // target is (see the `RigidTy` arm below): the
+            // substitution above resolves parameters but
+            // leaves projections standing, so an
+            // implementation parameter appearing in both
+            // the self type and another trait argument
+            // (`Carrier<A> for Wrap<A>` matched against
+            // `Carrier<dyn Trait<Assoc = u32>>` for
+            // `Wrap<T::Item>`) would bind the projection
+            // itself through the self type and then be
+            // rejected against the object type the
+            // projection denotes at the trait argument.
+            // A projection the evidence cannot resolve
+            // keeps its substituted form; a disagreement
+            // over that form is inconclusive rather than a
+            // mismatch (see `bind_impl_arg`).
+            let resolved;
+            let target = match guarded_ty_kind(target) {
+                Some(TyKind::Alias(..)) => {
+                    match resolve_screen_self_ty(target, ambient, depth + 1) {
+                        Some(t) => {
+                            resolved = t;
+                            &resolved
+                        }
+                        None => target,
+                    }
+                }
+                _ => target,
+            };
+            bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target), ambient, depth)
         }
         TyKind::RigidTy(irigid) => {
             // An interned-identity agreement settles the
@@ -2033,6 +2063,8 @@ fn match_impl_arg(
                     bindings,
                     param.index,
                     GenericArgKind::Lifetime(tregion.clone()),
+                    ambient,
+                    depth,
                 ),
                 // A lifetime never decides which type an
                 // implementation assigns the item -- the
@@ -2107,7 +2139,13 @@ fn match_impl_const(
     };
     match iconst.kind() {
         TyConstKind::Param(param) => {
-            bind_impl_arg(bindings, param.index, GenericArgKind::Const(tconst.clone()))
+            bind_impl_arg(
+                bindings,
+                param.index,
+                GenericArgKind::Const(tconst.clone()),
+                ambient,
+                depth,
+            )
         }
         TyConstKind::Unevaluated(idef, iargs) => match tconst.kind() {
             TyConstKind::Unevaluated(tdef, targs) if idef.def_id() == tdef.def_id() => {
@@ -2129,9 +2167,69 @@ fn bind_impl_arg(
     bindings: &mut HashMap<u32, GenericArgKind>,
     index: u32,
     arg: GenericArgKind,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
 ) -> bool {
     match bindings.get(&index) {
-        Some(prev) => *prev == arg,
+        Some(prev) => {
+            if *prev == arg {
+                return true;
+            }
+            // Two concrete types can spell the same type
+            // with different region spellings: a type read
+            // from a definition keeps the regions its
+            // declaration carries (`dyn Trait<Assoc =
+            // u32>` read from an implementation's item is
+            // `+ 'static`), while the same type reached
+            // through a monomorphized body is region-erased
+            // (the `+ 'static` is erased). Interned
+            // identity tells those spellings apart, but
+            // the type match the binding feeds ignores the
+            // regions inside types throughout (see
+            // `match_impl_arg`), so concrete rigid types
+            // -- ones mentioning no parameter, whose
+            // agreement a parameter could still turn on --
+            // are also compared structurally, in a scratch
+            // binding map the comparison cannot disturb.
+            if let (GenericArgKind::Type(prev_ty), GenericArgKind::Type(arg_ty)) =
+                (prev, &arg)
+            {
+                if !ty_contains_param(prev_ty)
+                    && !ty_contains_param(arg_ty)
+                    && matches!(guarded_ty_kind(prev_ty), Some(TyKind::RigidTy(_)))
+                    && matches!(guarded_ty_kind(arg_ty), Some(TyKind::RigidTy(_)))
+                {
+                    let mut scratch: HashMap<u32, GenericArgKind> = HashMap::new();
+                    if match_impl_self_ty(prev_ty, arg_ty, ambient, &mut scratch, depth + 1)
+                    {
+                        return true;
+                    }
+                }
+            }
+            // A disagreement one side of which is a
+            // projection the resolution could not settle
+            // (see the parameter arm of
+            // `match_impl_self_ty`, which binds the
+            // resolved form when it can) rests on ground
+            // the match does not check: the projection may
+            // denote the very type it is compared against,
+            // so the disagreement proves nothing about
+            // whether the outer projection normalizes.
+            // Record the resolution as inconclusive the
+            // way an unsettled disagreement among the
+            // matching implementations is recorded (see
+            // `RESOLUTION_INCONCLUSIVE`); the
+            // implementation itself does not stand as a
+            // candidate on unchecked ground.
+            let unresolved_projection = |a: &GenericArgKind| {
+                matches!(a, GenericArgKind::Type(t)
+                    if matches!(guarded_ty_kind(t), Some(TyKind::Alias(..))))
+            };
+            if unresolved_projection(prev) || unresolved_projection(&arg) {
+                note_resolution_inconclusive();
+            }
+            false
+        }
         None => {
             bindings.insert(index, arg);
             true

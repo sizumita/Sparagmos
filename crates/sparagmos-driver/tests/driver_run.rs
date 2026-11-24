@@ -3410,6 +3410,68 @@ fn run_mode_dyn_bound_projection_fn_ptr_binder_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_PROJECTION_TARGET_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Source {
+    type Item: Trait + ?Sized;
+}
+impl Source for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+trait Carrier<A: ?Sized> {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T: ?Sized>(std::marker::PhantomData<T>);
+impl<A: ?Sized> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Source>
+where
+    Wrap<T::Item>: Carrier<dyn Trait<Assoc = u32>>,
+{
+    field: <<Wrap<T::Item> as Carrier<dyn Trait<Assoc = u32>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_projection_target_arg_runs() {
+    // The implementation parameter `A` appears in both
+    // the self type (`Carrier<A> for Wrap<A>`) and the
+    // trait argument, and the target at the self type is
+    // a projection: walking `Holder<()>` matches the self
+    // type `Wrap<T::Item>`, whose argument the ambient
+    // frame substitutes to `<() as Source>::Item` but
+    // leaves standing as a projection. Binding `A` to
+    // that unresolved projection and then comparing it
+    // against the trait argument's `dyn Trait<Assoc =
+    // u32>` -- the very type the projection denotes --
+    // rejected the implementation, so the screen
+    // rejected the holder and `main`. The target is
+    // resolved before it is bound, the way a rigid self
+    // type's nested targets are -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-projection-target-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_projection_target_arg.rs",
+        DYN_BOUND_PROJECTION_PROJECTION_TARGET_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the projection-target-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
