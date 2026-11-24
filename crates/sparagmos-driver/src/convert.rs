@@ -1209,6 +1209,35 @@ fn take_resolution_depth_exhausted() -> bool {
     RESOLUTION_DEPTH_EXHAUSTED.with(|flag| flag.replace(false))
 }
 
+thread_local! {
+    /// Whether the resolution in progress found the
+    /// implementations matching a projection in a
+    /// disagreement it cannot settle (see
+    /// `projection_impl_assigned_ty`): set by the decision
+    /// when it runs, and read -- and cleared -- by the
+    /// one judgment that consults resolution (see
+    /// `projection_screen_ty`), the way the depth record
+    /// is (see `RESOLUTION_DEPTH_EXHAUSTED`), so a
+    /// disagreement recorded anywhere else cannot leak
+    /// into a verdict.
+    static RESOLUTION_INCONCLUSIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Note that the resolution in progress reached a
+/// disagreement it cannot settle (see
+/// `RESOLUTION_INCONCLUSIVE`).
+fn note_resolution_inconclusive() {
+    RESOLUTION_INCONCLUSIVE.with(|flag| flag.set(true));
+}
+
+/// Whether the resolution since the last take reached a
+/// disagreement it cannot settle, clearing the record
+/// (see `RESOLUTION_INCONCLUSIVE`).
+fn take_resolution_inconclusive() -> bool {
+    RESOLUTION_INCONCLUSIVE.with(|flag| flag.replace(false))
+}
+
 /// Resolve a type as far as the screen's own evidence
 /// reaches: parameters through the ambient arguments the
 /// way the screen's walk resolves them, and projections
@@ -1335,7 +1364,12 @@ fn impls_of_trait(trait_def: rustc_public::DefId) -> Vec<ImplDef> {
 /// implementation — one declaring predicates the
 /// structural match does not check — matches self types
 /// it may not apply to, so its disagreement with an
-/// unconditional implementation proves nothing.
+/// unconditional implementation proves nothing. A
+/// disagreement no unconditional implementation settles
+/// is recorded as an inconclusive resolution (see
+/// `RESOLUTION_INCONCLUSIVE`): it rests on ground the
+/// structural match does not check, so it is no proof
+/// the projection cannot normalize either.
 fn projection_impl_assigned_ty(
     alias: &rustc_public::ty::AliasTy,
     ambient: Option<&GenericArgs>,
@@ -1418,7 +1452,23 @@ fn projection_impl_assigned_ty(
         };
         candidates.push((ty, impl_def));
     }
-    decide_impl_assigned_ty(candidates)
+    let had_candidates = !candidates.is_empty();
+    let decided = decide_impl_assigned_ty(candidates);
+    if decided.is_none() && had_candidates {
+        // Implementations matched and their assigned
+        // types were read, but the decision has no
+        // verdict for their disagreement: the match is
+        // structural, so the disagreement can rest on
+        // ground it does not check — a conditional
+        // implementation's predicates, a function-pointer
+        // signature's bound lifetimes — and proves
+        // nothing about whether the projection
+        // normalizes. Record the resolution as
+        // inconclusive so the screen abstains (see
+        // `RESOLUTION_INCONCLUSIVE`).
+        note_resolution_inconclusive();
+    }
+    decided
 }
 
 /// The assigned type the matching implementations decide
@@ -1435,7 +1485,9 @@ fn projection_impl_assigned_ty(
 /// conditional disagreement no evidence against it. When
 /// the unconditional implementations disagree among
 /// themselves, or none is unconditional, the candidates
-/// determine nothing.
+/// determine nothing, and the caller records that
+/// outcome as an inconclusive resolution when candidates
+/// existed (see `projection_impl_assigned_ty`).
 fn decide_impl_assigned_ty(candidates: Vec<(Ty, ImplDef)>) -> Option<Ty> {
     if let Some((first, _)) = candidates.first() {
         if candidates.iter().all(|(ty, _)| ty == first) {
@@ -1772,7 +1824,19 @@ fn match_impl_self_ty(
                     // implementation's parameters. The
                     // signatures' own bound variables are
                     // their late-bound lifetimes, which
-                    // the type match does not turn on.
+                    // the type match does not turn on: a
+                    // signature distinguished from the
+                    // target's only by its bound lifetimes
+                    // (`fn(&'static u8)` beside
+                    // `for<'a> fn(&'a u8)`) still matches,
+                    // so its implementation can stand as a
+                    // candidate beside the applicable one.
+                    // That is safe because a disagreement
+                    // among the candidates is recorded as
+                    // an inconclusive resolution (see
+                    // `RESOLUTION_INCONCLUSIVE`), never as
+                    // proof the projection cannot
+                    // normalize.
                     let iv = isig.skip_binder();
                     let tv = tsig.skip_binder();
                     iv.c_variadic == tv.c_variadic
@@ -2101,16 +2165,21 @@ fn projection_screen_ty(
                 // projection's self type (see
                 // `dyn_binding_normalizes`); a resolution
                 // that exhausts its depth budget on the
-                // way reaches no answer, so exhaustion
-                // during this judgment leaves the screen
-                // without an opinion rather than rejecting
-                // a projection it could not finish
-                // resolving. The record is cleared first,
-                // so exhaustion from an earlier judgment
-                // cannot leak into this one.
+                // way, or reaches a disagreement among
+                // the matching implementations it cannot
+                // settle, has reached no answer, so either
+                // outcome during this judgment leaves the
+                // screen without an opinion rather than
+                // rejecting a projection it could not
+                // finish resolving. The records are
+                // cleared first, so an outcome from an
+                // earlier judgment cannot leak into this
+                // one.
                 let _ = take_resolution_depth_exhausted();
+                let _ = take_resolution_inconclusive();
                 if !dyn_binding_normalizes(&alias, ambient, depth)
                     && !take_resolution_depth_exhausted()
+                    && !take_resolution_inconclusive()
                 {
                     return Some(format!(
                         "{UNNORMALIZABLE_PROJECTION_REASON}: \

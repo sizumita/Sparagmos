@@ -3297,6 +3297,119 @@ fn run_mode_dyn_bound_projection_deep_chain_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_TWO_CONDITIONAL_IMPLS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Bound {}
+trait Other {}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<T: Bound> Carrier for T {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Wrap<U>(U);
+impl<U: Other> Carrier for Wrap<U> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Bound for u8 {}
+impl Other for u32 {}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_two_conditional_impls_runs() {
+    // Both implementations that structurally match the
+    // self type `Wrap<u32>` are conditional: a blanket
+    // one on `T: Bound`, which `Wrap<u32>` does not
+    // satisfy, and one for `Wrap<U>` on `U: Other`, which
+    // `u32` does. Structural matching checks no
+    // predicates, so both match, their assigned types
+    // disagree, and no unconditional implementation
+    // settles the disagreement -- the verdict the
+    // single-conditional case relies on has nothing to
+    // settle with here. The disagreement rests on
+    // predicates the match never checked, so it proves
+    // nothing about whether the projection normalizes:
+    // the resolution is recorded inconclusive and the
+    // screen abstains -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-two-conditional-impls");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_two_conditional_impls.rs",
+        DYN_BOUND_PROJECTION_TWO_CONDITIONAL_IMPLS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the two-conditional-impls projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_FN_PTR_BINDER_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for fn(&'static u8) {
+    type Item = dyn Trait<Assoc = u64>;
+}
+impl Carrier for for<'a> fn(&'a u8) {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<for<'a> fn(&'a u8)> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_fn_ptr_binder_runs() {
+    // Implementations exist for two function-pointer
+    // self types distinguished only by their bound
+    // lifetimes: `fn(&'static u8)` and
+    // `for<'a> fn(&'a u8)` are different self types with
+    // different assignments. The signature match does
+    // not turn on bound lifetimes, so the `'static`
+    // implementation also matches the higher-ranked
+    // target, the two candidates disagree, and the
+    // screen used to reject the holder and `main`. A
+    // disagreement the match cannot adjudicate is an
+    // inconclusive resolution, not proof the projection
+    // cannot normalize -- natively the program prints
+    // 42.
+    let dir = temp_dir("dyn-bound-projection-fn-ptr-binder");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_fn_ptr_binder.rs",
+        DYN_BOUND_PROJECTION_FN_PTR_BINDER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the fn-ptr-binder projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
