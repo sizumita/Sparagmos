@@ -27071,6 +27071,36 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
         "()" => Value::Unit,
         "std::string::String" => Value::Str(String::new()),
+        // `rustc_session::config::ErrorOutputType::default()` is
+        // the `#[default]` variant with its field defaults:
+        // `HumanReadable { kind: HumanReadableErrorType { short:
+        // false, unicode: false }, color_config: ColorConfig::Auto }`
+        // (rustc_errors' struct and enum, in declaration order).
+        // This is the first runtime value the rustdoc entry program
+        // asks for (session configuration), so it is modelled here
+        // like the other hand-modelled defaults.
+        // The rendered tag of a compiler-crate type named through
+        // an explicit `extern crate` item carries the naming
+        // crate's prefix (`<caller>::rustc_session::...`); from
+        // inside `rustc_session` itself it is the bare path. Both
+        // spellings denote this one ADT.
+        _ if tag == "rustc_session::config::ErrorOutputType"
+            || tag.ends_with("::rustc_session::config::ErrorOutputType") =>
+        {
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Bool(false), Value::Bool(false)],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    },
+                ],
+            }
+        }
         _ if tag.starts_with("std::vec::Vec<") => Value::Enum {
             variant: 0,
             fields: Vec::new(),

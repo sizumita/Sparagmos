@@ -27798,3 +27798,54 @@ fn convert_mode_required_const_behind_unsize_vtable_is_a_compile_failure() {
         "the failure must surface the evaluation error; stderr={stderr}"
     );
 }
+
+// ----- rustc_private type defaults (rustdoc execution path) -----------------
+
+// The rustdoc entry program's session configuration asks for
+// `ErrorOutputType::default()` before anything else observable
+// happens; the value is the `#[default]` variant with its field
+// defaults (`HumanReadable` with a non-short, non-unicode kind
+// and `ColorConfig::Auto`), served by the interpreter's modelled
+// `Default::default`. The expected line is the native 1.100.0
+// output of the same program.
+const ERROR_OUTPUT_TYPE_DEFAULT_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate rustc_errors;
+extern crate rustc_session;
+
+use rustc_errors::emitter::ColorConfig;
+use rustc_session::config::ErrorOutputType;
+
+fn main() {
+    let v = ErrorOutputType::default();
+    match v {
+        ErrorOutputType::HumanReadable { kind, color_config } => {
+            println!(
+                "human short={} unicode={} auto={}",
+                kind.short,
+                kind.unicode,
+                matches!(color_config, ColorConfig::Auto)
+            );
+        }
+        ErrorOutputType::Json { .. } => println!("json"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_error_output_type_default() {
+    let dir = temp_dir("error-output-type-default");
+    let src = fixture(&dir, "case.rs", ERROR_OUTPUT_TYPE_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "human short=false unicode=false auto=true\n",
+        "ErrorOutputType::default() must be the HumanReadable default; stderr={stderr}"
+    );
+}
