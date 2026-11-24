@@ -70,13 +70,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The cached tree's shape is part of this key's meaning:
+      # actions/cache never re-saves on an exact key hit, so any
+      # change to the sparse-checkout set widened below must bump
+      # the key in every job, or the measure jobs keep restoring
+      # the old tree.
       - name: Cache rust source tree and survey
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v2
+          key: rust-survey-1.100.0-v3
 
       - name: Fetch rust tree and generate survey (on cache miss)
         run: |
@@ -94,9 +99,15 @@ jobs:
           # survey's own set before the cache is saved. src/stage0,
           # also extracted, is a file directly under src/ and is
           # already included by the cone-mode parent rules.
+          # src/etc carries htmldocck.py, which run-make-support's
+          # `htmldocck()` helper executes from the source root, and
+          # src/librustdoc/html/static/css is read directly by the
+          # rustdoc themes recipe; without them those recipes fail
+          # on the native side of stage 3.
           git -C "$RUST_SURVEY_DIR" sparse-checkout add \
             src/tools/run-make-support src/build_helper \
-            src/rustdoc-json-types
+            src/rustdoc-json-types src/etc \
+            src/librustdoc/html/static/css
           ls -la "$SURVEY_JSON"
 
       - name: Upload survey
@@ -226,7 +237,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v2
+          key: rust-survey-1.100.0-v3
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -379,7 +390,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v2
+          key: rust-survey-1.100.0-v3
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -452,7 +463,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v2
+          key: rust-survey-1.100.0-v3
           fail-on-cache-miss: true
 
       - name: Download shard results

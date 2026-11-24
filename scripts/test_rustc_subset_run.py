@@ -3810,6 +3810,10 @@ class Stage3ProcedureTests(unittest.TestCase):
                              "x86_64-unknown-linux-gnu")
             self.assertEqual(env["LD_LIB_PATH_ENVVAR"],
                              "LD_LIBRARY_PATH")
+            # htmldocck.py refuses to start without the channel
+            # prefix bootstrap exports for compiletest.
+            self.assertEqual(env["DOC_RUST_LANG_ORG_CHANNEL"],
+                             "https://doc.rust-lang.org/1.100.0")
             self.assertNotIn("CARGO", env)
             env = run.stage3_recipe_env(Path("/rust"), Path("/build"),
                                         "run-make-cargo")

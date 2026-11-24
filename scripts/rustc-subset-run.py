@@ -5320,6 +5320,15 @@ def stage3_recipe_env(rust_dir, build_root, suite):
         # the compiler they invoke; without this the pinned
         # release-channel rustc rejects them all.
         "RUSTC_BOOTSTRAP": "1",
+        # bootstrap exports this for compiletest (the stable
+        # channel's doc.rust-lang.org prefix, version included);
+        # `htmldocck.py` refuses to start without it, and every
+        # recipe that reaches an `htmldocck()` call -- the
+        # rustdoc merge / scrape-examples / out-dir families --
+        # otherwise fails on the native side before the guest
+        # run is even attempted.
+        "DOC_RUST_LANG_ORG_CHANNEL":
+            f"https://doc.rust-lang.org/{TOOLCHAIN}",
     }
     if suite in ("run-make-cargo", "build-std"):
         env["CARGO"] = paths["cargo"]
