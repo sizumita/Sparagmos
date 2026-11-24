@@ -10480,7 +10480,7 @@ impl<'a> Interpreter<'a> {
                 // element: the pointer every buffer consumer
                 // (offsets, copies, reads) resolves against the
                 // vector's element aggregate.
-                self.ptr_first_elem_value(frames, body, vals[0].clone(), None)
+                self.ptr_first_elem_value(frames, body, vals[0].clone(), None, None)
             }
             Builtin::VecExtendTrusted => {
                 arity(2)?;

@@ -11350,6 +11350,7 @@ impl<'a> Interpreter<'a> {
         body: &Body,
         value: Value,
         elem_string: Option<bool>,
+        elem_ty: Option<&Ty>,
     ) -> InterpResult<Value> {
         // A target holding a scalar denotes the scalar's own
         // storage: its first element is the scalar itself, so
@@ -11376,7 +11377,21 @@ impl<'a> Interpreter<'a> {
                         self.read_resolved(frames, &resolved),
                         Ok(v) if scalar_storage_len(&v).is_some()
                     ) {
-                        return Ok(value);
+                        // A byte-width element of a different
+                        // scalar kind than the storage's own (a
+                        // `&[u8]` over a `bool`) does not denote
+                        // the scalar itself: its first element is
+                        // the storage's byte, the appended-index
+                        // form the arms below produce (the same
+                        // judgment `fat_denotes_scalar_element`
+                        // makes for element positions).
+                        if !self.scalar_storage_is_byte_view(
+                            frames,
+                            &resolved,
+                            elem_ty,
+                        ) {
+                            return Ok(value);
+                        }
                     }
                 }
             }
@@ -11429,7 +11444,7 @@ impl<'a> Interpreter<'a> {
                     {
                         Ok(*base)
                     } else {
-                        self.ptr_first_elem_value(frames, body, *base, elem_string)
+                        self.ptr_first_elem_value(frames, body, *base, elem_string, elem_ty)
                     }
                 }
                 Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => Ok(Value::Ref(
@@ -15667,6 +15682,41 @@ impl<'a> Interpreter<'a> {
         Some(out)
     }
 
+    /// Whether the position `target` resolves to is the root
+    /// of a scalar storage viewed through a byte-width element
+    /// of a different scalar kind (a `&[u8]` over a `bool`):
+    /// the position denotes the storage's byte, not the
+    /// scalar. Only a positively identified mismatch answers
+    /// true; an element type that is not a byte-width scalar,
+    /// or a root kind that cannot be determined, answers
+    /// false.
+    fn scalar_storage_is_byte_view(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem_ty: Option<&Ty>,
+    ) -> bool {
+        let Some(elem_ty) = elem_ty else {
+            return false;
+        };
+        let elem_kind = match self.byte_layout_of_ty(elem_ty) {
+            Some(ByteLayout::Scalar(kind)) if kind.width() == 1 => kind,
+            _ => return false,
+        };
+        let Some((projection, _, root_ty, _, _)) =
+            self.byte_view_base(frames, target)
+        else {
+            return false;
+        };
+        if !projection.is_empty() {
+            return false;
+        }
+        match self.byte_layout_of_ty(&root_ty) {
+            Some(ByteLayout::Scalar(root_kind)) => root_kind != elem_kind,
+            _ => false,
+        }
+    }
+
     /// Whether the position a fat dereference left in `target`
     /// is the storage of a scalar-backed slice whose element
     /// type is `elem_ty`: the element is then the scalar the
@@ -19538,7 +19588,7 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrFieldFirstElem(operand, depth) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 let value = self.ptr_field_value(frames, body, value, *depth)?;
-                self.ptr_first_elem_value(frames, body, value, None)
+                self.ptr_first_elem_value(frames, body, value, None, None)
             }
             Rvalue::PtrFirstElem(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -19555,7 +19605,22 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => None,
                 };
-                self.ptr_first_elem_value(frames, body, value, elem_string)
+                let elem_ty = match operand {
+                    Operand::Copy(place) | Operand::Move(place)
+                        if place.projection.is_empty() =>
+                    {
+                        body.local_ty(place.local)
+                            .and_then(|ty| fat_slice_elem_ty(&ty))
+                    }
+                    _ => None,
+                };
+                self.ptr_first_elem_value(
+                    frames,
+                    body,
+                    value,
+                    elem_string,
+                    elem_ty.as_ref(),
+                )
             }
             Rvalue::PtrCastUnits(operand, from_size) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -20412,6 +20477,20 @@ fn projection_ends_at_element(projection: &[RefProj]) -> bool {
 /// denotes element `k` of the container the index step ranges
 /// over, entered the way every element of that container is.
 /// Any other shape answers `None`.
+/// The element type of the fat pointer type `ty` (a
+/// reference to a slice or to an array), when the type
+/// says it.
+fn fat_slice_elem_ty(ty: &Ty) -> Option<Ty> {
+    let pointee = match ty {
+        Ty::Ref(pointee) => pointee,
+        _ => return None,
+    };
+    match &**pointee {
+        Ty::Slice(elem) | Ty::Array(elem, _) => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
 /// Whether the elements of the fat pointer type `ty` (a
 /// reference to a slice, or to `str`) are string carriers: an
 /// element whose stored value is the string data itself (a

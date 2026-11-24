@@ -15324,6 +15324,59 @@ fn run_mode_slice_scalar_backed_byte_view_of_bool() {
     );
 }
 
+const SLICE_SCALAR_BACKED_BYTE_VIEW_AS_PTR_SRC: &str = r#"
+fn main() {
+    let b = true;
+    let bytes = unsafe { std::slice::from_raw_parts(&b as *const bool as *const u8, 1) };
+    let p: *const u8 = bytes.as_ptr();
+    let n: u8 = unsafe { *p };
+    println!("n={n}");
+    let r: &u8 = unsafe { &*bytes.as_ptr() };
+    println!("r={r}");
+    let b2 = false;
+    let bytes2 = unsafe { std::slice::from_raw_parts(&b2 as *const bool as *const u8, 1) };
+    let r2: &u8 = unsafe { &*bytes2.as_ptr() };
+    println!("r2={r2}");
+    let m = -1i8;
+    let sbytes = unsafe { std::slice::from_raw_parts(&m as *const i8 as *const u8, 1) };
+    let sr: &u8 = unsafe { &*sbytes.as_ptr() };
+    println!("s={sr}");
+    let same = unsafe { std::slice::from_raw_parts(&b as *const bool as *const bool, 1) };
+    let br: &bool = unsafe { &*same.as_ptr() };
+    println!("same={br}");
+    let mut b3 = false;
+    let mbytes = unsafe { std::slice::from_raw_parts_mut(&mut b3 as *mut bool as *mut u8, 1) };
+    unsafe { *mbytes.as_mut_ptr() = 1u8; }
+    println!("w={b3}");
+}
+"#;
+
+#[test]
+fn run_mode_slice_scalar_backed_byte_view_as_ptr() {
+    // The first-element pointer a byte view of a scalar's
+    // storage extracts (`as_ptr` / `as_mut_ptr`) denotes the
+    // storage's byte, not the scalar itself: the scalar
+    // shortcut in the pointer extraction returned the storage
+    // pointer as it stands, so a consumer resolving the
+    // reference the pointer forms directly printed the boolean
+    // (`true` instead of `1`), and a byte write through
+    // `as_mut_ptr` met the boolean place's type check and
+    // failed. A same-kind view's pointer still denotes the
+    // scalar itself. Expected output is the native result of
+    // the same source.
+    let dir = temp_dir("slice-scalar-backed-byte-view-as-ptr");
+    let src = fixture(&dir, "case.rs", SLICE_SCALAR_BACKED_BYTE_VIEW_AS_PTR_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "n=1\nr=1\nr2=0\ns=255\nsame=true\nw=true\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }
