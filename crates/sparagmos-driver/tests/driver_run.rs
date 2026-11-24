@@ -27124,3 +27124,550 @@ fn run_mode_extern_static_field_prefix_slice_first_keeps_full_storage() {
         "d0=10 d1=20 sentinel=7\n",
     );
 }
+
+// ----- Required constants of collected instances (mono collector) -----
+
+const REQUIRED_CONST_DEAD_FN_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+#[inline(never)]
+fn called<T>() {
+    if false {
+        not_called::<T>();
+    }
+}
+fn main() {
+    called::<i32>();
+}
+"#;
+
+const REQUIRED_CONST_FNPTR_IN_CONST_SRC: &str = r#"
+struct Late<T>(T);
+impl<T> Late<T> {
+    const FAIL: () = panic!();
+    const FNPTR: fn() = || Self::FAIL;
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Late::<T>::FNPTR;
+    }
+}
+#[inline(never)]
+fn called<T>() {
+    if false {
+        not_called::<T>();
+    }
+}
+fn main() {
+    called::<i32>();
+}
+"#;
+
+const REQUIRED_CONST_UNMENTIONED_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_dead_mention_is_a_compile_failure() {
+    // rustc's mono collector evaluates the required constants of
+    // every instance it collects, following mentions recorded
+    // before optimization: `called::<i32>` mentions
+    // `not_called::<i32>` from dead code, and that body's required
+    // constant `Fail::<i32>::C` panics in evaluation (E0080), so
+    // the crate fails to compile even though the bad constant is
+    // never demanded by the converted (post-optimization) bodies.
+    let dir = temp_dir("required-const-dead-fn");
+    let src = fixture(&dir, "required_const_dead_fn.rs", REQUIRED_CONST_DEAD_FN_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind a dead-code mention must fail \
+         compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_required_const_behind_fnptr_const_is_a_compile_failure() {
+    // The failing constant hides one more hop away: evaluating
+    // `Late::<i32>::FNPTR` succeeds and yields a closure pointer,
+    // and the collector collects that closure instance, whose own
+    // required constant `Late::<i32>::FAIL` fails to evaluate.
+    let dir = temp_dir("required-const-fnptr");
+    let src = fixture(
+        &dir,
+        "required_const_fnptr.rs",
+        REQUIRED_CONST_FNPTR_IN_CONST_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind a function-pointer constant \
+         must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_required_const_never_mentioned_converts() {
+    // The same failing constant in a generic function that no
+    // collected instance mentions: rustc never collects it, never
+    // evaluates the constant, and the crate compiles. The check
+    // must not fire either — it only walks from the instances
+    // collection actually resolved.
+    let dir = temp_dir("required-const-unmentioned");
+    let src = fixture(
+        &dir,
+        "required_const_unmentioned.rs",
+        REQUIRED_CONST_UNMENTIONED_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in a never-mentioned generic \
+         function must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_BEHIND_UNREACHABLE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn leaf<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn bad<T>() {
+    if false {
+        leaf::<T>();
+    }
+}
+fn unused() {
+    bad::<i32>();
+}
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_unreachable_caller_converts() {
+    // `bad::<i32>` is demanded by conversion only because the
+    // unreachable private function `unused` calls it; the mono
+    // collector never roots it, so it never reaches `leaf::<i32>`
+    // and never evaluates the panicking constant. rustc compiles
+    // the crate, and the check must not fire either: its roots are
+    // the collector's roots, not every instance conversion
+    // demanded. (The constant sits one mention hop behind the
+    // demanded instance because conversion itself materializes the
+    // constants of the bodies it converts; what is exercised here
+    // is that the check does not start from `bad` at all.)
+    let dir = temp_dir("required-const-unreachable");
+    let src = fixture(
+        &dir,
+        "required_const_unreachable.rs",
+        REQUIRED_CONST_BEHIND_UNREACHABLE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant reachable only from an \
+         unreachable function must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_BEHIND_FN_ITEM_VALUE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn bad<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+#[inline(never)]
+fn hold<U>(x: U) {
+    std::hint::black_box(x);
+}
+#[inline(never)]
+fn outer<T>() {
+    hold(bad::<T>);
+}
+fn main() {
+    if false {
+        outer::<i32>();
+    }
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_fn_item_value_converts() {
+    // Passing the function item `bad::<T>` as a value to a generic
+    // function that never calls it does not reify a function
+    // pointer and does not codegen `bad`'s body: a bare `FnDef`
+    // constant operand is a zero-sized function-item value, not a
+    // collected item. The walk reaches `outer::<i32>` through its
+    // mention from `main`, but must not demand `bad::<i32>` from
+    // the operand, so the panicking constant is never evaluated
+    // and the crate converts, as it does under rustc.
+    let dir = temp_dir("required-const-fn-item-value");
+    let src = fixture(
+        &dir,
+        "required_const_fn_item_value.rs",
+        REQUIRED_CONST_BEHIND_FN_ITEM_VALUE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant behind a bare function-item \
+         value must convert; stderr={stderr}"
+    );
+}
+const REQUIRED_CONST_BEHIND_UNCALLED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn hold<U>(x: U) {
+    std::hint::black_box(x);
+}
+#[inline(never)]
+fn outer<T>() {
+    hold(|| {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+    });
+}
+fn main() {
+    if false {
+        outer::<i32>();
+    }
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_uncalled_closure_converts() {
+    // Passing a captureless closure as a value to a generic
+    // function that never calls it does not codegen the closure
+    // body: a bare closure constant operand is a zero-sized
+    // value, not a collected item. The walk reaches
+    // `outer::<i32>` through its mention from `main`, but must
+    // not demand the closure instance from the operand, so the
+    // panicking constant in the closure body is never evaluated
+    // and the crate converts, as it does under rustc.
+    let dir = temp_dir("required-const-uncalled-closure");
+    let src = fixture(
+        &dir,
+        "required_const_uncalled_closure.rs",
+        REQUIRED_CONST_BEHIND_UNCALLED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant behind an uncalled closure \
+         value must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_IN_CALLED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn main() {
+    let f = || {
+        let _ = Fail::<i32>::C;
+    };
+    f();
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_called_closure_is_a_compile_failure() {
+    // A closure that is actually called IS collected: the call
+    // names the `FnOnce` trait method, whose resolution reaches
+    // the closure instance, and the collector evaluates the
+    // closure body's required constants. `Fail::<i32>::C`
+    // panics in evaluation (E0080), so the crate fails to
+    // compile, exactly as under rustc.
+    let dir = temp_dir("required-const-called-closure");
+    let src = fixture(
+        &dir,
+        "required_const_called_closure.rs",
+        REQUIRED_CONST_IN_CALLED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant in a called closure must \
+         fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_IN_COERCED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn main() {
+    let f: fn() = || {
+        let _ = Fail::<i32>::C;
+    };
+    std::hint::black_box(f);
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_coerced_closure_is_a_compile_failure() {
+    // A closure coerced to a function pointer IS collected:
+    // the coercion is a mentioned item that resolves the
+    // closure instance, and the collector evaluates its
+    // required constants. `Fail::<i32>::C` panics in evaluation
+    // (E0080), so the crate fails to compile, exactly as under
+    // rustc.
+    let dir = temp_dir("required-const-coerced-closure");
+    let src = fixture(
+        &dir,
+        "required_const_coerced_closure.rs",
+        REQUIRED_CONST_IN_COERCED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant in a closure coerced to a \
+         function pointer must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_UNSIZE_DOUBLE_REF_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+fn main() {
+    let w = W(7u8);
+    let d: &dyn Trait = &&w;
+    println!("{}", d.method());
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_sibling_unsize_impl_converts() {
+    // The unsizing cast `&&W<u8>` -> `&dyn Trait` forms the
+    // vtable for `&W<u8>`, whose method carries no required
+    // constants. The sibling implementation for `W<u8>` is never
+    // collected, so its method's failing required constant is
+    // never evaluated and the crate compiles, exactly as under
+    // rustc. (A tail search that peels the cast's source and
+    // target independently strips both source references, forms
+    // the vtable for `W<u8>` instead, and wrongly rejects this.)
+    let dir = temp_dir("required-const-unsize-double-ref");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_double_ref.rs",
+        REQUIRED_CONST_UNSIZE_DOUBLE_REF_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in the sibling impl of an \
+         unsizing cast must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_UNSIZE_DEAD_GENERIC_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+#[inline(never)]
+fn cast_dead<T>(w: &W<T>) {
+    let d: &dyn Trait = &w;
+    println!("{}", d.method());
+}
+#[inline(never)]
+fn caller<T>(w: &W<T>) {
+    if false {
+        cast_dead::<T>(w);
+    }
+}
+fn main() {
+    let w = W(7u8);
+    caller::<u8>(&w);
+    println!("done");
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_sibling_unsize_impl_in_dead_generic_converts() {
+    // The same cast one mention further away: the generic
+    // function holding it is mentioned only from dead code of a
+    // called function, which the walk still follows. The cast
+    // forms the vtable for `&W<u8>`, so the failing required
+    // constant in `W<u8>`'s sibling implementation is never
+    // evaluated and the crate compiles.
+    let dir = temp_dir("required-const-unsize-dead-generic");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_dead_generic.rs",
+        REQUIRED_CONST_UNSIZE_DEAD_GENERIC_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in the sibling impl of an \
+         unsizing cast inside a dead-mentioned generic function \
+         must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_UNSIZE_VTABLE_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+fn main() {
+    let w = W(7u8);
+    let d: &dyn Trait = &w;
+    println!("{}", d.method());
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_unsize_vtable_is_a_compile_failure() {
+    // The direct shape, as a control: `&W<u8>` unsizing to
+    // `&dyn Trait` forms the vtable for `W<u8>` itself, so the
+    // collector collects its method and evaluates its failing
+    // required constant (E0080); the crate fails to compile,
+    // exactly as under rustc.
+    let dir = temp_dir("required-const-unsize-vtable");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_vtable.rs",
+        REQUIRED_CONST_UNSIZE_VTABLE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind an unsizing cast's \
+         own vtable must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}

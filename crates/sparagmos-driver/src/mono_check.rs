@@ -63,6 +63,20 @@
 //!   generation reads; named constants reach this check already
 //!   evaluated by the compiler's own constant conversion).
 //!
+//! - Required constants of collected instances (rustc's E0080 at
+//!   monomorphization time): the mono collector evaluates every
+//!   required constant of every instance it collects — dead code
+//!   included — and follows the items a body mentions (calls,
+//!   drops, unsizing casts, closures recorded before optimization)
+//!   to instances whose own constants it then evaluates the same
+//!   way. Stable MIR bodies are post-optimization, so a mention
+//!   that lives only in dead code is gone from them and the
+//!   failing constant behind it is never demanded; conversion
+//!   alone therefore succeeds where rustc fails. The check below
+//!   (`check_required_consts`) replays the collector's walk over
+//!   the compiler's internal bodies, which keep both the required
+//!   constants and the mentioned items from before optimization.
+//!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
 //! positively present, mirroring the corresponding rustc error.
@@ -1088,5 +1102,767 @@ fn check_simd_family(
             None
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Required constants of collected instances
+// ---------------------------------------------------------------------
+
+/// Upper bound on the instances one required-constant walk visits.
+/// Conversion itself collects at most a few thousand instance
+/// bodies per program; the walk additionally follows mentions into
+/// instances conversion never demanded (dead-code mentions), and
+/// the cap keeps a pathological mention graph from turning the
+/// check into a second full collection. Reaching the cap only
+/// narrows the check, never widens it.
+const MAX_REQUIRED_CONST_WALK: usize = 8192;
+
+fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
+    rustc_middle::ty::TypingEnv::fully_monomorphized()
+}
+
+/// Mirror of the constant evaluation rustc's monomorphization
+/// collector performs (`MirUsedCollector` in rustc_monomorphize):
+/// for every instance it collects, the collector evaluates the
+/// body's required constants — every unevaluated constant operand
+/// of the pre-optimization body, dead code included — and a
+/// constant whose evaluation is already reported as an error
+/// (E0080) fails the whole compilation. It reaches those bodies
+/// not only through live calls: the items a body *mentions*
+/// (calls, drops, unsizing casts and closure coercions recorded
+/// before optimization, so dead code still mentions them) and the
+/// function pointers inside evaluated constant values are all
+/// collected and checked the same way.
+///
+/// The driver's own collection walks Stable MIR bodies, which are
+/// post-optimization: a mention that lives only in dead code is
+/// gone from them, and the failing constant it leads to is never
+/// demanded, so conversion succeeds where rustc fails (the
+/// `tests/ui/consts/required-consts` family). This check replays
+/// the collector's walk over the compiler's internal bodies —
+/// which keep both the required constants and the mentioned items
+/// from before optimization — starting from the same roots
+/// the collector itself starts from (see
+/// `RequiredConstWalk::collect_roots`).
+///
+/// Only a positively reported evaluation error is a finding: a
+/// constant that stays too generic after substitution, an instance
+/// whose body the compiler cannot produce here, and any internal
+/// panic while walking are all "could not determine", never a
+/// failure — the same discipline as the layout check above.
+/// (Evaluating a failing constant also emits rustc's own E0080
+/// diagnostic into the session, which is how the failure surfaces
+/// in practice — the same emission that fails the compilation
+/// under rustc; the returned string is the driver's own record of
+/// the finding.)
+pub fn check_required_consts() -> Option<String> {
+    let tcx = crate::convert::compiler_tcx()?;
+    let mut walk = RequiredConstWalk {
+        tcx,
+        visited: std::collections::HashSet::new(),
+        visited_allocs: std::collections::HashSet::new(),
+        queue: std::collections::VecDeque::new(),
+        finding: None,
+    };
+    walk.collect_roots();
+    walk.run();
+    walk.finding
+}
+
+struct RequiredConstWalk<'tcx> {
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    visited: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
+    visited_allocs: std::collections::HashSet<rustc_middle::mir::interpret::AllocId>,
+    queue: std::collections::VecDeque<rustc_middle::ty::Instance<'tcx>>,
+    finding: Option<String>,
+}
+
+impl<'tcx> RequiredConstWalk<'tcx> {
+    fn run(&mut self) {
+        while let Some(instance) = self.queue.pop_front() {
+            if self.finding.is_some() {
+                return;
+            }
+            // Instance-body access and constant evaluation go
+            // through the compiler's internals and can panic on
+            // exotic instances (foreign bodies with no MIR here,
+            // shim shapes the queries do not expect). A panic
+            // abandons that instance's walk, never the check.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.process(instance);
+            }));
+        }
+    }
+
+    fn enqueue(&mut self, instance: rustc_middle::ty::Instance<'tcx>) {
+        use rustc_middle::ty::InstanceKind;
+        match instance.def {
+            // Intrinsics have no body to walk, and a virtual
+            // instance's body is the trait definition's (its
+            // constants are only evaluated for the concrete
+            // instances the walk reaches separately).
+            InstanceKind::Intrinsic(_)
+            | InstanceKind::LlvmIntrinsic(_)
+            | InstanceKind::Virtual(_, _) => return,
+            _ => {}
+        }
+        if self.visited.len() >= MAX_REQUIRED_CONST_WALK {
+            return;
+        }
+        if self.visited.insert(instance) {
+            self.queue.push_back(instance);
+        }
+    }
+
+    /// Seed the walk with the roots the monomorphization
+    /// collector itself starts from (`RootCollector` in
+    /// rustc_monomorphize, under the lazy collection strategy —
+    /// the eager strategy is selected only by `-Zlink-dead-code`,
+    /// which the driver does not pass):
+    ///
+    /// - the crate's entry point, when it has one;
+    /// - every non-generic local function the reachability
+    ///   analysis marks as a root — the entry point, exported and
+    ///   `#[used]` functions, and the non-generic functions they
+    ///   reference — plus functions carrying the internal-symbol
+    ///   flags the collector also treats as roots;
+    /// - every local static: collecting a static evaluates its
+    ///   initializer, and a non-nested static's type also gets
+    ///   its drop glue collected.
+    ///
+    /// The instances the driver's own demand passes resolved are
+    /// NOT roots. Conversion translates every local body,
+    /// reachable or not, so a demand originating in an
+    /// unreferenced private function would seed the walk with an
+    /// instance rustc never collects, and a failing constant
+    /// inside it would fail a compilation rustc accepts.
+    /// Everything the collector does collect is reached from
+    /// these roots by the mention walk, exactly as in the
+    /// compiler.
+    fn collect_roots(&mut self) {
+        let tcx = self.tcx;
+        if let Some((entry_def_id, _)) = tcx.entry_fn(()) {
+            self.enqueue(rustc_middle::ty::Instance::mono(tcx, entry_def_id));
+        }
+        for local_def_id in tcx.iter_local_def_id() {
+            if self.finding.is_some() {
+                return;
+            }
+            let def_id = local_def_id.to_def_id();
+            // The root queries can panic on exotic items; a
+            // panic abandons that root, never the check (the
+            // same discipline as the per-instance walk in `run`).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Foreign items (the contents of `extern`
+                // blocks) are never roots: the collector's item
+                // visitor does not process them, an extern
+                // function has no body to collect, and an extern
+                // static has no initializer to evaluate (asking
+                // for one is an internal compiler error).
+                if tcx.is_foreign_item(def_id) {
+                    return;
+                }
+                match tcx.def_kind(def_id) {
+                    rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn => {
+                        if tcx.generics_of(def_id).requires_monomorphization(tcx) {
+                            return;
+                        }
+                        let flags = tcx.codegen_fn_attrs(def_id).flags;
+                        if tcx.is_reachable_non_generic(def_id)
+                            || flags.intersects(
+                                rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+                                    | rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM,
+                            )
+                        {
+                            self.enqueue(rustc_middle::ty::Instance::mono(tcx, def_id));
+                        }
+                    }
+                    rustc_hir::def::DefKind::Static { nested, .. } => {
+                        self.collect_root_static(def_id, nested);
+                    }
+                    _ => {}
+                }
+            }));
+        }
+    }
+
+    /// Collect one root static the way the collector visits a
+    /// `MonoItem::Static`: evaluate its initializer and follow
+    /// the allocations it points into (an evaluation error
+    /// reported there is the same failure class as a required
+    /// constant's), and collect the drop glue of a non-nested
+    /// static's type.
+    fn collect_root_static(&mut self, def_id: rustc_span::def_id::DefId, nested: bool) {
+        let tcx = self.tcx;
+        if !nested {
+            let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
+            let ty = instance.ty(tcx, fully_monomorphized());
+            let glue = rustc_middle::ty::Instance::resolve_drop_glue(tcx, ty);
+            self.enqueue(glue);
+        }
+        match tcx.eval_static_initializer(def_id) {
+            Ok(alloc) => self.chase_allocation(alloc),
+            Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                self.finding = Some(format!(
+                    "initializer of static `{}` failed to evaluate \
+                     (rustc reports the evaluation error during \
+                     monomorphization collection)",
+                    tcx.def_path_str(def_id)
+                ));
+            }
+            Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
+        }
+    }
+
+    /// Instantiate a value read from `instance`'s body with the
+    /// instance's arguments, normalizing projections away. The
+    /// collector does this with the `try_` variant and simply
+    /// does not collect an item that fails to normalize (the
+    /// panicking variant reports an internal error instead), so
+    /// a failure here yields `None` and the item is skipped.
+    fn monomorphize<T>(&self, instance: rustc_middle::ty::Instance<'tcx>, value: T) -> Option<T>
+    where
+        T: rustc_middle::ty::TypeFoldable<rustc_middle::ty::TyCtxt<'tcx>>,
+    {
+        instance
+            .try_instantiate_mir_and_normalize_erasing_regions(
+                self.tcx,
+                fully_monomorphized(),
+                rustc_middle::ty::EarlyBinder::bind(self.tcx, value),
+            )
+            .ok()
+    }
+
+    fn process(&mut self, instance: rustc_middle::ty::Instance<'tcx>) {
+        let tcx = self.tcx;
+        // The collector only walks instances it would codegen
+        // locally: a foreign instance's constants were evaluated
+        // when its home crate was compiled (or never, if it was
+        // never collected there either), and its body may not be
+        // available here at all.
+        if !tcx.should_codegen_locally(instance) {
+            return;
+        }
+        // Shim instances are handled by kind. Drop glue and
+        // fn-pointer shim bodies are walked: a type's destructor
+        // and field drops live in the former, and the latter's
+        // body is what calls the pointee instance. The reify and
+        // closure `call_once` shims are instead followed to the
+        // instance they forward to — building a reify shim's
+        // body for a closure is not even safe (it asks for the
+        // closure's `fn_sig`, which the compiler refuses with
+        // "use `args.as_closure().sig()`"), while the target
+        // instance is the one whose constants the collector
+        // evaluates. The remaining shims are synthetic thunks
+        // whose targets the walk reaches by other edges (vtable
+        // methods via unsizing casts) or not at all
+        // (data-dependent callees).
+        if let rustc_middle::ty::InstanceKind::Shim(shim) = instance.def {
+            use rustc_middle::ty::ShimKind;
+            match shim {
+                ShimKind::DropGlue(..) | ShimKind::AsyncDropGlue(..) | ShimKind::FnPtr(..) => {}
+                ShimKind::Reify(def_id, _) => {
+                    self.enqueue_resolved(def_id, instance.args);
+                    return;
+                }
+                ShimKind::ClosureOnce { closure, .. } => {
+                    self.enqueue_resolved(closure, instance.args);
+                    return;
+                }
+                _ => return,
+            }
+        }
+        let body = tcx.instance_mir(instance.def);
+        self.process_body(instance, body);
+    }
+
+    /// Resolve `(def_id, args)` the way the collector resolves a
+    /// mentioned function item and queue the instance for the
+    /// walk. Unresolvable or generic instances are not collected
+    /// by the compiler either, so they are simply not queued.
+    fn enqueue_resolved(
+        &mut self,
+        def_id: rustc_span::def_id::DefId,
+        args: rustc_middle::ty::GenericArgsRef<'tcx>,
+    ) {
+        let tcx = self.tcx;
+        let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rustc_middle::ty::Instance::try_resolve(tcx, typing_env, def_id, args)
+        }));
+        if let Ok(Ok(Some(target))) = resolved {
+            self.enqueue(target);
+        }
+    }
+
+    fn process_body(
+        &mut self,
+        instance: rustc_middle::ty::Instance<'tcx>,
+        body: &rustc_middle::mir::Body<'tcx>,
+    ) {
+        use rustc_middle::mir::visit::Visitor as _;
+        let tcx = self.tcx;
+        // The collector evaluates every required constant of the
+        // body it collects (the list is taken from the
+        // pre-optimization body, so dead code is included).
+        for const_op in body.required_consts() {
+            let Some(mono_const) = self.monomorphize(instance, const_op.const_) else {
+                continue;
+            };
+            match mono_const.eval(tcx, fully_monomorphized(), const_op.span) {
+                Ok(value) => self.chase_value(value),
+                Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                    self.finding = Some(required_const_finding(tcx, instance));
+                    return;
+                }
+                Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
+            }
+            if self.finding.is_some() {
+                return;
+            }
+        }
+        // The items the body mentions: their instances' required
+        // constants are evaluated by the collector exactly like
+        // this body's. Item bodies carry the mentions the compiler
+        // recorded before optimization; shim bodies may carry
+        // none, so there the mentions are recomputed with the
+        // same visitor the compiler uses (`MentionScan`).
+        let mut mentions: Vec<rustc_middle::mir::MentionedItem<'tcx>> = body
+            .mentioned_items()
+            .iter()
+            .map(|spanned| spanned.node)
+            .collect();
+        if mentions.is_empty() {
+            let mut scan = MentionScan {
+                tcx,
+                body,
+                mentioned: Vec::new(),
+            };
+            scan.visit_body(body);
+            mentions = scan.mentioned;
+        }
+        for item in mentions {
+            let Some(item) = self.monomorphize(instance, item) else {
+                continue;
+            };
+            self.visit_mentioned(item);
+            if self.finding.is_some() {
+                return;
+            }
+        }
+        // Constant operands of the reachable blocks: the scan
+        // evaluates each one and chases the value into the
+        // allocations it points at (which can hold further
+        // instances and statics). A function item or closure
+        // used as a plain value is not collected from here; it
+        // is collected through the mentioned items above where
+        // it is actually used as a function.
+        let mut scan = OperandScan {
+            walk: self,
+            instance,
+        };
+        for (bb, data) in rustc_middle::mir::traversal::mono_reachable(body, tcx, instance) {
+            scan.visit_basic_block_data(bb, data);
+            if scan.walk.finding.is_some() {
+                return;
+            }
+        }
+    }
+    fn visit_mentioned(&mut self, item: rustc_middle::mir::MentionedItem<'tcx>) {
+        use rustc_middle::mir::MentionedItem;
+        let tcx = self.tcx;
+        match item {
+            MentionedItem::Fn(ty) => {
+                if let rustc_middle::ty::FnDef(def_id, args) = *ty.kind() {
+                    if let Some(args) = args.no_bound_vars() {
+                        if let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
+                            tcx,
+                            fully_monomorphized(),
+                            def_id,
+                            args,
+                        ) {
+                            self.enqueue(instance);
+                        }
+                    }
+                }
+            }
+            MentionedItem::Drop(ty) => {
+                let instance = rustc_middle::ty::Instance::resolve_drop_glue(tcx, ty);
+                self.enqueue(instance);
+            }
+            MentionedItem::Closure(ty) => {
+                if let rustc_middle::ty::Closure(def_id, args) = *ty.kind() {
+                    let instance = rustc_middle::ty::Instance::resolve_closure(
+                        tcx,
+                        def_id,
+                        args,
+                        rustc_middle::ty::ClosureKind::FnOnce,
+                    );
+                    self.enqueue(instance);
+                }
+            }
+            MentionedItem::UnsizeCast {
+                source_ty,
+                target_ty,
+            } => {
+                // Only the direct shape is chased: a concrete type
+                // unsized to a trait object, whose vtable's method
+                // instances the collector collects. The cast's
+                // operand types are the pointer types (`&Vec<T>`
+                // unsizing to `&dyn Trait`); the tails the vtable
+                // is formed for are found by traversing the two
+                // operand types together, the way the collector's
+                // tail search does (see `find_unsize_tails`). (A
+                // vtable formed through the tail of a custom
+                // unsizing struct is reached here through the
+                // constant value carrying it whenever one was
+                // evaluated, and the remaining shapes only narrow
+                // the check.)
+                let (source_ty, target_ty) = find_unsize_tails(tcx, source_ty, target_ty);
+                if target_ty.is_trait() && !source_ty.is_trait() {
+                    if let rustc_middle::ty::Dynamic(data, _) = target_ty.kind() {
+                        if let Some(principal) = data.principal() {
+                            let principal = tcx.instantiate_bound_regions_with_erased(principal);
+                            let alloc_id = tcx.vtable_allocation((source_ty, Some(principal)));
+                            self.chase_alloc(alloc_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Follow a constant value into the allocation it points at:
+    /// the collector collects the function instances and statics
+    /// inside evaluated constants (a function pointer constant
+    /// whose target body holds a failing required constant is the
+    /// `collect-in-dead-fnptr-in-const` shape).
+    fn chase_value(&mut self, value: rustc_middle::mir::ConstValue) {
+        use rustc_middle::mir::interpret::Scalar;
+        match value {
+            rustc_middle::mir::ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
+                self.chase_alloc(ptr.provenance.alloc_id());
+            }
+            rustc_middle::mir::ConstValue::Indirect { alloc_id, .. }
+            | rustc_middle::mir::ConstValue::Slice { alloc_id, .. } => {
+                self.chase_alloc(alloc_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn chase_alloc(&mut self, alloc_id: rustc_middle::mir::interpret::AllocId) {
+        if self.finding.is_some() || !self.visited_allocs.insert(alloc_id) {
+            return;
+        }
+        use rustc_middle::mir::interpret::GlobalAlloc;
+        match self.tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Function { instance, .. } => self.enqueue(instance),
+            GlobalAlloc::Static(def_id) => {
+                // A static the collector reaches is code-generated,
+                // which evaluates its initializer; an evaluation
+                // error there is the same class of failure. A
+                // foreign static (an `extern` block item) is never
+                // collected and has no initializer to evaluate
+                // (asking for one is an internal compiler error),
+                // so it is left alone, as are thread-local statics,
+                // whose initialization is lazy and likewise not
+                // evaluated by the collector.
+                if self.tcx.is_foreign_item(def_id) || self.tcx.is_thread_local_static(def_id) {
+                    return;
+                }
+                match self.tcx.eval_static_initializer(def_id) {
+                    Ok(alloc) => self.chase_allocation(alloc),
+                    Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                        self.finding = Some(format!(
+                            "initializer of static `{}` failed to evaluate \
+                             (rustc reports the evaluation error during \
+                             monomorphization collection)",
+                            self.tcx.def_path_str(def_id)
+                        ));
+                    }
+                    Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
+                }
+            }
+            // A type-id allocation holds no instances or statics.
+            GlobalAlloc::TypeId { .. } => {}
+            GlobalAlloc::Memory(alloc) => self.chase_allocation(alloc),
+            GlobalAlloc::VTable(ty, dyn_ty) => {
+                // Collect the vtable's method instances the way
+                // the collector does for a vtable allocation
+                // (`create_mono_items_for_vtable_methods`): the
+                // entries of the principal trait, plus the drop
+                // glue when the type needs dropping. (Chasing the
+                // vtable allocation itself cannot reach them: the
+                // allocation id is the one this very call is
+                // visiting, so the visited set would turn the
+                // chase away.)
+                if let Some(principal) = dyn_ty.principal() {
+                    let principal = self.tcx.instantiate_bound_regions_with_erased(principal);
+                    let trait_ref = principal.with_self_ty(self.tcx, ty);
+                    for entry in self.tcx.vtable_entries(trait_ref) {
+                        if let rustc_middle::ty::VtblEntry::Method(instance) = entry {
+                            self.enqueue(*instance);
+                        }
+                    }
+                    if ty.needs_drop(self.tcx, fully_monomorphized()) {
+                        let glue = rustc_middle::ty::Instance::resolve_drop_glue(self.tcx, ty);
+                        self.enqueue(glue);
+                    }
+                }
+            }
+        }
+    }
+
+    fn chase_allocation(&mut self, alloc: rustc_middle::mir::interpret::ConstAllocation<'tcx>) {
+        let ptrs = alloc.inner().provenance().ptrs();
+        for &prov in ptrs.values() {
+            self.chase_alloc(prov.alloc_id());
+            if self.finding.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+/// Find the tails of an unsizing cast's operand types the way the
+/// collector's `find_tails_for_unsizing` does: the source and the
+/// target are traversed together, never independently. One pointer
+/// layer (a reference, a raw pointer or a box) is peeled from both
+/// sides at once, and from there the two types descend in lockstep
+/// (see `unsize_lockstep_tails`) for as long as they keep the same
+/// shape, stopping when they diverge — in particular when the
+/// target reaches the trait object. So `&&W<T>` unsizing to
+/// `&dyn Trait` forms the vtable for `&W<T>`: the traversal stops
+/// with the target at `dyn Trait` after peeling one layer.
+/// Peeling each side on its own would strip both source
+/// references and select the implementation for `W<T>` instead.
+fn find_unsize_tails<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    source_ty: rustc_middle::ty::Ty<'tcx>,
+    target_ty: rustc_middle::ty::Ty<'tcx>,
+) -> (rustc_middle::ty::Ty<'tcx>, rustc_middle::ty::Ty<'tcx>) {
+    let pointees = match (source_ty.kind(), target_ty.kind()) {
+        (
+            &rustc_middle::ty::Ref(_, source_pointee, _),
+            &rustc_middle::ty::Ref(_, target_pointee, _)
+            | &rustc_middle::ty::RawPtr(target_pointee, _),
+        )
+        | (
+            &rustc_middle::ty::RawPtr(source_pointee, _),
+            &rustc_middle::ty::RawPtr(target_pointee, _),
+        ) => Some((source_pointee, target_pointee)),
+        _ => match (source_ty.boxed_ty(), target_ty.boxed_ty()) {
+            (Some(source_boxed), Some(target_boxed)) => Some((source_boxed, target_boxed)),
+            _ => None,
+        },
+    };
+    match pointees {
+        Some((source, target)) => unsize_lockstep_tails(tcx, source, target),
+        None => (source_ty, target_ty),
+    }
+}
+
+/// The lockstep half of the tail search (the collector's
+/// `struct_lockstep_tails_for_codegen`): descend both types
+/// through the tail field of a struct both sides instantiate, or
+/// through the last element of equal-length tuples, for as long
+/// as they keep the same shape.
+fn unsize_lockstep_tails<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    mut source: rustc_middle::ty::Ty<'tcx>,
+    mut target: rustc_middle::ty::Ty<'tcx>,
+) -> (rustc_middle::ty::Ty<'tcx>, rustc_middle::ty::Ty<'tcx>) {
+    loop {
+        match (source.kind(), target.kind()) {
+            (
+                &rustc_middle::ty::Adt(source_def, source_args),
+                &rustc_middle::ty::Adt(target_def, target_args),
+            ) if source_def == target_def && source_def.is_struct() => {
+                let Some(field) = source_def.non_enum_variant().tail_opt() else {
+                    break;
+                };
+                source = tcx
+                    .normalize_erasing_regions(fully_monomorphized(), field.ty(tcx, source_args));
+                target = tcx
+                    .normalize_erasing_regions(fully_monomorphized(), field.ty(tcx, target_args));
+            }
+            (&rustc_middle::ty::Tuple(source_tys), &rustc_middle::ty::Tuple(target_tys))
+                if source_tys.len() == target_tys.len() =>
+            {
+                let (Some(&source_last), Some(&target_last)) =
+                    (source_tys.last(), target_tys.last())
+                else {
+                    break;
+                };
+                source = source_last;
+                target = target_last;
+            }
+            _ => break,
+        }
+    }
+    (source, target)
+}
+
+fn required_const_finding(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    instance: rustc_middle::ty::Instance<'_>,
+) -> String {
+    format!(
+        "required constant of `{}` failed to evaluate \
+         (rustc reports the evaluation error during \
+         monomorphization collection)",
+        tcx.def_path_str(instance.def.def_id())
+    )
+}
+
+/// Recompute a body's mentioned items the way the compiler's
+/// `MentionedItems` pass does (rustc_mir_transform's
+/// `MentionedItemsVisitor`, kept in sync with the mono collector's
+/// own visitor): calls and tail calls, drops, inline-asm function
+/// symbols, unsizing casts that may form a vtable, and closures or
+/// function items coerced to function pointers. The pass stores
+/// its result on item bodies; shim bodies may carry no recording,
+/// so for those the recording is reproduced here from the same
+/// input the pass would read.
+struct MentionScan<'a, 'tcx> {
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &'a rustc_middle::mir::Body<'tcx>,
+    mentioned: Vec<rustc_middle::mir::MentionedItem<'tcx>>,
+}
+
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for MentionScan<'_, 'tcx> {
+    fn visit_terminator(
+        &mut self,
+        terminator: &rustc_middle::mir::Terminator<'tcx>,
+        location: rustc_middle::mir::Location,
+    ) {
+        self.super_terminator(terminator, location);
+        use rustc_middle::mir::MentionedItem;
+        match &terminator.kind {
+            rustc_middle::mir::TerminatorKind::Call { func, .. }
+            | rustc_middle::mir::TerminatorKind::TailCall { func, .. } => {
+                self.mentioned
+                    .push(MentionedItem::Fn(func.ty(self.body, self.tcx)));
+            }
+            rustc_middle::mir::TerminatorKind::Drop { place, .. } => {
+                self.mentioned
+                    .push(MentionedItem::Drop(place.ty(self.body, self.tcx).ty));
+            }
+            rustc_middle::mir::TerminatorKind::InlineAsm { operands, .. } => {
+                for op in operands {
+                    if let rustc_middle::mir::InlineAsmOperand::SymFn { value } = op {
+                        self.mentioned.push(MentionedItem::Fn(value.const_.ty()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_rvalue(
+        &mut self,
+        rvalue: &rustc_middle::mir::Rvalue<'tcx>,
+        location: rustc_middle::mir::Location,
+    ) {
+        self.super_rvalue(rvalue, location);
+        use rustc_middle::mir::MentionedItem;
+        use rustc_middle::ty::adjustment::PointerCoercion;
+        match *rvalue {
+            rustc_middle::mir::Rvalue::Cast(
+                rustc_middle::mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                ref operand,
+                target_ty,
+            ) => {
+                // Detect unsizing casts that require vtables
+                // (mirrors the pass: array-to-str/slice unsizing
+                // is the one shape that never does).
+                let source_ty = operand.ty(self.body, self.tcx);
+                let may_involve_vtable = match (
+                    source_ty.builtin_deref(true).map(|t| t.kind()),
+                    target_ty.builtin_deref(true).map(|t| t.kind()),
+                ) {
+                    (
+                        Some(rustc_middle::ty::Array(..)),
+                        Some(rustc_middle::ty::Str | rustc_middle::ty::Slice(..)),
+                    ) => false,
+                    _ => true,
+                };
+                if may_involve_vtable {
+                    self.mentioned.push(MentionedItem::UnsizeCast {
+                        source_ty,
+                        target_ty,
+                    });
+                }
+            }
+            rustc_middle::mir::Rvalue::Cast(
+                rustc_middle::mir::CastKind::PointerCoercion(
+                    PointerCoercion::ClosureFnPointer(_),
+                    _,
+                ),
+                ref operand,
+                _,
+            ) => {
+                self.mentioned
+                    .push(MentionedItem::Closure(operand.ty(self.body, self.tcx)));
+            }
+            rustc_middle::mir::Rvalue::Cast(
+                rustc_middle::mir::CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _),
+                ref operand,
+                _,
+            ) => {
+                self.mentioned
+                    .push(MentionedItem::Fn(operand.ty(self.body, self.tcx)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The constant-operand scan of one visited instance's reachable
+/// blocks (see `RequiredConstWalk::process_body`).
+struct OperandScan<'a, 'tcx> {
+    walk: &'a mut RequiredConstWalk<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+}
+
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for OperandScan<'_, 'tcx> {
+    fn visit_const_operand(
+        &mut self,
+        const_op: &rustc_middle::mir::ConstOperand<'tcx>,
+        _location: rustc_middle::mir::Location,
+    ) {
+        let tcx = self.walk.tcx;
+        let Some(mono_const) = self.walk.monomorphize(self.instance, const_op.const_) else {
+            return;
+        };
+        // A bare function-item or closure operand is NOT
+        // collected: both are plain values (a function item is
+        // zero-sized, and so is a captureless closure), and
+        // merely using one as a value (passing it to a generic
+        // function that never calls it, storing it, black-boxing
+        // it) does not make the collector codegen its body, so
+        // resolving it here would demand bodies rustc never
+        // collects and fail compilations rustc accepts. The
+        // instances behind them are collected where the value
+        // is actually used as a function: a call is a mentioned
+        // item (a closure call names the `Fn`/`FnMut`/`FnOnce`
+        // trait method, whose resolution reaches the closure
+        // instance), a coercion to a function pointer is a
+        // mentioned item too (both handled in
+        // `visit_mentioned`), and an evaluated function-pointer
+        // value points into a function allocation, which the
+        // evaluation below chases.
+        if self.walk.finding.is_some() {
+            return;
+        }
+        match mono_const.eval(tcx, fully_monomorphized(), const_op.span) {
+            Ok(value) => self.walk.chase_value(value),
+            Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                self.walk.finding = Some(required_const_finding(tcx, self.instance));
+            }
+            Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
+        }
     }
 }
