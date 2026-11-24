@@ -6553,7 +6553,10 @@ let inner = match (&src, target) {
                 signed: false,
             }),
             mir::Ty::Float(ft) => match ft.bits() {
-                16 | 32 | 64 => Some(S::Float { bits: ft.bits() }),
+                // An `f128` value is stored as its exact bit
+                // pattern (`Value::Float128`), so its scalar
+                // shape is exact like the narrower widths'.
+                16 | 32 | 64 | 128 => Some(S::Float { bits: ft.bits() }),
                 _ => None,
             },
             // A thin pointer flattens to its synthetic address.
@@ -7162,6 +7165,9 @@ let inner = match (&src, target) {
                 16 | 32 | 64 => Some(S::Float { bits: width }),
                 _ => None,
             },
+            ir::Constant::Float128(_) => {
+                (width == 128).then_some(S::Float { bits: 128 })
+            }
             ir::Constant::Bool(_) => (width == 8).then_some(S::Bool),
             ir::Constant::Bytes(b) => {
                 (width == 8 * b.len() as u32).then(|| {
@@ -7193,6 +7199,10 @@ let inner = match (&src, target) {
                         16 | 32 | 64 => S::Float { bits: ew },
                         _ => return None,
                     },
+                    ir::Constant::Float128(_) => match ew {
+                        128 => S::Float { bits: ew },
+                        _ => return None,
+                    },
                     ir::Constant::Bool(_) => {
                         if ew != 8 {
                             return None;
@@ -7212,6 +7222,10 @@ let inner = match (&src, target) {
                             | (
                                 ir::Constant::Float(..),
                                 ir::Constant::Float(..)
+                            )
+                            | (
+                                ir::Constant::Float128(_),
+                                ir::Constant::Float128(_)
                             )
                             | (ir::Constant::Bool(_), ir::Constant::Bool(_))
                     )

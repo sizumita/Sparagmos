@@ -516,10 +516,13 @@ pub enum ScalarShape {
     /// construction wraps into the width with the given
     /// signedness.
     Int { bits: u32, signed: bool },
-    /// A float of the given width (16, 32 or 64). The stored
-    /// value is an `f64` (an `f32` / `f16` widened exactly), so
-    /// flattening narrows it back to its own width's bit pattern
-    /// and construction widens the pattern's value back.
+    /// A float of the given width (16, 32, 64 or 128). The
+    /// stored value is an `f64` (an `f32` / `f16` widened
+    /// exactly), so flattening narrows it back to its own
+    /// width's bit pattern and construction widens the
+    /// pattern's value back; an `f128` value is stored as its
+    /// exact bit pattern (`Value::Float128`), so both
+    /// directions are the identity on the pattern there.
     Float { bits: u32 },
     /// A `bool`: one byte, flattened as 0 or 1; construction
     /// reads any nonzero pattern as `true`, the same convention
