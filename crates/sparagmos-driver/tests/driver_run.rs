@@ -14950,6 +14950,71 @@ fn run_mode_catch_unwind_o3_data_union() {
     );
 }
 
+const FORMAT_INNER_INLINED_SRC: &str = r#"
+fn foo(_i: i32) -> i32 { 1 }
+fn bar(_i: i32) -> i32 { 1 }
+
+fn main() {
+    let i = 40 + 2;
+    println!("{}", format!("value={i}!"));
+    let b = true;
+    println!("{}", format!("{b}"));
+    let c = 'x';
+    println!("{}", format!("{c}"));
+    let a = [1, 2, 3];
+    println!("{}", format!("{:?}", a));
+    let x: fn(i32) -> i32 = foo;
+    let y: fn(i32) -> i32 = bar;
+    let s1 = format!("{:?}, {:?}", x, y);
+    let s2 = format!("{:?}, {:?}", x, y);
+    assert_eq!(s1, s2);
+    println!("{}", format!("{:>width$}", i, width = 4));
+}
+"#;
+
+/// At opt-level 2 and above, rustc inlines the `#[inline]`
+/// `alloc::fmt::format` into the guest body, and the inlined
+/// body calls its nested helper `format_inner` directly. That
+/// helper is neither generic nor `#[inline]`, so no MIR body
+/// for it is encoded in the distributed alloc rlib; the call
+/// is served by the `fmt::format` builtin model, whose
+/// observable behaviour (format the `Arguments` into a fresh
+/// `String`) is exactly the helper's. Without the model the
+/// run stops at an unsupported "Call to
+/// std::fmt::format::format_inner (no converted body)"
+/// terminator.
+///
+/// The arguments of an optimized `format_args!` are built by
+/// the guest body itself, as raw `core::fmt::rt::Argument`
+/// aggregates whose formatter names the impl in one of the
+/// forms conversion can state: an instance name, the
+/// impl-segment form (`std::array::<impl Debug for [i32; 3]>::fmt`,
+/// `std::ptr::<impl Debug for fn(i32) -> i32>::fmt`), or the
+/// bare trait-item name (`std::fmt::Display::fmt`, for `bool`
+/// and `char`), whose Self type is recovered from the target
+/// place's declared type. The pieces below pin each form, a
+/// dynamic-width count argument, and deterministic
+/// function-pointer `Debug` text.
+#[test]
+fn run_mode_o3_format_macro_uses_inlined_format_inner() {
+    let dir = temp_dir("format-inner-o3");
+    let src = fixture(&dir, "case.rs", FORMAT_INNER_INLINED_SRC);
+    for opt in ["-Copt-level=2", "-Copt-level=3"] {
+        let out = run_driver_extra(&src, &["--rustc-arg", opt]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "inlined format_inner must run at {opt}; stderr={stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "value=42!\ntrue\nx\n[1, 2, 3]\n  42\n",
+            "formatted output must match native at {opt}; stderr={stderr}"
+        );
+    }
+}
+
 // ----- Optimized-build transmutes in inlined std shapes (Lane JJ) -----
 // Expected outputs are the native results of the same sources.
 
