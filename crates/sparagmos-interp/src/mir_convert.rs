@@ -232,6 +232,15 @@ pub struct MirProgram {
     /// converted body exporting the same symbol (see
     /// `Converter::link_symbol_route`).
     pub link_symbols: HashMap<mir::DefId, String>,
+    /// Sparagmos ids of the definitions the compiler classifies
+    /// as compiler intrinsics, as recorded by the driver (see
+    /// `Converter::note_intrinsic` in the driver crate). The
+    /// converter's name-only intrinsic fallback serves a
+    /// body-less callee only when its definition is in this set:
+    /// an ordinary function whose body the driver skipped (or
+    /// whose conversion failed) keeps that failure even when
+    /// its name matches an intrinsic's.
+    pub intrinsic_defs: std::collections::HashSet<mir::DefId>,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -2109,6 +2118,9 @@ struct Converter<'a> {
     /// Declared ABIs of the program's function instances (see
     /// `MirProgram::fn_abis`).
     fn_abis: &'a HashMap<mir::DefId, mir::Abi>,
+    /// Definitions the compiler classifies as intrinsics (see
+    /// `MirProgram::intrinsic_defs`).
+    intrinsic_defs: &'a std::collections::HashSet<mir::DefId>,
     /// Declared ADT field types recovered from `Field` projections
     /// across the whole program (see [`AdtFieldTys`]).
     adt_fields: AdtFieldTys,
@@ -2272,6 +2284,7 @@ impl<'a> Converter<'a> {
             def_names,
             names: &program.fn_names,
             fn_abis: &program.fn_abis,
+            intrinsic_defs: &program.intrinsic_defs,
             adt_fields,
             discriminants: &program.adt_discriminants,
             adt_shapes: &program.adt_shapes,
@@ -8462,12 +8475,24 @@ let inner = match (&src, target) {
     /// builtin model. Checked exactly as that conversion checks
     /// it, so a call is only ever diverted to a builtin that the
     /// external path would really produce.
+    ///
+    /// The intrinsic fallback (`builtins::intrinsic_lookup`) is
+    /// deliberately not part of this predicate. This predicate is
+    /// consulted only for a callee that HAS a body (one that
+    /// failed conversion; see `resolve_body_callee`), and a
+    /// compiler intrinsic never has a body, so such a callee is
+    /// an ordinary function that merely shares an intrinsic's
+    /// name: serving it with the intrinsic's builtin would
+    /// silently replace its semantics instead of reporting its
+    /// recorded conversion failure. The intrinsic fallback
+    /// applies only where the callee is already known to have no
+    /// body at all (the external conversion below and the run
+    /// time's name dispatch).
     fn external_builtin(&self, func: &mir::Operand) -> bool {
         self.resolve_external_callee(func).is_some_and(|(name, _, _)| {
             let canonical = crate::builtins::canonical_name(&name);
             crate::builtins::lookup_qualified(&canonical).is_some()
                 || crate::builtins::foreign_helper_lookup(&canonical).is_some()
-                || crate::builtins::intrinsic_lookup(&canonical).is_some()
         })
     }
 
@@ -8784,6 +8809,20 @@ let inner = match (&src, target) {
     /// name, its rendered generic arguments, and the raw generic
     /// arguments (used to type literal arguments whose type the
     /// callee's signature pins to a generic parameter).
+    /// The `DefId` a call's func operand names, when the operand
+    /// is a direct function constant (the same shapes
+    /// `resolve_callee` accepts).
+    fn callee_def_id(&self, func: &mir::Operand) -> Option<mir::DefId> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        match &c.literal {
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => Some(*def),
+            mir::ConstKind::Unevaluated { def, .. } => Some(*def),
+            _ => None,
+        }
+    }
+
     fn resolve_external_callee(
         &self,
         func: &mir::Operand,
@@ -9932,7 +9971,25 @@ let inner = match (&src, target) {
                         // qualified registry never matches; the
                         // intrinsic's own name is its identity
                         // (see `builtins::intrinsic_lookup`).
-                        .or_else(|| crate::builtins::intrinsic_lookup(&canonical))
+                        // The fallback is gated on the driver's
+                        // own classification, recorded in the
+                        // program: a body-less callee that Stable
+                        // MIR does not classify as an intrinsic
+                        // (an ordinary function whose body was
+                        // skipped, or whose conversion failed)
+                        // keeps that failure instead of being
+                        // silently served by the builtin its name
+                        // happens to match.
+                        .or_else(|| {
+                            let is_intrinsic = self
+                                .callee_def_id(func)
+                                .is_some_and(|def| self.intrinsic_defs.contains(&def));
+                            if is_intrinsic {
+                                crate::builtins::intrinsic_lookup(&canonical)
+                            } else {
+                                None
+                            }
+                        })
                         // A UFCS `fmt` trait call whose `Self`
                         // instance has no converted body is served
                         // by the structural fmt engine (see

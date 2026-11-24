@@ -544,6 +544,7 @@ pub fn collect_reachable(
                 }
                 _ if !inst.has_body() => match inst.kind {
                     InstanceKind::Intrinsic => {
+                        conv.note_intrinsic(&inst);
                         // A compiler intrinsic the interpreter
                         // models is served by the builtin, like
                         // the builtin-owned definitions excluded

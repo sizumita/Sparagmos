@@ -525,6 +525,53 @@ fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
     );
 }
 
+const INTRINSIC_NAMED_TAIL_CALL_SRC: &str = r#"
+#![allow(incomplete_features)]
+#![feature(explicit_tail_calls)]
+fn atomic_fence() {
+    become atomic_fence()
+}
+fn main() {
+    atomic_fence();
+    println!("main done");
+}
+"#;
+
+#[test]
+fn run_mode_unconverted_body_named_like_an_intrinsic_exits_two() {
+    // An ordinary function that merely shares a compiler
+    // intrinsic's name (`atomic_fence`) and whose body failed
+    // conversion (here: skipped for its tail call, exactly as in
+    // `run_mode_tail_call_body_is_skipped_and_call_exits_two`)
+    // must keep its recorded conversion failure. The intrinsic
+    // fallback serves body-less intrinsic declarations, never a
+    // body that exists; when `external_builtin` consulted it,
+    // this call was diverted to `Builtin::AtomicFence` and the
+    // run silently completed (exit 0, "main done" printed).
+    let dir = temp_dir("intrinsicname");
+    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_TAIL_CALL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "calling the unconverted body is unsupported (exit 2), not silently served by the intrinsic's builtin; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("no converted body"),
+        "the reason names the unconverted body: {stderr}"
+    );
+    assert!(
+        stderr.contains("atomic_fence"),
+        "the reason names the skipped function: {stderr}"
+    );
+    assert!(
+        !stdout.contains("main done"),
+        "the run must not complete past the diverted call: {stdout}"
+    );
+}
+
 
 #[test]
 fn run_mode_async_closure_call_runs() {

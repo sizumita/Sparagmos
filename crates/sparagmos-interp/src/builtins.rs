@@ -2244,9 +2244,13 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
 /// callee is already known to have no converted body (the
 /// driver's demand collection, which asks only about
 /// instances Stable MIR itself classifies as intrinsics,
-/// conversion's external-callee path, and the interpreter's
-/// name-based dispatch of the builtin nodes conversion
-/// emitted), so a collected body always wins over the model.
+/// conversion's external-callee path — gated on the same
+/// classification, which the driver records in the program —
+/// and the interpreter's name-based dispatch of the builtin
+/// nodes conversion emitted), so a collected body always
+/// wins over the model, and an ordinary body-less function
+/// that merely shares an intrinsic's name keeps its recorded
+/// conversion failure instead of being served by the model.
 pub fn intrinsic_lookup(canonical: &str) -> Option<Builtin> {
     let last = canonical.rsplit("::").next().unwrap_or(canonical);
     lookup(&format!("core::intrinsics::{last}"))
