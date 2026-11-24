@@ -61,7 +61,8 @@ use std::rc::Rc;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     cast_place_ty, cast_src_ty, constant_ty, describe_resolved, eval_binary, eval_cast, eval_unary,
-    navigate_mut, operand_pointee_ty, project_value, Frame, Interpreter,
+    navigate_mut, navigate_mut_grow, operand_pointee_ty, project_value, project_value_ev, Frame,
+    Interpreter,
 };
 use crate::ir::{
     BasicBlock, BinOp, Body, Constant, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
@@ -536,7 +537,14 @@ impl<'a> Interpreter<'a> {
         // value of a zero-sized field whose store was elided,
         // recorded in the body's `zst_fields` table; any other
         // projection error is the original one.
-        let value = match project_value(base, proj, &frame.func, desc) {
+        let value = match project_value_ev(
+            Some(self.program()),
+            body.local_ty(Local(local as usize)).cloned(),
+            base,
+            proj,
+            &frame.func,
+            desc,
+        ) {
             Ok(v) if v != Value::Uninit => v,
             Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
                 match self.zst_field_value(frame, local, proj) {
@@ -663,7 +671,22 @@ impl<'a> Interpreter<'a> {
                         })
                     }
                 };
-                let slot = navigate_mut(slot, proj, &func, desc)?;
+                // The general path's projected write judges
+                // the navigation's wrapper descent by the
+                // local's declared type (see
+                // `write_resolved_typed`); the fast path must
+                // supply the same evidence, or a partially
+                // materialised struct local's second field
+                // write descends into its first field.
+                let slot = navigate_mut_grow(
+                    slot,
+                    proj,
+                    &func,
+                    desc,
+                    false,
+                    Some(self.program()),
+                    body.local_ty(Local(local)).cloned(),
+                )?;
                 *slot = value;
                 Ok(())
             }

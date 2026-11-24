@@ -26,6 +26,7 @@
 //!   all return errors. Regression coverage lives in
 //!   `tests/robustness_tests.rs`.
 
+
 use crate::error::{InterpError, InterpResult};
 use crate::f128;
 use crate::ir::*;
@@ -598,6 +599,27 @@ pub(crate) fn alignment_value(align: u128) -> Value {
         }
     }
     Value::Uint(align)
+}
+
+/// The pointer a chain of one-field pointer wrappers holds:
+/// the innermost field of a chain of single-field aggregates
+/// (`NonNull` inside `Unique`, a `Box` inside its owner
+/// wrapper), when that field is a pointer value. `None` when
+/// the chain ends in anything else.
+pub(crate) fn ptr_wrapper_pointer(value: &Value) -> Option<Value> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                p @ (Value::Ref(_)
+                | Value::FatRef { .. }
+                | Value::DynRef { .. }) => return Some(p.clone()),
+                inner @ Value::Enum { .. } => cur = inner,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
 }
 
 pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
@@ -5053,7 +5075,7 @@ impl<'a> Interpreter<'a> {
                 if base == Value::Uninit {
                     return Ok(None);
                 }
-                match self.project_value_t(base, &projection, "<drop>", "drop glue") {
+                match self.project_value_t(base, &projection, "<drop>", "drop glue", None) {
                     Ok(v) if v == Value::Uninit => Ok(None),
                     Ok(v) => Ok(Some(v)),
                     Err(InterpError::UninitializedRead { .. }) => Ok(None),
@@ -5171,6 +5193,7 @@ impl<'a> Interpreter<'a> {
                 &steps[step_idx..step_idx + take],
                 "<drop>",
                 "drop glue",
+                None,
             ) {
                 Ok(v) => value = v,
                 Err(InterpError::UninitializedRead { .. }) => return Ok(None),
@@ -5421,6 +5444,26 @@ impl<'a> Interpreter<'a> {
                             // written by an aggregate and never
                             // projected lands here with an untyped plan.
                             Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
+                            // A one-field aggregate is a wrapper
+                            // whose only content is its field (a
+                            // `PhantomData` newtype, a cell): judge
+                            // the field by the same untyped plan,
+                            // exactly as a tuple's elements are
+                            // judged. Only a structural payload
+                            // (an enum or a tuple) is entered; a
+                            // scalar payload stays under the
+                            // conservative error below.
+                            Some(Value::Enum { fields, .. })
+                                if fields.len() == 1
+                                    && matches!(
+                                        fields[0],
+                                        Value::Enum { .. } | Value::Tuple(_)
+                                    ) =>
+                            {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(0));
+                                active.work.push((sub, P::Untyped));
+                            }
                             Some(Value::Enum { .. })
                             | Some(Value::SparseVec { .. })
                             | Some(Value::Coroutine { .. }) => {
@@ -6515,9 +6558,18 @@ impl<'a> Interpreter<'a> {
             // store -- ids are never reused, so nothing can observe
             // the difference within a run.)
             if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
-                if let Some((id, _)) = box_alloc_pointer(&value) {
-                    self.note_box_free(frames, &value);
-                    self.free_alloc(id);
+                // Only a box-shaped value whose pointer denotes
+                // the allocation's base owns the allocation: a
+                // one-field struct holding a reference into
+                // another value's storage (a drop guard's `&mut`
+                // field, say) has the same value shape but owns
+                // nothing, and freeing its pointee would cut the
+                // owner's storage from under it.
+                if let Some((id, projection)) = box_alloc_pointer(&value) {
+                    if projection_is_base(&projection) {
+                        self.note_box_free(frames, &value);
+                        self.free_alloc(id);
+                    }
                 }
             }
             // The place is cleared only when it is a local of the
@@ -7827,6 +7879,27 @@ impl<'a> Interpreter<'a> {
                     return out;
                 }
             }
+            // A field-first projection addresses the pointee's
+            // own structure: the block's base pointer denotes
+            // its first element, so the element step belongs in
+            // front. (A plain field step would otherwise land
+            // on the block's element tuple itself, whose field
+            // 0 happens to be the element and whose other
+            // fields do not exist.) Index- and sub-slice-first
+            // projections already denote positions in the
+            // block's element sequence and keep their form.
+            if matches!(
+                projection.first(),
+                Some(
+                    RefProj::Field(_)
+                        | RefProj::UnionField { .. }
+                        | RefProj::Downcast(_)
+                )
+            ) {
+                let mut out = vec![RefProj::Index(0)];
+                out.extend_from_slice(projection);
+                return out;
+            }
         }
         projection.to_vec()
     }
@@ -7952,7 +8025,11 @@ impl<'a> Interpreter<'a> {
                     return written;
                 }
                 let target = self.resolve_place(frames, body, place)?;
-                self.shaped_store(frames, &target, value, shape)
+                // The shaped store's fallthrough is a projected
+                // assignment like any other: it takes the place's
+                // root type evidence with it (see `write_place`).
+                let root_ty = self.resolved_root_ty(body, place);
+                self.shaped_store(frames, &target, value, shape, root_ty.as_ref())
             }
             StatementKind::SetDiscriminant { place, variant } => {
                 let target = self.resolve_place(frames, body, place)?;
@@ -9095,6 +9172,16 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
+                    // The array length the tracked type carries,
+                    // captured before the state resets below clear
+                    // it: the storage may never have been
+                    // materialised (a `Box::new_uninit` pointee's
+                    // array field no write has reached), in which
+                    // case the type is the only length there is.
+                    let ty_len = match &cur_ty {
+                        Some(Ty::Array(_, n)) => Some(*n as u128),
+                        _ => None,
+                    };
                     buf_depth = 0;
                     buf_base = None;
                     cur_ty = None;
@@ -9105,16 +9192,29 @@ impl<'a> Interpreter<'a> {
                     // length when the place was reached through a
                     // fat pointer (the value resolved at an
                     // element position has no length of its own
-                    // to ask), otherwise the resolved value's own.
-                    let len = match fat_cap {
-                        Some(cap) => cap,
-                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                format!("constant index into {place}"),
-                                "array, slice or string value",
-                                "value without a length",
-                            )
-                        })?,
+                    // to ask), otherwise the array type's length
+                    // when the types track one, otherwise the
+                    // resolved value's own. An unmaterialised
+                    // array has no value to take the length from:
+                    // the index is a compiler-checked constant,
+                    // so resolution proceeds without the bound
+                    // and the use of the place materialises the
+                    // storage (a write) or reports the
+                    // uninitialised read (a read), as it would
+                    // for any other unwritten slot.
+                    let len = match fat_cap.or(ty_len) {
+                        Some(cap) => Some(cap),
+                        None => match self.read_resolved(frames, &cur) {
+                            Ok(v) => Some(v.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("constant index into {place}"),
+                                    "array, slice or string value",
+                                    "value without a length",
+                                )
+                            })?),
+                            Err(InterpError::UninitializedRead { .. }) => None,
+                            Err(e) => return Err(e),
+                        },
                     };
                     let via_fat = fat_cap.is_some_and(|cap| {
                         !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
@@ -9127,20 +9227,39 @@ impl<'a> Interpreter<'a> {
                         }
                         _ => None,
                     };
-                    let idx = if *from_end {
-                        len.checked_sub(*offset as u128).ok_or_else(|| {
-                            index_oob(len as usize, *offset as usize)
-                        })?
-                    } else if *offset as u128 >= len {
-                        return Err(index_oob(len as usize, *offset as usize));
-                    } else {
-                        *offset as u128
+                    let idx = match len {
+                        Some(len) => {
+                            if *from_end {
+                                len.checked_sub(*offset as u128).ok_or_else(|| {
+                                    index_oob(len as usize, *offset as usize)
+                                })?
+                            } else if *offset as u128 >= len {
+                                return Err(index_oob(len as usize, *offset as usize));
+                            } else {
+                                *offset as u128
+                            }
+                        }
+                        None => {
+                            if *from_end {
+                                return Err(InterpError::type_mismatch(
+                                    format!("constant index into {place}"),
+                                    "array value of known length",
+                                    "unmaterialised array indexed from the end",
+                                ));
+                            }
+                            *offset as u128
+                        }
                     };
                     let idx = usize::try_from(idx).map_err(|_| {
                         InterpError::UnsupportedProjection {
-                            kind: format!(
-                                "index {idx} past the end of the stored value (length {len})"
-                            ),
+                            kind: match len {
+                                Some(len) => format!(
+                                    "index {idx} past the end of the stored value (length {len})"
+                                ),
+                                None => format!(
+                                    "index {idx} past the end of the stored value"
+                                ),
+                            },
                         }
                     })?;
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
@@ -9156,6 +9275,13 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::Subslice { from, to, from_end } => {
+                    // The array length the tracked type carries,
+                    // captured before the state resets below clear
+                    // it (see the constant-index arm).
+                    let ty_len = match &cur_ty {
+                        Some(Ty::Array(_, n)) => Some(*n as u128),
+                        _ => None,
+                    };
                     buf_depth = 0;
                     buf_base = None;
                     cur_ty = None;
@@ -9165,24 +9291,50 @@ impl<'a> Interpreter<'a> {
                     // The range is resolved against the length the
                     // base place currently has: the fat length when
                     // the base was reached through a fat deref,
-                    // otherwise the base value's own length. The
+                    // otherwise the array type's length when the
+                    // types track one (the storage may never have
+                    // been materialised), otherwise the base
+                    // value's own length. As for a constant index
+                    // (see there), an unmaterialised array's length
+                    // is unknown here and the range the MIR carries
+                    // is taken as written; the use of the place
+                    // materialises or reports, as appropriate. The
                     // resolved step carries an absolute offset and
                     // element count, so later steps (and reference
                     // targets formed from this place) need no
                     // knowledge of the MIR range shape.
-                    let len = match fat_cap {
-                        Some(cap) => cap,
-                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                format!("subslice of {place}"),
-                                "array, slice or string value",
-                                "value without a length",
-                            )
-                        })?,
+                    let len = match fat_cap.or(ty_len) {
+                        Some(cap) => Some(cap),
+                        None => match self.read_resolved(frames, &cur) {
+                            Ok(v) => Some(v.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("subslice of {place}"),
+                                    "array, slice or string value",
+                                    "value without a length",
+                                )
+                            })?),
+                            Err(InterpError::UninitializedRead { .. }) => None,
+                            Err(e) => return Err(e),
+                        },
                     };
                     fat_cap = None;
                     fat_elem_string = None;
-                    let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
+                    let (offset, sub_len) = match len {
+                        Some(len) => subslice_offset_len(*from, *to, *from_end, len)?,
+                        None => {
+                            if *from_end {
+                                return Err(InterpError::type_mismatch(
+                                    format!("subslice of {place}"),
+                                    "array value of known length",
+                                    "unmaterialised array sliced from the end",
+                                ));
+                            }
+                            (
+                                *from as usize,
+                                (*to as usize).saturating_sub(*from as usize),
+                            )
+                        }
+                    };
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some(Ty::Slice(elem.clone()))
@@ -9506,6 +9658,26 @@ impl<'a> Interpreter<'a> {
         cur: &Resolved,
         cur_ty: &Option<Ty>,
     ) -> bool {
+        // The value at the position the step denotes. An element
+        // block's root target denotes its first element, and the
+        // block's own stored form is the element tuple -- a tuple
+        // by construction, which says nothing about the form the
+        // element is stored in -- so an element block's storage
+        // is judged at the element position, not at the block.
+        let position_value = match cur {
+            Resolved::Alloc { id, projection }
+                if projection.is_empty() && self.is_elem_block(*id) =>
+            {
+                self.read_resolved(
+                    frames,
+                    &Resolved::Alloc {
+                        id: *id,
+                        projection: vec![RefProj::Index(0)],
+                    },
+                )
+            }
+            _ => self.read_resolved(frames, cur),
+        };
         match cur_ty {
             Some(Ty::Adt(name)) => {
                 let Some(shape) = self.debug_shape_for_def(name) else {
@@ -9518,14 +9690,14 @@ impl<'a> Interpreter<'a> {
                     return false;
                 }
                 matches!(
-                    self.read_resolved(frames, cur),
+                    position_value,
                     Ok(Value::Tuple(_) | Value::Bytes(_))
                 )
             }
             Some(Ty::Tuple(ts))
                 if ts.len() == 1 && matches!(ts[0], Ty::Array(..)) =>
             {
-                match self.read_resolved(frames, cur) {
+                match position_value {
                     Ok(Value::Bytes(_)) => true,
                     Ok(Value::Tuple(items)) => items.len() != 1,
                     _ => false,
@@ -10317,6 +10489,8 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+
+
     pub(crate) fn fat_deref_len(
         &self,
         frames: &[Frame],
@@ -10503,7 +10677,7 @@ impl<'a> Interpreter<'a> {
                 let mut projection = projection.clone();
                 projection.push(step);
                 let projected =
-                    self.project_value_t(base, &projection, &func, &place.to_string())?;
+                    self.project_value_t(base, &projection, &func, &place.to_string(), None)?;
                 Ok(Resolved::Value(projected, Vec::new()))
             }
             Resolved::Static {
@@ -10837,6 +11011,7 @@ impl<'a> Interpreter<'a> {
             )),
         }
     }
+
 
     /// The pointer an array / slice / `str` to element cast
     /// produces (see [`Rvalue::PtrFirstElem`]): the operand pointer
@@ -11305,7 +11480,29 @@ impl<'a> Interpreter<'a> {
                         return Ok(Cow::Owned(value));
                     }
                 }
-                let value = match project_value_ref(base, projection, &frame.func, &place_desc) {
+                // The projection's type walk is rooted at the
+                // local's declared type, exactly as the owned
+                // read's is (see `read_resolved_typed`): the
+                // caller's `ty` is the place's *result* type and
+                // judges only the uninitialized outcome below.
+                // Rooting the walk there instead would judge the
+                // wrapper descent against the result type -- for
+                // an elided field read, the field's own type --
+                // and let the descent take a sibling's contents
+                // for the field's value.
+                let root_ty = self
+                    .program()
+                    .get(&frame.func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
+                let value = match project_value_ref_ev(
+                    Some(self.program()),
+                    root_ty,
+                    base,
+                    projection,
+                    &frame.func,
+                    &place_desc,
+                ) {
                     Ok(v) if *v != Value::Uninit => v,
                     Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
                         // Mirror the owned read: a single-valued
@@ -12609,13 +12806,50 @@ impl<'a> Interpreter<'a> {
                     if *idx != 0 || !single_field {
                         trailing_entry = false;
                     }
-                    cur = match cur {
-                        Value::Tuple(items) => items.get(*idx)?,
-                        Value::Enum { fields, .. } => fields.get(*idx)?,
-                        Value::Coroutine { fields, .. } => fields.get(*idx)?,
-                        Value::Closure { env, .. } => env.get(*idx)?,
-                        _ => return None,
-                    };
+                    // The judgment above is made at the step's
+                    // own level: a step that retries through a
+                    // one-field wrapper below is out of range at
+                    // that level, so its index is non-zero and
+                    // the judgment already answers for the
+                    // retried levels too.
+                    // The transparent-wrapper descent of
+                    // `project_value`: a field step past the end
+                    // of a one-field wrapper the storage acquired
+                    // through a wrapper pointer (a `MaybeUninit`
+                    // pointee) retries on the wrapper's only
+                    // field — the projection itself carries no
+                    // wrapper step, so the prefix accounting is
+                    // unaffected.
+                    loop {
+                        match cur {
+                            Value::Tuple(items) => {
+                                cur = items.get(*idx)?;
+                                break;
+                            }
+                            Value::Enum { fields, .. } => {
+                                if let Some(v) = fields.get(*idx) {
+                                    cur = v;
+                                    break;
+                                }
+                                if fields.len() == 1
+                                    && wrapper_payload(&fields[0])
+                                {
+                                    cur = &fields[0];
+                                    continue;
+                                }
+                                return None;
+                            }
+                            Value::Coroutine { fields, .. } => {
+                                cur = fields.get(*idx)?;
+                                break;
+                            }
+                            Value::Closure { env, .. } => {
+                                cur = env.get(*idx)?;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
                 }
                 RefProj::Downcast(_) => {
                     if !matches!(cur, Value::Enum { .. } | Value::Coroutine { .. }) {
@@ -12891,7 +13125,13 @@ impl<'a> Interpreter<'a> {
         if projection.is_empty() {
             Ok(base.clone())
         } else {
-            self.project_value_t(base.clone(), projection, "<constant>", "constant aggregate")
+            self.project_value_t(
+                base.clone(),
+                projection,
+                "<constant>",
+                "constant aggregate",
+                None,
+            )
         }
     }
 
@@ -12936,7 +13176,9 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<static>".to_string());
                 let place_desc = format!("static {name}");
-                let value = self.project_value_t(base, projection, &func, &place_desc)?;
+                let root_ty = self.program().static_tys.get(name).cloned();
+                let value =
+                    self.project_value_t(base, projection, &func, &place_desc, root_ty)?;
                 if value == Value::Uninit {
                     return self.uninit_read_value(ty, func, place_desc);
                 }
@@ -12967,7 +13209,14 @@ impl<'a> Interpreter<'a> {
                         }
                         _ => false,
                     };
-                let value = match self.project_value_t(base, projection, &func, &place_desc) {
+                let root_ty = self.alloc_ty(*id);
+                let value = match self.project_value_t(
+                    base.clone(),
+                    projection,
+                    &func,
+                    &place_desc,
+                    root_ty,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         // The stored form of an allocation is a
@@ -13033,7 +13282,18 @@ impl<'a> Interpreter<'a> {
                 // type — so the precomputed value (conversion's
                 // `Body::zst_fields` table) only rescues a read
                 // that otherwise fails as uninitialized.
-                let value = match self.project_value_t(base, projection, &frame.func, &place_desc) {
+                let root_ty = self
+                    .program()
+                    .get(&frame.func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
+                let value = match self.project_value_t(
+                    base,
+                    projection,
+                    &frame.func,
+                    &place_desc,
+                    root_ty,
+                ) {
                     Ok(v) if v != Value::Uninit => v,
                     Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
                         match self.zst_field_value(frame, *local, projection) {
@@ -13240,6 +13500,24 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         value: Value,
     ) -> InterpResult<()> {
+        self.write_resolved_typed(frames, target, value, None)
+    }
+
+    /// [`Self::write_resolved`] with the caller's type evidence:
+    /// `root_ty`, the declared type of the value at the target's
+    /// root (for an allocation target, its pointee type), is
+    /// walked alongside the projected assignment so the
+    /// navigation's wrapper judgments can consult the declared
+    /// types (see `wrapper_descent_sanctioned`). Callers without
+    /// evidence use `write_resolved`, whose judgments are the
+    /// shape-only ones.
+    pub(crate) fn write_resolved_typed(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: Value,
+        root_ty: Option<&Ty>,
+    ) -> InterpResult<()> {
         match target {
             Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
@@ -13256,7 +13534,17 @@ impl<'a> Interpreter<'a> {
                     return Ok(());
                 }
                 let place_desc = format!("static {name}");
-                assign_projected(slot, projection, value, "<static>", &place_desc, false)
+                let root_ty = self.program().static_tys.get(name).cloned();
+                assign_projected(
+                    slot,
+                    projection,
+                    value,
+                    "<static>",
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )
             }
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
@@ -13307,18 +13595,63 @@ impl<'a> Interpreter<'a> {
                         // with the slots it skips over
                         // uninitialized, exactly as the grow
                         // below treats a short tuple.
-                        if *slot == Value::Uninit {
-                            *slot = Value::Tuple(vec![Value::Uninit; i + 1]);
-                        }
-                        if let Value::Tuple(items) = &mut *slot {
-                            if i >= items.len() {
-                                items.resize(i + 1, Value::Uninit);
+                        // The same materialisation bound as
+                        // the tuple growth: an index at or past
+                        // it is the navigation's error to
+                        // produce, not storage to allocate (at
+                        // the extreme index the size computation
+                        // itself overflows).
+                        if i < crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                            if *slot == Value::Uninit {
+                                *slot = Value::Tuple(vec![Value::Uninit; i + 1]);
+                            }
+                            if let Value::Tuple(items) = &mut *slot {
+                                if i >= items.len() {
+                                    items.resize(i + 1, Value::Uninit);
+                                }
                             }
                         }
                     }
                 }
                 let place_desc = format!("allocation #{id}");
-                assign_projected(slot, projection, value, "<allocation>", &place_desc, true)
+                // The navigation's root type: the projection is
+                // rooted at the allocation, so the type walked
+                // alongside it is the allocation's own declared
+                // type — the record its creation point made,
+                // which retargeting a pointer at the same storage
+                // does not move (see `record_alloc_ty`). The
+                // caller's evidence names the type at the
+                // *pointer's* target, which for a pointer to a
+                // field inside the allocation is that field's
+                // type, not the root's: walking the root-relative
+                // projection from it misaligns the type walk and
+                // the descent can land in a sibling. The caller's
+                // type remains the fallback for an allocation
+                // with no type on record, where it names the root
+                // in the flows that supply it: a plain
+                // allocation's root is the pointee value itself;
+                // an element block's root is its element type,
+                // seen as the element sequence the block's stored
+                // tuple is (an element-block projection starts by
+                // indexing into it).
+                let alloc_root = self.alloc_ty(*id).or_else(|| root_ty.cloned());
+                let alloc_root = match alloc_root {
+                    Some(element_ty) if self.is_elem_block(*id) => {
+                        Some(Ty::Slice(Box::new(element_ty)))
+                    }
+                    other => other,
+                };
+                grow_tuples_along(slot, projection, Some(self.program()), alloc_root.clone());
+                assign_projected(
+                    slot,
+                    projection,
+                    value,
+                    "<allocation>",
+                    &place_desc,
+                    true,
+                    Some(self.program()),
+                    alloc_root,
+                )
             }
             Resolved::Place {
                 frame_pos,
@@ -13343,8 +13676,13 @@ impl<'a> Interpreter<'a> {
                     *slot = Self::normalize_for_ty(value, target_body.local_ty(Local(*local)))?;
                     return Ok(());
                 }
+                let func = frames[*frame_pos].func.clone();
+                let root_ty = self
+                    .program()
+                    .get(&func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
                 let frame = &mut frames[*frame_pos];
-                let func = frame.func.clone();
                 let place_desc = describe_resolved(*local, projection);
                 let slot = frame.locals.get_mut(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
@@ -13352,7 +13690,16 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                assign_projected(slot, projection, value, &func, &place_desc, false)
+                assign_projected(
+                    slot,
+                    projection,
+                    value,
+                    &func,
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )
             }
         }
     }
@@ -13496,6 +13843,14 @@ impl<'a> Interpreter<'a> {
                 let slot = store
                     .get_mut(id)
                     .ok_or_else(|| self.missing_alloc(*id))?;
+                let root_ty = self.alloc_ty(*id);
+                let root_ty = match root_ty {
+                    Some(element_ty) if self.is_elem_block(*id) => {
+                        Some(Ty::Slice(Box::new(element_ty)))
+                    }
+                    other => other,
+                };
+                grow_tuples_along(slot, projection, Some(self.program()), root_ty);
                 let place_desc = format!("allocation #{id}");
                 let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
                 f(slot)
@@ -13505,8 +13860,13 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             } => {
+                let func = frames[*frame_pos].func.clone();
+                let root_ty = self
+                    .program()
+                    .get(&func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
                 let frame = &mut frames[*frame_pos];
-                let func = frame.func.clone();
                 let place_desc = describe_resolved(*local, projection);
                 let slot = frame.locals.get_mut(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
@@ -13514,7 +13874,15 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                let slot = navigate_mut(slot, projection, &func, &place_desc)?;
+                let slot = navigate_mut_grow(
+                    slot,
+                    projection,
+                    &func,
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )?;
                 f(slot)
             }
         }
@@ -14887,10 +15255,61 @@ impl<'a> Interpreter<'a> {
     /// `Box`).
     fn place_result_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
         let mut ty = body.local_ty(place.local)?.clone();
+        // The variant the walk is inside: field steps on an ADT
+        // read the field type of the variant a preceding downcast
+        // selected (0 when none did -- a struct's only variant,
+        // or a field step the MIR spells without one).
+        let mut variant = 0usize;
         for elem in &place.projection {
             ty = projection_step_ty(&ty, elem)?;
         }
         Some(ty)
+    }
+
+    /// The declared type of the value at the root of the target
+    /// a place resolves to: the place walk's type after its last
+    /// `Deref` step (the pointee type the resolved target's own
+    /// projection starts from), or the local's declared type
+    /// when the place never dereferences. Projected-assignment
+    /// navigation walks this type alongside the resolved
+    /// projection so its wrapper judgments can consult the
+    /// declared types (see `wrapper_descent_sanctioned`).
+    fn resolved_root_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
+        let mut ty = body.local_ty(place.local)?.clone();
+        let mut root = ty.clone();
+        let mut variant = 0usize;
+        for elem in &place.projection {
+            match (elem, &ty) {
+                (ProjectionElem::Deref, Ty::Ref(inner)) => {
+                    ty = (**inner).clone();
+                    root = ty.clone();
+                    variant = 0;
+                }
+                (ProjectionElem::Field(i), Ty::Tuple(ts)) => {
+                    ty = ts.get(*i)?.clone();
+                }
+                (ProjectionElem::Field(i), Ty::Adt(_)) => {
+                    ty = self.adt_field_ty(&ty, variant, *i)?;
+                }
+                (ProjectionElem::Index(_), Ty::Array(elem, _))
+                | (ProjectionElem::Index(_), Ty::Slice(elem))
+                | (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _))
+                | (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => {
+                    ty = (**elem).clone();
+                }
+                (ProjectionElem::Downcast(v), _) => {
+                    variant = *v as usize;
+                }
+                (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
+                    ty = Ty::Array(elem.clone(), 0);
+                }
+                (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
+                    ty = Ty::Slice(elem.clone());
+                }
+                _ => return None,
+            }
+        }
+        Some(root)
     }
 
     /// Whether the byte view judges byte positions over the
@@ -15409,10 +15828,11 @@ impl<'a> Interpreter<'a> {
             return written;
         }
         let target = self.resolve_place_mode(frames, body, place, false)?;
+        let place_ty = self.place_result_ty(body, place);
         // A direct deref of a byte pointer (see `read_place`):
         // the byte view of the base value's storage owns the
         // write.
-        if let Some(ty) = self.place_result_ty(body, place) {
+        if let Some(ty) = &place_ty {
             if matches!(
                 ty,
                 Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
@@ -15423,7 +15843,8 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        self.write_resolved(frames, &target, value)
+        let root_ty = self.resolved_root_ty(body, place);
+        self.write_resolved_typed(frames, &target, value, root_ty.as_ref())
     }
 
     /// A write to a `Vec`'s buffer bookkeeping slots through a
@@ -15945,23 +16366,18 @@ impl<'a> Interpreter<'a> {
             // fieldless (niche) variant value carries no pointer
             // to read, so it stays a mismatch rather than
             // fabricating one.
-            // A pointer-shaped ADT value (`NonNull`, `Unique`)
-            // written to a raw-pointer or reference place: MIR
-            // moves these transparent wrappers into pointer
-            // places verbatim (the `Allocator::deallocate` body
-            // passes its `NonNull<u8>` straight to
-            // `__rust_dealloc`), and the pointer the wrapper
-            // holds is the value the place denotes.
-            (Some(Ty::Ref(_)), Value::Enum { fields, .. })
-                if fields.len() == 1
-                    && matches!(
-                        fields[0],
-                        Value::Ref(_)
-                            | Value::FatRef { .. }
-                            | Value::DynRef { .. }
-                    ) =>
+            // A pointer-shaped ADT value (`NonNull`, `Unique`,
+            // a `Box` inside its owner wrapper) written to a
+            // raw-pointer or reference place: MIR moves these
+            // transparent wrappers into pointer places verbatim
+            // (the `Allocator::deallocate` body passes its
+            // `NonNull<u8>` straight to `__rust_dealloc`), and
+            // the pointer the wrapper chain holds is the value
+            // the place denotes.
+            (Some(Ty::Ref(_)), Value::Enum { .. })
+                if ptr_wrapper_pointer(&value).is_some() =>
             {
-                Ok(fields[0].clone())
+                Ok(ptr_wrapper_pointer(&value).expect("guard checked"))
             }
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
             (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
@@ -16005,11 +16421,13 @@ impl<'a> Interpreter<'a> {
             {
                 Ok(value)
             }
-            (Some(expected), other) => Err(InterpError::type_mismatch(
-                "assignment",
-                format!("{expected:?}"),
-                other.kind_name(),
-            )),
+            (Some(expected), other) => {
+                Err(InterpError::type_mismatch(
+                    "assignment",
+                    format!("{expected:?}"),
+                    other.kind_name(),
+                ))
+            }
         }
     }
 
@@ -16019,7 +16437,12 @@ impl<'a> Interpreter<'a> {
     /// conversion into a `Box<dyn Trait>`, whose result goes
     /// through the same unsizing (see
     /// `TerminatorKind::CallBuiltin::result_unsize`).
-    fn eval_unsize(&self, frames: &[Frame], v: Value, meta: &UnsizeMeta) -> InterpResult<Value> {
+    fn eval_unsize(
+        &self,
+        frames: &[Frame],
+        v: Value,
+        meta: &UnsizeMeta,
+    ) -> InterpResult<Value> {
         match meta {
             UnsizeMeta::Slice { array_len } => {
                 self.unsize_to_slice(frames, v, *array_len)
@@ -16283,13 +16706,26 @@ impl<'a> Interpreter<'a> {
         proj: &[RefProj],
         desc: &str,
     ) -> InterpResult<()> {
+        let func = frames.last().expect("frame").func.clone();
+        let root_ty = self
+            .program()
+            .get(&func)
+            .and_then(|body| body.local_ty(Local(local)))
+            .cloned();
         let frame = frames.last_mut().expect("frame");
-        let func = frame.func.clone();
         let slot = frame.locals.get_mut(local).ok_or_else(|| InterpError::UnknownLocal {
             func: func.clone(),
             local,
         })?;
-        let slot = navigate_mut(slot, proj, &func, desc)?;
+        let slot = navigate_mut_grow(
+            slot,
+            proj,
+            &func,
+            desc,
+            false,
+            Some(self.program()),
+            root_ty,
+        )?;
         *slot = Value::Uninit;
         Ok(())
     }
@@ -17149,12 +17585,15 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         func: &str,
         place: &str,
+        root_ty: Option<Ty>,
     ) -> InterpResult<Value> {
         let mut value = value;
+        let mut cur_ty = root_ty;
         let mut i = 0;
         while i < projection.len() {
             if let RefProj::UnionField { idx, table } = projection[i] {
                 value = self.union_field_read(value, idx, table, func, place)?;
+                cur_ty = stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, idx);
                 i += 1;
             } else {
                 let start = i;
@@ -17163,7 +17602,16 @@ impl<'a> Interpreter<'a> {
                 {
                     i += 1;
                 }
-                value = project_value(value, &projection[start..i], func, place)?;
+                let segment = &projection[start..i];
+                value = project_value_ev(
+                    Some(self.program()),
+                    cur_ty.clone(),
+                    value,
+                    segment,
+                    func,
+                    place,
+                )?;
+                cur_ty = step_ty_across(Some(self.program()), cur_ty, segment);
             }
         }
         Ok(value)
@@ -17256,13 +17704,35 @@ impl<'a> Interpreter<'a> {
     /// shape, then construct the target shape's value from the
     /// same bits.
     /// The lane decomposition of a vector shape: the shape of
-    /// one lane and the lane count, unwrapping one-payload-field
-    /// ADTs to the array they store. A shape that is not (an ADT
-    /// over) an array decomposes to itself as a single lane.
+    /// one lane and the lane count. Where a one-field ADT
+    /// wrapper chain bottoms out decides the element form. Over
+    /// an array the wrappers spread to the array's lanes. Over
+    /// an aggregate record (a struct or tuple payload) the
+    /// wrapper is itself the element: readers address the
+    /// payload through the wrapper's field step, so the slot
+    /// holds the wrapped value whole -- decomposing to the
+    /// payload would write it where the wrapper belongs and
+    /// lose the layer every other reader addresses. Over
+    /// anything else the wrappers are storage-transparent: a
+    /// wrapper around a scalar is stored as the scalar itself
+    /// (a hash table's slots hold bare control bytes, which
+    /// the byte-composing readers require).
     fn shape_lanes(shape: &ScalarShape) -> (ScalarShape, u64) {
         match shape {
-            ScalarShape::AdtField { inner, .. } => Self::shape_lanes(inner),
             ScalarShape::Array(elem, n) => ((**elem).clone(), *n),
+            ScalarShape::AdtField { inner, .. } => {
+                let mut cur = shape;
+                while let ScalarShape::AdtField { inner, .. } = cur {
+                    cur = inner;
+                }
+                match cur {
+                    ScalarShape::Array(elem, n) => ((**elem).clone(), *n),
+                    ScalarShape::AdtFields { .. } | ScalarShape::Fields { .. } => {
+                        (shape.clone(), 1)
+                    }
+                    _ => Self::shape_lanes(inner),
+                }
+            }
             other => (other.clone(), 1),
         }
     }
@@ -17454,6 +17924,7 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         value: Value,
         shape: &ScalarShape,
+        root_ty: Option<&Ty>,
     ) -> InterpResult<()> {
         let elem_block = matches!(target, Resolved::Alloc { id, projection }
             if self.is_elem_block(*id)
@@ -17488,7 +17959,7 @@ impl<'a> Interpreter<'a> {
         if let Some(view) = self.byte_view_shaped_store(frames, target, &value, shape) {
             return view;
         }
-        self.write_resolved(frames, target, value)
+        self.write_resolved_typed(frames, target, value, root_ty)
     }
 
     fn reinterpret_value(
@@ -18714,6 +19185,26 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, operand)?;
                 Self::unwrap_array_elems(value)
             }
+            Rvalue::UnwrapSliceElems(operand) => {
+                // A pointer cast never rewrites the storage it
+                // denotes: the same allocation can still be viewed
+                // through pointers of the other element type, and
+                // that view must keep observing the original
+                // values. The fat pointer is unchanged, and each
+                // element's representation difference between the
+                // two views is reconciled where the element is
+                // actually read or written through a pointer (the
+                // entry/peel judgments at access points), not here.
+                let value = self.eval_operand(frames, body, operand)?;
+                Ok(value)
+            }
+            Rvalue::WrapSliceElems(operand) => {
+                // See `UnwrapSliceElems`: the cast preserves the
+                // backing storage; only the resulting pointer's
+                // element view differs.
+                let value = self.eval_operand(frames, body, operand)?;
+                Ok(value)
+            }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 match value {
@@ -18885,7 +19376,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Reinterpret(operand, src, dst) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                self.reinterpret_value(&value, src, dst)
+                let r = self.reinterpret_value(&value, src, dst);
+                r
             }
             Rvalue::ShapedLoad(place, shape, moved) => {
                 let target = self.resolve_place(frames, body, place)?;
@@ -19505,7 +19997,13 @@ fn projection_ends_at_element(projection: &[RefProj]) -> bool {
     let mut pos = projection.len();
     while pos > 0 {
         match projection[pos - 1] {
-            RefProj::Field(_) | RefProj::Downcast(_) => pos -= 1,
+            // A whole-value entry step enters a transparent
+            // wrapper's only field (or downcasts to the entered
+            // variant); any other field step selects a genuine
+            // field of the element the index step denotes (a
+            // node's key array, say), and the position denotes
+            // that field's value, not the element.
+            RefProj::Field(0) | RefProj::Downcast(_) => pos -= 1,
             RefProj::Index(_) => return true,
             _ => return false,
         }
@@ -19615,10 +20113,11 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
     let mut entered = false;
     while pos > 0 {
         match projection[pos - 1] {
-            RefProj::Field(_) | RefProj::Downcast(_) => {
+            RefProj::Field(0) | RefProj::Downcast(_) => {
                 entered = true;
                 pos -= 1;
             }
+            RefProj::Field(_) => return None,
             RefProj::Index(k) => {
                 if !entered {
                     return None;
@@ -19757,7 +20256,14 @@ fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {
         let mut pos = projection.len();
         loop {
             match projection.get(pos.wrapping_sub(1)) {
-                Some(RefProj::Field(_)) | Some(RefProj::Downcast(_)) => {
+                // Only a whole-value entry step (a transparent
+                // wrapper's field 0, a downcast) can follow the
+                // element index here; any other field step selects
+                // a field of the element the index denotes (a
+                // node's key array, say), and composing the new
+                // index into that outer index would denote the
+                // field itself rather than its element.
+                Some(RefProj::Field(0)) | Some(RefProj::Downcast(_)) => {
                     pos -= 1;
                 }
                 Some(RefProj::Index(_)) => {
@@ -20432,6 +20938,25 @@ pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
         _ => false,
     }
 }
+/// Whether a one-field wrapper's only field is an aggregate the
+/// transparent-wrapper descent may enter: a tuple, a multi-field
+/// aggregate, or another wrapper in the chain. A value-holding
+/// enum (a unit variant, or a wrapper around a scalar) is NOT
+/// entered: the wrapper itself is the aggregate being addressed,
+/// so an out-of-range field step grows it instead of burrowing
+/// into the value it happens to hold (a leaf node's `parent:
+/// Option<_>` None value must not become the leaf's storage).
+fn wrapper_payload(v: &Value) -> bool {
+    match v {
+        Value::Tuple(_) => true,
+        Value::Enum { fields, .. } => {
+            fields.len() >= 2
+                || (fields.len() == 1
+                    && wrapper_payload(&fields[0]))
+        }
+        _ => false,
+    }
+}
 
 /// The element count a stored capacity value carries: the
 /// integer itself, or the single field of the one-field
@@ -20570,8 +21095,27 @@ fn projection_enters_coroutine(root: &Value, projection: &[RefProj], func: &str)
     }
     false
 }
-
 pub(crate) fn project_value(
+    value: Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Value> {
+    project_value_ev(None, None, value, projection, func, place)
+}
+
+/// [`project_value`] with type evidence: `root_ty` is the
+/// declared type of `value`, walked alongside the projection
+/// so the transparent-wrapper descent can tell a wrapper's
+/// payload -- a complete value of the type the projection
+/// addresses -- from a partially materialised aggregate's
+/// first field, which is a value of a strictly smaller type
+/// (see `wrapper_descent_sanctioned`). Callers without
+/// evidence use `project_value`, whose descent judgments are
+/// the shape-only ones.
+pub(crate) fn project_value_ev(
+    program: Option<&Program>,
+    root_ty: Option<Ty>,
     value: Value,
     projection: &[RefProj],
     func: &str,
@@ -20589,6 +21133,9 @@ pub(crate) fn project_value(
     // The state a coroutine downcast named, for the field step
     // that follows it (see the `Downcast` arm below).
     let mut downcast_state: Option<u32> = None;
+    // The declared type of the value in hand, stepped alongside
+    // it (see `project_value_ev`).
+    let mut cur_ty = root_ty;
     while step_idx < projection.len() {
         let step = &projection[step_idx];
         step_idx += 1;
@@ -20600,6 +21147,63 @@ pub(crate) fn project_value(
             });
         }
         let step_state = downcast_state.take();
+        // A one-field wrapper the storage acquired through a
+        // transparent-wrapper pointer (a `MaybeUninit` pointee
+        // materialised by projected writes that entered field 0
+        // — see `ptr_field_value`): the payload's own readers
+        // address the payload's fields directly on the storage
+        // (a `Box<Leaf>` after `assume_init` reads the leaf's
+        // fields where the wrapper's field 0 holds them), so an
+        // out-of-range field step descends into the wrapper's
+        // only field first. In-range steps are unaffected, and a
+        // step that stays out of range keeps its error.
+        if let RefProj::Field(idx) = step {
+            loop {
+                let descend = match &value {
+                    Value::Enum { fields, .. } => {
+                        fields.len() == 1
+                            && fields.get(*idx).is_none()
+                            && wrapper_payload(&fields[0])
+                            && wrapper_descent_sanctioned(
+                                program,
+                                cur_ty.as_ref(),
+                                &value,
+                            )
+                    }
+                    _ => false,
+                };
+                if !descend {
+                    break;
+                }
+                cur_ty = descent_payload_ty(program, cur_ty.as_ref(), &value);
+                value = match value {
+                    Value::Enum { mut fields, .. } => {
+                        fields.pop().expect("one field checked")
+                    }
+                    _ => unreachable!("descent checked the shape"),
+                };
+            }
+        }
+        // The declared type steps alongside the value, so the
+        // next step's descent judgment sees the type of the
+        // value it judges. A step the type walk cannot follow
+        // ends the evidence; later judgments are the shape-only
+        // ones, exactly as for a caller without evidence.
+        cur_ty = match step {
+            RefProj::Field(idx) => {
+                let variant = match &value {
+                    Value::Enum { variant, .. } => *variant as usize,
+                    _ => 0,
+                };
+                stepped_field_ty(program, cur_ty.as_ref(), variant, *idx)
+            }
+            RefProj::Index(_) => stepped_index_ty(cur_ty.as_ref()),
+            RefProj::UnionField { idx, .. } => {
+                stepped_field_ty(program, cur_ty.as_ref(), 0, *idx)
+            }
+            RefProj::Downcast(_) => cur_ty,
+            _ => None,
+        };
         value = match step {
             RefProj::Field(idx) => match value {
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
@@ -21231,7 +21835,383 @@ fn splice_scalar_storage_byte(slot: &mut Value, idx: usize, byte: u8) -> bool {
 /// storage (see [`scalar_storage_byte`]) has no byte slot to
 /// hand out, so it is spliced into the scalar in place. Every
 /// other shape navigates to the selected slot and assigns, with
+/// Grow every tuple an `Index` step of `projection` addresses
+/// along the path the step denotes, filling with `Uninit` slots.
+/// Allocation storage materialises an array field element by
+/// element (a fresh node's key area has no array value yet: its
+/// tuple is exactly as long as the highest index written), so an
+/// allocation write's path is grown before navigation refuses an
+/// index past a partial tuple's end. A built array value in a
+/// local or a static keeps its length: the same step there is the
+/// guest's own out-of-bounds error, which `navigate_mut` reports.
+/// The walk mirrors navigation only where the current value's
+/// shape already determines the next slot; anything else (an
+/// `Uninit` slot above all) is left for navigation to
+/// materialise or refuse.
+///
+/// The declared type rides along when the caller has it, so
+/// the wrapper-descent retries are judged by the same type
+/// evidence as the navigation itself (see
+/// `wrapper_descent_sanctioned`): growing inside a partially
+/// materialised aggregate's first field would mutate a sibling
+/// the write does not address, ahead of the correctly typed
+/// assignment. Without evidence the shape judgment stands.
+fn grow_tuples_along(
+    value: &mut Value,
+    projection: &[RefProj],
+    program: Option<&Program>,
+    ty: Option<Ty>,
+) {
+    let Some((step, rest)) = projection.split_first() else {
+        return;
+    };
+    // The wrapper-descent judgment for this node, taken
+    // before the walk borrows the value mutably.
+    let sanctioned = wrapper_descent_sanctioned(program, ty.as_ref(), value);
+    let payload_ty = descent_payload_ty(program, ty.as_ref(), value);
+    match (value, step) {
+        (Value::Tuple(items), RefProj::Index(idx)) => {
+            // The materialisation bound the navigation itself
+            // enforces (`navigate_mut_grow` errors at this
+            // index): growing to it here would resize the
+            // storage before that error can fire -- and at the
+            // extreme index the size computation itself
+            // overflows. Leave the storage alone and let the
+            // navigation produce its error.
+            if *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                return;
+            }
+            if *idx >= items.len() {
+                items.resize(*idx + 1, Value::Uninit);
+            }
+            let elem_ty = stepped_index_ty(ty.as_ref());
+            grow_tuples_along(&mut items[*idx], rest, program, elem_ty);
+        }
+        (Value::Tuple(items), RefProj::Field(idx)) => {
+            let field_ty = stepped_field_ty(program, ty.as_ref(), 0, *idx);
+            if let Some(item) = items.get_mut(*idx) {
+                grow_tuples_along(item, rest, program, field_ty);
+            }
+        }
+        (Value::Enum { fields, variant }, RefProj::Field(idx)) => {
+            let variant = *variant as usize;
+            if *idx < fields.len() {
+                let field_ty = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                grow_tuples_along(&mut fields[*idx], rest, program, field_ty);
+            } else if fields.len() == 1 && wrapper_payload(&fields[0]) && sanctioned {
+                // The transparent-wrapper descent navigation
+                // performs: the step retries one level down.
+                grow_tuples_along(&mut fields[0], projection, program, payload_ty);
+            }
+        }
+        (Value::Enum { fields, variant }, RefProj::Index(idx)) => {
+            let variant = *variant as usize;
+            if fields.len() == 1
+                && matches!(fields[0], Value::Tuple(_) | Value::Bytes(_))
+                && sanctioned
+            {
+                grow_tuples_along(&mut fields[0], projection, program, payload_ty);
+            } else if *idx < fields.len() {
+                let field_ty = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                grow_tuples_along(&mut fields[*idx], rest, program, field_ty);
+            }
+        }
+        (value, RefProj::Downcast(_)) => grow_tuples_along(value, rest, program, ty),
+        _ => {}
+    }
+}
+
 /// exactly the errors that navigation produced before.
+/// The declared type of field `idx` of `variant` of the ADT
+/// (or tuple) `ty`, from the program's field-type table -- the
+/// free-function form of `Interpreter::adt_field_ty`, for the
+/// navigation type walk below.
+/// The recorded field-type table for a definition name. The
+/// table is keyed by the defining crate's path, while a type
+/// spelled through a re-export carries the re-exporting crate's
+/// path (`std::option::Option` for the definition recorded as
+/// `core::option::Option`); the std-family roots are tried in
+/// turn so both spellings find the one entry.
+fn adt_field_tys_of<'p>(program: &'p Program, name: &str) -> Option<&'p Vec<Vec<Option<Ty>>>> {
+    if let Some(entry) = program.adt_field_tys.get(name) {
+        return Some(entry);
+    }
+    let (_, rest) = name.split_once("::")?;
+    for root in ["core", "std", "alloc"] {
+        if let Some(entry) = program.adt_field_tys.get(&format!("{root}::{rest}")) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+fn adt_field_ty_in(program: &Program, ty: &Ty, variant: usize, idx: usize) -> Option<Ty> {
+    match ty {
+        Ty::Adt(name) => adt_field_tys_of(program, name)?
+            .get(variant)?
+            .get(idx)?
+            .clone(),
+        Ty::Tuple(ts) => ts.get(idx).cloned(),
+        _ => None,
+    }
+}
+
+/// The number of fields the program's field-type table declares
+/// for `variant` of the ADT `name`, when recorded.
+fn adt_variant_field_count(program: &Program, name: &str, variant: usize) -> Option<usize> {
+    adt_field_tys_of(program, name)?
+        .get(variant)
+        .map(|fields| fields.len())
+}
+
+/// Walk `ty` across a whole projection at the type level
+/// alone (no value at hand), for callers that project a value
+/// in segments and must carry the declared type across a
+/// segment boundary (`project_value_t`'s union-field
+/// segmentation). A step the walk cannot follow ends the
+/// evidence (`None`).
+fn step_ty_across(
+    program: Option<&Program>,
+    ty: Option<Ty>,
+    projection: &[RefProj],
+) -> Option<Ty> {
+    let mut ty = ty;
+    let mut variant = 0usize;
+    for step in projection {
+        ty = match step {
+            RefProj::Field(idx) => {
+                let next = stepped_field_ty(program, ty.as_ref(), variant, *idx);
+                variant = 0;
+                next
+            }
+            RefProj::UnionField { idx, .. } => {
+                stepped_field_ty(program, ty.as_ref(), 0, *idx)
+            }
+            RefProj::Downcast(v) => {
+                variant = *v as usize;
+                ty
+            }
+            RefProj::Index(_) => stepped_index_ty(ty.as_ref()),
+            _ => None,
+        };
+        if ty.is_none() {
+            return None;
+        }
+    }
+    ty
+}
+
+/// The declared type one field step down from `ty`, when both
+/// the program's field-type table and the current type are
+/// known; the type walk in `navigate_mut_grow` uses it to keep
+/// each slot's declared type attached to the slot.
+fn stepped_field_ty(
+    program: Option<&Program>,
+    ty: Option<&Ty>,
+    variant: usize,
+    idx: usize,
+) -> Option<Ty> {
+    match (program, ty) {
+        (Some(program), Some(ty)) => adt_field_ty_in(program, ty, variant, idx),
+        _ => None,
+    }
+}
+
+/// The declared element type one index step down from `ty`.
+fn stepped_index_ty(ty: Option<&Ty>) -> Option<Ty> {
+    match ty {
+        Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
+/// Whether `value` is a *complete* value of `ty` under the
+/// program's declared field types: every declared field of an
+/// aggregate is present and itself complete, and scalars match
+/// in kind. A type the tables do not record cannot be judged
+/// incomplete and counts as complete (the caller's shape-based
+/// judgment then stands); a recorded type is judged strictly.
+/// Completeness is what separates a wrapper's payload -- a
+/// whole value of the type the wrapper wraps -- from a
+/// partially materialised aggregate's first field, which is a
+/// value of a strictly smaller type and so can never be
+/// complete for the aggregate's own type.
+fn value_complete_for_ty(program: &Program, value: &Value, ty: &Ty) -> bool {
+    value_complete_for_ty_at(program, value, ty, 0)
+}
+
+fn value_complete_for_ty_at(
+    program: &Program,
+    value: &Value,
+    ty: &Ty,
+    depth: usize,
+) -> bool {
+    if depth > 4 {
+        return true;
+    }
+    match (ty, value) {
+        (Ty::Adt(name), Value::Enum { variant, fields }) => {
+            match program
+                .adt_field_tys
+                .get(name)
+                .and_then(|variants| variants.get(*variant as usize))
+            {
+                Some(declared) => {
+                    fields.len() == declared.len()
+                        && fields.iter().zip(declared.iter()).all(|(field, field_ty)| {
+                            // A field whose declared type the
+                            // table could not track (its head is
+                            // a generic parameter) cannot be
+                            // judged incomplete.
+                            match field_ty {
+                                Some(field_ty) => value_complete_for_ty_at(
+                                    program,
+                                    field,
+                                    field_ty,
+                                    depth + 1,
+                                ),
+                                None => true,
+                            }
+                        })
+                }
+                None => true,
+            }
+        }
+        (Ty::Adt(name), Value::Unit) => match program.adt_field_tys.get(name) {
+            Some(variants) => variants.iter().any(|declared| declared.is_empty()),
+            None => true,
+        },
+        (Ty::Tuple(ts), Value::Tuple(items)) => {
+            items.len() == ts.len()
+                && items
+                    .iter()
+                    .zip(ts.iter())
+                    .all(|(item, t)| value_complete_for_ty_at(program, item, t, depth + 1))
+        }
+        (Ty::Tuple(ts), Value::Unit) => ts.is_empty(),
+        (Ty::Array(elem, n), Value::Tuple(items)) => {
+            items.len() as u64 == *n
+                && items
+                    .iter()
+                    .all(|item| value_complete_for_ty_at(program, item, elem, depth + 1))
+        }
+        (Ty::Uint(_), Value::Uint(_))
+        | (Ty::Int(_), Value::Int(_))
+        | (Ty::Bool, Value::Bool(_))
+        | (Ty::Float(_), Value::Float(_) | Value::Float128(_))
+        | (Ty::Unit, Value::Unit)
+        | (Ty::Str, Value::Str(_) | Value::Bytes(_)) => true,
+        (Ty::Ref(_), Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }) => true,
+        // An aggregate type over a non-aggregate value (or the
+        // wrong aggregate form) is a clear mismatch.
+        (Ty::Adt(_) | Ty::Tuple(_), _) => false,
+        _ => true,
+    }
+}
+
+/// Whether the transparent-wrapper descent in
+/// `navigate_mut_grow`'s field arm may fire for a slot holding
+/// a one-field enum whose sole field is an aggregate: the
+/// descent presumes the stored field is a wrapper layer around
+/// the value the rest of the projection addresses. Type
+/// evidence can refute that presumption, in one case: the
+/// variant the stored value selects (the only variant, for a
+/// struct) declares at least two fields, and the stored field
+/// is not a *complete* value of that type. Then the stored
+/// field is the selected variant's own first field and the
+/// slot is that variant's value materialised field by field,
+/// its remaining fields elided or not yet written: the step
+/// belongs to the slot's own fields, which the ordinary field
+/// arm grows into place (and a read answers through the
+/// canonical-value fallback). The same judgment applies to
+/// a tuple root, whose declared fields are its element types.
+/// Every other declared shape
+/// leaves the descent standing: a step into a variant with at
+/// most one declared field can only address its sole field's
+/// interior. With no type evidence the stored form decides,
+/// as before.
+/// The declared type of a wrapper's payload after a
+/// sanctioned descent: the payload is a value of the slot's
+/// declared type (the retargeted-pointer case), except when
+/// the declared type is the one-field wrapper itself, whose
+/// interior is its sole field's type. (The same computation
+/// `navigate_mut_grow` performs inline at its descent.)
+fn descent_payload_ty(
+    program: Option<&Program>,
+    ty: Option<&Ty>,
+    slot: &Value,
+) -> Option<Ty> {
+    let slot_variant = match slot {
+        Value::Enum { variant, .. } => *variant as usize,
+        _ => 0,
+    };
+    match (program, ty) {
+        (Some(program), Some(adt @ Ty::Adt(name)))
+            if adt_variant_field_count(program, name, slot_variant) == Some(1) =>
+        {
+            adt_field_ty_in(program, adt, slot_variant, 0)
+        }
+        (_, Some(Ty::Tuple(ts))) if ts.len() == 1 => ts.first().cloned(),
+        _ => ty.cloned(),
+    }
+}
+
+fn wrapper_descent_sanctioned(
+    program: Option<&Program>,
+    ty: Option<&Ty>,
+    slot: &Value,
+) -> bool {
+    let (
+        Some(program),
+        Some(ty),
+        Value::Enum {
+            variant, fields, ..
+        },
+    ) = (program, ty, slot)
+    else {
+        return true;
+    };
+    // The declared shape that decides is the *selected*
+    // variant's field count (a tuple's element count, for a
+    // tuple root: a tuple materialised field by field has the
+    // same one-field stored form as a struct): the stored
+    // form is a value of that variant, and the step addresses
+    // its fields. Declaring at most one field leaves the
+    // descent standing. Declaring more fields makes the
+    // one-field stored form that variant's own partially
+    // materialised value, and the completeness check decides.
+    let (declared_len, slot_ty) = match ty {
+        Ty::Adt(name) => {
+            let Some(variants) = adt_field_tys_of(program, name) else {
+                // The type is a named ADT the program's field
+                // table does not record: there is no evidence
+                // the stored form is a wrapper around a value
+                // of this type rather than the type's own
+                // partially materialised form, so the descent
+                // does not stand. (With no type evidence at
+                // all -- no program or a non-ADT, non-tuple
+                // type -- the shape judgment above stands as
+                // before.)
+                return false;
+            };
+            let Some(selected) = variants.get(*variant as usize) else {
+                // The stored variant is not among the
+                // declared ones: there is no evidence the
+                // stored form is a wrapper, so the descent
+                // does not stand.
+                return false;
+            };
+            (selected.len(), Ty::Adt(name.clone()))
+        }
+        Ty::Tuple(ts) => (ts.len(), Ty::Tuple(ts.clone())),
+        _ => return true,
+    };
+    if declared_len <= 1 {
+        return true;
+    }
+    value_complete_for_ty(program, &fields[0], &slot_ty)
+}
+
 fn assign_projected(
     slot: &mut Value,
     projection: &[RefProj],
@@ -21239,6 +22219,8 @@ fn assign_projected(
     func: &str,
     place: &str,
     grow: bool,
+    program: Option<&Program>,
+    ty: Option<Ty>,
 ) -> InterpResult<()> {
     // The byte-splice pre-passes below read the projection's
     // last step as a byte position inside the value the head
@@ -21247,12 +22229,32 @@ fn assign_projected(
     // splice mistakes the run's last index for a byte offset
     // into the element at the run's head.
     let composed;
-    let projection = if projection_needs_composition(projection) {
+    let (projection, ty) = if projection_needs_composition(projection) {
         composed = compose_projection(slot, projection, func, place);
-        &composed[..]
+        if composed.as_slice() == projection {
+            // Composition left the steps nested as written
+            // (the element at the run's head is itself an
+            // aggregate, so the steps do not compose): the
+            // declared types still correspond step by step,
+            // so the type evidence stands.
+            (&composed[..], ty)
+        } else {
+            // A composed projection's steps no longer
+            // correspond to the declared types step by step
+            // (an index run flattened into one step spans
+            // several element types), so the type walk only
+            // follows an uncomposed projection.
+            (&composed[..], None)
+        }
     } else {
-        projection
+        (projection, ty)
     };
+    // The pre-passes' head navigations carry the type evidence
+    // the caller supplied (when the projection was not
+    // composed): a shape-only head walk can take the wrapper
+    // descent into a partially materialised aggregate's first
+    // field and splice the byte into a sibling the write does
+    // not address.
     if let Some((&RefProj::ByteOffset(disp), head)) = projection.split_last() {
         // A byte written through a pointer displaced into a
         // scalar's storage, with no index step after the
@@ -21261,7 +22263,15 @@ fn assign_projected(
         // written is what makes the position a byte position.
         if disp >= 0 {
             if let Some(byte) = value_as_storage_byte(&value) {
-                if let Ok(head_slot) = navigate_mut_grow(slot, head, func, place, grow) {
+                if let Ok(head_slot) = navigate_mut_grow(
+                    slot,
+                    head,
+                    func,
+                    place,
+                    grow,
+                    program,
+                    ty.clone(),
+                ) {
                     if splice_scalar_storage_byte(head_slot, disp as usize, byte) {
                         return Ok(());
                     }
@@ -21273,15 +22283,37 @@ fn assign_projected(
         // A byte pointer displaced into the storage first
         // (`p.add(k)`) puts a byte-offset step immediately before
         // the index step; the byte position is the sum.
-        let (idx, head) = match head.split_last() {
+        let (idx, head, byte_displaced) = match head.split_last() {
             Some((&RefProj::ByteOffset(disp), head)) if disp >= 0 => {
-                (idx + disp as usize, head)
+                (idx + disp as usize, head, true)
             }
-            _ => (idx, head),
+            _ => (idx, head, false),
         };
         if let Some(byte) = value_as_storage_byte(&value) {
-            if let Ok(head_slot) = navigate_mut_grow(slot, head, func, place, grow) {
-                if splice_scalar_storage_byte(head_slot, idx, byte) {
+            if let Ok(head_slot) = navigate_mut_grow(
+                slot,
+                head,
+                func,
+                place,
+                grow,
+                program,
+                ty.clone(),
+            ) {
+                // The splice is a byte position inside a scalar's
+                // storage. It applies when the projection is
+                // byte-displaced (its shape says so outright), or
+                // when the head slot actually holds a scalar. An
+                // unwritten head slot is not evidence of a scalar:
+                // it is just as often an array field no write has
+                // materialised yet (a fresh node's key area being
+                // filled element by element), and splicing the
+                // first elements into a fabricated scalar there
+                // would pack them into one integer and lose the
+                // array. Such a write belongs to the ordinary
+                // navigation below, which materialises the array.
+                if (byte_displaced || scalar_storage_len(head_slot).is_some())
+                    && splice_scalar_storage_byte(head_slot, idx, byte)
+                {
                     return Ok(());
                 }
             }
@@ -21293,10 +22325,11 @@ fn assign_projected(
         // the element-list value, so the write applies the
         // `Vec::set_len` storage change to the vector value
         // the head denotes.
-        let head_slot = navigate_mut_grow(slot, head, func, place, grow)?;
+        let head_slot =
+            navigate_mut_grow(slot, head, func, place, grow, program, ty.clone())?;
         return assign_vec_len(head_slot, value, place);
     }
-    let target = navigate_mut_grow(slot, projection, func, place, grow)?;
+    let target = navigate_mut_grow(slot, projection, func, place, grow, program, ty)?;
     *target = value;
     Ok(())
 }
@@ -21400,6 +22433,19 @@ pub(crate) fn project_value_ref<'a>(
     func: &str,
     place: &str,
 ) -> InterpResult<Cow<'a, Value>> {
+    project_value_ref_ev(None, None, value, projection, func, place)
+}
+
+/// [`project_value_ref`] with type evidence, as in
+/// `project_value_ev`.
+pub(crate) fn project_value_ref_ev<'a>(
+    program: Option<&Program>,
+    root_ty: Option<Ty>,
+    value: &'a Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Cow<'a, Value>> {
     let composed;
     let projection = if projection_needs_composition(projection) {
         composed = compose_projection(value, projection, func, place);
@@ -21408,6 +22454,7 @@ pub(crate) fn project_value_ref<'a>(
         projection
     };
     let mut cur: &'a Value = value;
+    let mut cur_ty = root_ty;
     let mut rest = projection;
     // The state a coroutine downcast named, for the field step
     // that follows it (see the `Downcast` arm below).
@@ -21421,8 +22468,40 @@ pub(crate) fn project_value_ref<'a>(
         }
         rest = tail;
         let step_state = downcast_state.take();
+        // The declared type steps alongside the value (see
+        // `project_value_ev`); the field step steps inside its
+        // arm, past its wrapper descent.
+        if !matches!(step, RefProj::Field(_)) {
+            cur_ty = match step {
+                RefProj::Index(_) => stepped_index_ty(cur_ty.as_ref()),
+                RefProj::UnionField { idx, .. } => {
+                    stepped_field_ty(program, cur_ty.as_ref(), 0, *idx)
+                }
+                RefProj::Downcast(_) => cur_ty,
+                _ => None,
+            };
+        }
         match step {
             RefProj::Field(idx) => {
+                // The transparent-wrapper descent of
+                // `project_value`, in borrowing form: retry the
+                // step on the wrapper's only field.
+                while let Value::Enum { fields, .. } = cur {
+                    if fields.len() == 1
+                        && fields.get(*idx).is_none()
+                        && wrapper_payload(&fields[0])
+                        && wrapper_descent_sanctioned(program, cur_ty.as_ref(), cur)
+                    {
+                        cur_ty = descent_payload_ty(program, cur_ty.as_ref(), cur);
+                        cur = &fields[0];
+                    } else {
+                        break;
+                    }
+                }
+                let variant = match cur {
+                    Value::Enum { variant, .. } => *variant as usize,
+                    _ => 0,
+                };
                 cur = match cur {
                     Value::Tuple(items) => items.get(*idx).ok_or_else(|| {
                         InterpError::UninitializedRead {
@@ -21579,6 +22658,7 @@ pub(crate) fn project_value_ref<'a>(
                         ))
                     }
                 };
+                cur_ty = stepped_field_ty(program, cur_ty.as_ref(), variant, *idx);
             }
             RefProj::Index(idx) => match cur {
                 Value::FatRef { base, len } => {
@@ -21847,7 +22927,7 @@ pub(crate) fn navigate_mut<'x>(
     func: &str,
     place: &str,
 ) -> InterpResult<&'x mut Value> {
-    navigate_mut_grow(slot, projection, func, place, false)
+    navigate_mut_grow(slot, projection, func, place, false, None, None)
 }
 
 /// [`navigate_mut`] with the sequence-growth policy explicit.
@@ -21859,22 +22939,40 @@ pub(crate) fn navigate_mut<'x>(
 /// so an index write past its length there is the bounds
 /// violation the guest's own index semantics name; only
 /// allocation writes grow.
-fn navigate_mut_grow<'x>(
+///
+/// `ty` is the declared type of the value in `slot`, when the
+/// caller knows it; the walk steps it alongside the projection
+/// (through the program's field-type table) so each slot's own
+/// declared type rides with it, and the wrapper descent in the
+/// field arm consults it (see `wrapper_descent_sanctioned`).
+/// Steps whose interior the declared types do not describe
+/// (byte positions, vector storage, coroutine state) drop the
+/// walk, and the judgments there stay shape-only.
+pub(crate) fn navigate_mut_grow<'x>(
     slot: &'x mut Value,
     projection: &[RefProj],
     func: &str,
     place: &str,
     grow: bool,
+    program: Option<&Program>,
+    ty: Option<Ty>,
 ) -> InterpResult<&'x mut Value> {
     if projection.is_empty() {
         return Ok(slot);
     }
     let composed;
-    let projection = if projection_needs_composition(projection) {
+    let (projection, ty) = if projection_needs_composition(projection) {
         composed = compose_projection(slot, projection, func, place);
-        &composed[..]
+        // As in `assign_projected`: the type walk follows the
+        // projection when composition left it unchanged, and
+        // only a rewritten projection drops the evidence.
+        if composed.as_slice() == projection {
+            (&composed[..], ty)
+        } else {
+            (&composed[..], None)
+        }
     } else {
-        projection
+        (projection, ty)
     };
     if *slot == Value::Uninit {
         // Partial initialization: MIR fills an aggregate place
@@ -21982,11 +23080,19 @@ fn navigate_mut_grow<'x>(
                     *field = Value::Uninit;
                 }
             }
-            navigate_mut_grow(&mut fields[*idx], rest, func, place, grow)
+            navigate_mut_grow(
+                &mut fields[*idx],
+                rest,
+                func,
+                place,
+                grow,
+                program,
+                stepped_field_ty(program, ty.as_ref(), 0, *idx),
+            )
         }
         RefProj::ByteOffset(disp) => {
             if *disp == 0 {
-                navigate_mut_grow(slot, rest, func, place, grow)
+                navigate_mut_grow(slot, rest, func, place, grow, program, ty)
             } else {
                 Err(InterpError::UnsupportedProjection {
                     kind: format!(
@@ -22005,7 +23111,7 @@ fn navigate_mut_grow<'x>(
                     let Value::DynRef { base, .. } = slot else {
                         unreachable!("shape checked by the guard")
                     };
-                    return navigate_mut_grow(base, projection, func, place, grow);
+                    return navigate_mut_grow(base, projection, func, place, grow, None, None);
                 }
             }
             if *idx == 0
@@ -22020,7 +23126,15 @@ fn navigate_mut_grow<'x>(
                 // string value lands on the string itself, and
                 // over a fat pointer (the non-UTF-8 form of the
                 // same values) on the fat pointer itself.
-                return navigate_mut_grow(slot, rest, func, place, grow);
+                return navigate_mut_grow(
+                    slot,
+                    rest,
+                    func,
+                    place,
+                    grow,
+                    program,
+                    stepped_field_ty(program, ty.as_ref(), 0, 0),
+                );
             }
             if *idx == 0
                 && matches!(
@@ -22042,7 +23156,7 @@ fn navigate_mut_grow<'x>(
                 // in `project_value`), or of a wrapper over a
                 // bare scalar lands on the held value, which is
                 // the slot itself.
-                return navigate_mut_grow(slot, rest, func, place, grow);
+                return navigate_mut_grow(slot, rest, func, place, grow, None, None);
             }
             if let Value::Coroutine { fields, .. } = slot {
                 // The state storage grows to the written slot: a
@@ -22052,7 +23166,7 @@ fn navigate_mut_grow<'x>(
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
                 }
-                return navigate_mut_grow(&mut fields[*idx], rest, func, place, grow);
+                return navigate_mut_grow(&mut fields[*idx], rest, func, place, grow, None, None);
             }
             // The field vector of the value in the slot may be
             // sparse or invalidated: a union value covers only
@@ -22065,12 +23179,88 @@ fn navigate_mut_grow<'x>(
             // the vector with Uninit padding up to the written
             // index; slots never written keep reading as
             // uninitialized.
-            if let Value::Enum { fields, .. } = slot {
+            // The transparent-wrapper descent of
+            // `project_value`, in writing form: a field step
+            // past the end of a one-field wrapper whose only
+            // field is an aggregate continues into that field
+            // with the whole projection, instead of growing
+            // the wrapper with padding it does not have.
+            if matches!(
+                slot,
+                Value::Enum { fields, .. }
+                    if fields.len() == 1
+                        && fields.len() <= *idx
+                        && wrapper_payload(&fields[0])
+            ) {
+                // The shape alone does not prove a wrapper: a
+                // struct being initialized field by field has
+                // exactly this shape once its first (aggregate)
+                // field is stored, and descending there would
+                // write the next field inside the first one.
+                // Type evidence arbitrates (see
+                // `wrapper_descent_sanctioned`); without it the
+                // descent stands, as before. When the evidence
+                // refutes the wrapper, execution falls through
+                // to the field arm below, which grows the value's
+                // own field vector into place.
+                if wrapper_descent_sanctioned(program, ty.as_ref(), slot) {
+                    let slot_variant = match slot {
+                        Value::Enum { variant, .. } => *variant as usize,
+                        _ => unreachable!("descent checked the shape"),
+                    };
+                    // The type the rest of the projection
+                    // addresses inside the payload: the payload
+                    // is a value of the slot's declared type (the
+                    // retargeted-pointer case), except when the
+                    // declared type is the one-field wrapper
+                    // itself, whose interior is its sole field's
+                    // type.
+                    let payload_ty = match (program, &ty) {
+                        (Some(program), Some(adt @ Ty::Adt(name)))
+                            if adt_variant_field_count(program, name, slot_variant)
+                                == Some(1) =>
+                        {
+                            adt_field_ty_in(program, adt, slot_variant, 0)
+                        }
+                        (_, Some(Ty::Tuple(ts))) if ts.len() == 1 => {
+                            ts.first().cloned()
+                        }
+                        _ => ty.clone(),
+                    };
+                    let Value::Enum { fields, .. } = slot else {
+                        unreachable!("descent checked the shape")
+                    };
+                    return navigate_mut_grow(
+                        &mut fields[0],
+                        projection,
+                        func,
+                        place,
+                        false,
+                        program,
+                        payload_ty,
+                    );
+                }
+            }
+            if let Value::Enum { fields, variant } = slot {
+                let variant = *variant as usize;
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
                 }
-                return navigate_mut_grow(&mut fields[*idx], rest, func, place, grow);
+                return navigate_mut_grow(
+                    &mut fields[*idx],
+                    rest,
+                    func,
+                    place,
+                    grow,
+                    program,
+                    stepped_field_ty(program, ty.as_ref(), variant, *idx),
+                );
             }
+            let sub_ty = if matches!(&*slot, Value::Tuple(_)) {
+                stepped_field_ty(program, ty.as_ref(), 0, *idx)
+            } else {
+                None
+            };
             let items = match slot {
                 Value::Tuple(items) => items,
                 Value::Closure { env, .. } => env,
@@ -22086,7 +23276,7 @@ fn navigate_mut_grow<'x>(
                 func: func.to_string(),
                 place: place.to_string(),
             })?;
-            navigate_mut_grow(item, rest, func, place, grow)
+            navigate_mut_grow(item, rest, func, place, grow, program, sub_ty)
         }
         RefProj::Index(idx) => match slot {
             Value::Tuple(items) => {
@@ -22102,7 +23292,15 @@ fn navigate_mut_grow<'x>(
                     }
                     items.resize(*idx + 1, Value::Uninit);
                 }
-                navigate_mut_grow(&mut items[*idx], rest, func, place, grow)
+                navigate_mut_grow(
+                    &mut items[*idx],
+                    rest,
+                    func,
+                    place,
+                    grow,
+                    program,
+                    stepped_index_ty(ty.as_ref()),
+                )
             }
             // A `Vec` value is the aggregate of its elements:
             // indexing the vector's own place writes the element
@@ -22162,11 +23360,11 @@ fn navigate_mut_grow<'x>(
                     let mut full = Vec::with_capacity(rest.len() + 1);
                     full.push(RefProj::Index(*idx));
                     full.extend_from_slice(rest);
-                    navigate_mut_grow(&mut fields[0], &full, func, place, grow)
+                    navigate_mut_grow(&mut fields[0], &full, func, place, grow, None, None)
                 } else if *idx >= fields.len() {
                     return Err(index_oob(fields.len(), *idx));
                 } else {
-                    navigate_mut_grow(&mut fields[*idx], rest, func, place, grow)
+                    navigate_mut_grow(&mut fields[*idx], rest, func, place, grow, None, None)
                 }
             }
             // A sparse vector value (see `Value::SparseVec`):
@@ -22209,7 +23407,7 @@ fn navigate_mut_grow<'x>(
                         *cap = elems.len() as u128;
                     }
                 }
-                navigate_mut_grow(&mut elems[*idx], rest, func, place, grow)
+                navigate_mut_grow(&mut elems[*idx], rest, func, place, grow, None, None)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
@@ -22253,13 +23451,29 @@ fn navigate_mut_grow<'x>(
                             if target >= items.len() {
                                 return Err(index_oob(items.len(), target));
                             }
-                            navigate_mut_grow(&mut items[target], rest, func, place, grow)
+                            navigate_mut_grow(
+                                &mut items[target],
+                                rest,
+                                func,
+                                place,
+                                grow,
+                                program,
+                                stepped_index_ty(ty.as_ref()),
+                            )
                         }
                         Value::Enum { fields, .. } => {
                             if target >= fields.len() {
                                 return Err(index_oob(fields.len(), target));
                             }
-                            navigate_mut_grow(&mut fields[target], rest, func, place, grow)
+                            navigate_mut_grow(
+                                &mut fields[target],
+                                rest,
+                                func,
+                                place,
+                                grow,
+                                None,
+                                None,
+                            )
                         }
                         other => Err(InterpError::type_mismatch(
                             format!("subslice element write on {place}"),
@@ -22283,7 +23497,7 @@ fn navigate_mut_grow<'x>(
                         len: *inner_len,
                     }];
                     composed.extend_from_slice(&rest[1..]);
-                    navigate_mut_grow(slot, &composed, func, place, grow)
+                    navigate_mut_grow(slot, &composed, func, place, grow, program, ty)
                 }
                 _ => Err(InterpError::type_mismatch(
                     format!("write through sub-slice on {place}"),
@@ -22326,32 +23540,67 @@ fn navigate_mut_grow<'x>(
                 if state.len() <= idx {
                     state.resize(idx + 1, Value::Uninit);
                 }
-                navigate_mut_grow(&mut state[idx], tail, func, place, grow)
+                navigate_mut_grow(&mut state[idx], tail, func, place, grow, None, None)
             }
             // A downcast with no field step after it (a whole-state
             // place) denotes the coroutine value itself.
-            Value::Coroutine { .. } => navigate_mut_grow(slot, rest, func, place, grow),
-            Value::Enum {
-                variant: current,
-                fields,
-            } => {
-                if current != variant {
-                    // A mutable navigation through the downcast of
-                    // a variant other than the one the tag names is
-                    // an in-place reinitialization: the old variant's
-                    // payload is invalidated and the new variant's
-                    // storage is rematerialized empty (the Field arm
-                    // pads it with Uninit slots as fields are
-                    // written). The tag switches here so that the
-                    // closing SetDiscriminant, when the MIR emits
-                    // one after the stores, names the held variant
-                    // and leaves the stored fields in place.
-                    *current = *variant;
-                    fields.clear();
-                }
-                navigate_mut_grow(slot, rest, func, place, grow)
+            Value::Coroutine { .. } => {
+                navigate_mut_grow(slot, rest, func, place, grow, None, None)
             }
-            Value::Tuple(_) if *variant == 0 => navigate_mut_grow(slot, rest, func, place, grow),
+            Value::Enum { .. } => {
+                if let Value::Enum {
+                    variant: current,
+                    fields,
+                } = slot
+                {
+                    if current != variant {
+                        // A mutable navigation through the downcast of
+                        // a variant other than the one the tag names is
+                        // an in-place reinitialization: the old variant's
+                        // payload is invalidated and the new variant's
+                        // storage is rematerialized empty (the Field arm
+                        // pads it with Uninit slots as fields are
+                        // written). The tag switches here so that the
+                        // closing SetDiscriminant, when the MIR emits
+                        // one after the stores, names the held variant
+                        // and leaves the stored fields in place.
+                        *current = *variant;
+                        fields.clear();
+                    }
+                }
+                // A field step right after a downcast names one of
+                // the variant's own fields: consume it here, growing
+                // the field vector as the `Field` arm would, so the
+                // wrapper descent there never sees a post-downcast
+                // step (a variant's field 0 is not a transparent
+                // wrapper's payload).
+                if matches!(rest.first(), Some(RefProj::Field(_))) {
+                    let Value::Enum { fields, .. } = slot else {
+                        unreachable!("enum checked above")
+                    };
+                    let Some((RefProj::Field(idx), tail)) = rest.split_first()
+                    else {
+                        unreachable!("field step checked above")
+                    };
+                    let idx = *idx;
+                    if fields.len() <= idx {
+                        fields.resize(idx + 1, Value::Uninit);
+                    }
+                    return navigate_mut_grow(
+                        &mut fields[idx],
+                        tail,
+                        func,
+                        place,
+                        grow,
+                        program,
+                        stepped_field_ty(program, ty.as_ref(), *variant as usize, idx),
+                    );
+                }
+                navigate_mut_grow(slot, rest, func, place, grow, program, ty)
+            }
+            Value::Tuple(_) if *variant == 0 => {
+                navigate_mut_grow(slot, rest, func, place, grow, program, ty)
+            }
             other => Err(InterpError::type_mismatch(
                 format!("downcast write on {place}"),
                 "ADT value",
@@ -24525,5 +25774,656 @@ fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
         (Value::Closure { .. }, Ty::Closure(..)) => true,
         (Value::Coroutine { .. }, Ty::Coroutine(_)) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod write_bound_tests {
+    use super::*;
+
+    /// A projected write whose index step sits at the
+    /// materialisation bound must produce the navigation's
+    /// interpreter error, not resize the allocation's storage
+    /// first: the growth pre-pass runs ahead of the bounded
+    /// navigation, and at the extreme index its size
+    /// computation overflows the host's arithmetic.
+    #[test]
+    fn alloc_write_at_materialisation_bound_errors() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(0), RefProj::Index(usize::MAX)],
+        };
+        let result = interp.write_resolved(&mut frames, &target, Value::Int(7));
+        assert!(result.is_err(), "write at the bound must error");
+        // The storage is untouched by the rejected write.
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_route_tests {
+    use super::*;
+    use crate::ir::{Body, Place, Program, Ty, ZstPathStep};
+
+    fn partial_struct() -> Value {
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+        }
+    }
+
+    /// A projected write into an allocation whose declared
+    /// pointee type is on record (the type the box construction
+    /// builtins record, or a caller's root type): the second
+    /// field's write extends the struct's own field vector; it
+    /// does not descend into the first field.
+    #[test]
+    fn typed_alloc_field_write_extends_the_struct() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(partial_struct());
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(30),
+                Some(&Ty::Adt("probe::S".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            })
+        );
+    }
+
+    /// A read-modify-write whose index step sits at the
+    /// materialisation bound errors like the plain write does
+    /// (see `write_bound_tests`), with the storage untouched.
+    #[test]
+    fn modify_resolved_at_materialisation_bound_errors() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(0), RefProj::Index(usize::MAX)],
+        };
+        let result = interp.modify_resolved(&mut frames, &target, |_| Ok(()));
+        assert!(result.is_err(), "modify at the bound must error");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
+            })
+        );
+    }
+
+    fn s2_program() -> Program {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::S2".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Unit),
+            ]],
+        );
+        let mut body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::S2".to_string())],
+            vec![],
+        );
+        let mut zst1 = std::collections::HashMap::new();
+        zst1.insert(vec![ZstPathStep::Field(1)], Value::Unit);
+        body.zst_fields = vec![std::collections::HashMap::new(), zst1];
+        program.add_function(body);
+        program
+    }
+
+    fn s2_frame() -> Frame {
+        Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![Value::Uninit, partial_struct()],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }
+    }
+
+    /// Successive projected writes to a local struct place:
+    /// the second field's write extends the struct's own
+    /// field vector; it does not descend into the first
+    /// field's aggregate and corrupt it.
+    #[test]
+    fn local_field_write_extends_the_struct() {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::S".to_string())],
+            vec![],
+        );
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let mut frames = vec![Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![Value::Uninit, partial_struct()],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }];
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(30))
+            .expect("write");
+        assert_eq!(
+            frames[0].locals[1],
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }
+        );
+        let readback = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(0), RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &readback).expect("read"),
+            Value::Int(20),
+        );
+    }
+
+    /// The borrowing read of a never-stored zero-sized field:
+    /// the wrapper descent is judged against the struct's own
+    /// declared type (the walk's root), refuses, and the
+    /// recorded canonical value answers -- a sibling's contents
+    /// are not the field's value. The owned read of the same
+    /// place already answered this way.
+    #[test]
+    fn borrowed_read_of_elided_field_is_canonical() {
+        let program = s2_program();
+        let interp = Interpreter::new(&program);
+        let body = program.get("main").unwrap();
+        let frames = vec![s2_frame()];
+        let place = Place::from_index(1).field(1);
+        assert_eq!(
+            interp.read_place(&frames, body, &place).expect("read"),
+            Value::Unit,
+            "the elided field must read as its canonical value"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp
+                .read_resolved_ref(&frames, &target)
+                .expect("read")
+                .into_owned(),
+            Value::Unit,
+        );
+        assert_eq!(
+            interp.read_resolved(&frames, &target).expect("read"),
+            Value::Unit,
+        );
+    }
+
+    fn e_program() -> Program {
+        let mut program = Program::new();
+        program.adt_field_tys.insert(
+            "probe::E".to_string(),
+            vec![
+                vec![
+                    Some(Ty::Tuple(vec![
+                        Ty::Int(IntTy::I32),
+                        Ty::Int(IntTy::I32),
+                    ])),
+                    Some(Ty::Unit),
+                ],
+                vec![Some(Ty::Int(IntTy::I32))],
+            ],
+        );
+        let mut body = Body::new(
+            "main",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::E".to_string())],
+            vec![],
+        );
+        let mut zst1 = std::collections::HashMap::new();
+        zst1.insert(
+            vec![ZstPathStep::Downcast(0), ZstPathStep::Field(1)],
+            Value::Unit,
+        );
+        body.zst_fields = vec![std::collections::HashMap::new(), zst1];
+        program.add_function(body);
+        program
+    }
+
+    /// The elided-field read of an enum place: the selected
+    /// variant declares a second, zero-sized field that was
+    /// never stored. The wrapper descent is judged against the
+    /// *selected variant's* declared fields, exactly as for a
+    /// struct: the stored first field is the variant's own, not
+    /// a wrapper payload, so the descent refuses and the
+    /// recorded canonical value answers -- a sibling's contents
+    /// are not the field's value.
+    #[test]
+    fn borrowed_read_of_elided_enum_field_is_canonical() {
+        let program = e_program();
+        let interp = Interpreter::new(&program);
+        let body = program.get("main").unwrap();
+        let frames = vec![s2_frame()];
+        let place = Place {
+            local: Local(1),
+            projection: vec![ProjectionElem::Downcast(0), ProjectionElem::Field(1)],
+        };
+        assert_eq!(
+            interp.read_place(&frames, body, &place).expect("read"),
+            Value::Unit,
+            "the elided variant field must read as its canonical value"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Downcast(0), RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp
+                .read_resolved_ref(&frames, &target)
+                .expect("read")
+                .into_owned(),
+            Value::Unit,
+        );
+        assert_eq!(
+            interp.read_resolved(&frames, &target).expect("read"),
+            Value::Unit,
+        );
+    }
+
+    /// A projected write to the second field's array element,
+    /// with the struct's declared type on record: the growth
+    /// pre-pass judges its wrapper-descent retry by the same
+    /// type evidence as the navigation, so it does not grow
+    /// an array inside the first field -- a sibling the write
+    /// does not address.
+    #[test]
+    fn alloc_growth_prepass_keeps_sibling_array() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S3".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Array(Box::new(Ty::Int(IntTy::I32)), 1),
+                ])),
+                Some(Ty::Array(Box::new(Ty::Int(IntTy::I32)), 4)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![
+                Value::Int(10),
+                Value::Tuple(vec![Value::Int(20)]),
+            ])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Index(3)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(1000),
+                Some(&Ty::Adt("probe::S3".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![
+                        Value::Int(10),
+                        Value::Tuple(vec![Value::Int(20)]),
+                    ]),
+                    Value::Tuple(vec![
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Int(1000),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    /// A byte-sized typed write to an unwritten array field
+    /// of a partially materialised struct: the byte-splice
+    /// pre-pass navigates the head with the type evidence, so
+    /// it cannot take the shape-only wrapper descent into the
+    /// first field and splice the byte into that sibling's
+    /// scalar storage; the ordinary navigation materialises
+    /// the array field instead.
+    #[test]
+    fn byte_splice_prepass_keeps_sibling() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S5".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 4)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Index(3)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Uint(7),
+                Some(&Ty::Adt("probe::S5".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Tuple(vec![
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uninit,
+                        Value::Uint(7),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    /// Nested index steps into an array of partially
+    /// materialised structs: the index run's head element is
+    /// itself an aggregate, so composition leaves the steps
+    /// nested as written, and the type evidence survives into
+    /// the navigation (see `assign_projected`): writing the
+    /// element struct's second field extends that struct; it
+    /// does not descend into the first field.
+    #[test]
+    fn nested_index_field_write_extends_the_struct() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::S".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![Value::Tuple(vec![
+            partial_struct(),
+        ])]));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(0), RefProj::Index(0), RefProj::Field(1)],
+        };
+        let root_ty = Ty::Array(
+            Box::new(Ty::Array(Box::new(Ty::Adt("probe::S".to_string())), 1)),
+            1,
+        );
+        interp
+            .write_resolved_typed(&mut frames, &target, Value::Int(30), Some(&root_ty))
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Tuple(vec![Value::Tuple(vec![Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }])]))
+        );
+    }
+
+    /// A write through a pointer to a field inside an
+    /// allocation whose declared type is on record: the
+    /// caller's type evidence is the pointee type (`Inner`),
+    /// but the resolved projection is rooted at the allocation
+    /// (`Outer`), so the navigation roots at the allocation's
+    /// own type. Writing the inner struct's second field
+    /// extends that struct; it does not descend into the first
+    /// field and corrupt it.
+    #[test]
+    fn interior_pointer_alloc_write_uses_the_allocations_type() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::Inner".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        program.adt_field_tys.insert(
+            "probe::Outer".to_string(),
+            vec![vec![
+                Some(Ty::Int(IntTy::I32)),
+                Some(Ty::Adt("probe::Inner".to_string())),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Int(7),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+        });
+        interp.record_alloc_ty(id, Ty::Adt("probe::Outer".to_string()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Field(1)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(30),
+                Some(&Ty::Adt("probe::Inner".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Int(7),
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                            Value::Int(30),
+                        ],
+                    },
+                ],
+            })
+        );
+    }
+
+    /// Successive projected writes to a tuple local: the
+    /// wrapper descent is judged against the tuple's declared
+    /// element types, exactly as for a struct, so the second
+    /// field's write extends the tuple's own storage; it does
+    /// not descend into the first field's aggregate, and the
+    /// unwritten field does not read as the first field's
+    /// contents.
+    #[test]
+    fn tuple_field_write_extends_the_tuple() {
+        let mut program = Program::new();
+        let body = Body::new(
+            "main",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Tuple(vec![
+                    Ty::Tuple(vec![Ty::Int(IntTy::I32), Ty::Int(IntTy::I32)]),
+                    Ty::Int(IntTy::I32),
+                ]),
+            ],
+            vec![],
+        );
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let mut frames = vec![Frame {
+            id: 0,
+            func: "main".to_string(),
+            locals: vec![
+                Value::Uninit,
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }];
+        // The unwritten second field must not read as the
+        // first field's contents.
+        let unread = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        assert!(
+            interp.read_resolved(&frames, &unread).is_err(),
+            "the unwritten tuple field must not read through the wrapper descent"
+        );
+        let target = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(30))
+            .expect("write");
+        assert_eq!(
+            frames[0].locals[1],
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                    Value::Int(30),
+                ],
+            }
+        );
+        let readback = Resolved::Place {
+            frame_pos: 0,
+            local: 1,
+            projection: vec![RefProj::Field(0), RefProj::Field(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &readback).expect("read"),
+            Value::Int(20),
+        );
     }
 }

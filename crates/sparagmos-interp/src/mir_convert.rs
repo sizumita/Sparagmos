@@ -6408,6 +6408,47 @@ let inner = match (&src, target) {
     /// [`Self::pointee_crosses_cell_wrapper`]), `Some(false)`
     /// for the reverse crossing, `None` when the pair does not
     /// cross the boundary.
+    /// The element-wrapper direction of a pointer cast
+    /// between two slice pointees: `Some(true)` when the
+    /// target's elements wrap the source's (`[T]` ->
+    /// `[MaybeUninit<T>]`), `Some(false)` for the reverse,
+    /// `None` when the element types are not related by
+    /// exactly one `MaybeUninit` / `UnsafeCell` layer.
+    fn slice_elem_wrap_direction(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<bool> {
+        let (Some(mir::Ty::Slice(src_elem)), Some(mir::Ty::Slice(target_elem))) =
+            (ptr_pointee(src), ptr_pointee(target))
+        else {
+            return None;
+        };
+        let wraps = |wrapper: &mir::Ty, inner: &mir::Ty| -> bool {
+            match wrapper {
+                mir::Ty::Adt(def, args) => {
+                    args.len() == 1
+                        && args[0] == *inner
+                        && matches!(
+                            self.def_display_name(def).as_str(),
+                            "core::mem::MaybeUninit"
+                                | "std::mem::MaybeUninit"
+                                | "core::cell::UnsafeCell"
+                                | "std::cell::UnsafeCell"
+                        )
+                }
+                _ => false,
+            }
+        };
+        if wraps(target_elem, src_elem) {
+            Some(true)
+        } else if wraps(src_elem, target_elem) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     fn array_elem_wrap_direction(
         &self,
         src: &mir::Ty,
@@ -7716,6 +7757,25 @@ let inner = match (&src, target) {
                             // the metadata alone would leave the
                             // result denoting the whole aggregate.
                             ir::Rvalue::PtrFirstElem(v)
+                        } else if let Some(wrap) = ctx
+                            .as_ref()
+                            .and_then(|src| self.slice_elem_wrap_direction(src, target))
+                        {
+                            // A cast between slice pointers
+                            // whose element types differ by one
+                            // `MaybeUninit` / `UnsafeCell` layer
+                            // (`<[MaybeUninit<T>]>::assume_init`
+                            // and its kin): the fat pointer and
+                            // the storage it denotes are both
+                            // unchanged; the representation
+                            // difference between the two element
+                            // views is reconciled at the access
+                            // points (see the rvalue's docs).
+                            if wrap {
+                                ir::Rvalue::WrapSliceElems(v)
+                            } else {
+                                ir::Rvalue::UnwrapSliceElems(v)
+                            }
                         } else if ctx.as_ref().is_some_and(|src| {
                             self.cast_returns_to_array_base(src, target)
                         }) {

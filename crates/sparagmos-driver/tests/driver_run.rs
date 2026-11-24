@@ -31723,6 +31723,119 @@ fn convert_mode_required_const_behind_unsize_vtable_is_a_compile_failure() {
     );
 }
 
+const ELEM_BLOCK_NEWTYPE_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+#[derive(Clone, Copy)]
+struct Inner { a: i32, b: i32 }
+struct Outer { inner: Inner }
+fn main() {
+    unsafe {
+        let layout = Layout::new::<[Outer; 2]>();
+        let p = alloc(layout) as *mut Outer;
+        p.write(Outer { inner: Inner { a: 10, b: 20 } });
+        p.add(1).write(Outer { inner: Inner { a: 30, b: 40 } });
+        let inner = (*p).inner;
+        println!("{} {}", inner.a, inner.b);
+        let inner2 = (*p.add(1)).inner;
+        println!("{} {}", inner2.a, inner2.b);
+        (*p).inner = Inner { a: 1, b: 2 };
+        let inner3 = (*p).inner;
+        println!("{} {}", inner3.a, inner3.b);
+        dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_elem_block_genuine_newtype_field_read_write() {
+    // A genuine one-field struct (`Outer`) around an aggregate
+    // (`Inner`) in a raw allocation block is a real field, not a
+    // `MaybeUninit` wrapper: reading the field yields the whole
+    // aggregate (not its first field), and writing it replaces
+    // the field (not the element). The pointee field-0 rewrite
+    // and the resolver's bare-wrapper judgment must both stand
+    // down for it, judged by the place's declared type and by
+    // the element's own stored form.
+    run_ok(
+        "elemblock-newtype",
+        ELEM_BLOCK_NEWTYPE_SRC,
+        "10 20\n30 40\n1 2\n",
+    );
+}
+
+const SLICE_WRAP_CAST_SRC: &str = r#"
+fn main() {
+    let b: Box<[i32]> = Box::new([1, 2, 3]);
+    let p: *const [i32] = &*b;
+    let q = p as *const [std::mem::MaybeUninit<i32>];
+    let _ = q;
+    println!("{}", unsafe { (*p)[2] });
+    println!("{}", b[1]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_wrap_cast_preserves_original_view() {
+    // Casting a slice pointer to the `MaybeUninit` element view
+    // (without ever dereferencing the result) must not rewrite
+    // the backing elements: the original view keeps reading the
+    // original integers.
+    run_ok("slice-wrap-cast", SLICE_WRAP_CAST_SRC, "3\n2\n");
+}
+
+const SLICE_UNWRAP_TWICE_SRC: &str = r#"
+struct N(i32);
+fn main() {
+    let v: Vec<std::mem::MaybeUninit<N>> = vec![std::mem::MaybeUninit::new(N(7)), std::mem::MaybeUninit::new(N(8))];
+    let s1: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
+    println!("{}", s1[0].0);
+    let s2: &[N] = unsafe { &*(&v[..] as *const [std::mem::MaybeUninit<N>] as *const [N]) };
+    println!("{}", s2[1].0);
+}
+"#;
+
+#[test]
+fn run_mode_slice_unwrap_casts_keep_genuine_newtype() {
+    // Repeated unwrap casts over a slice of wrapped genuine
+    // one-field elements (`N`) must not strip the newtype layer:
+    // the elements read back as `N` values through both casts.
+    run_ok("slice-unwrap-twice", SLICE_UNWRAP_TWICE_SRC, "7\n8\n");
+}
+
+const ELEM_BLOCK_PARTIAL_INIT_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+struct S { first: (i32, i32), second: i32 }
+fn main() {
+    unsafe {
+        let layout = Layout::new::<S>();
+        let p = alloc(layout) as *mut S;
+        (*p).first = (10, 20);
+        (*p).second = 30;
+        println!("{} {}", (*p).first.0, (*p).first.1);
+        println!("{}", (*p).second);
+        dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_elem_block_partial_struct_init_keeps_siblings() {
+    // A struct in a raw allocation block initialized field by
+    // field: after the first (aggregate) field is stored, the
+    // partially materialized value has the shape of a one-field
+    // wrapper around an aggregate, but the second field's write
+    // must grow the struct's own field vector, not descend into
+    // the first field and corrupt it. The navigation's wrapper
+    // descent is gated on the declared type: the stored field
+    // is the declared type's own first field, not a complete
+    // value of it.
+    run_ok(
+        "elemblock-partial-init",
+        ELEM_BLOCK_PARTIAL_INIT_SRC,
+        "10 20\n30\n",
+    );
+}
+
 // ----- rustc_private type defaults (rustdoc execution path) -----------------
 
 // The rustdoc entry program's session configuration asks for
@@ -33941,4 +34054,58 @@ fn run_mode_dyn_ptr_equality_compares_vtable_identity() {
         String::from_utf8_lossy(&out.stdout),
         "eq_ab=false eq_ac=true\ndirect_ab=false direct_ac=true\neq_xy=false eq_xz=true\nnull_a=true null_x=false\naddr_x=0x1000\n"
     );
+}
+const BTREE_ITER_WRAPPER_PTR_SRC: &str = r#"
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+fn main() {
+    let mut m: BTreeMap<i32, i32> = BTreeMap::new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    println!("count={}", m.iter().count());
+    let mut c: BTreeMap<Cow<'static, str>, usize> = BTreeMap::new();
+    assert!(c.insert(Cow::Borrowed("foo"), 42).is_none());
+    assert!(c.insert(Cow::Owned("foo".to_string()), 43).is_some());
+    println!("len={} count={}", c.len(), c.iter().count());
+    println!("get={:?}", c.get("foo"));
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_iter_reads_leaf_nodes() {
+    // Iterating a BTreeMap walks its leaf nodes through the
+    // node pointer stored in the root's NodeRef: the pointer
+    // enters the node's `MaybeUninit` storage layer with its
+    // field-0 step, and the stored element at that address is
+    // the leaf aggregate itself ([parent, parent index,
+    // length, keys, values]). The read must land on the
+    // aggregate the pointer addresses, not descend one field
+    // further into the leaf's parent slot.
+    run_ok(
+        "btree-iter-wrapper-ptr",
+        BTREE_ITER_WRAPPER_PTR_SRC,
+        "count=2\nlen=1 count=1\nget=Some(43)\n",
+    );
+}
+
+const BTREE_ZST_ITER_SRC: &str = r#"
+use std::collections::BTreeMap;
+#[derive(Eq, Hash, Debug, Ord, PartialEq, PartialOrd)]
+struct Zst;
+fn main() {
+    let mut m: BTreeMap<Zst, ()> = BTreeMap::new();
+    m.insert(Zst, ());
+    m.insert(Zst, ());
+    println!("len={} count={}", m.len(), m.iter().count());
+    println!("get={}", m.get(&Zst).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_zst_iter_count() {
+    // A zero-sized key/value BTreeMap: the leaf walk reads the
+    // node through the same wrapper-entering node pointer as
+    // the sized case, and the elided ZST slots fill out to the
+    // declared length.
+    run_ok("btree-zst-iter", BTREE_ZST_ITER_SRC, "len=1 count=1\nget=true\n");
 }
