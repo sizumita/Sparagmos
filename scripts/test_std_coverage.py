@@ -235,8 +235,10 @@ class CandidateTests(unittest.TestCase):
 
     def write(self, name, data):
         import json
+        import shutil
         import tempfile
         d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         path = d / name
         path.write_text(json.dumps(data))
         return path

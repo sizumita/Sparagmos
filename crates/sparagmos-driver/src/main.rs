@@ -7152,6 +7152,7 @@ fn tool_run(
                     "sparagmos-tool-informational-{}.rs",
                     std::process::id()
                 ));
+                register_process_scratch(&scratch);
                 if !scratch.exists() {
                     let _ = std::fs::write(&scratch, "");
                 }
@@ -10151,6 +10152,66 @@ static COMPILE_VERDICT_MODE: std::sync::atomic::AtomicBool =
 /// pages are committed only as the stack actually grows.
 const DRIVER_STACK_SIZE: usize = 8 * 1024 * 1024 * 1024;
 
+/// Scratch paths this process created under the system temp
+/// directory and must remove before it exits: the compile flow's
+/// output directory (`sparagmos-driver-out-{pid}`, the rustc
+/// `--out-dir` and the auxiliary builds) and the informational
+/// scratch source file. (The materialised artifact source trees,
+/// `sparagmos-artifact-sources-{pid}`, are deliberately not
+/// covered: the snapshot-privacy test sweeps for the tree after
+/// the driver exits, so its post-exit observability is
+/// load-bearing -- see #537.) Nothing outside
+/// this process reads them once it exits -- the subset runner
+/// and the harness consume only the driver's stdout, stderr and
+/// exit code -- but they are large (the out dir carries an
+/// `.rmeta` and the aux artifacts) and a measurement wave spawns
+/// thousands of driver processes, so leaving them behind filled
+/// the dev host's disk (154 GB across 122,813 out dirs, #537).
+/// The driver exits through `exit_process`, never bare
+/// `std::process::exit`, so the removal happens on every path;
+/// `SPARAGMOS_DRIVER_KEEP_SCRATCH=1` opts out for a local
+/// debugging session that wants to inspect the artifacts.
+static PROCESS_SCRATCH: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a temp-dir scratch path for removal at process exit
+/// (see `PROCESS_SCRATCH`). Registration is idempotent.
+fn register_process_scratch(path: &std::path::Path) {
+    if std::env::var_os("SPARAGMOS_DRIVER_KEEP_SCRATCH").is_some() {
+        return;
+    }
+    if let Ok(mut paths) = PROCESS_SCRATCH.lock() {
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_path_buf());
+        }
+    }
+}
+
+/// Remove every registered scratch path (see `PROCESS_SCRATCH`).
+/// Best-effort: a path another process already removed, or one
+/// that was never created, is not an error.
+fn remove_process_scratch() {
+    if let Ok(mut paths) = PROCESS_SCRATCH.lock() {
+        for path in paths.drain(..) {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Terminate the process with `code` after removing the scratch
+/// paths this process registered (see `PROCESS_SCRATCH`). Every
+/// exit in this binary goes through here: `std::process::exit`
+/// runs no destructors, so a Drop guard on the paths themselves
+/// would silently not fire on most exit paths.
+fn exit_process(code: i32) -> ! {
+    remove_process_scratch();
+    std::process::exit(code)
+}
+
 fn main() {
     let worker = std::thread::Builder::new()
         .name("sparagmos-driver".to_string())
@@ -10161,11 +10222,20 @@ fn main() {
         // The worker panicked: a driver crash, which the exit
         // contract reports as 101.
         eprintln!("sparagmos-driver: internal error: driver thread panicked");
-        std::process::exit(101);
+        exit_process(101);
     }
 }
 
 fn driver_main() {
+    driver_main_inner();
+    // Reached on the paths that return instead of exiting (a
+    // successful conversion, an informational invocation): the
+    // scratch removal `exit_process` performs on the exit paths
+    // is owed here too.
+    remove_process_scratch();
+}
+
+fn driver_main_inner() {
     let argv: Vec<String> = std::env::args().collect();
     let mode = match argv.get(1).map(|a| a.as_str()) {
         Some("run") => Mode::Run,
@@ -10214,83 +10284,83 @@ fn driver_main() {
                 i += 1;
                 dump_path = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--dump needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--guest-stderr-file" => {
                 i += 1;
                 guest_stderr_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-stderr-file needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--guest-env-file" => {
                 i += 1;
                 guest_env_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-env-file needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--guest-cwd" => {
                 i += 1;
                 guest_cwd = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-cwd needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--guest-program-name" => {
                 i += 1;
                 guest_program_name = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-program-name needs a value");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--edition" => {
                 i += 1;
                 edition = argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--edition needs a value");
-                    std::process::exit(2);
+                    exit_process(2);
                 });
             }
             "--rustc-arg" => {
                 i += 1;
                 rustc_args.push(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--rustc-arg needs a value");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--guest-arg" => {
                 i += 1;
                 guest_args.push(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-arg needs a value");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--debug-script" => {
                 i += 1;
                 debug_script = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--debug-script needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--debug-dialect" => {
                 i += 1;
                 debug_dialect = argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--debug-dialect needs a value (gdb|lldb)");
-                    std::process::exit(2);
+                    exit_process(2);
                 });
             }
             "--aux" => {
                 i += 1;
                 let spec = argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--aux needs a <name>=<file.rs> value");
-                    std::process::exit(2);
+                    exit_process(2);
                 });
                 match parse_aux_spec(&spec) {
                     Ok(parsed) => aux_specs.push(parsed),
                     Err(reason) => {
                         eprintln!("{reason}");
-                        std::process::exit(2);
+                        exit_process(2);
                     }
                 }
             }
@@ -10298,7 +10368,7 @@ fn driver_main() {
                 i += 1;
                 let spec = argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--aux-lib needs a <name>=<path> value");
-                    std::process::exit(2);
+                    exit_process(2);
                 });
                 match spec.split_once('=') {
                     Some((name, path)) if !name.is_empty() && !path.is_empty() => {
@@ -10306,7 +10376,7 @@ fn driver_main() {
                     }
                     _ => {
                         eprintln!("--aux-lib needs a <name>=<path> value, got: {spec}");
-                        std::process::exit(2);
+                        exit_process(2);
                     }
                 }
             }
@@ -10333,14 +10403,14 @@ fn driver_main() {
                 i += 1;
                 tool_programs.push(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--tool-program needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--sysroot needs a path");
-                    std::process::exit(2);
+                    exit_process(2);
                 }));
             }
             "-h" | "--help" => {
@@ -10352,14 +10422,14 @@ fn driver_main() {
             }
             other => {
                 eprintln!("unknown argument: {other}");
-                std::process::exit(2);
+                exit_process(2);
             }
         }
         i += 1;
     }
     let Some(input) = input else {
         eprintln!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--dump <path>]");
-        std::process::exit(2);
+        exit_process(2);
     };
     let sysroot = sysroot
         .or_else(|| std::env::var("SPARAGMOS_SYSROOT").ok())
@@ -10420,6 +10490,7 @@ fn driver_main() {
     // working directory.
     let out_dir = std::env::temp_dir().join(format!("sparagmos-driver-out-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
+    register_process_scratch(&out_dir);
 
     // Compile the auxiliary crates first, in the order given (each
     // one sees the previously built ones through --extern), so the
@@ -10442,14 +10513,14 @@ fn driver_main() {
             Err(reason) => {
                 if mode == Mode::RunJit {
                     eprintln!("sparagmos-driver run-jit: unsupported: {reason}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }
                 if exec_mode {
                     eprintln!("sparagmos-driver run: unsupported: {reason}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }
                 eprintln!("sparagmos-driver: {reason}");
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     }
@@ -10627,10 +10698,10 @@ fn driver_main() {
                 // conversion-side failure.
                 if exec_mode {
                     eprintln!("sparagmos-driver: compilation failed: {DELAYED_BUG_ABORT}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }
                 eprintln!("sparagmos-driver: compiler crashed: {DELAYED_BUG_ABORT}");
-                std::process::exit(101);
+                exit_process(101);
             }
             if let Some(abort) = treat_err_abort_reason(&reason) {
                 // The compiler itself aborted the compilation on a
@@ -10641,19 +10712,19 @@ fn driver_main() {
                 // exactly like a front-end rejection recorded by
                 // the callbacks.
                 eprintln!("sparagmos-driver: compilation failed: {abort}");
-                std::process::exit(if exec_mode { 2 } else { 1 });
+                exit_process(if exec_mode { 2 } else { 1 });
             }
             if mode == Mode::RunJit {
                 eprintln!(
                     "sparagmos-driver run-jit: unsupported: Stable MIR conversion panicked: {reason}"
                 );
-                std::process::exit(2);
+                exit_process(2);
             }
             if exec_mode {
                 eprintln!(
                     "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
                 );
-                std::process::exit(2);
+                exit_process(2);
             }
             // Any other panic that escapes the compiler run is an
             // internal failure of the compiler itself (Issue #66):
@@ -10662,7 +10733,7 @@ fn driver_main() {
             // per body or per query never reach this point; they
             // keep their named reasons in the report.
             eprintln!("sparagmos-driver: Stable MIR conversion panicked: {reason}");
-            std::process::exit(101);
+            exit_process(101);
         }
     };
     let collected = take();
@@ -10672,7 +10743,7 @@ fn driver_main() {
                 eprintln!("sparagmos-driver: compilation failed: {e}");
                 // Same contract as a front-end failure: exit 1 in
                 // convert mode, exit 2 (unsupported) in run mode.
-                std::process::exit(if exec_mode { 2 } else { 1 });
+                exit_process(if exec_mode { 2 } else { 1 });
             }
             if debug_mode {
                 // Limited debug info (`-C debuginfo=0` or `=1`,
@@ -10686,7 +10757,7 @@ fn driver_main() {
                             | "-Cdebuginfo=1"
                     )
                 });
-                std::process::exit(execute_debug(
+                exit_process(execute_debug(
                     &c,
                     &input,
                     &guest_args,
@@ -10714,7 +10785,7 @@ fn driver_main() {
                             eprintln!(
                                 "sparagmos-driver run: unsupported: cannot read the guest environment file {path}: {e}"
                             );
-                            std::process::exit(2);
+                            exit_process(2);
                         }
                     }
                 }
@@ -10730,7 +10801,7 @@ fn driver_main() {
                         eprintln!(
                             "sparagmos-driver run: unsupported: cannot enter the guest working directory {dir}: {e}"
                         );
-                        std::process::exit(2);
+                        exit_process(2);
                     }
                 }
                 if let Some(path) = &dump_path {
@@ -10738,13 +10809,13 @@ fn driver_main() {
                         sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
                     if let Err(e) = std::fs::write(path, text) {
                         eprintln!("failed to write dump {path}: {e}");
-                        std::process::exit(1);
+                        exit_process(1);
                     }
                 }
                 if mode == Mode::RunJit {
-                    std::process::exit(execute_jit(&c, &guest_args));
+                    exit_process(execute_jit(&c, &guest_args));
                 }
-                std::process::exit(execute(
+                exit_process(execute(
                     &c,
                     &input,
                     &guest_args,
@@ -10765,7 +10836,7 @@ fn driver_main() {
                         eprintln!(
                             "sparagmos-driver jit-compile: unsupported: {reason}"
                         );
-                        std::process::exit(2);
+                        exit_process(2);
                     }
                 }
             }
@@ -10774,14 +10845,14 @@ fn driver_main() {
                     sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
                 if let Err(e) = std::fs::write(path, text) {
                     eprintln!("failed to write dump {path}: {e}");
-                    std::process::exit(1);
+                    exit_process(1);
                 }
                 println!("dump: {path}");
             }
         }
         (Ok(()), None) => {
             eprintln!("sparagmos-driver: internal error: no results collected");
-            std::process::exit(1);
+            exit_process(1);
         }
         (Err(rustc_public::CompilerError::Skipped), _) if !exec_mode => {
             // The compiler finished without ever handing the
@@ -10814,7 +10885,7 @@ fn driver_main() {
             eprintln!("sparagmos-driver: compilation failed: {e:?}");
             // In run mode a failed compilation is a conversion failure,
             // which the run contract reports as exit 2.
-            std::process::exit(if exec_mode { 2 } else { 1 });
+            exit_process(if exec_mode { 2 } else { 1 });
         }
     }
 }

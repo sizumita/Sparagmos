@@ -9,6 +9,34 @@
 
 use std::process::Command;
 
+/// Fixture directories this test process created under the
+/// system temp directory, removed when the process exits.
+/// Tests spawn the driver per case and used to leave every
+/// fixture directory behind (#537); the registry keeps the
+/// per-test `temp_dir` shape and sweeps at exit instead.
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_scratch_dir(dir: &std::path::Path) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let _ = libc::atexit(remove_scratch_dirs);
+    });
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+}
+
+extern "C" fn remove_scratch_dirs() {
+    if let Ok(dirs) = SCRATCH_DIRS.try_lock() {
+        for dir in dirs.iter() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 const FIXTURE: &str = r#"
 fn unused() -> u8 {
     let a = std::cmp::min(3u8, 4u8);
@@ -60,6 +88,7 @@ fn convert_mode_collects_in_seed_order() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let dump = run_driver(&dir, None);
     // `unused` is defined (and so seeded) before `main`, so the
     // FIFO walk records its demand (`std::cmp::min`) first.
@@ -76,6 +105,7 @@ fn run_mode_collects_execution_first() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let dump = run_driver(&dir, Some("run"));
     // The entry's own call (`std::cmp::max`) is collected
     // before the uncalled local function's demand, whatever
