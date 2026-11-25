@@ -10036,6 +10036,219 @@ fn run_mode_closure_clone_panic_drops_cloned_captures() {
     );
 }
 
+const CLOSURE_CLONE_ZST_CAPTURE_PANIC_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+
+struct Boom;
+
+impl Clone for Boom {
+    fn clone(&self) -> Self {
+        panic!("boom clone");
+    }
+}
+
+fn main() {
+    // A direct .clone() of a closure whose second capture is a
+    // zero-sized unit struct whose Clone panics. The compiler
+    // emits no debug-info entry for a zero-sized capture, so the
+    // recorded environment shape used to drop the field and the
+    // shape with it, and the clone fell back to a shallow copy:
+    // no panic, and the copy aliased the Rc capture (Issue
+    // #499). The capture cloned before the panicking one drops
+    // during unwinding, restoring the strong count.
+    let rc = Rc::new(Cell::new(7));
+    let rc_in = rc.clone();
+    let boom = Boom;
+    let f = move || {
+        let _ = rc_in.get();
+        let _ = &boom;
+    };
+    println!("direct before: {}", Rc::strong_count(&rc));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = f.clone();
+        println!("direct no panic");
+    }));
+    println!("direct caught: {}", r.is_err());
+    println!("direct after: {}", Rc::strong_count(&rc));
+    drop(f);
+    println!("direct final: {}", Rc::strong_count(&rc));
+
+    // The boxed-slice conversion of the same closure shape
+    // dispatches the panicking capture clone the same way.
+    let rc2 = Rc::new(Cell::new(7));
+    let rc2_in = rc2.clone();
+    let boom2 = Boom;
+    let f2 = move || {
+        let _ = rc2_in.get();
+        let _ = &boom2;
+    };
+    let src = [f2];
+    println!("boxed before: {}", Rc::strong_count(&rc2));
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[_]> = Box::from(&src[..]);
+        println!("boxed no panic");
+    }));
+    println!("boxed caught: {}", r2.is_err());
+    println!("boxed after: {}", Rc::strong_count(&rc2));
+}
+"#;
+
+#[test]
+fn run_mode_closure_clone_zst_capture_panics() {
+    let dir = temp_dir("closure-clone-zst-capture-panic");
+    let src = fixture(
+        &dir,
+        "closure_clone_zst_capture_panic.rs",
+        CLOSURE_CLONE_ZST_CAPTURE_PANIC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closure capturing a zero-sized type must clone capture-by-capture, not shallow-copy; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "direct before: 2\ndirect caught: true\ndirect after: 2\ndirect final: 1\nboxed before: 2\nboxed caught: true\nboxed after: 2\n"
+    );
+}
+
+const CLOSURE_CLONE_ZST_CAPTURE_SIDE_EFFECTS_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+
+struct Zap;
+
+impl Clone for Zap {
+    fn clone(&self) -> Self {
+        println!("clone Zap");
+        Zap
+    }
+}
+
+impl Drop for Zap {
+    fn drop(&mut self) {
+        println!("drop Zap");
+    }
+}
+
+fn main() {
+    // A zero-sized capture with an observable Clone side effect
+    // and an observable Drop: cloning the closure runs the
+    // capture's Clone, and each closure's own drop runs the
+    // capture's Drop exactly once (Issue #499).
+    let rc = Rc::new(Cell::new(7));
+    let rc_in = rc.clone();
+    let zap = Zap;
+    let f = move || {
+        let _ = rc_in.get();
+        let _ = &zap;
+    };
+    let g = f.clone();
+    println!("count: {}", Rc::strong_count(&rc));
+    drop(g);
+    println!("after drop g: {}", Rc::strong_count(&rc));
+    drop(f);
+    println!("final: {}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_closure_clone_zst_capture_side_effects() {
+    let dir = temp_dir("closure-clone-zst-capture-side-effects");
+    let src = fixture(
+        &dir,
+        "closure_clone_zst_capture_side_effects.rs",
+        CLOSURE_CLONE_ZST_CAPTURE_SIDE_EFFECTS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a zero-sized capture's Clone and Drop must run for a cloned closure; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "clone Zap\ncount: 3\ndrop Zap\nafter drop g: 2\ndrop Zap\nfinal: 1\n"
+    );
+}
+
+const CLOSURE_CLONE_ZST_CAPTURE_FIRST_SRC: &str = r#"use std::cell::Cell;
+use std::rc::Rc;
+
+struct Zap;
+
+impl Clone for Zap {
+    fn clone(&self) -> Self {
+        println!("clone Zap");
+        Zap
+    }
+}
+
+impl Drop for Zap {
+    fn drop(&mut self) {
+        println!("drop Zap");
+    }
+}
+
+struct Boom(i32);
+
+impl Clone for Boom {
+    fn clone(&self) -> Self {
+        panic!("boom clone");
+    }
+}
+
+fn main() {
+    // The zero-sized capture comes first, then a counted
+    // handle, then a panicking capture: the prefix cloned
+    // before the panic — the zero-sized capture and the handle
+    // — drops during unwinding, in an environment whose field
+    // plans must stay aligned across the recovered field
+    // (Issue #499).
+    let rc = Rc::new(Cell::new(7));
+    let rc_in = rc.clone();
+    let zap = Zap;
+    let boom = Boom(3);
+    let f = move || {
+        let _ = &zap;
+        let _ = rc_in.get();
+        let _ = &boom;
+    };
+    println!("before: {}", Rc::strong_count(&rc));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = f.clone();
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+    println!("after: {}", Rc::strong_count(&rc));
+    drop(f);
+    println!("final: {}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_closure_clone_zst_capture_first() {
+    let dir = temp_dir("closure-clone-zst-capture-first");
+    let src = fixture(
+        &dir,
+        "closure_clone_zst_capture_first.rs",
+        CLOSURE_CLONE_ZST_CAPTURE_FIRST_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a leading zero-sized capture must not misalign the cloned prefix's drop glue; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before: 2\nclone Zap\ndrop Zap\ncaught: true\nafter: 2\ndrop Zap\nfinal: 1\n"
+    );
+}
+
 const BOXED_SLICE_ELIDED_ELEM_CLONE_PANIC_SRC: &str = r#"struct D;
 
 impl Clone for D {

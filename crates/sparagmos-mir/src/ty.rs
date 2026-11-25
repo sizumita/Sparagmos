@@ -217,11 +217,13 @@ pub struct AdtDebugVariant {
 /// name - the type tag the debugger interface sees.
 ///
 /// The driver fills one entry per monomorphic closure/coroutine
-/// instance it converts whose environment fields are all named by
-/// the instance body's debug info (see
-/// `Converter::record_env_shape` in the driver); the debugger
-/// interface consults the table when it prints a closure or
-/// coroutine value. An instance with no entry stays unrenderable
+/// instance it converts (see `Converter::record_env_shape` in
+/// the driver); the debugger interface consults the table when
+/// it prints a closure or coroutine value. An environment field
+/// the instance body's debug info does not name (the compiler
+/// emits no entry for a zero-sized capture) is recorded with
+/// its type recovered from the instance's upvars tuple and a
+/// `None` name. An instance with no entry stays unrenderable
 /// in the debugger, exactly as an ADT with no debug shape stays
 /// unformattable.
 pub type EnvDebugShapes = std::collections::HashMap<String, EnvDebugShape>;
