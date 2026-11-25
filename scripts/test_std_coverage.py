@@ -220,5 +220,40 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(agg["executable_strict"], 1)
 
 
+class CandidateTests(unittest.TestCase):
+    """The survey and the subset results define one candidate set."""
+
+    ENTRIES = [
+        # (path, nature, single_file, suite, env_excluded)
+        ("tests/ui/a.rs", "exec", True, "ui", False),
+        ("tests/ui-fulldeps/b.rs", "exec", True, "ui-fulldeps", False),
+        ("tests/ui/c/main.rs", "exec", False, "ui", False),
+        ("tests/ui/d.rs", "compile-check", True, "ui", False),
+        ("tests/codegen/e.rs", "exec", True, "codegen", False),
+        ("tests/ui/f.rs", "exec", True, "ui", True),
+    ]
+
+    def write(self, name, data):
+        import json
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        path = d / name
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_survey_and_results_agree(self):
+        survey = self.write("survey.json", {"tests": [
+            {"path": p, "nature": n, "single_file": sf, "suite": su,
+             "env_excluded": ex}
+            for p, n, sf, su, ex in self.ENTRIES]})
+        # env_excluded tests never reach the runner's results.
+        results = self.write("results.json", {"results": [
+            {"path": p, "nature": n, "single_file": sf, "suite": su}
+            for p, n, sf, su, ex in self.ENTRIES if not ex]})
+        expected = ["tests/ui-fulldeps/b.rs", "tests/ui/a.rs"]
+        self.assertEqual(cov.stage1_candidates_from_survey(survey), expected)
+        self.assertEqual(cov.stage1_candidates(results), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

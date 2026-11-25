@@ -19,6 +19,11 @@ Subcommands:
   fails without writing output when it does not; the official
   measurement workflow always passes these options, while partial
   populations (flip-diff etc.) merge without them.
+- check-candidates: assert that the stage-1 candidate set a metric-3
+  result (scripts/std-coverage.py --survey-json) was measured over is
+  the set the merged subset results define. The official workflow
+  measures metric 3 from the survey, alongside the subset run, and
+  this check fails the aggregate when the two sets ever diverge.
 - diff: compare two result JSONs (base driver vs head driver) and
   report gains and losses. A record passes when its bucket is empty;
   the comparison key is path + nature, matching the flip-diff
@@ -28,6 +33,7 @@ Only the Python standard library is used.
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from collections import Counter
@@ -259,6 +265,41 @@ def cmd_merge(args):
 
 
 # ---------------------------------------------------------------------------
+# check-candidates
+# ---------------------------------------------------------------------------
+
+def load_std_coverage():
+    """scripts/std-coverage.py as a module, so the candidate predicate
+    is the one metric 3 itself uses (not a copy that could drift)."""
+    path = Path(__file__).resolve().parent / "std-coverage.py"
+    spec = importlib.util.spec_from_file_location("std_coverage", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_check_candidates(args):
+    std_coverage = load_std_coverage()
+    expected = std_coverage.stage1_candidates(args.results)
+    coverage = load_json(args.coverage)
+    measured = coverage.get("subset_candidates")
+    if measured is None:
+        print(f"error: {args.coverage} records no subset_candidates",
+              file=sys.stderr)
+        return 1
+    if measured != expected:
+        missing = sorted(set(expected) - set(measured))
+        extra = sorted(set(measured) - set(expected))
+        print(f"error: metric-3 candidate set differs from the merged "
+              f"results: {len(measured)} measured, {len(expected)} "
+              f"expected; missing {missing[:10]}, extra {extra[:10]}",
+              file=sys.stderr)
+        return 1
+    print(f"check-candidates: {len(measured)} stage-1 candidates agree")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # diff
 # ---------------------------------------------------------------------------
 
@@ -331,6 +372,13 @@ def main():
                         "and per-nature counts are asserted as well")
     p.add_argument("inputs", nargs="+", type=Path)
     p.set_defaults(func=cmd_merge)
+
+    p = sub.add_parser("check-candidates")
+    p.add_argument("--coverage", type=Path, required=True,
+                   help="scripts/std-coverage.py result JSON")
+    p.add_argument("--results", type=Path, required=True,
+                   help="merged subset result JSON")
+    p.set_defaults(func=cmd_check_candidates)
 
     p = sub.add_parser("diff")
     p.add_argument("--base", type=Path, required=True)

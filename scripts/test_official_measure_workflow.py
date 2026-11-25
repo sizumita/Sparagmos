@@ -5,7 +5,7 @@ Run with: python3 -m pytest scripts/test_official_measure_workflow.py
 (or directly: python3 scripts/test_official_measure_workflow.py)
 
 The survey source tree is produced once by the prepare job and restored
-by the measure, measure-jit and aggregate jobs through actions/cache.
+by the measure, measure-jit and metric3 jobs through actions/cache.
 actions/cache never re-saves on an exact key hit, so the cached tree's
 shape (its sparse-checkout set) is part of the cache key's meaning:
 every job must name one and the same key, and widening the checkout
@@ -28,7 +28,7 @@ def workflow_text():
 class SurveyCacheKeyTest(unittest.TestCase):
     def test_all_survey_cache_keys_are_one_value(self):
         keys = re.findall(r"key:\s*(rust-survey-\S+)", workflow_text())
-        # prepare (save) + measure, measure-jit, aggregate (restore).
+        # prepare (save) + measure, measure-jit, metric3 (restore).
         self.assertEqual(len(keys), 4, keys)
         self.assertEqual(len(set(keys)), 1, keys)
 
@@ -40,6 +40,26 @@ class SurveyCacheKeyTest(unittest.TestCase):
         text = workflow_text()
         self.assertIn("src/etc", text)
         self.assertIn("src/librustdoc/html/static/css", text)
+
+
+class DriverArtifactTest(unittest.TestCase):
+    def test_jobs_run_the_shared_measure_profile_driver(self):
+        # The driver is built once (build job, measure profile) and
+        # every job runs that artifact; no job builds its own driver
+        # or points at a debug build.
+        text = workflow_text()
+        self.assertEqual(text.count("cargo build"), 1)
+        self.assertIn("cargo build --profile measure", text)
+        self.assertNotIn("target/debug/sparagmos-driver", text)
+        self.assertEqual(text.count('--driver-bin "$DRIVER_BIN"'), 3)
+
+    def test_measure_profile_keeps_dev_checks(self):
+        cargo = (WORKFLOW.parent.parent.parent / "crates"
+                 / "sparagmos-driver" / "Cargo.toml").read_text()
+        profile = cargo.split("[profile.measure]", 1)[1]
+        self.assertIn('inherits = "dev"', profile)
+        self.assertNotIn("debug-assertions = false", profile)
+        self.assertNotIn("overflow-checks = false", profile)
 
 
 if __name__ == "__main__":
