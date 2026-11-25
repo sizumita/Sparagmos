@@ -20440,8 +20440,206 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A pair of bit-stream shapes (arrays and
+        // one-payload wrappers over them) whose leaf
+        // streams have the same total width: reinterpret
+        // through the stream — the width-crossing
+        // regrouping and the long wrapped array, at any
+        // total width. The whole-pattern path below packs
+        // into a single `u128`, so a stream pair beyond
+        // 128 bits must not fall through to it.
+        if let Some(r) = self.reinterpret_stream(value, src, dst) {
+            return r;
+        }
         let bits = self.flatten_scalar(value, src)?;
         self.construct_scalar(bits, dst)
+    }
+
+    /// The bit-stream reinterpretation of `value` from
+    /// shape `src` to shape `dst`, or `None` when the pair
+    /// is not a stream pair this path serves (the caller
+    /// falls back to the whole-pattern path). The source
+    /// flattens leaf by leaf into a bit stream (little-
+    /// endian: earlier leaves occupy the lower bits); an
+    /// uninit leaf poisons exactly the stream bits it
+    /// occupies, and a target leaf is uninit iff any of
+    /// its bits are. Served pairs: pure scalar leaf
+    /// streams of equal nonzero total width, beyond 128
+    /// bits or with a one-payload wrapper on either side
+    /// — the pairs the whole-pattern path cannot flatten
+    /// or construct. Every other pair keeps the pattern
+    /// path, so its behaviour is unchanged.
+    fn reinterpret_stream(
+        &self,
+        value: &Value,
+        src: &ScalarShape,
+        dst: &ScalarShape,
+    ) -> Option<InterpResult<Value>> {
+        if !shape_is_stream(src) || !shape_is_stream(dst) {
+            return None;
+        }
+        let total = src.bits();
+        if total == 0 || total != dst.bits() {
+            return None;
+        }
+        let wrapped = matches!(src, ScalarShape::AdtField { .. })
+            || matches!(dst, ScalarShape::AdtField { .. });
+        if total <= 128 && !wrapped {
+            return None;
+        }
+        Some(self.reinterpret_stream_inner(value, src, dst))
+    }
+
+    fn reinterpret_stream_inner(
+        &self,
+        value: &Value,
+        src: &ScalarShape,
+        dst: &ScalarShape,
+    ) -> InterpResult<Value> {
+        // Flatten the source into (bits, width, init)
+        // leaves, then pack them into a word stream with
+        // an init mask of the same layout.
+        let mut flat: Vec<(u128, u32, bool)> = Vec::new();
+        self.flatten_stream(value, src, &mut flat)?;
+        let total: usize =
+            flat.iter().map(|(_, w, _)| *w as usize).sum();
+        let mut words = vec![0u64; total.div_ceil(64)];
+        let mut mask = vec![0u64; total.div_ceil(64)];
+        let mut offset = 0usize;
+        for (bits, width, init) in &flat {
+            stream_insert(
+                &mut words,
+                &mut mask,
+                offset,
+                *bits,
+                *width,
+                *init,
+            );
+            offset += *width as usize;
+        }
+        let mut offset = 0usize;
+        self.construct_stream(dst, &words, &mask, &mut offset)
+    }
+
+    /// Flatten `value` through a stream shape into
+    /// `(bits, width, init)` leaves in storage order.
+    fn flatten_stream(
+        &self,
+        value: &Value,
+        shape: &ScalarShape,
+        out: &mut Vec<(u128, u32, bool)>,
+    ) -> InterpResult<()> {
+        match shape {
+            ScalarShape::Array(elem, n) => match value {
+                Value::Tuple(items) if items.len() as u64 == *n => {
+                    for item in items {
+                        self.flatten_stream(item, elem, out)?;
+                    }
+                    Ok(())
+                }
+                Value::Bytes(b)
+                    if elem.bits() == 8 && b.len() as u64 == *n =>
+                {
+                    for byte in b {
+                        out.push((u128::from(*byte), 8, true));
+                    }
+                    Ok(())
+                }
+                Value::Uninit => {
+                    flatten_stream_uninit(shape, out);
+                    Ok(())
+                }
+                other => Err(InterpError::type_mismatch(
+                    "transmute",
+                    "an array value of the source shape's length",
+                    other.kind_name(),
+                )),
+            },
+            ScalarShape::AdtField { index, inner, .. } => {
+                match value {
+                    Value::Enum { fields, .. } => {
+                        match fields.get(*index as usize) {
+                            Some(field) => {
+                                self.flatten_stream(field, inner, out)
+                            }
+                            None => Err(InterpError::type_mismatch(
+                                "transmute",
+                                "an ADT value holding the payload \
+                                 field",
+                                "an ADT value without it",
+                            )),
+                        }
+                    }
+                    Value::Uninit => {
+                        flatten_stream_uninit(shape, out);
+                        Ok(())
+                    }
+                    // The storage form: the payload value
+                    // itself where the aggregate would sit.
+                    _ => self.flatten_stream(value, inner, out),
+                }
+            }
+            leaf => {
+                if matches!(value, Value::Uninit) {
+                    out.push((0, leaf.bits(), false));
+                    return Ok(());
+                }
+                let bits = self.flatten_scalar(value, leaf)?;
+                out.push((bits, leaf.bits(), true));
+                Ok(())
+            }
+        }
+    }
+
+    /// Build the value of stream shape `shape` from the
+    /// bit stream at `offset`, in storage order.
+    fn construct_stream(
+        &self,
+        shape: &ScalarShape,
+        words: &[u64],
+        mask: &[u64],
+        offset: &mut usize,
+    ) -> InterpResult<Value> {
+        match shape {
+            ScalarShape::Array(elem, n) => {
+                let mut items = Vec::with_capacity(*n as usize);
+                for _ in 0..*n {
+                    items.push(self.construct_stream(
+                        elem, words, mask, offset,
+                    )?);
+                }
+                Ok(Value::Tuple(items))
+            }
+            ScalarShape::AdtField {
+                index,
+                count,
+                fill,
+                inner,
+            } => {
+                let payload =
+                    self.construct_stream(inner, words, mask, offset)?;
+                let mut fields = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    fields[*i as usize] = self.eval_constant(c)?;
+                }
+                fields[*index as usize] = payload;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
+            }
+            leaf => {
+                let width = leaf.bits();
+                let (bits, init) =
+                    stream_extract(words, mask, *offset, width);
+                *offset += width as usize;
+                if init {
+                    self.construct_scalar(bits, leaf)
+                } else {
+                    Ok(Value::Uninit)
+                }
+            }
+        }
     }
 
     /// The value of shape `dst` that is `value` (of shape
@@ -26542,6 +26740,107 @@ fn wrap_signed(v: i128, bits: u32) -> i128 {
 }
 
 /// The mask of the low `bits` bits (all bits for 128).
+/// Whether a shape decomposes into a bit stream: scalar
+/// leaves (integers, floats, `bool`, `char`) under arrays
+/// and one-payload wrappers. The interpreter-side mirror
+/// of the conversion's stream predicate — the conversion
+/// only emits stream pairs, but the check is repeated
+/// here so a hand-built program gets the same reading.
+fn shape_is_stream(shape: &ScalarShape) -> bool {
+    match shape {
+        ScalarShape::Int { .. }
+        | ScalarShape::Float { .. }
+        | ScalarShape::Bool
+        | ScalarShape::Char => true,
+        ScalarShape::Array(elem, _) => shape_is_stream(elem),
+        ScalarShape::AdtField { inner, .. } => shape_is_stream(inner),
+        _ => false,
+    }
+}
+
+/// The leaves of a stream shape read from wholly uninit
+/// storage: every leaf uninit at its own width.
+fn flatten_stream_uninit(
+    shape: &ScalarShape,
+    out: &mut Vec<(u128, u32, bool)>,
+) {
+    match shape {
+        ScalarShape::Array(elem, n) => {
+            for _ in 0..*n {
+                flatten_stream_uninit(elem, out);
+            }
+        }
+        ScalarShape::AdtField { inner, .. } => {
+            flatten_stream_uninit(inner, out);
+        }
+        leaf => out.push((0, leaf.bits(), false)),
+    }
+}
+
+/// Insert `width` bits of `bits` into the word stream at
+/// bit `offset`, and the all-ones pattern into the mask
+/// stream when `init` (an uninit leaf's mask bits stay
+/// clear, whatever its value bits are).
+fn stream_insert(
+    words: &mut [u64],
+    mask: &mut [u64],
+    mut offset: usize,
+    mut bits: u128,
+    mut width: u32,
+    init: bool,
+) {
+    while width > 0 {
+        let wi = offset / 64;
+        let shift = (offset % 64) as u32;
+        let take = width.min(64 - shift);
+        let chunk_mask: u64 = if take == 64 {
+            u64::MAX
+        } else {
+            (1u64 << take) - 1
+        };
+        let chunk = (bits as u64) & chunk_mask;
+        words[wi] |= chunk << shift;
+        if init {
+            mask[wi] |= chunk_mask << shift;
+        }
+        bits >>= take;
+        width -= take;
+        offset += take as usize;
+    }
+}
+
+/// Extract `width` bits at bit `offset` from the word
+/// stream, with whether every one of them is init.
+fn stream_extract(
+    words: &[u64],
+    mask: &[u64],
+    mut offset: usize,
+    mut width: u32,
+) -> (u128, bool) {
+    let mut bits: u128 = 0;
+    let mut init = true;
+    let mut done: u32 = 0;
+    while width > 0 {
+        let wi = offset / 64;
+        let shift = (offset % 64) as u32;
+        let take = width.min(64 - shift);
+        let chunk_mask: u64 = if take == 64 {
+            u64::MAX
+        } else {
+            (1u64 << take) - 1
+        };
+        let chunk = (words[wi] >> shift) & chunk_mask;
+        bits |= u128::from(chunk) << done;
+        if (mask[wi] >> shift) & chunk_mask != chunk_mask {
+            init = false;
+        }
+        done += take;
+        width -= take;
+        offset += take as usize;
+    }
+    (bits, init)
+}
+
 fn bit_mask(bits: u32) -> u128 {
     if bits >= 128 {
         u128::MAX
