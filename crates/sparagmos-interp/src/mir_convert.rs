@@ -686,12 +686,267 @@ fn merge_static_seeds(
     }
 }
 
+/// One body's resolution consultations: the keys whose membership in
+/// a round's resolution inputs can change how the body converts.
+///
+/// A body's conversion consults the round inputs only through the
+/// call operands in its terminators — `resolve_body_callee` tests
+/// the direct callee's key against the unconverted set,
+/// `alloc_shim_route` and `link_symbol_route` test their keys the
+/// same way, and `resolve_impl_callee` tests the impl candidate's
+/// key against the clean-target set (the exhaustive read sites of
+/// `Converter::unconverted` / `Converter::impl_targets`). Every one
+/// of those keys is a deterministic function of the call operand
+/// alone, computed from tables that do not change between rounds.
+/// So a body's converted form can only change when one of these
+/// keys' answers changes — the basis of the demand-driven worklist
+/// in `lazy_resolution_rounds`.
+#[derive(Default)]
+struct ResolutionConsult {
+    /// Keys tested against the round's unconverted set.
+    unconverted_keys: HashSet<String>,
+    /// Keys tested against the round's clean-target set.
+    target_keys: HashSet<String>,
+}
+
+/// Compute one body's resolution consultations under `conv` (any
+/// converter over the same program; the key computations do not
+/// depend on the round state). `impl_cache` memoises
+/// `impl_callee_cached` across bodies.
+fn body_consultations(
+    conv: &Converter,
+    func: &MirFunction,
+    impl_cache: &mut HashMap<String, Option<String>>,
+) -> ResolutionConsult {
+    let mut consult = ResolutionConsult::default();
+    for bb in &func.body.basic_blocks {
+        let Some(term) = &bb.terminator else {
+            continue;
+        };
+        let mir::TerminatorKind::Call { func: callee, .. } = &term.kind else {
+            continue;
+        };
+        if let Some(key) = conv.resolve_callee(callee) {
+            consult.unconverted_keys.insert(key);
+        }
+        if let Some(key) = conv.alloc_shim_key(callee) {
+            consult.unconverted_keys.insert(key);
+        }
+        if let Some(key) = conv.link_symbol_key(callee) {
+            consult.unconverted_keys.insert(key);
+        }
+        if let Some(key) = impl_callee_cached(conv, callee, impl_cache) {
+            consult.target_keys.insert(key);
+        }
+    }
+    consult
+}
+
+/// `Converter::find_impl_callee` memoised for the consultation
+/// scan. The computation is a deterministic function of the
+/// callee's name, its `Self` type's concrete name and its generic
+/// arguments' rendered tags, and the same callee recurs across
+/// thousands of bodies, while a miss costs a scan of every body
+/// key — so the cache key joins exactly those determinants (the
+/// separator cannot occur in any of them).
+fn impl_callee_cached(
+    conv: &Converter,
+    callee: &mir::Operand,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let (name, tags, raw_generic_args) = conv.resolve_external_callee(callee)?;
+    let self_name = raw_generic_args
+        .first()
+        .map(|t| conv.concrete_ty_name(t))
+        .unwrap_or_default();
+    let mut key = name;
+    key.push('\u{1}');
+    key.push_str(&self_name);
+    for tag in &tags {
+        key.push('\u{1}');
+        key.push_str(tag);
+    }
+    cache
+        .entry(key)
+        .or_insert_with(|| conv.find_impl_callee(callee))
+        .clone()
+}
+
+/// The answers a body's consultations receive from one round's
+/// inputs, as sorted vectors: the consulted unconverted keys that
+/// are unconverted, and the consulted target keys that are clean
+/// targets. A body is stale in a later round exactly when these
+/// answers differ from the ones its current form was converted
+/// under.
+type ConsultAnswers = (Vec<String>, Vec<String>);
+
+fn consult_answers(
+    consult: &ResolutionConsult,
+    targets: &HashSet<String>,
+    unconverted: &HashMap<String, String>,
+) -> ConsultAnswers {
+    let mut unconverted_hits: Vec<String> = consult
+        .unconverted_keys
+        .iter()
+        .filter(|key| unconverted.contains_key(*key))
+        .cloned()
+        .collect();
+    unconverted_hits.sort();
+    let mut target_hits: Vec<String> = consult
+        .target_keys
+        .iter()
+        .filter(|key| targets.contains(*key))
+        .cloned()
+        .collect();
+    target_hits.sort();
+    (unconverted_hits, target_hits)
+}
+
+/// Demand-driven variant of the resolution rounds, used by the run
+/// entry points (Issue #426).
+///
+/// The eager rounds re-convert every body in every round, but a
+/// body's converted form depends on the round inputs only through
+/// its own consultations (see `ResolutionConsult`), so this
+/// worklist re-converts a body only when the answers to its
+/// consultations changed since its last conversion, and stops when
+/// no body is stale. The fixpoint reached is the eager one: when
+/// the loop stops, every body's form reflects the final round
+/// inputs, exactly as after a full round whose inputs no longer
+/// change. A failed re-conversion keeps the body's previous form,
+/// mirroring the eager merge, and still records the attempt's
+/// answers — conversion under the same answers is deterministic,
+/// so the body would fail again identically.
+fn lazy_resolution_rounds(
+    program: &MirProgram,
+    keys: &[String],
+    probe: &Converter,
+    out: &mut ir::Program,
+    all_static_seeds: &mut HashMap<String, (u8, ir::Constant)>,
+) {
+    let mut impl_cache: HashMap<String, Option<String>> = HashMap::new();
+    let consultations: Vec<ResolutionConsult> = program
+        .functions
+        .iter()
+        .map(|func| body_consultations(probe, func, &mut impl_cache))
+        .collect();
+    // The answers each body's current form was converted under.
+    // Phase 1 ran with resolution off — empty inputs, so the empty
+    // answer vectors.
+    let mut last_answers: Vec<ConsultAnswers> = vec![(Vec::new(), Vec::new()); keys.len()];
+    let mut used: Option<(HashSet<String>, HashMap<String, String>)> = None;
+    for _ in 0..MAX_RESOLUTION_ROUNDS {
+        let targets = clean_targets(out);
+        let unconverted = unconverted_bodies(program, keys, out);
+        if used
+            .as_ref()
+            .is_some_and(|(t, u)| *t == targets && *u == unconverted)
+        {
+            break;
+        }
+        if targets.is_empty() && unconverted.is_empty() {
+            break;
+        }
+        used = Some((targets.clone(), unconverted.clone()));
+        let stale: Vec<usize> = (0..keys.len())
+            .filter(|&i| {
+                consult_answers(&consultations[i], &targets, &unconverted) != last_answers[i]
+            })
+            .collect();
+        if stale.is_empty() {
+            break;
+        }
+        let conv =
+            Converter::with_resolution(program, keys, targets.clone(), unconverted.clone());
+
+        for &i in &stale {
+            last_answers[i] = consult_answers(&consultations[i], &targets, &unconverted);
+            if let Ok(body) = conv.convert_body(&program.functions[i], &keys[i]) {
+                out.unconverted.remove(&keys[i]);
+                out.functions.insert(keys[i].clone(), body);
+            }
+        }
+        merge_static_seeds(&mut *all_static_seeds, &conv);
+    }
+}
+
+/// The eager resolution rounds of `convert_all_with`: re-convert
+/// every body against each round's resolution inputs until the
+/// inputs stop changing. The convert and debug entry points use
+/// this path unchanged.
+fn eager_resolution_rounds(
+    program: &MirProgram,
+    keys: &[String],
+    out: &mut ir::Program,
+    all_static_seeds: &mut HashMap<String, (u8, ir::Constant)>,
+) {
+    let mut used: Option<(HashSet<String>, HashMap<String, String>)> = None;
+    for _ in 0..MAX_RESOLUTION_ROUNDS {
+        let targets = clean_targets(out);
+        let unconverted = unconverted_bodies(program, keys, out);
+        if used
+            .as_ref()
+            .is_some_and(|(t, u)| *t == targets && *u == unconverted)
+        {
+            break;
+        }
+        if targets.is_empty() && unconverted.is_empty() {
+            break;
+        }
+        let conv = Converter::with_resolution(
+            program,
+            &keys,
+            targets.clone(),
+            unconverted.clone(),
+        );
+        let (resolved, _) = convert_each(&conv, program, &keys);
+        merge_static_seeds(&mut *all_static_seeds, &conv);
+        for (key, body) in resolved.functions {
+            out.unconverted.remove(&key);
+            out.functions.insert(key, body);
+        }
+        used = Some((targets, unconverted));
+    }
+}
+
+thread_local! {
+    /// Diagnostic counter of body conversions performed on this
+    /// thread (see `conversions_performed`).
+    static BODY_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of bodies conversion has (re-)converted on this
+/// thread so far, across all entry points. A diagnostic for the
+/// resolution rounds' work: the run entry points' demand-driven
+/// rounds keep this close to the phase-1 body count, where the
+/// eager rounds multiply it by the round count (Issue #426).
+pub fn conversions_performed() -> usize {
+    BODY_CONVERSIONS.with(|c| c.get())
+}
+
 /// [`convert_program`] plus the per-function conversion failures,
 /// for the run entry points: the entry function's own failure is a
 /// whole-run conversion failure, exactly as before per-body
 /// isolation, so callers need the failures beside the program.
 fn convert_all(
     program: &MirProgram,
+) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
+    convert_all_with(program, false)
+}
+
+/// `convert_all` for the run entry points, with demand-driven
+/// resolution rounds (see `lazy_resolution_rounds`, Issue #426):
+/// the program produced is the eager fixpoint; only the
+/// re-conversion work differs.
+fn convert_all_lazy(
+    program: &MirProgram,
+) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
+    convert_all_with(program, true)
+}
+
+fn convert_all_with(
+    program: &MirProgram,
+    lazy: bool,
 ) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
     let keys = program_keys(program)?;
     // First phase: convert every body with trait-impl call
@@ -753,32 +1008,10 @@ fn convert_all(
     // resolution target is clean in that same program, and every
     // diverted call names a body that is unconverted in that same
     // program. The round cap is a defensive bound only.
-    let mut used: Option<(HashSet<String>, HashMap<String, String>)> = None;
-    for _ in 0..MAX_RESOLUTION_ROUNDS {
-        let targets = clean_targets(&out);
-        let unconverted = unconverted_bodies(program, &keys, &out);
-        if used
-            .as_ref()
-            .is_some_and(|(t, u)| *t == targets && *u == unconverted)
-        {
-            break;
-        }
-        if targets.is_empty() && unconverted.is_empty() {
-            break;
-        }
-        let conv = Converter::with_resolution(
-            program,
-            &keys,
-            targets.clone(),
-            unconverted.clone(),
-        );
-        let (resolved, _) = convert_each(&conv, program, &keys);
-        merge_static_seeds(&mut all_static_seeds, &conv);
-        for (key, body) in resolved.functions {
-            out.unconverted.remove(&key);
-            out.functions.insert(key, body);
-        }
-        used = Some((targets, unconverted));
+    if lazy {
+        lazy_resolution_rounds(program, &keys, &conv, &mut out, &mut all_static_seeds);
+    } else {
+        eager_resolution_rounds(program, &keys, &mut out, &mut all_static_seeds);
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
@@ -1214,7 +1447,7 @@ pub fn interpret_mir(
     entry: &str,
     args: Vec<Value>,
 ) -> Result<Value, MirRunError> {
-    let (ir_program, failures) = convert_all(program)?;
+    let (ir_program, failures) = convert_all_lazy(program)?;
     if let Some(e) = failures.get(entry) {
         return Err(MirRunError::Convert(e.clone()));
     }
@@ -1314,7 +1547,7 @@ fn interpret_mir_captured_impl(
     config: crate::InterpConfig,
     report: impl FnOnce(&Value) -> Option<(Value, String, mir::Ty)>,
 ) -> CapturedRun {
-    match convert_all(program) {
+    match convert_all_lazy(program) {
         Ok((ir_program, failures)) => {
             // The entry function's own conversion failure is a
             // whole-run failure with no guest output, as before.
@@ -2639,6 +2872,7 @@ impl<'a> Converter<'a> {
     }
 
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
+        BODY_CONVERSIONS.with(|c| c.set(c.get() + 1));
         let body = &func.body;
         let mut local_tys = Vec::with_capacity(body.local_decls.len());
         for (i, decl) in body.local_decls.iter().enumerate() {
@@ -8867,6 +9101,18 @@ let inner = match (&src, target) {
     /// itself failed conversion does not serve the call; the
     /// builtin model below does.
     fn alloc_shim_route(&self, func: &mir::Operand) -> Option<String> {
+        let shim = self.alloc_shim_key(func)?;
+        if self.unconverted.contains_key(&shim) {
+            return None;
+        }
+        Some(shim)
+    }
+
+    /// The program key of the allocation shim a call to a std
+    /// allocation entry point names, when the program defines a
+    /// shim for it: the key whose membership in the round's
+    /// unconverted set `alloc_shim_route` tests.
+    fn alloc_shim_key(&self, func: &mir::Operand) -> Option<String> {
         let mir::Operand::Constant(c) = func else {
             return None;
         };
@@ -8883,11 +9129,7 @@ let inner = match (&src, target) {
             "alloc::alloc::__rust_alloc_zeroed" => "__rust_alloc_zeroed",
             _ => return None,
         };
-        let shim = self.alloc_shims.get(symbol)?;
-        if self.unconverted.contains_key(shim) {
-            return None;
-        }
-        Some(shim.clone())
+        self.alloc_shims.get(symbol).cloned()
     }
 
     /// The body serving a call to a body-less extern
@@ -8899,6 +9141,18 @@ let inner = match (&src, target) {
     /// the previous round does not serve the call, the same
     /// rule the allocation shims follow.
     fn link_symbol_route(&self, func: &mir::Operand) -> Option<String> {
+        let key = self.link_symbol_key(func)?;
+        if self.unconverted.contains_key(&key) {
+            return None;
+        }
+        Some(key)
+    }
+
+    /// The program key of the in-program definition a call to a
+    /// body-less extern declaration binds to, when one exports the
+    /// declaration's link symbol: the key whose membership in the
+    /// round's unconverted set `link_symbol_route` tests.
+    fn link_symbol_key(&self, func: &mir::Operand) -> Option<String> {
         let mir::Operand::Constant(c) = func else {
             return None;
         };
@@ -8908,11 +9162,7 @@ let inner = match (&src, target) {
             _ => return None,
         };
         let symbol = self.link_symbols.get(def)?;
-        let key = self.link_exports.get(symbol)?;
-        if self.unconverted.contains_key(key) {
-            return None;
-        }
-        Some(key.clone())
+        self.link_exports.get(symbol).cloned()
     }
 
     /// Whether the external/builtin conversion below would serve

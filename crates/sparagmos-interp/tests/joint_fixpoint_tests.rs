@@ -411,3 +411,116 @@ fn call_to_unconverted_body_without_a_builtin_model_stays_an_error() {
         other => panic!("expected the recorded unconverted-body error, got {other:?}"),
     }
 }
+
+// ----- demand-driven rounds: work skipped, failures unchanged ----------------
+
+use sparagmos_interp::mir_convert::{conversions_performed, convert_program};
+
+const HELPER: mir::DefId = mir::DefId::new(0, 50);
+const MID: mir::DefId = mir::DefId::new(0, 51);
+
+/// A three-body program in which every body converts in phase 1
+/// and no resolution answer ever changes: `main` calls `caller`,
+/// `caller` calls `helper`, and every call is a direct call to a
+/// converted body.
+fn all_clean_program() -> MirProgram {
+    let helper = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_i32(7)))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(HELPER, "probe::helper".to_string());
+    prog.fn_names.insert(MID, "probe::caller".to_string());
+    prog.add_with_def_id("probe::helper", HELPER, helper);
+    prog.add_with_def_id(
+        "probe::caller",
+        MID,
+        main_calling(fndef_operand(HELPER, Vec::new()), i32_ty()),
+    );
+    prog.add(
+        "main",
+        main_calling(fndef_operand(MID, Vec::new()), i32_ty()),
+    );
+    prog
+}
+
+#[test]
+fn run_mode_rounds_skip_bodies_whose_answers_never_change() {
+    // Convert mode still converts `probe::caller` in its eager
+    // round (six conversions: three bodies in phase 1, three in
+    // the round), while the run entry point's demand-driven rounds
+    // re-convert nothing: no body's resolution answers change, so
+    // the worklist is empty and only the phase-1 conversions
+    // happen. The programs the two paths produce are the same.
+    let prog = all_clean_program();
+
+    let before = conversions_performed();
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    let run_conversions = conversions_performed() - before;
+    assert_eq!(value, Value::Int(7));
+    assert_eq!(
+        run_conversions, 3,
+        "run mode must convert each body once (phase 1 only)"
+    );
+
+    let before = conversions_performed();
+    let converted = convert_program(&prog).expect("program converts");
+    let convert_conversions = conversions_performed() - before;
+    assert_eq!(converted.functions.len(), 3);
+    assert!(converted.unconverted.is_empty());
+    assert_eq!(
+        convert_conversions, 6,
+        "convert mode's eager round re-converts every body once"
+    );
+}
+
+#[test]
+fn demanded_unconverted_body_fails_the_same_through_the_rounds() {
+    // `main` -> `probe::mid` -> `probe::unmodelled`, where the
+    // last body does not convert and has no builtin model. The
+    // demand-driven rounds do re-convert `mid` (its unconverted
+    // answers change when `unmodelled` lands in the unconverted
+    // set), and the run still fails with the recorded
+    // `UnconvertedFunction` error for the demanded body — the
+    // pre-change failure class, unsuperseded. Convert mode's
+    // report keeps the body in the unconverted table.
+    let unmodelled = mir::Body::new(
+        decls(&[i32_ty(), unconvertible_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_i32(7)))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(UNMODELLED, "probe::unmodelled".to_string());
+    prog.fn_names.insert(MID, "probe::mid".to_string());
+    prog.add_with_def_id("probe::unmodelled", UNMODELLED, unmodelled);
+    prog.add_with_def_id(
+        "probe::mid",
+        MID,
+        main_calling(fndef_operand(UNMODELLED, Vec::new()), i32_ty()),
+    );
+    prog.add(
+        "main",
+        main_calling(fndef_operand(MID, Vec::new()), i32_ty()),
+    );
+
+    match interpret_mir(&prog, "main", Vec::new()) {
+        Err(MirRunError::Interp(InterpError::UnconvertedFunction { name, .. })) => {
+            assert_eq!(name, "probe::unmodelled");
+        }
+        other => panic!("expected the recorded unconverted-body error, got {other:?}"),
+    }
+
+    let converted = convert_program(&prog).expect("program converts");
+    assert!(converted.unconverted.contains_key("probe::unmodelled"));
+    assert!(converted.functions.contains_key("probe::mid"));
+    assert!(converted.functions.contains_key("main"));
+}
