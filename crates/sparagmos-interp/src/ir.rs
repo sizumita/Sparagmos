@@ -1556,6 +1556,119 @@ pub struct DropGlue {
     pub adts: Vec<DropPlan>,
 }
 
+impl DropGlue {
+    /// The glue of field `index` of the value this glue drops
+    /// (of variant `variant` for an enum value), extracted from
+    /// the plan's field structure. The aggregate's own
+    /// destructor plan is never part of the result: a field of
+    /// a value that was never fully constructed drops alone.
+    /// `None` when the plan does not decompose into per-field
+    /// plans this extraction can name.
+    pub fn field_plan(&self, variant: Option<usize>, index: usize) -> Option<DropGlue> {
+        let root = field_plan_in(&self.root, &self.adts, variant, index)?;
+        Some(DropGlue {
+            root,
+            adts: self.adts.clone(),
+        })
+    }
+
+    /// The glue of one element of the sequence this glue drops
+    /// (an array / slice / `Vec` element), extracted from the
+    /// plan's element structure. `None` when the plan carries
+    /// no element plan this extraction can name.
+    pub fn elem_plan(&self) -> Option<DropGlue> {
+        let root = elem_plan_in(&self.root, &self.adts)?;
+        Some(DropGlue {
+            root,
+            adts: self.adts.clone(),
+        })
+    }
+
+    /// The glue of the pointee of the box this glue drops,
+    /// extracted from the plan's box structure. `None` when the
+    /// plan carries no pointee plan this extraction can name.
+    pub fn pointee_plan(&self) -> Option<DropGlue> {
+        let root = pointee_plan_in(&self.root, &self.adts)?;
+        Some(DropGlue {
+            root,
+            adts: self.adts.clone(),
+        })
+    }
+}
+
+/// The per-field extraction behind [`DropGlue::field_plan`]:
+/// walk the plan's spine (ADT table entries, sequences, a
+/// variant selection) to the field structure and take field
+/// `index`'s plan. A plan addressed at exactly this field (a
+/// one-field wrapper's held value) is the field's own plan.
+/// Anything else — the aggregate's own destructor above all —
+/// names no field plan. The elided-element wrapper is
+/// transparent to the walk: it wraps the plan of the very
+/// value being extracted from, so the extraction recurses
+/// through it — without that, a zero-sized aggregate reached
+/// as a sequence element names no field plan, and
+/// partial-clone cleanup silently skips the fields cloned
+/// before a panic.
+fn field_plan_in(
+    plan: &DropPlan,
+    adts: &[DropPlan],
+    variant: Option<usize>,
+    index: usize,
+) -> Option<DropPlan> {
+    match plan {
+        DropPlan::Adt { index: i } => field_plan_in(adts.get(*i)?, adts, variant, index),
+        DropPlan::Elided { plan, .. } => field_plan_in(plan, adts, variant, index),
+        DropPlan::Seq(plans) => plans
+            .iter()
+            .find_map(|p| field_plan_in(p, adts, variant, index)),
+        DropPlan::Fields { fields, .. } => fields.get(index).cloned(),
+        DropPlan::Variants { variants } => {
+            let v = variant?;
+            field_plan_in(variants.get(v)?, adts, None, index)
+        }
+        DropPlan::At { path, plan } => {
+            if path.len() == 1 && matches!(path[0], RefProj::Field(i) if i == index) {
+                Some((**plan).clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The element extraction behind [`DropGlue::elem_plan`]: walk
+/// the plan's spine to its element plan (the `Vec` plan holds
+/// it directly, a buffer-addressed plan under its `At`). The
+/// elided-element wrapper is transparent, as in
+/// [`field_plan_in`].
+fn elem_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
+    match plan {
+        DropPlan::Adt { index } => elem_plan_in(adts.get(*index)?, adts),
+        DropPlan::Elided { plan, .. } => elem_plan_in(plan, adts),
+        DropPlan::Seq(plans) => plans.iter().find_map(|p| elem_plan_in(p, adts)),
+        DropPlan::At { plan, .. } => elem_plan_in(plan, adts),
+        DropPlan::Each { elem } => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
+/// The pointee extraction behind [`DropGlue::pointee_plan`]:
+/// walk the plan's spine to its box plan (through the
+/// plain-form side of a `dyn`-mentioning pointer's plan). The
+/// elided-element wrapper is transparent, as in
+/// [`field_plan_in`].
+fn pointee_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
+    match plan {
+        DropPlan::Adt { index } => pointee_plan_in(adts.get(*index)?, adts),
+        DropPlan::Elided { plan, .. } => pointee_plan_in(plan, adts),
+        DropPlan::Seq(plans) => plans.iter().find_map(|p| pointee_plan_in(p, adts)),
+        DropPlan::DynOrPlain { plain } => pointee_plan_in(plain, adts),
+        DropPlan::BoxPointee { pointee } => Some((**pointee).clone()),
+        _ => None,
+    }
+}
+
 /// Terminator kinds (subset of rustc MIR `TerminatorKind`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminatorKind {
@@ -1690,6 +1803,32 @@ pub enum TerminatorKind {
         /// cannot be accounted for (the item is then discarded
         /// as before).
         skipped_glue: Option<DropGlue>,
+        /// Drop glue of the element type when the callee is a
+        /// `From` / `Into` conversion into a `Box<[T]>` whose
+        /// elements the modelled conversion clones one by one (a
+        /// `&[T]` or borrowed-`Cow<[T]>` source): when a later
+        /// element's clone panics, the conversion drops the
+        /// elements it already cloned — the initialized prefix —
+        /// before the panic propagates, exactly as the real
+        /// construction's guard drops them. `None` for every
+        /// other builtin, and when the element glue is trivial
+        /// or cannot be accounted for (the prefix is then
+        /// discarded as before).
+        elem_glue: Option<DropGlue>,
+        /// Drop glue of the receiver's `Self` type when the
+        /// callee is `Clone::clone` and `Self` is a closure
+        /// type: the modelled clone clones the environment
+        /// capture by capture, and when a later capture's
+        /// clone panics, the captures cloned so far drop with
+        /// their own glue before the panic propagates, exactly
+        /// as the real field-wise construction's guard drops
+        /// them. Conversion builds the closure type's
+        /// [`DropGlue`] (its captures' glue, see
+        /// `DropGlueBuilder`). `None` for every other builtin,
+        /// when `Self` is not a closure type, and when the
+        /// glue is trivial or cannot be accounted for (the
+        /// cloned captures are then discarded as before).
+        receiver_glue: Option<DropGlue>,
         /// Discriminant values of the comparison's `Self` type,
         /// baked by conversion for the `PartialOrd` / `Ord`
         /// comparison builtins: their structural comparison orders

@@ -213,6 +213,51 @@ impl RefTarget {
             projection,
         }
     }
+
+    /// This target with one more projection step appended: the
+    /// target denoting the sub-value the step reaches within
+    /// the value this target denotes. `None` for the targets
+    /// that denote no storage (the null and address-only
+    /// pointers).
+    pub fn projected(&self, step: RefProj) -> Option<RefTarget> {
+        match self {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Place {
+                    frame: *frame,
+                    local: *local,
+                    projection,
+                })
+            }
+            RefTarget::Value(value, projection) => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Value(value.clone(), projection))
+            }
+            RefTarget::Static { name, projection } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                })
+            }
+            RefTarget::Alloc { id, projection } => {
+                let mut projection = projection.clone();
+                projection.push(step);
+                Some(RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                })
+            }
+            RefTarget::Null | RefTarget::Address(_) => None,
+        }
+    }
 }
 
 /// Which formatting trait an `rt::Argument` was built for; mirrors
@@ -464,6 +509,90 @@ impl Value {
             Value::Closure { .. } => "closure",
             Value::Coroutine { .. } => "coroutine",
             Value::PanicPayload(_) => "panic payload",
+        }
+    }
+
+    /// Whether two values are identical bit for bit: the
+    /// derived `PartialEq` comparison, except that a float
+    /// compares by its bit pattern, recursively through
+    /// every aggregate that can hold one. The derived
+    /// equality is the guest's `==`, under which a NaN is
+    /// unequal to everything including itself (and -0.0
+    /// equals 0.0), so it cannot witness that a value read
+    /// back from storage is the very value that was
+    /// snapshotted from it: a NaN read back from its own
+    /// storage is bit-identical to the snapshot, while a
+    /// -0.0 in storage is not the 0.0 a canonicalised
+    /// snapshot may hold. Callers that need an identity
+    /// witness rather than the guest's equality use this;
+    /// everything else keeps `==`.
+    pub fn bit_identical(&self, other: &Value) -> bool {
+        fn elems_identical(a: &[Value], b: &[Value]) -> bool {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(x, y)| x.bit_identical(y))
+        }
+        match (self, other) {
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Tuple(a), Value::Tuple(b)) => elems_identical(a, b),
+            (
+                Value::Enum { variant: va, fields: fa },
+                Value::Enum { variant: vb, fields: fb },
+            ) => va == vb && elems_identical(fa, fb),
+            (
+                Value::SparseVec { elems: ea, len: la, cap: ca },
+                Value::SparseVec { elems: eb, len: lb, cap: cb },
+            ) => la == lb && ca == cb && elems_identical(ea, eb),
+            (
+                Value::FatRef { base: ba, len: la },
+                Value::FatRef { base: bb, len: lb },
+            ) => la == lb && ba.bit_identical(bb),
+            (
+                Value::DynRef { base: ba, concrete: ca, traits: ta, drop_glue: ga },
+                Value::DynRef { base: bb, concrete: cb, traits: tb, drop_glue: gb },
+            ) => ca == cb && ta == tb && ga == gb && ba.bit_identical(bb),
+            (
+                Value::ErasedBlock { bytes: ba, relocs: ra },
+                Value::ErasedBlock { bytes: bb, relocs: rb },
+            ) => {
+                ba == bb
+                    && ra.len() == rb.len()
+                    && ra.iter().zip(rb.iter()).all(|((oa, va), (ob, vb))| {
+                        oa == ob && va.bit_identical(vb)
+                    })
+            }
+            (
+                Value::FmtArg { target: ta, trait_: tra, ty: tya },
+                Value::FmtArg { target: tb, trait_: trb, ty: tyb },
+            ) => tra == trb && tya == tyb && ta.bit_identical(tb),
+            (
+                Value::FmtArguments(FmtArguments::Template {
+                    template: ta,
+                    args: aa,
+                }),
+                Value::FmtArguments(FmtArguments::Template {
+                    template: tb,
+                    args: ab,
+                }),
+            ) => ta == tb && elems_identical(aa, ab),
+            (
+                Value::Closure { def: da, env: ea },
+                Value::Closure { def: db, env: eb },
+            ) => da == db && elems_identical(ea, eb),
+            (
+                Value::Coroutine { variant: va, fields: fa, saved: sa },
+                Value::Coroutine { variant: vb, fields: fb, saved: sb },
+            ) => {
+                va == vb
+                    && elems_identical(fa, fb)
+                    && sa.len() == sb.len()
+                    && sa.iter()
+                        .zip(sb.iter())
+                        .all(|(xa, xb)| elems_identical(xa, xb))
+            }
+            (Value::PanicPayload(pa), Value::PanicPayload(pb)) => {
+                pa.ty == pb.ty && pa.value.bit_identical(&pb.value)
+            }
+            _ => self == other,
         }
     }
 
