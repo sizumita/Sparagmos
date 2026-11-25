@@ -1540,7 +1540,8 @@ class ProcessStage2Tests(unittest.TestCase):
         captured = {}
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             captured["rustc_args"] = list(rustc_args)
             return conv_result
 
@@ -1634,7 +1635,8 @@ class ProcessStage2Tests(unittest.TestCase):
         calls = []
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             calls.append(list(rustc_args))
             return conv()
 
@@ -1656,7 +1658,8 @@ class ProcessStage2Tests(unittest.TestCase):
         calls = []
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             calls.append(list(rustc_args))
             for rev, res in by_rev.items():
                 if rev in rustc_args or \
@@ -1842,7 +1845,8 @@ class ProcessStage2Tests(unittest.TestCase):
             suite="incremental")
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -2099,7 +2103,8 @@ class ProcessStage2AuxTests(unittest.TestCase):
         orig = run.convert_side
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -2449,7 +2454,8 @@ class ProcessStage2RevisionTests(unittest.TestCase):
     def run_with_fake(self, rec, fake):
         orig = run.convert_side
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -3260,7 +3266,8 @@ class ProcMacroExternTests(unittest.TestCase):
         orig = run.convert_side
 
         def capture(path, edition, driver_bin, rustc_args=(),
-                    aux_specs=(), env_extra=None, env_remove=()):
+                    aux_specs=(), env_extra=None, env_remove=(),
+                    jit=False, aux_env_scrub=()):
             seen["args"] = list(rustc_args)
             return conv()
 

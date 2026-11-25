@@ -9355,6 +9355,32 @@ fn declared_rustc_env(src_text: &str) -> (Vec<(String, String)>, Vec<String>) {
 /// fails links that need the code; an rlib-only pin fails with
 /// "only metadata stub found"). Mirrors the subset runner's
 /// ambiguous_sysroot_crates for its native compilations.
+/// The host target triple of a sysroot's rustc (`rustc -vV`'s
+/// `host:` line), asked once per sysroot per process.
+fn sysroot_host_target(sysroot: &str) -> Option<String> {
+    static CACHE: std::sync::Mutex<Vec<(String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((_, host)) = cache.iter().find(|(s, _)| s == sysroot) {
+            return Some(host.clone());
+        }
+    }
+    let rustc = std::path::Path::new(sysroot).join("bin").join("rustc");
+    let out = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let host = text
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(|h| h.trim().to_string())?;
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.push((sysroot.to_string(), host.clone()));
+    }
+    Some(host)
+}
+
 fn sysroot_extern_pins(
     sysroot: &str,
     src_text: &str,
@@ -9374,12 +9400,25 @@ fn sysroot_extern_pins(
         String,
         std::collections::HashMap<String, (std::path::PathBuf, bool, bool)>,
     > = std::collections::HashMap::new();
+    // Only the host target's lib dir is scanned: a toolchain
+    // carrying std for many targets offers a complete
+    // candidate for the name under most of them, and the
+    // ambiguity this disambiguates is the host dir's own
+    // (the rustc-dev component's second rmeta beside the
+    // std component's rlib+rmeta pair). The host triple is
+    // the sysroot rustc's own, asked once.
     let rustlib = std::path::Path::new(sysroot).join("lib").join("rustlib");
-    let Ok(targets) = std::fs::read_dir(&rustlib) else {
-        return Vec::new();
+    let libdirs: Vec<std::path::PathBuf> = match sysroot_host_target(sysroot) {
+        Some(host) => vec![rustlib.join(host).join("lib")],
+        None => match std::fs::read_dir(&rustlib) {
+            Ok(targets) => targets
+                .flatten()
+                .map(|t| t.path().join("lib"))
+                .collect(),
+            Err(_) => return Vec::new(),
+        },
     };
-    for target in targets.flatten() {
-        let libdir = target.path().join("lib");
+    for libdir in libdirs {
         let Ok(entries) = std::fs::read_dir(&libdir) else {
             continue;
         };
@@ -9620,6 +9659,7 @@ fn compile_aux(
     spec: &AuxSpec,
     previous: &[AuxBuilt],
     native_lib_dirs: &[std::path::PathBuf],
+    env_scrub: &[String],
 ) -> Result<AuxBuilt, String> {
     let name = spec.name.as_str();
     let src_path = spec.path.as_str();
@@ -9732,6 +9772,16 @@ fn compile_aux(
     // compiletest-self-test env.rs auxiliary reads
     // COMPILETEST_BAR through env!() and does not compile
     // without it).
+    // The test's own rustc-env names are scrubbed first:
+    // compiletest configures an auxiliary build's environment
+    // separately from the test's, so a variable the test's
+    // rustc-env set for the main compilation (which the
+    // subset runner hands this process as its environment)
+    // must not leak into the auxiliary build, whose own
+    // directives are applied after the scrub and win.
+    for name in env_scrub {
+        cmd.env_remove(name);
+    }
     let (aux_env, aux_unset) = declared_rustc_env(&src_text);
     for name in &aux_unset {
         cmd.env_remove(name);
@@ -10145,6 +10195,7 @@ fn driver_main() {
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
     let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut aux_native_lib_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut aux_env_scrub: Vec<String> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
     let mut dump_path: Option<String> = None;
@@ -10267,6 +10318,14 @@ fn driver_main() {
                 });
                 aux_native_lib_dirs.push(std::path::PathBuf::from(dir));
             }
+            "--aux-env-scrub" => {
+                i += 1;
+                let name = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--aux-env-scrub needs a variable name");
+                    std::process::exit(2);
+                });
+                aux_env_scrub.push(name);
+            }
             "--guest-process-host" => {
                 guest_process_host = true;
             }
@@ -10285,7 +10344,7 @@ fn driver_main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -10377,6 +10436,7 @@ fn driver_main() {
             spec,
             &aux_built,
             &aux_native_lib_dirs,
+            &aux_env_scrub,
         ) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {

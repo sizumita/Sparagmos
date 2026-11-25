@@ -2588,6 +2588,7 @@ def proc_macro_extern_args(test_path, view, edition):
 
 
 _SYSROOT_EXTERN_CACHE = None
+_SYSROOT_EXTERN_LOCK = threading.Lock()
 _SYSROOT_RMETA_RE = re.compile(r"^lib(.+)-([0-9a-f]{16})\.(rmeta|rlib)$")
 _EXTERN_CRATE_RE = re.compile(r"\bextern\s+crate\s+([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -2609,30 +2610,38 @@ def ambiguous_sysroot_crates():
     """
     global _SYSROOT_EXTERN_CACHE
     if _SYSROOT_EXTERN_CACHE is None:
-        facts = host_facts()
-        if facts is None:
-            return {}
-        _SYSROOT_EXTERN_CACHE = {}
-        libdir = facts.target_lib_dir()
-        if libdir is not None:
-            try:
-                entries = os.listdir(libdir)
-            except OSError:
-                entries = []
-            by_name = {}
-            for entry in entries:
-                m = _SYSROOT_RMETA_RE.match(entry)
-                if m:
-                    by_name.setdefault(m.group(1), {}) \
-                        .setdefault(m.group(2), set()).add(m.group(3))
-            for name, hashes in by_name.items():
-                if len(hashes) < 2:
-                    continue
-                linkable = [h for h, kinds in hashes.items()
-                            if kinds == {"rmeta", "rlib"}]
-                if len(linkable) == 1:
-                    _SYSROOT_EXTERN_CACHE[name] = str(
-                        libdir / f"lib{name}-{linkable[0]}.rmeta")
+        # The map is built under a lock and published whole:
+        # stage attempts run on a thread pool, and a reader
+        # that observed the map mid-build would pin nothing
+        # and fail its compilation with E0464.
+        with _SYSROOT_EXTERN_LOCK:
+            if _SYSROOT_EXTERN_CACHE is None:
+                facts = host_facts()
+                if facts is None:
+                    return {}
+                cache = {}
+                libdir = facts.target_lib_dir()
+                if libdir is not None:
+                    try:
+                        entries = os.listdir(libdir)
+                    except OSError:
+                        entries = []
+                    by_name = {}
+                    for entry in entries:
+                        m = _SYSROOT_RMETA_RE.match(entry)
+                        if m:
+                            by_name.setdefault(m.group(1), {}) \
+                                .setdefault(m.group(2), set()) \
+                                .add(m.group(3))
+                    for name, hashes in by_name.items():
+                        if len(hashes) < 2:
+                            continue
+                        linkable = [h for h, kinds in hashes.items()
+                                    if kinds == {"rmeta", "rlib"}]
+                        if len(linkable) == 1:
+                            cache[name] = str(
+                                libdir / f"lib{name}-{linkable[0]}.rmeta")
+                _SYSROOT_EXTERN_CACHE = cache
     return _SYSROOT_EXTERN_CACHE
 
 
@@ -2775,6 +2784,79 @@ def aux_bin_specs(path, view):
     return out
 
 
+def build_native_aux(spec, edition, auxdir, lib, helpers, workdir,
+                     prev_built):
+    """Build one auxiliary crate natively into auxdir against
+    the crates in prev_built ((binding, artifact) pairs).
+    Returns ((binding, artifact), None) or (None, reason).
+    Shared by a test's own auxiliary crates and an aux-bin
+    file's own."""
+    spec = as_aux_spec(spec)
+    name, src = spec.name, spec.path
+    text = src.read_text(errors="ignore")
+    declared = declared_crate_type(text)
+    eff_name = declared_crate_name(text) or name
+    aview = aux_header_view(text)
+    aux_no_pd = aview.has("no-prefer-dynamic")
+    aux_flags = compile_flags(aview, suite_root(src), workdir)
+    if screen_flags(aux_flags, targets={HOST_TARGET}):
+        aux_flags = []
+    # A source declaring several crate types builds one
+    # artifact per type; the one a dependent compilation
+    # can link against is the first linkable declared
+    # type (a cdylib-only auxiliary stays unbound, as
+    # before). With no declared type, the directive's
+    # forced type or compiletest's default applies.
+    linkable = [t for t in declared_crate_types(text)
+                if t in ("rlib", "lib", "dylib", "proc-macro")]
+    if linkable:
+        effective = linkable[0]
+    elif declared is not None:
+        effective = declared
+    else:
+        effective = spec.crate_type or (
+            "rlib" if aux_no_pd else "dylib")
+    cmd = rustc_cmd() + ["--edition", spec.edition or edition,
+                         "--out-dir", str(auxdir)]
+    if lib:
+        cmd += ["-L", lib]
+    cmd += ["-L", f"dependency={auxdir}"]
+    cmd += helpers
+    if declared is None:
+        cmd += ["--crate-type", effective]
+    if declared_crate_name(text) is None:
+        cmd += ["--crate-name", name]
+    if not aux_no_pd and not any(
+            "prefer-dynamic" in f for f in aux_flags):
+        cmd += ["-C", "prefer-dynamic"]
+    for prev_binding, prev_artifact in prev_built:
+        if prev_artifact is not None:
+            cmd += ["--extern",
+                    f"{prev_binding}={prev_artifact}"]
+    cmd += sysroot_extern_args(src, ())
+    cmd += aux_flags
+    cmd += [str(src)]
+    apairs, aunset = view_env(aview, "rustc-env",
+                              "unset-rustc-env",
+                              suite_root(src), workdir)
+    aenv = dict(BOOTSTRAP_ENV)
+    aenv.update(apairs)
+    build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                    env_extra=aenv, env_remove=aunset)
+    if build["timeout"]:
+        return None, "native compile timed out"
+    if build["exit_code"] != 0:
+        first = first_error_line(build["stderr"])
+        return None, f"native compile failed: {first}"
+    artifact = (find_artifact(auxdir, eff_name)
+                if effective in ("rlib", "lib", "dylib",
+                                 "proc-macro")
+                else None)
+    binding = (f"{spec.modifiers}:{eff_name}"
+               if spec.modifiers else eff_name)
+    return (binding, artifact), None
+
+
 def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
                 run_args=(), run_env_extra=None, run_env_remove=(),
                 compile_env_extra=None, compile_env_remove=(),
@@ -2819,72 +2901,14 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
         auxdir.mkdir()
         built = []
         for spec in aux_specs:
-            spec = as_aux_spec(spec)
-            name, src = spec.name, spec.path
-            text = src.read_text(errors="ignore")
-            declared = declared_crate_type(text)
-            eff_name = declared_crate_name(text) or name
-            aview = aux_header_view(text)
-            aux_no_pd = aview.has("no-prefer-dynamic")
-            aux_flags = compile_flags(aview, suite_root(src), workdir)
-            if screen_flags(aux_flags, targets={HOST_TARGET}):
-                aux_flags = []
-            # A source declaring several crate types builds one
-            # artifact per type; the one a dependent compilation
-            # can link against is the first linkable declared
-            # type (a cdylib-only auxiliary stays unbound, as
-            # before). With no declared type, the directive's
-            # forced type or compiletest's default applies.
-            linkable = [t for t in declared_crate_types(text)
-                        if t in ("rlib", "lib", "dylib", "proc-macro")]
-            if linkable:
-                effective = linkable[0]
-            elif declared is not None:
-                effective = declared
-            else:
-                effective = spec.crate_type or (
-                    "rlib" if aux_no_pd else "dylib")
-            cmd = rustc_cmd() + ["--edition", spec.edition or edition,
-                                 "--out-dir", str(auxdir)]
-            if lib:
-                cmd += ["-L", lib]
-            cmd += ["-L", f"dependency={auxdir}"]
-            cmd += helpers
-            if declared is None:
-                cmd += ["--crate-type", effective]
-            if declared_crate_name(text) is None:
-                cmd += ["--crate-name", name]
-            if not aux_no_pd and not any(
-                    "prefer-dynamic" in f for f in aux_flags):
-                cmd += ["-C", "prefer-dynamic"]
-            for prev_binding, prev_artifact in built:
-                if prev_artifact is not None:
-                    cmd += ["--extern",
-                            f"{prev_binding}={prev_artifact}"]
-            cmd += sysroot_extern_args(src, ())
-            cmd += aux_flags
-            cmd += [str(src)]
-            apairs, aunset = view_env(aview, "rustc-env",
-                                      "unset-rustc-env",
-                                      suite_root(src), workdir)
-            aenv = dict(BOOTSTRAP_ENV)
-            aenv.update(apairs)
-            build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
-                            env_extra=aenv, env_remove=aunset)
-            if build["timeout"]:
-                return None, "native compile timed out"
-            if build["exit_code"] != 0:
-                first = first_error_line(build["stderr"])
-                return None, f"native compile failed: {first}"
-            artifact = (find_artifact(auxdir, eff_name)
-                        if effective in ("rlib", "lib", "dylib",
-                                         "proc-macro")
-                        else None)
-            binding = (f"{spec.modifiers}:{eff_name}"
-                       if spec.modifiers else eff_name)
-            built.append((binding, artifact))
-            if artifact is not None:
-                externs += ["--extern", f"{binding}={artifact}"]
+            pair, err = build_native_aux(spec, edition, auxdir, lib,
+                                         helpers, workdir, built)
+            if err:
+                return None, err
+            built.append(pair)
+            if pair[1] is not None:
+                externs += ["--extern", f"{pair[0]}={pair[1]}"]
+    bins_built_libs = False
     if aux_bins:
         # `//@ aux-bin:` binaries, built after the auxiliary
         # crates (compiletest's order: bins link the crates built
@@ -2899,6 +2923,28 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
         for stem, bsrc in aux_bins:
             btext = bsrc.read_text(errors="ignore")
             bview = aux_header_view(btext)
+            # The bin file's own auxiliary crates: an aux-bin
+            # file's own `//@ aux-crate:` / `//@ aux-build:`
+            # directives are resolved and built for the bin,
+            # as compiletest builds them (the on-broken-pipe
+            # bins name sigpipe_utils this way, a crate the
+            # test itself never declares).
+            bin_specs, bin_err = resolve_aux_specs(bsrc)
+            if bin_err:
+                return None, bin_err
+            bin_built = []
+            if bin_specs:
+                auxdir.mkdir(exist_ok=True)
+                for bspec in bin_specs:
+                    pair, err = build_native_aux(
+                        bspec, edition, auxdir, lib, helpers,
+                        workdir, bin_built)
+                    if err:
+                        return None, err
+                    bin_built.append(pair)
+            bin_pairs = built_pairs + bin_built
+            if bin_built:
+                bins_built_libs = True
             bflags = compile_flags(bview, suite_root(bsrc), workdir)
             if screen_flags(bflags, targets={HOST_TARGET}):
                 bflags = []
@@ -2908,13 +2954,13 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
                                   "-o", str(bin_dir / stem)]
             if lib:
                 bcmd += ["-L", lib]
-            if aux_specs:
+            if aux_specs or bin_built:
                 bcmd += ["-L", f"dependency={auxdir}"]
             bcmd += helpers
             if not bview.has("no-prefer-dynamic") and not any(
                     "prefer-dynamic" in f for f in bflags):
                 bcmd += ["-C", "prefer-dynamic"]
-            for prev_binding, prev_artifact in built_pairs:
+            for prev_binding, prev_artifact in bin_pairs:
                 if prev_artifact is not None:
                     bcmd += ["--extern",
                              f"{prev_binding}={prev_artifact}"]
@@ -2965,7 +3011,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
     facts = host_facts()
     if facts is not None and facts.target_lib_dir() is not None:
         lib_dirs.append(str(facts.target_lib_dir()))
-    if aux_specs:
+    if aux_specs or bins_built_libs:
         lib_dirs.append(str(auxdir))
     if lib_dirs:
         prev = os.environ.get("LD_LIBRARY_PATH", "")
@@ -2995,7 +3041,7 @@ def aux_native_lib_dirs(path):
 
 def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
                    aux_specs=(), guest_args=(), env_extra=None,
-                   env_remove=(), jit=False):
+                   env_remove=(), jit=False, aux_env_scrub=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (the run completed; the exit code is the
@@ -3051,7 +3097,32 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     # driver's auxiliary builds get it as --aux-native-lib.
     for d in aux_native_lib_dirs(path):
         argv += ["--aux-native-lib", d]
+    # The test's rustc-env names ride this process's
+    # environment into the main conversion (env!/option_env!
+    # read it there), but compiletest configures an auxiliary
+    # build's environment separately: the driver scrubs these
+    # names from its auxiliary builds' environments.
+    for name in aux_env_scrub:
+        argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
+    # The library path the native run gets (see native_side):
+    # the guest's host children are real binaries that load
+    # the shared std and the attempt's dylib auxiliaries, and
+    # they inherit this process's environment. A test's own
+    # exec-env still wins (applied after).
+    lib_dirs = []
+    slib = sysroot_lib()
+    if slib:
+        lib_dirs.append(slib)
+    facts = host_facts()
+    if facts is not None and facts.target_lib_dir() is not None:
+        lib_dirs.append(str(facts.target_lib_dir()))
+    if cwd is not None:
+        lib_dirs.append(str(Path(cwd) / "auxlibs"))
+    if lib_dirs:
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join(
+            lib_dirs + ([prev] if prev else []))
     if env_extra:
         env.update(env_extra)
     res = run_cmd(argv,
@@ -3765,7 +3836,8 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
             edition, args, aux_specs, cenv, cunset, _ep, _eu = asm
             conv = convert_side(path, edition, driver_bin,
                                 rustc_args=args, aux_specs=aux_specs,
-                                env_extra=cenv, env_remove=cunset)
+                                env_extra=cenv, env_remove=cunset,
+                                aux_env_scrub=tuple(cenv))
             if conv["timeout"]:
                 out["reason"] = "driver timed out"
                 out["bucket"] = "timeout"
@@ -4080,6 +4152,13 @@ def sanitizer_scope(rec, view):
     """
     if rec["nature"] != "exec":
         return None
+    # Only a run-fail verdict is the sanitizer's report: a
+    # run-pass sanitizer test (the cfi family, memory-passing,
+    # dataflow) is judged on the instrumented program running
+    # clean, which plain execution of the same program
+    # reproduces -- those stay attempted.
+    if run_mode(view) != "run-fail":
+        return None
     for flag in view.values("compile-flags"):
         for token in flag.split():
             opt = token[2:] if token.startswith("-Z") else token
@@ -4223,6 +4302,7 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             out["status"] = "unsupported"
@@ -4407,6 +4487,7 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                                                      revision),
                         env_extra=cenv,
                         env_remove=cunset,
+                        aux_env_scrub=tuple(cenv),
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
@@ -4551,6 +4632,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"
@@ -4841,7 +4923,8 @@ _TARGET_NOT_DEMANDED_RE = re.compile(
 
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
-                 env_extra=None, env_remove=(), jit=False):
+                 env_extra=None, env_remove=(), jit=False,
+                 aux_env_scrub=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -4883,6 +4966,8 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         argv += ["--aux", aux_spec_arg(spec)]
     for d in aux_native_lib_dirs(path):
         argv += ["--aux-native-lib", d]
+    for name in aux_env_scrub:
+        argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
     if env_extra:
         env.update(env_extra)
@@ -5453,6 +5538,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=specs, env_extra=cenv,
                         env_remove=cunset,
+                        aux_env_scrub=tuple(cenv),
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
@@ -5574,6 +5660,7 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"

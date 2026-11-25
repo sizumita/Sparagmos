@@ -185,18 +185,43 @@ denominator. Runs on every push to `main` and on manual dispatch.
   runs also receive `RUST_TEST_TMPDIR` (the attempt's temp
   directory), which bootstrap exports to the whole test
   process tree and tests read at run time.
-- The exec records compiled with a `-Z sanitizer=...` flag
-  (the `tests/ui/sanitizer` family) are attempted by no
-  stage. compiletest judges them by the sanitizer runtime's
-  own report on the instrumented binary -- its exit class
-  and the diagnostic its `error-pattern` names -- and the
-  instrumentation is LLVM-level: no MIR the interpreter
-  executes carries it and the guest program is never
-  instrumented, so no verdict reduces to plain execution.
-  The runner records them as not attempted under the bucket
+- The run-fail exec records compiled with a
+  `-Z sanitizer=...` flag (the `tests/ui/sanitizer` family)
+  are attempted by no stage. compiletest judges them by
+  the sanitizer runtime's own report on the instrumented
+  binary -- its exit class and the diagnostic its
+  `error-pattern` names -- and the instrumentation is
+  LLVM-level: no MIR the interpreter executes carries it
+  and the guest program is never instrumented, so no
+  verdict reduces to plain execution. The runner records
+  them as not attempted under the bucket
   `not attempted (sanitizer instrumentation)` (issue #532),
   the same shape as the coverage records above. The
-  denominator is unaffected.
+  denominator is unaffected. A run-pass sanitizer test
+  (the cfi family, memory-passing, dataflow) is judged on
+  the instrumented program running clean, which plain
+  execution reproduces, so those stay attempted.
+- An `//@ aux-bin:` file is built as compiletest builds it:
+  after the test's auxiliary crates, into
+  `auxiliary/bin/` of the attempt directory, with its own
+  header's flags and environment -- including the auxiliary
+  crates its own `//@ aux-crate:` / `//@ aux-build:`
+  directives name, which are resolved and built for the bin
+  (the on-broken-pipe bins name sigpipe_utils this way, a
+  crate the test itself never declares). Both runs work in
+  the attempt directory, so both spawn the same binaries.
+  The runs' library path is compiletest's as well -- the
+  sysroot lib dir, the target lib dir holding the shared
+  std, and the attempt's auxiliary directory -- on the
+  native run and on the driver process alike, whose host
+  children load the same shared libraries. An auxiliary
+  build's environment is the auxiliary file's own
+  (`--aux-env-scrub`): the test's `//@ rustc-env:` variables
+  ride the driver process's environment into the main
+  conversion, where `env!` / `option_env!` read them, and
+  are scrubbed from the driver's auxiliary builds, whose
+  own `//@ rustc-env:` directives are applied after the
+  scrub.
 - The exec records whose mode is run-crash are attempted by
   stages 1 and 2 and judged by crash class, following
   compiletest's own classification of a finished run

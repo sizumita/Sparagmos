@@ -6463,9 +6463,66 @@ impl<'a> Interpreter<'a> {
                         },
                         Err(InterpError::Panic { message, payload }) => {
                             self.note_panic_consumed();
+                            if opts.nocapture
+                                && !matches!(test.should_panic, ShouldPanic::No)
+                            {
+                                // In nocapture mode the panic's
+                                // report goes to the guest's
+                                // stderr as it runs (the default
+                                // hook prints it at panic time):
+                                // a should-panic test's panic is
+                                // printed there too, whether the
+                                // harness then counts the test as
+                                // passed or failed. The backtrace
+                                // note is spent on the process's
+                                // first printed report.
+                                let report = if backtrace_note_pending {
+                                    backtrace_note_pending = false;
+                                    panic_report_full(
+                                        test,
+                                        self.current_thread_id(),
+                                        self.panic_location(),
+                                        &message,
+                                    )
+                                } else {
+                                    panic_report_head(
+                                        test,
+                                        self.current_thread_id(),
+                                        self.panic_location(),
+                                        &message,
+                                    )
+                                };
+                                self.push_error_output(&report);
+                            }
                             match &test.should_panic {
                                 ShouldPanic::No => {
                                     if opts.nocapture {
+                                        // The report the default
+                                        // hook prints to the
+                                        // guest's stderr as the
+                                        // panic runs (see the
+                                        // should-panic arms): in
+                                        // nocapture mode there
+                                        // is no captured section,
+                                        // so this print is the
+                                        // failure's only account.
+                                        let report = if backtrace_note_pending {
+                                            backtrace_note_pending = false;
+                                            panic_report_full(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        } else {
+                                            panic_report_head(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        };
+                                        self.push_error_output(&report);
                                         Some(None)
                                     } else {
                                         let report = match self.panic_location() {
