@@ -4096,6 +4096,23 @@ impl<'a> Interpreter<'a> {
         {
             return Some(Ok((candidate, receiver)));
         }
+        // The instance name a body is stored under elides the
+        // concrete type's trailing *defaulted* generic arguments,
+        // while the rendered type the fat pointer carries keeps
+        // them (`Layered<L, S, S>` for a `Layered<L, S, N = S>`
+        // whose stored key is `Layered<L, S>`). Try the spellings
+        // with trailing arguments dropped, longest first; the
+        // dropped arguments are the declared defaults, which the
+        // remaining arguments determine, so at most one spelling
+        // can be a program key.
+        for elided in elided_self_spellings(concrete) {
+            let candidate = format!("<{elided} as {trait_path}>::{method}");
+            if self.program.get(&candidate).is_some()
+                || self.program.unconverted_reason(&candidate).is_some()
+            {
+                return Some(Ok((candidate, receiver)));
+            }
+        }
         // The impl key may carry the trait's generic arguments
         // (`<S as std::ops::FnMut<(i32,)>>::call_mut`) or spell the
         // trait through the other of `std::` / `core::`: scan the
@@ -25958,6 +25975,71 @@ fn parse_coroutine_key(key: &str) -> Option<(String, String, Vec<String>)> {
     let seg = &rest[..=seg_end];
     let (parent, args) = strip_generic_groups(&key[..idx])?;
     Some((parent, seg.to_string(), args))
+}
+
+/// The spellings of a rendered type with trailing generic
+/// arguments dropped from its outermost argument list, longest
+/// first: `a::W<X, Y, Z>` yields `a::W<X, Y>`, then `a::W<X>`,
+/// then `a::W`. A name with no argument list (or an empty one)
+/// yields nothing.
+fn elided_self_spellings(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = name.to_string();
+    while let Some(elided) = drop_last_generic_arg(&current) {
+        out.push(elided.clone());
+        current = elided;
+    }
+    out
+}
+
+/// `name` with the last argument of its outermost generic
+/// argument list removed (the bare path once the list is
+/// empty); `None` when the name does not end in an argument
+/// list. Both scans track nesting depth, so commas inside
+/// nested arguments do not count, and the `>` of a `->` is not
+/// a bracket.
+fn drop_last_generic_arg(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    if bytes.last() != Some(&b'>') {
+        return None;
+    }
+    // The '<' matching the final '>', scanning backwards.
+    let mut depth = 0i32;
+    let mut open = None;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
+            b'>' => depth += 1,
+            b'<' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let inner = &name[open + 1..name.len() - 1];
+    if inner.is_empty() {
+        return None;
+    }
+    // The last comma at depth 0 within the list.
+    let mut depth = 0i32;
+    let mut last_comma = None;
+    for (i, &b) in inner.as_bytes().iter().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    match last_comma {
+        Some(i) => Some(format!("{}<{}>", &name[..open], &inner[..i])),
+        None => Some(name[..open].to_string()),
+    }
 }
 
 fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
