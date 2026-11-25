@@ -6,7 +6,7 @@ For each of the 40 denominator variants (StatementKind 12 + TerminatorKind
 from a mechanical extraction of rustc 1.100.0's MIR enums), this
 script mechanically cross-references three kinds of evidence:
 
-  driver  -- crates/sparagmos-driver/src/convert.rs has a match arm for the
+  driver  -- crates/sparagmos-driver/src/convert/ has a match arm for the
              variant that constructs the sparagmos-mir counterpart without
              unconditionally recording a conversion error;
   interp  -- a passing test constructs the sparagmos-mir variant in a body
@@ -61,7 +61,7 @@ MIR_SRC = {
     "TerminatorKind": "crates/sparagmos-mir/src/terminator.rs",
     "Rvalue": "crates/sparagmos-mir/src/rvalue.rs",
 }
-DRIVER_SRC = "crates/sparagmos-driver/src/convert.rs"
+DRIVER_SRC = "crates/sparagmos-driver/src/convert"
 COVERAGE_RS = "crates/sparagmos-mir/src/coverage.rs"
 # Metric-1 tables in coverage.rs: enum -> (denominator const,
 # unreachable const).
@@ -130,13 +130,13 @@ MANUAL_REVIEWS = [
 # Driver arms whose self.err(...) call fires only on a sub-case, while the
 # arm does construct the real variant on the main path.
 CONDITIONAL_ERR_OK = {
-    # convert.rs: R::Repeat records an error only when the repeat count is
+    # convert/: R::Repeat records an error only when the repeat count is
     # not evaluable as a constant; otherwise it constructs Rvalue::Repeat.
     ("Rvalue", "Repeat"),
-    # convert.rs: cast_kind() records an error only for
+    # convert/: cast_kind() records an error only for
     # CastKind::BoxDerefTransmute; other CastKinds construct Rvalue::Cast.
     ("Rvalue", "Cast"),
-    # convert.rs: TK::InlineAsm records an error only when the template
+    # convert/: TK::InlineAsm records an error only when the template
     # is outside the no-op class (see inline_asm_is_noop in
     # sparagmos-mir); no-op templates construct TerminatorKind::InlineAsm.
     ("TerminatorKind", "InlineAsm"),
@@ -359,6 +359,24 @@ def parse_enum_variants(rust_src: str, enum_name: str) -> list:
 # --------------------------------------------------------------------------
 # Driver scan
 # --------------------------------------------------------------------------
+
+def read_driver_source(path):
+    """Source text of the driver's convert module.
+
+    `path` may name the historical single `convert.rs` file or the
+    `convert/` module directory it was split into; a directory is
+    read as the concatenation of its `*.rs` files in name order.
+    """
+    if os.path.isdir(path):
+        parts = []
+        for name in sorted(os.listdir(path)):
+            if name.endswith(".rs"):
+                with open(os.path.join(path, name)) as f:
+                    parts.append(f.read())
+        return "".join(parts)
+    with open(path) as f:
+        return f.read()
+
 
 def scan_driver(convert_rs: str) -> dict:
     """Per denominator variant: does the driver convert it?
@@ -711,8 +729,7 @@ def main():
         with open(os.path.join(repo, MIR_SRC[enum])) as f:
             SM_VARIANTS[enum] = parse_enum_variants(f.read(), enum)
 
-    with open(os.path.join(repo, DRIVER_SRC)) as f:
-        driver = scan_driver(f.read())
+    driver = scan_driver(read_driver_source(os.path.join(repo, DRIVER_SRC)))
 
     # Scan test files per binary target.
     scanned = {}  # label -> {test_name: FnInfo}
