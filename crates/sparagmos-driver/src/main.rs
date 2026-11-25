@@ -7820,6 +7820,10 @@ fn self_run(
     tail.push(env_path.display().to_string());
     tail.push("--guest-program-name".to_string());
     tail.push(program_name);
+    // The child's guest stdout writes through to the stream
+    // this spawn wired as its stdout, as a native child's
+    // would (see `InterpConfig::stdout_sink`).
+    tail.push("--guest-stdout-passthrough".to_string());
     // The arguments travel as command-line strings, as in
     // `artifact_run`: an argument that is not valid UTF-8
     // cannot be carried without changing its bytes, so the
@@ -8098,18 +8102,75 @@ struct DriverProcessHost {
     exe_fingerprint: std::sync::OnceLock<Option<(u64, u64)>>,
 }
 
-/// One live host child (see [`DriverProcessHost`]).
+/// One live host child started for the interpreter's
+/// `Child` model (see [`DriverProcessHost`]): the streams
+/// themselves are with the interpreter (see
+/// `ProcessSpawned`); what stays here is what observing the
+/// child's end needs.
 struct HostChild {
     child: std::process::Child,
-    /// The child's stdout drain.
-    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
-    /// The child's stderr drain: a host program's own stderr.
-    /// A self-child's stderr carries only the nested driver's
-    /// own lines; the guest's stderr goes to `stderr_file`.
-    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// A self-child's stderr drain: the nested driver's own
+    /// diagnostic lines, kept for the exit-2 disambiguation
+    /// when the child's end is observed. A plain host child's
+    /// stderr is the guest's own stream, handed to the
+    /// interpreter at spawn, so there is nothing to drain.
+    diag: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// A self-child's guest-stderr channel file (the guest
+    /// reads its end through the interpreter); removed once
+    /// the child's end has been observed.
     stderr_file: Option<std::path::PathBuf>,
     self_run: bool,
-    outcome: Option<sparagmos_interp::ProcessChildOutcome>,
+    /// The exit code once the end has been observed, so
+    /// repeated waits answer the same, as std's cached
+    /// status does.
+    exit: Option<i32>,
+}
+
+/// The pipe end a spawned child hands over, as the file the
+/// interpreter's file table holds: the descriptor the pipe
+/// value owns transfers to the file.
+fn pipe_file<P: std::os::unix::io::IntoRawFd>(
+    pipe: P,
+) -> std::fs::File {
+    use std::os::unix::io::FromRawFd as _;
+    // SAFETY: `pipe` owns its descriptor; `into_raw_fd`
+    // relinquishes it and the file takes ownership, so the
+    // descriptor is closed exactly once, by the file.
+    unsafe { std::fs::File::from_raw_fd(pipe.into_raw_fd()) }
+}
+
+/// Whether a self-child's end is the nested driver's own
+/// failure rather than the child program's exit: exit 2 with
+/// the driver's own lines on the diagnostic stream. Then
+/// `Some(reason)` -- the driver's first named reason when it
+/// gave one -- and the invocation is the host's failure to
+/// carry out, not an exit code (the same disambiguation
+/// `artifact_run` makes).
+fn self_run_failure(exit_code: i32, drained: &[u8]) -> Option<String> {
+    if exit_code != 2 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(drained);
+    let reason = text.lines().find_map(|line| {
+        line.strip_prefix("sparagmos-driver run: unsupported: ")
+            .or_else(|| {
+                line.strip_prefix(
+                    "sparagmos-driver: compilation failed: ",
+                )
+            })
+            .map(|rest| rest.to_string())
+    });
+    let driver_failed = reason.is_some()
+        || text
+            .lines()
+            .any(|line| line.starts_with("sparagmos-driver"));
+    if !driver_failed {
+        return None;
+    }
+    Some(reason.unwrap_or_else(|| {
+        "the guest program could not be run as a child process"
+            .to_string()
+    }))
 }
 
 fn os_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
@@ -8121,6 +8182,17 @@ fn drain_pipe<R: std::io::Read>(mut pipe: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = pipe.read_to_end(&mut buf);
     buf
+}
+
+/// One host child being run to completion for a
+/// `status` / `output` call (see `ProcessHostOps::run`):
+/// both streams drained on threads while it runs, as std's
+/// collection does.
+struct RunChild {
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr_file: Option<std::path::PathBuf>,
+    self_run: bool,
 }
 
 /// The exit code a finished host child reports in the
@@ -8158,11 +8230,35 @@ impl DriverProcessHost {
         if path == self.exe {
             return true;
         }
+        if self.is_input_program(path) {
+            return true;
+        }
         let mine = self
             .exe_fingerprint
             .get_or_init(|| Self::fingerprint(&self.exe));
         match (mine, Self::fingerprint(path)) {
             (Some(a), Some(b)) => *a == b,
+            _ => false,
+        }
+    }
+
+    /// Whether `path` denotes the source this run interprets.
+    /// A spawn naming it is the guest re-executing itself under
+    /// the name it knows: the guest's argv[0] is the source
+    /// path, which is not an executable file, so the filesystem
+    /// resolution refuses it -- but the invocation is a
+    /// self-child all the same, run by re-interpreting the
+    /// source (the `is_self_program` treatment).
+    fn is_input_program(&self, path: &std::path::Path) -> bool {
+        let input = std::path::Path::new(&self.input);
+        if path == input {
+            return true;
+        }
+        match (
+            std::fs::canonicalize(path),
+            std::fs::canonicalize(input),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
             _ => false,
         }
     }
@@ -8176,7 +8272,7 @@ impl DriverProcessHost {
     /// exit -- the same disambiguation `artifact_run` makes.
     fn finalize(
         &self,
-        entry: &mut HostChild,
+        entry: &mut RunChild,
         status: std::process::ExitStatus,
     ) -> Result<sparagmos_interp::ProcessChildOutcome, sparagmos_interp::ProcessHostError> {
         use sparagmos_interp::ProcessHostError as HostErr;
@@ -8206,29 +8302,8 @@ impl DriverProcessHost {
         if let Some(file) = &entry.stderr_file {
             let _ = std::fs::remove_file(file);
         }
-        if exit_code == 2 {
-            let text = String::from_utf8_lossy(&drained);
-            let reason = text.lines().find_map(|line| {
-                line.strip_prefix("sparagmos-driver run: unsupported: ")
-                    .or_else(|| {
-                        line.strip_prefix(
-                            "sparagmos-driver: compilation failed: ",
-                        )
-                    })
-                    .map(|rest| rest.to_string())
-            });
-            let driver_failed = reason.is_some()
-                || text
-                    .lines()
-                    .any(|line| line.starts_with("sparagmos-driver"));
-            if driver_failed {
-                return Err(HostErr::Failed(reason.unwrap_or_else(
-                    || {
-                        "the guest program could not be run as a child process"
-                            .to_string()
-                    },
-                )));
-            }
+        if let Some(reason) = self_run_failure(exit_code, &drained) {
+            return Err(HostErr::Failed(reason));
         }
         Ok(sparagmos_interp::ProcessChildOutcome {
             exit_code,
@@ -8238,11 +8313,41 @@ impl DriverProcessHost {
     }
 }
 
-impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
-    fn spawn(
+fn wire_stdio(
+    stdio: sparagmos_interp::ProcessStdio,
+) -> std::process::Stdio {
+    match stdio {
+        sparagmos_interp::ProcessStdio::Inherit => {
+            std::process::Stdio::inherit()
+        }
+        sparagmos_interp::ProcessStdio::Null => {
+            std::process::Stdio::null()
+        }
+        sparagmos_interp::ProcessStdio::Piped => {
+            std::process::Stdio::piped()
+        }
+    }
+}
+
+impl DriverProcessHost {
+    /// Assemble the host command a spawn request denotes:
+    /// a self invocation becomes this driver re-interpreting
+    /// the same source with the child's arguments (see
+    /// [`DriverProcessHost`]); any other program starts as
+    /// itself. Also settles whether the invocation is a
+    /// self-run and, for one, the guest-stderr channel file.
+    /// The caller wires the stdio and starts the command.
+    fn assemble(
         &self,
         request: &sparagmos_interp::ProcessSpawnRequest,
-    ) -> Result<(u64, u32), sparagmos_interp::ProcessHostError> {
+    ) -> Result<
+        (
+            std::process::Command,
+            bool,
+            Option<std::path::PathBuf>,
+        ),
+        sparagmos_interp::ProcessHostError,
+    > {
         use sparagmos_interp::ProcessHostError as HostErr;
         use std::os::unix::ffi::OsStrExt as _;
         let os = os_bytes;
@@ -8314,6 +8419,7 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             }
             cmd.arg("--guest-process-host");
             cmd.arg("--guest-stderr-file").arg(&file);
+            cmd.arg("--guest-stdout-passthrough");
             let program_name = request
                 .argv0
                 .as_deref()
@@ -8350,30 +8456,80 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         if let Some(cwd) = &request.cwd {
             cmd.current_dir(os(cwd));
         }
-        let wire = |stdio: sparagmos_interp::ProcessStdio| {
-            match stdio {
-                sparagmos_interp::ProcessStdio::Inherit => {
-                    std::process::Stdio::inherit()
-                }
-                sparagmos_interp::ProcessStdio::Null => {
-                    std::process::Stdio::null()
-                }
-                sparagmos_interp::ProcessStdio::Piped => {
-                    std::process::Stdio::piped()
-                }
+        Ok((cmd, self_run, stderr_file))
+    }
+
+    /// Settle a spawned child's observed end: the exit code
+    /// in the interpreter's convention, cached on the entry.
+    /// A self-child's end first faces the exit-2
+    /// disambiguation against its drained diagnostic stream
+    /// (see `self_run_failure`): a nested driver failure is
+    /// the host's failure, not an exit code.
+    fn observe_end(
+        &self,
+        entry: &mut HostChild,
+        status: std::process::ExitStatus,
+    ) -> Result<i32, sparagmos_interp::ProcessHostError> {
+        use sparagmos_interp::ProcessHostError as HostErr;
+        let exit_code = host_exit_code(status);
+        if entry.self_run {
+            let drained = entry
+                .diag
+                .take()
+                .map(|t| t.join().unwrap_or_default())
+                .unwrap_or_default();
+            if let Some(file) = &entry.stderr_file {
+                let _ = std::fs::remove_file(file);
             }
-        };
-        cmd.stdin(wire(request.stdin))
+            if let Some(reason) =
+                self_run_failure(exit_code, &drained)
+            {
+                return Err(HostErr::Failed(reason));
+            }
+        }
+        entry.exit = Some(exit_code);
+        Ok(exit_code)
+    }
+}
+
+impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
+    fn spawn(
+        &self,
+        request: &sparagmos_interp::ProcessSpawnRequest,
+    ) -> Result<
+        sparagmos_interp::ProcessSpawned,
+        sparagmos_interp::ProcessHostError,
+    > {
+        use sparagmos_interp::ProcessHostError as HostErr;
+        let (mut cmd, self_run, stderr_file) =
+            self.assemble(request)?;
+        cmd.stdin(wire_stdio(request.stdin))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if self_run {
+            // The guest-stderr channel file exists before the
+            // child starts, so its read end can be handed over
+            // now; the nested driver writes through its own
+            // handle on the same file.
+            if let Some(file) = &stderr_file {
+                let _ = std::fs::File::create(file);
+            }
+        }
         let mut child = cmd.spawn().map_err(HostErr::Io)?;
         let pid = child.id();
-        let out_pipe = child.stdout.take().expect("piped stdout");
-        let err_pipe = child.stderr.take().expect("piped stderr");
-        let stdout =
-            std::thread::spawn(move || drain_pipe(out_pipe));
-        let stderr =
-            std::thread::spawn(move || drain_pipe(err_pipe));
+        let stdin = child.stdin.take().map(pipe_file);
+        let stdout = child.stdout.take().map(pipe_file);
+        let (stderr, diag) = if self_run {
+            let pipe = child.stderr.take().expect("piped stderr");
+            let drain =
+                std::thread::spawn(move || drain_pipe(pipe));
+            let guest = stderr_file
+                .as_ref()
+                .and_then(|file| std::fs::File::open(file).ok());
+            (guest, Some(drain))
+        } else {
+            (child.stderr.take().map(pipe_file), None)
+        };
         let id = {
             let mut next = self.next.lock().unwrap();
             let id = *next;
@@ -8384,55 +8540,83 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             id,
             HostChild {
                 child,
-                stdout: Some(stdout),
-                stderr: Some(stderr),
+                diag,
                 stderr_file,
                 self_run,
-                outcome: None,
+                exit: None,
             },
         );
-        Ok((id, pid))
+        Ok(sparagmos_interp::ProcessSpawned {
+            host_id: id,
+            pid,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run(
+        &self,
+        request: &sparagmos_interp::ProcessSpawnRequest,
+    ) -> Result<
+        sparagmos_interp::ProcessChildOutcome,
+        sparagmos_interp::ProcessHostError,
+    > {
+        use sparagmos_interp::ProcessHostError as HostErr;
+        let (mut cmd, self_run, stderr_file) =
+            self.assemble(request)?;
+        cmd.stdin(wire_stdio(request.stdin))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(HostErr::Io)?;
+        let out_pipe = child.stdout.take().expect("piped stdout");
+        let err_pipe = child.stderr.take().expect("piped stderr");
+        let stdout =
+            std::thread::spawn(move || drain_pipe(out_pipe));
+        let stderr =
+            std::thread::spawn(move || drain_pipe(err_pipe));
+        let status = child.wait().map_err(HostErr::Io)?;
+        let mut entry = RunChild {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            stderr_file,
+            self_run,
+        };
+        self.finalize(&mut entry, status)
     }
 
     fn wait(
         &self,
         child: u64,
-    ) -> Result<sparagmos_interp::ProcessChildOutcome, sparagmos_interp::ProcessHostError> {
+    ) -> Result<i32, sparagmos_interp::ProcessHostError> {
         use sparagmos_interp::ProcessHostError as HostErr;
         let mut children = self.children.lock().unwrap();
         let entry = children
             .get_mut(&child)
             .ok_or_else(|| HostErr::Failed("stale host child".into()))?;
-        if let Some(outcome) = &entry.outcome {
-            return Ok(outcome.clone());
+        if let Some(code) = entry.exit {
+            return Ok(code);
         }
         let status = entry.child.wait().map_err(HostErr::Io)?;
-        let outcome = self.finalize(entry, status)?;
-        entry.outcome = Some(outcome.clone());
-        Ok(outcome)
+        self.observe_end(entry, status)
     }
 
     fn try_wait(
         &self,
         child: u64,
-    ) -> Result<
-        Option<sparagmos_interp::ProcessChildOutcome>,
-        sparagmos_interp::ProcessHostError,
-    > {
+    ) -> Result<Option<i32>, sparagmos_interp::ProcessHostError> {
         use sparagmos_interp::ProcessHostError as HostErr;
         let mut children = self.children.lock().unwrap();
         let entry = children
             .get_mut(&child)
             .ok_or_else(|| HostErr::Failed("stale host child".into()))?;
-        if let Some(outcome) = &entry.outcome {
-            return Ok(Some(outcome.clone()));
+        if let Some(code) = entry.exit {
+            return Ok(Some(code));
         }
         match entry.child.try_wait().map_err(HostErr::Io)? {
             None => Ok(None),
             Some(status) => {
-                let outcome = self.finalize(entry, status)?;
-                entry.outcome = Some(outcome.clone());
-                Ok(Some(outcome))
+                self.observe_end(entry, status).map(Some)
             }
         }
     }
@@ -8477,6 +8661,7 @@ fn execute(
     overflow_checks: bool,
     tool_programs: &[String],
     guest_stderr_file: Option<&str>,
+    guest_stdout_passthrough: bool,
     program_name: Option<&str>,
     process_host: Option<sparagmos_interp::ProcessHost>,
     self_ctx: &SelfRunContext,
@@ -8570,6 +8755,26 @@ fn execute(
             None
         },
         tool_interception,
+        // A run the process model re-ran as a child (see
+        // `self_run`) writes the guest's stdout through to
+        // this process's own stdout as it happens, errors
+        // included: that stream is the pipe (or terminal) the
+        // parent arranged, and a parent that has closed it
+        // must be observable to the guest, as natively.
+        stdout_sink: if guest_stdout_passthrough {
+            use std::os::fd::AsFd as _;
+            std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .ok()
+                .map(|fd| {
+                    sparagmos_interp::StdoutSink(std::sync::Arc::new(
+                        std::fs::File::from(fd),
+                    ))
+                })
+        } else {
+            None
+        },
         ..sparagmos_interp::InterpConfig::default()
     };
     // A `Result` entry's `Termination` report renders its `Err`
@@ -8604,8 +8809,10 @@ fn execute(
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
-        let _ = out.write_all(run.stdout.as_bytes());
-        let _ = out.flush();
+        if !guest_stdout_passthrough {
+            let _ = out.write_all(run.stdout.as_bytes());
+            let _ = out.flush();
+        }
         let mut relay_to_stderr = true;
         if let Some(path) = guest_stderr_file {
             relay_to_stderr = std::fs::write(path, run.stderr.as_bytes()).is_err();
@@ -10270,6 +10477,7 @@ fn driver_main_inner() {
     let mut guest_process_host = false;
     let mut dump_path: Option<String> = None;
     let mut guest_stderr_file: Option<String> = None;
+    let mut guest_stdout_passthrough = false;
     let mut guest_env_file: Option<String> = None;
     let mut guest_cwd: Option<String> = None;
     let mut guest_program_name: Option<String> = None;
@@ -10293,6 +10501,9 @@ fn driver_main_inner() {
                     eprintln!("--guest-stderr-file needs a path");
                     exit_process(2);
                 }));
+            }
+            "--guest-stdout-passthrough" => {
+                guest_stdout_passthrough = true;
             }
             "--guest-env-file" => {
                 i += 1;
@@ -10822,6 +11033,7 @@ fn driver_main_inner() {
                     overflow_checks,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
+                    guest_stdout_passthrough,
                     guest_program_name.as_deref(),
                     process_host,
                     &self_ctx,

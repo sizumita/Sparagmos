@@ -40472,3 +40472,342 @@ fn run_mode_libtest_nocapture_prints_panic_report() {
         "stderr={stderr}"
     );
 }
+const CHILD_STDIO_SRC: &str = r#"
+use std::env;
+use std::io::{BufRead, Write};
+use std::process::{Command, Stdio};
+fn main() {
+    let me = env::args_os().next().unwrap();
+    if env::args().nth(1).as_deref() == Some("child") {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            println!("{}", line.unwrap());
+        }
+        return;
+    }
+    let mut child = Command::new(&me)
+        .arg("child")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"test1\ntest2\ntest3")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"test1\ntest2\ntest3\n");
+    println!("handles ok");
+}
+"#;
+
+#[test]
+fn run_mode_child_stdio_handles_round_trip() {
+    // The `Child` value's stdio slots carry the child's pipe
+    // ends as file handles: the parent writes the child's
+    // stdin through the handle, `wait_with_output` closes the
+    // end it still holds (so the child's line iteration sees
+    // EOF) and collects the child's stdout, and the child's
+    // own `std::io::stdin` reads the pipe the parent wired.
+    let dir = temp_dir("child-stdio");
+    let src = fixture(&dir, "childstdio.rs", CHILD_STDIO_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "child-stdio guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "handles ok\n");
+}
+
+const CHILD_WAIT_STDIN_SRC: &str = r#"
+use std::env;
+use std::io::{BufRead, Write};
+use std::process::{Command, Stdio};
+fn main() {
+    let me = env::args_os().next().unwrap();
+    if env::args().nth(1).as_deref() == Some("child") {
+        println!("foo");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        let n = std::io::stdin().lock().read_line(&mut line).unwrap();
+        assert_eq!(n, 0);
+        return;
+    }
+    let mut child = Command::new(&me)
+        .arg("child")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    println!("wait ok");
+}
+"#;
+
+#[test]
+fn run_mode_child_wait_closes_held_stdin() {
+    // `Child::wait` drops the stdin handle the `Child` still
+    // holds before waiting, so a child reading its stdin to
+    // the end observes EOF instead of blocking on a parent
+    // that never writes.
+    let dir = temp_dir("child-wait-stdin");
+    let src = fixture(&dir, "childwaitstdin.rs", CHILD_WAIT_STDIN_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "child-wait guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "wait ok\n");
+}
+
+const CHILD_TAKEN_STDOUT_SRC: &str = r#"
+use std::env;
+use std::io::Read;
+use std::process::{Command, Stdio};
+fn main() {
+    let me = env::args_os().next().unwrap();
+    if env::args().nth(1).as_deref() == Some("child") {
+        println!("child text");
+        return;
+    }
+    let mut child = Command::new(&me)
+        .arg("child")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut taken = child.stdout.take().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let mut text = String::new();
+    taken.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "child text\n");
+    println!("taken ok");
+}
+"#;
+
+#[test]
+fn run_mode_child_taken_stdout_belongs_to_the_guest() {
+    // A stdio handle the guest takes out of the `Child` is
+    // the guest's to read: `wait` neither collects nor
+    // closes it, and reading it after the child ends yields
+    // the child's bytes.
+    let dir = temp_dir("child-taken-stdout");
+    let src = fixture(&dir, "childtaken.rs", CHILD_TAKEN_STDOUT_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "taken-stdout guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "taken ok\n");
+}
+
+const GUEST_STDIN_SRC: &str = r#"
+use std::io::BufRead;
+fn main() {
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line).unwrap();
+    println!("got {}: {}", n, line.trim());
+}
+"#;
+
+#[test]
+fn run_mode_guest_reads_its_own_stdin() {
+    // The guest's `std::io::stdin` is the run's own stdin
+    // in the file table: a line read consumes the piped
+    // bytes the driver process was fed.
+    let dir = temp_dir("guest-stdin");
+    let src = fixture(&dir, "gueststdin.rs", GUEST_STDIN_SRC);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn sparagmos-driver");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("driver run failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guest-stdin guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "got 6: hello\n");
+}
+
+const BARRIER_SRC: &str = r#"
+use std::sync::{Arc, Barrier};
+use std::thread;
+fn main() {
+    let barrier = Arc::new(Barrier::new(2));
+    let other = barrier.clone();
+    let t = thread::spawn(move || {
+        let result = other.wait();
+        println!("thread leader={}", result.is_leader());
+    });
+    let result = barrier.wait();
+    println!("main leader={}", result.is_leader());
+    t.join().unwrap();
+    println!("joined");
+}
+"#;
+
+#[test]
+fn run_mode_barrier_releases_both_parties() {
+    // A `Barrier` wait by the first party is the cooperative
+    // scheduling point: the second party runs, completes the
+    // generation as its leader, and both proceed.
+    let dir = temp_dir("barrier");
+    let src = fixture(&dir, "barrier.rs", BARRIER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "barrier guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("thread leader=true"), "stdout={stdout}");
+    assert!(stdout.contains("main leader=false"), "stdout={stdout}");
+    assert!(stdout.contains("joined"), "stdout={stdout}");
+}
+
+const BACKTRACE_SRC: &str = r#"
+fn main() {
+    let bt = std::backtrace::Backtrace::capture();
+    println!("{}", bt);
+}
+"#;
+
+#[test]
+fn run_mode_backtrace_capture_follows_the_environment() {
+    // `Backtrace::capture` honours the backtrace settings
+    // std consults: with capture enabled its `Display` is
+    // the call stack's trace (the guest's `main` among the
+    // frames); without, it is the disabled marker.
+    let dir = temp_dir("backtrace");
+    let src = fixture(&dir, "backtrace.rs", BACKTRACE_SRC);
+    let enabled = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stdout = String::from_utf8_lossy(&enabled.stdout);
+    assert_eq!(enabled.status.code(), Some(0), "stdout={stdout}");
+    assert!(stdout.contains("stack backtrace:"), "stdout={stdout}");
+    assert!(stdout.contains("main"), "stdout={stdout}");
+
+    let disabled = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stdout = String::from_utf8_lossy(&disabled.stdout);
+    assert_eq!(disabled.status.code(), Some(0), "stdout={stdout}");
+    assert_eq!(stdout, "disabled backtrace\n");
+}
+
+const CHILD_BROKEN_PIPE_SRC: &str = r#"
+use std::env;
+use std::io::prelude::*;
+use std::io;
+use std::process::{Command, Stdio};
+fn test() {
+    let _ = io::stdin().read_line(&mut String::new());
+    io::stdout().write(&[1]).unwrap();
+    assert!(io::stdout().flush().is_err());
+}
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "test" {
+        return test();
+    }
+    let mut p = Command::new(&args[0])
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .arg("test")
+        .spawn()
+        .unwrap();
+    drop(p.stdout.take());
+    assert!(p.wait().unwrap().success());
+    println!("pipe ok");
+}
+"#;
+
+#[test]
+fn run_mode_child_observes_the_broken_pipe_at_flush() {
+    // A re-run child's stdout is the pipe the parent wired:
+    // when the parent drops the read end, the child's writes
+    // are buffered by its line writer (the small write
+    // succeeds) and the flush observes the broken pipe, as
+    // natively — the write-through sink carries the stream's
+    // errors into the guest.
+    let dir = temp_dir("child-broken-pipe");
+    let src = fixture(&dir, "childpipe.rs", CHILD_BROKEN_PIPE_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "broken-pipe guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "pipe ok\n");
+}
+
+const SPAWN_RESULT_DEBUG_SRC: &str = r#"
+use std::env;
+use std::process::Command;
+fn main() {
+    let me = env::args_os().next().unwrap();
+    if env::args().nth(1).as_deref() == Some("child") {
+        return;
+    }
+    let st = Command::new(&me).arg("child").status();
+    println!("{:?}", st);
+}
+"#;
+
+#[test]
+fn run_mode_exit_status_debug_names_the_wait_status() {
+    // std's `Debug` for `ExitStatus` is a manual impl naming
+    // the raw wait status, and a guest printing a spawn
+    // result observes exactly that text.
+    let dir = temp_dir("exit-status-debug");
+    let src = fixture(&dir, "exitstatus.rs", SPAWN_RESULT_DEBUG_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exit-status guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "Ok(ExitStatus(unix_wait_status(0)))\n");
+}
