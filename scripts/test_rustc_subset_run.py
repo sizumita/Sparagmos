@@ -835,6 +835,27 @@ class Stage2BlockerTests(unittest.TestCase):
         self.assertIsNone(run.stage2_blocker(h.view("a"), self.rec()))
         self.assertIsNone(run.stage2_blocker(h.view("b"), self.rec()))
 
+    def test_add_minicore_with_run_pass_blocks(self):
+        # compiletest panics on the combination when parsing the
+        # directives (`add-minicore` cannot be used to run the
+        # test binary), so the file is never compiled; the one
+        # suite file with both is a should-fail self-test of the
+        # rejection.
+        h = header("//@ add-minicore\n//@ run-pass\n//@ should-fail\n")
+        blocker = run.stage2_blocker(h.view(None), self.rec())
+        self.assertIn("cannot be used to run the test binary", blocker)
+        self.assertEqual(run.header_bucket(blocker),
+                         "not attempted (header feature)")
+
+    def test_add_minicore_with_other_modes_does_not_block(self):
+        # compiletest's rejection is specific to run-pass:
+        # add-minicore with a compile-only mode or with
+        # run-rustfix is attempted as usual.
+        h = header("//@ add-minicore\n//@ check-pass\n")
+        self.assertIsNone(run.stage2_blocker(h.view(None), self.rec()))
+        h = header("//@ add-minicore\n//@ run-rustfix\n")
+        self.assertIsNone(run.stage2_blocker(h.view(None), self.rec()))
+
 
 def conv(**kw):
     base = {"exit_code": 0, "timeout": False, "converted": 3,
@@ -1793,6 +1814,23 @@ class ConvertSideTests(unittest.TestCase):
         args = [argv[i + 1] for i, a in enumerate(argv) if a == "--aux"]
         self.assertEqual(args, ["pm=/x/pm.rs;crate-type=proc-macro",
                                 "old=/x/old.rs;edition=2015"])
+
+    def test_aux_cfg_becomes_aux_arg_attribute(self):
+        spec = run.AuxSpec("a", Path("/x/a.rs"), None, None, None,
+                           "rpass1")
+        self.assertEqual(run.aux_spec_arg(spec),
+                         "a=/x/a.rs;cfg=rpass1")
+
+    def test_stamp_revision_cfg(self):
+        specs = [run.AuxSpec("a", Path("/x/a.rs")),
+                 ("b", Path("/x/b.rs"))]
+        stamped = run.stamp_revision_cfg(specs, "rpass1")
+        self.assertEqual([sp.cfg for sp in stamped],
+                         ["rpass1", "rpass1"])
+        # The resolved specs are not mutated, and a revisionless
+        # attempt passes its specs through unchanged.
+        self.assertIsNone(specs[0].cfg)
+        self.assertIs(run.stamp_revision_cfg(specs, None), specs)
 
 
 class ProcessStage2AuxTests(unittest.TestCase):

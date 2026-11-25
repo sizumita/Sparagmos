@@ -1912,6 +1912,7 @@ class AuxSpec(NamedTuple):
     crate_type: Optional[str] = None
     edition: Optional[str] = None
     modifiers: Optional[str] = None
+    cfg: Optional[str] = None
 
 
 def as_aux_spec(spec):
@@ -1925,8 +1926,8 @@ def as_aux_spec(spec):
 
 def aux_spec_arg(spec):
     """The driver's `--aux` value for a spec: `name=path` plus the
-    `;crate-type=` / `;edition=` attributes the spec carries. A
-    spec with `--extern` modifiers binds under
+    `;crate-type=` / `;edition=` / `;cfg=` attributes the spec
+    carries. A spec with `--extern` modifiers binds under
     `modifiers:name`, the verbatim binding name the driver keeps
     for such specs."""
     spec = as_aux_spec(spec)
@@ -1937,7 +1938,28 @@ def aux_spec_arg(spec):
         arg += f";crate-type={spec.crate_type}"
     if spec.edition:
         arg += f";edition={spec.edition}"
+    if spec.cfg:
+        arg += f";cfg={spec.cfg}"
     return arg
+
+
+def stamp_revision_cfg(aux_specs, revision):
+    """Copies of `aux_specs` carrying the revision's `--cfg` name.
+
+    compiletest compiles a test's auxiliary crates with the
+    test's own compile arguments (make_compile_args), which
+    carry `--cfg <revision>` for a revised test, and an
+    auxiliary crate's properties are loaded with the variant's
+    revision — an incremental test's auxiliary crate selects
+    its revision's definitions through `#[cfg(rpass1)]` /
+    `#[cfg(rpass2)]`. The main conversion receives the cfg
+    through revision_args; the auxiliary builds receive it
+    through the spec's `;cfg=` attribute.
+    """
+    if revision is None:
+        return aux_specs
+    return [as_aux_spec(spec)._replace(cfg=revision)
+            for spec in aux_specs]
 
 
 def parse_aux_crate_value(value):
@@ -2248,6 +2270,12 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
             cmd += ["--extern", "proc_macro"]
         cmd += compile_flags(aux_view, suite_root(csrc),
                              str(outdir))
+        # The native test-helpers library, as native_side's
+        # auxiliary builds pass it: a proc-macro auxiliary can
+        # declare `#[link(name = "rust_test_helpers")]` (the
+        # incremental issue-54059 proc macro does), and without
+        # the -L native directory its build cannot link.
+        cmd += test_helpers_args(csrc)
         cmd += [str(csrc)]
         # The crate's own `//@ rustc-env:` pairs apply to its
         # build, as compiletest applies an auxiliary file's
@@ -2313,7 +2341,7 @@ def build_proc_macro(test_path, fname, edition, extra_externs=(),
     # Recipe version: bump when the build recipe changes (crate
     # metadata disambiguation, the bare proc_macro extern, ...),
     # so artifacts built by an older recipe are never reused.
-    h.update(b"sparagmos-pm-recipe-4")  # 4: chain crates fall back to edition 2015, not the test edition
+    h.update(b"sparagmos-pm-recipe-5")  # 5: chain builds link the rust_test_helpers native library
     h.update(edition.encode())
     for prev_name, prev_artifact in extra_externs:
         h.update(prev_name.encode())
@@ -4033,7 +4061,9 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
     cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                             suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
-                        aux_specs=aux_specs, env_extra=cenv,
+                        aux_specs=stamp_revision_cfg(aux_specs,
+                                                     revision),
+                        env_extra=cenv,
                         env_remove=cunset,
                         **({"jit": True} if jit else {}))
     if jit:
@@ -4398,6 +4428,17 @@ def stage2_blocker(view, rec):
     """
     if view.has("add-core-stubs"):
         return "add-core-stubs (test links the core stub crate)"
+    if view.has("add-minicore") and view.has("run-pass"):
+        # compiletest panics on the combination when parsing
+        # the directives (`add-minicore` cannot be used to run
+        # the test binary: TestProps::update_add_minicore), so
+        # the file is never compiled at all; the one suite file
+        # with both is a should-fail self-test of that
+        # rejection.
+        return ("add-minicore with run-pass (compiletest rejects "
+                "the combination when parsing the directives: "
+                "`add-minicore` cannot be used to run the test "
+                "binary)")
     if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
     return None
@@ -5020,6 +5061,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                 return res
         else:
             specs = []
+    specs = stamp_revision_cfg(specs, revision)
     pm_args, pm_err = proc_macro_extern_args(path, view, edition)
     if pm_err:
         res["reason"] = pm_err
