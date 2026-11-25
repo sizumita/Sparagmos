@@ -8057,6 +8057,75 @@ fn run_mode_closure_clone_panic_drops_cloned_captures() {
     );
 }
 
+const BOXED_SLICE_ELIDED_ELEM_CLONE_PANIC_SRC: &str = r#"struct D;
+
+impl Clone for D {
+    fn clone(&self) -> Self {
+        println!("clone D");
+        D
+    }
+}
+
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop D");
+    }
+}
+
+struct Boom;
+
+impl Clone for Boom {
+    fn clone(&self) -> Self {
+        panic!("boom clone");
+    }
+}
+
+fn main() {
+    // Array elements that are zero-sized tuples: the tuple's
+    // drop plan reaches the clone through the array's elided
+    // element plan, and the tuple's field glue must survive
+    // the extraction — the field cloned before the panicking
+    // one drops during unwinding.
+    let src: [[(D, Boom); 1]; 1] = [[(D, Boom)]];
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[[(D, Boom); 1]]> = Box::from(&src[..]);
+        println!("array no panic");
+    }));
+    println!("array caught: {}", r.is_err());
+
+    // Nested arrays: the inner array's own plan is the elided
+    // element of the outer array, so the element extraction
+    // must pass through the wrapper as well.
+    let src2: [[[(D, Boom); 1]; 1]; 1] = [[[(D, Boom)]]];
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _b: Box<[[[(D, Boom); 1]; 1]]> = Box::from(&src2[..]);
+        println!("nested no panic");
+    }));
+    println!("nested caught: {}", r2.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_elided_elem_clone_panic_drops_cloned_fields() {
+    let dir = temp_dir("boxed-slice-elided-elem-clone-panic");
+    let src = fixture(
+        &dir,
+        "boxed_slice_elided_elem_clone_panic.rs",
+        BOXED_SLICE_ELIDED_ELEM_CLONE_PANIC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a panicking clone behind an elided element plan must still drop the cloned prefix; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "clone D\ndrop D\narray caught: true\nclone D\ndrop D\nnested caught: true\ndrop D\ndrop D\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CUSTOM_CLONE_SOURCE_REF_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 

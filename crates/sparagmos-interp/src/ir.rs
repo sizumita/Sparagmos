@@ -1602,7 +1602,13 @@ impl DropGlue {
 /// `index`'s plan. A plan addressed at exactly this field (a
 /// one-field wrapper's held value) is the field's own plan.
 /// Anything else — the aggregate's own destructor above all —
-/// names no field plan.
+/// names no field plan. The elided-element wrapper is
+/// transparent to the walk: it wraps the plan of the very
+/// value being extracted from, so the extraction recurses
+/// through it — without that, a zero-sized aggregate reached
+/// as a sequence element names no field plan, and
+/// partial-clone cleanup silently skips the fields cloned
+/// before a panic.
 fn field_plan_in(
     plan: &DropPlan,
     adts: &[DropPlan],
@@ -1611,6 +1617,7 @@ fn field_plan_in(
 ) -> Option<DropPlan> {
     match plan {
         DropPlan::Adt { index: i } => field_plan_in(adts.get(*i)?, adts, variant, index),
+        DropPlan::Elided { plan, .. } => field_plan_in(plan, adts, variant, index),
         DropPlan::Seq(plans) => plans
             .iter()
             .find_map(|p| field_plan_in(p, adts, variant, index)),
@@ -1632,10 +1639,13 @@ fn field_plan_in(
 
 /// The element extraction behind [`DropGlue::elem_plan`]: walk
 /// the plan's spine to its element plan (the `Vec` plan holds
-/// it directly, a buffer-addressed plan under its `At`).
+/// it directly, a buffer-addressed plan under its `At`). The
+/// elided-element wrapper is transparent, as in
+/// [`field_plan_in`].
 fn elem_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
     match plan {
         DropPlan::Adt { index } => elem_plan_in(adts.get(*index)?, adts),
+        DropPlan::Elided { plan, .. } => elem_plan_in(plan, adts),
         DropPlan::Seq(plans) => plans.iter().find_map(|p| elem_plan_in(p, adts)),
         DropPlan::At { plan, .. } => elem_plan_in(plan, adts),
         DropPlan::Each { elem } => Some((**elem).clone()),
@@ -1645,10 +1655,13 @@ fn elem_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
 
 /// The pointee extraction behind [`DropGlue::pointee_plan`]:
 /// walk the plan's spine to its box plan (through the
-/// plain-form side of a `dyn`-mentioning pointer's plan).
+/// plain-form side of a `dyn`-mentioning pointer's plan). The
+/// elided-element wrapper is transparent, as in
+/// [`field_plan_in`].
 fn pointee_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
     match plan {
         DropPlan::Adt { index } => pointee_plan_in(adts.get(*index)?, adts),
+        DropPlan::Elided { plan, .. } => pointee_plan_in(plan, adts),
         DropPlan::Seq(plans) => plans.iter().find_map(|p| pointee_plan_in(p, adts)),
         DropPlan::DynOrPlain { plain } => pointee_plan_in(plain, adts),
         DropPlan::BoxPointee { pointee } => Some((**pointee).clone()),
