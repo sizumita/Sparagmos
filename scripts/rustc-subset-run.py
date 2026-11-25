@@ -2728,6 +2728,13 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
     argv = [str(driver_bin), "run-jit" if jit else "run",
             str(path), "--edition", edition]
+    if not jit:
+        # A program run opts into real child processes on the
+        # host (`--guest-process-host` in the driver): the
+        # guest's `std::process` children really start, as they
+        # do for the native binary. The JIT run keeps the
+        # standing process model (it installs no host).
+        argv.append("--guest-process-host")
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:

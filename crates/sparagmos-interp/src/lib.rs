@@ -62,8 +62,9 @@ pub mod value;
 
 pub use error::{InterpError, InterpResult};
 pub use interp::{
-    interpret, InterpConfig, Interpreter, ToolInterception, ToolRunOutcome,
-    ToolRunRequest, ToolRunner,
+    interpret, InterpConfig, Interpreter, ProcessChildOutcome, ProcessHost,
+    ProcessHostError, ProcessHostOps, ProcessSpawnRequest, ProcessStdio,
+    ToolInterception, ToolRunOutcome, ToolRunRequest, ToolRunner,
 };
 pub use ir::{
     BasicBlock, BasicBlockData, BinOp, Body, Constant, DropGlue, DropPlan, Local, Operand,

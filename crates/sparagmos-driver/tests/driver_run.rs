@@ -22,6 +22,18 @@ fn run_driver(src: &Path) -> Output {
         .expect("failed to run sparagmos-driver")
 }
 
+/// Run the driver with real child processes enabled
+/// (`--guest-process-host`): the guest's `std::process`
+/// children start on the host.
+fn run_driver_with_process_host(src: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .arg("--guest-process-host")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir =
         std::env::temp_dir().join(format!("sparagmos-driver-run-{}-{tag}", std::process::id()));
@@ -23900,6 +23912,199 @@ fn run_mode_process_spawn_resolvable_is_named_error() {
     assert!(
         stderr.contains("does not start child processes"),
         "stderr={stderr}"
+    );
+}
+
+// ---- Process host (issue #515) ----
+// With `--guest-process-host`, a run's children really start
+// on the host: `output` / `status` report the child's real
+// exit status and captured streams, `spawn` hands the guest
+// a live `Child`, and a child naming the guest's own
+// executable re-runs the guest program under the driver.
+
+const PROCESS_HOST_OUTPUT_SRC: &str = r#"
+use std::process::Command;
+fn main() {
+    let out = Command::new("echo").arg("hello-child").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hello-child\n");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("echo oops >&2; exit 3")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "oops\n");
+    let status = Command::new("false").status().unwrap();
+    assert!(!status.success());
+    assert_eq!(status.code(), Some(1));
+    println!("process-host-output-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_output_and_status() {
+    let dir = temp_dir("proc-host-output");
+    let src = fixture(&dir, "process_host_output.rs", PROCESS_HOST_OUTPUT_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-output-ok\n"
+    );
+}
+
+const PROCESS_HOST_ENV_CWD_SRC: &str = r#"
+use std::process::Command;
+fn main() {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("echo $MARKER; pwd")
+        .env("MARKER", "zap")
+        .current_dir("/tmp")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("zap\n"), "env missing: {text}");
+    assert!(text.contains("/tmp\n"), "cwd missing: {text}");
+    println!("process-host-env-cwd-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_env_and_cwd() {
+    let dir = temp_dir("proc-host-env-cwd");
+    let src = fixture(&dir, "process_host_env_cwd.rs", PROCESS_HOST_ENV_CWD_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-env-cwd-ok\n"
+    );
+}
+
+const PROCESS_HOST_SPAWN_SRC: &str = r#"
+use std::process::{Command, Stdio};
+fn main() {
+    // spawn + wait_with_output over a piped stream.
+    let child = Command::new("echo")
+        .arg("piped-bytes")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(child.id() > 0);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "piped-bytes\n");
+    // try_wait observes a running child, then wait reaps it.
+    let mut child = Command::new("sleep").arg("0.3").spawn().unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let again = child.try_wait().unwrap().unwrap();
+    assert!(again.success());
+    // kill ends a child; its status reports no exit code.
+    let mut victim = Command::new("sleep").arg("100").spawn().unwrap();
+    victim.kill().unwrap();
+    let status = victim.wait().unwrap();
+    assert!(!status.success());
+    assert_eq!(status.code(), None);
+    println!("process-host-spawn-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_spawn_wait_kill() {
+    let dir = temp_dir("proc-host-spawn");
+    let src = fixture(&dir, "process_host_spawn.rs", PROCESS_HOST_SPAWN_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-spawn-ok\n"
+    );
+}
+
+const PROCESS_HOST_SELF_SRC: &str = r#"
+use std::env;
+use std::process::Command;
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "greet" => {
+                println!("child-stdout {}", env::var("WHO").unwrap_or_default());
+            }
+            "fail" => {
+                eprintln!("child-stderr");
+                std::process::exit(7);
+            }
+            _ => {}
+        }
+        return;
+    }
+    let me = env::current_exe().unwrap();
+    let out = Command::new(&me)
+        .arg("greet")
+        .env("WHO", "world")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "child-stdout world\n"
+    );
+    let status = Command::new(&me).arg("fail").status().unwrap();
+    assert_eq!(status.code(), Some(7));
+    println!("process-host-self-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_self_reexec() {
+    let dir = temp_dir("proc-host-self");
+    let src = fixture(&dir, "process_host_self.rs", PROCESS_HOST_SELF_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-self-ok\n"
+    );
+    // The self-child's own stderr joins the guest's through
+    // the `status` relay.
+    assert!(stderr.contains("child-stderr"), "stderr={stderr}");
+}
+
+const PROCESS_HOST_FAILURE_SRC: &str = r#"
+use std::io::ErrorKind;
+use std::process::Command;
+fn main() {
+    let e = Command::new("definitely-not-a-real-program-xyz")
+        .spawn()
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    let e = Command::new("definitely-not-a-real-program-xyz")
+        .output()
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    println!("process-host-failure-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_spawn_failure() {
+    let dir = temp_dir("proc-host-failure");
+    let src = fixture(&dir, "process_host_failure.rs", PROCESS_HOST_FAILURE_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-failure-ok\n"
     );
 }
 

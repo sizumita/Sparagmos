@@ -70,6 +70,12 @@ pub struct InterpConfig {
     /// `None` keeps the process model's standing behaviour, under
     /// which no child process ever starts.
     pub tool_interception: Option<ToolInterception>,
+    /// The host side of real child processes for this run (see
+    /// [`ProcessHost`]); `None` keeps the process model's
+    /// standing behaviour, under which no child process ever
+    /// starts. Tool interception takes precedence for the
+    /// programs it claims.
+    pub process_host: Option<ProcessHost>,
 }
 
 impl Default for InterpConfig {
@@ -81,6 +87,7 @@ impl Default for InterpConfig {
             program_path: String::new(),
             overflow_checks: true,
             tool_interception: None,
+            process_host: None,
         }
     }
 }
@@ -184,6 +191,116 @@ pub struct ToolInterception {
     /// standing unsupported answer.
     pub fallback: Option<ToolRunner>,
 }
+
+/// How one stdio stream of a spawned child is wired, as the
+/// command's recorded configuration prescribes (see
+/// [`ProcessSpawnRequest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStdio {
+    Inherit,
+    Null,
+    Piped,
+}
+
+/// A request to start one child process, handed from the
+/// interpreter to the process host (see
+/// [`InterpConfig::process_host`]). The fields mirror the
+/// interpreter's command-table entry for the invocation, in the
+/// same shape as [`ToolRunRequest`], plus the stdio wiring the
+/// entry point's semantics and the command's recorded
+/// configuration settle on. The host starts the program the
+/// invocation denotes: `resolved_program` (the interpreter's
+/// own `execvp` search result) when it resolved, else the
+/// spelled `program`, resolved by the host under the child's
+/// working directory and environment, as a native spawn
+/// resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSpawnRequest {
+    pub program: Vec<u8>,
+    pub args: Vec<Vec<u8>>,
+    pub argv0: Option<Vec<u8>>,
+    pub envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub env_clear: bool,
+    pub cwd: Option<Vec<u8>>,
+    pub resolved_program: Option<Vec<u8>>,
+    pub stdin: ProcessStdio,
+    pub stdout: ProcessStdio,
+    pub stderr: ProcessStdio,
+}
+
+/// The outcome of one finished child process: its exit code
+/// (negative when the child ended on a signal) and the bytes
+/// its stdout and stderr produced. The host always captures
+/// both streams; the interpreter routes them by the command's
+/// stdio configuration (collected into the guest's `Output`,
+/// relayed into the guest's own streams, or discarded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessChildOutcome {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Why a process-host operation produced no outcome: the
+/// host's own `io` failure, which the guest observes as the
+/// `io::Error` a native spawn/wait would report, or a failure
+/// the run cannot carry out, which becomes the run's
+/// unsupported error with the text as the reason.
+#[derive(Debug)]
+pub enum ProcessHostError {
+    Io(std::io::Error),
+    Failed(String),
+}
+
+/// The host side of real child processes: the operations the
+/// interpreter's `Child` model performs against live children
+/// the host started. Child ids are the host's own, handed back
+/// at spawn; the interpreter's child table maps its guest
+/// handles onto them.
+pub trait ProcessHostOps: Send + Sync {
+    /// Start the child the request describes. On success,
+    /// returns the host child id and the child's process id.
+    fn spawn(
+        &self,
+        request: &ProcessSpawnRequest,
+    ) -> Result<(u64, u32), ProcessHostError>;
+    /// Wait for the child to end and collect its outcome.
+    fn wait(&self, child: u64) -> Result<ProcessChildOutcome, ProcessHostError>;
+    /// The child's outcome if it has already ended; `None`
+    /// while it is still running.
+    fn try_wait(
+        &self,
+        child: u64,
+    ) -> Result<Option<ProcessChildOutcome>, ProcessHostError>;
+    /// Kill the child (SIGKILL semantics, as `Child::kill`).
+    fn kill(&self, child: u64) -> Result<(), ProcessHostError>;
+    /// Forget the host child without waiting for it (the
+    /// guest's `Child` value was dropped, or its outcome was
+    /// collected): the child itself is left alone, exactly as
+    /// a dropped native `Child` leaves it running.
+    fn release(&self, child: u64);
+}
+
+/// The process host configured for a run: an
+/// [`InterpConfig::process_host`] value the interpreter calls
+/// when the guest starts a child process no tool interception
+/// claims.
+#[derive(Clone)]
+pub struct ProcessHost(pub std::sync::Arc<dyn ProcessHostOps>);
+
+impl std::fmt::Debug for ProcessHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessHost(..)")
+    }
+}
+
+impl PartialEq for ProcessHost {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProcessHost {}
 
 /// One call frame: a function's locals plus where to resume.
 pub(crate) struct Frame {
@@ -514,6 +631,38 @@ pub(crate) struct CommandState {
     /// The `Stdio` configuration set for the child's stderr;
     /// see `stdout_stdio`.
     pub stderr_stdio: Option<StdioConfig>,
+    /// The `Stdio` configuration set for the child's stdin;
+    /// see `stdout_stdio`. Recorded for the process host's
+    /// wiring; the tool model never feeds a child's stdin and
+    /// ignores it.
+    pub stdin_stdio: Option<StdioConfig>,
+}
+
+/// One live child process started through the process host
+/// (see [`ProcessHost`]): the host's child id and the child's
+/// process id, the command's stdio configuration (the finished
+/// outcome's bytes are routed by it), and the exit code once
+/// the end has been observed, so repeated `wait` / `try_wait`
+/// calls answer with the same status, as std's cached status
+/// does.
+pub(crate) struct ChildState {
+    pub host_id: u64,
+    pub pid: u32,
+    pub stdout_stdio: Option<StdioConfig>,
+    pub stderr_stdio: Option<StdioConfig>,
+    pub finished: Option<i32>,
+    /// Whether the finished outcome's inherited streams have
+    /// been relayed into the guest's own streams (they join
+    /// them once, at the first observation of the end).
+    pub relayed: bool,
+    /// The finished child's captured stdout bytes, kept until
+    /// `wait_with_output` collects them (only a piped stream's
+    /// bytes are kept; an inherited stream was relayed, a
+    /// nulled one dropped).
+    pub stdout: Vec<u8>,
+    /// The finished child's captured stderr bytes; see
+    /// `stdout`.
+    pub stderr: Vec<u8>,
 }
 
 /// The channel id carried by an mpsc handle value, if the value
@@ -991,6 +1140,13 @@ pub struct Interpreter<'a> {
     commands: std::cell::RefCell<HashMap<u64, CommandState>>,
     /// The id the next created command gets.
     next_command: std::cell::RefCell<u64>,
+    /// Live child processes started through the process host
+    /// (see [`ChildState`]), keyed by the id inside the `Child`
+    /// handle values. Interior-mutable for the same reason as
+    /// the command table.
+    children: std::cell::RefCell<HashMap<u64, ChildState>>,
+    /// The id the next spawned child gets.
+    next_child: std::cell::RefCell<u64>,
     /// Captured `core::fmt::Formatter` states (see
     /// [`FmtCapture`]), keyed by the id inside the formatter
     /// handle values.
@@ -1716,6 +1872,12 @@ impl<'a> Interpreter<'a> {
         self.config.tool_interception.as_ref()
     }
 
+    /// The process host configured for this run, if any
+    /// (see [`InterpConfig::process_host`]).
+    pub fn process_host(&self) -> Option<&ProcessHost> {
+        self.config.process_host.as_ref()
+    }
+
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {
         Interpreter {
             program,
@@ -1754,6 +1916,8 @@ impl<'a> Interpreter<'a> {
             next_file: std::cell::RefCell::new(3),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),
+            children: std::cell::RefCell::new(HashMap::new()),
+            next_child: std::cell::RefCell::new(1),
             formatters: std::cell::RefCell::new(HashMap::new()),
             next_formatter: std::cell::RefCell::new(1),
             fmt_stream_arm: false,
@@ -7368,6 +7532,34 @@ impl<'a> Interpreter<'a> {
         drop(next);
         self.commands.borrow_mut().insert(id, state);
         id
+    }
+
+    /// Register a freshly spawned child process and return the
+    /// id its `Child` handle value carries.
+    pub(crate) fn new_child(&self, state: ChildState) -> u64 {
+        let mut next = self.next_child.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.children.borrow_mut().insert(id, state);
+        id
+    }
+
+    /// Run `f` against the state of the child with the given
+    /// id; `None` if the id names no live child.
+    pub(crate) fn with_child<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut ChildState) -> R,
+    ) -> Option<R> {
+        let mut children = self.children.borrow_mut();
+        children.get_mut(&id).map(f)
+    }
+
+    /// Forget the child with the given id (its outcome was
+    /// collected, or the guest dropped the handle).
+    pub(crate) fn remove_child(&self, id: u64) -> Option<ChildState> {
+        self.children.borrow_mut().remove(&id)
     }
 
     /// Register a C variable argument list holding `args` (the

@@ -976,6 +976,25 @@ pub enum Builtin {
     /// and a program that would start is a named unsupported
     /// error, because the model does not start child processes.
     ProcessSpawn,
+    /// `std::process::Child::wait(&mut self) ->
+    /// io::Result<ExitStatus>`: wait for the child the process
+    /// host started and report its exit status (see
+    /// `ProcessSpawn` for how a `Child` handle comes to be).
+    ProcessChildWait,
+    /// `std::process::Child::try_wait(&mut self) ->
+    /// io::Result<Option<ExitStatus>>`: the child's exit status
+    /// if it has already ended, `None` while it runs.
+    ProcessChildTryWait,
+    /// `std::process::Child::kill(&mut self) -> io::Result<()>`:
+    /// kill the child the process host started.
+    ProcessChildKill,
+    /// `std::process::Child::wait_with_output(self) ->
+    /// io::Result<Output>`: wait for the child and collect the
+    /// streams its invocation piped.
+    ProcessChildWaitWithOutput,
+    /// `std::process::Child::id(&self) -> u32`: the child's
+    /// process id.
+    ProcessChildId,
     /// `std::env::current_exe() -> io::Result<PathBuf>`: the
     /// path of the executable running the guest program, which
     /// is the driver host process's own executable path.
@@ -2749,6 +2768,13 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::process::Command::spawn" => Builtin::ProcessSpawn,
         "std::process::Command::output" => Builtin::ProcessOutput,
         "std::process::Command::status" => Builtin::ProcessSpawn,
+        "std::process::Child::wait" => Builtin::ProcessChildWait,
+        "std::process::Child::try_wait" => Builtin::ProcessChildTryWait,
+        "std::process::Child::kill" => Builtin::ProcessChildKill,
+        "std::process::Child::wait_with_output" => {
+            Builtin::ProcessChildWaitWithOutput
+        }
+        "std::process::Child::id" => Builtin::ProcessChildId,
         "std::sys::process::output" => Builtin::ProcessOutput,
         "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
         "std::time::SystemTime::checked_add" => Builtin::TimeCheckedAdd(true),
@@ -6678,46 +6704,74 @@ impl<'a> Interpreter<'a> {
                 match process_spawn_error(&state) {
                     Some(error) => Ok(err_result(error)),
                     None => {
-                        // `Command::status` on a configured tool
-                        // program runs the tool and reports its
-                        // exit status. A `Child` handle for a
-                        // spawned tool cannot be fabricated, so
-                        // `spawn` itself stays unsupported.
+                        // `Command::status` runs the program and
+                        // reports its exit status: a configured
+                        // tool program through the tool runner,
+                        // any other program through the process
+                        // host when one is configured. A `Child`
+                        // handle for a spawned tool cannot be
+                        // fabricated, so tool interception never
+                        // answers `spawn` itself.
                         if name == "std::process::Command::status" {
                             check_stdio_modelled(&state)?;
-                            if let Some(outcome) =
-                                tool_outcome(self.tool_interception(), &state, false)?
-                            {
-                                // `status` inherits the child's
-                                // streams (it collects no
-                                // `Output`): what the program
-                                // printed joins the guest's own
-                                // streams here, in invocation
-                                // order, before the status is
-                                // reported -- for the streams
-                                // whose configuration inherits
-                                // them. A stream the guest
-                                // redirected to null or a pipe
-                                // is not the guest's own, and
-                                // its bytes go nowhere
-                                // observable.
-                                if stdio_route(state.stdout_stdio, false)
-                                    == StdioRoute::Relay
-                                {
-                                    self.push_output(&String::from_utf8_lossy(
-                                        &outcome.stdout,
-                                    ));
+                            let outcome = match tool_outcome(
+                                self.tool_interception(),
+                                &state,
+                                false,
+                            )? {
+                                Some(outcome) => Some(Ok(outcome)),
+                                None => self.host_outcome(&state, false)?,
+                            };
+                            match outcome {
+                                Some(Ok(outcome)) => {
+                                    // `status` inherits the
+                                    // child's streams (it collects
+                                    // no `Output`): what the
+                                    // program printed joins the
+                                    // guest's own streams here, in
+                                    // invocation order, before the
+                                    // status is reported -- for
+                                    // the streams whose
+                                    // configuration inherits them.
+                                    // A stream the guest
+                                    // redirected to null or a pipe
+                                    // is not the guest's own, and
+                                    // its bytes go nowhere
+                                    // observable.
+                                    if stdio_route(state.stdout_stdio, false)
+                                        == StdioRoute::Relay
+                                    {
+                                        self.push_output(
+                                            &String::from_utf8_lossy(
+                                                &outcome.stdout,
+                                            ),
+                                        );
+                                    }
+                                    if stdio_route(state.stderr_stdio, false)
+                                        == StdioRoute::Relay
+                                    {
+                                        self.push_error_output(
+                                            &String::from_utf8_lossy(
+                                                &outcome.stderr,
+                                            ),
+                                        );
+                                    }
+                                    return Ok(ok_result(exit_status_value(
+                                        outcome.exit_code,
+                                    )));
                                 }
-                                if stdio_route(state.stderr_stdio, false)
-                                    == StdioRoute::Relay
-                                {
-                                    self.push_error_output(&String::from_utf8_lossy(
-                                        &outcome.stderr,
-                                    ));
+                                Some(Err(error)) => {
+                                    return Ok(err_result(error));
                                 }
-                                return Ok(ok_result(exit_status_value(
-                                    outcome.exit_code,
-                                )));
+                                None => {}
+                            }
+                        }
+                        // `Command::spawn` through the process
+                        // host starts a real child and hands the
+                        // guest its `Child` handle.
+                        if name == "std::process::Command::spawn" {
+                            if let Some(result) = self.host_spawn(&state)? {
+                                return Ok(result);
                             }
                         }
                         Err(unsupported(format!(
@@ -6808,8 +6862,16 @@ impl<'a> Interpreter<'a> {
                     Some(error) => Ok(err_result(error)),
                     None => {
                         check_stdio_modelled(&state)?;
-                        match tool_outcome(self.tool_interception(), &state, true)? {
-                            Some(outcome) => {
+                        let outcome = match tool_outcome(
+                            self.tool_interception(),
+                            &state,
+                            true,
+                        )? {
+                            Some(outcome) => Some(Ok(outcome)),
+                            None => self.host_outcome(&state, true)?,
+                        };
+                        match outcome {
+                            Some(Ok(outcome)) => {
                                 // `output` collects the streams
                                 // it pipes -- by default and on
                                 // an explicit pipe. A stream the
@@ -6845,6 +6907,7 @@ impl<'a> Interpreter<'a> {
                                     &stderr,
                                 )))
                             }
+                            Some(Err(error)) => Ok(err_result(error)),
                             None => Err(unsupported(format!(
                                 "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
                                 String::from_utf8_lossy(&state.program)
@@ -6852,6 +6915,109 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+            }
+            Builtin::ProcessChildWait => {
+                arity(1)?;
+                let id = self.child_id_of(frames, &vals[0], name)?;
+                match self.child_finish(id, true)? {
+                    ChildWait::Finished(code) => {
+                        Ok(ok_result(exit_status_value(code)))
+                    }
+                    ChildWait::IoError(error) => Ok(io_result_err(error)),
+                    ChildWait::Running => Err(unsupported(
+                        "child wait did not observe the child's end"
+                            .to_string(),
+                    )),
+                }
+            }
+            Builtin::ProcessChildTryWait => {
+                arity(1)?;
+                let id = self.child_id_of(frames, &vals[0], name)?;
+                match self.child_finish(id, false)? {
+                    ChildWait::Finished(code) => Ok(ok_result(some_value(
+                        exit_status_value(code),
+                    ))),
+                    ChildWait::Running => Ok(ok_result(none_value())),
+                    ChildWait::IoError(error) => Ok(io_result_err(error)),
+                }
+            }
+            Builtin::ProcessChildKill => {
+                arity(1)?;
+                let id = self.child_id_of(frames, &vals[0], name)?;
+                let live = self
+                    .with_child(id, |state| {
+                        (state.host_id, state.finished.is_some())
+                    })
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "call to {name} on a stale child handle"
+                        ))
+                    })?;
+                // A child whose end was already observed is
+                // gone; std's `kill` on an exited child reports
+                // success, and the host entry is already reaped.
+                if live.1 {
+                    return Ok(io_result_ok(Value::Unit));
+                }
+                let host = self.process_host().cloned().ok_or_else(|| {
+                    unsupported(
+                        "child process without a process host".to_string(),
+                    )
+                })?;
+                match host.0.kill(live.0) {
+                    Ok(()) => Ok(io_result_ok(Value::Unit)),
+                    Err(crate::interp::ProcessHostError::Io(e)) => {
+                        Ok(io_result_err(host_io_error(&e)))
+                    }
+                    Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                        Err(unsupported(reason))
+                    }
+                }
+            }
+            Builtin::ProcessChildWaitWithOutput => {
+                arity(1)?;
+                let id = self.child_id_of(frames, &vals[0], name)?;
+                match self.child_finish(id, true)? {
+                    ChildWait::Finished(code) => {
+                        // The call consumes the `Child`: the
+                        // entry leaves the table and the host
+                        // forgets its side. The collected bytes
+                        // are the piped streams' (an inherited
+                        // stream was relayed at the end's first
+                        // observation and is not part of the
+                        // `Output`, as in std).
+                        let state = self.remove_child(id).ok_or_else(|| {
+                            unsupported(format!(
+                                "call to {name} on a stale child handle"
+                            ))
+                        })?;
+                        if let Some(host) = self.process_host() {
+                            host.0.release(state.host_id);
+                        }
+                        Ok(ok_result(process_output_value(
+                            code,
+                            &state.stdout,
+                            &state.stderr,
+                        )))
+                    }
+                    ChildWait::IoError(error) => Ok(io_result_err(error)),
+                    ChildWait::Running => Err(unsupported(
+                        "child wait did not observe the child's end"
+                            .to_string(),
+                    )),
+                }
+            }
+            Builtin::ProcessChildId => {
+                arity(1)?;
+                let id = self.child_id_of(frames, &vals[0], name)?;
+                let pid = self
+                    .with_child(id, |state| state.pid)
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "call to {name} on a stale child handle"
+                        ))
+                    })?;
+                Ok(Value::Uint(u128::from(pid)))
             }
             Builtin::CurrentExe => {
                 arity(0)?;
@@ -23417,6 +23583,164 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         })
     }
 
+    /// The child-table id of the `Child` handle a builtin
+    /// call received (as receiver, by reference or by value).
+    fn child_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let resolved = self.resolve_value(frames, value)?;
+        child_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a process child handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
+    /// Run this command to completion through the process
+    /// host, in the shape of a tool outcome (see
+    /// `tool_outcome`). `None` when no host is configured (the
+    /// caller keeps the standing answer); `Some(Err(value))`
+    /// when starting the child failed the way std reports it
+    /// (the value is the guest's `io::Error`).
+    fn host_outcome(
+        &self,
+        state: &crate::interp::CommandState,
+        output_captured: bool,
+    ) -> InterpResult<Option<Result<crate::interp::ToolRunOutcome, Value>>> {
+        let Some(host) = self.process_host() else {
+            return Ok(None);
+        };
+        check_host_stdio(state)?;
+        let request = process_spawn_request(state, output_captured);
+        let (host_id, _pid) = match host.0.spawn(&request) {
+            Ok(started) => started,
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                return Ok(Some(Err(host_io_error(&e))));
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                return Err(unsupported(reason));
+            }
+        };
+        let outcome = host.0.wait(host_id);
+        host.0.release(host_id);
+        match outcome {
+            Ok(outcome) => Ok(Some(Ok(crate::interp::ToolRunOutcome {
+                exit_code: outcome.exit_code,
+                stdout: outcome.stdout,
+                stderr: outcome.stderr,
+            }))),
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                Ok(Some(Err(host_io_error(&e))))
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                Err(unsupported(reason))
+            }
+        }
+    }
+
+    /// Start this command's program through the process host
+    /// and register the child, returning the guest's
+    /// `io::Result<Child>` value. `None` when no host is
+    /// configured (the caller keeps the standing answer).
+    fn host_spawn(
+        &self,
+        state: &crate::interp::CommandState,
+    ) -> InterpResult<Option<Value>> {
+        let Some(host) = self.process_host() else {
+            return Ok(None);
+        };
+        check_host_stdio(state)?;
+        let request = process_spawn_request(state, false);
+        match host.0.spawn(&request) {
+            Ok((host_id, pid)) => {
+                let id = self.new_child(crate::interp::ChildState {
+                    host_id,
+                    pid,
+                    stdout_stdio: state.stdout_stdio,
+                    stderr_stdio: state.stderr_stdio,
+                    finished: None,
+                    relayed: false,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+                Ok(Some(ok_result(child_value(id))))
+            }
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                Ok(Some(err_result(host_io_error(&e))))
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                Err(unsupported(reason))
+            }
+        }
+    }
+
+    /// Observe the end of the child with the given id,
+    /// waiting for it when `block` is set. On the first
+    /// observation of the end, the outcome's inherited
+    /// streams are relayed into the guest's own streams and
+    /// its piped streams' bytes are kept on the entry for a
+    /// later `wait_with_output`; the exit code is cached, so
+    /// every later observation answers with the same status,
+    /// as std's cached status does.
+    fn child_finish(&mut self, id: u64, block: bool) -> InterpResult<ChildWait> {
+        let Some((host_id, finished)) = self.with_child(id, |state| {
+            (state.host_id, state.finished)
+        }) else {
+            return Err(unsupported(
+                "call on a stale child handle".to_string(),
+            ));
+        };
+        if let Some(code) = finished {
+            return Ok(ChildWait::Finished(code));
+        }
+        let host = self.process_host().cloned().ok_or_else(|| {
+            unsupported("child process without a process host".to_string())
+        })?;
+        let outcome = if block {
+            host.0.wait(host_id).map(Some)
+        } else {
+            host.0.try_wait(host_id)
+        };
+        let outcome = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Ok(ChildWait::Running),
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                return Ok(ChildWait::IoError(host_io_error(&e)));
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                return Err(unsupported(reason));
+            }
+        };
+        let code = outcome.exit_code;
+        let (out_cfg, err_cfg) = self
+            .with_child(id, |state| {
+                (state.stdout_stdio, state.stderr_stdio)
+            })
+            .expect("child entry present");
+        if stdio_route(out_cfg, false) == StdioRoute::Relay {
+            self.push_output(&String::from_utf8_lossy(&outcome.stdout));
+        }
+        if stdio_route(err_cfg, false) == StdioRoute::Relay {
+            self.push_error_output(&String::from_utf8_lossy(&outcome.stderr));
+        }
+        self.with_child(id, |state| {
+            state.finished = Some(code);
+            state.relayed = true;
+            if out_cfg == Some(crate::interp::StdioConfig::Piped) {
+                state.stdout = outcome.stdout;
+            }
+            if err_cfg == Some(crate::interp::StdioConfig::Piped) {
+                state.stderr = outcome.stderr;
+            }
+        });
+        Ok(ChildWait::Finished(code))
+    }
+
     /// The byte string a path argument denotes, and whether it
     /// arrived as text: a `Path` / `OsStr` value in this model
     /// is the byte string itself under its wrapper chain (see
@@ -26645,6 +26969,7 @@ fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState {
         cwd: None,
         stdout_stdio: None,
         stderr_stdio: None,
+        stdin_stdio: None,
     }
 }
 
@@ -28064,6 +28389,146 @@ fn tool_outcome(
     }
 }
 
+/// The result of observing a child's end (see
+/// `Interpreter::child_finish`).
+enum ChildWait {
+    Running,
+    Finished(i32),
+    IoError(Value),
+}
+
+/// The spawn request a command denotes, for the process
+/// host: the recorded builder state, the interpreter's own
+/// resolution of the program, and the stdio wiring the entry
+/// point settles on -- `output` pipes the streams it
+/// collects and nulls the child's stdin, `status` / `spawn`
+/// inherit what the guest did not configure.
+fn process_spawn_request(
+    state: &crate::interp::CommandState,
+    output_captured: bool,
+) -> crate::interp::ProcessSpawnRequest {
+    use crate::interp::ProcessStdio;
+    let wire = |config: Option<crate::interp::StdioConfig>,
+                default: ProcessStdio|
+     -> ProcessStdio {
+        match config {
+            Some(crate::interp::StdioConfig::Inherit) => {
+                ProcessStdio::Inherit
+            }
+            Some(crate::interp::StdioConfig::Null) => ProcessStdio::Null,
+            Some(crate::interp::StdioConfig::Piped) => ProcessStdio::Piped,
+            // Rejected by the caller's stdio check before the
+            // request is built; inherit is the neutral wire.
+            Some(crate::interp::StdioConfig::Unmodelled) => {
+                ProcessStdio::Inherit
+            }
+            None => default,
+        }
+    };
+    use std::os::unix::ffi::OsStrExt as _;
+    crate::interp::ProcessSpawnRequest {
+        program: state.program.clone(),
+        args: state.args.clone(),
+        argv0: state.argv0.clone(),
+        envs: state.envs.clone(),
+        env_clear: state.env_clear,
+        cwd: state.cwd.clone(),
+        resolved_program: resolve_program(state)
+            .ok()
+            .map(|path| path.as_os_str().as_bytes().to_vec()),
+        stdin: wire(
+            state.stdin_stdio,
+            if output_captured {
+                ProcessStdio::Null
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+        stdout: wire(
+            state.stdout_stdio,
+            if output_captured {
+                ProcessStdio::Piped
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+        stderr: wire(
+            state.stderr_stdio,
+            if output_captured {
+                ProcessStdio::Piped
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+    }
+}
+
+/// Reject an invocation the process host cannot wire: a
+/// stdio configuration the model does not decode (see
+/// `check_stdio_modelled`, which covers the output streams
+/// for the tool model; the host also wires the child's
+/// stdin, so its configuration is checked here too).
+fn check_host_stdio(
+    state: &crate::interp::CommandState,
+) -> InterpResult<()> {
+    for config in [
+        state.stdin_stdio,
+        state.stdout_stdio,
+        state.stderr_stdio,
+    ] {
+        if config == Some(crate::interp::StdioConfig::Unmodelled) {
+            return Err(unsupported(
+                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A `std::process::Child` value denoting child-table id
+/// `id`: the handle -- the sys `Process` value, the id in
+/// its first slot and the not-yet-observed status slot
+/// empty -- and the three stdio handle slots, all empty:
+/// the streams live on the host side of the child entry,
+/// where `wait_with_output` collects them. A guest that
+/// takes a stdio handle out of the `Child` therefore
+/// observes `None`; reading or writing a child's pipes
+/// through the handle values is not modelled.
+fn child_value(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(u128::from(id)), none_value()],
+            },
+            none_value(),
+            none_value(),
+            none_value(),
+        ],
+    }
+}
+
+/// The child-table id a `Child` value carries: the first
+/// slot of its handle field. `None` for any other shape.
+fn child_handle_id(value: &Value) -> Option<u64> {
+    let fields = match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    let handle = fields.first()?;
+    let handle_fields = match handle {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    match handle_fields.first() {
+        Some(Value::Uint(id)) => Some(*id as u64),
+        Some(Value::Int(id)) => Some(*id as u64),
+        _ => None,
+    }
+}
+
 /// A `Cow<str>` value over the given bytes: borrowed when
 /// they are valid UTF-8, owned with replacement characters
 /// otherwise (the host `from_utf8_lossy` semantics); in this
@@ -28152,15 +28617,17 @@ fn stdio_config_of(value: &Value) -> crate::interp::StdioConfig {
 
 /// Record a stdio setter's configuration on the command it
 /// names: the builtin's own name says which stream it
-/// configures. The stdin configuration is not recorded:
-/// the tool model never feeds a child's stdin, so it has
-/// no routing to decide.
+/// configures. The stdin configuration is recorded for the
+/// process host's wiring (the tool model never feeds a
+/// child's stdin and ignores it).
 fn record_stdio_config(state: &mut crate::interp::CommandState, name: &str, value: &Value) {
     let config = stdio_config_of(value);
     if name.ends_with("::stdout") {
         state.stdout_stdio = Some(config);
     } else if name.ends_with("::stderr") {
         state.stderr_stdio = Some(config);
+    } else if name.ends_with("::stdin") {
+        state.stdin_stdio = Some(config);
     }
 }
 

@@ -105,6 +105,15 @@ denominator. Runs on every push to `main` and on manual dispatch.
   runner never combines stages 3 or 4 with `--jit`), so they
   remain in metric 4's denominator as not
   attempted.
+- Stage-1 and stage-2 program runs pass `--guest-process-host`
+  to the driver: a guest's `std::process` children really start
+  on the host (the interpreter's `Child` model is performed
+  against live host children), and a child naming the guest's
+  own executable -- or a byte-identical copy of it -- re-runs
+  the guest program under the driver with the child's
+  arguments, environment and working directory. Stage-3 runs
+  configure tool interception instead and install no process
+  host, and the JIT pass (`run-jit`) installs none either.
 - The `rustdoc-check` records (1,735) are attempted by the
   stage-4 rustdoc harness for the rustdoc-html (802),
   rustdoc-ui (440), and rustdoc-json (194) suites (see
