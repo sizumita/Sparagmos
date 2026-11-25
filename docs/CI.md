@@ -156,6 +156,40 @@ denominator. Runs on every push to `main` and on manual dispatch.
   under the bucket `not attempted (coverage instrumentation)`
   (issue #514). The denominator is unaffected; all 109 stay
   in it as non-passes.
+- The exec records whose mode is run-crash are attempted by
+  stages 1 and 2 and judged by crash class, following
+  compiletest's own classification of a finished run
+  (runtest/ui.rs's RunResult): exit 0 is a pass-class run, an
+  exit code in 1..=127 is a failure-class run, and death by
+  signal or a code above 127 is a crash. The record passes
+  when the native run classifies as a crash, the Sparagmos
+  run classifies as a crash too, and the guest's stdout
+  agrees with the native run's; when the native run does not
+  crash, the record is not judged and keeps the
+  native-expectation bucket, as a native mismatch does for
+  the fixed-code modes. To make the classes distinguishable,
+  the driver reports a guest crash -- a guest panic that may
+  not unwind (panic=abort, a nounwind assertion failure, a
+  second panic while a panic is in flight) -- with exit code
+  134 and a `guest crashed` marker line, while an unwinding
+  guest panic keeps exit 101 and a completed run keeps 0.
+  A guest failure the interpreter cannot exhibit as a crash
+  (a hook panic the interpreter unwinds where native code
+  aborts, a conversion gap) fails under its own bucket; the
+  verdict is never widened to cover it.
+- The compile-check records of the `crashes` suite carry
+  compiletest's crash expectation (runtest/crashes.rs): the
+  compile passes the test exactly when the compiler process
+  ends with an exit code other than 0 or 1, and no output is
+  compared. The runner's crash judging implements exactly
+  that condition, so these records are judged, not waived:
+  the driver drives rustc only as far as Stable MIR, the
+  internal compiler errors these tests reproduce live in
+  later compiler phases, and a driver that converts the
+  input or rejects it cleanly is recorded as failing the
+  crash expectation (`no crash (converted successfully)` /
+  `no crash (clean rejection)`) until the crash itself is
+  reproduced.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact

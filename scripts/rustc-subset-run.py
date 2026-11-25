@@ -64,8 +64,16 @@ metric-2(b) rate, whose denominator is always the full subset
 A test is *attempted* only when both sides can be run faithfully:
 
 - its header carries a run-pass / run-fail directive
-  (run-crash, stdin and add-core-stubs are recorded as
-  not-attempted reasons in stage 1; `//@ run-flags:` are
+  (stdin and add-core-stubs are recorded as
+  not-attempted reasons in stage 1; a run-crash directive is
+  attempted and judged by crash class -- the native run must
+  classify as a crash under compiletest's RunResult rules
+  (runtest/ui.rs: death by signal or an exit code above 127)
+  and the Sparagmos run must crash the same way, with the
+  guest's stdout compared as for run-pass; the driver reports
+  a guest crash -- a panic that may not unwind -- with exit
+  code 134 and a `guest crashed` marker, keeping it distinct
+  from an unwinding guest panic (101); `//@ run-flags:` are
   forwarded to both runs -- as the native run's argv and as the
   driver's `--guest-arg` options -- and `//@ exec-env:` pairs
   are applied to both runs' environments, the way compiletest
@@ -1509,7 +1517,52 @@ def expected_exit(mode, header):
             except ValueError:
                 pass
         return 101
-    return None  # run-crash: no fixed expectation in stage 1
+    return None  # run-crash: no fixed code; judged by run class
+
+
+def run_result_class(exit_code):
+    """compiletest's classification of a finished program run
+    (runtest/ui.rs's RunResult): exit 0 is "pass", an exit code
+    in 1..=127 is "fail", and anything else -- death by signal
+    (a negative subprocess code) or a code above 127 -- is
+    "crash". A timeout reports no exit code and never reaches
+    a classification: both run sides treat it as an error
+    before judging.
+    """
+    if exit_code == 0:
+        return "pass"
+    if exit_code is not None and 1 <= exit_code <= 127:
+        return "fail"
+    return "crash"
+
+
+def native_mismatch(mode, header, native):
+    """Why the native run does not behave as the mode expects,
+    or None when it does: the oracle check every execution
+    attempt applies before the Sparagmos side is judged.
+    run-pass / run-fail expect the one fixed exit code of
+    expected_exit; run-crash expects the run to classify as a
+    crash (see run_result_class).
+    """
+    if mode == "run-crash":
+        if run_result_class(native["exit_code"]) != "crash":
+            return (f"native run exit {native['exit_code']} does "
+                    f"not crash as the mode expects")
+        return None
+    exp = expected_exit(mode, header)
+    if native["exit_code"] != exp:
+        return (f"native run exit {native['exit_code']} does "
+                f"not match the mode expectation {exp}")
+    return None
+
+
+def failure_bucket(detail):
+    """The aggregate bucket for a judged execution failure."""
+    if detail == "stdout mismatch":
+        return "stdout mismatch"
+    if detail.startswith("guest did not crash"):
+        return "guest did not crash"
+    return "exit-code mismatch"
 
 
 def judge(mode, header, native, sparagmos):
@@ -1519,6 +1572,19 @@ def judge(mode, header, native, sparagmos):
     stdout (str). Returns (status, detail): status is "pass" or
     "fail".
     """
+    if mode == "run-crash":
+        # compiletest's run-crash verdict: the run must classify
+        # as a crash (run_result_class); the native side has
+        # already been checked to crash, so the Sparagmos run
+        # passes when it crashes too and the guest's stdout up
+        # to the crash agrees with the native run's.
+        if run_result_class(sparagmos["exit_code"]) != "crash":
+            return ("fail",
+                    f"guest did not crash: exit "
+                    f"{sparagmos['exit_code']}")
+        if sparagmos["stdout"] != native["stdout"]:
+            return ("fail", "stdout mismatch")
+        return ("pass", "")
     exp = expected_exit(mode, header)
     if native["exit_code"] != exp:
         return ("fail",
@@ -1551,8 +1617,6 @@ def stage1_blocker(header, survey_rec):
     mode = run_mode(header)
     if mode is None:
         return "no unscoped run-pass/run-fail directive"
-    if mode == "run-crash":
-        return "run-crash mode (crash reproduction is out of stage-1 scope)"
     if header.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if header.has("add-core-stubs"):
@@ -1575,8 +1639,6 @@ def stage1_view_blocker(view):
     if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
     mode = run_mode(view)
-    if mode == "run-crash":
-        return "run-crash mode (crash reproduction is out of stage-1 scope)"
     if view.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if view.has("add-core-stubs"):
@@ -1589,8 +1651,8 @@ def header_bucket(reason):
 
     ignore-test is its own bucket: compiletest itself never runs
     the test, on any host, so the record is not a gap in what the
-    subset reproduces at all. The other header features (run-crash,
-    stdin, core stubs) name behaviour of the test that the subset
+    subset reproduces at all. The other header features (stdin,
+    core stubs) name behaviour of the test that the subset
     declines to reproduce, and keep the shared bucket.
     """
     if reason.startswith("ignore-test"):
@@ -3864,10 +3926,9 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
             return
-        exp = expected_exit(mode, header)
-        if native["exit_code"] != exp:
-            out["reason"] = (f"native run exit {native['exit_code']} does "
-                              f"not match the mode expectation {exp}")
+        mismatch = native_mismatch(mode, header, native)
+        if mismatch:
+            out["reason"] = mismatch
             out["bucket"] = "native run does not match mode expectation"
             out["native"] = {"exit_code": native["exit_code"]}
             return
@@ -3895,9 +3956,7 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
         out["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             out["reason"] = detail
-            out["bucket"] = ("stdout mismatch"
-                             if detail == "stdout mismatch"
-                             else "exit-code mismatch")
+            out["bucket"] = failure_bucket(detail)
             out["native"] = {"exit_code": native["exit_code"],
                              "stdout": native["stdout"][:500]}
             out["sparagmos"] = {"exit_code": got["exit_code"],
@@ -4177,10 +4236,9 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
             return res
-        exp = expected_exit(mode, view)
-        if native["exit_code"] != exp:
-            res["reason"] = (f"native run exit {native['exit_code']} does "
-                             f"not match the mode expectation {exp}")
+        mismatch = native_mismatch(mode, view, native)
+        if mismatch:
+            res["reason"] = mismatch
             res["bucket"] = "native run does not match mode expectation"
             res["native"] = {"exit_code": native["exit_code"]}
             return res
@@ -4208,9 +4266,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             res["reason"] = detail
-            res["bucket"] = ("stdout mismatch"
-                             if detail == "stdout mismatch"
-                             else "exit-code mismatch")
+            res["bucket"] = failure_bucket(detail)
             res["native"] = {"exit_code": native["exit_code"],
                              "stdout": native["stdout"][:500]}
             res["sparagmos"] = {"exit_code": got["exit_code"],
@@ -4982,7 +5038,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     expectation = compile_expectation(rec["suite"], view)
     res["expectation"] = expectation
     if expectation is None and run_mode(view) not in ("run-pass",
-                                                     "run-fail"):
+                                                     "run-fail",
+                                                     "run-crash"):
         if rec["suite"] == "incremental":
             if revision is None:
                 res["reason"] = ("incremental test declares no "
@@ -5155,11 +5212,12 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
     conversion; the native compile and the driver's run both
     take them, as compiletest compiles a run test with its
     mode arguments. Execution is host-only, so the flags are
-    screened again against the host target alone. run-crash and
-    run-fail-or-crash views never reach here: crash reproduction
-    is out of the subset's scope in stage 1 as well, and they
-    keep the not-attempted verdict compile_expectation's None
-    produced for them.
+    screened again against the host target alone. run-crash
+    views reach here and are judged by crash class exactly as
+    stage 1 judges them; run-fail-or-crash views never reach
+    here (run_mode does not name the mode) and keep the
+    not-attempted verdict compile_expectation's None produced
+    for them.
     """
     mode = run_mode(view)
     res["expectation"] = mode
@@ -5188,10 +5246,9 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
             return res
-        exp = expected_exit(mode, view)
-        if native["exit_code"] != exp:
-            res["reason"] = (f"native run exit {native['exit_code']} does "
-                             f"not match the mode expectation {exp}")
+        mismatch = native_mismatch(mode, view, native)
+        if mismatch:
+            res["reason"] = mismatch
             res["bucket"] = "native run does not match mode expectation"
             res["native"] = {"exit_code": native["exit_code"]}
             return res
@@ -5219,9 +5276,7 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
         res["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             res["reason"] = detail
-            res["bucket"] = ("stdout mismatch"
-                             if detail == "stdout mismatch"
-                             else "exit-code mismatch")
+            res["bucket"] = failure_bucket(detail)
             res["native"] = {"exit_code": native["exit_code"],
                              "stdout": native["stdout"][:500]}
             res["sparagmos"] = {"exit_code": got["exit_code"],

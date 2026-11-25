@@ -12484,7 +12484,7 @@ fn run_mode_uncaught_panic_runs_drops() {
 fn run_mode_unwind_drop_panics_aborts_uncaught_by_catch_unwind() {
     // Unwinding drops M(1) first (reverse order), then Bad's
     // destructor panics while unwinding: a double panic. The run
-    // aborts (101, abort reason on stderr) and the surrounding
+    // aborts (134, abort reason on stderr) and the surrounding
     // catch_unwind does NOT observe it ("caught" never prints),
     // exactly as a native abort is not a catchable panic.
     let dir = temp_dir("unwind-drop-panics");
@@ -12493,8 +12493,8 @@ fn run_mode_unwind_drop_panics_aborts_uncaught_by_catch_unwind() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(101),
-        "a panic in an unwind destructor must abort with 101; stderr={stderr}"
+        Some(134),
+        "a panic in an unwind destructor must abort with 134; stderr={stderr}"
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -17163,12 +17163,13 @@ fn run_mode_termination_report_unwind_drop_and_streaming() {
         RESULT_ERR_FMT_PANIC_DROP_PANICS_SRC,
     );
     let out = run_driver(&src);
-    assert_eq!(out.status.code(), Some(101), "second panic aborts");
+    assert_eq!(out.status.code(), Some(134), "second panic aborts");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "Error: thread 'main' aborted: panic `drop exploded` raised in the \
          drop of the Termination report payload while unwinding: \
-         panicking while unwinding aborts the run\n"
+         panicking while unwinding aborts the run\n\
+         sparagmos-driver run: guest crashed: abort\n"
     );
     let src = fixture(&dir, "err_streaming_debug.rs", RESULT_ERR_STREAMING_DEBUG_SRC);
     let out = run_driver(&src);
@@ -17353,12 +17354,13 @@ fn run_mode_termination_report_fmt_error_panics() {
         RESULT_ERR_FMT_ERROR_DROP_PANICS_SRC,
     );
     let out = run_driver(&src);
-    assert_eq!(out.status.code(), Some(101), "second panic aborts");
+    assert_eq!(out.status.code(), Some(134), "second panic aborts");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "Error: thread 'main' aborted: panic `drop exploded` raised in the \
          drop of the Termination report payload while unwinding: \
-         panicking while unwinding aborts the run\n"
+         panicking while unwinding aborts the run\n\
+         sparagmos-driver run: guest crashed: abort\n"
     );
 }
 
@@ -21888,7 +21890,7 @@ fn main() {
     let arr = [10i32, 20, 30, 40];
     unsafe {
         let b = (arr.as_ptr() as *const u8).byte_add(1);
-        let x = *(b as *const i32);
+        let x = core::ptr::read_unaligned(b as *const i32);
         assert_eq!(x, 0x1400_0000);
         let y = *((arr.as_ptr() as *const u8).byte_add(4));
         assert_eq!(y, 20);
@@ -21919,7 +21921,36 @@ fn run_mode_ptr_byte_displaced_reads_match_native() {
         "byte-displaced reads must run with native values; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    // The same load through an ordinary dereference carries the
+    // alignment assertion the compiler inserts under debug
+    // assertions, and the displaced address (base + 1) fails it:
+    // the run aborts as a guest crash, exactly as the native
+    // program compiled with -Cdebug-assertions=yes does.
+    let src = fixture(&dir, "ptr_byte_displaced_aligned.rs",
+                      PTR_BYTE_DISPLACED_ALIGNED_LOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "aligned load at a displaced address must abort; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("guest crashed"),
+        "the abort is reported as a guest crash: {stderr}"
+    );
 }
+
+const PTR_BYTE_DISPLACED_ALIGNED_LOAD_SRC: &str = r#"
+fn main() {
+    let arr = [10i32, 20, 30, 40];
+    unsafe {
+        let b = (arr.as_ptr() as *const u8).byte_add(1);
+        let x = *(b as *const i32);
+        println!("{x}");
+    }
+}
+"#;
 
 const ENUM_TAG_BYTE_READ_SRC: &str = r#"
 enum E { A(u32), B(u16) }
@@ -32445,8 +32476,8 @@ fn run_mode_nounwind_from_str_panic_message() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(101),
-        "nounwind panic must exit 101; stderr={stderr}"
+        Some(134),
+        "nounwind panic must exit 134 (guest crash); stderr={stderr}"
     );
     assert!(
         stderr.contains(
@@ -39484,7 +39515,7 @@ fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
     // An owned predicate panics, and dropping it (the search's
     // cleanup duty) panics again in a capture's destructor: a
     // double panic, which natively aborts. The run must abort
-    // (101, the abort named on stderr) instead of letting the
+    // (134, the abort named on stderr) instead of letting the
     // original panic reach the guest's `catch_unwind` -- before
     // the fix the `CallBuiltin` dispatch discarded the cleanup
     // glue's result, so the run printed `caught=true` and
@@ -39505,8 +39536,8 @@ fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(
             out.status.code(),
-            Some(101),
-            "a panic in the predicate cleanup must abort with 101 ({name}); stderr={stderr}"
+            Some(134),
+            "a panic in the predicate cleanup must abort with 134 ({name}); stderr={stderr}"
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
