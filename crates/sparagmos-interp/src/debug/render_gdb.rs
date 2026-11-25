@@ -1,0 +1,711 @@
+//! gdb-form rendering: aggregates, layouts and the union byte forms behind the raw `$N = ...` print.
+
+use crate::interp::Interpreter;
+use crate::value::Value;
+use super::desc::{Desc, dwarf_type_name, split_top_level};
+use super::queries::nonzero_scalar;
+use super::render_lldb::{render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width};
+use super::session::{DebugDialect, PrintFormat};
+
+/// The deepest aggregate nesting the renderers unfold. A value
+/// graph in this model is finite (recursive types pass through
+/// references, which render as addresses), so the cap is a
+/// safeguard, not a shaping rule.
+pub(super) const MAX_RENDER_DEPTH: usize = 24;
+
+/// Render a sequence of element values, in one dialect's element
+/// form: per-element descriptors from `descs`, or one shared
+/// element descriptor.
+pub(super) fn render_elements(
+    interp: &Interpreter,
+    fields: &[Value],
+    descs: &[Desc],
+    shared: Option<&Desc>,
+    dialect: DebugDialect,
+    depth: usize,
+) -> Option<Vec<String>> {
+    let mut parts = Vec::with_capacity(fields.len());
+    for (i, field) in fields.iter().enumerate() {
+        let d = shared.or_else(|| descs.get(i));
+        parts.push(match dialect {
+            DebugDialect::Gdb => {
+                render_gdb(interp, field, d, false, None, depth + 1)?
+            }
+            DebugDialect::Lldb => {
+                render_lldb_compact(interp, field, d, false, true, depth + 1)?
+            }
+        });
+    }
+    Some(parts)
+}
+
+/// gdb's array-element repeat compression: a run of more than
+/// ten identical elements is printed once, followed by
+/// `<repeats N times>` with the run's full length.
+pub(super) fn compress_repeats(rendered: &[String]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rendered.len() {
+        let mut j = i + 1;
+        while j < rendered.len() && rendered[j] == rendered[i] {
+            j += 1;
+        }
+        let run = j - i;
+        if run > 10 {
+            out.push(format!("{} <repeats {} times>", rendered[i], run));
+        } else {
+            out.extend_from_slice(&rendered[i..j]);
+        }
+        i = j;
+    }
+    out.join(", ")
+}
+
+/// Render a value the way gdb (with its Rust pretty printers
+/// disabled, as the debuginfo suite runs it) prints it: scalars
+/// as [`render_scalar`] renders them, tuples as `(a, b)`, arrays
+/// as `[a, b]` with gdb's repeat compression, and ADT values
+/// through the debug-shape table — `Tag {f: v, ...}` for a
+/// named-field struct, `Tag (v, ...)` for a tuple struct,
+/// `Tag::Variant{...}` / `Tag::Variant(...)` / `Tag::Variant`
+/// for an enum. A reference renders as its address. Anything the
+/// shape table does not describe stays unrendered (`None`).
+pub(super) fn render_gdb(
+    interp: &Interpreter,
+    value: &Value,
+    desc: Option<&Desc>,
+    top_char: bool,
+    format: Option<PrintFormat>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_RENDER_DEPTH {
+        return None;
+    }
+    if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
+        return render_gdb(interp, &scalar, Some(&inner), top_char, format, depth);
+    }
+    match value {
+        Value::Bool(_)
+        | Value::Unit
+        | Value::Int(_)
+        | Value::Uint(_)
+        | Value::Float(_)
+        | Value::Float128(_) => render_scalar(
+            value,
+            None,
+            top_char || matches!(desc, Some(Desc::Char)),
+            format,
+            scalar_desc_bit_width(desc),
+            DebugDialect::Gdb,
+        ),
+        Value::Tuple(fields) => {
+            // A tuple-shaped value with an array descriptor is an
+            // array; with a slice descriptor it is an array whose
+            // length did not survive conversion (the length was
+            // named by a const item) — a genuine slice value is a
+            // fat reference, never a tuple.
+            let array_elem = match desc {
+                Some(Desc::Array(elem, _)) | Some(Desc::Slice(elem)) => {
+                    Some(elem.as_ref())
+                }
+                _ => None,
+            };
+            if let Some(elem) = array_elem {
+                let mut rendered = Vec::with_capacity(fields.len());
+                for field in fields {
+                    rendered.push(render_gdb(
+                        interp,
+                        field,
+                        Some(elem),
+                        false,
+                        None,
+                        depth + 1,
+                    )?);
+                }
+                Some(format!("[{}]", compress_repeats(&rendered)))
+            } else {
+                let descs: Vec<Desc> = match desc {
+                    Some(Desc::Tuple(ts)) => ts.clone(),
+                    _ => Vec::new(),
+                };
+                let parts = render_elements(
+                    interp,
+                    fields,
+                    &descs,
+                    None,
+                    DebugDialect::Gdb,
+                    depth,
+                )?;
+                if parts.len() == 1 {
+                    Some(format!("({},)", parts[0]))
+                } else {
+                    Some(format!("({})", parts.join(", ")))
+                }
+            }
+        }
+        Value::Enum { variant, fields } => {
+            let Some(Desc::Adt(tag)) = desc else {
+                return None;
+            };
+            let shape = interp.program().adt_debug_shapes.get(tag)?;
+            render_adt_gdb(interp, tag, shape, *variant, fields, depth)
+        }
+        Value::Ref(_)
+        | Value::FatRef { .. }
+        | Value::DynRef { .. }
+        | Value::FnPtr(_) => {
+            let addr = crate::interp::synthetic_address(value)?;
+            // A pointer to the unit type prints with its type
+            // in cast form (`(*mut ()) 0x...`): the unit type
+            // has no value form for the address to stand for.
+            if matches!(
+                desc,
+                Some(
+                    Desc::Ref(inner)
+                    | Desc::RefMut(inner)
+                    | Desc::PtrConst(inner)
+                    | Desc::PtrMut(inner)
+                ) if matches!(inner.as_ref(), Desc::Unit)
+            ) {
+                return Some(format!("(*mut ()) 0x{addr:x}"));
+            }
+            Some(format!("0x{addr:x}"))
+        }
+        Value::Closure { .. } | Value::Coroutine { .. } => {
+            render_env_gdb(interp, value, desc, depth)
+        }
+        Value::Uninit => match desc {
+            Some(Desc::Int(_)) | Some(Desc::Float(_)) => Some("0".to_string()),
+            Some(Desc::Bool) => Some("false".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The byte width of an integer type tag, when the tag names
+/// one.
+fn int_ty_width(ty: &str) -> Option<usize> {
+    match ty {
+        "i8" | "u8" => Some(1),
+        "i16" | "u16" => Some(2),
+        "i32" | "u32" => Some(4),
+        "i64" | "u64" | "isize" | "usize" => Some(8),
+        "i128" | "u128" => Some(16),
+        _ => None,
+    }
+}
+
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) / align.max(1) * align.max(1)
+}
+
+/// The (size, alignment) a debugger field type tag describes,
+/// for the scalar, tuple and array types a union's fields take:
+/// the layout the byte reinterpretation of a union value's
+/// storage follows (a tuple's fields sit at the compiler's
+/// own offsets — see [`tuple_field_layout`]).
+fn tag_layout(ty: &str) -> Option<(usize, usize)> {
+    let ty = ty.trim();
+    let scalar = match ty {
+        "bool" | "i8" | "u8" => Some((1, 1)),
+        "char" => Some((4, 4)),
+        "i16" | "u16" | "f16" => Some((2, 2)),
+        "i32" | "u32" | "f32" => Some((4, 4)),
+        "i64" | "u64" | "f64" | "isize" | "usize" => Some((8, 8)),
+        "i128" | "u128" | "f128" => Some((16, 16)),
+        _ => None,
+    };
+    if let Some(s) = scalar {
+        return Some(s);
+    }
+    if ty.starts_with('(') && ty.ends_with(')') {
+        let inner = &ty[1..ty.len() - 1];
+        if inner.trim().is_empty() {
+            return Some((0, 1));
+        }
+        let parts = split_top_level(inner);
+        let (_, size, align) = tuple_field_layout(&parts)?;
+        return Some((size, align));
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        let (elem, len) = inner.rsplit_once(';')?;
+        let n: usize = len.trim().parse().ok()?;
+        let (esize, ealign) = tag_layout(elem)?;
+        let stride = align_up(esize, ealign);
+        return Some((stride * n, ealign));
+    }
+    None
+}
+
+/// The byte layout of a tuple type's fields: each field's
+/// offset (in declaration order), the total size and the
+/// alignment. This is the compiler's own layout for a tuple —
+/// the `rustc_abi` univariant layout under the tuple's
+/// `MaybeUnsized` kind: the last field stays last (it is the
+/// unsizing tail), and the remaining fields are stably sorted
+/// by a group key, `trailing_zeros(max(align, size))`, capped
+/// by the largest head alignment when one of them carries a
+/// niche, with the larger niche preferred inside a group.
+/// Verified against the pinned toolchain's `offset_of!`
+/// layouts over scalar, array and nested-tuple shapes,
+/// niches included.
+fn tuple_field_layout(parts: &[String]) -> Option<(Vec<usize>, usize, usize)> {
+    let layouts: Vec<(usize, usize)> = parts
+        .iter()
+        .map(|p| tag_layout(p))
+        .collect::<Option<Vec<_>>>()?;
+    let n = parts.len();
+    if n == 0 {
+        return Some((Vec::new(), 0, 1));
+    }
+    let niches: Vec<Option<(u64, usize)>> =
+        parts.iter().map(|p| tag_niche(p)).collect();
+    let head = n - 1;
+    let largest_niche = niches[..head]
+        .iter()
+        .flatten()
+        .map(|(available, _)| *available)
+        .max()
+        .unwrap_or(0);
+    let max_head_align = layouts[..head]
+        .iter()
+        .map(|(_, align)| *align)
+        .max()
+        .unwrap_or(1);
+    let group_key = |i: usize| -> u64 {
+        let (size, align) = layouts[i];
+        let key = u64::from(align.max(size).trailing_zeros());
+        if largest_niche > 0 {
+            key.min(u64::from(max_head_align.trailing_zeros()))
+        } else {
+            key
+        }
+    };
+    let mut order: Vec<usize> = (0..head).collect();
+    order.sort_by_key(|&i| {
+        let (niche_size, niche_offset) = niches[i].unwrap_or((0, 0));
+        (std::cmp::Reverse(group_key(i)), !niche_size, niche_offset)
+    });
+    order.push(head);
+    let mut offsets = vec![0usize; n];
+    let mut offset = 0usize;
+    let mut align = 1usize;
+    for i in order {
+        let (size, field_align) = layouts[i];
+        offset = align_up(offset, field_align);
+        offsets[i] = offset;
+        offset += size;
+        align = align.max(field_align);
+    }
+    Some((offsets, align_up(offset, align), align))
+}
+
+/// The largest niche a debugger field type's values leave
+/// unused, as (the number of unused values, the niche's offset
+/// within the type), for the types whose layout ordering a
+/// niche steers: `bool` and `char`, and aggregates containing
+/// them. Anything else has no niche here.
+fn tag_niche(ty: &str) -> Option<(u64, usize)> {
+    let ty = ty.trim();
+    match ty {
+        // A `bool` leaves every byte but 0 and 1 unused.
+        "bool" => return Some((254, 0)),
+        // A `char` leaves the `u32` values above the last
+        // scalar value unused, plus the surrogate range.
+        "char" => return Some(((1u64 << 32) - (0x11_0000 - 0x800), 0)),
+        _ => {}
+    }
+    if ty.starts_with('(') && ty.ends_with(')') {
+        let inner = &ty[1..ty.len() - 1];
+        if inner.trim().is_empty() {
+            return None;
+        }
+        let parts = split_top_level(inner);
+        let (offsets, _, _) = tuple_field_layout(&parts)?;
+        let mut best: Option<(u64, usize)> = None;
+        for (i, part) in parts.iter().enumerate() {
+            if let Some((available, inner_offset)) = tag_niche(part) {
+                if best.is_none_or(|(b, _)| available > b) {
+                    best = Some((available, offsets[i] + inner_offset));
+                }
+            }
+        }
+        return best;
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        let (elem, len) = inner.rsplit_once(';')?;
+        if len.trim().parse::<usize>().ok()? == 0 {
+            return None;
+        }
+        // An array's niche is its first element's.
+        return tag_niche(elem).map(|(available, _)| (available, 0));
+    }
+    None
+}
+
+/// Serialize a value as the little-endian bytes of its type
+/// (see [`tag_layout`]): the storage a union field of that type
+/// occupies. Types with no byte form here (references, ADT
+/// fields, strings) make the whole reinterpretation fail, and
+/// the union keeps the unrenderable form.
+fn value_to_union_bytes(value: &Value, ty: &str) -> Option<Vec<u8>> {
+    let ty = ty.trim();
+    match ty {
+        "bool" => match value {
+            Value::Bool(b) => Some(vec![*b as u8]),
+            _ => None,
+        },
+        "char" => match value {
+            Value::Uint(v) => Some((*v as u32).to_le_bytes().to_vec()),
+            Value::Int(v) => Some((*v as u32).to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f32" => match value {
+            Value::Float(f) => Some((*f as f32).to_bits().to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f64" => match value {
+            Value::Float(f) => Some(f.to_bits().to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f128" => match value {
+            Value::Float128(bits) => Some(bits.to_le_bytes().to_vec()),
+            _ => None,
+        },
+        _ if int_ty_width(ty).is_some() => {
+            let width = int_ty_width(ty)?;
+            let bits = match value {
+                Value::Int(v) => *v as u128,
+                Value::Uint(v) => *v,
+                _ => return None,
+            };
+            Some(bits.to_le_bytes()[..width].to_vec())
+        }
+        _ if ty.starts_with('(') && ty.ends_with(')') => {
+            let Value::Tuple(items) = value else {
+                return None;
+            };
+            let inner = &ty[1..ty.len() - 1];
+            if inner.trim().is_empty() {
+                return Some(Vec::new());
+            }
+            let parts = split_top_level(inner);
+            if parts.len() != items.len() {
+                return None;
+            }
+            // The fields sit at the compiler's tuple offsets,
+            // which are not the declaration order (see
+            // `tuple_field_layout`).
+            let (offsets, size, _) = tuple_field_layout(&parts)?;
+            let mut out = vec![0u8; size];
+            for (i, (item, part)) in items.iter().zip(parts.iter()).enumerate() {
+                let bytes = value_to_union_bytes(item, part)?;
+                out[offsets[i]..offsets[i] + bytes.len()].copy_from_slice(&bytes);
+            }
+            Some(out)
+        }
+        _ if ty.starts_with('[') && ty.ends_with(']') => {
+            let Value::Tuple(items) = value else {
+                return None;
+            };
+            let inner = &ty[1..ty.len() - 1];
+            let (elem, _) = inner.rsplit_once(';')?;
+            let (esize, ealign) = tag_layout(elem)?;
+            let stride = align_up(esize, ealign);
+            let mut out = Vec::new();
+            for item in items {
+                let bytes = value_to_union_bytes(item, elem)?;
+                out.extend_from_slice(&bytes);
+                out.resize(out.len() + (stride - bytes.len()), 0);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Read a value of a union field's type back from the field's
+/// little-endian storage bytes (see [`value_to_union_bytes`]).
+fn value_from_union_bytes(bytes: &[u8], ty: &str) -> Option<Value> {
+    let ty = ty.trim();
+    match ty {
+        "bool" => Some(Value::Bool(bytes.first().copied()? != 0)),
+        "char" => {
+            let v = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+            Some(Value::Uint(u128::from(v)))
+        }
+        "f32" => {
+            let bits = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+            Some(Value::Float(f32::from_bits(bits) as f64))
+        }
+        "f64" => {
+            let bits = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+            Some(Value::Float(f64::from_bits(bits)))
+        }
+        "f128" => {
+            let bits = u128::from_le_bytes(bytes.get(..16)?.try_into().ok()?);
+            Some(Value::Float128(bits))
+        }
+        _ if int_ty_width(ty).is_some() => {
+            let width = int_ty_width(ty)?;
+            let raw = bytes.get(..width)?;
+            let mut buf = [0u8; 16];
+            buf[..width].copy_from_slice(raw);
+            let bits = u128::from_le_bytes(buf);
+            if ty.starts_with('i') {
+                let shift = 128 - width * 8;
+                Some(Value::Int(((bits << shift) as i128) >> shift))
+            } else {
+                Some(Value::Uint(bits))
+            }
+        }
+        _ if ty.starts_with('(') && ty.ends_with(')') => {
+            let inner = &ty[1..ty.len() - 1];
+            if inner.trim().is_empty() {
+                return Some(Value::Tuple(Vec::new()));
+            }
+            let parts = split_top_level(inner);
+            let (offsets, _, _) = tuple_field_layout(&parts)?;
+            let mut items = Vec::with_capacity(parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                let (esize, _) = tag_layout(part)?;
+                items.push(value_from_union_bytes(
+                    bytes.get(offsets[i]..offsets[i] + esize)?,
+                    part,
+                )?);
+            }
+            Some(Value::Tuple(items))
+        }
+        _ if ty.starts_with('[') && ty.ends_with(']') => {
+            let inner = &ty[1..ty.len() - 1];
+            let (elem, len) = inner.rsplit_once(';')?;
+            let n: usize = len.trim().parse().ok()?;
+            let (esize, ealign) = tag_layout(elem)?;
+            let stride = align_up(esize, ealign);
+            let mut items = Vec::with_capacity(n);
+            for i in 0..n {
+                items.push(value_from_union_bytes(
+                    bytes.get(i * stride..i * stride + esize)?,
+                    elem,
+                )?);
+            }
+            Some(Value::Tuple(items))
+        }
+        _ => None,
+    }
+}
+
+/// The values of every declared field of a union value: the
+/// value model stores only the written field (the slots before
+/// it uninitialised, the slots after it absent), while a
+/// debugger reads every field from the same storage, so the
+/// stored field's bytes are reinterpreted through each declared
+/// field's type.
+pub(super) fn union_field_values(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    fields: &[Value],
+) -> Option<Vec<Value>> {
+    let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
+    let stored_ty = &shape_fields.get(stored)?.ty;
+    let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
+    let size = shape_fields
+        .iter()
+        .map(|f| tag_layout(&f.ty).map(|(s, _)| s))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    bytes.resize(size, 0);
+    shape_fields
+        .iter()
+        .map(|f| value_from_union_bytes(&bytes, &f.ty))
+        .collect()
+}
+
+/// One field of a union value: the stored field's bytes
+/// reinterpreted as the requested field's type. The stored
+/// field is serialized and the requested field deserialized
+/// independently of the union's other fields, so a sibling
+/// whose layout or byte conversion is unsupported (a raw
+/// pointer field, say) does not prevent reading a supported
+/// field -- the independence the whole-union reading in
+/// [`union_field_values`] cannot offer, since it must
+/// produce every field at once.
+fn union_field_value(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    value: &Value,
+    index: usize,
+) -> Option<Value> {
+    let fields: &[Value] = match value {
+        Value::Enum { fields, .. } => fields,
+        Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
+    let stored_ty = &shape_fields.get(stored)?.ty;
+    let requested = shape_fields.get(index)?;
+    let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
+    let (size, _) = tag_layout(&requested.ty)?;
+    bytes.resize(size, 0);
+    value_from_union_bytes(&bytes, &requested.ty)
+}
+
+/// The value of one field of the ADT value a descriptor
+/// names, when that ADT is a union: the field read through
+/// the storage reinterpretation above, so inspecting a
+/// field agrees with printing its containing union. `None`
+/// for non-ADT descriptors, non-union shapes, and storage
+/// the reinterpretation cannot read (the caller then
+/// projects directly).
+pub(super) fn union_projected_field(
+    interp: &Interpreter,
+    desc: Option<&Desc>,
+    value: &Value,
+    index: usize,
+) -> Option<Value> {
+    let Desc::Adt(tag) = desc? else {
+        return None;
+    };
+    let shape = interp.program().adt_debug_shapes.get(tag)?;
+    if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+        return None;
+    }
+    let variant = match value {
+        Value::Enum { variant, .. } => *variant as usize,
+        _ => 0,
+    };
+    let vshape = shape.variants.get(variant)?;
+    union_field_value(&vshape.fields, value, index)
+}
+
+/// lldb's expanded-children form of a `NonZero` value: the
+/// scalar summary is the value itself, and the children are the
+/// two one-field wrappers the DWARF describes (the struct's
+/// field 0 holding the inner validity wrapper holding the
+/// scalar), the inner one in compact form: `{ 0 = {0:11} }`.
+/// The recorded debug shape does not describe those wrappers
+/// (the value arrives already unwrapped for the summary), so
+/// the form is synthesized from the wrapper structure itself.
+pub(super) fn nonzero_lldb_expanded(
+    interp: &Interpreter,
+    value: &Value,
+    desc: Option<&Desc>,
+) -> Option<String> {
+    let (scalar, inner) = nonzero_scalar(value, desc)?;
+    let wrapper = match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+        Value::Tuple(fields) if fields.len() == 1 => &fields[0],
+        _ => return None,
+    };
+    let inner_fields: &[Value] = match wrapper {
+        Value::Enum { fields, .. } => fields,
+        Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    if inner_fields.len() != 1 || inner_fields[0] != scalar {
+        return None;
+    }
+    let text = render_lldb_compact(interp, &scalar, Some(&inner), false, true, 1)?;
+    Some(format!("{{ 0 = {{0:{text}}} }}"))
+}
+
+/// Render one ADT value in gdb form (see [`render_gdb`]).
+fn render_adt_gdb(
+    interp: &Interpreter,
+    tag: &str,
+    shape: &sparagmos_mir::AdtDebugShape,
+    variant: u32,
+    fields: &[Value],
+    depth: usize,
+) -> Option<String> {
+    // The printed name is the DWARF (definition-path) form of
+    // the recorded tag; the shape lookup above used the tag
+    // itself, which is the table's key.
+    let tag = &dwarf_type_name(tag);
+    let vshape = shape.variants.get(variant as usize)?;
+    if matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+        // A union value stores only the written field; every
+        // declared field is read back from the same storage
+        // (see `union_field_values`).
+        let values = union_field_values(&vshape.fields, fields)?;
+        let mut parts = Vec::with_capacity(values.len());
+        for (i, v) in values.iter().enumerate() {
+            let name = vshape.fields[i].name.as_deref()?;
+            let d = Desc::from_tag(&vshape.fields[i].ty);
+            let r = render_gdb(interp, v, Some(&d), false, None, depth + 1)?;
+            parts.push(format!("{name}: {r}"));
+        }
+        return Some(format!("{tag} {{{}}}", parts.join(", ")));
+    }
+    if vshape.fields.len() != fields.len() {
+        return None;
+    }
+    let descs: Vec<Desc> = vshape
+        .fields
+        .iter()
+        .map(|f| Desc::from_tag(&f.ty))
+        .collect();
+    let named = vshape.fields.iter().all(|f| f.name.is_some());
+    let named_parts = |interp: &Interpreter| -> Option<Vec<String>> {
+        let mut parts = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let name = vshape.fields[i].name.as_deref()?;
+            let v = render_gdb(
+                interp,
+                field,
+                Some(&descs[i]),
+                false,
+                None,
+                depth + 1,
+            )?;
+            parts.push(format!("{name}: {v}"));
+        }
+        Some(parts)
+    };
+    match shape.kind {
+        sparagmos_mir::AdtShapeKind::Struct => {
+            if fields.is_empty() {
+                return Some(tag.to_string());
+            }
+            if named {
+                let parts = named_parts(interp)?;
+                Some(format!("{tag} {{{}}}", parts.join(", ")))
+            } else {
+                let parts = render_elements(
+                    interp,
+                    fields,
+                    &descs,
+                    None,
+                    DebugDialect::Gdb,
+                    depth,
+                )?;
+                Some(format!("{tag} ({})", parts.join(", ")))
+            }
+        }
+        sparagmos_mir::AdtShapeKind::Enum => {
+            let prefix = format!("{tag}::{}", vshape.name);
+            if fields.is_empty() {
+                return Some(prefix);
+            }
+            if named {
+                let parts = named_parts(interp)?;
+                Some(format!("{prefix}{{{}}}", parts.join(", ")))
+            } else {
+                let parts = render_elements(
+                    interp,
+                    fields,
+                    &descs,
+                    None,
+                    DebugDialect::Gdb,
+                    depth,
+                )?;
+                Some(format!("{prefix}({})", parts.join(", ")))
+            }
+        }
+        sparagmos_mir::AdtShapeKind::Union => None,
+    }
+}
+
