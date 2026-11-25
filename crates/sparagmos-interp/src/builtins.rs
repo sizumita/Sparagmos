@@ -21528,10 +21528,12 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// `Index::index` with a range argument: the sub-slice of the
     /// receiver between the range's bounds, with core's own panic
     /// messages for out-of-range bounds. The result is a fat
-    /// reference over a materialised copy of the sub-slice's
-    /// elements (a shared slice: reads through it are exact; the
-    /// model has no offsettable place to alias the original
-    /// storage) — or, when the range runs past a sparse
+    /// reference aliasing the receiver's storage when the
+    /// receiver is backed by live storage (see
+    /// [`range_view_base`]), and a fat reference over a
+    /// materialised copy of the sub-slice's elements when it is
+    /// not (reads through the copy are exact; it has no storage
+    /// to alias) — or, when the range runs past a sparse
     /// receiver's stored elements, over the sparse form of the
     /// range (see `Value::SparseVec`). A `str` receiver yields
     /// the sub-string, with char-boundary checks as in core.
@@ -21714,10 +21716,82 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         let (elems, len) = self.slice_elements_ref(frames, receiver)?;
         let len = usize::try_from(len).unwrap_or(usize::MAX);
         let (start, end) = range_bounds(&kind, &bound, len)?;
+        let sub_len = end - start;
+        // A receiver backed by live storage yields a fat
+        // reference aliasing that storage, formed exactly as
+        // `index_range_mut` forms its result, so that
+        // interior-mutability writes through the sub-slice land
+        // in the source storage and later source writes are read
+        // through the sub-slice. Only a receiver with no live
+        // storage behind it keeps the materialised copy below.
+        if let Some(base) =
+            self.range_view_base(frames, receiver, start, sub_len, len, name)?
+        {
+            return Ok(Value::FatRef {
+                base: Box::new(base),
+                len: sub_len as u128,
+            });
+        }
         Ok(Value::FatRef {
             base: Box::new(elems.sub_snapshot(start, end)),
-            len: (end - start) as u128,
+            len: sub_len as u128,
         })
+    }
+
+    /// The base for a shared range window over a receiver with
+    /// live storage behind it: [`windowed_base`] over the
+    /// receiver reference itself (a plain reference receiver) or
+    /// over a fat receiver's base reference. `Ok(None)` when the
+    /// receiver has no live storage to alias: a fat base that is
+    /// not a reference, a reference to a constant aggregate or
+    /// another target without storage a subslice step can
+    /// window, or storage held in the sparse form — a
+    /// `Subslice` step has no sparse arm, so a sparse window
+    /// keeps the materialised sparse snapshot (see
+    /// `sub_snapshot`), whose reads stay exact.
+    fn range_view_base(
+        &self,
+        frames: &[Frame],
+        receiver: &Value,
+        start: usize,
+        sub_len: usize,
+        receiver_len: usize,
+        name: &str,
+    ) -> InterpResult<Option<Value>> {
+        let base = match receiver {
+            Value::Ref(_) => receiver,
+            Value::FatRef { base, .. } if matches!(&**base, Value::Ref(_)) => {
+                base.as_ref()
+            }
+            _ => return Ok(None),
+        };
+        let live = matches!(
+            base,
+            Value::Ref(
+                RefTarget::Place { .. }
+                    | RefTarget::Static { .. }
+                    | RefTarget::Alloc { .. }
+            )
+        );
+        if !live {
+            return Ok(None);
+        }
+        if let Ok(target) = self.deref_value(frames, base) {
+            if matches!(
+                self.read_resolved(frames, &target),
+                Ok(Value::SparseVec { .. })
+            ) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.windowed_base(
+            frames,
+            base,
+            start,
+            sub_len,
+            receiver_len,
+            name,
+        )?))
     }
 
     /// `IndexMut::index_mut` with a range argument: the mutable

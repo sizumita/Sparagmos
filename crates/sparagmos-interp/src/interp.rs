@@ -20892,10 +20892,9 @@ fn subslice_value(value: &Value, offset: usize, len: usize) -> Option<Value> {
     let end = offset.checked_add(len)?;
     match value {
         Value::Tuple(items) => Some(Value::Tuple(items.get(offset..end)?.to_vec())),
-        Value::Enum { variant, fields } => Some(Value::Enum {
-            variant: *variant,
-            fields: fields.get(offset..end)?.to_vec(),
-        }),
+        Value::Enum { fields, .. } => {
+            Some(Value::Tuple(fields.get(offset..end)?.to_vec()))
+        }
         Value::Bytes(b) => Some(Value::Bytes(b.get(offset..end)?.to_vec())),
         Value::Str(text) => Some(Value::Str(text.get(offset..end)?.to_string())),
         _ => None,
@@ -22182,14 +22181,15 @@ pub(crate) fn project_value_ev(
                         }
                     },
                     // A `Vec` value is the aggregate of its
-                    // elements: its sub-slice is the aggregate of
-                    // the sub-range's elements.
-                    Value::Enum { variant, ref fields } => {
+                    // elements: its sub-slice is the sub-range's
+                    // elements as a slice value (a tuple of the
+                    // elements), not a shorter `Vec` aggregate --
+                    // the window is a slice, and consumers that
+                    // dispatch on the value's form (formatting,
+                    // pointer casts) read it as one.
+                    Value::Enum { ref fields, .. } => {
                         check_subslice(fields.len(), start, *len)?;
-                        Value::Enum {
-                            variant,
-                            fields: fields[start..end].to_vec(),
-                        }
+                        Value::Tuple(fields[start..end].to_vec())
                     }
                     // A sub-slice of a fat reference value (a
                     // constant slice's representation): a zero
@@ -23546,12 +23546,9 @@ pub(crate) fn project_value_ref_ev<'a>(
                             )))
                         }
                     },
-                    Value::Enum { variant, fields } => {
+                    Value::Enum { fields, .. } => {
                         check_subslice(fields.len(), start, *len)?;
-                        Value::Enum {
-                            variant: *variant,
-                            fields: fields[start..end].to_vec(),
-                        }
+                        Value::Tuple(fields[start..end].to_vec())
                     }
                     Value::FatRef {
                         base,
