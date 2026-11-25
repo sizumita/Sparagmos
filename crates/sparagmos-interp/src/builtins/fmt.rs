@@ -6,9 +6,9 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     rc_handle_id,
     FmtBuilderKind, FmtCapture,
-    Frame, Interpreter,
+    Frame, Interpreter, PanicOrigin,
 };
-use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
+use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
 
 use super::*;
 
@@ -436,6 +436,24 @@ fn template_error(what: &str) -> InterpError {
 
 impl<'a> Interpreter<'a> {
     /// Format a built `fmt::Arguments` value to a string.
+    /// Format a panic entry point's message arguments, with
+    /// the in-hook mark held: natively the formatting happens
+    /// inside the hook (the payload's lazy `fill` runs when
+    /// the default hook reads the message), so a panic the
+    /// formatting raises is a panic while processing a panic
+    /// (see `Interpreter::fire_panic_hook`).
+    pub(crate) fn format_panic_message(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        args: &FmtArguments,
+    ) -> InterpResult<String> {
+        let previous = self.in_panic_hook();
+        self.set_in_panic_hook(true);
+        let result = self.format_arguments(frames, args, 0);
+        self.set_in_panic_hook(previous);
+        result
+    }
+
     pub(crate) fn format_arguments(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -1412,10 +1430,36 @@ impl<'a> Interpreter<'a> {
             // the caller runs the payload's drop as the panic's
             // unwind cleanup, as it does for a panic the body
             // itself raises.
-            Err(InterpError::FmtReturnedError { .. }) => Err(InterpError::panic_str_payload(
-                "a formatting trait implementation returned an error \
-                     when the underlying stream did not",
-            )),
+            Err(InterpError::FmtReturnedError { .. }) => {
+                // The panic is a real one (core's `write_fmt`
+                // raises it at a fixed position in
+                // `core::io::write`, pinned to the toolchain
+                // build, as the runtime's own nounwind positions
+                // are): fire the hook for it here, since no
+                // drive loop will see it — the detached rendering
+                // is where it was raised.
+                let message = "a formatting trait implementation returned an error \
+                     when the underlying stream did not";
+                self.note_panic_stamp(Value::Ref(RefTarget::value(Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        Value::Str(
+                            "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs"
+                                .to_string(),
+                        ),
+                        Value::Uint(411),
+                        Value::Uint(17),
+                    ],
+                })));
+                self.note_panic_origin(PanicOrigin::PanicFmt);
+                self.note_panic_no_backtrace(false);
+                let payload = Some(PanicPayload {
+                    ty: "&str".to_string(),
+                    value: Box::new(Value::Str(message.to_string())),
+                });
+                self.fire_panic_hook(&mut Vec::new(), 0, message, &payload);
+                Err(InterpError::panic_str_payload(message))
+            }
             Err(e) => Err(e),
         }
     }

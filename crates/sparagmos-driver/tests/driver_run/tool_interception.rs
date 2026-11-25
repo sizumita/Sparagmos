@@ -285,7 +285,12 @@ fn main() {
     assert_eq!(out.status.code(), Some(101));
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
-        "before panic\nthread 'main' panicked: artifact boom\n"
+        format!(
+            "before panic\n\nthread 'main' (1) panicked at {}:1:40:\n\
+             artifact boom\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            dir.join("panicprobe.rs").display()
+        )
     );
 
     // The built program's argv[0] is the name it was

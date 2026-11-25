@@ -31,10 +31,12 @@ pub struct SourceLine {
     pub file: u32,
     /// 1-based line number; 0 when unknown.
     pub line: u32,
+    /// 1-based column number; 0 when unknown.
+    pub col: u32,
 }
 
 impl SourceLine {
-    pub const UNKNOWN: SourceLine = SourceLine { file: u32::MAX, line: 0 };
+    pub const UNKNOWN: SourceLine = SourceLine { file: u32::MAX, line: 0, col: 0 };
 
     pub fn is_known(&self) -> bool {
         self.line != 0 && self.file != u32::MAX

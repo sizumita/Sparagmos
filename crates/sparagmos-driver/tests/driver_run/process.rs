@@ -322,11 +322,16 @@ fn run_mode_termination_report_guest_outcomes_and_tls_order() {
     assert_eq!(out.status.code(), Some(101), "panic in Debug::fmt");
     // The report's `Error: ` prefix is written before the
     // formatting starts (the native order), so it stands even
-    // though the formatting panicked: it precedes the panic
-    // line the driver prints for the run's outcome.
+    // though the formatting panicked: it precedes the panic's
+    // own report (std's default hook output, printed when the
+    // panic is raised).
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: thread 'main' panicked: fmt exploded\n"
+        format!(
+            "Error: \nthread 'main' (1) panicked at {}:6:9:\nfmt exploded\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(&dir, "err_exiting_debug.rs", RESULT_ERR_EXITING_DEBUG_SRC);
     let out = run_driver(&src);
@@ -481,7 +486,11 @@ fn run_mode_termination_report_drops_payload_and_prefix_order() {
     assert_eq!(out.status.code(), Some(101), "panic in payload Drop");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: E\nthread 'main' panicked: drop panicked\n"
+        format!(
+            "Error: E\n\nthread 'main' (1) panicked at {}:8:26:\ndrop panicked\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(&dir, "err_drop_tls_order.rs", RESULT_ERR_DROP_TLS_ORDER_SRC);
     let out = run_driver(&src);
@@ -509,7 +518,11 @@ fn run_mode_termination_report_drops_payload_and_prefix_order() {
     assert_eq!(out.status.code(), Some(101), "panic in Debug::fmt keeps prefix");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: side effect\nthread 'main' panicked: fmt panicked\n"
+        format!(
+            "Error: side effect\n\nthread 'main' (1) panicked at {}:7:9:\nfmt panicked\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            src.display()
+        )
+        .as_str()
     );
 }
 

@@ -794,6 +794,7 @@ impl Converter {
         sm::SourceLine {
             file: file_id,
             line: lines.start_line as u32,
+            col: lines.start_col as u32,
         }
     }
 

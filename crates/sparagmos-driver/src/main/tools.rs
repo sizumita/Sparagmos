@@ -1626,19 +1626,12 @@ pub(crate) fn self_run(
     }
     // A guest abort (a panic under `panic=abort`, a panic
     // escaping a cleanup, an explicit abort) ends the child
-    // driver with the abort report on the guest's stderr
-    // channel and the run's abort exit code -- 134 since the
-    // crash-class judging change gave guest crashes their
-    // own code (the guest-panic code 101 is the older
-    // representation of the same end); natively the child
-    // died on SIGABRT, and the outcome's negative-code
-    // convention carries exactly that (see
+    // driver with the run's abort exit code, 134, which only
+    // an abort produces (an unwound guest panic exits 101);
+    // natively the child died on SIGABRT, and the outcome's
+    // negative-code convention carries exactly that (see
     // `exit_status_value` in the interpreter).
-    let exit_code = if (code == 101 || code == 134)
-        && String::from_utf8_lossy(&guest_stderr)
-            .lines()
-            .any(|line| line.starts_with("thread 'main' aborted:"))
-    {
+    let exit_code = if code == 134 {
         -6 // SIGABRT
     } else {
         code

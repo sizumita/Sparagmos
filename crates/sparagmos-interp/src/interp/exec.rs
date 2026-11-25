@@ -110,6 +110,17 @@ impl<'a> Interpreter<'a> {
         // whatever the entry's outcome was.
         match self.run_tls_dtors(&mut frames, 1) {
             Ok(()) => result,
+            Err(InterpError::Panic { .. }) => {
+                // A panic in an entry-thread TLS destructor: as
+                // on any thread, std reports it as a fatal
+                // runtime error and aborts (see `run_thread`).
+                self.push_error_output(
+                    "fatal runtime error: thread local panicked on drop, aborting\n",
+                );
+                Err(InterpError::Abort {
+                    message: "thread local panicked on drop".to_string(),
+                })
+            }
             Err(e) => Err(e),
         }
     }
@@ -183,7 +194,41 @@ impl<'a> Interpreter<'a> {
                 Err(InterpError::Panic { message, payload }) => {
                     let resumed = std::mem::take(&mut self.resume_signaled);
                     if !resumed {
+                        if self.always_abort.get() {
+                            // `panic::always_abort` is in
+                            // effect: the panic prints its abort
+                            // line and the run aborts, without
+                            // the hook running (std's
+                            // MustAbort::AlwaysAbort). The
+                            // payload prints through its Display,
+                            // which is the panic's message.
+                            if !self.panic_report_suppressed.get() {
+                                let out = match self.panic_location_in(frames) {
+                                    Some((file, line, col)) => format!(
+                                        "aborting due to panic at {file}:{line}:{col}:\n{message}\n"
+                                    ),
+                                    None => {
+                                        format!("aborting due to panic:\n{message}\n")
+                                    }
+                                };
+                                self.push_error_output(&out);
+                            }
+                            return Err(InterpError::Abort {
+                                message: format!(
+                                    "panic `{message}` after `panic::always_abort`: \
+                                     the run aborts"
+                                ),
+                            });
+                        }
                         self.fire_panic_hook(frames, stop_depth, &message, &payload);
+                        if self.hook_abort.get() {
+                            return Err(InterpError::Abort {
+                                message:
+                                    "a panic raised while the panic hook was running \
+                                     aborts the run"
+                                        .to_string(),
+                            });
+                        }
                     }
                     let mut panic = InterpError::Panic { message, payload };
                     // Whether the panic was raised directly in the
@@ -205,10 +250,31 @@ impl<'a> Interpreter<'a> {
                             // A fresh panic raised by the cleanup
                             // frame itself (not one resuming into
                             // it from a callee): panicking while
-                            // unwinding aborts, natively.
+                            // unwinding aborts, natively. The
+                            // fresh panic's own report has just
+                            // been printed by the hook; std then
+                            // raises `panic_in_cleanup` (a fixed
+                            // location in core — the
+                            // `panic_nounwind_nobacktrace` call
+                            // at core/src/panicking.rs:233:5 in
+                            // the pinned 1.100.0 build — a `&str`
+                            // payload, no backtrace), whose
+                            // report and the non-unwinding line
+                            // precede the abort.
                             let InterpError::Panic { message, .. } = &panic else {
                                 unreachable!("panic is a Panic")
                             };
+                            self.fire_nounwind_abort_panic(
+                                frames,
+                                (
+                                    "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                        .to_string(),
+                                    233,
+                                    5,
+                                ),
+                                "panic in a destructor during cleanup",
+                                true,
+                            );
                             return Err(InterpError::Abort {
                                 message: format!(
                                     "panic `{message}` raised in a cleanup of `{func}`: \
@@ -318,6 +384,35 @@ impl<'a> Interpreter<'a> {
                                 let InterpError::Panic { message, .. } = &panic else {
                                     unreachable!("panic is a Panic")
                                 };
+                                if !self.config.panic_abort {
+                                    // A panic crossing a nounwind
+                                    // boundary: std raises
+                                    // `panic_cannot_unwind` there
+                                    // (a fixed location in core —
+                                    // the `panic_nounwind_fmt` call
+                                    // inside `panic_nounwind` at
+                                    // core/src/panicking.rs:225:5
+                                    // in the pinned 1.100.0 build —
+                                    // a `&str` payload), whose
+                                    // report and the non-unwinding
+                                    // line precede the abort. Under
+                                    // `-C panic=abort` the panic's
+                                    // own report is all that
+                                    // prints: the strategy aborts
+                                    // in the personality, with no
+                                    // second panic.
+                                    self.fire_nounwind_abort_panic(
+                                        frames,
+                                        (
+                                            "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                                .to_string(),
+                                            225,
+                                            5,
+                                        ),
+                                        "panic in a function that cannot unwind",
+                                        false,
+                                    );
+                                }
                                 return Err(InterpError::Abort {
                                     message: format!(
                                         "panic `{message}` may not unwind past `{func}`: \
@@ -1263,6 +1358,17 @@ impl<'a> Interpreter<'a> {
                                     match self.drop_value_sync(frames, final_state, glue) {
                                         Ok(()) => {}
                                         Err(InterpError::Panic { message, .. }) => {
+                                            self.fire_nounwind_abort_panic(
+                                                frames,
+                                                (
+                                                    "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                                        .to_string(),
+                                                    233,
+                                                    5,
+                                                ),
+                                                "panic in a destructor during cleanup",
+                                                true,
+                                            );
                                             return Err(InterpError::Abort {
                                                 message: format!(
                                                     "panic `{message}` raised while dropping \
@@ -1495,6 +1601,24 @@ impl<'a> Interpreter<'a> {
                                 }
                                 None => message.clone(),
                             };
+                            // The panic's location is the
+                            // terminator's own source position
+                            // (the operation it guards): record
+                            // it as the panic's stamp, with the
+                            // entry path a rendered backtrace
+                            // starts from, as a panic entry
+                            // point's stamp would.
+                            self.note_call_site_stamp(frames);
+                            self.note_panic_no_backtrace(false);
+                            self.note_panic_origin(PanicOrigin::Assert(match format {
+                                Some(crate::ir::AssertFormat::BoundsCheck) => {
+                                    "core::panicking::panic_bounds_check"
+                                }
+                                Some(
+                                    crate::ir::AssertFormat::MisalignedPointerDeref,
+                                ) => "core::panicking::panic_misaligned_pointer_dereference",
+                                None => "core::panicking::panic",
+                            }));
                             return Err(InterpError::panic(text));
                         }
                         Self::jump(frames, body, *target)?;
