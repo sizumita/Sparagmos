@@ -647,11 +647,14 @@ impl<'a> Converter<'a> {
     /// When a callee name denotes a `fmt` trait method (the
     /// `Display`/`Debug`/radix family), the `Self` type the
     /// call is monomorphized at, in rendered form. The name
-    /// comes in two shapes: the trait item
+    /// comes in three shapes: the trait item
     /// (`std::fmt::Debug::fmt`, whose `Self` is the call's
-    /// first generic argument) and the resolved impl instance
+    /// first generic argument), the resolved impl instance
     /// (`<std::vec::Vec<i32> as std::fmt::Debug>::fmt`, whose
-    /// `Self` is the key's subject). Foreign impl bodies of
+    /// `Self` is the key's subject), and the module-qualified
+    /// impl instance (`core::fmt::num::<impl
+    /// std::fmt::Debug for u32>::fmt`, whose `Self` is the
+    /// type the impl header's `for` introduces). Foreign impl bodies of
     /// these methods are written against the real value layout
     /// (a `Vec`'s `Debug` reads its buffer pointer out of the
     /// `RawVec`), which the value model does not reproduce, so
@@ -681,9 +684,36 @@ impl<'a> Converter<'a> {
                 .first()
                 .map(|t| self.concrete_ty_name(t));
         }
+        if let Some(self_part) = Self::impl_header_self(name) {
+            return Some(self_part);
+        }
         let rest = name.strip_prefix('<')?;
         let (self_part, trait_part) = rest.rsplit_once(" as ")?;
         let trait_path = trait_part.strip_suffix(">::fmt")?;
+        if crate::builtins::fmt_trait_method(&format!("{trait_path}::fmt")).is_none() {
+            return None;
+        }
+        Some(self_part.to_string())
+    }
+
+    /// The `Self` type named by a callee in the module-qualified
+    /// impl-instance shape (`core::fmt::num::<impl
+    /// std::fmt::Debug for u32>::fmt`): the type the impl
+    /// header's `for` introduces. An impl collected from a
+    /// foreign crate's module is keyed this way rather than by
+    /// the `<Self as Trait>` subject shape, and the integer
+    /// `fmt` impls in `core::fmt::num` — whose bodies read the
+    /// `Formatter`'s flag word directly — reach a guest body
+    /// forwarding to a field's `fmt` under exactly this name.
+    /// `None` when the name is not that shape or the header's
+    /// trait is not a `fmt` trait.
+    fn impl_header_self(name: &str) -> Option<String> {
+        // The `>::fmt` strip consumes the impl bracket's own
+        // closing `>` (it directly precedes `::fmt`), so the
+        // header tail is exactly `<Trait> for <Type>` with the
+        // type's own brackets intact.
+        let inner = name.strip_suffix(">::fmt")?.rsplit_once("::<impl ")?.1;
+        let (trait_path, self_part) = inner.rsplit_once(" for ")?;
         if crate::builtins::fmt_trait_method(&format!("{trait_path}::fmt")).is_none() {
             return None;
         }
