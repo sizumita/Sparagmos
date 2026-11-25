@@ -1,0 +1,1044 @@
+//! Process spawning, child processes and stdio configuration.
+
+
+
+use crate::error::{InterpError, InterpResult};
+use crate::interp::{
+    Frame, Interpreter,
+};
+use crate::value::Value;
+
+use super::*;
+
+impl<'a> Interpreter<'a> {
+    /// The command id a process-command receiver denotes: the
+    /// receiver is a reference to the handle value the
+    /// `Command::new` builtin returned (possibly reached through
+    /// the public `Command`'s `inner` field projection).
+    pub(super) fn command_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let resolved = self.resolve_value(frames, value)?;
+        command_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a process command handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
+    /// The child-table id of the `Child` handle a builtin
+    /// call received (as receiver, by reference or by value).
+    pub(super) fn child_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let resolved = self.resolve_value(frames, value)?;
+        child_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a process child handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
+    /// The barrier-table id a `Barrier` handle value
+    /// denotes: resolve the reference and read the id out of
+    /// the handle (see `barrier_value`).
+    pub(super) fn barrier_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let target = self.deref_value(frames, value)?;
+        let resolved = self.read_resolved(frames, &target)?;
+        barrier_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a barrier handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
+    /// Run this command to completion through the process
+    /// host, in the shape of a tool outcome (see
+    /// `tool_outcome`). `None` when no host is configured (the
+    /// caller keeps the standing answer); `Some(Err(value))`
+    /// when starting the child failed the way std reports it
+    /// (the value is the guest's `io::Error`).
+    pub(super) fn host_outcome(
+        &self,
+        state: &crate::interp::CommandState,
+        output_captured: bool,
+    ) -> InterpResult<Option<Result<crate::interp::ToolRunOutcome, Value>>> {
+        let Some(host) = self.process_host() else {
+            return Ok(None);
+        };
+        check_host_stdio(state)?;
+        let request = process_spawn_request(state, output_captured);
+        match host.0.run(&request) {
+            Ok(outcome) => Ok(Some(Ok(crate::interp::ToolRunOutcome {
+                exit_code: outcome.exit_code,
+                stdout: outcome.stdout,
+                stderr: outcome.stderr,
+            }))),
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                Ok(Some(Err(host_io_error(&e))))
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                Err(unsupported(reason))
+            }
+        }
+    }
+
+    /// Start this command's program through the process host
+    /// and register the child, returning the guest's
+    /// `io::Result<Child>` value. `None` when no host is
+    /// configured (the caller keeps the standing answer).
+    pub(super) fn host_spawn(
+        &self,
+        state: &crate::interp::CommandState,
+    ) -> InterpResult<Option<Value>> {
+        let Some(host) = self.process_host() else {
+            return Ok(None);
+        };
+        check_host_stdio(state)?;
+        let request = process_spawn_request(state, false);
+        match host.0.spawn(&request) {
+            Ok(spawned) => {
+                // The child's pipe ends join the file table;
+                // the guest's `Child` value carries a handle
+                // value for each stream it configured piped
+                // (the only slots std fills), while the entry
+                // keeps every end for collection and relay.
+                let stdin_file =
+                    spawned.stdin.map(|file| self.register_file(file));
+                let stdout_file =
+                    spawned.stdout.map(|file| self.register_file(file));
+                let stderr_file =
+                    spawned.stderr.map(|file| self.register_file(file));
+                let stdin_slot = (state.stdin_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stdin_file)
+                .flatten();
+                let stdout_slot = (state.stdout_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stdout_file)
+                .flatten();
+                let stderr_slot = (state.stderr_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stderr_file)
+                .flatten();
+                let id = self.new_child(crate::interp::ChildState {
+                    host_id: spawned.host_id,
+                    pid: spawned.pid,
+                    stdout_stdio: state.stdout_stdio,
+                    stderr_stdio: state.stderr_stdio,
+                    stdin_file,
+                    stdout_file,
+                    stderr_file,
+                    finished: None,
+                    relayed: false,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    drains: Vec::new(),
+                });
+                Ok(Some(ok_result(child_value(
+                    id,
+                    stdin_slot,
+                    stdout_slot,
+                    stderr_slot,
+                ))))
+            }
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                Ok(Some(err_result(host_io_error(&e))))
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                Err(unsupported(reason))
+            }
+        }
+    }
+
+    /// Which of the guest `Child` value's stdio slots still
+    /// hold their handle (a `Some` slot the guest has not
+    /// taken out). The blocking child operations act on the
+    /// handles the `Child` itself still holds -- std drops
+    /// its stdin handle before waiting, and `wait_with_output`
+    /// collects the streams it still holds -- so they consult
+    /// the receiver value's slots.
+    pub(super) fn child_slots_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(bool, bool, bool)> {
+        let resolved = self.resolve_value(frames, value)?;
+        let present =
+            |slot: &Value| matches!(slot, Value::Enum { variant: 1, .. });
+        Ok(match &resolved {
+            Value::Enum { fields, .. } if fields.len() == 4 => (
+                present(&fields[1]),
+                present(&fields[2]),
+                present(&fields[3]),
+            ),
+            _ => (false, false, false),
+        })
+    }
+
+    /// Start collecting the child's stream bytes on drain
+    /// threads for the streams this observation needs: an
+    /// inherited (relayed) stream, and a piped stream whose
+    /// handle the `Child` still holds (a taken stream belongs
+    /// to the guest, which reads it itself). Collection runs
+    /// alongside the child, so a child that fills its pipes
+    /// is never starved by a parent blocked in `wait`, as
+    /// std's own collection runs alongside.
+    fn child_start_drains(&self, id: u64, slots: (bool, bool, bool)) {
+        let Some((out_file, err_file, out_cfg, err_cfg, started)) =
+            self.with_child(id, |state| {
+                (
+                    state.stdout_file,
+                    state.stderr_file,
+                    state.stdout_stdio,
+                    state.stderr_stdio,
+                    (
+                        state.drains.iter().any(|(is_err, _)| !*is_err),
+                        state.drains.iter().any(|(is_err, _)| *is_err),
+                    ),
+                )
+            })
+        else {
+            return;
+        };
+        let mut drains = Vec::new();
+        for (is_err, file, cfg, slot, already) in [
+            (false, out_file, out_cfg, slots.1, started.0),
+            (true, err_file, err_cfg, slots.2, started.1),
+        ] {
+            let wanted = stdio_route(cfg, false) == StdioRoute::Relay
+                || (cfg == Some(crate::interp::StdioConfig::Piped) && slot);
+            if already || !wanted {
+                continue;
+            }
+            let Some(file_id) = file else { continue };
+            let Some(Ok(mut clone)) =
+                self.with_file(file_id, |file| file.try_clone())
+            else {
+                continue;
+            };
+            drains.push((
+                is_err,
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ =
+                        std::io::Read::read_to_end(&mut clone, &mut bytes);
+                    bytes
+                }),
+            ));
+        }
+        if !drains.is_empty() {
+            self.with_child(id, |state| state.drains.extend(drains));
+        }
+    }
+
+    /// Move finished drain threads' bytes into the child's
+    /// collected buffers; with `join_all`, wait for every
+    /// drain (a blocking call's collection completes there).
+    /// Returns whether no drain remains in flight.
+    fn child_pump_drains(&self, id: u64, join_all: bool) -> bool {
+        let mut handles = Vec::new();
+        let remaining = self
+            .with_child(id, |state| {
+                let mut kept = Vec::new();
+                for drain in std::mem::take(&mut state.drains) {
+                    if join_all || drain.1.is_finished() {
+                        handles.push(drain);
+                    } else {
+                        kept.push(drain);
+                    }
+                }
+                let remaining = !kept.is_empty();
+                state.drains = kept;
+                remaining
+            })
+            .unwrap_or(false);
+        for (is_err, handle) in handles {
+            let bytes = handle.join().unwrap_or_default();
+            self.with_child(id, |state| {
+                if is_err {
+                    state.stderr.extend_from_slice(&bytes);
+                } else {
+                    state.stdout.extend_from_slice(&bytes);
+                }
+            });
+        }
+        !remaining
+    }
+
+    /// Relay the child's inherited streams into the guest's
+    /// own streams, once their collected bytes are complete:
+    /// the end observed and every drain collected.
+    fn child_relay(&mut self, id: u64) {
+        let Some((finished, relayed, drained, out_cfg, err_cfg)) =
+            self.with_child(id, |state| {
+                (
+                    state.finished.is_some(),
+                    state.relayed,
+                    state.drains.is_empty(),
+                    state.stdout_stdio,
+                    state.stderr_stdio,
+                )
+            })
+        else {
+            return;
+        };
+        if !finished || relayed || !drained {
+            return;
+        }
+        let (stdout, stderr) = self
+            .with_child(id, |state| {
+                (state.stdout.clone(), state.stderr.clone())
+            })
+            .expect("child entry present");
+        if stdio_route(out_cfg, false) == StdioRoute::Relay {
+            self.push_output(&String::from_utf8_lossy(&stdout));
+        }
+        if stdio_route(err_cfg, false) == StdioRoute::Relay {
+            self.push_error_output(&String::from_utf8_lossy(&stderr));
+        }
+        self.with_child(id, |state| state.relayed = true);
+    }
+
+    /// Observe the end of the child with the given id,
+    /// waiting for it when `block` is set. A blocking call
+    /// first closes the stdin end the `Child` still holds
+    /// (std's `wait` / `wait_with_output` drop that handle
+    /// before waiting, so a child reading its stdin to the
+    /// end sees EOF) and starts collecting the streams the
+    /// `Child` still holds; on the first observation of the
+    /// end, the inherited streams are relayed into the
+    /// guest's own streams once their bytes are collected,
+    /// and the exit code is cached, so every later
+    /// observation answers with the same status, as std's
+    /// cached status does.
+    pub(super) fn child_finish(
+        &mut self,
+        id: u64,
+        block: bool,
+        slots: (bool, bool, bool),
+    ) -> InterpResult<ChildWait> {
+        let Some((host_id, finished)) = self.with_child(id, |state| {
+            (state.host_id, state.finished)
+        }) else {
+            return Err(unsupported(
+                "call on a stale child handle".to_string(),
+            ));
+        };
+        if block && slots.0 {
+            if let Some(stdin_file) = self
+                .with_child(id, |state| state.stdin_file.take())
+                .flatten()
+            {
+                self.file_handle_closed(stdin_file);
+            }
+        }
+        if let Some(code) = finished {
+            self.child_start_drains(id, slots);
+            self.child_pump_drains(id, block);
+            self.child_relay(id);
+            return Ok(ChildWait::Finished(code));
+        }
+        let host = self.process_host().cloned().ok_or_else(|| {
+            unsupported("child process without a process host".to_string())
+        })?;
+        if block {
+            self.child_start_drains(id, slots);
+        }
+        let outcome = if block {
+            host.0.wait(host_id).map(Some)
+        } else {
+            host.0.try_wait(host_id)
+        };
+        let code = match outcome {
+            Ok(Some(code)) => code,
+            Ok(None) => return Ok(ChildWait::Running),
+            Err(crate::interp::ProcessHostError::Io(e)) => {
+                return Ok(ChildWait::IoError(host_io_error(&e)));
+            }
+            Err(crate::interp::ProcessHostError::Failed(reason)) => {
+                return Err(unsupported(reason));
+            }
+        };
+        self.with_child(id, |state| state.finished = Some(code));
+        self.child_start_drains(id, slots);
+        self.child_pump_drains(id, block);
+        self.child_relay(id);
+        Ok(ChildWait::Finished(code))
+    }
+}
+
+/// `Ok(value)` in the value model.
+/// The initial builder state for a command over `program`.
+pub(super) fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState {
+    crate::interp::CommandState {
+        saw_nul: program.contains(&0),
+        program,
+        args: Vec::new(),
+        argv0: None,
+        envs: Vec::new(),
+        env_clear: false,
+        cwd: None,
+        stdout_stdio: None,
+        stderr_stdio: None,
+        stdin_stdio: None,
+    }
+}
+
+/// The command id a handle value carries, at whichever nesting
+/// the value arrives with (the bare handle, or the handle inside
+/// the public `Command` aggregate).
+fn command_handle_id(value: &Value) -> Option<u64> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Uint(id) => return Some(*id as u64),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(super) const ERROR_KIND_INVALID_INPUT: u32 = 20;
+/// The `errno` for a missing file or directory.
+const ERRNO_NOT_FOUND: i32 = 2;
+/// The `errno` for a permission failure.
+const ERRNO_PERMISSION_DENIED: i32 = 13;
+/// The `errno` for a path component that is not a directory.
+const ERRNO_NOT_A_DIRECTORY: i32 = 20;
+
+/// Whether `candidate` could be executed as a program: it must
+/// exist, not be a directory, and carry an execute bit. The
+/// error is the `errno` the native spawn reports for it.
+fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(candidate) {
+        Ok(m) if m.is_dir() => Err(ERRNO_PERMISSION_DENIED),
+        Ok(m) if m.permissions().mode() & 0o111 == 0 => Err(ERRNO_PERMISSION_DENIED),
+        Ok(_) => Ok(()),
+        Err(_) => Err(ERRNO_NOT_FOUND),
+    }
+}
+
+/// Resolve a command's program the way `execvp` does at spawn:
+/// a program containing a path separator is used as-is
+/// (relative to the child's working directory when one is set);
+/// any other program is searched along the effective `PATH`
+/// (the command's own `PATH` entry wins over the inherited one,
+/// as in std's environment capture). `Ok` is the path the
+/// search settled on -- the program the invocation denotes,
+/// which a bare name under a command-specific `PATH` owes to
+/// the search, not to the working directory; `Err` is the
+/// `errno` the failed spawn reports.
+fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::PathBuf, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let program = std::ffi::OsStr::from_bytes(&state.program);
+    if state.program.contains(&b'/') {
+        let candidate = if state.program.starts_with(b"/") {
+            std::path::PathBuf::from(program)
+        } else {
+            match &state.cwd {
+                Some(cwd) => {
+                    std::path::Path::new(std::ffi::OsStr::from_bytes(cwd)).join(program)
+                }
+                None => std::path::PathBuf::from(program),
+            }
+        };
+        return check_executable(&candidate).map(|()| candidate);
+    }
+    // The effective PATH: the inherited environment with the
+    // command's entries applied in order.
+    let mut path_var: Option<Vec<u8>> =
+        std::env::var_os("PATH").map(|v| v.as_bytes().to_vec());
+    if state.env_clear {
+        path_var = None;
+    }
+    for (key, value) in &state.envs {
+        if key == b"PATH" {
+            path_var = value.clone();
+        }
+    }
+    let search: Vec<u8> = path_var.unwrap_or_else(|| b"/bin:/usr/bin".to_vec());
+    let mut denied = false;
+    for dir in std::env::split_paths(std::ffi::OsStr::from_bytes(&search)) {
+        let candidate = dir.join(program);
+        match check_executable(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(ERRNO_PERMISSION_DENIED) => denied = true,
+            Err(_) => {}
+        }
+    }
+    Err(if denied {
+        ERRNO_PERMISSION_DENIED
+    } else {
+        ERRNO_NOT_FOUND
+    })
+}
+
+/// The `io::Error` a spawn of this command fails with, if it
+/// fails before any program starts: a NUL byte in the program
+/// or an argument is std's `InvalidInput` const error, a bad
+/// working directory fails the spawn's `chdir`, and an
+/// unresolvable program fails the `exec`. `None` means the
+/// program would start — which the process model does not do,
+/// so the caller reports it as a named unsupported error.
+/// The spawn gate for a command: the `io::Error` the spawn
+/// fails with, if it fails at all. A program the run's tool
+/// interception claims by name is exempt from the filesystem
+/// resolution `process_spawn_error` performs: the host side
+/// has taken responsibility for that program, so whether it
+/// can start is the host's call. The claimed name in a plain
+/// run is the guest's own program -- a source path, which the
+/// filesystem check would refuse as not executable even
+/// though the host runs it by re-interpreting the source.
+pub(super) fn spawn_gate_error(
+    interception: Option<&crate::interp::ToolInterception>,
+    state: &crate::interp::CommandState,
+) -> Option<Value> {
+    if let Some(interception) = interception {
+        if interception.programs.iter().any(|p| p == &state.program) {
+            return None;
+        }
+    }
+    process_spawn_error(state)
+}
+
+fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
+    use std::os::unix::ffi::OsStrExt;
+    if state.saw_nul {
+        return Some(io_simple_error_value(ERROR_KIND_INVALID_INPUT));
+    }
+    if let Some(cwd) = &state.cwd {
+        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(cwd));
+        match std::fs::metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Some(io_os_error_value(ERRNO_NOT_A_DIRECTORY)),
+            Err(_) => return Some(io_os_error_value(ERRNO_NOT_FOUND)),
+        }
+    }
+    match resolve_program(state) {
+        Ok(_) => None,
+        Err(code) => Some(io_os_error_value(code)),
+    }
+}
+
+/// The OS error function table the model answers for
+/// `get_os_functions`: std's unix entries, by name (all three
+/// entries are the builtins above).
+pub(super) fn os_functions_table() -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::FnPtr("std::sys::io::error::unix::format_error".to_string()),
+            Value::FnPtr("std::sys::io::error::unix::decode_error_kind".to_string()),
+            Value::FnPtr("std::sys::io::error::unix::is_interrupted".to_string()),
+        ],
+    }
+}
+
+/// std's unix `decode_error_kind`: the `ErrorKind` discriminant
+/// for an `errno` (Linux values). Mirrors the table in
+/// `std::sys::io::error::unix` entry for entry; anything not
+/// listed is `Uncategorized` (43).
+pub(super) fn decode_error_kind_unix(errno: i32) -> u32 {
+    match errno {
+        7 => 34,   // E2BIG -> ArgumentListTooLong
+        98 => 8,   // EADDRINUSE -> AddrInUse
+        99 => 9,   // EADDRNOTAVAIL -> AddrNotAvailable
+        16 => 28,  // EBUSY -> ResourceBusy
+        103 => 6,  // ECONNABORTED -> ConnectionAborted
+        111 => 2,  // ECONNREFUSED -> ConnectionRefused
+        104 => 3,  // ECONNRESET -> ConnectionReset
+        35 => 30,  // EDEADLK -> Deadlock
+        122 => 26, // EDQUOT -> QuotaExceeded
+        17 => 12,  // EEXIST -> AlreadyExists
+        27 => 27,  // EFBIG -> FileTooLarge
+        113 => 4,  // EHOSTUNREACH -> HostUnreachable
+        4 => 35,   // EINTR -> Interrupted
+        22 => 20,  // EINVAL -> InvalidInput
+        21 => 15,  // EISDIR -> IsADirectory
+        40 => 18,  // ELOOP -> FilesystemLoop
+        2 => 0,    // ENOENT -> NotFound
+        12 => 38,  // ENOMEM -> OutOfMemory
+        28 => 24,  // ENOSPC -> StorageFull
+        31 => 32,  // EMLINK -> TooManyLinks
+        36 => 33,  // ENAMETOOLONG -> InvalidFilename
+        100 => 10, // ENETDOWN -> NetworkDown
+        101 => 5,  // ENETUNREACH -> NetworkUnreachable
+        107 => 7,  // ENOTCONN -> NotConnected
+        20 => 14,  // ENOTDIR -> NotADirectory
+        39 => 16,  // ENOTEMPTY -> DirectoryNotEmpty
+        32 => 11,  // EPIPE -> BrokenPipe
+        30 => 17,  // EROFS -> ReadOnlyFilesystem
+        29 => 25,  // ESPIPE -> NotSeekable
+        116 => 19, // ESTALE -> StaleNetworkFileHandle
+        110 => 22, // ETIMEDOUT -> TimedOut
+        26 => 29,  // ETXTBSY -> ExecutableFileBusy
+        18 => 31,  // EXDEV -> CrossesDevices
+        115 => 39, // EINPROGRESS -> InProgress
+        24 | 23 => 40, // EMFILE | ENFILE -> TooManyOpenFiles
+        5 => 41,   // EIO -> InputOutputError
+        13 | 1 => 1, // EACCES | EPERM -> PermissionDenied
+        38 => 36,  // ENOSYS -> Unsupported
+        95 => 36,  // EOPNOTSUPP / ENOTSUP -> Unsupported
+        11 => 13,  // EAGAIN / EWOULDBLOCK -> WouldBlock
+        _ => 43,   // Uncategorized
+    }
+}
+
+pub(super) fn ok_result(value: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![value],
+    }
+}
+
+/// `Err(value)` in the value model.
+pub(super) fn err_result(value: Value) -> Value {
+    Value::Enum {
+        variant: 1,
+        fields: vec![value],
+    }
+}
+
+/// The `str::Utf8Error` value for a host validation failure:
+/// the struct's `valid_up_to` and `error_len` fields, in the
+/// model's aggregate shape.
+pub(super) fn utf8_error_value(error: &std::str::Utf8Error) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Uint(u128::from(error.valid_up_to() as u64)),
+            match error.error_len() {
+                Some(n) => Value::Enum {
+                    variant: 1,
+                    fields: vec![Value::Uint(n as u128)],
+                },
+                None => Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+            },
+        ],
+    }
+}
+
+/// A one-field handle value carrying an id: the shape of the
+/// thread model's `JoinHandle` / `Thread` / `ThreadId` values and
+/// of the mpsc `Sender` / `Receiver` handle values.
+pub(super) fn id_handle(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Uint(u128::from(id))],
+    }
+}
+
+/// A join handle value: `JoinHandle { inner: JoinInner }`, the
+/// inner value being the one-field handle of the thread id.
+/// Optimizing MIR moves field 0 (the `JoinInner`) out of the
+/// handle and calls `JoinInner::join` on it directly, so the
+/// nesting is observable: the inner value must have the
+/// `JoinInner` type's shape, not the bare id.
+pub(super) fn join_handle_value(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![id_handle(id)],
+    }
+}
+
+/// The thread id a join handle value carries, at whichever
+/// nesting the value arrives with: the `JoinHandle` aggregate,
+/// the `JoinInner` moved out of it, or the bare id.
+pub(super) fn join_handle_id(value: &Value) -> Option<u64> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Uint(id) => return Some(*id as u64),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The thread name a `std::thread::Builder` value carries (its
+/// first field, an `Option<String>` in the real field shape), as
+/// host text. `None` for an unnamed builder or a value of an
+/// unexpected shape.
+pub(super) fn builder_thread_name(builder: &Value) -> Option<String> {
+    let Value::Enum { variant: 0, fields } = builder else {
+        return None;
+    };
+    let name_field = fields.first()?;
+    let Value::Enum {
+        variant: 1,
+        fields: name_fields,
+    } = name_field
+    else {
+        return None;
+    };
+    let bytes = string_aggregate_bytes(name_fields.first()?)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Run the configured tool runner for this command, when the
+/// command's program is one of the intercepted tool programs --
+/// or, for any other program, the interception's fallback
+/// runner when one is configured (the host side answers for
+/// artifacts the guest itself produced earlier in the run).
+/// `None` when no interception applies, in which case the
+/// caller keeps the process model's standing answer. A runner
+/// error becomes the run's unsupported error: the tool ran the
+/// invocation and reported it cannot be carried out.
+pub(super) fn tool_outcome(
+    interception: Option<&crate::interp::ToolInterception>,
+    state: &crate::interp::CommandState,
+    output_captured: bool,
+) -> InterpResult<Option<crate::interp::ToolRunOutcome>> {
+    let Some(interception) = interception else {
+        return Ok(None);
+    };
+    let runner = if interception.programs.iter().any(|p| p == &state.program) {
+        &interception.runner
+    } else if let Some(fallback) = &interception.fallback {
+        fallback
+    } else {
+        return Ok(None);
+    };
+    // The path the spawn resolution settled on rides along:
+    // the host side looks its answer up by it, so a bare
+    // program name invoked under a command-specific `PATH`
+    // reaches the artifact that search found, not a
+    // namesake in the working directory (see
+    // `ToolRunRequest::resolved_program`). Both callers run
+    // this only after the spawn gate has accepted the
+    // command, so the resolution is the one that succeeded.
+    use std::os::unix::ffi::OsStrExt as _;
+    let resolved_program = resolve_program(state)
+        .ok()
+        .map(|path| path.as_os_str().as_bytes().to_vec());
+    let request = crate::interp::ToolRunRequest {
+        program: state.program.clone(),
+        args: state.args.clone(),
+        argv0: state.argv0.clone(),
+        envs: state.envs.clone(),
+        env_clear: state.env_clear,
+        cwd: state.cwd.clone(),
+        resolved_program,
+        output_captured,
+    };
+    match (runner.0)(&request) {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(reason) => Err(unsupported(reason)),
+    }
+}
+
+/// The result of observing a child's end (see
+/// `Interpreter::child_finish`).
+pub(super) enum ChildWait {
+    Running,
+    Finished(i32),
+    IoError(Value),
+}
+
+/// The spawn request a command denotes, for the process
+/// host: the recorded builder state, the interpreter's own
+/// resolution of the program, and the stdio wiring the entry
+/// point settles on -- `output` pipes the streams it
+/// collects and nulls the child's stdin, `status` / `spawn`
+/// inherit what the guest did not configure.
+fn process_spawn_request(
+    state: &crate::interp::CommandState,
+    output_captured: bool,
+) -> crate::interp::ProcessSpawnRequest {
+    use crate::interp::ProcessStdio;
+    let wire = |config: Option<crate::interp::StdioConfig>,
+                default: ProcessStdio|
+     -> ProcessStdio {
+        match config {
+            Some(crate::interp::StdioConfig::Inherit) => {
+                ProcessStdio::Inherit
+            }
+            Some(crate::interp::StdioConfig::Null) => ProcessStdio::Null,
+            Some(crate::interp::StdioConfig::Piped) => ProcessStdio::Piped,
+            // Rejected by the caller's stdio check before the
+            // request is built; inherit is the neutral wire.
+            Some(crate::interp::StdioConfig::Unmodelled) => {
+                ProcessStdio::Inherit
+            }
+            None => default,
+        }
+    };
+    use std::os::unix::ffi::OsStrExt as _;
+    crate::interp::ProcessSpawnRequest {
+        program: state.program.clone(),
+        args: state.args.clone(),
+        argv0: state.argv0.clone(),
+        envs: state.envs.clone(),
+        env_clear: state.env_clear,
+        cwd: state.cwd.clone(),
+        resolved_program: resolve_program(state)
+            .ok()
+            .map(|path| path.as_os_str().as_bytes().to_vec()),
+        stdin: wire(
+            state.stdin_stdio,
+            if output_captured {
+                ProcessStdio::Null
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+        stdout: wire(
+            state.stdout_stdio,
+            if output_captured {
+                ProcessStdio::Piped
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+        stderr: wire(
+            state.stderr_stdio,
+            if output_captured {
+                ProcessStdio::Piped
+            } else {
+                ProcessStdio::Inherit
+            },
+        ),
+    }
+}
+
+/// Reject an invocation the process host cannot wire: a
+/// stdio configuration the model does not decode (see
+/// `check_stdio_modelled`, which covers the output streams
+/// for the tool model; the host also wires the child's
+/// stdin, so its configuration is checked here too).
+fn check_host_stdio(
+    state: &crate::interp::CommandState,
+) -> InterpResult<()> {
+    for config in [
+        state.stdin_stdio,
+        state.stdout_stdio,
+        state.stderr_stdio,
+    ] {
+        if config == Some(crate::interp::StdioConfig::Unmodelled) {
+            return Err(unsupported(
+                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A `std::process::Child` value denoting child-table id
+/// `id`: the handle -- the sys `Process` value, the id in
+/// its first slot and the not-yet-observed status slot
+/// empty -- and the three stdio handle slots. A stream the
+/// guest configured piped carries its handle value: the
+/// pipe end's file-table id under the handle wrapper chain
+/// (see `file_value`), so the guest reads and writes the
+/// pipe through the ordinary file model, and dropping the
+/// handle closes its end. A stream wired any other way
+/// leaves its slot empty, as std leaves it.
+fn child_value(
+    id: u64,
+    stdin: Option<u64>,
+    stdout: Option<u64>,
+    stderr: Option<u64>,
+) -> Value {
+    let slot = |file: Option<u64>| match file {
+        Some(file_id) => some_value(file_value(file_id)),
+        None => none_value(),
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(u128::from(id)), none_value()],
+            },
+            slot(stdin),
+            slot(stdout),
+            slot(stderr),
+        ],
+    }
+}
+
+/// A `Cow<str>` value over the given bytes: borrowed when
+/// they are valid UTF-8, owned with replacement characters
+/// otherwise (the host `from_utf8_lossy` semantics); in this
+/// model both variants carry the string data itself.
+pub(super) fn cow_str_value(bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::Enum {
+            variant: 0,
+            fields: vec![Value::Str(text.to_string())],
+        },
+        Err(_) => Value::Enum {
+            variant: 1,
+            fields: vec![Value::Str(
+                String::from_utf8_lossy(bytes).into_owned(),
+            )],
+        },
+    }
+}
+
+/// A `Vec<u8>` value: the element-list aggregate the
+/// interpreter uses for vectors.
+pub(super) fn byte_vec_value(bytes: &[u8]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: bytes.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
+    }
+}
+
+/// An `OsString` value in std's shape: `OsString { inner: Buf {
+/// inner: Vec<u8> } }`, the same nesting `pathbuf_value` builds
+/// for the `OsString` inside a `PathBuf`.
+pub(super) fn os_string_value(bytes: &[u8]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![byte_vec_value(bytes)],
+        }],
+    }
+}
+
+/// A `std::process::ExitStatus` value: the platform wait
+/// status in std's own layout (the outer struct wraps the sys
+/// status struct, which wraps the raw `c_int`). An exited
+/// process's raw status carries its code in the high byte; a
+/// process ended by a signal carries the signal number in the
+/// low byte, as `waitpid` reports it. The guest's own
+/// `ExitStatus::code` body decodes it from there.
+pub(super) fn exit_status_value(exit_code: i32) -> Value {
+    let raw: i32 = if exit_code >= 0 {
+        exit_code << 8
+    } else {
+        -exit_code
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Int(i128::from(raw))],
+        }],
+    }
+}
+
+/// A `std::process::Output` value: the exit status and the two
+/// captured byte vectors, in declaration order.
+/// The `Stdio` configuration a stdio argument value
+/// denotes. The public `std::process::Stdio` is a one-field
+/// wrapper over the sys enum (`Inherit` 0, `Null` 1,
+/// `MakePipe` 2, `Fd` 3); the sys-level setter receives the
+/// sys value unwrapped. Anything the model does not decode
+/// -- the `Fd` form included -- is
+/// [`StdioConfig::Unmodelled`](crate::interp::StdioConfig::Unmodelled).
+fn stdio_config_of(value: &Value) -> crate::interp::StdioConfig {
+    use crate::interp::StdioConfig;
+    let inner = match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+        other => other,
+    };
+    match inner {
+        Value::Enum { variant: 0, fields } if fields.is_empty() => StdioConfig::Inherit,
+        Value::Enum { variant: 1, fields } if fields.is_empty() => StdioConfig::Null,
+        Value::Enum { variant: 2, fields } if fields.is_empty() => StdioConfig::Piped,
+        _ => StdioConfig::Unmodelled,
+    }
+}
+
+/// Record a stdio setter's configuration on the command it
+/// names: the builtin's own name says which stream it
+/// configures. The stdin configuration is recorded for the
+/// process host's wiring (the tool model never feeds a
+/// child's stdin and ignores it).
+pub(super) fn record_stdio_config(state: &mut crate::interp::CommandState, name: &str, value: &Value) {
+    let config = stdio_config_of(value);
+    if name.ends_with("::stdout") {
+        state.stdout_stdio = Some(config);
+    } else if name.ends_with("::stderr") {
+        state.stderr_stdio = Some(config);
+    } else if name.ends_with("::stdin") {
+        state.stdin_stdio = Some(config);
+    }
+}
+
+/// Reject an invocation whose stdio configuration the
+/// model does not route (see `StdioConfig::Unmodelled`):
+/// running it with a guessed routing would expose output
+/// the guest configured away, or hide output it kept.
+pub(super) fn check_stdio_modelled(state: &crate::interp::CommandState) -> InterpResult<()> {
+    for config in [state.stdout_stdio, state.stderr_stdio] {
+        if config == Some(crate::interp::StdioConfig::Unmodelled) {
+            return Err(unsupported(
+                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where one stream's bytes go for an invocation, under
+/// its configuration: `output` collects the streams it
+/// pipes, `status` relays the streams it inherits, and a
+/// stream redirected to null -- or, for `status`, to a
+/// pipe nobody reads -- goes nowhere observable. An
+/// unmodelled configuration never reaches the routing
+/// (`check_stdio_modelled` rejects it first); it is
+/// grouped with the discards defensively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StdioRoute {
+    Collect,
+    Relay,
+    Discard,
+}
+
+pub(super) fn stdio_route(
+    config: Option<crate::interp::StdioConfig>,
+    output_captured: bool,
+) -> StdioRoute {
+    use crate::interp::StdioConfig;
+    match (config, output_captured) {
+        (Some(StdioConfig::Null), _) | (Some(StdioConfig::Unmodelled), _) => {
+            StdioRoute::Discard
+        }
+        (Some(StdioConfig::Piped), false) => StdioRoute::Discard,
+        (Some(StdioConfig::Piped), true) | (None, true) => StdioRoute::Collect,
+        (Some(StdioConfig::Inherit), _) | (None, false) => StdioRoute::Relay,
+    }
+}
+
+pub(super) fn process_output_value(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            exit_status_value(exit_code),
+            byte_vec_value(stdout),
+            byte_vec_value(stderr),
+        ],
+    }
+}

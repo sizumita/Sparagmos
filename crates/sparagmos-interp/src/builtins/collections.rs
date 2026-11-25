@@ -1,0 +1,597 @@
+//! Vec/VecDeque/Box storage construction for the collection builtins.
+
+
+
+use crate::error::{InterpError, InterpResult};
+use crate::interp::{
+    box_alloc_pointer,
+    Frame, Interpreter,
+};
+use crate::ir::Ty;
+use crate::value::{RefTarget, Value};
+
+use super::*;
+
+impl<'a> Interpreter<'a> {
+    /// Take the pointee out of a `Box` value a conversion
+    /// consumes (`From<Box<T>>` and its kin): the box aggregate
+    /// `new_box` builds, over the allocation holding the
+    /// pointee. The box's allocation is released — the box is
+    /// gone once its pointee has moved out — and the pointee is
+    /// returned. `None` when the value is not a box over a live
+    /// allocation, or the box pointer carries a projection.
+    pub(super) fn unbox_take(&self, value: &Value) -> Option<Value> {
+        let (id, projection) = box_alloc_pointer(value)?;
+        if !projection.is_empty() {
+            return None;
+        }
+        let pointee = self.alloc_value(id)?;
+        self.free_alloc(id);
+        Some(pointee)
+    }
+
+    /// The `Box<[T]>` a sequence value's elements move into: the
+    /// element tuple in a fresh allocation, with the slice
+    /// pointee type recorded when known. This is the shape
+    /// `Vec::into_boxed_slice` builds and every slice consumer
+    /// of a boxed slice (indexing, iteration, `Debug`, comparison)
+    /// reads, so all construction paths that produce a boxed
+    /// slice go through here. A sparse vector contributes its
+    /// declared elements: the stored prefix, plus the
+    /// uninitialised tail when the length runs past it
+    /// (materialised up to the same limit `Vec::set_len` uses).
+    pub(super) fn boxed_slice_value(
+        &self,
+        value: Value,
+        pointee_ty: Option<Ty>,
+        context: &'static str,
+    ) -> InterpResult<Value> {
+        let boxed = match value {
+            Value::Enum { fields, .. } => self.new_box(Value::Tuple(fields)),
+            Value::SparseVec { mut elems, len, .. } => {
+                let len = usize::try_from(len).map_err(|_| {
+                    unsupported(format!(
+                        "{context} on a vector whose elements are not materialised"
+                    ))
+                })?;
+                if len > elems.len() && len > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(unsupported(format!(
+                        "{context} on a vector whose elements are not materialised"
+                    )));
+                }
+                elems.truncate(len);
+                if elems.len() < len {
+                    elems.resize(len, Value::Uninit);
+                }
+                self.new_box(Value::Tuple(elems))
+            }
+            Value::Tuple(items) => self.new_box(Value::Tuple(items)),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    context,
+                    "vector value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if let Some(ty) = pointee_ty {
+            self.record_box_ty(&boxed, ty);
+        }
+        Ok(boxed)
+    }
+}
+
+impl<'a> Interpreter<'a> {
+    /// Semantic (derived `PartialEq`) equality of two values:
+    /// references are followed to the data they denote and aggregates
+    /// compare element-wise. This is the equality of the *data*, not
+    /// of the representation — exactly what the derived `PartialEq`
+    /// impls of the modelled types compute.
+    /// The logical element sequence of a `VecDeque` value (the
+    /// real aggregate: wrapped head index, length, and the ring
+    /// buffer), in iteration order, when the value has exactly
+    /// that shape; `None` for any other value, and for a deque
+    /// whose buffer slots cannot be read back (a physical slot
+    /// of the logical range was never written -- not a state a
+    /// well-formed deque reaches). The buffer's physical layout
+    /// is not part of the sequence.
+    pub(crate) fn vec_deque_elements(
+        &self,
+        value: &Value,
+    ) -> InterpResult<Option<Vec<Value>>> {
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        if fields.len() != 3 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: head_fields, ..
+        } = &fields[0]
+        else {
+            return Ok(None);
+        };
+        let [Value::Uint(head)] = head_fields.as_slice() else {
+            return Ok(None);
+        };
+        let Value::Uint(len) = fields[1] else {
+            return Ok(None);
+        };
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &fields[2]
+        else {
+            return Ok(None);
+        };
+        if buf_fields.len() != 2 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: inner_fields, ..
+        } = &buf_fields[0]
+        else {
+            return Ok(None);
+        };
+        if inner_fields.len() != 3 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: ptr_fields, ..
+        } = &inner_fields[0]
+        else {
+            return Ok(None);
+        };
+        let [ptr] = ptr_fields.as_slice() else {
+            return Ok(None);
+        };
+        let Value::Enum {
+            fields: cap_fields, ..
+        } = &inner_fields[1]
+        else {
+            return Ok(None);
+        };
+        let [Value::Uint(cap)] = cap_fields.as_slice() else {
+            return Ok(None);
+        };
+        let (head, len, cap) = (*head as usize, len as usize, *cap as usize);
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if cap == 0 {
+            return Ok(None);
+        }
+        // The buffer's element block: the allocation the
+        // `RawVec` pointer denotes, whose stored value is the
+        // element tuple.
+        let Value::Ref(RefTarget::Alloc { id, .. }) = ptr else {
+            return Ok(None);
+        };
+        let Ok(buffer) = self.alloc_base(*id) else {
+            return Ok(None);
+        };
+        let Value::Tuple(slots) = buffer else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let physical = (head + i) % cap;
+            let Some(elem) = slots.get(physical) else {
+                return Ok(None);
+            };
+            if *elem == Value::Uninit {
+                return Ok(None);
+            }
+            out.push(elem.clone());
+        }
+        Ok(Some(out))
+    }
+}
+
+impl<'a> Interpreter<'a> {
+    /// The byte string a path argument denotes, and whether it
+    /// arrived as text: a `Path` / `OsStr` value in this model
+    /// is the byte string itself under its wrapper chain (see
+    /// the field projection pun in `project_value`), held as a
+    /// `Str` for text data or a `Bytes` for arbitrary bytes, or
+    /// as a fat pointer over the bytes.
+    /// Assemble a `VecDeque` value from a `From` / `Into`
+    /// source: a `Vec` (modelled, or in its real aggregate
+    /// form), an array, or a slice. The deque's value is the
+    /// real aggregate the converted std bodies build and
+    /// consume (see `vec_deque_value`): a source `Vec` in its
+    /// real aggregate form hands its buffer over unchanged, as
+    /// the std conversion does; every other source's elements
+    /// are copied into a fresh element block at exact-fit
+    /// capacity, with the head at index zero.
+    pub(super) fn vec_deque_from_value(
+        &self,
+        frames: &[Frame],
+        value: Value,
+    ) -> InterpResult<Value> {
+        let resolved = self.resolve_value(frames, &value)?;
+        if let Some((buf, len)) = vec_real_aggregate_parts(&resolved) {
+            return Ok(vec_deque_value(buf, len));
+        }
+        let elements = match resolved {
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(items) => items,
+            v @ Value::SparseVec { .. } => value_elements(&v)?,
+            Value::FatRef { base, .. } => match *base {
+                Value::Tuple(items) => items,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "From::from to VecDeque",
+                        "slice value over an element tuple",
+                        other.kind_name(),
+                    ));
+                }
+            },
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "From::from to VecDeque",
+                    "vector, array or slice value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let len = elements.len();
+        let id = self.alloc_insert(Value::Tuple(elements));
+        self.mark_elem_block(id);
+        let buf = raw_vec_value(
+            Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            }),
+            len,
+        );
+        Ok(vec_deque_value(buf, len))
+    }
+}
+
+/// The `ErrorKind::InvalidInput` discriminant.
+/// The largest element count `Vec::set_len` will materialise
+/// (see the `VecSetLen` builtin): the element list is stored
+/// value by value, so the count is bounded well clear of the
+/// memory a pathological length would need.
+pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
+
+/// A vector value holding `elems` at declared length `len`:
+/// the plain element aggregate when the declared length is
+/// exactly the stored list — a growth into the materialisation
+/// limit pads with `uninit_elem`, the element type's
+/// uninitialised form (see `uninit_elem_value_for_tag`), as
+/// `Vec::set_len` does — and the sparse form (see
+/// `Value::SparseVec`) when
+/// the two differ: past the materialisation limit the length
+/// runs ahead of the stored elements, and on a shrink the
+/// stored elements run ahead of the length. A shrink keeps
+/// the tail in storage: those slots are the vector's spare
+/// capacity — still reachable through the buffer pointer (a
+/// `pop` reads the element it just un-declared), counted by
+/// the capacity the model reports, and overwritten by the
+/// next append before any new storage is needed.
+///
+/// `prev_cap` is the storage extent the value being rebuilt
+/// accounted (see `vec_stored_len`): the rebuilt value keeps
+/// accounting at least that much storage — a length change
+/// alone never shrinks the allocation a `with_capacity`
+/// established — so the result takes the sparse form
+/// whenever the accounted extent runs past the stored list,
+/// even when length and stored list meet again.
+pub(crate) fn vec_with_len(
+    mut elems: Vec<Value>,
+    len: usize,
+    uninit_elem: &Value,
+    prev_cap: u128,
+) -> Value {
+    let cap = prev_cap.max(len as u128).max(elems.len() as u128);
+    if len == elems.len() {
+        if cap == len as u128 {
+            Value::Enum {
+                variant: 0,
+                fields: elems,
+            }
+        } else {
+            Value::SparseVec {
+                elems,
+                len: len as u128,
+                cap,
+            }
+        }
+    } else if len < elems.len() {
+        Value::SparseVec {
+            elems,
+            len: len as u128,
+            cap,
+        }
+    } else if len <= MAX_VEC_SET_LEN_ELEMENTS {
+        elems.resize(len, uninit_elem.clone());
+        if cap == len as u128 {
+            Value::Enum {
+                variant: 0,
+                fields: elems,
+            }
+        } else {
+            Value::SparseVec {
+                elems,
+                len: len as u128,
+                cap,
+            }
+        }
+    } else {
+        Value::SparseVec {
+            elems,
+            len: len as u128,
+            cap,
+        }
+    }
+}
+
+/// The capacity a vector value's storage represents: the
+/// number of element slots the value accounts for — the stored
+/// list's length, or the declared length when it runs past the
+/// stored list (the unmaterialised tail is allocation the
+/// model accounts without holding element by element), or the
+/// extent a `with_capacity` requested past the materialisation
+/// limit, which the sparse form records as its `cap`. Every
+/// capacity question in the model gives this answer (the
+/// `Vec::capacity` builtin and the buffer chain's capacity
+/// slot in place resolution alike): the element storage is
+/// exactly the allocation the model holds.
+pub(crate) fn vec_stored_len(value: &Value) -> Option<u128> {
+    match value {
+        Value::Enum { fields, .. } => Some(fields.len() as u128),
+        Value::SparseVec { elems, cap, .. } => Some((*cap).max(elems.len() as u128)),
+        _ => None,
+    }
+}
+
+/// The minimum non-zero capacity of a `RawVec` for an element
+/// of `elem_size` bytes: std's `MIN_NON_ZERO_CAP` (8 for
+/// byte-sized elements, 4 up to a 1024-byte element, 1 above).
+fn rawvec_min_non_zero_cap(elem_size: usize) -> usize {
+    if elem_size == 1 {
+        8
+    } else if elem_size <= 1024 {
+        4
+    } else {
+        1
+    }
+}
+
+/// The capacity RawVec's amortized growth reaches when
+/// `required` elements must fit over a current capacity of
+/// `cap`: twice the current capacity or the requirement,
+/// whichever is larger, floored at the minimum non-zero
+/// capacity -- the floor applies at every growth, not only the
+/// first allocation (growing a capacity-1 vector of 4-byte
+/// elements reaches 4, not 2).
+fn rawvec_amortized_capacity(cap: usize, required: usize, elem_size: usize) -> usize {
+    cap.saturating_mul(2)
+        .max(required)
+        .max(rawvec_min_non_zero_cap(elem_size))
+}
+
+/// Grow the element storage of the vector value in `slot` to
+/// `target` slots by padding with `uninit_elem`, the element
+/// type's uninitialised form: the storage change RawVec's
+/// reallocation performs in this model, where the capacity a
+/// vector reports is the extent of the storage it holds (see
+/// `vec_stored_len`). The declared length is untouched; the
+/// padded slots are the spare capacity the next append
+/// overwrites. A vector whose declared length runs past its
+/// stored elements (the unmaterialised form) has no storage to
+/// grow and is left as it stands.
+fn vec_grow_storage(slot: &mut Value, target: usize, uninit_elem: &Value) {
+    match slot {
+        Value::Enum { fields, .. } => {
+            if target > fields.len() {
+                let len = fields.len();
+                let elems = {
+                    let mut padded = std::mem::take(fields);
+                    padded.resize(target, uninit_elem.clone());
+                    padded
+                };
+                *slot = Value::SparseVec {
+                    elems,
+                    len: len as u128,
+                    cap: target as u128,
+                };
+            }
+        }
+        Value::SparseVec { elems, len, cap } => {
+            if *len <= elems.len() as u128 && target > elems.len() {
+                elems.resize(target, uninit_elem.clone());
+                *cap = (*cap).max(target as u128);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move the capacity slot of a real-aggregate vector value
+/// (see `vec_real_aggregate_parts`) to `cap`: the navigation
+/// mirrors `Interpreter::real_vec_cap`, writing the count back
+/// in the shape the slot already holds (a bare count or the
+/// one-field `UsizeNoHighBit` wrapper around one).
+fn set_real_vec_cap(slot: &mut Value, cap: usize) {
+    let Value::Enum { fields, .. } = slot else {
+        return;
+    };
+    let Some(buf) = fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: buf_fields, ..
+    } = buf
+    else {
+        return;
+    };
+    let Some(inner) = buf_fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: inner_fields,
+        ..
+    } = inner
+    else {
+        return;
+    };
+    let Some(cap_slot) = inner_fields.get_mut(1) else {
+        return;
+    };
+    match cap_slot {
+        Value::Uint(n) => *n = cap as u128,
+        Value::Int(n) => *n = cap as i128,
+        Value::Enum { fields, .. } if fields.len() == 1 => match &mut fields[0] {
+            Value::Uint(n) => *n = cap as u128,
+            Value::Int(n) => *n = cap as i128,
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Ensure the vector value in `slot` holds storage for
+/// `additional` elements past its declared length, growing the
+/// storage the way RawVec grows the allocation: amortized
+/// (`reserve`, the appends) or to the exact requirement (the
+/// `*_exact` spellings). A requirement the storage already
+/// meets changes nothing, and a target past the materialisation
+/// limit is not accounted -- the same stance `Vec::with_capacity`
+/// takes toward a capacity past the limit: the storage the
+/// model can hold is the allocation it reports.
+pub(super) fn vec_ensure_capacity(
+    slot: &mut Value,
+    additional: usize,
+    exact: bool,
+    uninit_elem: &Value,
+    elem_size: usize,
+) {
+    // A vector in its real aggregate form (the `Vec { buf, len }`
+    // aggregate a converted body builds field by field, e.g. the
+    // buffer `join_generic_copy` fills through raw pointers) is
+    // not the element list its outer `Enum` shape suggests: the
+    // two fields are the `RawVec` and the length, and the
+    // capacity lives in the buffer chain's own slot (see
+    // `vec_real_aggregate_parts`). Growth there is the
+    // reallocation's bookkeeping: the capacity slot moves to the
+    // reached capacity, and the element storage behind the
+    // buffer pointer grows on the writes that use it, as
+    // allocation storage does. A capacity the chain does not
+    // expose leaves the value as it stands.
+    if let Some((_, agg_len)) = vec_real_aggregate_parts(slot) {
+        let Some(cap) = Interpreter::real_vec_cap(slot) else {
+            return;
+        };
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+        let required = agg_len.saturating_add(additional);
+        if required <= cap {
+            return;
+        }
+        let target = if exact {
+            required
+        } else {
+            rawvec_amortized_capacity(cap, required, elem_size)
+        };
+        if target > MAX_VEC_SET_LEN_ELEMENTS {
+            return;
+        }
+        set_real_vec_cap(slot, target);
+        return;
+    }
+    let (len, cap) = match &*slot {
+        Value::Enum { fields, .. } => (fields.len(), fields.len()),
+        Value::SparseVec { elems, len, cap } => {
+            let len = usize::try_from(*len).unwrap_or(usize::MAX);
+            let cap = usize::try_from(*cap).unwrap_or(usize::MAX);
+            (len, cap.max(elems.len()))
+        }
+        _ => return,
+    };
+    let required = len.saturating_add(additional);
+    if required <= cap {
+        return;
+    }
+    let target = if exact {
+        required
+    } else {
+        rawvec_amortized_capacity(cap, required, elem_size)
+    };
+    if target > MAX_VEC_SET_LEN_ELEMENTS {
+        return;
+    }
+    vec_grow_storage(slot, target, uninit_elem);
+}
+
+/// Append `items` to the vector value in `slot`, in place:
+/// slots the storage already holds past the length (the spare
+/// capacity a length shrink left behind) are overwritten in
+/// order and the rest extend the storage, so length and
+/// storage grow together and the value takes the plain
+/// aggregate form when they meet again — unless the accounted
+/// capacity still runs past the stored list, which only the
+/// sparse form records. Appends past the accounted capacity
+/// extend the account with the storage, as the plain form's
+/// appends do. A vector whose
+/// declared length runs past its stored elements cannot take
+/// appends — the new elements would land past the stored
+/// region — and stays the explicit error it was.
+pub(super) fn vec_append_in_place(
+    slot: &mut Value,
+    items: &[Value],
+    op: &str,
+) -> InterpResult<()> {
+    match slot {
+        Value::Enum { fields, .. } => {
+            fields.extend(items.iter().cloned());
+            Ok(())
+        }
+        Value::SparseVec { .. } => {
+            let value = std::mem::replace(slot, Value::Uninit);
+            let Value::SparseVec {
+                mut elems,
+                len,
+                cap,
+            } = value
+            else {
+                unreachable!("matched sparse vector above")
+            };
+            let cur_len = usize::try_from(len).unwrap_or(usize::MAX);
+            if cur_len > elems.len() {
+                *slot = Value::SparseVec { elems, len, cap };
+                return Err(unsupported(format!(
+                    "{op} on a vector whose elements are not materialised"
+                )));
+            }
+            let mut l = cur_len;
+            for item in items {
+                if l < elems.len() {
+                    elems[l] = item.clone();
+                } else {
+                    elems.push(item.clone());
+                }
+                l += 1;
+            }
+            let cap = cap.max(l as u128).max(elems.len() as u128);
+            *slot = if l == elems.len() && cap == l as u128 {
+                Value::Enum {
+                    variant: 0,
+                    fields: elems,
+                }
+            } else {
+                Value::SparseVec {
+                    elems,
+                    len: l as u128,
+                    cap,
+                }
+            };
+            Ok(())
+        }
+        other => Err(InterpError::type_mismatch(
+            op,
+            "vector value",
+            other.kind_name(),
+        )),
+    }
+}
