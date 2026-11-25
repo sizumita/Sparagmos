@@ -10675,10 +10675,46 @@ impl<'a> Interpreter<'a> {
         let Some(field) = fields.first() else {
             return resolved;
         };
-        if !self.wrapper_payload_matches(field, *variant, pointee, fields.len()) {
+        if *field != Value::Uninit {
+            if !self.wrapper_payload_matches(field, *variant, pointee, fields.len()) {
+                return resolved;
+            }
+            return enter_wrapper_field(resolved);
+        }
+        // The raw form of the same wrapper: the union value a
+        // field-by-field write through the union's declared
+        // members leaves behind -- the payload written into the
+        // `value` member (index 1 in `MaybeUninit`) while the
+        // `uninit` member's slot before it was never written.
+        // The payload sits in the one live member, inside that
+        // member's own one-field form (the `ManuallyDrop<T>` the
+        // member is declared as), so the entry descends both
+        // steps. A stored enum holding several live members is
+        // not a shape the write side produces for a wrapper,
+        // and a live member that is not a one-field form is not
+        // this wrapper's shape; both keep the unentered
+        // resolution, as does a payload that does not match the
+        // pointee.
+        let mut live = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| **f != Value::Uninit);
+        let Some((idx, stored)) = live.next() else {
+            return resolved;
+        };
+        if live.next().is_some() {
             return resolved;
         }
-        enter_wrapper_field(resolved)
+        let Value::Enum { fields: inner, .. } = stored else {
+            return resolved;
+        };
+        if inner.len() != 1 {
+            return resolved;
+        }
+        if !self.wrapper_payload_matches(&inner[0], *variant, pointee, 1) {
+            return resolved;
+        }
+        enter_wrapper_fields(resolved, &[idx, 0])
     }
 
     /// The `MaybeUninit` entry for the dereference of an
@@ -10742,6 +10778,17 @@ impl<'a> Interpreter<'a> {
             (Ty::Array(_, n), Value::Tuple(items)) => items.len() as u64 <= *n,
             (Ty::Array(elem, n), Value::Bytes(b)) => {
                 matches!(**elem, Ty::Uint(UintTy::U8)) && b.len() as u64 == *n
+            }
+            // A slice pointee's payload is the array value the
+            // wrapper holds: an element tuple whose items all
+            // fit the slice's element type, or a byte block for
+            // a byte slice. The slice name carries no length of
+            // its own, so any item count is the payload's.
+            (Ty::Slice(elem), Value::Tuple(items)) => {
+                items.iter().all(|item| value_fits_ty(item, elem))
+            }
+            (Ty::Slice(elem), Value::Bytes(_)) => {
+                matches!(**elem, Ty::Uint(UintTy::U8))
             }
             (Ty::Uint(_), Value::Uint(_)) => true,
             (Ty::Int(_), Value::Int(_)) => true,
@@ -21393,6 +21440,50 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
 /// entry step: the `Field(0)` a `MaybeUninit` (or like wrapper)
 /// layer adds between a pointer and its payload, appended to
 /// whichever store the target denotes.
+/// A resolved target descended through several wrapper entry
+/// steps in order (see [`enter_wrapper_field`]): the raw form
+/// of a `MaybeUninit` value holds its payload behind the
+/// union's `value` member and that member's own field, so the
+/// entry appends both steps.
+fn enter_wrapper_fields(resolved: Resolved, steps: &[usize]) -> Resolved {
+    let mut resolved = resolved;
+    for step in steps {
+        resolved = match resolved {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(RefProj::Field(*step));
+                Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                }
+            }
+            Resolved::Alloc {
+                id,
+                mut projection,
+            } => {
+                projection.push(RefProj::Field(*step));
+                Resolved::Alloc { id, projection }
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(RefProj::Field(*step));
+                Resolved::Static { name, projection }
+            }
+            Resolved::Value(base, mut projection) => {
+                projection.push(RefProj::Field(*step));
+                Resolved::Value(base, projection)
+            }
+        };
+    }
+    resolved
+}
+
 fn enter_wrapper_field(resolved: Resolved) -> Resolved {
     let entered = RefProj::Field(0);
     match resolved {
@@ -24475,11 +24566,20 @@ pub(crate) fn navigate_mut_grow<'x>(
             // reinterprets this field's bits; see
             // `union_field_read`). Writing *inside* the field
             // (`u.a.0 = ...`) navigates into the held value as
-            // usual, but a field that holds no value has nothing
-            // to write inside of: the bytes a native write would
-            // preserve there belong to a field this model does
-            // not hold, so that stays an uninitialized error
-            // rather than a fabricated partial value.
+            // usual. When no field holds a value yet -- the
+            // storage is fresh, every slot uninitialized -- the
+            // write inside field `idx` is partial initialization
+            // of that field: the recursion below materializes
+            // the field's storage sparsely, exactly as a write
+            // into a never-written slot does at the head of this
+            // function, and the slots the write does not touch
+            // stay uninitialized. But when another field DOES
+            // hold the union's value, a field that holds no value
+            // has nothing to write inside of: the bytes a native
+            // write would preserve there belong to the held
+            // field's representation, which this model does not
+            // hold as bytes, so that stays an uninitialized
+            // error rather than a fabricated partial value.
             let Value::Enum { fields, .. } = slot else {
                 return Err(InterpError::type_mismatch(
                     format!("union field write on {place}"),
@@ -24490,7 +24590,13 @@ pub(crate) fn navigate_mut_grow<'x>(
             if fields.len() <= *idx {
                 fields.resize(*idx + 1, Value::Uninit);
             }
-            if !rest.is_empty() && fields[*idx] == Value::Uninit {
+            if !rest.is_empty()
+                && fields[*idx] == Value::Uninit
+                && fields
+                    .iter()
+                    .enumerate()
+                    .any(|(i, field)| i != *idx && *field != Value::Uninit)
+            {
                 return Err(InterpError::UninitializedRead {
                     func: func.to_string(),
                     place: place.to_string(),
