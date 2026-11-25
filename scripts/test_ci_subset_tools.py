@@ -183,5 +183,43 @@ class MergeCliTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
 
 
+class CheckCandidatesTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.results = self.dir / "merged.json"
+        self.results.write_text(json.dumps({"results": [
+            {"path": "tests/ui/a.rs", "nature": "exec",
+             "single_file": True, "suite": "ui"},
+            {"path": "tests/ui/b.rs", "nature": "exec",
+             "single_file": True, "suite": "ui"},
+            {"path": "tests/ui/c.rs", "nature": "compile-check",
+             "single_file": True, "suite": "ui"},
+        ]}))
+
+    def run_check(self, candidates):
+        coverage = self.dir / "coverage.json"
+        data = {"aggregate": {}}
+        if candidates is not None:
+            data["subset_candidates"] = candidates
+        coverage.write_text(json.dumps(data))
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "check-candidates",
+             "--coverage", str(coverage), "--results", str(self.results)],
+            capture_output=True, text=True)
+
+    def test_matching_set_passes(self):
+        res = self.run_check(["tests/ui/a.rs", "tests/ui/b.rs"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_missing_candidate_fails(self):
+        res = self.run_check(["tests/ui/a.rs"])
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("tests/ui/b.rs", res.stderr)
+
+    def test_coverage_without_candidate_list_fails(self):
+        res = self.run_check(None)
+        self.assertEqual(res.returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

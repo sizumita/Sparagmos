@@ -25,7 +25,7 @@ their callees cannot be counted and they are reported separately.
 
 Usage:
   python3 scripts/std-coverage.py \
-      --results-json <subset-run-results.json> \
+      --results-json <subset-run-results.json> | --survey-json <survey.json> \
       --rust-dir <rust checkout> \
       --driver-bin <sparagmos-driver> \
       --out <results JSON>
@@ -323,20 +323,44 @@ def aggregate(records, registry):
     }
 
 
+def is_stage1_candidate(rec):
+    """exec, single-file, ui / ui-fulldeps: the stage-1 candidate
+    predicate, over a subset-runner result record or a survey test
+    entry (both carry nature, single_file, and suite)."""
+    return (rec["nature"] == "exec" and rec["single_file"]
+            and rec["suite"] in ("ui", "ui-fulldeps"))
+
+
 def stage1_candidates(results_json):
-    """The stage-1 candidate paths from the subset runner results:
-    exec, single-file, ui / ui-fulldeps (3,699 files at tag 1.100.0)."""
+    """The stage-1 candidate paths from the subset runner results
+    (3,699 files at tag 1.100.0)."""
     d = json.loads(Path(results_json).read_text())
-    return sorted(i["path"] for i in d["results"]
-                  if i["nature"] == "exec" and i["single_file"]
-                  and i["suite"] in ("ui", "ui-fulldeps"))
+    return sorted(i["path"] for i in d["results"] if is_stage1_candidate(i))
+
+
+def stage1_candidates_from_survey(survey_json):
+    """The same candidate paths taken from the survey the runner is fed.
+
+    The candidate predicate reads only properties the survey already
+    classifies, so the set does not depend on the subset run's outcome
+    and metric 3 can be measured alongside the subset run instead of
+    after it. env_excluded tests never reach the runner, so they are
+    not candidates. The official workflow cross-checks this set against
+    the merged subset results (ci-subset-tools.py check-candidates)."""
+    d = json.loads(Path(survey_json).read_text())
+    return sorted(t["path"] for t in d["tests"]
+                  if not t.get("env_excluded") and is_stage1_candidate(t))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--corpus-dir", type=Path, default=Path("tests/corpus"))
-    ap.add_argument("--results-json", type=Path,
-                    help="subset-run-results.json (stage-1 candidates)")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--results-json", type=Path,
+                     help="subset-run-results.json (stage-1 candidates)")
+    src.add_argument("--survey-json", type=Path,
+                     help="subset survey JSON (the same stage-1 candidates, "
+                          "without waiting for the subset run)")
     ap.add_argument("--rust-dir", type=Path,
                     help="rust checkout the candidate paths are relative to")
     ap.add_argument("--driver-bin", required=True)
@@ -352,10 +376,14 @@ def main(argv=None):
     tasks = []
     for f in sorted(args.corpus_dir.glob("*.rs")):
         tasks.append((str(f), "corpus", str(args.driver_bin), args.timeout))
+    candidates = []
     if args.results_json:
-        for rel in stage1_candidates(args.results_json):
-            tasks.append((str(args.rust_dir / rel), "subset",
-                          str(args.driver_bin), args.timeout))
+        candidates = stage1_candidates(args.results_json)
+    elif args.survey_json:
+        candidates = stage1_candidates_from_survey(args.survey_json)
+    for rel in candidates:
+        tasks.append((str(args.rust_dir / rel), "subset",
+                      str(args.driver_bin), args.timeout))
     if args.only:
         keep = [s for s in args.only.split(",") if s]
         tasks = [t for t in tasks if any(s in t[0] for s in keep)]
@@ -375,6 +403,7 @@ def main(argv=None):
     status_counts = Counter(r["status"] for r in records)
     summary = {
         "tool": "scripts/std-coverage.py",
+        "subset_candidates": candidates,
         "files_total": len(records),
         "files_by_status": dict(status_counts),
         "files_without_dump": [r["path"] for r in records

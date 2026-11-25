@@ -19,3 +19,14 @@ sparagmos-jit = { path = "../sparagmos-jit" }
 [[bin]]
 name = "sparagmos-driver"
 path = "src/main.rs"
+
+# The profile the measurement workflows build the driver with: the dev
+# profile's semantics (debug assertions and overflow checks stay on, so
+# a check that panics under `cargo build` panics here too) with the
+# optimizer on. Only how fast the driver runs differs, which is what
+# the per-record timeouts see (docs/CI.md, "Hosted-runner calibration").
+[profile.measure]
+inherits = "dev"
+opt-level = 3
+debug = false
+incremental = false

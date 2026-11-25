@@ -73,10 +73,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - The survey (`scripts/rustc-subset-survey.py`) classifies the
   Rust 1.100.0 test suite; the source tree and the survey JSON are
   cached between runs.
+- The driver is built once per run, by the `build` job, with the
+  driver crate's `measure` profile (`crates/sparagmos-driver/Cargo.toml`:
+  the dev profile with the optimizer on; debug assertions and
+  overflow checks stay enabled, so a check that panics under a plain
+  `cargo build` panics here too). Every other job downloads that one
+  binary as an artifact, so no shard compiles the driver and all
+  shards run the same build.
 - The survey is split into shards
   (`scripts/ci-subset-tools.py shard`, round-robin over path order so
   shards are balanced), and each shard runs as one matrix job with
-  `scripts/rustc-subset-run.py`. The metric-2(b) pass runs the
+  `scripts/rustc-subset-run.py`. The metric-2(b) pass is cut into 12
+  shards and the JIT pass into 4 by default (the dispatch inputs
+  `shards` and `jit_shards`): the metric-2(b) pass carries the
+  stage-3 and stage-4 records and is several times heavier. The metric-2(b) pass runs the
   runner with `--stages all`: stages 1 and 2, the stage-3
   procedure harness, which attempts the `procedure` records
   (run-make recipes — each recipe runs natively as the oracle, then
@@ -187,11 +197,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
   spawn a child to feed its stdin (the process model
   fabricates no child handle, and tool requests carry no
   stdin) stay unsupported.
+- Metric 3 runs in its own job (`metric3`), alongside the shards:
+  `scripts/std-coverage.py --survey-json` takes the stage-1
+  candidates (exec, single-file, ui / ui-fulldeps) from the survey
+  instead of from the merged results, since the predicate reads only
+  properties the survey classifies. The aggregate job publishes the
+  value only after `scripts/ci-subset-tools.py check-candidates` has
+  asserted that the measured candidate set is exactly the one the
+  merged metric-2(b) results define.
 - The aggregate job merges the shard results
   (`scripts/ci-subset-tools.py merge`; aggregates are recomputed from
-  the merged records), derives metric 3 with
-  `scripts/std-coverage.py`, and publishes metrics 2(b), 3, and 4 to
-  the job summary. The merged result JSONs are kept as run artifacts.
+  the merged records), checks and adds the metric-3 result, and
+  publishes metrics 2(b), 3, and 4 to the job summary. It runs no
+  toolchain or build. The merged result JSONs are kept as run
+  artifacts.
 - The denominator is asserted at merge time, not taken from the
   merged records: both merges (metrics 2(b) and 4) run with
   `--expect-total 24937`, the per-nature expectations
@@ -376,7 +395,16 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   bound is on RSS, not address space: the driver's virtual
   size is ~10 GB at startup, so an address-space cap tight
   enough to matter would stop it spawning its own threads;
-- free disk space before measuring and cache the Rust source tree,
-  the survey, and cargo build outputs;
+- in the official measurement, run the driver built with the
+  `measure` profile (optimized, with the dev profile's debug
+  assertions and overflow checks; flip-diff still compares two dev
+  builds, so its base and head stay like for like). Like the
+  raised timeouts, this only changes how fast a record runs, and so
+  which records near a timeout boundary finish in time; official
+  values from runs before and after the switch are not a
+  same-conditions series either;
+- cache the Rust source tree, the survey, and cargo build outputs
+  (the hosted image's disk has ample room for the toolchain and the
+  tree, so no preinstalled software is removed first);
 - give every job an explicit `timeout-minutes` below the 6-hour
   hosted limit.
