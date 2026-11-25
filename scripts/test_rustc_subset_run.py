@@ -2299,6 +2299,77 @@ class SkipBucketTests(unittest.TestCase):
         self.assertIn("no skip reason", run.skip_bucket([]))
 
 
+class HostProfileTests(unittest.TestCase):
+    """The host profiles behind SPARAGMOS_HOST_TARGET (issue #517):
+    the default profile is the environment model the runner has
+    always used, and selecting another profile switches the whole
+    model (target, cfg set, needs-* rules) at once."""
+
+    # The x86_64-linux model as it stood before profiles existed.
+    DEFAULT_CFGS = {
+        "linux", "unix", "x86_64", "x86_64-unknown-linux-gnu",
+        "target_os=\"linux\"", "target_arch=\"x86_64\"",
+        "target_family=\"unix\"", "target_env=\"gnu\"",
+        "target_vendor=\"unknown\"", "target_pointer_width=\"64\"",
+        "target_endian=\"little\"", "64bit", "gnu", "elf",
+    }
+    DEFAULT_RULES = {
+        "needs-run-enabled": True, "needs-unwind": True,
+        "needs-threads": True, "needs-subprocess": True,
+        "needs-asm-support": True, "needs-dlltool": False,
+        "needs-deterministic-layouts": True,
+        "needs-rustc-debug-assertions": False,
+        "needs-std-debug-assertions": False, "needs-enzyme": False,
+        "needs-offload": False, "needs-force-clang-based-tests": False,
+        "needs-wasmtime": False, "needs-symlink": True,
+        "needs-target-std": True,
+    }
+
+    def setUp(self):
+        run.select_host_profile(run.DEFAULT_HOST_TARGET)
+
+    def tearDown(self):
+        run.select_host_profile(run.DEFAULT_HOST_TARGET)
+
+    def test_default_profile_is_the_historical_model(self):
+        self.assertEqual(run.HOST_TARGET, "x86_64-unknown-linux-gnu")
+        self.assertEqual(run.HOST_TRUE_CFGS, self.DEFAULT_CFGS)
+        self.assertEqual(run.NEEDS_HOST_RULES, self.DEFAULT_RULES)
+
+    def test_windows_gnu_profile(self):
+        run.select_host_profile("x86_64-pc-windows-gnu")
+        self.assertEqual(run.HOST_TARGET, "x86_64-pc-windows-gnu")
+        self.assertIn("windows", run.HOST_TRUE_CFGS)
+        self.assertIn("windows-gnu", run.HOST_TRUE_CFGS)
+        self.assertNotIn("unix", run.HOST_TRUE_CFGS)
+        self.assertNotIn("elf", run.HOST_TRUE_CFGS)
+        self.assertTrue(run.NEEDS_HOST_RULES["needs-dlltool"])
+
+    def test_windows_msvc_profile_has_no_dlltool(self):
+        run.select_host_profile("x86_64-pc-windows-msvc")
+        self.assertIn("windows-msvc", run.HOST_TRUE_CFGS)
+        self.assertFalse(run.NEEDS_HOST_RULES["needs-dlltool"])
+
+    def test_darwin_profile(self):
+        run.select_host_profile("aarch64-apple-darwin")
+        self.assertIn("apple", run.HOST_TRUE_CFGS)
+        self.assertIn("macos", run.HOST_TRUE_CFGS)
+        self.assertIn("aarch64", run.HOST_TRUE_CFGS)
+        self.assertNotIn("elf", run.HOST_TRUE_CFGS)
+
+    def test_applicability_follows_the_selected_profile(self):
+        h = header("//@ only-aarch64\nfn main() {}\n")
+        status, _why = run.applicability(h.view(None), None)
+        self.assertEqual(status, "out-of-environment")
+        run.select_host_profile("aarch64-unknown-linux-gnu")
+        status, _why = run.applicability(h.view(None), None)
+        self.assertEqual(status, "applicable")
+
+    def test_unknown_target_is_rejected(self):
+        with self.assertRaises(ValueError):
+            run.select_host_profile("riscv64gc-unknown-linux-gnu")
+
+
 if __name__ == "__main__":
     unittest.main()
 

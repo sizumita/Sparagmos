@@ -73,13 +73,15 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - The survey (`scripts/rustc-subset-survey.py`) classifies the
   Rust 1.100.0 test suite; the source tree and the survey JSON are
   cached between runs.
-- The driver is built once per run, by the `build` job, with the
-  driver crate's `measure` profile (`crates/sparagmos-driver/Cargo.toml`:
-  the dev profile with the optimizer on; debug assertions and
-  overflow checks stay enabled, so a check that panics under a plain
-  `cargo build` panics here too). Every other job downloads that one
-  binary as an artifact, so no shard compiles the driver and all
-  shards run the same build.
+- The driver is built once per host class per run (the `build`
+  job for Linux x86_64, the `build-host` jobs for the other
+  classes), with the driver crate's `measure` profile
+  (`crates/sparagmos-driver/Cargo.toml`: the dev profile with the
+  optimizer on; debug assertions and overflow checks stay enabled,
+  so a check that panics under a plain `cargo build` panics here
+  too). Every judging job downloads its class's binary as an
+  artifact, so no shard compiles the driver and all shards of a
+  class run the same build.
 - The survey is split into shards
   (`scripts/ci-subset-tools.py shard`, round-robin over path order so
   shards are balanced), and each shard runs as one matrix job with
@@ -227,30 +229,63 @@ denominator. Runs on every push to `main` and on manual dispatch.
   denominator stays 24,937 and `procedure` stays 551. The same
   holds for stage 4: the denominator stays 24,937 and
   `rustdoc-check` stays 1,735.
-- Environment applicability is judged against one reference
-  environment: the host target `x86_64-unknown-linux-gnu` and the
-  pinned official Rust 1.100.0 release toolchain (stable channel,
-  by its own version string; the release build configuration).
-  The runner evaluates `//@ ignore-*`, `only-*`, and `needs-*`
-  directives the way compiletest evaluates them for that
-  environment -- the host cfg set, compiletest's target rules,
-  queries to the pinned rustc, and the release configuration --
-  and records a test whose conditions do not hold as not
-  attempted (bucket `out of environment`, with the unmet
-  condition as the reason); it stays in the denominator as a
-  fail, and a condition that cannot be decided is recorded as
-  `not attempted (unevaluatable condition)`. The hosted
-  environment has the same properties (`ubuntu-latest` is
-  x86_64-linux-gnu and the toolchain is the pinned release), so
-  the unmet prerequisites -- other targets, the nightly channel,
-  a rustc built with debug assertions, Enzyme, or offload
-  support, the host target's unsupported sanitizers, and
-  dlltool's windows-gnu target rule -- fail identically in CI
-  and no workflow change satisfies them. Judging `only-*`
-  records under their own target, or replacing the pinned
-  toolchain with a differently configured build, would change
-  the environment the records are judged against; that is a
-  methodology change, not an environment fix (issue #382).
+- Environment applicability is judged per host class (issue
+  #517). The metric-2(b) pass partitions the survey by host class
+  (`scripts/ci-subset-tools.py partition`, run by the prepare
+  job): each record is assigned to the first class whose host
+  model admits it, evaluating the record's headers with the
+  runner's own applicability code under that class's host
+  profile -- the target's cfg condition set and compiletest's
+  target rules for it, with the target-spec facts taken from the
+  pinned toolchain's own spec document and the live-probe facts
+  taken as satisfied (a satisfied probe can only keep a record
+  attemptable, never exclude it, so no record the Linux host
+  attempts is moved away, and the judging host's runner
+  re-evaluates the probes for real). The classes are disjoint
+  and cover the survey exactly once -- the partition command
+  refuses to write output otherwise -- so the aggregate's
+  denominator assertion (24,937 with the per-nature split) is
+  unchanged and no record is double-counted or dropped. Records
+  no enabled class admits stay in the first class (Linux
+  x86_64) as the residual class and keep the verdict its runner
+  gives them today (bucket `out of environment`, with the unmet
+  condition as the reason; a condition that cannot be decided
+  is `not attempted (unevaluatable condition)`).
+- The enabled classes are `linux-x86_64` (the `measure` shards
+  on `ubuntu-latest`), `linux-aarch64` (`ubuntu-24.04-arm`), and
+  `darwin-aarch64` (`macos-latest`); the latter two run as the
+  `measure-host` jobs, with drivers the `build-host` jobs build
+  natively on the class's runner and the runner's host model
+  selected through `SPARAGMOS_HOST_TARGET`. On the survey of
+  run 45564001677 the partition moves 85 records off the Linux
+  class (56 to `linux-aarch64`, 29 to `darwin-aarch64`); every
+  other record is judged exactly where it was judged before.
+  The host jobs do not restore the rustdoc artifact tree (it is
+  a Linux-built tree), so a class record whose stage 4 needs it
+  records the same not-attempted verdict the Linux jobs record
+  on a cache miss. Metric 4 and metric 3 are not partitioned:
+  they run on the Linux host over the full survey (the JIT
+  lowers x86_64 machine code, and metric 3's candidate
+  predicate reads only survey-classified properties).
+- What no host class changes: conditions that are not host
+  properties. The pinned official Rust 1.100.0 release toolchain
+  (stable channel, by its own version string; the release build
+  configuration) is the same build on every runner, so the
+  nightly channel, a rustc built with debug assertions, Enzyme,
+  and offload support fail identically on all of them, as do the
+  runner-configuration conditions (wasmtime, clang-based
+  tests). Conditions that name a compilation target rather
+  than an execution host (the wasm32 and nvptx64 families,
+  32-bit and other non-hosted targets) are likewise not host
+  cases: compiletest matches them against the target, and they
+  belong with cross-target support. The Windows classes
+  (`x86_64-pc-windows-msvc` and `x86_64-pc-windows-gnu`) are
+  defined in the runner's host profiles and in the partition
+  rule but have no jobs yet: the runner's process layer
+  (process groups, `/proc`-based memory accounting) is
+  POSIX-only, so a Windows runner would record internal errors
+  instead of verdicts; their records stay in the residual class
+  until that port lands (issue #517).
 - The cached source tree's sparse checkout additionally includes
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the

@@ -82,7 +82,9 @@ A test is *attempted* only when both sides can be run faithfully:
   runs passes);
 - no `ignore-*` condition matches this host and every `only-*`
   condition is satisfied (otherwise the test is out of environment
-  for x86_64-unknown-linux-gnu and is recorded as such);
+  for the measurement host -- x86_64-unknown-linux-gnu unless
+  SPARAGMOS_HOST_TARGET selects another host profile -- and is
+  recorded as such);
 - every `needs-*` condition is evaluated the way compiletest
   evaluates it for the reference toolchain (compiletest's own
   target rules, queries to the pinned rustc, and the release
@@ -438,7 +440,14 @@ def view_run_flags(view, src_base, build_base):
 # compile-flags handling
 # ---------------------------------------------------------------------------
 
-HOST_TARGET = "x86_64-unknown-linux-gnu"
+# The host target this measurement runs on. The official host is
+# x86_64-unknown-linux-gnu; the host-partitioned CI jobs (docs/CI.md,
+# issue #517) select their own native target through
+# SPARAGMOS_HOST_TARGET, which select_host_profile() in the
+# environment section below turns into that host's condition model.
+DEFAULT_HOST_TARGET = "x86_64-unknown-linux-gnu"
+HOST_TARGET = os.environ.get("SPARAGMOS_HOST_TARGET",
+                             DEFAULT_HOST_TARGET)
 
 _INSTALLED_TARGETS = None
 
@@ -710,24 +719,73 @@ def revision_args(view, revision, all_revisions):
 
 
 # ---------------------------------------------------------------------------
-# Environment applicability (host: x86_64-unknown-linux-gnu)
+# Environment applicability (host profiles)
 # ---------------------------------------------------------------------------
 
-# cfg atoms that are true for the measurement host. Directive suffixes
-# are matched against this set the way compiletest matches them
-# against the target's cfg list (an `ignore-<x>` skips the test when
-# <x> matches; an `only-<x>` keeps the test only when <x> matches).
-HOST_TRUE_CFGS = {
-    "linux", "unix", "x86_64", "x86_64-unknown-linux-gnu",
-    "target_os=\"linux\"", "target_arch=\"x86_64\"",
-    "target_family=\"unix\"", "target_env=\"gnu\"",
-    "target_vendor=\"unknown\"", "target_pointer_width=\"64\"",
-    "target_endian=\"little\"", "64bit", "gnu",
+# The environment model of one measurement host: the cfg atoms that
+# are true for it and the needs-* rules compiletest's target rules
+# give it. Directive suffixes are matched against the cfg set the
+# way compiletest matches them against the target's cfg list (an
+# `ignore-<x>` skips the test when <x> matches; an `only-<x>` keeps
+# the test only when <x> matches) -- compiletest conditions are
+# properties of the target, and for a native run the target is the
+# host, so each CI host class judges the records its own model
+# admits (issue #517). The default profile, x86_64-unknown-linux-gnu,
+# is the model this runner has always used; the official workflow's
+# Linux jobs never select another, so their verdicts are unchanged.
+# The other profiles exist so the host-partitioned jobs (and the
+# partition tool in ci-subset-tools.py, which evaluates every
+# profile) share one definition of each host.
+
+
+def _host_cfg_set(os_name, arch, triple, env, vendor, family, extra):
+    """The true cfg atoms of one host target, in the shape of the
+    x86_64-linux set below: the bare condition names compiletest
+    registers for the target (its OS, arch, full triple, env, the
+    os-env combination, family and vendor markers) and the
+    `target_* = "..."` forms `cfg(...)` conditions evaluate."""
+    cfgs = {
+        os_name, arch, triple,
+        f'target_os="{os_name}"', f'target_arch="{arch}"',
+        f'target_family="{family}"', f'target_env="{env}"',
+        f'target_vendor="{vendor}"', 'target_pointer_width="64"',
+        'target_endian="little"', "64bit",
+    }
+    cfgs.update(extra)
+    return cfgs
+
+
+HOST_PROFILES = {
     # compiletest also registers the target's binary format as a
     # condition (directives/cfg.rs: `elf` when binary_format is
-    # "elf"); x86_64-unknown-linux-gnu binaries are ELF.
-    "elf",
+    # "elf"); the Linux targets' binaries are ELF, the Windows and
+    # macOS ones are not (PE / Mach-O), so only the Linux profiles
+    # carry "elf".
+    "x86_64-unknown-linux-gnu": _host_cfg_set(
+        "linux", "x86_64", "x86_64-unknown-linux-gnu", "gnu",
+        "unknown", "unix", {"unix", "gnu", "elf"}),
+    "aarch64-unknown-linux-gnu": _host_cfg_set(
+        "linux", "aarch64", "aarch64-unknown-linux-gnu", "gnu",
+        "unknown", "unix", {"unix", "gnu", "elf"}),
+    "x86_64-pc-windows-msvc": _host_cfg_set(
+        "windows", "x86_64", "x86_64-pc-windows-msvc", "msvc",
+        "pc", "windows", {"msvc", "windows-msvc"}),
+    "x86_64-pc-windows-gnu": _host_cfg_set(
+        "windows", "x86_64", "x86_64-pc-windows-gnu", "gnu",
+        "pc", "windows", {"gnu", "windows-gnu"}),
+    # The macOS targets' target_os is "macos" and their vendor
+    # registers the `apple` condition (directives/cfg.rs); their
+    # env is empty.
+    "aarch64-apple-darwin": _host_cfg_set(
+        "macos", "aarch64", "aarch64-apple-darwin", "",
+        "apple", "unix", {"unix", "apple"}),
+    "x86_64-apple-darwin": _host_cfg_set(
+        "macos", "x86_64", "x86_64-apple-darwin", "",
+        "apple", "unix", {"unix", "apple"}),
 }
+
+# cfg atoms that are true for the selected measurement host.
+HOST_TRUE_CFGS = set(HOST_PROFILES[DEFAULT_HOST_TARGET])
 
 # compiletest builds the channel conditions in the same condition set
 # (directives/cfg.rs): exactly one of stable/beta/nightly is true, for
@@ -784,36 +842,72 @@ ASM_SUPPORTED_ARCHS = {
     "riscv64", "loongarch32", "loongarch64", "s390x",
 }
 
+
+def _build_needs_host_rules(target, arch, os_name, env):
+    """One host's formulaic needs-* rules (the table in the section
+    comment above, applied to that host target). True means the
+    condition holds there; False means compiletest would ignore the
+    test on that host."""
+    return {
+        "needs-run-enabled": True,    # we do run programs
+        "needs-unwind": True,         # the reference toolchain unwinds
+        # has_threads: only wasm targets without `-threads` lack them.
+        "needs-threads": not target.startswith("wasm"),
+        # has_subprocess_support: denied only for sgx / wasm /
+        # emscripten.
+        "needs-subprocess": not (env == "sgx"
+                                 or arch in ("wasm32", "wasm64")
+                                 or os_name == "emscripten"),
+        "needs-asm-support": arch in ASM_SUPPORTED_ARCHS,
+        # find_dlltool: dlltool exists only for *-windows-gnu targets.
+        "needs-dlltool": os_name == "windows" and env == "gnu",
+        # Release build configuration (see the section comment).
+        "needs-deterministic-layouts": True,   # layouts are not randomized
+        "needs-rustc-debug-assertions": False,
+        "needs-std-debug-assertions": False,
+        "needs-enzyme": False,
+        "needs-offload": False,
+        # compiletest runner configuration: this runner never runs
+        # tests under wasmtime or clang, and always has symlinks and
+        # std for the host target.
+        "needs-force-clang-based-tests": False,
+        "needs-wasmtime": False,
+        "needs-symlink": True,
+        "needs-target-std": True,
+    }
+
+
+def select_host_profile(target):
+    """Select the measurement host: HOST_TARGET, its true cfg set
+    and its needs-* rules all switch to `target`'s profile. The
+    runner's stages read these globals when they run, so selecting
+    before a run (the CI jobs do it through SPARAGMOS_HOST_TARGET;
+    the survey partition tool does it per class) re-targets every
+    stage at once. Raises ValueError for a target with no profile:
+    a misspelled CI class must fail loudly, never judge records
+    under the wrong host's model."""
+    global HOST_TARGET, HOST_TRUE_CFGS, _HOST_PARTS, _HOST_ARCH, \
+        _HOST_OS, _HOST_ENV, NEEDS_HOST_RULES
+    if target not in HOST_PROFILES:
+        raise ValueError(
+            f"unknown host target {target!r}; known profiles: "
+            + ", ".join(sorted(HOST_PROFILES)))
+    HOST_TARGET = target
+    HOST_TRUE_CFGS = set(HOST_PROFILES[target])
+    _HOST_PARTS = target.split("-")
+    _HOST_ARCH = _HOST_PARTS[0]
+    _HOST_OS = _HOST_PARTS[2] if len(_HOST_PARTS) > 2 else ""
+    _HOST_ENV = _HOST_PARTS[3] if len(_HOST_PARTS) > 3 else ""
+    NEEDS_HOST_RULES = _build_needs_host_rules(
+        target, _HOST_ARCH, _HOST_OS, _HOST_ENV)
+
 # needs-* conditions decided by compiletest's target rules and by
-# the release build configuration, for the host target. True means
-# the condition holds here; False means compiletest would ignore
-# the test on this host.
-NEEDS_HOST_RULES = {
-    "needs-run-enabled": True,    # we do run programs
-    "needs-unwind": True,         # the reference toolchain unwinds
-    # has_threads: only wasm targets without `-threads` lack them.
-    "needs-threads": not HOST_TARGET.startswith("wasm"),
-    # has_subprocess_support: denied only for sgx / wasm / emscripten.
-    "needs-subprocess": not (_HOST_ENV == "sgx"
-                             or _HOST_ARCH in ("wasm32", "wasm64")
-                             or _HOST_OS == "emscripten"),
-    "needs-asm-support": _HOST_ARCH in ASM_SUPPORTED_ARCHS,
-    # find_dlltool: dlltool exists only for *-windows-gnu targets.
-    "needs-dlltool": _HOST_OS == "windows" and _HOST_ENV == "gnu",
-    # Release build configuration (see the section comment).
-    "needs-deterministic-layouts": True,   # layouts are not randomized
-    "needs-rustc-debug-assertions": False,
-    "needs-std-debug-assertions": False,
-    "needs-enzyme": False,
-    "needs-offload": False,
-    # compiletest runner configuration: this runner never runs
-    # tests under wasmtime or clang, and always has symlinks and
-    # std for the host target.
-    "needs-force-clang-based-tests": False,
-    "needs-wasmtime": False,
-    "needs-symlink": True,
-    "needs-target-std": True,
-}
+# The selected host's needs-* rules; select_host_profile() below
+# (re)builds them, and the import-time call selects the host named
+# by HOST_TARGET (SPARAGMOS_HOST_TARGET, defaulting to
+# x86_64-unknown-linux-gnu).
+NEEDS_HOST_RULES = {}
+select_host_profile(HOST_TARGET)
 
 # needs-sanitizer-* directive -> the name in the target spec's
 # `supported-sanitizers` list (compiletest's Sanitizer enum, in

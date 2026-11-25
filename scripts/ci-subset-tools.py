@@ -10,6 +10,13 @@ Subcommands:
   sorted by path and dealt round-robin so every shard carries a mix of
   suites and stages (a contiguous block would concentrate the heavy
   stage-1 records in a few shards).
+- partition: split a survey JSON into one survey per host class for
+  the host-partitioned official measurement (issue #517). Each record
+  is assigned to the first class whose host model -- the runner's own
+  applicability evaluation under that class's host profile -- admits
+  it, or to the first (residual) class when no class admits it, so
+  the per-class surveys are disjoint and cover the survey exactly
+  once (the command refuses to write anything otherwise).
 - merge: combine several subset result JSONs (one per shard) into a
   single result JSON whose aggregates are recomputed from the merged
   records, so the merged file is a drop-in replacement for a result
@@ -340,6 +347,248 @@ def cmd_diff(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Host partition (issue #517)
+# ---------------------------------------------------------------------------
+
+#: Host classes for the partitioned measurement, by short name: the
+#: runner target whose environment model judges the class. The
+#: workflow enables linux-x86_64, linux-aarch64 and darwin-aarch64;
+#: the Windows classes are defined so the partition rule is complete
+#: (their jobs wait on the runner's process layer, which is POSIX
+#: only today -- see issue #517), and darwin-x86_64 rides on a
+#: retiring runner image.
+HOST_CLASSES = {
+    "linux-x86_64": "x86_64-unknown-linux-gnu",
+    "linux-aarch64": "aarch64-unknown-linux-gnu",
+    "darwin-aarch64": "aarch64-apple-darwin",
+    "windows-msvc": "x86_64-pc-windows-msvc",
+    "windows-gnu": "x86_64-pc-windows-gnu",
+    "darwin-x86_64": "x86_64-apple-darwin",
+}
+
+#: The classes the official workflow partitions into, in priority
+#: order: a record goes to the first class that admits it, and the
+#: first class is the residual class for records no class admits.
+DEFAULT_PARTITION_CLASSES = ["linux-x86_64", "linux-aarch64",
+                             "darwin-aarch64"]
+
+
+def _load_runner_module():
+    """The subset runner as a module (the same importlib pattern
+    the runner's companion stages use), so the partition evaluates
+    records with the runner's own applicability code and host
+    profiles rather than a second implementation."""
+    path = Path(__file__).with_name("rustc-subset-run.py")
+    spec = importlib.util.spec_from_file_location(
+        "rustc_subset_run_partition", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _PartitionFacts:
+    """ToolchainFacts stand-in for partitioning one host class.
+
+    The target-spec facts (supported sanitizers, xray, dynamic
+    linking, relocation model) are exact: they come from the pinned
+    toolchain's own spec document for the class's target. The
+    live-probe facts (LLVM components, profiler support, debugger
+    presence) are set to their satisfied outcomes. That is safe for
+    partitioning: a satisfied probe can only keep a record
+    attemptable, never exclude it, so no record the Linux host
+    attempts today is moved away, and a record assigned by a probe
+    alone is re-evaluated for real by the judging host's runner,
+    which records it out of environment there if the probe does not
+    hold. The CI host jobs install the same rustc-dev component set
+    as the Linux job, so the probes hold there by construction."""
+
+    def __init__(self, spec):
+        self._spec = spec or {}
+
+    def sanitizers(self):
+        return set(self._spec.get("supported-sanitizers") or [])
+
+    def sanitizer_supported(self, name):
+        return name in self.sanitizers()
+
+    def xray(self):
+        return bool(self._spec.get("supports-xray", False))
+
+    def dynamic_linking(self):
+        return bool(self._spec.get("dynamic-linking", False))
+
+    def relocation_model(self):
+        return self._spec.get("relocation-model") or "pic"
+
+    # The remaining facts applicability() consults are the
+    # live-probe ones discussed in the class docstring; they get
+    # their satisfied outcomes (the values the official toolchain
+    # installation the CI jobs use reports for them).
+    def llvm_component_present(self, name):
+        return True
+
+    def has_profiler_support(self):
+        return True
+
+    def profiler_runtime(self):
+        return True
+
+    def debugger_present(self, kind):
+        return True
+
+    def rust_lld(self):
+        return True
+
+    def sanitizer_runtime_present(self):
+        return True
+
+    def git_hash(self):
+        return True
+
+    def llvm_zstd(self):
+        return True
+
+    def has_mnemonic(self, mnemonic):
+        return True
+
+    def supported_crate_types(self):
+        return {"bin", "lib", "rlib", "dylib", "cdylib",
+                "staticlib", "proc-macro"}
+
+    def target_has_atomic(self):
+        return {"8", "16", "32", "64", "128", "ptr"}
+
+    def default_codegen_backend(self):
+        return "llvm"
+
+
+def _record_attemptable_on_host(runner, tree, record, facts):
+    """Whether the runner on this host class would attempt the
+    record: the same applicability witnesses the stages use --
+    procedure and rustdoc records are gated on the whole header;
+    the other natures are attempted when any revision view is
+    applicable (debugger views through the debugger filter), and a
+    revision-less exec record also counts its whole header, whose
+    names stage 1 consults. A record whose file cannot be read is
+    attemptable nowhere and lands in the residual class."""
+    nature = record["nature"]
+    if nature == "env_excluded":
+        return False
+    path = tree / record["path"]
+    if path.is_dir():
+        path = path / "rmake.rs"
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return False
+    header = runner.Header(text)
+    if nature in ("procedure", "rustdoc-check"):
+        status, _why = runner.applicability(header, facts)
+        return status != "out-of-environment"
+    revisions = header.revisions()
+    views = [header.view(rev) for rev in revisions] \
+        if revisions else [header.view(None)]
+    if nature == "exec-debugger":
+        views = [runner._DebuggerFilteredView(view) for view in views]
+    if nature == "exec" and not revisions:
+        views.append(header)
+    # A view counts when the host does not exclude it: "applicable",
+    # or "unevaluatable" (a condition the canned facts cannot
+    # decide; the judging host's runner evaluates it for real, so
+    # the record belongs with the first host that does not exclude
+    # it outright).
+    return any(runner.applicability(view, facts)[0]
+               != "out-of-environment" for view in views)
+
+
+def partition_survey(runner, survey, tree, classes, specs):
+    """Assign every survey record to exactly one host class.
+
+    `classes` is a list of (name, target) in priority order; a
+    record goes to the first class whose host model admits it, and
+    records no class admits (including env_excluded records, which
+    no host judges) go to the first, residual class, where they
+    keep the verdict that class's runner gives them today. Raises
+    ValueError when the assignment would not cover the survey
+    exactly once -- a partition that drops or double-counts a
+    record must never reach the workflow."""
+    by_class = {name: [] for name, _target in classes}
+    facts = {name: _PartitionFacts(specs.get(target))
+             for name, target in classes}
+    residual = classes[0][0]
+    for record in survey["tests"]:
+        dest = None
+        if record.get("nature") != "env_excluded":
+            for name, target in classes:
+                runner.select_host_profile(target)
+                if _record_attemptable_on_host(
+                        runner, tree, record, facts[name]):
+                    dest = name
+                    break
+        by_class[dest or residual].append(record)
+    runner.select_host_profile(runner.DEFAULT_HOST_TARGET)
+    seen = [record["path"] for records in by_class.values()
+            for record in records]
+    if len(seen) != len(set(seen)) or set(seen) != {
+            record["path"] for record in survey["tests"]}:
+        raise ValueError(
+            "host partition does not cover the survey exactly once")
+    return by_class
+
+
+def _all_target_specs(runner):
+    """The pinned toolchain's all-target-specs document, queried
+    the way the runner queries it (its own rustc invocation and
+    bootstrap env)."""
+    res = runner.run_cmd(
+        runner.rustc_cmd() + ["-Zunstable-options", "--print",
+                              "all-target-specs-json"],
+        timeout=120, env_extra=runner.BOOTSTRAP_ENV)
+    if res["timeout"] or res["exit_code"] != 0:
+        raise SystemExit(
+            "partition: querying the pinned toolchain's target "
+            "specs failed; cannot partition without them")
+    return json.loads(res["stdout"])
+
+
+def cmd_partition(args):
+    survey = json.loads(Path(args.survey).read_text())
+    classes = []
+    for name in args.classes.split(","):
+        name = name.strip()
+        if name not in HOST_CLASSES:
+            raise SystemExit(
+                f"partition: unknown host class {name!r}; known: "
+                + ", ".join(sorted(HOST_CLASSES)))
+        classes.append((name, HOST_CLASSES[name]))
+    runner = _load_runner_module()
+    specs = _all_target_specs(runner)
+    for _name, target in classes:
+        if target not in specs:
+            raise SystemExit(
+                f"partition: the pinned toolchain has no target "
+                f"spec for {target}; cannot partition for it")
+    by_class = partition_survey(runner, survey, Path(args.tree),
+                                classes, specs)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for name, target in classes:
+        doc = dict(survey)
+        doc["tests"] = by_class[name]
+        doc["partition"] = {"class": name, "target": target}
+        out = out_dir / f"subset-survey-{name}.json"
+        out.write_text(json.dumps(doc))
+        total += len(by_class[name])
+        print(f"partition: {name} ({target}): "
+              f"{len(by_class[name])} records -> {out}")
+    print(f"partition: {total} records in "
+          f"{len(survey['tests'])} survey records, "
+          f"{len(classes)} classes")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -379,6 +628,18 @@ def main():
     p.add_argument("--results", type=Path, required=True,
                    help="merged subset result JSON")
     p.set_defaults(func=cmd_check_candidates)
+
+    p = sub.add_parser("partition")
+    p.add_argument("--survey", type=Path, required=True)
+    p.add_argument("--tree", type=Path, required=True,
+                   help="the survey tree the records' headers are "
+                        "read from")
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument(
+        "--classes", default=",".join(DEFAULT_PARTITION_CLASSES),
+        help="comma-separated host classes in priority order; "
+             "the first is the residual class")
+    p.set_defaults(func=cmd_partition)
 
     p = sub.add_parser("diff")
     p.add_argument("--base", type=Path, required=True)
