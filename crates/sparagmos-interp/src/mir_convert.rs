@@ -1879,6 +1879,49 @@ fn scalar_leaf_is_int(shape: &ir::ScalarShape) -> bool {
     }
 }
 
+/// Whether a scalar shape is a pure bit pattern for the
+/// bit-stream reinterpretation: integer, float, `bool` and
+/// `char` leaves under arrays and one-payload wrappers.
+/// Pointer-carrying leaves stay out — flattening one to its
+/// synthetic address and constructing one back severs the
+/// pointer from its pointee, which the aligned paths
+/// (elementwise and whole-pattern) exist to avoid; niche
+/// and multi-field shapes carry encodings a raw stream
+/// does not reproduce.
+fn shape_is_bit_stream(shape: &ir::ScalarShape) -> bool {
+    match shape {
+        ir::ScalarShape::Int { .. }
+        | ir::ScalarShape::Float { .. }
+        | ir::ScalarShape::Bool
+        | ir::ScalarShape::Char => true,
+        ir::ScalarShape::Array(elem, _) => shape_is_bit_stream(elem),
+        ir::ScalarShape::AdtField { inner, .. } => {
+            shape_is_bit_stream(inner)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a multi-field shape is exactly a fat pointer's
+/// two words: the data pointer at offset 0 and a 64-bit
+/// length at offset 64 (the shape a `(ptr, len)` tuple
+/// built for a DST transmute records).
+fn fat_words_fields(shape: &ir::ScalarShape) -> bool {
+    match shape {
+        ir::ScalarShape::Fields { fields, .. } => {
+            fields.len() == 2
+                && fields[0].0 == 0
+                && fields[0].1 == ir::ScalarShape::Ptr
+                && fields[1].0 == 64
+                && matches!(
+                    fields[1].1,
+                    ir::ScalarShape::Int { bits: 64, .. }
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Whether a scalar shape carries a thin pointer anywhere in
 /// its payload: the pointer is a place identity in this model,
 /// not a bit pattern, so a shape containing one cannot be
@@ -5702,6 +5745,28 @@ impl<'a> Converter<'a> {
     ///   lengths that fit, carried by the elements' shapes
     ///   instead (`[ *mut T; 63 ]` -> `[Atomic<*mut T>; 63]`,
     ///   the `thread_local` crate's bucket table);
+    /// * array <-> array (or one-payload wrapper over an
+    ///   array) whose leaf streams have the same total width,
+    ///   at any total width ([`ir::Rvalue::Reinterpret`] over
+    ///   the stream shapes): the width-crossing regrouping
+    ///   (`[i16; 50]` -> `[f32; 25]`) and the long wrapped
+    ///   array (`Mu64([u64; 4])` -> `[u8; 32]`); a one-field
+    ///   ADT over an array whose length the type
+    ///   representation does not carry (a `Simd<T, N>`
+    ///   storage field) takes its element count from the
+    ///   other side, the pair being size-equal by the
+    ///   transmute's own validity;
+    /// * fat pointer <-> pointer to a DST-wrapper struct
+    ///   (an ADT whose last field is the slice / `str` /
+    ///   `dyn` tail the metadata describes): the fat value
+    ///   itself under the other declared type;
+    /// * (thin pointer, length) tuple <-> fat reference to
+    ///   a DST-wrapper struct: the tuple's two recorded
+    ///   words are the fat pointer's two words;
+    /// * scalar or thin pointer <-> union: the bit
+    ///   reinterpretation between the leaf shape and the
+    ///   storage shape of the union field whose own shape
+    ///   is the leaf's;
     /// * a byte-string constant in pointer position (it
     ///   carries no place type) -> a thin pointer or a
     ///   transparent wrapper over one: const propagation
@@ -6057,6 +6122,66 @@ let inner = match (&src, target) {
             {
                 ir::Rvalue::Use(v.clone())
             }
+            // Fat pointer <-> pointer to a DST-wrapper
+            // struct (an ADT whose last field is the
+            // unsized tail the metadata describes): the
+            // value is the same fat pointer — the data word
+            // denotes the struct's storage, whose tail sits
+            // at the end of it, and the metadata word counts
+            // or names that tail under both readings
+            // (`&[u8]` -> `&X` where `struct X([u8])`, and
+            // `&Baz` whose tail is a `str`). The pointee
+            // type lives in the destination's declared
+            // type, as for the plain fat -> fat identity
+            // above.
+            (Some(s), t)
+                if self.fat_tail_meta(s).is_some()
+                    && self.fat_tail_meta(s) == self.fat_tail_meta(t)
+                    && (matches!(
+                        ptr_pointee(s),
+                        Some(mir::Ty::Adt(..))
+                    ) || matches!(
+                        ptr_pointee(t),
+                        Some(mir::Ty::Adt(..))
+                    )) =>
+            {
+                ir::Rvalue::Use(v.clone())
+            }
+            // (thin pointer, length) tuple -> fat reference
+            // to a DST-wrapper struct, and the reverse: the
+            // tuple's recorded layout is the fat pointer's
+            // two words — the data pointer at offset 0 and
+            // the length at offset 64 — so the crossing is
+            // the reinterpretation between the tuple's
+            // Fields shape and the FatPtr shape (the
+            // `PackedSized::unsize` transmute, which builds
+            // a `&PackedUnsized` from `(self, len)`).
+            (Some(mir::Ty::Tuple(_)), t)
+                if self.fat_tail_meta(t).is_some()
+                    && shape_from
+                        .as_ref()
+                        .is_some_and(fat_words_fields) =>
+            {
+                let from = shape_from.clone().expect("guard checked");
+                let meta = self.fat_tail_meta(t).expect("guard checked");
+                ir::Rvalue::Reinterpret(
+                    v.clone(),
+                    from,
+                    ir::ScalarShape::FatPtr(meta),
+                )
+            }
+            (Some(s), mir::Ty::Tuple(_))
+                if self.fat_tail_meta(s).is_some()
+                    && shape_to.as_ref().is_some_and(fat_words_fields) =>
+            {
+                let meta = self.fat_tail_meta(s).expect("guard checked");
+                let to = shape_to.clone().expect("guard checked");
+                ir::Rvalue::Reinterpret(
+                    v.clone(),
+                    ir::ScalarShape::FatPtr(meta),
+                    to,
+                )
+            }
             // Pointer <-> pointer where both pointees are
             // byte-string DSTs (`str`, `[u8]`, `OsStr`, `Path`):
             // all four are a byte string with a length metadata
@@ -6114,6 +6239,36 @@ let inner = match (&src, target) {
             // the integer of exactly its field's type) the result
             // is the same value: the field itself.
             (_, _) if generic.is_some() => generic.clone().unwrap(),
+            // Scalar or thin pointer -> union (and the
+            // reverse): the union's storage shape is the
+            // one-payload shape of the field whose own
+            // shape is the other side's — a union's fields
+            // all describe the same storage, and a union
+            // field read reinterprets between them, so the
+            // crossing is the bit reinterpretation between
+            // the leaf shape and that AdtField shape. No
+            // specialised arm carries a value into a union
+            // (the wrapper arms serve structs), and the
+            // generic path declined this pair precisely
+            // because a bare leaf meets an ADT.
+            (Some(s), mir::Ty::Adt(def, args))
+                if self.adt_is_union(def)
+                    && self.union_leaf_pair(def, args, s).is_some() =>
+            {
+                let (leaf, to) = self
+                    .union_leaf_pair(def, args, s)
+                    .expect("guard checked");
+                ir::Rvalue::Reinterpret(v.clone(), leaf, to)
+            }
+            (Some(mir::Ty::Adt(def, args)), t)
+                if self.adt_is_union(def)
+                    && self.union_leaf_pair(def, args, t).is_some() =>
+            {
+                let (leaf, from) = self
+                    .union_leaf_pair(def, args, t)
+                    .expect("guard checked");
+                ir::Rvalue::Reinterpret(v.clone(), from, leaf)
+            }
             // ADT -> integer through a newtype chain over a
             // thin pointer (the `NonNull` shape, whose payload
             // field is a `NonZero<*const T>`): the synthetic
@@ -6643,6 +6798,22 @@ let inner = match (&src, target) {
                     .expect("guard checked");
                 ir::Rvalue::Reinterpret(v.clone(), from, to)
             }
+            // Array <-> array (or one-payload wrapper
+            // over an array) whose leaf streams have the
+            // same total width, at any total width: the
+            // bit-stream reinterpretation — the
+            // width-crossing regrouping and the long
+            // wrapped array the whole-shape and
+            // elementwise paths above cannot see (see
+            // `stream_regroup_shapes`).
+            (Some(s), t)
+                if self.stream_regroup_shapes(s, t).is_some() =>
+            {
+                let (from, to) = self
+                    .stream_regroup_shapes(s, t)
+                    .expect("guard checked");
+                ir::Rvalue::Reinterpret(v.clone(), from, to)
+            }
             // Zero-sized -> zero-sized with a uniquely determined
             // value: the value is the target type's unique value,
             // whatever the source value was (a zero-sized source
@@ -7004,6 +7175,362 @@ let inner = match (&src, target) {
             ir::ScalarShape::Array(Box::new(from), *src_len),
             ir::ScalarShape::Array(Box::new(to), *src_len),
         ))
+    }
+
+    /// The bit-stream shape of a type: the scalar shape
+    /// without the 128-bit total-width budget on arrays.
+    /// Leaves are the scalar kinds; an array contributes
+    /// its element's stream at any length; a one-variant
+    /// ADT contributes its single nonzero-stream payload
+    /// field (every other field a zero-sized constant, the
+    /// discipline `scalar_shape`'s payload arm uses), which
+    /// covers plain wrappers, `MaybeUninit<T>` and unions
+    /// alike. Everything else — tuples, multi-field and
+    /// niche/tagged shapes, pointers — has no stream shape:
+    /// a pointer leaf is a place identity, not a bit
+    /// pattern, and a multi-field layout's gaps are not
+    /// stream positions.
+    fn stream_shape(
+        &self,
+        ty: &mir::Ty,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        use ir::ScalarShape as S;
+        if depth > 8 {
+            return None;
+        }
+        match ty {
+            mir::Ty::Bool => Some(S::Bool),
+            mir::Ty::Char => Some(S::Char),
+            mir::Ty::Int(it) => Some(S::Int {
+                bits: it.bits(),
+                signed: true,
+            }),
+            mir::Ty::Uint(ut) => Some(S::Int {
+                bits: ut.bits(),
+                signed: false,
+            }),
+            mir::Ty::Float(ft) => match ft.bits() {
+                16 | 32 | 64 | 128 => Some(S::Float { bits: ft.bits() }),
+                _ => None,
+            },
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n == 0 {
+                    return None;
+                }
+                let elem = self.stream_shape(elem, depth + 1)?;
+                if elem.bits() == 0 {
+                    return None;
+                }
+                Some(S::Array(Box::new(elem), *n))
+            }
+            mir::Ty::Adt(def, args) => {
+                if matches!(
+                    self.def_display_name(def).as_str(),
+                    "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+                ) {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    let inner = self.stream_shape(&args[0], depth + 1)?;
+                    return Some(S::AdtField {
+                        index: 0,
+                        count: 1,
+                        fill: Vec::new(),
+                        inner: Box::new(inner),
+                    });
+                }
+                let shape = self.adt_shapes.get(def)?;
+                if shape.variants.len() != 1 {
+                    return None;
+                }
+                let fields = self.instantiated_field_tys(def, args, 0)?;
+                let mut payload: Option<(u32, ir::ScalarShape)> = None;
+                let mut fill = Vec::new();
+                for (i, fty) in fields.iter().enumerate() {
+                    match self.stream_shape(fty, depth + 1) {
+                        Some(fs) if fs.bits() > 0 => {
+                            if payload.is_some() {
+                                return None;
+                            }
+                            payload = Some((i as u32, fs));
+                        }
+                        _ => {
+                            let zv = self.zst_value(fty, 0)?;
+                            fill.push((i as u32, value_to_constant(&zv)?));
+                        }
+                    }
+                }
+                let (index, inner) = payload?;
+                Some(S::AdtField {
+                    index,
+                    count: fields.len(),
+                    fill,
+                    inner: Box::new(inner),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The stream shape of a one-field ADT whose only field
+    /// is an array, with the element count taken from the
+    /// transmute's other side (`total_bits` is its total
+    /// width): the pair is size-equal by the transmute's
+    /// own validity, so the other side's total width over
+    /// this side's element width is the count. Deriving
+    /// the count this way — rather than reading the
+    /// field's recorded length — is what makes the
+    /// `Simd<T, N>` storage field work: the length is a
+    /// const parameter, const arguments are not part of
+    /// the type here, and the recorded instance field
+    /// types key on the type arguments only, so a sibling
+    /// instance's length can be the recorded one.
+    fn wrapped_array_stream_shape(
+        &self,
+        ty: &mir::Ty,
+        total_bits: u32,
+    ) -> Option<ir::ScalarShape> {
+        let mir::Ty::Adt(def, args) = ty else {
+            return None;
+        };
+        let shape = self.adt_shapes.get(def)?;
+        if shape.variants.len() != 1 {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        if fields.len() != 1 {
+            return None;
+        }
+        let mir::Ty::Array(elem, _) = &fields[0] else {
+            return None;
+        };
+        let elem = self.stream_shape(elem, 1)?;
+        let eb = elem.bits();
+        if eb == 0 || total_bits == 0 || total_bits % eb != 0 {
+            return None;
+        }
+        Some(ir::ScalarShape::AdtField {
+            index: 0,
+            count: 1,
+            fill: Vec::new(),
+            inner: Box::new(ir::ScalarShape::Array(
+                Box::new(elem),
+                u64::from(total_bits / eb),
+            )),
+        })
+    }
+
+    /// The bit-stream reinterpretation shapes for a
+    /// transmute pair: both sides decompose into scalar
+    /// leaf streams of the same nonzero total width, and
+    /// at least one side decomposes through an array (a
+    /// bare leaf pair is the generic path's business, and
+    /// a one-payload pair over a scalar is the payload
+    /// arms'). Either side may instead be a one-field ADT
+    /// over an array whose length the type representation
+    /// does not carry; its count comes from the other side
+    /// (see `wrapped_array_stream_shape`).
+    fn stream_regroup_shapes(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<(ir::ScalarShape, ir::ScalarShape)> {
+        let from = self.stream_shape(src, 0);
+        let to = self.stream_shape(target, 0);
+        // A one-field ADT over an array field takes its
+        // element count from the other side whenever the
+        // other side's stream shape is known (see
+        // `wrapped_array_stream_shape`); when neither side
+        // is such a wrapper — or both are, so neither total
+        // is independently known — the stream shapes stand
+        // as computed.
+        let (from, to) = match (from, to) {
+            (Some(f), Some(t)) => {
+                let f = if self.is_array_wrapper(src)
+                    && !self.is_array_wrapper(target)
+                {
+                    self.wrapped_array_stream_shape(src, t.bits())
+                        .unwrap_or(f)
+                } else {
+                    f
+                };
+                let t = if self.is_array_wrapper(target)
+                    && !self.is_array_wrapper(src)
+                {
+                    self.wrapped_array_stream_shape(target, f.bits())
+                        .unwrap_or(t)
+                } else {
+                    t
+                };
+                (f, t)
+            }
+            (None, Some(t)) => (
+                self.wrapped_array_stream_shape(src, t.bits())?,
+                t,
+            ),
+            (Some(f), None) => {
+                let total = f.bits();
+                (
+                    f,
+                    self.wrapped_array_stream_shape(target, total)?,
+                )
+            }
+            (None, None) => return None,
+        };
+        if from.bits() == 0 || from.bits() != to.bits() {
+            return None;
+        }
+        if !shape_is_bit_stream(&from) || !shape_is_bit_stream(&to) {
+            return None;
+        }
+        fn decomposes(shape: &ir::ScalarShape) -> bool {
+            match shape {
+                ir::ScalarShape::Array(..) => true,
+                ir::ScalarShape::AdtField { inner, .. } => {
+                    decomposes(inner)
+                }
+                _ => false,
+            }
+        }
+        if !decomposes(&from) && !decomposes(&to) {
+            return None;
+        }
+        Some((from, to))
+    }
+
+    /// The fat-pointer metadata kind a pointer type's value
+    /// carries in this model, seeing through a DST-wrapper
+    /// struct: a pointer to a slice / `str` / `dyn`
+    /// pointee, or to an ADT whose last field is such a
+    /// type (the unsized tail the metadata counts or
+    /// names). `None` for a thin pointer type.
+    fn fat_tail_meta(&self, ty: &mir::Ty) -> Option<ir::FatMeta> {
+        self.tail_meta(ptr_pointee(ty)?, 0)
+    }
+
+    /// The metadata kind for an unsized tail type: a slice
+    /// / `str` / `dyn` type itself, or a DST-wrapper ADT
+    /// whose last field is (recursively) such a tail — the
+    /// `Slice([u32])` wrapper inside a `PackedUnsized` is
+    /// the same tail one level down.
+    fn tail_meta(
+        &self,
+        tail: &mir::Ty,
+        depth: u32,
+    ) -> Option<ir::FatMeta> {
+        if depth > 4 {
+            return None;
+        }
+        match tail {
+            mir::Ty::Slice(_) | mir::Ty::Str => Some(ir::FatMeta::Len),
+            mir::Ty::Dynamic(..) => Some(ir::FatMeta::Vtable),
+            mir::Ty::Adt(def, args) => {
+                let shape = self.adt_shapes.get(def)?;
+                if shape.variants.len() != 1 {
+                    return None;
+                }
+                let fields = self.instantiated_field_tys(def, args, 0)?;
+                self.tail_meta(fields.last()?, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the type is a one-variant ADT with exactly
+    /// one field, an array: the wrapper form whose stream
+    /// shape's element count the transmute's other side
+    /// fixes (see `wrapped_array_stream_shape`).
+    fn is_array_wrapper(&self, ty: &mir::Ty) -> bool {
+        let mir::Ty::Adt(def, args) = ty else {
+            return false;
+        };
+        let Some(shape) = self.adt_shapes.get(def) else {
+            return false;
+        };
+        if shape.variants.len() != 1 {
+            return false;
+        }
+        let Some(fields) = self.instantiated_field_tys(def, args, 0)
+        else {
+            return false;
+        };
+        fields.len() == 1 && matches!(fields[0], mir::Ty::Array(..))
+    }
+
+    /// The (leaf, storage) shape pair for a transmute
+    /// between a scalar-or-pointer leaf type and a union:
+    /// the leaf is the other side's scalar shape when it
+    /// is a leaf kind, and the storage shape is the
+    /// union's read through the field whose shape is the
+    /// leaf's (see `union_storage_shape`). `None` when the
+    /// other side is not a leaf or no union field has its
+    /// shape.
+    fn union_leaf_pair(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        other: &mir::Ty,
+    ) -> Option<(ir::ScalarShape, ir::ScalarShape)> {
+        let leaf = self.scalar_shape(other, 0)?;
+        if !matches!(
+            leaf,
+            ir::ScalarShape::Ptr
+                | ir::ScalarShape::FnPtr
+                | ir::ScalarShape::Int { .. }
+                | ir::ScalarShape::Float { .. }
+                | ir::ScalarShape::Bool
+                | ir::ScalarShape::Char
+        ) {
+            return None;
+        }
+        let storage = self.union_storage_shape(def, args, &leaf)?;
+        Some((leaf, storage))
+    }
+
+    /// The storage shape of a union read through the
+    /// field whose scalar shape is `want`: that field as
+    /// the one-payload shape's payload, every zero-sized
+    /// field as a fill constant, and every other field
+    /// left uninit (a union's fields alias one storage;
+    /// the value records the field it was written
+    /// through). `None` when no field has shape `want`,
+    /// or a zero-sized field has no constant.
+    fn union_storage_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        want: &ir::ScalarShape,
+    ) -> Option<ir::ScalarShape> {
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let mut payload = None;
+        let mut fill = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            match self.scalar_shape(fty, 0) {
+                Some(fs) if &fs == want && payload.is_none() => {
+                    payload = Some(i as u32);
+                }
+                Some(fs) if fs.bits() == 0 => {
+                    let zv = self.zst_value(fty, 0)?;
+                    fill.push((i as u32, value_to_constant(&zv)?));
+                }
+                _ => {}
+            }
+        }
+        let index = payload?;
+        Some(ir::ScalarShape::AdtField {
+            index,
+            count: fields.len(),
+            fill,
+            inner: Box::new(want.clone()),
+        })
+    }
+
+    /// Whether the ADT is a union.
+    fn adt_is_union(&self, def: &mir::AdtDefId) -> bool {
+        self.adt_shapes
+            .get(def)
+            .is_some_and(|sh| sh.kind == mir::AdtShapeKind::Union)
     }
 
     /// Whether a thin-pointer -> thin-pointer transmute crosses

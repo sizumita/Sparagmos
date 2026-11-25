@@ -522,7 +522,10 @@ pub struct TaggedVariantShape {
 /// and how a bit pattern constructs a value of this shape. Only
 /// shapes whose every bit is accounted for by scalar leaves are
 /// described; the two sides of a reinterpretation always agree
-/// on the total width, at most 128 bits.
+/// on the total width. A single pattern is at most 128 bits;
+/// array and one-payload shapes whose leaf streams agree on a
+/// larger total width are evaluated through the interpreter's
+/// bit-stream path instead.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarShape {
     /// An integer of the given width. Flattening masks the
