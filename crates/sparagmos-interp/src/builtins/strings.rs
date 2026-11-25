@@ -191,6 +191,46 @@ impl<'a> Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
+    /// Mutate the text of the string stored at `target`, whatever
+    /// form the stored value takes: the abstract string form
+    /// mutates where it sits; a `String` in an aggregate form --
+    /// the real `Vec` aggregate a converted body builds field by
+    /// field, or the element form the return-boundary
+    /// translation produces -- is read through the same
+    /// coercions the string readers use (see
+    /// `resolve_string`) and stored back in the abstract form.
+    /// Any other shape is the type mismatch `name` reports.
+    pub(super) fn modify_string(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        name: &str,
+        f: impl FnOnce(&mut String) -> InterpResult<Value>,
+    ) -> InterpResult<Value> {
+        let stored = self.read_resolved(frames, target)?;
+        if matches!(stored, Value::Str(_)) {
+            return self.modify_resolved(frames, target, |slot| match slot {
+                Value::Str(s) => f(s),
+                other => Err(InterpError::type_mismatch(
+                    name,
+                    "string value",
+                    other.kind_name(),
+                )),
+            });
+        }
+        let text = match self.string_from_real_aggregate(frames, &stored)? {
+            Some(text) => Some(text),
+            None => string_aggregate_bytes(&stored)
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+        };
+        let mut text = text.ok_or_else(|| {
+            InterpError::type_mismatch(name, "string value", stored.kind_name())
+        })?;
+        let result = f(&mut text)?;
+        self.write_resolved(frames, target, Value::Str(text))?;
+        Ok(result)
+    }
+
     pub(super) fn resolve_string(&self, frames: &[Frame], value: &Value) -> InterpResult<String> {
         let resolved = self.resolve_value(frames, value)?;
         match resolved {

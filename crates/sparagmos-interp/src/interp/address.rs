@@ -398,6 +398,8 @@ fn rvalue_liveness(rv: &Rvalue, uses: &mut [u64], n: usize) {
         | Rvalue::IntToPtr(op)
         | Rvalue::EnumToInt(op, ..)
         | Rvalue::IntToEnum(op, ..)
+        | Rvalue::SliceEnumToInt(op, ..)
+        | Rvalue::SliceIntToEnum(op, ..)
         | Rvalue::Reinterpret(op, ..)
         | Rvalue::IntToPtrWrapped { operand: op, .. }
         | Rvalue::ScalarToPtrWrapped { operand: op, .. }

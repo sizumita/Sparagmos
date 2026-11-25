@@ -226,6 +226,10 @@ const PAIR_TY: mir::DefId = mir::DefId::new(0, 333);
 const UNKNOWN_TY: mir::DefId = mir::DefId::new(0, 334);
 const MEM_SWAP: mir::DefId = mir::DefId::new(0, 237);
 const MEM_DROP: mir::DefId = mir::DefId::new(0, 238);
+const STRING_PUSH: mir::DefId = mir::DefId::new(0, 340);
+const RAWVEC_TY: mir::DefId = mir::DefId::new(0, 341);
+const RAWVEC_INNER_TY: mir::DefId = mir::DefId::new(0, 342);
+const NONNULL_TY: mir::DefId = mir::DefId::new(0, 343);
 
 fn std_names() -> HashMap<mir::DefId, String> {
     HashMap::from([
@@ -289,6 +293,10 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (UNKNOWN_TY, "Unknown".to_string()),
         (MEM_SWAP, "std::mem::swap".to_string()),
         (MEM_DROP, "std::mem::drop".to_string()),
+        (STRING_PUSH, "std::string::String::push".to_string()),
+        (RAWVEC_TY, "alloc::raw_vec::RawVec<u8>".to_string()),
+        (RAWVEC_INNER_TY, "alloc::raw_vec::RawVecInner<u8>".to_string()),
+        (NONNULL_TY, "core::ptr::non_null::NonNull<u8>".to_string()),
     ])
 }
 
@@ -4924,4 +4932,206 @@ fn box_from_borrowed_cow_clones_place_backed_elements() {
     );
     let value = interpret_mir(&program_cow(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(1));
+}
+
+// ----- slice bases that are themselves elements (Issue #513) ----------------
+
+#[test]
+fn slice_of_an_array_element_reads_the_element_not_its_sibling() {
+    // fn main() -> i32 {
+    //   _1 = [[10, 11], [20, 21]];
+    //   _3 = Index::index(&_1, 0);   // &[i32; 2], a ref to element 0
+    //   _4 = _3 as &[i32];
+    //   return _4.iter().sum();      // 21, not 41
+    // }
+    // The fat pointer base denotes element 0 of the outer
+    // array, and the value there is itself the two-element
+    // sequence the pointer describes. Extracting the slice
+    // elements by walking the outer array by sibling indices
+    // instead reads element 1 of the outer array as if it
+    // were an element of the slice (the issue-3563-3 shape:
+    // the inner vec of a vec-of-vecs read through a deref).
+    let inner_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(2));
+    let outer_ty = mir::Ty::Array(Box::new(inner_ty.clone()), mir::ArrayLen::Known(2));
+    let slice_ref_ty = ref_ty(mir::Ty::Slice(Box::new(i32_ty())), false);
+    let iter_ty = mir::Ty::Adt(ITER_TY, vec![i32_ty()]);
+    let option_ty = mir::Ty::Adt(OPTION_TY, vec![ref_ty(i32_ty(), false)]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            outer_ty.clone(),
+            ref_ty(outer_ty.clone(), false),
+            ref_ty(inner_ty.clone(), false),
+            slice_ref_ty.clone(),
+            iter_ty.clone(),
+            iter_ty.clone(),
+            ref_ty(iter_ty.clone(), true),
+            option_ty,
+            mir::Ty::Int(mir::IntTy::Isize),
+            ref_ty(i32_ty(), false),
+            i32_ty(),
+            i32_ty(),
+            inner_ty.clone(),
+            inner_ty.clone(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(13),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(10), const_i32(11)],
+                        ),
+                    ),
+                    assign(
+                        place(14),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(20), const_i32(21)],
+                        ),
+                    ),
+                    assign(
+                        place(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(inner_ty.clone())),
+                            vec![copy(13), copy(14)],
+                        ),
+                    ),
+                    assign(place(2), ref_rvalue(1, false)),
+                ],
+                call(
+                    fndef(INDEX, vec![outer_ty.clone(), usize_ty()]),
+                    vec![move_(2), const_usize(0)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(4),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                        copy(3),
+                        slice_ref_ty,
+                    ),
+                )],
+                call(
+                    fndef(SLICE_ITER, vec![mir::Ty::Slice(Box::new(i32_ty()))]),
+                    vec![move_(4)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(11), mir::Rvalue::Use(const_i32(0)))],
+                call(fndef(INTO_ITER, vec![iter_ty.clone()]), vec![move_(5)], 6, 3),
+            ),
+            block(
+                vec![assign(place(7), ref_rvalue(6, true))],
+                call(fndef(ITER_NEXT, vec![iter_ty.clone()]), vec![move_(7)], 8, 4),
+            ),
+            block(
+                vec![assign(place(9), mir::Rvalue::Discriminant(place(8)))],
+                mir::TerminatorKind::SwitchInt {
+                    discr: copy(9),
+                    targets: mir::SwitchTargets::new(
+                        vec![0],
+                        vec![mir::BasicBlock(6)],
+                        mir::BasicBlock(5),
+                    ),
+                },
+            ),
+            block(
+                vec![
+                    assign(
+                        place(10),
+                        mir::Rvalue::Use(mir::Operand::Copy(
+                            place(8).downcast(None, 1).field(0, ref_ty(i32_ty(), false)),
+                        )),
+                    ),
+                    assign(place(12), mir::Rvalue::Use(mir::Operand::Copy(deref_place(10)))),
+                    assign(
+                        place(11),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(11), copy(12))),
+                        ),
+                    ),
+                ],
+                goto(3),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(11)))], ret()),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(21));
+}
+
+#[test]
+fn string_push_accepts_the_aggregate_form() {
+    // fn main() -> String {
+    //   _1 = String { vec: Vec { buf: RawVec { ptr: 8, cap: 0 }, len: 0 } };
+    //   String::push(&mut _1, .);
+    //   return _1;
+    // }
+    // Bodies inside std build strings in the aggregate form
+    // (the FromIterator::from_iter shape), and the in-place
+    // string mutators must accept that form like the string
+    // readers do; a Value::Str-only reading is the type
+    // mismatch the issue-3563-3 record fails with.
+    let string_ty = mir::Ty::Adt(STRING_TY, vec![]);
+    let vec_u8_ty = mir::Ty::Adt(VEC_TY, vec![u8_ty()]);
+    let rawvec_ty = mir::Ty::Adt(RAWVEC_TY, vec![u8_ty()]);
+    let inner_ty = mir::Ty::Adt(RAWVEC_INNER_TY, vec![u8_ty()]);
+    let nonnull_ty = mir::Ty::Adt(NONNULL_TY, vec![u8_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            string_ty.clone(),
+            string_ty.clone(),
+            vec_u8_ty,
+            rawvec_ty,
+            inner_ty,
+            nonnull_ty,
+            ref_ty(string_ty.clone(), true),
+            mir::Ty::unit(),
+            mir::Ty::Char,
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(5),
+                        adt_aggregate(NONNULL_TY, 0, vec![u8_ty()], vec![const_usize(8)]),
+                    ),
+                    assign(
+                        place(4),
+                        adt_aggregate(
+                            RAWVEC_INNER_TY,
+                            0,
+                            vec![u8_ty()],
+                            vec![move_(5), const_usize(0), const_usize(0)],
+                        ),
+                    ),
+                    assign(
+                        place(3),
+                        adt_aggregate(RAWVEC_TY, 0, vec![u8_ty()], vec![move_(4), const_usize(0)]),
+                    ),
+                    assign(
+                        place(2),
+                        adt_aggregate(VEC_TY, 0, vec![u8_ty()], vec![move_(3), const_usize(0)]),
+                    ),
+                    assign(place(1), adt_aggregate(STRING_TY, 0, vec![], vec![move_(2)])),
+                    assign(place(8), mir::Rvalue::Use(const_int(46, 4))),
+                    assign(place(6), ref_rvalue(1, true)),
+                ],
+                call(fndef(STRING_PUSH, vec![]), vec![move_(6), copy(8)], 7, 1),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Str(".".to_string()));
 }

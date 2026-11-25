@@ -2541,6 +2541,65 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
+            Rvalue::SliceEnumToInt(operand, discriminants, ty) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.map_slice_pointer_elems(
+                    frames,
+                    &value,
+                    |elem| match elem {
+                        Value::Enum { variant, fields } if fields.is_empty() => {
+                            let discr = if discriminants.is_empty() {
+                                *variant as i128
+                            } else {
+                                *discriminants.get(*variant as usize).ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        "slice enum-to-integer transmute",
+                                        "variant covered by the discriminant table",
+                                        format!("variant {variant}"),
+                                    )
+                                })?
+                            };
+                            eval_cast(&Value::Int(discr), None, ty)
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "slice enum-to-integer transmute",
+                            "fieldless enum element",
+                            other.kind_name(),
+                        )),
+                    },
+                )
+            }
+            Rvalue::SliceIntToEnum(operand, discriminants) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.map_slice_pointer_elems(
+                    frames,
+                    &value,
+                    |elem| {
+                        let bits = match elem {
+                            Value::Int(i) => *i as u128,
+                            Value::Uint(u) => *u,
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "slice integer-to-enum transmute",
+                                    "integer element",
+                                    other.kind_name(),
+                                ))
+                            }
+                        };
+                        match discriminants.iter().position(|d| *d as u128 == bits) {
+                            Some(variant) => Ok(Value::Enum {
+                                variant: variant as u32,
+                                fields: Vec::new(),
+                            }),
+                            None => Err(InterpError::type_mismatch(
+                                "slice integer-to-enum transmute",
+                                "a discriminant value of the target enum",
+                                format!("integer {bits}"),
+                            )),
+                        }
+                    },
+                )
+            }
             Rvalue::IntToEnumWrapped {
                 operand,
                 discriminants,

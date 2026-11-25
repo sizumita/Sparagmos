@@ -994,6 +994,74 @@ impl<'a> Interpreter<'a> {
         self.write_resolved_typed(frames, target, value, root_ty)
     }
 
+    /// Map the elements a slice / array pointer denotes
+    /// through `map`, for the slice element reinterpretation
+    /// casts (see `Rvalue::SliceEnumToInt`): the result is a
+    /// fresh value target holding a snapshot of the mapped
+    /// elements, in the same shape the source pointer had.
+    /// The storage the operand denotes is never rewritten
+    /// (see `Rvalue::WrapSliceElems`); a pointer whose
+    /// pointee is not an element aggregate keeps the identity
+    /// value, and element reads through it keep the explicit
+    /// type mismatch they already give.
+    pub(crate) fn map_slice_pointer_elems(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        map: impl Fn(&Value) -> InterpResult<Value>,
+    ) -> InterpResult<Value> {
+        match value {
+            Value::FatRef { base, len } => match &**base {
+                Value::Tuple(items) => {
+                    let mapped = items
+                        .iter()
+                        .map(&map)
+                        .collect::<InterpResult<Vec<_>>>()?;
+                    Ok(Value::FatRef {
+                        base: Box::new(Value::Tuple(mapped)),
+                        len: *len,
+                    })
+                }
+                Value::Ref(_) => {
+                    let (elems, _) = self.slice_elements(frames, value)?;
+                    let mapped = elems
+                        .iter()
+                        .map(&map)
+                        .collect::<InterpResult<Vec<_>>>()?;
+                    // The fresh base is the bare element tuple,
+                    // not a value target entered at index 0: an
+                    // index step over the fat deref composes
+                    // into place/static/alloc targets only, and
+                    // a value target already standing at an
+                    // element position would take a second index
+                    // step into the element itself. The bare
+                    // tuple denotes the whole sequence, so the
+                    // deref denotes the slice storage and index
+                    // steps address its elements directly.
+                    Ok(Value::FatRef {
+                        base: Box::new(Value::Tuple(mapped)),
+                        len: *len,
+                    })
+                }
+                _ => Ok(value.clone()),
+            },
+            Value::Ref(_) => {
+                let pointee = self.resolve_ref(frames, value)?;
+                match &*pointee {
+                    Value::Tuple(items) => {
+                        let mapped = items
+                            .iter()
+                            .map(&map)
+                            .collect::<InterpResult<Vec<_>>>()?;
+                        Ok(Value::Ref(RefTarget::value(Value::Tuple(mapped))))
+                    }
+                    _ => Ok(value.clone()),
+                }
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
     pub(crate) fn reinterpret_value(
         &self,
         value: &Value,
