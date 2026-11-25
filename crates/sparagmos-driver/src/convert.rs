@@ -656,6 +656,20 @@ pub struct Converter {
     /// rather than fall back to the declared type's decode
     /// (see `decode_ref`).
     const_budget_failed: bool,
+    /// Scan budget remaining for the constant currently being
+    /// decoded (see `MAX_CONST_SCAN_BYTES`): reset wherever
+    /// `const_budget` resets, and spent by `range_all_uninit`
+    /// once per byte examined, so the uninitialised-range scan
+    /// at the head of `decode_const` -- the one decode step
+    /// whose cost tracks a range's byte size rather than the
+    /// materialised value -- stays bounded when one root
+    /// constant re-decodes a large partially initialised
+    /// pointee once per element. Exhaustion does not fail a
+    /// decode: the scan reports "undecided" and the structural
+    /// decode proceeds, so only the `Uninit` shortcut is ever
+    /// lost, never a value the structural decode could still
+    /// build.
+    const_scan_budget: usize,
     /// Materialised memory allocations by provenance id,
     /// shared within one root constant's decode tree and
     /// cleared wherever `const_budget` resets. Resolving a
@@ -3272,6 +3286,7 @@ impl Converter {
             const_fn_mentions_seen: std::collections::HashSet::new(),
             const_budget: MAX_CONST_TOTAL_ELEMS,
             const_budget_failed: false,
+            const_scan_budget: MAX_CONST_SCAN_BYTES,
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
             alloc_cache_bytes: 0,
@@ -4885,6 +4900,7 @@ impl Converter {
         // behind, so whether a constant decodes would depend
         // on the constants visited before it.
         self.const_budget = MAX_CONST_TOTAL_ELEMS;
+        self.const_scan_budget = MAX_CONST_SCAN_BYTES;
         self.clear_alloc_caches();
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
@@ -5305,6 +5321,49 @@ impl Converter {
         true
     }
 
+    /// Whether every byte of `alloc` in `offset..offset + size`
+    /// is uninitialised, spending one unit of the scan budget
+    /// (see `MAX_CONST_SCAN_BYTES`) per byte examined. `None`
+    /// when the budget runs out before the outcome is decided:
+    /// the caller then decodes structurally, so exhaustion
+    /// costs only the `Uninit` shortcut, never a value the
+    /// structural decode could still build. The scan is the
+    /// one decode step whose cost is proportional to a range's
+    /// byte size rather than to the materialised value -- a
+    /// partially initialised pointee is scanned in full at the
+    /// aggregate (whose scan runs to its one initialised
+    /// field) and again at its uninitialised field -- so
+    /// without a budget of its own, a table repeating one such
+    /// reference scans the same megabytes once per element
+    /// while spending only a few expansion-budget units each
+    /// (a 100,000-element table of references to one struct
+    /// with a 16 MiB uninitialised payload scanned terabytes
+    /// in aggregate). Charging the scan against the expansion
+    /// budget instead would refuse single values outright:
+    /// one 16 MiB uninitialised buffer is a small constant
+    /// (an `Uninit` marker) whose one scan is unremarkable --
+    /// only the repetition is unbounded, and only a budget on
+    /// the examination itself bounds that.
+    fn range_all_uninit(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+        size: usize,
+    ) -> Option<bool> {
+        let range = alloc.bytes.get(offset..offset + size)?;
+        let mut examined = 0usize;
+        let all = range.iter().all(|b| {
+            examined += 1;
+            b.is_none()
+        });
+        if examined > self.const_scan_budget {
+            self.const_scan_budget = 0;
+            return None;
+        }
+        self.const_scan_budget -= examined;
+        Some(all)
+    }
+
     /// Decode the value of type `ty` stored in `alloc` at `offset`
     /// into a structured constant. Aggregates are laid out with the
     /// type's own layout (`Ty::layout`), pointers are followed
@@ -5333,6 +5392,7 @@ impl Converter {
         // A constant whose expansion exhausts it stays undecoded.
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.const_scan_budget = MAX_CONST_SCAN_BYTES;
             self.clear_alloc_caches();
         }
         if !self.spend_const_budget(1) {
@@ -5343,16 +5403,17 @@ impl Converter {
         // `MaybeUninit::uninit()` constant, at whichever nesting
         // level it appears). A partially initialized range falls
         // through to the structural decode below, which reads the
-        // initialized parts field by field.
+        // initialized parts field by field. The scan itself is
+        // charged against the scan budget (see
+        // `range_all_uninit`): a scan the budget cannot pay for
+        // is skipped, and the structural decode proceeds without
+        // the shortcut.
         if let Ok(layout) = ty.layout() {
             let size = layout.shape().size.bytes() as usize;
-            if size > 0
-                && offset + size <= alloc.bytes.len()
-                && alloc.bytes[offset..offset + size]
-                    .iter()
-                    .all(|b| b.is_none())
-            {
-                return Some(sm::ConstValue::Uninit);
+            if size > 0 && offset + size <= alloc.bytes.len() {
+                if let Some(true) = self.range_all_uninit(alloc, offset, size) {
+                    return Some(sm::ConstValue::Uninit);
+                }
             }
         }
         match ty.kind() {
@@ -6523,6 +6584,7 @@ impl Converter {
         }
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.const_scan_budget = MAX_CONST_SCAN_BYTES;
             self.clear_alloc_caches();
         }
         // A pointee type passing through a coroutine-closure
@@ -8773,6 +8835,20 @@ const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
 /// so repeated references to one shared byte block cannot
 /// multiply that block's copies past the budget either.
 const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
+
+/// Work budget for the uninitialised-range scan at the head
+/// of `decode_const` (see `Converter::range_all_uninit`):
+/// bytes of allocation the scan may examine while decoding
+/// one root constant. A single value's own scans total a
+/// small multiple of its allocation size -- its ranges nest,
+/// and each level's scan stops at the first initialised
+/// byte -- so any one value fits easily; the budget exists
+/// for repetition, where one root constant re-decodes the
+/// same large partially initialised pointee once per element
+/// and every re-decode scans it in full. One gibibyte of
+/// examinations bounds that repetition to seconds while
+/// leaving single values of any realistic size untouched.
+const MAX_CONST_SCAN_BYTES: usize = 1 << 30;
 
 /// Cap on the total bytes held in the converter's per-constant
 /// allocation cache (see `Converter::alloc_cache`).

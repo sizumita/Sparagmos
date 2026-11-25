@@ -888,6 +888,64 @@ fn run_mode_static_ref_pair_under_budget_shares_storage() {
 }
 
 #[test]
+fn run_mode_uninit_scan_table_over_budget_stays_undecoded() {
+    // A 300-element table of references to one struct whose
+    // 16 MiB `MaybeUninit` payload is uninitialised and whose
+    // `bool` field is set: decoding each element's static seed
+    // scans the payload in full twice (once at the struct,
+    // whose scan runs to the one initialised field, and once
+    // at the payload itself), while the expansion budget
+    // spends only a few units per element. The scan budget
+    // (1 GiB of examinations per root constant) runs out
+    // after about thirty elements; the decode then loses the
+    // `Uninit` shortcut, the payload's structural decode
+    // charges its 16 MiB against the expansion budget, and
+    // the whole table stays undecoded -- in seconds, where
+    // the uncharged scan needed about 0.2 s per element
+    // (a 100,000-element table scanned terabytes in
+    // aggregate) and the table decoded.
+    let src = "#[repr(C)] struct S { payload: std::mem::MaybeUninit<[u8; 16777216]>, flag: bool } static S_VAL: S = S { payload: std::mem::MaybeUninit::uninit(), flag: true }; static TABLE: [&S; 300] = [&S_VAL; 300]; fn main() { println!(\"len={} flag={}\", TABLE.len(), TABLE[0].flag); }";
+    let dir = temp_dir("uninit-scan-table-over-budget");
+    let src = fixture(&dir, "uninit_scan_table_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a reference table whose repeated uninit scans exceed the scan budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_uninit_scan_table_under_budget_reads_back() {
+    // The same table at four elements: the repeated scans
+    // total about 128 MiB of examinations, well within the
+    // scan budget, so every element's seed decodes exactly as
+    // before and the run reads the flag back through the
+    // references.
+    let src = "#[repr(C)] struct S { payload: std::mem::MaybeUninit<[u8; 16777216]>, flag: bool } static S_VAL: S = S { payload: std::mem::MaybeUninit::uninit(), flag: true }; static TABLE: [&S; 4] = [&S_VAL; 4]; fn main() { println!(\"len={} flag={}\", TABLE.len(), TABLE[3].flag); }";
+    let dir = temp_dir("uninit-scan-table-under-budget");
+    let src = fixture(&dir, "uninit_scan_table_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget uninit-scan table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=4 flag=true\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
 fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
     // One root constant -- a 21-element table of one-byte
     // slices -- whose elements alternate between ten distinct
