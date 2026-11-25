@@ -12696,6 +12696,82 @@ fn run_mode_transmute_fn_ptr_niche_payload() {
     );
 }
 
+const TRANSMUTE_NICHE_MULTI_FIELD_SRC: &str = r#"
+#![feature(core_intrinsics)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Safety { Unsafe, Safe }
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Mut { Immutable, Mutable }
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Kind {
+    Mod,
+    Const,
+    Static { safety: Safety, mutability: Mut, nested: bool },
+    Fn,
+    Type,
+}
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Tail {
+    A,
+    B,
+    Payload { x: u8, flag: bool },
+}
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Head {
+    Payload { x: u8, flag: bool },
+    A,
+    B,
+}
+fn inp() -> u32 { let mut s = 0u32; let mut i = 0; while i < 41 { s += 1; i += 1; } s }
+fn erase<T: Copy, const N: usize>(v: T) -> std::mem::MaybeUninit<[u8; N]> {
+    unsafe { std::intrinsics::transmute_unchecked(v) }
+}
+fn restore<T: Copy, const N: usize>(data: std::mem::MaybeUninit<[u8; N]>) -> T {
+    unsafe { std::intrinsics::transmute_unchecked(data) }
+}
+fn rt<T: Copy + PartialEq + std::fmt::Debug, const N: usize>(v: T) {
+    let back: T = restore(erase::<T, N>(v));
+    println!("{v:?} == {back:?} : {}", v == back);
+}
+fn main() {
+    let n = inp();
+    let safety = if n == 41 { Safety::Safe } else { Safety::Unsafe };
+    let mutable = if n % 2 == 1 { Mut::Mutable } else { Mut::Immutable };
+    println!("sizes {} {} {}", std::mem::size_of::<Kind>(), std::mem::size_of::<Tail>(), std::mem::size_of::<Head>());
+    rt::<Kind, 3>(Kind::Mod);
+    rt::<Kind, 3>(Kind::Const);
+    rt::<Kind, 3>(Kind::Static { safety, mutability: mutable, nested: n == 41 });
+    rt::<Kind, 3>(Kind::Static { safety: Safety::Unsafe, mutability: Mut::Immutable, nested: false });
+    rt::<Kind, 3>(Kind::Fn);
+    rt::<Kind, 3>(Kind::Type);
+    rt::<Tail, 2>(Tail::A);
+    rt::<Tail, 2>(Tail::B);
+    rt::<Tail, 2>(Tail::Payload { x: (n + 159) as u8, flag: true });
+    rt::<Tail, 2>(Tail::Payload { x: 3, flag: false });
+    rt::<Head, 2>(Head::Payload { x: (n + 36) as u8, flag: false });
+    rt::<Head, 2>(Head::A);
+    rt::<Head, 2>(Head::B);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_multi_field_payload() {
+    // A niche-encoded enum whose payload variant carries
+    // several fields — the storage shape of the compiler's
+    // `DefKind`, which the query-result erasure
+    // (`erase_val` / `restore_val`) transmutes through a
+    // `MaybeUninit<[u8; N]>` in both directions. The payload
+    // variant sits between fieldless variants, so its own
+    // index is a dead slot inside the recorded niche range;
+    // the payload-first and payload-last orders exercise the
+    // range's other two placements.
+    run_ok(
+        "transmute-niche-multi-field",
+        TRANSMUTE_NICHE_MULTI_FIELD_SRC,
+        "sizes 3 2 2\nMod == Mod : true\nConst == Const : true\nStatic { safety: Safe, mutability: Mutable, nested: true } == Static { safety: Safe, mutability: Mutable, nested: true } : true\nStatic { safety: Unsafe, mutability: Immutable, nested: false } == Static { safety: Unsafe, mutability: Immutable, nested: false } : true\nFn == Fn : true\nType == Type : true\nA == A : true\nB == B : true\nPayload { x: 200, flag: true } == Payload { x: 200, flag: true } : true\nPayload { x: 3, flag: false } == Payload { x: 3, flag: false } : true\nPayload { x: 77, flag: false } == Payload { x: 77, flag: false } : true\nA == A : true\nB == B : true\n",
+    );
+}
+
 const TRANSMUTE_FN_ADDR_AS_DATA_PTR_SRC: &str = r#"
 fn hello() { println!("hello called"); }
 fn main() {

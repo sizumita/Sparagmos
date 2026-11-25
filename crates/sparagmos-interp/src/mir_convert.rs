@@ -1649,6 +1649,9 @@ fn scalar_shape_has_ptr_leaf(shape: &ir::ScalarShape) -> bool {
         ir::ScalarShape::AdtFields { fields, .. } => fields
             .iter()
             .any(|(_, _, s)| scalar_shape_has_ptr_leaf(s)),
+        ir::ScalarShape::NicheEnumFields { fields, .. } => fields
+            .iter()
+            .any(|(_, _, s)| scalar_shape_has_ptr_leaf(s)),
         ir::ScalarShape::TaggedEnum { variants, .. } => variants
             .iter()
             .any(|v| v.fields.iter().any(|(_, _, s)| scalar_shape_has_ptr_leaf(s))),
@@ -3866,6 +3869,9 @@ impl<'a> Converter<'a> {
             ir::ScalarShape::AdtFields { fields, .. } => fields
                 .iter()
                 .any(|(_, _, s)| Self::shape_contains_ptr(s)),
+            ir::ScalarShape::NicheEnumFields { fields, .. } => fields
+                .iter()
+                .any(|(_, _, s)| Self::shape_contains_ptr(s)),
             ir::ScalarShape::TaggedEnum { variants, .. } => variants
                 .iter()
                 .any(|v| v.fields.iter().any(|(_, _, s)| Self::shape_contains_ptr(s))),
@@ -5364,8 +5370,11 @@ impl<'a> Converter<'a> {
     ///   payload (`Option<NonNull<T>>`), over a fieldless-enum
     ///   payload, or over a wider payload field holding the
     ///   niche scalar in a sub-window (an enum whose payload
-    ///   is itself an enum) — the bit-level reinterpretation
-    ///   `transmute` means there;
+    ///   is itself an enum), or over several payload fields
+    ///   packed around the niche (the storage shape of
+    ///   `DefKind`, which the compiler's query-result erasure
+    ///   transmutes through a byte array) — the bit-level
+    ///   reinterpretation `transmute` means there;
     /// * pointer <-> pointer over byte-string DST pointees
     ///   (`str`, `[u8]`, `OsStr`, `Path` in any combination);
     /// * fat pointer <-> fat pointer, and fat pointer <->
@@ -6969,6 +6978,11 @@ let inner = match (&src, target) {
                     {
                         return Some(s);
                     }
+                    if let Some(s) = self.niche_enum_multi_shape(
+                        def, args, shape, depth,
+                    ) {
+                        return Some(s);
+                    }
                     if let Some(s) = self.fieldless_enum_shape(def) {
                         return Some(s);
                     }
@@ -7182,6 +7196,123 @@ let inner = match (&src, target) {
             niche_variants: niche.niche_variants,
             niche_start: niche.niche_start,
             niche_shift,
+            niche_bits: niche.tag_bits,
+        })
+    }
+
+    /// The scalar shape of a niche-encoded enum whose
+    /// payload-carrying variant carries several fields (see
+    /// [`ir::ScalarShape::NicheEnumFields`]): the variant's
+    /// fields at their recorded layout offsets, the
+    /// discriminant in the niche window inside the recorded
+    /// niche field's span. [`Self::niche_enum_shape`] is the
+    /// single-field case of the same encoding; the conditions
+    /// mirror it — exactly one non-fieldless variant (the
+    /// untagged one), every other variant fieldless, the
+    /// variant count matching the recorded niche range, the
+    /// niche window inside one payload field's span.
+    /// Anything else — a
+    /// payload field with no shape at its span, overlapping
+    /// spans, a window reaching outside the niche field —
+    /// has no shape and stays unsupported.
+    fn niche_enum_multi_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        shape: &mir::AdtShape,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let niche = self.adt_niches.get(&tag)?;
+        let (first, last) = niche.niche_variants;
+        let niche_count = last.checked_sub(first)? + 1;
+        // The recorded range spans every variant that needs a
+        // discriminant; the untagged variant's own index sits
+        // inside it as a dead slot when the payload variant is
+        // not at either end of the declaration order (the
+        // range then covers every variant), and outside it
+        // otherwise (one more variant than the range covers).
+        let untagged = niche.untagged_variant as usize;
+        let in_range = (first..=last).contains(&niche.untagged_variant);
+        if untagged >= shape.variants.len()
+            || shape.variants.len() as u32
+                != niche_count + u32::from(!in_range)
+        {
+            return None;
+        }
+        for (i, fields) in shape.variants.iter().enumerate() {
+            if i == untagged {
+                if fields.len() <= 1 {
+                    return None;
+                }
+            } else if !fields.is_empty() {
+                return None;
+            }
+        }
+        let (size, _) = *self.adt_layouts.get(&tag)?;
+        if size == 0 || size > 16 {
+            return None;
+        }
+        let layouts = self.adt_field_layouts.get(&tag)?;
+        let vlayout = layouts.get(untagged)?;
+        let ftys =
+            self.instantiated_field_tys(def, args, niche.untagged_variant)?;
+        if vlayout.len() != ftys.len() {
+            return None;
+        }
+        // The niche window (an absolute bit range of the
+        // enum) must sit inside one payload field's span:
+        // that field's pattern is what the window cuts into.
+        // (The recorded niche field index names the field in
+        // the layout's own field order, which is not the
+        // declaration order the field layout rows use, so
+        // the window is matched by span instead.)
+        let win_lo = niche.niche_offset * 8;
+        let win_hi = win_lo + u64::from(niche.tag_bits);
+        if niche.tag_bits == 0 || win_hi > size * 8 {
+            return None;
+        }
+        let mut out_fields = Vec::new();
+        let mut fill = Vec::new();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for (i, fty) in ftys.iter().enumerate() {
+            let (off, fsize) = vlayout[i];
+            if fsize == 0 {
+                let zv = self.zst_value(fty, 0)?;
+                fill.push((i as u32, value_to_constant(&zv)?));
+                continue;
+            }
+            if off + fsize > size {
+                return None;
+            }
+            let fs = self.field_shape_at_span(fty, fsize, depth)?;
+            if spans
+                .iter()
+                .any(|(o, s)| off < o + s && *o < off + fsize)
+            {
+                return None;
+            }
+            spans.push((off, fsize));
+            out_fields.push((i as u32, (off * 8) as u32, fs));
+        }
+        if !out_fields.iter().any(|(_, off, s)| {
+            u64::from(*off) <= win_lo
+                && win_hi <= u64::from(*off) + u64::from(s.bits())
+        }) {
+            return None;
+        }
+        Some(ir::ScalarShape::NicheEnumFields {
+            total_bits: (size * 8) as u32,
+            count: ftys.len(),
+            fill,
+            fields: out_fields,
+            untagged_variant: niche.untagged_variant,
+            niche_variants: niche.niche_variants,
+            niche_start: niche.niche_start,
+            niche_shift: win_lo as u32,
             niche_bits: niche.tag_bits,
         })
     }

@@ -18675,6 +18675,51 @@ impl<'a> Interpreter<'a> {
                 _ => None,
             },
             (
+                ScalarShape::NicheEnumFields {
+                    fields: sfields,
+                    untagged_variant: suv,
+                    niche_variants: snv,
+                    niche_start: sns,
+                    niche_shift: sshift,
+                    niche_bits: sbits,
+                    ..
+                },
+                ScalarShape::NicheEnumFields {
+                    fields: dfields,
+                    untagged_variant: duv,
+                    niche_variants: dnv,
+                    niche_start: dns,
+                    niche_shift: dshift,
+                    niche_bits: dbits,
+                    ..
+                },
+            ) if suv == duv
+                && snv == dnv
+                && sns == dns
+                && sshift == dshift
+                && sbits == dbits =>
+            match value {
+                Value::Enum { variant, fields } if variant == suv => {
+                    let mut out = fields.clone();
+                    for ((si, _, ss), (di, _, ds)) in
+                        sfields.iter().zip(dfields.iter())
+                    {
+                        if si != di {
+                            return None;
+                        }
+                        let field = fields.get(*si as usize)?;
+                        out[*si as usize] =
+                            self.reinterpret_preserving(field, ss, ds)?;
+                    }
+                    Some(Value::Enum {
+                        variant: *variant,
+                        fields: out,
+                    })
+                }
+                Value::Enum { .. } => Some(value.clone()),
+                _ => None,
+            },
+            (
                 ScalarShape::Array(selem, sn),
                 ScalarShape::Array(delem, dn),
             ) if sn == dn => match value {
@@ -18795,6 +18840,53 @@ impl<'a> Interpreter<'a> {
                             "an enum value without it",
                         )),
                     }
+                } else {
+                    Err(InterpError::type_mismatch(
+                        "transmute",
+                        "a variant of the niche-encoded enum",
+                        format!("variant {variant}"),
+                    ))
+                }
+            }
+            (
+                ScalarShape::NicheEnumFields {
+                    fields,
+                    untagged_variant,
+                    niche_variants,
+                    niche_start,
+                    niche_shift,
+                    niche_bits,
+                    ..
+                },
+                Value::Enum { variant, fields: vals },
+            ) => {
+                if variant == untagged_variant {
+                    let mut out = 0u128;
+                    for (index, offset, shape) in fields {
+                        let field = vals.get(*index as usize).ok_or_else(
+                            || {
+                                InterpError::type_mismatch(
+                                    "transmute",
+                                    "an ADT value holding every field",
+                                    "an ADT value without one",
+                                )
+                            },
+                        )?;
+                        out |= (self.flatten_scalar(field, shape)?
+                            & bit_mask(shape.bits()))
+                            << offset;
+                    }
+                    Ok(out)
+                } else if (niche_variants.0..=niche_variants.1)
+                    .contains(variant)
+                {
+                    // As in the single-field niche shape, the
+                    // encoded value is taken at the niche
+                    // scalar's width before shifting.
+                    Ok(((*niche_start
+                        + u128::from(*variant - niche_variants.0))
+                        & bit_mask(*niche_bits))
+                        << niche_shift)
                 } else {
                     Err(InterpError::type_mismatch(
                         "transmute",
@@ -19088,6 +19180,50 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Enum {
                         variant: *untagged_variant,
                         fields: vec![payload],
+                    })
+                }
+            }
+            ScalarShape::NicheEnumFields {
+                count,
+                fill,
+                fields,
+                untagged_variant,
+                niche_variants,
+                niche_start,
+                niche_shift,
+                niche_bits,
+                ..
+            } => {
+                let window =
+                    (bits >> niche_shift) & bit_mask(*niche_bits);
+                let span =
+                    u128::from(niche_variants.1 - niche_variants.0);
+                // As in the single-field niche shape, the
+                // distance from the range's start is taken at
+                // the niche scalar's width (the range may wrap
+                // past the scalar's maximum).
+                let offset = window.wrapping_sub(*niche_start)
+                    & bit_mask(*niche_bits);
+                let decoded = niche_variants.0 + offset as u32;
+                if offset <= span && decoded != *untagged_variant {
+                    Ok(Value::Enum {
+                        variant: decoded,
+                        fields: Vec::new(),
+                    })
+                } else {
+                    let mut vals = vec![Value::Uninit; *count];
+                    for (i, c) in fill {
+                        vals[*i as usize] = self.eval_constant(c)?;
+                    }
+                    for (index, offset, shape) in fields {
+                        let part =
+                            (bits >> offset) & bit_mask(shape.bits());
+                        vals[*index as usize] =
+                            self.construct_scalar(part, shape)?;
+                    }
+                    Ok(Value::Enum {
+                        variant: *untagged_variant,
+                        fields: vals,
                     })
                 }
             }

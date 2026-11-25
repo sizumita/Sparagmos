@@ -603,6 +603,40 @@ pub enum ScalarShape {
         niche_shift: u32,
         niche_bits: u32,
     },
+    /// A niche-encoded enum whose payload-carrying variant
+    /// (`untagged_variant`) carries several scalar-shaped
+    /// fields: the variant's fields sit at their recorded
+    /// layout offsets in a pattern of `total_bits` bits (the
+    /// enum's whole storage), its zero-sized fields baked in
+    /// as `fill` constants for construction, and the
+    /// fieldless variants
+    /// `niche_variants.0..=niche_variants.1` are stored as
+    /// `niche_start + (variant - niche_variants.0)` in the
+    /// `niche_bits`-wide window at bit offset `niche_shift`
+    /// of the pattern — the window inside one designated
+    /// field's span (the niche field), whose own valid
+    /// patterns never take a window value in the niche range.
+    /// The range can contain the untagged variant's own
+    /// index as a dead slot: a tag decoding to it, like one
+    /// decoding outside the range, is the untagged variant.
+    /// This is [`Self::NicheEnum`] generalised from a single
+    /// payload field to a payload of several fields: the
+    /// encoding of enums like `DefKind`, whose one payload
+    /// variant packs several small scalar fields around the
+    /// discriminant's niche (the storage the compiler's
+    /// query-result erasure, `erase_val` / `restore_val`,
+    /// transmutes through a byte array).
+    NicheEnumFields {
+        total_bits: u32,
+        count: usize,
+        fill: Vec<(u32, Constant)>,
+        fields: Vec<(u32, u32, ScalarShape)>,
+        untagged_variant: u32,
+        niche_variants: (u32, u32),
+        niche_start: u128,
+        niche_shift: u32,
+        niche_bits: u32,
+    },
     /// A single-variant ADT (a struct) with several
     /// scalar-shaped fields: field `index`'s bit pattern
     /// sits at bit offset `offset` of the whole pattern (the
@@ -690,6 +724,7 @@ impl ScalarShape {
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),
+            ScalarShape::NicheEnumFields { total_bits, .. } => *total_bits,
             ScalarShape::AdtFields { total_bits, .. } => *total_bits,
             ScalarShape::TaggedEnum { total_bits, .. } => *total_bits,
             ScalarShape::FieldlessEnum { bits, .. } => *bits,
