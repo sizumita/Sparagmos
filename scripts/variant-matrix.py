@@ -652,7 +652,7 @@ TEST_TARGETS = [
      ["crates/sparagmos-interp/tests/print_support_tests.rs"]),
     ("sparagmos-interp", ["--lib"], "sparagmos_interp_lib",
      ["crates/sparagmos-interp/src/lib.rs", "crates/sparagmos-interp/src/interp.rs",
-      "crates/sparagmos-interp/src/mir_convert.rs", "crates/sparagmos-interp/src/ir.rs",
+      "crates/sparagmos-interp/src/mir_convert/mod.rs", "crates/sparagmos-interp/src/ir.rs",
       "crates/sparagmos-interp/src/builtins/mod.rs", "crates/sparagmos-interp/src/value.rs",
       "crates/sparagmos-interp/src/error.rs"]),
     ("sparagmos-jit", ["--test", "mir_jit"], "mir_jit",
