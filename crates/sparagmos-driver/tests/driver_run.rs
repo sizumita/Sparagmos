@@ -11627,6 +11627,63 @@ fn run_mode_transmute_raw_pointer_to_box() {
     );
 }
 
+const TRANSMUTE_LONG_ATOMIC_ARRAY_SRC: &str = r#"
+use std::sync::atomic::{AtomicPtr, Ordering};
+static A: u8 = 11;
+static B: u8 = 22;
+fn main() {
+    let mut raw: [*mut u8; 63] = [std::ptr::null_mut(); 63];
+    raw[0] = std::ptr::addr_of!(A) as *mut u8;
+    raw[62] = std::ptr::addr_of!(B) as *mut u8;
+    let arr: [AtomicPtr<u8>; 63] = unsafe { std::mem::transmute(raw) };
+    let p0 = arr[0].load(Ordering::SeqCst);
+    let p62 = arr[62].load(Ordering::SeqCst);
+    unsafe { println!("{} {} {}", *p0, *p62, arr[1].load(Ordering::SeqCst).is_null()); }
+    arr[0].store(std::ptr::addr_of!(B) as *mut u8, Ordering::SeqCst);
+    let back: [*mut u8; 63] = unsafe { std::mem::transmute(arr) };
+    unsafe { println!("{} {} {}", *back[0], *back[62], back[1].is_null()); }
+}
+"#;
+
+#[test]
+fn run_mode_transmute_long_atomic_ptr_array() {
+    // A long array whose total width exceeds the 128-bit
+    // whole-array scalar-shape budget: the elements'
+    // shapes carry the reinterpretation instead. The
+    // 63-element pointer -> `Atomic` array is the
+    // `thread_local` crate's bucket-table transmute.
+    run_ok(
+        "transmute-long-atomic-array",
+        TRANSMUTE_LONG_ATOMIC_ARRAY_SRC,
+        "11 22 true\n22 22 true\n",
+    );
+}
+
+const TRANSMUTE_LONG_SCALAR_ARRAY_SRC: &str = r#"
+fn main() {
+    let mut a: [u32; 40] = [0; 40];
+    for i in 0..40 { a[i] = 0x3fc00000 + (i as u32) * 0x10000; }
+    let f: [f32; 40] = unsafe { std::mem::transmute(a) };
+    println!("{} {} {}", f[0], f[1], f[39]);
+    let back: [u32; 40] = unsafe { std::mem::transmute(f) };
+    println!("{:x} {:x}", back[0], back[39]);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_long_scalar_arrays() {
+    // The same over-budget length with element shapes
+    // that do not line up structurally (integer ->
+    // float): the evaluation reinterprets element by
+    // element instead of packing the whole array into
+    // one 128-bit pattern.
+    run_ok(
+        "transmute-long-scalar-arrays",
+        TRANSMUTE_LONG_SCALAR_ARRAY_SRC,
+        "1.5 1.5078125 1.8046875\n3fc00000 3fe70000\n",
+    );
+}
+
 const TRANSMUTE_RAW_TO_ZST_FIRST_WRAPPER_SRC: &str = r#"
 #[repr(transparent)]
 struct Inner(*mut u32);

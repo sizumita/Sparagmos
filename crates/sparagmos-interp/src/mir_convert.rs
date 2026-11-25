@@ -5327,6 +5327,15 @@ impl<'a> Converter<'a> {
     ///   [`ir::Rvalue::UnwrapArrayElems`]). An inlined by-value
     ///   array iterator construction performs this cast on the
     ///   backing array;
+    /// * array -> array of the same length whose elements
+    ///   are scalar-shaped of the same nonzero width, at
+    ///   lengths whose total width exceeds the 128-bit
+    ///   whole-array shape budget (so the generic path above
+    ///   cannot see the pair): the reinterpretation the
+    ///   generic path computes element by element for the
+    ///   lengths that fit, carried by the elements' shapes
+    ///   instead (`[ *mut T; 63 ]` -> `[Atomic<*mut T>; 63]`,
+    ///   the `thread_local` crate's bucket table);
     /// * a byte-string constant in pointer position (it
     ///   carries no place type) -> a thin pointer or a
     ///   transparent wrapper over one: const propagation
@@ -6255,6 +6264,19 @@ let inner = match (&src, target) {
                     _ => ir::Rvalue::UnwrapArrayElems(v.clone()),
                 }
             }
+            // Array -> array of the same length whose
+            // elements are scalar-shaped of the same nonzero
+            // width, at a total width beyond the whole-array
+            // shape budget: the elementwise reinterpretation
+            // (see `array_elem_reinterpret_shapes`).
+            (Some(s), t)
+                if self.array_elem_reinterpret_shapes(s, t).is_some() =>
+            {
+                let (from, to) = self
+                    .array_elem_reinterpret_shapes(s, t)
+                    .expect("guard checked");
+                ir::Rvalue::Reinterpret(v.clone(), from, to)
+            }
             // Zero-sized -> zero-sized with a uniquely determined
             // value: the value is the target type's unique value,
             // whatever the source value was (a zero-sized source
@@ -6575,6 +6597,47 @@ let inner = match (&src, target) {
         } else {
             None
         }
+    }
+
+    /// The elementwise reinterpretation shapes for an
+    /// array -> array transmute of the same length whose
+    /// elements are scalar-shaped of the same nonzero
+    /// width: the pair of array shapes over the elements'
+    /// own shapes, or `None` when the pair is not that
+    /// shape. The whole-array scalar shapes cap the total
+    /// width at 128 bits, so the generic scalar path
+    /// cannot see a long array pair; the elements' shapes
+    /// carry the same reinterpretation the generic path
+    /// computes for the lengths that fit, and the
+    /// evaluation walks the two array shapes element by
+    /// element. `[ *mut T; 63 ]` -> `[Atomic<*mut T>; 63]`
+    /// (the `thread_local` crate's bucket table) is the
+    /// canonical case: each element is the pointer's bits
+    /// behind the transparent atomic wrapper.
+    fn array_elem_reinterpret_shapes(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<(ir::ScalarShape, ir::ScalarShape)> {
+        let (
+            mir::Ty::Array(src_elem, mir::ArrayLen::Known(src_len)),
+            mir::Ty::Array(target_elem, mir::ArrayLen::Known(target_len)),
+        ) = (src, target)
+        else {
+            return None;
+        };
+        if src_len != target_len || *src_len == 0 {
+            return None;
+        }
+        let from = self.scalar_shape(src_elem, 0)?;
+        let to = self.scalar_shape(target_elem, 0)?;
+        if from.bits() == 0 || from.bits() != to.bits() {
+            return None;
+        }
+        Some((
+            ir::ScalarShape::Array(Box::new(from), *src_len),
+            ir::ScalarShape::Array(Box::new(to), *src_len),
+        ))
     }
 
     /// Whether a thin-pointer -> thin-pointer transmute crosses
