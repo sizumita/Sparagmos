@@ -8334,6 +8334,138 @@ fn run_mode_boxed_slice_from_slice_ref_clone_reads_fields_live() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_NAN_ELEMENT_SRC: &str = r#"
+use std::cell::Cell;
+
+// An element whose Clone body updates its own inline Cell
+// through `&self`, and which also carries an f64.
+struct Elem {
+    cell: Cell<i32>,
+    x: f64,
+}
+
+impl Clone for Elem {
+    fn clone(&self) -> Self {
+        self.cell.set(42);
+        Elem { cell: Cell::new(self.cell.get()), x: self.x }
+    }
+}
+
+// Same, with the float nested one level down (inside a tuple
+// field of the element).
+struct Nested {
+    cell: Cell<i32>,
+    pair: (f64, u32),
+}
+
+impl Clone for Nested {
+    fn clone(&self) -> Self {
+        self.cell.set(43);
+        Nested { cell: Cell::new(self.cell.get()), pair: self.pair }
+    }
+}
+
+// Same, with an f32 payload.
+struct Elem32 {
+    cell: Cell<i32>,
+    x: f32,
+}
+
+impl Clone for Elem32 {
+    fn clone(&self) -> Self {
+        self.cell.set(44);
+        Elem32 { cell: Cell::new(self.cell.get()), x: self.x }
+    }
+}
+
+fn main() {
+    // 1. NaN directly in the cloned element: the element read
+    //    back from its own storage must still denote the
+    //    snapshot, so the Clone body runs on the live element
+    //    and its Cell update lands in the source.
+    {
+        let src = [Elem { cell: Cell::new(0), x: f64::NAN }];
+        let s: &[Elem] = &src;
+        let boxed: Box<[Elem]> = Box::from(s);
+        println!(
+            "nan src={} boxed={} is_nan={}",
+            src[0].cell.get(),
+            boxed[0].cell.get(),
+            boxed[0].x.is_nan()
+        );
+    }
+    // 2. NaN nested inside a tuple field of the element.
+    {
+        let src = [Nested { cell: Cell::new(0), pair: (f64::NAN, 7) }];
+        let s: &[Nested] = &src;
+        let boxed: Box<[Nested]> = Box::from(s);
+        println!(
+            "nested src={} boxed={} is_nan={}",
+            src[0].cell.get(),
+            boxed[0].cell.get(),
+            boxed[0].pair.0.is_nan()
+        );
+    }
+    // 3. -0.0 control: sign-zero float, no NaN.
+    {
+        let src = [Elem { cell: Cell::new(0), x: -0.0 }];
+        let s: &[Elem] = &src;
+        let boxed: Box<[Elem]> = Box::from(s);
+        println!(
+            "negzero src={} boxed={} sign={}",
+            src[0].cell.get(),
+            boxed[0].cell.get(),
+            boxed[0].x.is_sign_negative()
+        );
+    }
+    // 4. Ordinary float control.
+    {
+        let src = [Elem { cell: Cell::new(0), x: 1.5 }];
+        let s: &[Elem] = &src;
+        let boxed: Box<[Elem]> = Box::from(s);
+        println!(
+            "plain src={} boxed={} x={}",
+            src[0].cell.get(),
+            boxed[0].cell.get(),
+            boxed[0].x
+        );
+    }
+    // 5. f32 NaN in the cloned element.
+    {
+        let src = [Elem32 { cell: Cell::new(0), x: f32::NAN }];
+        let s: &[Elem32] = &src;
+        let boxed: Box<[Elem32]> = Box::from(s);
+        println!(
+            "f32nan src={} boxed={} is_nan={}",
+            src[0].cell.get(),
+            boxed[0].cell.get(),
+            boxed[0].x.is_nan()
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_nan_element_keeps_live_ref() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-nan-element");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_nan_element.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_NAN_ELEMENT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an element containing NaN must keep its live source reference, so its Clone body's Cell update lands in the source; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nan src=42 boxed=42 is_nan=true\nnested src=43 boxed=43 is_nan=true\nnegzero src=42 boxed=42 sign=true\nplain src=42 boxed=42 x=1.5\nf32nan src=44 boxed=44 is_nan=true\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_DROP_ORDER_SRC: &str = r#"
 struct G(i32);
 impl Clone for G {

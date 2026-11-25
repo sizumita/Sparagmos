@@ -13994,7 +13994,11 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// whose store the source's MIR elided reaches the
     /// snapshot as its canonical value, not as the storage's
     /// uninitialised slot): the dispatch then keeps the
-    /// snapshot argument it has always used.
+    /// snapshot argument it has always used. The denotation
+    /// check is bit identity, not the guest's `==` (see
+    /// [`Value::bit_identical`]): a NaN element read back
+    /// from its own storage denotes its snapshot, though
+    /// `==` holds it unequal to itself.
     fn clone_source_element_ref(
         &self,
         frames: &[Frame],
@@ -14009,7 +14013,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         };
         let resolved = self.deref_value(frames, &refr).ok()?;
         let stored = self.read_resolved(frames, &resolved).ok()?;
-        if stored == *snapshot {
+        if stored.bit_identical(snapshot) {
             Some(target.clone())
         } else {
             None
