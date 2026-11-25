@@ -400,6 +400,24 @@ impl<'a> Converter<'a> {
         let Some(iter_ty) = iter_ty else {
             return false;
         };
+        // A `collect` into a hash collection is not pre-empted:
+        // the builtin can only build the target shapes it
+        // models natively -- a hash table is not one of them --
+        // while the collected instance bodies (the trait
+        // default delegating to the collection's own
+        // `FromIterator` body, `with_hasher` + `extend` over
+        // the raw-table memory model) execute faithfully for
+        // any iterator, modelled or not. The target is the
+        // call's second generic argument (the first is the
+        // iterator).
+        if kind == crate::builtins::Builtin::IteratorCollect {
+            if let Some(target_ty) = raw_generic_args.get(1) {
+                let target_tag = crate::builtins::ty_tag(target_ty, self.names);
+                if crate::builtins::hash_collection_tag(&target_tag) {
+                    return false;
+                }
+            }
+        }
         let tag = crate::builtins::ty_tag(iter_ty, self.names);
         match kind {
             crate::builtins::Builtin::IteratorLen => crate::builtins::iterator_len_modelled(&tag),
@@ -456,6 +474,34 @@ impl<'a> Converter<'a> {
                     && self.resolve_body_callee(func).is_some();
             }
             _ => {}
+        }
+        // Hash-collection targets of `collect` / `from_iter`
+        // are the same inversion one level up: the builtin
+        // drains the iterator itself and can only build the
+        // target shapes it models natively -- a hash table is
+        // not one of them -- while the instance bodies
+        // (`with_hasher` + `extend` over the raw-table memory
+        // model) execute faithfully for any iterator, modelled
+        // or not, so the body wins whenever the program has
+        // one. The target is the call's second generic
+        // argument for `collect` (whose first is the iterator)
+        // and its first for `from_iter` (whose first is the
+        // collection itself).
+        if matches!(
+            kind,
+            crate::builtins::Builtin::IteratorCollect
+                | crate::builtins::Builtin::FromIteratorFromIter
+        ) {
+            let target_ty = match kind {
+                crate::builtins::Builtin::IteratorCollect => raw_generic_args.get(1),
+                _ => raw_generic_args.first(),
+            };
+            if let Some(target_ty) = target_ty {
+                let target_tag = crate::builtins::ty_tag(target_ty, self.names);
+                if crate::builtins::hash_collection_tag(&target_tag) {
+                    return self.resolve_body_callee(func).is_some();
+                }
+            }
         }
         let modelled = match kind {
             crate::builtins::Builtin::IteratorNextBack => {
