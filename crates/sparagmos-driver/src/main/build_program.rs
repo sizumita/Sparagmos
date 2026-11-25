@@ -51,6 +51,7 @@ pub(crate) fn build_program(
     }
     program.intrinsic_defs = c.intrinsic_defs.clone();
     program.async_closure_defs = c.async_closure_defs.clone();
+    program.vtable_identities = c.vtable_identities.clone();
     program.fn_abis = c.fn_abis.clone();
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();

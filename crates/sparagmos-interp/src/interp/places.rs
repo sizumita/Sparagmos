@@ -769,7 +769,18 @@ impl<'a> Interpreter<'a> {
                             base
                         }
                         None => {
-                            let resolved = self.deref_value(frames, &value)?;
+                            let resolved = match self.deref_value(frames, &value) {
+                                Ok(resolved) => resolved,
+                                Err(err) => {
+                                    match self.storage_less_zst_deref(
+                                        &value,
+                                        pointee_ty.as_ref(),
+                                    ) {
+                                        Some(resolved) => resolved,
+                                        None => return Err(err),
+                                    }
+                                }
+                            };
                             // A raw allocation block holds its elements
                             // as a tuple: a dereference of its base
                             // pointer denotes the first element, not the

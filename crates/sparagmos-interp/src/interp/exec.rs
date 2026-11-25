@@ -1275,6 +1275,7 @@ impl<'a> Interpreter<'a> {
                     cmp_discriminants,
                     result_unsize,
                     unique_elem,
+                    zeroed_value,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -1398,6 +1399,7 @@ impl<'a> Interpreter<'a> {
                             skipped_glue.as_ref(),
                             elem_glue.as_ref(),
                             receiver_glue.as_ref(),
+                            zeroed_value.as_ref(),
                         );
                         if matches!(builtin_outcome, Err(InterpError::Suspended)) {
                             Self::restore_moved_args(frames, caller_id, moved_args);
@@ -1530,6 +1532,44 @@ impl<'a> Interpreter<'a> {
                     // (which jumps to `target`) or suspends on a
                     // destructor call and resumes when that call
                     // returns.
+                    // A trait-object place reached through a
+                    // dereference of the fat pointer itself (the
+                    // `drop_in_place` shim's `*ptr`, a `ThinBox`
+                    // pointee drop): resolving the dereference
+                    // consumes the `DynRef`, leaving the session
+                    // nothing that carries the concrete glue.
+                    // Root the session at the fat pointer value
+                    // instead, whose carried glue the `Dyn` plan
+                    // runs against its base.
+                    if matches!(glue.root, crate::ir::DropPlan::Dyn)
+                        && matches!(
+                            place.projection.last(),
+                            Some(ProjectionElem::Deref)
+                        )
+                    {
+                        let mut base_place = place.clone();
+                        base_place.projection.pop();
+                        if let Ok(dyn_value) =
+                            self.read_place(&frames, body, &base_place)
+                        {
+                            if matches!(dyn_value, Value::DynRef { .. }) {
+                                let root = RefTarget::Value(
+                                    Box::new(dyn_value),
+                                    Vec::new(),
+                                );
+                                let work =
+                                    vec![(Vec::new(), glue.root.clone())];
+                                self.run_drop_glue(
+                                    frames,
+                                    root,
+                                    work,
+                                    &glue.adts,
+                                    *target,
+                                )?;
+                                continue;
+                            }
+                        }
+                    }
                     let resolved = self.resolve_place(&frames, body, place)?;
                     let root = match resolved {
                         Resolved::Place {
@@ -2116,6 +2156,14 @@ impl<'a> Interpreter<'a> {
                             // Unit metadata is no metadata: the
                             // aggregate is the data pointer itself.
                             return Ok(base);
+                        }
+                        // A `dyn` metadata value: the aggregate
+                        // is the data pointer rebased onto the
+                        // vtable the metadata names.
+                        if let Some(dynref) =
+                            self.dyn_ref_from_metadata(&meta_value, base.clone())
+                        {
+                            return Ok(dynref);
                         }
                         let len = match meta_value {
                             Value::Uint(v) => v,
