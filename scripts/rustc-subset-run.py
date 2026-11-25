@@ -548,7 +548,8 @@ def known_targets():
     return _KNOWN_TARGETS
 
 
-def screen_flags(flags, targets=None, known=None, expectation=None):
+def screen_flags(flags, targets=None, known=None, expectation=None,
+                 allow_print=False):
     """Why this flag set cannot be honoured here, or None.
 
     The driver forwards flags verbatim to its embedded rustc (and
@@ -582,6 +583,13 @@ def screen_flags(flags, targets=None, known=None, expectation=None):
     outcome: there the only failure available is the environment's
     (E0463, can't find crate for `std`), not the test's, and
     judging it would manufacture passes.
+
+    With `allow_print`, a --print request or a -Zunpretty request
+    does not refuse either: the caller judges such an invocation
+    as a print invocation, comparing the compiler stdout the
+    driver captures against the test's snapshot (see
+    judge_print_stdout), so the printing itself is the verdict's
+    evidence rather than an obstacle to one.
     """
     if targets is None:
         targets = installed_targets()
@@ -610,8 +618,10 @@ def screen_flags(flags, targets=None, known=None, expectation=None):
                     return (f"compile-flags specify --target {tgt} "
                             "(that target is not installed on this host)")
         elif t == "--print" or t.startswith("--print="):
-            return ("compile-flags request --print output (rustc "
-                    "prints target information instead of compiling)")
+            if not allow_print:
+                return ("compile-flags request --print output (rustc "
+                        "prints target information instead of "
+                        "compiling)")
         elif t == "--sysroot" or t.startswith("--sysroot="):
             return ("compile-flags specify --sysroot (the driver "
                     "pins the reference toolchain sysroot)")
@@ -620,9 +630,10 @@ def screen_flags(flags, targets=None, known=None, expectation=None):
                     "driver uses its own scratch output directory)")
         elif t.startswith("-Zunpretty") or (t == "-Z" and nxt is not None
                                              and nxt.startswith("unpretty")):
-            return ("compile-flags request -Zunpretty output (rustc "
-                    "stops after printing, so no conversion is "
-                    "possible)")
+            if not allow_print:
+                return ("compile-flags request -Zunpretty output "
+                        "(rustc stops after printing, so no "
+                        "conversion is possible)")
         i += 1
     return None
 
@@ -641,6 +652,28 @@ def has_unpretty(flags):
             return True
         i += 1
     return False
+
+
+def has_print_request(flags):
+    """Whether the flag set carries a --print request, in either
+    the joined (`--print=cfg`) or split (`--print`, `cfg`)
+    spelling."""
+    return any(t == "--print" or t.startswith("--print=")
+               for t in flags)
+
+
+def print_invocation(suite, flags):
+    """Whether a view's flag set asks the compiler to print: a
+    -Zunpretty dump or a --print answer, in a suite whose compile
+    verdict compiletest takes from that printed output (the ui
+    family, and the crashes suite, whose verdict is the crash a
+    printing run reproduces). Such a view is judged by the
+    compiler's exit outcome plus, for the ui family, the captured
+    compiler stdout compared against the test's snapshot (see
+    judge_print_stdout); other suites' print flags keep the
+    standing refusal, because no stage judges their output."""
+    return suite in ("ui", "ui-fulldeps", "crashes") and (
+        has_unpretty(flags) or has_print_request(flags))
 
 
 def strip_unpretty(flags):
@@ -688,9 +721,10 @@ def unpretty_unchecked(view, path, revision, expectation):
     convert the compilation itself.
 
     -Zunpretty makes rustc print a dump and stop, so no conversion
-    is possible while the flag stands (screen_flags refuses it).
-    The dump is the test's assertion whenever compiletest compares
-    it, and those tests stay refused. It cannot take part in the
+    is possible while the flag stands. The dump is the test's
+    assertion whenever compiletest compares it, and those views
+    are judged as print invocations instead (see
+    print_invocation). It cannot take part in the
     verdict when the view declares `//@ dont-check-compiler-stdout`
     (the dump is compiler stdout, explicitly unchecked), or when
     the expected outcome is a compilation failure and no `.stdout`
@@ -4482,17 +4516,24 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
     args += pm_args
     cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                             suite_root(path), os.getcwd())
+    print_view = print_invocation(rec["suite"], flags)
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=stamp_revision_cfg(aux_specs,
                                                      revision),
                         env_extra=cenv,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
+                        capture_stdout=print_view,
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
     else:
         verdict, reason, bucket = judge_compile(expectation, conv)
+    if print_view and verdict == "pass":
+        refined = judge_print_stdout(rec["suite"], view, path,
+                                     revision, conv)
+        if refined is not None:
+            verdict, reason, bucket = refined
     res["status"] = verdict
     res["reason"] = reason
     res["bucket"] = bucket
@@ -4566,7 +4607,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         flags = compile_flags(view, src_base, td)
-        screened = screen_flags(flags, targets={HOST_TARGET})
+        screened = screen_flags(
+            flags, targets={HOST_TARGET},
+            allow_print=(mode is None
+                         and print_invocation(rec["suite"], flags)))
         if screened:
             res["reason"] = screened
             res["bucket"] = "not attempted (compile-flags)"
@@ -4924,7 +4968,7 @@ _TARGET_NOT_DEMANDED_RE = re.compile(
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
                  env_extra=None, env_remove=(), jit=False,
-                 aux_env_scrub=()):
+                 aux_env_scrub=(), capture_stdout=False):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -4954,12 +4998,27 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     unsupported reason, when it printed one). In this mode exit
     code 2 means the compilation succeeded but JIT lowering is
     unsupported — it is not a compiler crash.
+
+    With `capture_stdout=True` the driver is handed
+    `--compiler-stdout <path>` and the result also carries
+    compiler_stdout (the text the embedded compiler printed to
+    its stdout during the run — a -Zunpretty dump or a --print
+    answer — or None when no capture was produced) and
+    compiler_stdout_dir (the capture's directory, for output
+    normalization).
     """
     rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
     argv = [str(driver_bin)]
     if jit:
         argv.append("jit-compile")
     argv += [str(path), "--edition", edition]
+    capture_td = None
+    capture_path = None
+    if capture_stdout:
+        capture_td = tempfile.TemporaryDirectory(
+            prefix="subset-capture-")
+        capture_path = os.path.join(capture_td.name, "stdout.txt")
+        argv += ["--compiler-stdout", capture_path]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
@@ -4975,6 +5034,16 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
                   timeout=CONVERT_TIMEOUT, env_extra=env,
                   env_remove=env_remove,
                   mem_limit_mb=DRIVER_MEM_LIMIT_MB)
+    captured = None
+    captured_dir = ""
+    if capture_td is not None:
+        captured_dir = capture_td.name
+        try:
+            with open(capture_path, "rb") as fh:
+                captured = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            captured = None
+        capture_td.cleanup()
     out = {
         "exit_code": res["exit_code"],
         "timeout": res["timeout"],
@@ -4994,6 +5063,8 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         "ice": "internal compiler error" in res["stderr"],
         "stderr": res["stderr"],
         "stdout": res["stdout"],
+        "compiler_stdout": captured,
+        "compiler_stdout_dir": captured_dir,
     }
     if "jit-compiled: yes" in res["stdout"]:
         out["jit_compiled"] = True
@@ -5170,6 +5241,64 @@ def judge_compile(expectation, conv):
                 "no longer crashes: clean compilation failure",
                 "no crash (clean rejection)")
     raise ValueError(f"unknown expectation {expectation!r}")
+
+
+def judge_print_stdout(suite, view, path, revision, conv):
+    """The stdout half of a print invocation's verdict.
+
+    A print invocation (see print_invocation) asserts what the
+    compiler prints: compiletest's Ui mode compares the compiler's
+    stdout against the view's `.stdout` snapshot after its
+    normalization, with an absent snapshot comparing as empty, and
+    a view declaring `//@ dont-check-compiler-stdout` exempts
+    itself from the comparison. The comparison here reuses stage
+    4's snapshot and normalization machinery (the same functions
+    compiletest's compare is modelled by), including the view's
+    `//@ normalize-stdout` rules. It refines only a verdict the
+    exit-outcome judge already passed: a mismatch is a fail, and
+    a missing capture is a fail with its own reason (the output
+    the test asserts was never produced for comparison), never a
+    silent pass.
+
+    Two populations are exempt. The crashes suite's verdict is
+    the crash itself — compiletest compares no stdout there, and
+    a crashing compiler leaves a partial dump behind. A
+    `dont-check-compiler-stdout` view's dump is unchecked by
+    declaration, so its verdict is the exit outcome alone.
+    Stage 2's standing contract otherwise judges no compiler
+    output (diagnostics are judged by exit outcome alone); the
+    printed output is compared here because for these tests the
+    output *is* the assertion, exactly as stage 4 compares
+    rustdoc's stdout for the rustdoc-ui suite.
+
+    Returns None when the comparison passes or does not apply,
+    else a (status, reason, bucket) triple replacing the verdict.
+    """
+    if suite == "crashes":
+        return None
+    if view.has("dont-check-compiler-stdout"):
+        return None
+    captured = conv.get("compiler_stdout")
+    if captured is None:
+        return ("fail",
+                "the driver's compiler-stdout capture was not "
+                "produced, so the printed output the test asserts "
+                "could not be compared",
+                "compiler stdout mismatch")
+    base_dir = conv.get("compiler_stdout_dir") or ""
+    rules = stage4_normalize_rules(view, "normalize-stdout")
+    json_mode = stage4_json_mode(view)
+    actual = stage4_normalize_output(captured, path, base_dir, rules,
+                                     json_mode)
+    expected = stage4_normalize_output(
+        stage4_expected_output(path, revision, "stdout"), path,
+        base_dir, rules, json_mode)
+    if actual == expected:
+        return None
+    return ("fail",
+            "compiler stdout differs from the test's .stdout "
+            "snapshot after compiletest normalization",
+            "compiler stdout mismatch")
 
 
 def jit_bucket(reason):
@@ -5451,8 +5580,10 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     if has_unpretty(flags) and unpretty_unchecked(
             view, path, revision, expectation):
         flags = strip_unpretty(flags)
+    print_view = print_invocation(rec["suite"], flags)
     screened = screen_flags(flags, known=known_targets() or None,
-                            expectation=expectation)
+                            expectation=expectation,
+                            allow_print=print_view)
     if screened:
         res["reason"] = screened
         res["bucket"] = "not attempted (compile-flags)"
@@ -5539,11 +5670,17 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                         aux_specs=specs, env_extra=cenv,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
+                        capture_stdout=print_view,
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
     else:
         verdict, reason, bucket = judge_compile(expectation, conv)
+    if print_view and verdict == "pass":
+        refined = judge_print_stdout(rec["suite"], view, path,
+                                     revision, conv)
+        if refined is not None:
+            verdict, reason, bucket = refined
     if incr_dir is not None and conv["compilation_failed"] and \
             mir_only_assertion_failure(conv["stderr"]):
         # The revision's outcome rests solely on clean assertions

@@ -1541,8 +1541,9 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             captured["rustc_args"] = list(rustc_args)
+            captured["capture_stdout"] = capture_stdout
             return conv_result
 
         orig = run.convert_side
@@ -1636,7 +1637,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             calls.append(list(rustc_args))
             return conv()
 
@@ -1659,7 +1660,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             calls.append(list(rustc_args))
             for rev, res in by_rev.items():
                 if rev in rustc_args or \
@@ -1846,7 +1847,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -1967,19 +1968,119 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertEqual(res["status"], "pass")
         self.assertNotIn("-Zunpretty=mir", captured["rustc_args"])
 
-    def test_unpretty_checked_dump_stays_refused(self):
+    def test_unpretty_checked_dump_is_attempted_and_compared(self):
+        # The dump is the test's assertion: the view is attempted
+        # as a print invocation, the flag kept, the compiler
+        # stdout captured, and a matching dump passes.
         rec = self.write_test(
             "//@ check-fail\n//@ compile-flags: -Zunpretty=hir\n"
             "fn main() {}\n")
         (self.rust_dir / "tests" / "ui" / "t.stdout").write_text(
             "dump\n")
-        res, captured = self.run_with_conv_capture(rec, conv())
-        self.assertEqual(res["status"], "not-attempted")
-        self.assertEqual(res["bucket"],
-                         "not attempted (compile-flags)")
-        self.assertNotIn("rustc_args", captured)
+        res, captured = self.run_with_conv_capture(
+            rec, conv(exit_code=1, compilation_failed=True,
+                      converted=None, skipped=None,
+                      compiler_stdout="dump\n",
+                      compiler_stdout_dir=""))
+        self.assertEqual(res["status"], "pass")
+        self.assertTrue(captured["capture_stdout"])
+        self.assertIn("-Zunpretty=hir", captured["rustc_args"])
+
+    def test_unpretty_checked_dump_mismatch_fails(self):
+        rec = self.write_test(
+            "//@ check-fail\n//@ compile-flags: -Zunpretty=hir\n"
+            "fn main() {}\n")
+        (self.rust_dir / "tests" / "ui" / "t.stdout").write_text(
+            "dump\n")
+        res, _ = self.run_with_conv_capture(
+            rec, conv(exit_code=1, compilation_failed=True,
+                      converted=None, skipped=None,
+                      compiler_stdout="other\n",
+                      compiler_stdout_dir=""))
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "compiler stdout mismatch")
+
+    def test_unpretty_success_dump_mismatch_fails(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ compile-flags: -Zunpretty=mir\n"
+            "fn main() {}\n")
+        (self.rust_dir / "tests" / "ui" / "t.stdout").write_text(
+            "dump\n")
+        res, _ = self.run_with_conv_capture(
+            rec, conv(compiler_stdout="other\n",
+                      compiler_stdout_dir=""))
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "compiler stdout mismatch")
+
+    def test_print_request_is_compared(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ compile-flags: --print cfg\n"
+            "fn main() {}\n")
+        (self.rust_dir / "tests" / "ui" / "t.stdout").write_text(
+            "answer\n")
+        res, captured = self.run_with_conv_capture(
+            rec, conv(compiler_stdout="answer\n",
+                      compiler_stdout_dir=""))
+        self.assertEqual(res["status"], "pass")
+        self.assertTrue(captured["capture_stdout"])
+        self.assertIn("--print", captured["rustc_args"])
+
+    def test_print_missing_capture_fails(self):
+        # A print invocation whose capture was never produced
+        # cannot pass: the asserted output was never compared.
+        rec = self.write_test(
+            "//@ check-pass\n//@ compile-flags: --print cfg\n"
+            "fn main() {}\n")
+        res, _ = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "compiler stdout mismatch")
+        self.assertIn("capture", res["reason"])
+
+    def test_print_dont_check_stdout_skips_comparison(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ dont-check-compiler-stdout\n"
+            "//@ compile-flags: --print cfg\nfn main() {}\n")
+        res, _ = self.run_with_conv_capture(
+            rec, conv(compiler_stdout="anything\n",
+                      compiler_stdout_dir=""))
+        self.assertEqual(res["status"], "pass")
 
 
+
+
+class PrintStdoutJudgeTests(unittest.TestCase):
+    """judge_print_stdout's exemptions and capture discipline."""
+
+    class View:
+        def __init__(self, directives=()):
+            self.directives = set(directives)
+
+        def has(self, name):
+            return name in self.directives
+
+    def judge(self, suite, view, conv_result):
+        return run.judge_print_stdout(suite, view, Path("t.rs"), None,
+                                      conv_result)
+
+    def test_crashes_suite_compares_no_stdout(self):
+        # A crashing compiler leaves a partial dump behind; the
+        # crash is the verdict, so any capture passes.
+        out = self.judge("crashes", self.View(),
+                         conv(compiler_stdout="partial dump",
+                              compiler_stdout_dir=""))
+        self.assertIsNone(out)
+
+    def test_dont_check_stdout_compares_nothing(self):
+        out = self.judge(
+            "ui", self.View({"dont-check-compiler-stdout"}),
+            conv(compiler_stdout="anything", compiler_stdout_dir=""))
+        self.assertIsNone(out)
+
+    def test_missing_capture_is_a_fail_not_a_pass(self):
+        out = self.judge("ui", self.View(), conv())
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0], "fail")
+        self.assertEqual(out[2], "compiler stdout mismatch")
 
 
 class ConvertSideTests(unittest.TestCase):
@@ -2033,6 +2134,20 @@ class ConvertSideTests(unittest.TestCase):
         self.assertEqual(out["target_skipped"], 0)
         self.assertEqual(out["not_demanded"], 4)
         self.assertEqual(out["target_not_demanded"], 2)
+
+    def test_capture_stdout_adds_driver_option(self):
+        argv, out = self.run_argv(capture_stdout=True)
+        i = argv.index("--compiler-stdout")
+        self.assertTrue(argv[i + 1].endswith("stdout.txt"))
+        # The stub never creates the capture file: the result
+        # reports the capture as absent, not as empty output.
+        self.assertIsNone(out["compiler_stdout"])
+        self.assertTrue(out["compiler_stdout_dir"])
+
+    def test_no_capture_by_default(self):
+        argv, out = self.run_argv()
+        self.assertNotIn("--compiler-stdout", argv)
+        self.assertIsNone(out["compiler_stdout"])
 
     def test_counts_default_to_none_without_report_lines(self):
         out = self.run_stdout("converted: 1, skipped: 0\n")
@@ -2104,7 +2219,7 @@ class ProcessStage2AuxTests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -2295,6 +2410,19 @@ class ScreenFlagsTests(unittest.TestCase):
         self.assertIn("unpretty",
                       run.screen_flags(["-Z", "unpretty=mir"]))
 
+    def test_print_allowed_when_caller_judges_output(self):
+        self.assertIsNone(run.screen_flags(["--print", "cfg"],
+                                           allow_print=True))
+        self.assertIsNone(run.screen_flags(["--print=cfg"],
+                                           allow_print=True))
+        self.assertIsNone(run.screen_flags(["-Zunpretty=mir"],
+                                           allow_print=True))
+        self.assertIsNone(run.screen_flags(["-Z", "unpretty=mir"],
+                                           allow_print=True))
+        # Other refusals still apply to a print invocation.
+        self.assertIn("--sysroot", run.screen_flags(
+            ["--print", "cfg", "--sysroot=/x"], allow_print=True))
+
 
 class CompileFlagsExpansionTests(unittest.TestCase):
     def test_expands_variables_when_bases_supplied(self):
@@ -2455,7 +2583,7 @@ class ProcessStage2RevisionTests(unittest.TestCase):
         orig = run.convert_side
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -3267,7 +3395,7 @@ class ProcMacroExternTests(unittest.TestCase):
 
         def capture(path, edition, driver_bin, rustc_args=(),
                     aux_specs=(), env_extra=None, env_remove=(),
-                    jit=False, aux_env_scrub=()):
+                    jit=False, aux_env_scrub=(), capture_stdout=False):
             seen["args"] = list(rustc_args)
             return conv()
 

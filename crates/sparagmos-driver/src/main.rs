@@ -3,7 +3,11 @@
 //! Usage:
 //! - `sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>]`
 //!   `[--rustc-arg <arg>]...` — convert and print a per-function
-//!   summary.
+//!   summary. `--compiler-stdout <path>` captures what
+//!   the compiler itself prints to its stdout during the run
+//!   (a `-Zunpretty` dump or a `--print` answer) into a file,
+//!   for a caller that judges that output; compiler stdout
+//!   otherwise goes to stderr, like all compile-time printing.
 //! - `sparagmos-driver run <file.rs> [--edition <ed>]`
 //!   `[--rustc-arg <arg>]...` — convert and execute the program's
 //!   `main` in the Sparagmos interpreter (`sparagmos-interp`), in
@@ -623,6 +627,34 @@ impl StdoutToStderr {
         Self { saved: Some(saved) }
     }
 
+    /// Point stdout at the file at `path` for the duration of the
+    /// run instead of at stderr: a caller that judges the
+    /// compiler's own printed output (a `-Zunpretty` dump or a
+    /// `--print` answer, both written to the compiler's stdout)
+    /// reads the file back once the run is over. If the file
+    /// cannot be created, fall back to the stderr redirect: the
+    /// capture is then absent, which the caller sees as a missing
+    /// file rather than as output the compiler never produced.
+    fn to_file(path: &std::path::Path) -> Self {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let _ = std::io::stdout().flush();
+        let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if saved < 0 {
+            return Self { saved: None };
+        }
+        let file = std::fs::File::create(path);
+        let target = match &file {
+            Ok(f) => f.as_raw_fd(),
+            Err(_) => libc::STDERR_FILENO,
+        };
+        if unsafe { libc::dup2(target, libc::STDOUT_FILENO) } < 0 {
+            unsafe { libc::close(saved) };
+            return Self { saved: None };
+        }
+        Self { saved: Some(saved) }
+    }
+
     fn restore(&mut self) {
         use std::io::Write;
         if let Some(saved) = self.saved.take() {
@@ -654,6 +686,10 @@ struct StdoutToStderr;
 #[cfg(not(unix))]
 impl StdoutToStderr {
     fn new() -> Self {
+        Self
+    }
+
+    fn to_file(_path: &std::path::Path) -> Self {
         Self
     }
 
@@ -4440,6 +4476,70 @@ fn account_trivial_const(report: &mut ConversionReport, name: String) {
         arg_count: 0,
         outcome: FnOutcome::Converted,
     });
+}
+
+/// The callbacks driving the conversion's compiler run: the
+/// `run_with_tcx!` callback shape, written out so the run can
+/// also configure the session the way the real rustc entry point
+/// does. rustc's own entry enters through `TimePassesCallbacks`,
+/// whose `config` sets `trimmed_def_paths`; type printing
+/// consults that flag when the compiler itself prints
+/// (`-Zunpretty` dumps, `--print` answers), so without it a
+/// printed Stable MIR body names `std::vec::Vec` where rustc
+/// prints `Vec`. The flag is set exactly for those printing
+/// invocations; every other run keeps the session the
+/// rustc_public callbacks would have built.
+struct ConversionCallbacks {
+    result: Option<std::ops::ControlFlow<()>>,
+}
+
+impl ConversionCallbacks {
+    fn run(&mut self, args: &[String]) -> Result<(), rustc_public::CompilerError<()>> {
+        let compiler_result =
+            rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                rustc_driver::run_compiler(args, self);
+                Ok(())
+            });
+        match (compiler_result, self.result.take()) {
+            (Ok(Ok(())), Some(std::ops::ControlFlow::Continue(value))) => Ok(value),
+            (Ok(Ok(())), Some(std::ops::ControlFlow::Break(value))) => {
+                Err(rustc_public::CompilerError::Interrupted(value))
+            }
+            (Ok(Ok(_)), None) => Err(rustc_public::CompilerError::Skipped),
+            (Ok(Err(_)), _) | (Err(_), _) => Err(rustc_public::CompilerError::Failed),
+        }
+    }
+}
+
+impl rustc_driver::Callbacks for ConversionCallbacks {
+    fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        if config.opts.pretty.is_some() || !config.opts.prints.is_empty() {
+            config.opts.trimmed_def_paths = true;
+        }
+    }
+
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &rustc_interface::interface::Compiler,
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    ) -> rustc_driver::Compilation {
+        rustc_public::rustc_internal::run(tcx, || {
+            self.result = Some(collect_with_tcx(tcx));
+        })
+        .unwrap();
+        if self.result.as_ref().is_some_and(|val| val.is_continue()) {
+            rustc_driver::Compilation::Continue
+        } else {
+            rustc_driver::Compilation::Stop
+        }
+    }
+}
+
+/// Run the compiler over `args` and convert what it analyses
+/// (see `collect_with_tcx`), under the outcome contract
+/// `rustc_public::run_with_tcx!` provided.
+fn run_conversion_compiler(args: &[String]) -> Result<(), rustc_public::CompilerError<()>> {
+    ConversionCallbacks { result: None }.run(args)
 }
 
 /// The compiler callback, in the `run_with_tcx` form: the
@@ -10199,6 +10299,7 @@ fn driver_main() {
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
     let mut dump_path: Option<String> = None;
+    let mut compiler_stdout: Option<String> = None;
     let mut guest_stderr_file: Option<String> = None;
     let mut guest_env_file: Option<String> = None;
     let mut guest_cwd: Option<String> = None;
@@ -10214,6 +10315,13 @@ fn driver_main() {
                 i += 1;
                 dump_path = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--dump needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--compiler-stdout" => {
+                i += 1;
+                compiler_stdout = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--compiler-stdout needs a path");
                     std::process::exit(2);
                 }));
             }
@@ -10344,7 +10452,7 @@ fn driver_main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -10604,9 +10712,12 @@ fn driver_main() {
     //   in run mode, for the guest program's output alone.
     let overflow_checks = session_overflow_checks(&args);
     let previous_hook = begin_panic_capture();
-    let mut stdout_guard = StdoutToStderr::new();
+    let mut stdout_guard = match &compiler_stdout {
+        Some(path) => StdoutToStderr::to_file(std::path::Path::new(path)),
+        None => StdoutToStderr::new(),
+    };
     let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_public::run_with_tcx!(args.as_slice(), collect_with_tcx)
+        run_conversion_compiler(args.as_slice())
     }));
     stdout_guard.restore();
     end_panic_capture(previous_hook);
