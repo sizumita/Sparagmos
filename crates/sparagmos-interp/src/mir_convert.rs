@@ -666,6 +666,26 @@ pub fn program_key_of(program: &MirProgram, func: &MirFunction) -> String {
     }
 }
 
+/// Merge one conversion round's collected static seeds into
+/// the program-wide table (see [`Converter::register_static_seed`]
+/// for the priority rule). Re-converting a body in a later
+/// round produces the same seeds as the round that first
+/// converted it, so merging is idempotent, and a later round
+/// can only upgrade a static's seed, never downgrade it.
+fn merge_static_seeds(
+    dst: &mut HashMap<String, (u8, ir::Constant)>,
+    conv: &Converter,
+) {
+    for (name, (priority, seed)) in conv.static_seeds.borrow().iter() {
+        match dst.get(name) {
+            Some((existing, _)) if *existing >= *priority => {}
+            _ => {
+                dst.insert(name.clone(), (*priority, seed.clone()));
+            }
+        }
+    }
+}
+
 /// [`convert_program`] plus the per-function conversion failures,
 /// for the run entry points: the entry function's own failure is a
 /// whole-run conversion failure, exactly as before per-body
@@ -679,6 +699,8 @@ fn convert_all(
     // bodies convert at all.
     let conv = Converter::new(program, &keys);
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
+    let mut all_static_seeds: HashMap<String, (u8, ir::Constant)> = HashMap::new();
+    merge_static_seeds(&mut all_static_seeds, &conv);
     out.union_tables = conv.union_tables.clone();
     out.async_closure_captures = conv.async_closure_captures.clone();
     out.mat_plans = conv.mat_table.clone();
@@ -751,6 +773,7 @@ fn convert_all(
             unconverted.clone(),
         );
         let (resolved, _) = convert_each(&conv, program, &keys);
+        merge_static_seeds(&mut all_static_seeds, &conv);
         for (key, body) in resolved.functions {
             out.unconverted.remove(&key);
             out.functions.insert(key, body);
@@ -764,6 +787,11 @@ fn convert_all(
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();
+    merge_static_seeds(&mut all_static_seeds, &conv);
+    out.static_seeds = all_static_seeds
+        .into_iter()
+        .map(|(name, (_, seed))| (name, seed))
+        .collect();
     // The thread-locals table: each recorded static's initializer,
     // converted with its declared type as context and keyed by the
     // same static key the `ThreadLocalRef` rvalues carry. A seed
@@ -2222,6 +2250,13 @@ struct Converter<'a> {
     /// Declared types of the program's statics (see
     /// `MirProgram::static_tys`).
     static_tys: &'a mir::StaticTys,
+    /// Initializer seeds of the program's statics, collected
+    /// while converting `StaticRef` constants (see
+    /// [`Self::register_static_seed`]): static key -> (priority,
+    /// seed). Behind a `RefCell` because constant conversion
+    /// takes `&self`; `convert_all` merges each round's table
+    /// into the program's (see `ir::Program::static_seeds`).
+    static_seeds: std::cell::RefCell<HashMap<String, (u8, ir::Constant)>>,
     /// The bodies a body-less extern declaration can bind to,
     /// by link symbol: symbol -> program key, holding only the
     /// symbols exactly one converted body exports (a symbol
@@ -2340,6 +2375,7 @@ impl<'a> Converter<'a> {
             alloc_shims,
             link_symbols: &program.link_symbols,
             static_tys: &program.static_tys,
+            static_seeds: std::cell::RefCell::new(HashMap::new()),
             link_exports,
             impl_targets: None,
             unconverted: HashMap::new(),
@@ -4189,6 +4225,29 @@ impl<'a> Converter<'a> {
         })
     }
 
+    /// Record the initializer seed a `StaticRef` conversion
+    /// produced for the static `name` (see
+    /// `ir::Program::static_seeds`). One seed per static is
+    /// kept, ranked by how fully it was expanded: a seed
+    /// expanded from the static's recorded declared type (2)
+    /// outranks one expanded from a whole-static reference's
+    /// own context (1), which outranks a bare seed (0) -- the
+    /// seed an interior reference keeps, or one rebuilt to a
+    /// slice reference's extent. The ranking gives the storage
+    /// the fullest skeleton available whichever reference is
+    /// evaluated first, the same outcome the recorded-type
+    /// expansion exists to guarantee; seeds of one rank are
+    /// interchangeable, so the first recorded wins.
+    fn register_static_seed(&self, name: &str, priority: u8, seed: ir::Constant) {
+        let mut seeds = self.static_seeds.borrow_mut();
+        match seeds.get(name) {
+            Some((existing, _)) if *existing >= priority => {}
+            _ => {
+                seeds.insert(name.to_string(), (priority, seed));
+            }
+        }
+    }
+
     /// Expand the `Uninit` leaves of a seed constant (a
     /// thread-local's initializer, a static's initializer, an
     /// operand constant) into the aggregate skeleton of their
@@ -4679,10 +4738,10 @@ impl<'a> Converter<'a> {
                 // length; an interior reference with no recorded
                 // type keeps the bare form, as the full type is
                 // unknown to this conversion.
-                let seed = match self.static_tys.get(def) {
+                let (seed, seed_priority) = match self.static_tys.get(def) {
                     Some(ty) => {
                         let ty = ty.clone();
-                        self.expand_uninit_constant(&seed, &ty, 0)
+                        (self.expand_uninit_constant(&seed, &ty, 0), 2)
                     }
                     None if projection.is_empty() => {
                         let seed_ty = match (inner_ctx, len) {
@@ -4699,15 +4758,30 @@ impl<'a> Converter<'a> {
                             _ => None,
                         };
                         match seed_ty {
-                            Some(ty) => self.expand_uninit_constant(&seed, &ty, 0),
-                            None => seed,
+                            Some(ty) => {
+                                let expanded =
+                                    self.expand_uninit_constant(&seed, &ty, 0);
+                                // A seed rebuilt to a slice
+                                // reference's extent ranks with
+                                // the bare seeds: it must not
+                                // shrink the storage a
+                                // whole-static seed would give.
+                                (expanded, if len.is_none() { 1 } else { 0 })
+                            }
+                            None => (seed, 0),
                         }
                     }
-                    None => seed,
+                    None => (seed, 0),
                 };
+                // The seed is recorded once in the program's
+                // seed table, not carried by this constant: a
+                // table of references to one static otherwise
+                // retains one (expanded) copy of the static's
+                // initializer per element.
+                let name = self.static_key(def);
+                self.register_static_seed(&name, seed_priority, seed);
                 ir::Constant::StaticRef {
-                    name: self.static_key(def),
-                    value: Box::new(seed),
+                    name,
                     projection: projection
                         .iter()
                         .map(|e| self.convert_ref_proj(e))

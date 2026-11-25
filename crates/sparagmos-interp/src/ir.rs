@@ -366,15 +366,17 @@ pub enum Constant {
     /// explicit error).
     NullPtr,
     /// A reference to a `static` item's storage: `name` is the
-    /// static's program key and `value` is its initializer constant.
-    /// Evaluating it seeds the interpreter's statics store from
-    /// `value` on first touch and yields a reference to the store,
-    /// so writes through the reference are observed by later reads
-    /// (unlike [`Constant::Ref`], whose pointee is an immutable
-    /// snapshot).
+    /// static's program key. The static's initializer constant
+    /// is not carried here: it lives once in the program's seed
+    /// table ([`Program::static_seeds`]), keyed by the same
+    /// name, however many references name the static. Evaluating
+    /// the reference seeds the interpreter's statics store from
+    /// that seed on first touch and yields a reference to the
+    /// store, so writes through the reference are observed by
+    /// later reads (unlike [`Constant::Ref`], whose pointee is
+    /// an immutable snapshot).
     StaticRef {
         name: String,
-        value: Box<Constant>,
         /// The path from the static's base to the pointee (empty
         /// for a reference to the static itself).
         projection: Vec<RefProj>,
@@ -2266,6 +2268,19 @@ pub struct Program {
     /// constant each thread's storage for that static is seeded
     /// from on first access.
     pub thread_locals: std::collections::HashMap<String, Constant>,
+    /// Initializer seeds of the program's statics, keyed by the
+    /// static key a `StaticRef` constant carries: the one
+    /// converted initializer constant each static's storage is
+    /// seeded from on first touch. A static's seed is recorded
+    /// once, however many `StaticRef` constants name it -- a
+    /// table of thousands of references to one static whose
+    /// initializer carries a large uninitialised payload
+    /// otherwise retained one expanded copy of the seed per
+    /// element (the interpreter materialisation balloon of
+    /// Issue #489). A static no converted reference names has
+    /// no seed here; evaluating a reference to it is an
+    /// explicit error.
+    pub static_seeds: std::collections::HashMap<String, Constant>,
     /// Declared types of the program's statics, keyed by the
     /// static key a `StaticRef` value carries, as recorded by
     /// the driver. Consulted when a pointer offset over a static

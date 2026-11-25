@@ -7830,6 +7830,31 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// Seed the storage of the static `name` from the
+    /// initializer seed the conversion recorded for it in the
+    /// program's seed table (see `ir::Program::static_seeds`),
+    /// unless it is already seeded (or being seeded, for a
+    /// static whose initializer mentions itself). A static
+    /// with no recorded seed -- one no converted `StaticRef`
+    /// named, as in a hand-built program -- is an explicit
+    /// error, never a guessed value.
+    fn ensure_static_seeded(&self, name: &str) -> InterpResult<()> {
+        if self.statics.borrow().contains_key(name)
+            || self.statics_seeding.borrow().contains(name)
+        {
+            return Ok(());
+        }
+        let Some(seed) = self.program.static_seeds.get(name) else {
+            return Err(InterpError::UnsupportedTerminator {
+                kind: format!(
+                    "static `{name}` has no storage: no initializer seed \
+                     was recorded for it in the program"
+                ),
+            });
+        };
+        self.ensure_static(name, seed)
+    }
+
     /// The current value of the static `name`'s storage.
     fn static_base(&self, name: &str) -> InterpResult<Value> {
         self.statics
@@ -17372,11 +17397,10 @@ impl<'a> Interpreter<'a> {
             Constant::Uninit => Value::Uninit,
             Constant::StaticRef {
                 name,
-                value,
                 projection,
                 len,
             } => {
-                self.ensure_static(name, value)?;
+                self.ensure_static_seeded(name)?;
                 let base = Value::Ref(RefTarget::Static {
                     name: name.clone(),
                     projection: projection.clone(),

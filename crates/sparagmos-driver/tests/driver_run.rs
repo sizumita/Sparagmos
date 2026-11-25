@@ -1013,6 +1013,76 @@ fn run_mode_static_ref_table_scan_within_budget_shares_storage() {
 }
 
 #[test]
+fn run_mode_static_ref_table_large_uninit_payload_stays_bounded() {
+    // A 2,000-element table of pointers to the `flag` field of
+    // one static whose other two fields are 4 KiB uninitialised
+    // payloads. Every element's `StaticRef` constant used to
+    // carry its own converted copy of the static's initializer
+    // seed, the payloads expanded to their declared skeleton:
+    // megabytes of retained constants per element, and a
+    // 2,000-element table peaked over 21 GB once elements were
+    // accessed (about 9 GB when only the length was read), so
+    // such records landed in the runner's `memory limit`
+    // bucket instead of being judged. The seed now lives once
+    // in the program's seed table, so the run stays near the
+    // driver's baseline footprint -- and the elements still
+    // denote the one storage: a write through the first is
+    // observed through the last, exactly as in the native
+    // program. The RSS bound is asserted on Linux only, from
+    // the child's VmHWM; elsewhere the run's output is the
+    // check.
+    let src = "#[repr(C)] struct S { a: std::mem::MaybeUninit<[u8; 4096]>, b: std::mem::MaybeUninit<[u8; 4096]>, flag: std::cell::Cell<bool> } unsafe impl Sync for S {} static S_VAL: S = S { a: std::mem::MaybeUninit::uninit(), b: std::mem::MaybeUninit::uninit(), flag: std::cell::Cell::new(false) }; struct Table([*const std::cell::Cell<bool>; 2000]); unsafe impl Sync for Table {} static TABLE: Table = Table([core::ptr::addr_of!(S_VAL.flag); 2000]); fn main() { unsafe { (*TABLE.0[0]).set(true); println!(\"first={} last={}\", (*TABLE.0[0]).get(), (*TABLE.0[1999]).get()); } }";
+    let dir = temp_dir("static-ref-table-large-uninit-payload");
+    let src_path = fixture(&dir, "static_ref_table_large_uninit_payload.rs", src);
+    // Spawn with output redirected to files so the child's
+    // peak RSS can be polled from /proc while it runs.
+    let out_path = dir.join("stdout.txt");
+    let err_path = dir.join("stderr.txt");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src_path)
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("failed to run sparagmos-driver");
+    let pid = child.id();
+    let mut peak_kib: u64 = 0;
+    let status = loop {
+        #[cfg(target_os = "linux")]
+        if let Ok(proc_status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in proc_status.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Ok(kib) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
+                        peak_kib = peak_kib.max(kib);
+                    }
+                }
+            }
+        }
+        match child.try_wait().expect("failed to poll sparagmos-driver") {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let stdout = std::fs::read_to_string(&out_path).unwrap();
+    let stderr = std::fs::read_to_string(&err_path).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a large static-ref table over an uninit payload must run; stderr={stderr}"
+    );
+    assert_eq!(
+        stdout, "first=true last=true\n",
+        "both pointers must denote the static's shared storage"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        peak_kib < 1024 * 1024,
+        "peak RSS {peak_kib} KiB must stay bounded: the static's seed \
+         is recorded once in the program, not once per table element"
+    );
+}
+
+#[test]
 fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
     // One root constant -- a 21-element table of one-byte
     // slices -- whose elements alternate between ten distinct
