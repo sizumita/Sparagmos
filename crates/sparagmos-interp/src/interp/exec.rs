@@ -128,14 +128,51 @@ impl<'a> Interpreter<'a> {
         let result = self.drive(&mut frames, base);
         // A scheduler yield leaves the driven segment's frames
         // live above `base`: the segment's driver parks them and
-        // the segment later resumes from exactly this stack.
-        // Every other outcome restores the caller's stack depth
-        // as documented above.
-        if !matches!(result, Err(InterpError::Yield)) {
+        // the segment later resumes from exactly this stack. A
+        // suspension ([`InterpError::Suspended`]) leaves them
+        // whole for the same reason: they are the suspended
+        // thread's live state, which `run_thread` splits off and
+        // saves. Every other outcome (a value, a panic, a hard
+        // error) ends the region, so its frames are truncated
+        // away as documented above.
+        if !matches!(
+            result,
+            Err(InterpError::Yield) | Err(InterpError::Suspended)
+        ) {
             frames.truncate(base);
         }
         *frames_out = frames;
         result
+    }
+
+    /// Put back the argument values a call's `move` operands
+    /// consumed out of plain locals, after the call ended in a
+    /// suspension (see [`InterpError::Suspended`]): the resumed
+    /// thread re-executes the call terminator, so its arguments
+    /// must be in their places again, exactly as if the call
+    /// had never been entered — a `move` leaves its source
+    /// place uninitialized, and the blocking builtins' decisive
+    /// argument (the `&self` temporary of a channel operation
+    /// above all) is such a move. Only plain-local moves are
+    /// restored; a move out of a projection stays consumed. The
+    /// restore applies only when the caller frame is again the
+    /// top frame: a call that pushed a callee frame which then
+    /// suspended leaves that frame on the stack, and the
+    /// caller's terminator is not re-executed.
+    pub(crate) fn restore_moved_args(
+        frames: &mut Vec<Frame>,
+        caller_id: u64,
+        moved: Vec<(usize, Value)>,
+    ) {
+        if frames.last().map(|f| f.id) != Some(caller_id) {
+            return;
+        }
+        let frame = frames.last_mut().expect("frame");
+        for (local, value) in moved {
+            if let Some(slot) = frame.locals.get_mut(local) {
+                *slot = value;
+            }
+        }
     }
 
     /// Drive the frame stack with unwinding: run the raw loop
@@ -470,10 +507,26 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                 } => {
+                    let caller_id = frames.last().expect("frame").id;
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in args {
                         arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
+                    // The values the call's `move` operands
+                    // consumed out of plain locals, snapshotted
+                    // before the call: if the call ends in a
+                    // suspension, they are put back (see
+                    // `restore_moved_args`).
+                    let moved_args: Vec<(usize, Value)> = args
+                        .iter()
+                        .zip(arg_values.iter())
+                        .filter_map(|(arg, value)| match arg {
+                            Operand::Move(place) if place.projection.is_empty() => {
+                                Some((place.local.0, value.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
                     // A call naming a trait method by its plain
                     // trait path, in a body the converter kept in
                     // generic form, has no body under that name:
@@ -486,7 +539,7 @@ impl<'a> Interpreter<'a> {
                     } else {
                         None
                     };
-                    if let Some((canonical, kind, generic_args)) = fallback {
+                    let outcome = if let Some((canonical, kind, generic_args)) = fallback {
                         self.complete_builtin_name_fallback(
                             frames,
                             body,
@@ -497,10 +550,14 @@ impl<'a> Interpreter<'a> {
                             arg_values,
                             destination,
                             *target,
-                        )?;
+                        )
                     } else {
-                        self.start_call(frames, func, arg_values, destination, *target)?;
+                        self.start_call(frames, func, arg_values, destination, *target)
+                    };
+                    if matches!(outcome, Err(InterpError::Suspended)) {
+                        Self::restore_moved_args(frames, caller_id, moved_args);
                     }
+                    outcome?;
                 }
                 TerminatorKind::CallIndirect {
                     func,
@@ -1216,6 +1273,24 @@ impl<'a> Interpreter<'a> {
                                 }
                             }
                         }
+                        // The values the call's `move` operands
+                        // are about to consume out of plain
+                        // locals, read without consuming: if the
+                        // builtin ends in a suspension, they are
+                        // put back (see `restore_moved_args`),
+                        // because the resumed thread re-executes
+                        // this terminator.
+                        let caller_id = frames.last().expect("frame").id;
+                        let moved_args: Vec<(usize, Value)> = args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                Operand::Move(place) if place.projection.is_empty() => self
+                                    .read_place(frames, body, place)
+                                    .ok()
+                                    .map(|value| (place.local.0, value)),
+                                _ => None,
+                            })
+                            .collect();
                         *self.consumed_iter_final.borrow_mut() = None;
                         let builtin_outcome = self.exec_builtin(
                             frames,
@@ -1229,6 +1304,9 @@ impl<'a> Interpreter<'a> {
                             elem_glue.as_ref(),
                             receiver_glue.as_ref(),
                         );
+                        if matches!(builtin_outcome, Err(InterpError::Suspended)) {
+                            Self::restore_moved_args(frames, caller_id, moved_args);
+                        }
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
                         let mut result = match builtin_outcome {

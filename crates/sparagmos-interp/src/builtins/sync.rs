@@ -69,6 +69,23 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The outcome of a blocking operation that cannot proceed
+    /// after every scheduling round the cooperative scheduler
+    /// can offer: where the running thread can be suspended
+    /// (see [`Interpreter::suspend_permitted`]), suspend it —
+    /// a later activation re-executes the operation and
+    /// re-checks its condition, so the wait stays honest and
+    /// no result is fabricated. Where it cannot (the entry
+    /// thread, or code inside a detached synchronous drive),
+    /// the would-block-forever error stands.
+    pub(super) fn block_or_suspend(&self, name: &str, situation: &str) -> InterpError {
+        if self.suspend_permitted() {
+            InterpError::Suspended
+        } else {
+            unsupported(self.block_forever_message(name, situation))
+        }
+    }
+
     /// `Sender::send` / `SyncSender::send`: enqueue the value,
     /// running pending threads while a bounded channel is full
     /// (the sender would block; the threads it waits for run
@@ -110,11 +127,17 @@ impl<'a> Interpreter<'a> {
                     }))
                 }
                 Step::Full => {
-                    if !self.drain_threads(frames)? {
-                        return Err(unsupported(self.block_forever_message(
+                    // Give the other threads a scheduling round;
+                    // a receiver among them may make room. When
+                    // a round changes nothing, the send cannot
+                    // proceed (see `block_or_suspend`).
+                    self.tick_step()?;
+                    let (_, progressed) = self.schedule_round(frames)?;
+                    if !progressed {
+                        return Err(self.block_or_suspend(
                             name,
                             "the channel is full and no pending thread can receive",
-                        )));
+                        ));
                     }
                 }
                 Step::Unknown => {
@@ -145,11 +168,17 @@ impl<'a> Interpreter<'a> {
             if senders == 0 {
                 return Ok(Err(()));
             }
-            if !self.drain_threads(frames)? {
-                return Err(unsupported(self.block_forever_message(
+            // Give the other threads a scheduling round; a
+            // sender among them may produce (or drop the last
+            // sender handle). When a round changes nothing, the
+            // receive cannot proceed (see `block_or_suspend`).
+            self.tick_step()?;
+            let (_, progressed) = self.schedule_round(frames)?;
+            if !progressed {
+                return Err(self.block_or_suspend(
                     name,
                     "the channel is empty and no pending thread can send",
-                )));
+                ));
             }
         }
     }
@@ -176,7 +205,11 @@ impl<'a> Interpreter<'a> {
             if senders == 0 {
                 return Ok(Err(1));
             }
-            if !self.drain_threads(frames)? {
+            // Like `mpsc_recv`, but a round that changes
+            // nothing is the timeout outcome, not an error.
+            self.tick_step()?;
+            let (_, progressed) = self.schedule_round(frames)?;
+            if !progressed {
                 return Ok(Err(0));
             }
         }

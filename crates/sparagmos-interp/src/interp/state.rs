@@ -22,15 +22,18 @@ pub(crate) struct ThreadSlot {
     /// unnamed thread.
     pub name: Option<String>,
     pub callable: Option<Value>,
-    /// The frames of a run suspended at a quantum boundary, if
-    /// this thread has started but not finished.
+    /// The frames of a run suspended at a quantum boundary, or
+    /// blocked on a channel operation no other thread could
+    /// satisfy (see [`InterpError::Suspended`]), if this thread
+    /// has started but not finished.
     pub parked: Option<ParkedThread>,
     /// The thread's outcome: its return value, or the panic
     /// payload it ended with (kept whole, so `join`'s error can
     /// be the `Box<dyn Any>` the guest downcasts).
     pub outcome: Option<Result<Value, PanicPayload>>,
 }
-/// A thread segment suspended at a quantum boundary: its call
+/// A thread segment suspended at a quantum boundary, or
+/// blocked on a channel operation: its call
 /// frames (the bottom frame is the thread's entry frame), and
 /// the ids of the frames below the segment that its frames
 /// actually reference. The segment may resume only on a stack
@@ -57,6 +60,12 @@ pub(crate) enum ThreadRun {
     /// The thread's quantum expired; its frames are parked and
     /// it will resume at a later scheduling point.
     Yielded,
+    /// The thread blocked on a channel operation no other
+    /// thread could satisfy at the time; its frames are parked
+    /// (see [`InterpError::Suspended`]) and it will resume at a
+    /// later scheduling point, where the operation it blocked
+    /// in re-executes and re-checks its condition.
+    Blocked,
     /// The thread is parked above frames that are not on the
     /// current stack, so it cannot resume in this context.
     NotRunnable,
@@ -680,6 +689,7 @@ impl<'a> Interpreter<'a> {
                 bound,
             },
         );
+        self.channel_epoch.set(self.channel_epoch.get() + 1);
         id
     }
 
@@ -689,7 +699,17 @@ impl<'a> Interpreter<'a> {
         id: u64,
         f: impl FnOnce(&mut ChannelState) -> R,
     ) -> Option<R> {
-        self.channels.borrow_mut().get_mut(&id).map(f)
+        self.channels.borrow_mut().get_mut(&id).map(|st| {
+            // The scheduler's progress signal: an access that
+            // changes the observable state (the queue length or
+            // a handle count) moves the epoch.
+            let before = (st.queue.len(), st.senders, st.receivers);
+            let result = f(st);
+            if before != (st.queue.len(), st.senders, st.receivers) {
+                self.channel_epoch.set(self.channel_epoch.get() + 1);
+            }
+            result
+        })
     }
 
     /// Record a channel handle's drop (see [`ChannelState`]):
@@ -800,9 +820,13 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn channel_handle_dropped(&self, id: u64, kind: &str) {
         if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
+            let before = (state.senders, state.receivers);
             match kind {
                 "sender" => state.senders = state.senders.saturating_sub(1),
                 _ => state.receivers = state.receivers.saturating_sub(1),
+            }
+            if before != (state.senders, state.receivers) {
+                self.channel_epoch.set(self.channel_epoch.get() + 1);
             }
         }
     }
@@ -814,6 +838,7 @@ impl<'a> Interpreter<'a> {
                 "sender" => state.senders += 1,
                 _ => state.receivers += 1,
             }
+            self.channel_epoch.set(self.channel_epoch.get() + 1);
         }
     }
 

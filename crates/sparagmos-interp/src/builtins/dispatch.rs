@@ -1036,12 +1036,12 @@ impl<'a> Interpreter<'a> {
                     ));
                 };
                 match self.join_thread(frames, id)? {
-                    Ok(value) => Ok(ok_result(value)),
+                    Some(Ok(value)) => Ok(ok_result(value)),
                     // The error is the thread's panic payload as
                     // the `Box<dyn Any + Send>` the guest
                     // downcasts, in the same shape the
                     // `catch_unwind` cleanup produces.
-                    Err(payload) => Ok(err_result(Value::DynRef {
+                    Some(Err(payload)) => Ok(err_result(Value::DynRef {
                         base: Box::new(Value::Enum {
                             variant: 0,
                             fields: vec![(*payload.value).clone()],
@@ -1053,6 +1053,14 @@ impl<'a> Interpreter<'a> {
                         ],
                         drop_glue: None,
                     })),
+                    // The joined thread is blocked and no
+                    // scheduling round can unblock it: the join
+                    // itself cannot complete (see
+                    // `block_or_suspend`).
+                    None => Err(self.block_or_suspend(
+                        "JoinHandle::join",
+                        "the joined thread is blocked and no pending thread can unblock it",
+                    )),
                 }
             }
             Builtin::ThreadScope => {
@@ -2688,18 +2696,40 @@ impl<'a> Interpreter<'a> {
             Builtin::MpscTryRecv => {
                 arity(1)?;
                 let id = self.handle_id_of_ref(frames, &vals[0], name)?;
-                match self.with_channel(id, |st| match st.queue.pop_front() {
-                    Some(v) => Ok(v),
-                    None => Err(if st.senders == 0 { 1 } else { 0 }),
-                }) {
-                    Some(Ok(value)) => Ok(ok_result(value)),
-                    // `TryRecvError`: Empty = 0, Disconnected = 1,
-                    // both fieldless.
-                    Some(Err(variant)) => Ok(err_result(Value::Enum {
-                        variant,
-                        fields: Vec::new(),
-                    })),
-                    None => Err(unsupported(format!("{name} on an unknown channel"))),
+                // A native `try_recv` never blocks, but under
+                // the cooperative scheduler a pending sender
+                // only runs when the running thread reaches a
+                // scheduling point; a caller spinning on
+                // `try_recv` would starve it forever. An empty
+                // result therefore first gives the other threads
+                // one scheduling round — each runnable thread
+                // gets one activation, the cooperative unit of
+                // "meanwhile" — and re-checks the queue.
+                let mut scheduled = false;
+                loop {
+                    match self.with_channel(id, |st| match st.queue.pop_front() {
+                        Some(v) => Ok(v),
+                        None => Err(if st.senders == 0 { 1 } else { 0 }),
+                    }) {
+                        Some(Ok(value)) => return Ok(ok_result(value)),
+                        Some(Err(0)) if !scheduled => {
+                            scheduled = true;
+                            self.schedule_round(frames)?;
+                        }
+                        // `TryRecvError`: Empty = 0,
+                        // Disconnected = 1, both fieldless.
+                        Some(Err(variant)) => {
+                            return Ok(err_result(Value::Enum {
+                                variant,
+                                fields: Vec::new(),
+                            }))
+                        }
+                        None => {
+                            return Err(unsupported(format!(
+                                "{name} on an unknown channel"
+                            )))
+                        }
+                    }
                 }
             }
             Builtin::MpscRecvTimeout => {
@@ -2886,6 +2916,9 @@ impl<'a> Interpreter<'a> {
                     Ok(owned_iter_state(elems))
                 } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
                     // `mpsc::Iter` is its own `IntoIterator`.
+                    Ok(value)
+                } else if self_ty.starts_with("std::sync::mpsc::TryIter<") {
+                    // `mpsc::TryIter` is its own `IntoIterator`.
                     Ok(value)
                 } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
                     // The channel iterator holds the receiver

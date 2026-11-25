@@ -474,6 +474,18 @@ pub struct Interpreter<'a> {
     /// The thread whose code is currently executing (the entry
     /// thread outside any spawned thread's run).
     current_thread: std::cell::Cell<u64>,
+    /// The number of detached synchronous drives (see
+    /// `detached_drive` in `call`) currently enclosing the
+    /// executing code, reset to zero at a spawned thread's root
+    /// drive. A suspension is only sound at zero: inside a
+    /// detached drive, the host-side continuation waiting for
+    /// the callee's return value cannot be saved and resumed.
+    sync_nesting: std::cell::Cell<u32>,
+    /// A counter bumped on every observable channel-state
+    /// change (a queue push or pop, a handle count change):
+    /// the cooperative scheduler's progress signal (see
+    /// `schedule_round` in `threads`).
+    channel_epoch: std::cell::Cell<u64>,
     /// The depth of the innermost active
     /// [`Interpreter::drive`] region (0 outside any drive).
     drive_depth: usize,
@@ -772,6 +784,8 @@ impl<'a> Interpreter<'a> {
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
             current_thread: std::cell::Cell::new(1),
+            sync_nesting: std::cell::Cell::new(0),
+            channel_epoch: std::cell::Cell::new(0),
             drive_depth: 0,
             segment: None,
             drain_depth: 0,
