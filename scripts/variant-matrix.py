@@ -635,7 +635,7 @@ TEST_TARGETS = [
     ("sparagmos-interp", ["--lib"], "sparagmos_interp_lib",
      ["crates/sparagmos-interp/src/lib.rs", "crates/sparagmos-interp/src/interp.rs",
       "crates/sparagmos-interp/src/mir_convert.rs", "crates/sparagmos-interp/src/ir.rs",
-      "crates/sparagmos-interp/src/builtins.rs", "crates/sparagmos-interp/src/value.rs",
+      "crates/sparagmos-interp/src/builtins/mod.rs", "crates/sparagmos-interp/src/value.rs",
       "crates/sparagmos-interp/src/error.rs"]),
     ("sparagmos-jit", ["--test", "mir_jit"], "mir_jit",
      ["crates/sparagmos-jit/tests/mir_jit.rs"]),

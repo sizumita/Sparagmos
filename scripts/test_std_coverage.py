@@ -4,9 +4,9 @@
 Run with: python3 -m unittest scripts.test_std_coverage
 (or directly: python3 scripts/test_std_coverage.py)
 
-Name canonicalization, the builtins.rs registry parser, the dump
+Name canonicalization, the builtins registry parser, the dump
 parser and the aggregation are exercised on small fixtures; the
-registry is additionally checked against the real builtins.rs.
+registry is additionally checked against the real builtins module.
 """
 
 import importlib.util
@@ -85,7 +85,8 @@ class RegistryTests(unittest.TestCase):
             cov.BuiltinRegistry(bad)
 
     def test_real_builtins_rs(self):
-        src = (REPO_ROOT / "crates/sparagmos-interp/src/builtins.rs").read_text()
+        src = cov.read_builtins_source(
+            REPO_ROOT / "crates/sparagmos-interp/src/builtins")
         reg = cov.BuiltinRegistry(src)
         self.assertIn("std::io::_print", reg.exact)
         self.assertIn("core::fmt::rt::Argument::new_display", reg.exact)
