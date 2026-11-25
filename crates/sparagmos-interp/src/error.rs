@@ -44,8 +44,8 @@ pub enum InterpError {
     /// execution aborts the process here (a double panic); this
     /// model reports it as its own error so it stays distinct from
     /// a catchable guest panic: `catch_unwind` never observes it,
-    /// and the driver maps it to the guest-panic exit (101) with
-    /// the abort reason on stderr.
+    /// and the driver maps it to the guest-crash exit (134, the
+    /// SIGABRT death code) with the abort reason on stderr.
     Abort { message: String },
     /// The guest called `std::process::exit(code)`: the run ends
     /// successfully with that exit code. This is not a failure —

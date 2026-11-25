@@ -91,9 +91,10 @@ class BlockerTests(unittest.TestCase):
         h = header("//@ run-pass\n//@ compile-flags: -C opt-level=3\n")
         self.assertIsNone(run.stage1_blocker(h, self.rec()))
 
-    def test_run_crash_blocks(self):
+    def test_run_crash_has_no_blocker(self):
+        # run-crash is attempted and judged by crash class.
         h = header("//@ run-crash\n")
-        self.assertIn("run-crash", run.stage1_blocker(h, self.rec()))
+        self.assertIsNone(run.stage1_blocker(h, self.rec()))
 
     def test_ignore_test_blocks_without_run_directive(self):
         # compiletest decides ignore-test before mode dispatch, so a
@@ -527,6 +528,69 @@ class JudgeTests(unittest.TestCase):
         native = {"exit_code": 7, "stdout": ""}
         got = {"exit_code": 101, "stdout": ""}
         self.assertEqual(run.judge("run-fail", h, native, got)[0], "fail")
+
+    def test_run_result_class_matches_compiletest(self):
+        # runtest/ui.rs's RunResult: success is Pass, 1..=127 is
+        # Fail, signal death (negative here) or a code above 127
+        # is Crash.
+        self.assertEqual(run.run_result_class(0), "pass")
+        for code in (1, 101, 127):
+            self.assertEqual(run.run_result_class(code), "fail")
+        for code in (-6, -11, 128, 134, 255):
+            self.assertEqual(run.run_result_class(code), "crash")
+
+    def test_run_crash_both_sides_crash_passes(self):
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -6, "stdout": ""}
+        got = {"exit_code": 134, "stdout": ""}
+        self.assertEqual(run.judge("run-crash", h, native, got),
+                         ("pass", ""))
+
+    def test_run_crash_guest_unwind_fails(self):
+        # The guest panicked and unwound to the top (101): a
+        # failure exit, not a crash.
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -6, "stdout": ""}
+        got = {"exit_code": 101, "stdout": ""}
+        status, detail = run.judge("run-crash", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertIn("did not crash", detail)
+        self.assertEqual(run.failure_bucket(detail),
+                         "guest did not crash")
+
+    def test_run_crash_guest_completion_fails(self):
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -11, "stdout": ""}
+        got = {"exit_code": 0, "stdout": ""}
+        status, detail = run.judge("run-crash", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertIn("did not crash", detail)
+
+    def test_run_crash_stdout_mismatch_fails(self):
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -6, "stdout": "before\n"}
+        got = {"exit_code": 134, "stdout": ""}
+        status, detail = run.judge("run-crash", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertEqual(detail, "stdout mismatch")
+
+    def test_native_mismatch_run_crash(self):
+        h = header("//@ run-crash\n")
+        self.assertIsNone(run.native_mismatch(
+            "run-crash", h, {"exit_code": -6}))
+        self.assertIsNone(run.native_mismatch(
+            "run-crash", h, {"exit_code": 134}))
+        self.assertIn("does not crash", run.native_mismatch(
+            "run-crash", h, {"exit_code": 101}))
+        self.assertIn("does not crash", run.native_mismatch(
+            "run-crash", h, {"exit_code": 0}))
+
+    def test_native_mismatch_fixed_code_modes(self):
+        h = header("//@ run-pass\n")
+        self.assertIsNone(run.native_mismatch(
+            "run-pass", h, {"exit_code": 0}))
+        self.assertIn("does not match", run.native_mismatch(
+            "run-pass", h, {"exit_code": 101}))
 
 
 class BucketReasonTests(unittest.TestCase):
@@ -2131,8 +2195,8 @@ class HeaderBucketTests(unittest.TestCase):
 
     def test_other_blockers_keep_the_header_feature_bucket(self):
         self.assertEqual(
-            run.header_bucket("run-crash mode (crash reproduction "
-                              "is out of stage-1 scope)"),
+            run.header_bucket("stdin directive present (guest stdin "
+                              "is not modelled)"),
             "not attempted (header feature)")
 
 
@@ -2569,11 +2633,13 @@ class ViewBlockerTests(unittest.TestCase):
         self.assertIn("core stub", run.stage1_view_blocker(h.view("a")))
         self.assertIsNone(run.stage1_view_blocker(h.view("b")))
 
-    def test_scoped_run_crash_blocks_only_its_revision(self):
+    def test_scoped_run_crash_blocks_no_revision(self):
+        # run-crash is attempted and judged by crash class, in
+        # every revision that declares it.
         h = header("//@ revisions: a b\n//@[a] run-pass\n"
                    "//@[b] run-crash\n")
         self.assertIsNone(run.stage1_view_blocker(h.view("a")))
-        self.assertIn("run-crash", run.stage1_view_blocker(h.view("b")))
+        self.assertIsNone(run.stage1_view_blocker(h.view("b")))
 
     def test_scoped_only_directives_still_block_the_flat_path(self):
         # stage1_blocker is unchanged: scoped directives on a test
@@ -3329,7 +3395,7 @@ class ProcessStage2RunModeTests(unittest.TestCase):
         self.assertEqual(res["status"], "fail")
         self.assertEqual(res["bucket"], "exit-code mismatch")
 
-    def test_run_crash_revision_stays_not_attempted(self):
+    def test_run_crash_revision_is_judged_by_execution(self):
         rec = self.write_test(
             "//@ revisions: chk rt\n"
             "//@ [chk] check-pass\n"
@@ -3337,13 +3403,50 @@ class ProcessStage2RunModeTests(unittest.TestCase):
             "fn main() {}\n")
         res = self.run_with_sides(
             rec,
+            ({"exit_code": -6, "stdout": "", "stderr": ""}, None),
+            ({"exit_code": 134, "stdout": "", "stderr": ""},
+             "result", ""),
+            conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["revisions"]["rt"]["status"], "pass")
+        self.assertEqual(res["revisions"]["rt"]["expectation"],
+                         "run-crash")
+        self.assertEqual(res["revisions"]["chk"]["status"], "pass")
+
+    def test_run_crash_revision_guest_unwind_fails(self):
+        rec = self.write_test(
+            "//@ revisions: rt\n"
+            "//@ [rt] run-crash\n"
+            "fn main() {}\n")
+        res = self.run_with_sides(
+            rec,
+            ({"exit_code": -6, "stdout": "", "stderr": ""}, None),
+            ({"exit_code": 101, "stdout": "", "stderr": ""},
+             "result", ""),
+            conv())
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "guest did not crash")
+
+    def test_run_crash_revision_native_not_crashing_unjudged(self):
+        # The oracle itself does not reproduce the test's premise
+        # (the native run does not crash), so the record cannot
+        # be judged: it stays not-attempted under the native
+        # expectation bucket, as a native mismatch does for the
+        # fixed-code modes.
+        rec = self.write_test(
+            "//@ revisions: rt\n"
+            "//@ [rt] run-crash\n"
+            "fn main() {}\n")
+        res = self.run_with_sides(
+            rec,
             ({"exit_code": 0, "stdout": "", "stderr": ""}, None),
-            ({"exit_code": 0, "stdout": "", "stderr": ""},
+            ({"exit_code": 134, "stdout": "", "stderr": ""},
              "result", ""),
             conv())
         self.assertEqual(res["status"], "not-attempted")
-        self.assertEqual(res["bucket"],
-                         "not attempted (verdict needs execution)")
+        self.assertEqual(
+            res["bucket"],
+            "native run does not match mode expectation")
 
     def test_unscoped_run_mode_is_judged_by_execution(self):
         rec = self.write_test("//@ run-pass\nfn main() {}\n")

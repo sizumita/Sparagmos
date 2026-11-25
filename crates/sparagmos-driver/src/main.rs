@@ -89,11 +89,17 @@
 //! succeeded; lint levels are not part of an execution verdict.
 //!
 //! Run-mode exit codes: 0 = the guest program terminated normally,
-//! 101 = the guest program panicked (message on stderr), 2 = the
-//! program could not be converted or executed (concrete reason on
-//! stderr). Run mode writes the guest program's captured stdout to
-//! its own stdout (in every outcome — a native program's output is
-//! likewise observable when it panics).
+//! 101 = the guest program panicked and the panic unwound to the
+//! top of the run (message on stderr), 134 = the guest program
+//! crashed: a panic that may not unwind aborted the run, the
+//! outcome a native process dies by SIGABRT in (128 + 6; the
+//! abort reason is on the guest's stderr and a
+//! `sparagmos-driver run: guest crashed` marker on the driver's
+//! own stderr names the outcome), 2 = the program could not be
+//! converted or executed (concrete reason on stderr). Run mode
+//! writes the guest program's captured stdout to its own stdout
+//! (in every outcome — a native program's output is likewise
+//! observable when it panics).
 //!
 //! Convert-mode exit codes: 0 = the crate converted (per-function
 //! outcomes are in the report; an informational or parse-only
@@ -8013,10 +8019,16 @@ fn execute(
             message,
         })) => {
             // A panic that escaped a cleanup (a native double
-            // panic aborts the process): the guest-panic exit, with
-            // the abort reason on stderr.
+            // panic aborts the process): the guest crashed. The
+            // abort reason goes to the guest's stderr, a marker
+            // on the driver's own stderr names the outcome, and
+            // the exit code is the crash code (128 + SIGABRT)
+            // the native process's death carries, so a crash
+            // stays distinct from a guest panic that unwound to
+            // the top of the run (101).
             guest_report_line(&format!("thread 'main' aborted: {message}"));
-            101
+            eprintln!("sparagmos-driver run: guest crashed: abort");
+            134
         }
         Err(e) => {
             eprintln!("sparagmos-driver run: unsupported: {e}");

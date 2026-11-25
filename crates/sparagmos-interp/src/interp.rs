@@ -1134,6 +1134,11 @@ pub struct Interpreter<'a> {
 /// target always yields the same address within a run, so equality,
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
+/// A target carrying a trailing byte displacement
+/// ([`RefProj::ByteOffset`]) yields its base target's slot address
+/// plus the displacement instead of a slot of its own, so the
+/// transmuted address of a byte-displaced pointer moves exactly
+/// as the native one does.
 /// The slot size is 2^16, not 2^12, because a place in this model
 /// can carry an alignment that large (`#[repr(align(0x10000))]`):
 /// with 4096-byte slots the address of such a place is a multiple
@@ -1169,7 +1174,142 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
             return Some(0);
         }
     }
-    address_key(value).map(|key| hash_address_key(&key))
+    let (stripped, offset) = strip_trailing_offsets_value(value);
+    address_key(&stripped).map(|key| displaced_address(&key, offset))
+}
+
+/// The address a key's slot denotes under a byte displacement:
+/// the slot address plus the displacement. A zero displacement
+/// is the slot itself. The slot range starts at 2^32, far above
+/// any displacement a guest's pointer arithmetic computes, so
+/// the sum stays positive and distinct from the null address; a
+/// displacement that would leave the positive range (not
+/// reachable from a real pointer-arithmetic chain) keeps the
+/// slot address.
+fn displaced_address(key: &str, offset: i128) -> u128 {
+    let slot = hash_address_key(key);
+    if offset == 0 {
+        return slot;
+    }
+    let moved = slot as i128 + offset;
+    if moved > 0 {
+        moved as u128
+    } else {
+        slot
+    }
+}
+
+/// A reference target with its trailing byte displacements
+/// removed, together with their sum. Pointer arithmetic whose
+/// result does not coincide with a structural position carries
+/// the displacement as a trailing [`RefProj::ByteOffset`] step,
+/// and the position it denotes is the position the remaining
+/// steps denote, moved by that many bytes -- so the target's
+/// exposed address is its base target's address plus the
+/// displacement, the relation the compiler's inserted alignment
+/// checks (which key on the transmuted address) rely on. Only
+/// trailing steps are priced this way: a displacement in the
+/// middle of a projection (a field read through a byte-displaced
+/// pointer) stays part of the target's identity, as it was
+/// before addresses priced displacements at all.
+fn split_trailing_byte_offsets(target: &RefTarget) -> (RefTarget, i128) {
+    fn split(projection: &[RefProj]) -> (Vec<RefProj>, i128) {
+        let mut end = projection.len();
+        let mut total: i128 = 0;
+        while end > 0 {
+            match &projection[end - 1] {
+                RefProj::ByteOffset(d) => {
+                    total += d;
+                    end -= 1;
+                }
+                _ => break,
+            }
+        }
+        (projection[..end].to_vec(), total)
+    }
+    match target {
+        RefTarget::Place {
+            frame,
+            local,
+            projection,
+        } => {
+            let (projection, total) = split(projection);
+            (
+                RefTarget::Place {
+                    frame: *frame,
+                    local: *local,
+                    projection,
+                },
+                total,
+            )
+        }
+        RefTarget::Static { name, projection } => {
+            let (projection, total) = split(projection);
+            (
+                RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                },
+                total,
+            )
+        }
+        RefTarget::Alloc { id, projection } => {
+            let (projection, total) = split(projection);
+            (
+                RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                },
+                total,
+            )
+        }
+        RefTarget::Value(base, projection) => {
+            let (projection, total) = split(projection);
+            (RefTarget::Value(base.clone(), projection), total)
+        }
+        RefTarget::Null | RefTarget::Address(_) => (target.clone(), 0),
+    }
+}
+
+/// A pointer value with its trailing byte displacements split
+/// off (see [`split_trailing_byte_offsets`]): the value the
+/// remaining target denotes, and the summed displacement. Fat
+/// and dyn pointers displace their base value.
+fn strip_trailing_offsets_value(value: &Value) -> (Value, i128) {
+    match value {
+        Value::Ref(target) => {
+            let (target, total) = split_trailing_byte_offsets(target);
+            (Value::Ref(target), total)
+        }
+        Value::FatRef { base, len } => {
+            let (base, total) = strip_trailing_offsets_value(base);
+            (
+                Value::FatRef {
+                    base: Box::new(base),
+                    len: *len,
+                },
+                total,
+            )
+        }
+        Value::DynRef {
+            base,
+            concrete,
+            traits,
+            drop_glue,
+        } => {
+            let (base, total) = strip_trailing_offsets_value(base);
+            (
+                Value::DynRef {
+                    base: Box::new(base),
+                    concrete: concrete.clone(),
+                    traits: traits.clone(),
+                    drop_glue: drop_glue.clone(),
+                },
+                total,
+            )
+        }
+        _ => (value.clone(), 0),
+    }
 }
 
 /// The identity key a pointer value's synthetic address is
@@ -1545,6 +1685,42 @@ fn synthetic_addresses_do_not_collide_at_scale() {
         let addr = synthetic_address(&v).expect("address");
         assert!(seen.insert(addr), "collision at allocation {id}");
     }
+}
+
+#[test]
+fn synthetic_address_moves_with_trailing_byte_displacement() {
+    let base = Value::Ref(RefTarget::Alloc {
+        id: 7,
+        projection: Vec::new(),
+    });
+    let base_addr = synthetic_address(&base).expect("address");
+    let displaced = |d: i128| {
+        Value::Ref(RefTarget::Alloc {
+            id: 7,
+            projection: vec![RefProj::ByteOffset(d)],
+        })
+    };
+    // A byte-displaced pointer's address is the base target's
+    // address plus the displacement -- the relation the
+    // compiler's inserted alignment checks key on.
+    assert_eq!(synthetic_address(&displaced(1)), Some(base_addr + 1));
+    assert_eq!(synthetic_address(&displaced(-8)), Some(base_addr - 8));
+    // Consecutive trailing displacements accumulate.
+    let twice = Value::Ref(RefTarget::Alloc {
+        id: 7,
+        projection: vec![RefProj::ByteOffset(3), RefProj::ByteOffset(4)],
+    });
+    assert_eq!(synthetic_address(&twice), Some(base_addr + 7));
+    // A displacement in the middle of a projection is part of
+    // the target's identity, not a priced displacement: the
+    // address is a slot of its own, as before.
+    let middle = Value::Ref(RefTarget::Alloc {
+        id: 7,
+        projection: vec![RefProj::ByteOffset(1), RefProj::Field(0)],
+    });
+    let middle_addr = synthetic_address(&middle).expect("address");
+    assert_eq!(middle_addr % 0x1_0000, 0);
+    assert_ne!(middle_addr, base_addr + 1);
 }
 
 /// The Self type of an impl-qualified method name
@@ -11951,25 +12127,28 @@ impl<'a> Interpreter<'a> {
             }
         }
         match self.canonical_address_key(frames, value, leaf_ty) {
-            Some(key) => Some(hash_address_key(&key)),
+            Some((key, offset)) => Some(displaced_address(&key, offset)),
             None => synthetic_address(value),
         }
     }
 
     /// The address identity key of a pointer value with
     /// zero-sized element positions normalised (see
-    /// [`Self::pointer_address`]); `None` exactly when
+    /// [`Self::pointer_address`]), together with the trailing
+    /// byte displacement the key's slot is displaced by (see
+    /// [`split_trailing_byte_offsets`]); `None` exactly when
     /// [`address_key`] has no key for the value.
     fn canonical_address_key(
         &self,
         frames: &[Frame],
         value: &Value,
         leaf_ty: Option<&Ty>,
-    ) -> Option<String> {
+    ) -> Option<(String, i128)> {
         match value {
             Value::Ref(target) => {
                 let target = self.canonical_target(frames, target, leaf_ty);
-                Some(format!("ref:{target:?}"))
+                let (target, offset) = split_trailing_byte_offsets(&target);
+                Some((format!("ref:{target:?}"), offset))
             }
             Value::FatRef { base, len } => {
                 // The base target's element positions are
@@ -11979,13 +12158,18 @@ impl<'a> Interpreter<'a> {
                     _ => None,
                 };
                 let base = self.canonical_base_value(frames, base, elem);
-                Some(format!("fat:{base:?}:{len}"))
+                let (base, offset) = strip_trailing_offsets_value(&base);
+                Some((format!("fat:{base:?}:{len}"), offset))
             }
             Value::DynRef { base, concrete, .. } => {
                 let base = self.canonical_base_value(frames, base, None);
-                Some(format!("dyn:{base:?}:{concrete}"))
+                let (base, offset) = strip_trailing_offsets_value(&base);
+                Some((format!("dyn:{base:?}:{concrete}"), offset))
             }
-            _ => address_key(value),
+            _ => {
+                let (stripped, offset) = strip_trailing_offsets_value(value);
+                address_key(&stripped).map(|key| (key, offset))
+            }
         }
     }
 
