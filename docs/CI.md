@@ -312,6 +312,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
   process layer (process groups, `/proc`-based memory
   accounting), which is POSIX-only, so a Windows runner would
   record internal errors instead of verdicts (issue #517).
+- Auxiliary crates are built the way compiletest builds them:
+  with the test's own compile arguments, which carry the
+  revision's `--cfg` for a revised test (an incremental test's
+  auxiliary crate selects its revision's definitions through
+  `#[cfg(rpass1)]` / `#[cfg(rpass2)]`; the runner stamps the
+  revision onto each auxiliary spec and the driver forwards it
+  to the auxiliary build as `--cfg`), and a proc-macro
+  auxiliary chain links the same native test-helpers library
+  the native auxiliary builds link. A test whose header
+  combines `add-minicore` with `run-pass` is not attempted:
+  compiletest itself panics on the combination when parsing
+  the directives (`add-minicore` cannot be used to run the
+  test binary), so the file is never compiled — the one suite
+  file with both is a should-fail self-test of that rejection.
 - The cached source tree's sparse checkout additionally includes
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the

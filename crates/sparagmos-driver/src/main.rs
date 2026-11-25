@@ -50,10 +50,15 @@
 //! per-crate attributes may follow the path, separated by `;`:
 //! `;crate-type=<type>` builds the crate as that crate type (the
 //! runner passes `proc-macro` for compiletest's `//@ proc-macro:`
-//! auxiliaries, whose sources do not declare a crate type), and
+//! auxiliaries, whose sources do not declare a crate type),
 //! `;edition=<ed>` builds it with that edition instead of the main
 //! `--edition` (compiletest builds each auxiliary crate with the
-//! edition its own `//@ edition:` directive declares). An in-source
+//! edition its own `//@ edition:` directive declares), and
+//! `;cfg=<name>` (repeatable) builds it with `--cfg <name>`
+//! (compiletest compiles a test's auxiliary crates with the
+//! test's own compile arguments, which carry the revision's
+//! `--cfg` for a revised test — an incremental test's auxiliary
+//! crate selects its revision's definitions through it). An in-source
 //! `#![crate_type]` declaration still decides the crate type when
 //! one is present. Pass auxiliary
 //! crates in dependency order (a crate before the crates that use
@@ -8596,17 +8601,19 @@ fn expand_aux_flag_variables(flag: &str, src_path: &str) -> String {
 
 /// One `--aux` specification: the crate name and source path from
 /// `<name>=<file.rs>`, plus the optional per-crate attributes that
-/// followed the path (`;crate-type=<type>`, `;edition=<ed>`).
+/// followed the path (`;crate-type=<type>`, `;edition=<ed>`,
+/// `;cfg=<name>`).
 struct AuxSpec {
     name: String,
     path: String,
     crate_type: Option<String>,
     edition: Option<String>,
+    cfgs: Vec<String>,
 }
 
 /// Parse one `--aux` value: `<name>=<file.rs>` optionally followed
-/// by `;crate-type=<type>` and/or `;edition=<ed>` attributes.
-/// Anything else is a usage error.
+/// by `;crate-type=<type>`, `;edition=<ed>` and/or `;cfg=<name>`
+/// attributes. Anything else is a usage error.
 fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
     let (name, rest) = spec
         .split_once('=')
@@ -8622,6 +8629,7 @@ fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
         path: path.to_string(),
         crate_type: None,
         edition: None,
+        cfgs: Vec::new(),
     };
     for attr in parts {
         let (key, value) = attr
@@ -8631,6 +8639,7 @@ fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
         match key {
             "crate-type" => parsed.crate_type = Some(value.to_string()),
             "edition" => parsed.edition = Some(value.to_string()),
+            "cfg" => parsed.cfgs.push(value.to_string()),
             _ => return Err(format!("unknown --aux attribute: {key}")),
         }
     }
@@ -8723,8 +8732,13 @@ fn bind_names_for<'a>(
 /// each auxiliary crate with its own edition) and with
 /// `default_edition` otherwise; its crate type is the source's own
 /// `#![crate_type]` declaration when present, else the caller's
-/// `spec.crate_type`, else `rlib`. On failure, returns the first
-/// compiler error line as the reason.
+/// `spec.crate_type`, else `rlib`. The build carries every
+/// `spec.cfgs` entry as a `--cfg` (with a matching `--check-cfg`
+/// declaration, so the name is a known cfg): compiletest compiles
+/// a revised test's auxiliary crates with the test's compile
+/// arguments, revision `--cfg` included, and an auxiliary crate
+/// can select per-revision definitions through it. On failure,
+/// returns the first compiler error line as the reason.
 fn compile_aux(
     sysroot: &str,
     default_edition: &str,
@@ -8765,8 +8779,12 @@ fn compile_aux(
     cmd.env("RUSTC_BOOTSTRAP", "1");
     cmd.arg(src_path)
         .arg("-Zalways-encode-mir")
-        .arg(format!("--edition={edition}"))
-        .arg(format!("--out-dir={}", aux_dir.display()))
+        .arg(format!("--edition={edition}"));
+    for cfg in &spec.cfgs {
+        cmd.arg("--cfg").arg(cfg);
+        cmd.arg("--check-cfg").arg(format!("cfg({cfg})"));
+    }
+    cmd.arg(format!("--out-dir={}", aux_dir.display()))
         .arg(format!("--sysroot={sysroot}"))
         .arg("-L")
         .arg(format!("dependency={}", aux_dir.display()));

@@ -2793,18 +2793,42 @@ fn projection_screen_const(
     }
 }
 
+/// Whether a panic hook record names one of rustc_public
+/// 1.100.0's known `unimplemented!()` conversion sites — the
+/// same sites the driver binary's location classification
+/// maps to named skip reasons (the tail-call terminator, the
+/// unsafe-binder type, and the unconverted constant kinds).
+/// A panic there is a known conversion gap, not a crash.
+fn record_names_unimplemented_site(record: &str) -> bool {
+    record.contains("rustc_public/src/unstable/convert/stable/mir.rs:775:")
+        || record.contains("rustc_public/src/unstable/convert/stable/ty.rs:471:")
+        || record.contains("rustc_public/src/unstable/convert/stable/ty.rs:577:")
+}
+
 /// Run a screen question under the containment
 /// `guarded_ty_kind` applies to kind questions. The screen
 /// asks questions some types cannot answer — an async
 /// closure instance's type cannot be asked at all, and an
 /// instance constant's evaluation can be too generic — and
 /// those questions panic with one of rustc_public's known
-/// unimplemented conversions. Such a panic means the
-/// question has no answer the screen can use, so the screen
-/// has no opinion; the panic hook's record of it is
-/// consumed, so no outer containment mistakes it for its
-/// own. Any other panic is resumed: the screen must never
-/// paper over an unrelated compiler failure.
+/// unimplemented conversions. The screen also asks for an
+/// instance's type, which panics with "needs further
+/// instantiation" while the instance is still generic
+/// (the same gap `guarded_abi_query` tolerates: the
+/// question is speculative, and a body the question would
+/// have vetoed is fetched afterwards under
+/// `fetch_body_contained`'s own containment), and a screen
+/// walk over a body's types can reach a type whose kind
+/// conversion is one of rustc_public's known
+/// `unimplemented!()` sites — vetoing the body is not the
+/// screen's call there either, because the body's own
+/// conversion classifies the site into its named skip
+/// reason. Such a panic means the question has no answer
+/// the screen can use, so the screen has no opinion; the
+/// panic hook's record of it is consumed, so no outer
+/// containment mistakes it for its own. Any other panic is
+/// resumed: the screen must never paper over an unrelated
+/// compiler failure.
 fn screen_question<T>(question: impl FnOnce() -> Option<T>) -> Option<T> {
     clear_captured_panic();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(question)) {
@@ -2820,7 +2844,11 @@ fn screen_question<T>(question: impl FnOnce() -> Option<T>) -> Option<T> {
             // hence this very panic's — is the witness that
             // identifies it.
             match take_captured_panic() {
-                Some(record) if record.contains("FIXME(async_closures)") => {
+                Some(record)
+                    if record.contains("FIXME(async_closures)")
+                        || record.contains("needs further instantiation")
+                        || record_names_unimplemented_site(&record) =>
+                {
                     None
                 }
                 other => {
@@ -3596,10 +3624,41 @@ impl Converter {
     /// The link symbol the compiler assigns to `inst`, when a
     /// compiler context is installed (outside one there is no
     /// compiler to ask, and no symbol is recorded).
+    ///
+    /// The query is speculative in the same way an instance
+    /// resolution is: the driver asks for the symbols of
+    /// generic instances the compiler's own code generation
+    /// never names (it names only monomorphized ones), and a
+    /// mangler can fail on such an instance as a session
+    /// diagnostic rather than a panic — the legacy mangler
+    /// reports an internal error for an instance whose
+    /// arguments mention an anonymous constant. Left standing,
+    /// that one report poisons the whole compilation of a
+    /// program rustc accepts. The query therefore runs under
+    /// the resolution containment: diagnostics it emits are
+    /// discounted, and an instance the compiler cannot name —
+    /// by diagnostic or by panic — simply gets no symbol.
     fn link_symbol_of(&self, inst: &Instance) -> Option<String> {
         let tcx = compiler_tcx()?;
         let internal = rustc_public::rustc_internal::internal(tcx, inst);
-        Some(tcx.symbol_name(internal).name.to_string())
+        let (result, emitted) =
+            with_instance_resolution_contained(|| tcx.symbol_name(internal).name.to_string());
+        if emitted {
+            return None;
+        }
+        match result {
+            Ok(symbol) => Some(symbol),
+            Err(_payload) => {
+                // The containment returns the payload; the
+                // callers' contract is that an unnameable
+                // instance gets no symbol, so the panic is
+                // consumed here, hook record included (the
+                // discipline `resolve_instance_guarded`
+                // follows for the same slot).
+                let _ = take_captured_panic();
+                None
+            }
+        }
     }
 
     /// The `&'static Location` of a body's own definition: the
@@ -5058,9 +5117,23 @@ impl Converter {
             return sm::ConstValue::ZeroSized;
         };
         let value = match kind {
-            TyKind::RigidTy(RigidTy::Bool) => match alloc.read_bool() {
-                Ok(b) => sm::ConstValue::Bool(b),
-                Err(_) => {
+            TyKind::RigidTy(RigidTy::Bool) => match alloc.bytes.as_slice() {
+                [Some(0)] => sm::ConstValue::Bool(false),
+                [Some(1)] => sm::ConstValue::Bool(true),
+                // A byte outside {0, 1} is the product of a
+                // transmute; its bits are the value, kept as a
+                // scalar (the interpreter reads a scalar under a
+                // bool context as `data != 0`, the meaning the
+                // bits carry). A wholly uninitialised byte has
+                // no bits to read and decodes as uninit, the
+                // form the structural decode below already
+                // gives an all-uninit range.
+                [Some(b)] => sm::ConstValue::Scalar(sm::Scalar::Int {
+                    data: *b as u128,
+                    size: 1,
+                }),
+                [None] => sm::ConstValue::Uninit,
+                _ => {
                     self.err("ConstantKind::Allocated (unreadable bool)");
                     sm::ConstValue::ZeroSized
                 }
@@ -5068,11 +5141,18 @@ impl Converter {
             TyKind::RigidTy(RigidTy::Char) => match alloc.read_uint() {
                 Ok(v) => match char::from_u32(v as u32) {
                     Some(ch) => sm::ConstValue::Char(ch),
-                    None => {
-                        self.err("ConstantKind::Allocated (invalid char)");
-                        sm::ConstValue::ZeroSized
-                    }
+                    // An invalid char is a transmuted value;
+                    // keep its bits as a scalar, as the bool
+                    // arm does (a scalar under a char context
+                    // reads back as the same code unit value).
+                    None => sm::ConstValue::Scalar(sm::Scalar::Int {
+                        data: v,
+                        size: alloc.bytes.len() as u8,
+                    }),
                 },
+                Err(_) if alloc.bytes.iter().all(|b| b.is_none()) => {
+                    sm::ConstValue::Uninit
+                }
                 Err(_) => {
                     self.err("ConstantKind::Allocated (unreadable char)");
                     sm::ConstValue::ZeroSized
@@ -5083,6 +5163,9 @@ impl Converter {
                     data: v as u128,
                     size: alloc.bytes.len() as u8,
                 }),
+                Err(_) if alloc.bytes.iter().all(|b| b.is_none()) => {
+                    sm::ConstValue::Uninit
+                }
                 Err(_) => {
                     self.err("ConstantKind::Allocated (unreadable int)");
                     sm::ConstValue::ZeroSized
@@ -5093,6 +5176,9 @@ impl Converter {
                     data: v,
                     size: alloc.bytes.len() as u8,
                 }),
+                Err(_) if alloc.bytes.iter().all(|b| b.is_none()) => {
+                    sm::ConstValue::Uninit
+                }
                 Err(_) => {
                     self.err("ConstantKind::Allocated (unreadable uint)");
                     sm::ConstValue::ZeroSized
@@ -9836,15 +9922,26 @@ fn fn_ty_abi(ty: &rustc_public::ty::Ty) -> Option<sm::Abi> {
 /// type panics with "needs further instantiation" — a known
 /// gap, not a crash: the instance's ABI is not needed, since a
 /// monomorphized instance of the same function registers (and
-/// is recorded) separately. That panic's hook record is
-/// consumed, so no outer containment mistakes it for a
+/// is recorded) separately. An instance the driver fabricated
+/// without generic arguments for a definition that has
+/// parameters (a `Drop` implementation generic over a
+/// lifetime, asked for its drop function's ABI) fails the
+/// same way inside the compiler's instantiation, with "no
+/// args were provided in instantiate": the ABI is equally
+/// unneeded, for the same reason. Those panics' hook records
+/// are consumed, so no outer containment mistakes them for a
 /// conversion panic; any other panic resumes.
 fn guarded_abi_query(query: impl FnOnce() -> Option<sm::Abi>) -> Option<sm::Abi> {
     clear_captured_panic();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(abi) => abi,
         Err(payload) => match take_captured_panic() {
-            Some(record) if record.contains("needs further instantiation") => None,
+            Some(record)
+                if record.contains("needs further instantiation")
+                    || record.contains("no args were provided in instantiate") =>
+            {
+                None
+            }
             other => {
                 if let Some(record) = other {
                     record_captured_panic(record);
