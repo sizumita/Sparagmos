@@ -656,6 +656,16 @@ pub struct Converter {
     /// rather than fall back to the declared type's decode
     /// (see `decode_ref`).
     const_budget_failed: bool,
+    /// Set when a `range_all_uninit` scan runs out of scan
+    /// budget before its outcome is decided. Read by the same
+    /// `decode_ref` fallbacks that read `const_budget_failed`,
+    /// which clear it before attempting a decode and check it
+    /// afterwards: a decode that failed after the scan budget
+    /// denied it the `Uninit` shortcut may have failed for
+    /// exactly that reason, so it must fail the whole constant
+    /// rather than fall back to a different value (see
+    /// `decode_ref`).
+    const_scan_failed: bool,
     /// Scan budget remaining for the constant currently being
     /// decoded (see `MAX_CONST_SCAN_BYTES`): reset wherever
     /// `const_budget` resets, and spent by `range_all_uninit`
@@ -664,11 +674,15 @@ pub struct Converter {
     /// whose cost tracks a range's byte size rather than the
     /// materialised value -- stays bounded when one root
     /// constant re-decodes a large partially initialised
-    /// pointee once per element. Exhaustion does not fail a
-    /// decode: the scan reports "undecided" and the structural
-    /// decode proceeds, so only the `Uninit` shortcut is ever
-    /// lost, never a value the structural decode could still
-    /// build.
+    /// pointee once per element. Exhaustion does not by itself
+    /// fail a decode: the scan reports "undecided" and the
+    /// structural decode proceeds, so a value the structural
+    /// decode can still build is never lost. What exhaustion
+    /// does record is `const_scan_failed`: when the structural
+    /// decode then fails anyway, the `decode_ref` fallbacks
+    /// cannot tell that failure apart from one the lost
+    /// shortcut caused, so they keep the constant undecoded
+    /// rather than substitute a snapshot (see `decode_ref`).
     const_scan_budget: usize,
     /// Materialised memory allocations by provenance id,
     /// shared within one root constant's decode tree and
@@ -3286,6 +3300,7 @@ impl Converter {
             const_fn_mentions_seen: std::collections::HashSet::new(),
             const_budget: MAX_CONST_TOTAL_ELEMS,
             const_budget_failed: false,
+            const_scan_failed: false,
             const_scan_budget: MAX_CONST_SCAN_BYTES,
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
@@ -5327,7 +5342,9 @@ impl Converter {
     /// when the budget runs out before the outcome is decided:
     /// the caller then decodes structurally, so exhaustion
     /// costs only the `Uninit` shortcut, never a value the
-    /// structural decode could still build. The scan is the
+    /// structural decode could still build. The exhaustion is
+    /// recorded in `const_scan_failed` for the fallbacks in
+    /// `decode_ref`. The scan is the
     /// one decode step whose cost is proportional to a range's
     /// byte size rather than to the materialised value -- a
     /// partially initialised pointee is scanned in full at the
@@ -5358,6 +5375,7 @@ impl Converter {
         });
         if examined > self.const_scan_budget {
             self.const_scan_budget = 0;
+            self.const_scan_failed = true;
             return None;
         }
         self.const_scan_budget -= examined;
@@ -6769,7 +6787,9 @@ impl Converter {
                 // constant stays undecoded instead.
                 if self.pointee_is_erased(inner, &target, target_off) {
                     // A block that cannot be built because the
-                    // expansion budget ran out must not fall
+                    // expansion budget -- or the scan budget,
+                    // whose exhaustion can equally deny a decode
+                    // its `Uninit` shortcut -- ran out must not fall
                     // back to the declared type's decode below:
                     // that decode names the zero-sized declared
                     // type, so the constant would hold a
@@ -6782,18 +6802,22 @@ impl Converter {
                     // be decoded type-free) keeps the declared
                     // decode, as before.
                     self.const_budget_failed = false;
+                    self.const_scan_failed = false;
                     if let Some(block) =
                         self.decode_erased_alloc(&target, target_off, depth + 1)
                     {
                         return Some(sm::ConstValue::Ref(Box::new(block)));
                     }
-                    if self.const_budget_failed {
+                    if self.const_budget_failed || self.const_scan_failed {
                         return None;
                     }
                 }
                 if let Some(def) = &static_def {
                     // A static seed that cannot be built because the
-                    // expansion budget ran out must not fall back to
+                    // expansion budget -- or the scan budget,
+                    // whose exhaustion can equally deny the seed
+                    // decode its `Uninit` shortcut -- ran out must
+                    // not fall back to
                     // the snapshot decode below: the snapshot names
                     // only the pointee's current value, so the
                     // pointer loses the static's identity -- a
@@ -6804,12 +6828,13 @@ impl Converter {
                     // An ordinary failure to determine the
                     // projection keeps the snapshot, as before.
                     self.const_budget_failed = false;
+                    self.const_scan_failed = false;
                     if let Some(c) =
                         self.decode_static_ref(def, inner, &target, target_off, depth)
                     {
                         return Some(c);
                     }
-                    if self.const_budget_failed {
+                    if self.const_budget_failed || self.const_scan_failed {
                         return None;
                     }
                 }

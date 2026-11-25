@@ -946,6 +946,73 @@ fn run_mode_uninit_scan_table_under_budget_reads_back() {
 }
 
 #[test]
+fn run_mode_static_ref_table_scan_exhaustion_stays_undecoded() {
+    // A 70,000-element table of pointers to the `flag` field
+    // of one static whose other two fields are 4 KiB
+    // uninitialised payloads. Building each element's static
+    // seed scans about 16 KiB (the struct's scan runs through
+    // both payloads to the one initialised field, and each
+    // payload is scanned again on its own), so the scan
+    // budget (1 GiB of examinations per root constant) runs
+    // out after about 65,000 elements, while the expansion
+    // budget spends only a few units per element (the
+    // payloads decode through the `Uninit` shortcut). Past
+    // exhaustion the payload's structural decode fails on an
+    // uninitialised byte -- an ordinary failure that set no
+    // budget flag -- and the static-reference fallback then
+    // substituted a snapshot of the flag for the remaining
+    // elements: those pointers no longer denoted the static's
+    // storage, and a write through the first was not observed
+    // through the last (the native program prints
+    // `last=true`). With scan exhaustion recorded alongside
+    // expansion exhaustion, the constant stays undecoded.
+    // Two payloads halve the element count at which
+    // exhaustion bites, keeping this test near ten seconds;
+    // the single-payload shape at 140,000 entries behaves
+    // identically.
+    let src = "#[repr(C)] struct S { a: std::mem::MaybeUninit<[u8; 4096]>, b: std::mem::MaybeUninit<[u8; 4096]>, flag: std::cell::Cell<bool> } unsafe impl Sync for S {} static S_VAL: S = S { a: std::mem::MaybeUninit::uninit(), b: std::mem::MaybeUninit::uninit(), flag: std::cell::Cell::new(false) }; struct Table([*const std::cell::Cell<bool>; 70000]); unsafe impl Sync for Table {} static TABLE: Table = Table([core::ptr::addr_of!(S_VAL.flag); 70000]); fn main() { unsafe { (*TABLE.0[0]).set(true); println!(\"last={}\", (*TABLE.0[69999]).get()); } }";
+    let dir = temp_dir("static-ref-table-scan-exhaustion");
+    let src = fixture(&dir, "static_ref_table_scan_exhaustion.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a static-ref table whose seed scans exhaust the scan budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_table_scan_within_budget_shares_storage() {
+    // The same flag-pointer table at sixteen elements: the
+    // repeated seed scans total about 256 KiB of
+    // examinations, well within the scan budget, so every
+    // element decodes as a static reference to the one
+    // storage, and a write through the first is observed
+    // through the last, exactly as in the native program.
+    let src = "#[repr(C)] struct S { a: std::mem::MaybeUninit<[u8; 4096]>, b: std::mem::MaybeUninit<[u8; 4096]>, flag: std::cell::Cell<bool> } unsafe impl Sync for S {} static S_VAL: S = S { a: std::mem::MaybeUninit::uninit(), b: std::mem::MaybeUninit::uninit(), flag: std::cell::Cell::new(false) }; struct Table([*const std::cell::Cell<bool>; 16]); unsafe impl Sync for Table {} static TABLE: Table = Table([core::ptr::addr_of!(S_VAL.flag); 16]); fn main() { unsafe { (*TABLE.0[0]).set(true); println!(\"first={} last={}\", (*TABLE.0[0]).get(), (*TABLE.0[15]).get()); } }";
+    let dir = temp_dir("static-ref-table-scan-within-budget");
+    let src = fixture(&dir, "static_ref_table_scan_within_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget static-ref table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=true last=true\n",
+        "both pointers must denote the static's shared storage"
+    );
+}
+
+#[test]
 fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
     // One root constant -- a 21-element table of one-byte
     // slices -- whose elements alternate between ten distinct
