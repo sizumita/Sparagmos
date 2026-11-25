@@ -3594,6 +3594,150 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// The `(element tag, inline capacity)` of a
+/// `smallvec::SmallVec<[T; N]>` self-type tag, or `None` when
+/// the tag does not denote a SmallVec over an array (the
+/// `Array` implementation in use).
+/// The tag may carry the naming crate's prefix
+/// (`<caller>::smallvec::SmallVec<[...]>`), as rendered tags do
+/// when the type is named through an explicit `extern crate`
+/// item; from inside the crate's ordinary consumers the bare
+/// path is spelled. Both spellings denote the same ADT.
+fn smallvec_array_arg(self_ty: &str) -> Option<(String, usize)> {
+    let args = if let Some(rest) = self_ty.strip_prefix("smallvec::SmallVec<") {
+        rest
+    } else {
+        let (head, tail) = self_ty.split_once("::")?;
+        if head.is_empty()
+            || !head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        tail.strip_prefix("smallvec::SmallVec<")?
+    };
+    // `args` is the array argument plus the closing `>` of the
+    // SmallVec argument list: `[T; N]>`.
+    if !args.starts_with('[') || !args.ends_with('>') {
+        return None;
+    }
+    let bytes = args.as_bytes();
+    let mut depth = 0i64;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' | b'<' => depth += 1,
+            b']' | b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    if close != args.len() - 2 {
+        return None;
+    }
+    let inner = &args[1..close];
+    let mut depth = 0i64;
+    let mut semi = None;
+    for (i, &b) in inner.as_bytes().iter().enumerate() {
+        match b {
+            b'[' | b'<' => depth += 1,
+            b']' | b'>' => depth -= 1,
+            b';' if depth == 0 => semi = Some(i),
+            _ => {}
+        }
+    }
+    let semi = semi?;
+    let cap: usize = inner[semi + 1..].trim().parse().ok()?;
+    Some((inner[..semi].trim().to_string(), cap))
+}
+
+/// The value of one scalar element of type `tag` whose
+/// storage bytes are `bytes` (little-endian, the element's own
+/// width). `None` for a tag that names no scalar element type.
+fn scalar_elem_value(tag: &str, bytes: &[u8]) -> Option<Value> {
+    let mut buf = [0u8; 16];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let bits = u128::from_le_bytes(buf);
+    Some(match tag {
+        "u8" => Value::Uint(bits & 0xff),
+        "u16" => Value::Uint(bits & 0xffff),
+        "u32" => Value::Uint(bits & 0xffff_ffff),
+        "u64" | "usize" => Value::Uint(bits & 0xffff_ffff_ffff_ffff),
+        "u128" => Value::Uint(bits),
+        "i8" => Value::Int(i128::from(bits as u8 as i8)),
+        "i16" => Value::Int(i128::from(bits as u16 as i16)),
+        "i32" => Value::Int(i128::from(bits as u32 as i32)),
+        "i64" | "isize" => Value::Int(i128::from(bits as u64 as i64)),
+        "i128" => Value::Int(bits as i128),
+        "bool" => Value::Bool(bytes.first().copied().unwrap_or(0) != 0),
+        "char" => Value::Uint(bits & 0xffff_ffff),
+        "f16" => Value::Float(crate::mir_convert::f16_to_f64(bits as u16)),
+        "f32" => {
+            Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32))
+        }
+        "f64" => Value::Float(f64::from_bits(bits as u64)),
+        "f128" => Value::Float128(bits),
+        _ => return None,
+    })
+}
+
+/// The `usize` a scalar value holds, when it holds one.
+fn value_as_usize(value: &Value) -> Option<usize> {
+    match value {
+        Value::Uint(n) => usize::try_from(*n).ok(),
+        Value::Int(n) => usize::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+/// The `(pointer, length)` a spilled SmallVec's data word
+/// holds: the enum form's `Heap` variant carries the pair as
+/// its two fields; the union form's heap field (index 1) is
+/// the pair itself, a two-element tuple. The pointer sits
+/// inside a `NonNull` one-field wrapper.
+fn smallvec_heap_parts(data: &Value) -> Option<(Value, usize)> {
+    let Value::Enum {
+        variant, fields, ..
+    } = data
+    else {
+        return None;
+    };
+    let (ptr_field, len_field) = if *variant == 1 && fields.len() == 2 {
+        (fields[0].clone(), fields[1].clone())
+    } else {
+        match fields.get(1) {
+            Some(Value::Tuple(pair)) if pair.len() == 2 => {
+                (pair[0].clone(), pair[1].clone())
+            }
+            Some(Value::Enum { fields: pair, .. }) if pair.len() == 2 => {
+                (pair[0].clone(), pair[1].clone())
+            }
+            _ => return None,
+        }
+    };
+    let mut ptr = ptr_field;
+    for _ in 0..2 {
+        match &ptr {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                ptr = fields[0].clone();
+            }
+            _ => break,
+        }
+    }
+    if !matches!(ptr, Value::Ref(_)) {
+        return None;
+    }
+    let len = value_as_usize(&len_field)?;
+    Some((ptr, len))
+}
+
 /// Look a canonical callee name up in the registry, tolerating
 /// a crate-qualified spelling. A callee reached through an
 /// extern crate the referencing crate links (and possibly
@@ -8880,6 +9024,13 @@ impl<'a> Interpreter<'a> {
                         base: Box::new(vals.into_iter().next().expect("arity checked")),
                         len,
                     })
+                } else if smallvec_array_arg(self_ty).is_some() {
+                    self.smallvec_slice(
+                        frames,
+                        &vals[0],
+                        self_ty,
+                        "Deref::deref for SmallVec",
+                    )
                 } else if self_ty.starts_with("std::boxed::Box<") {
                     // A built box's single field is its allocation
                     // pointer, and `deref` yields that very
@@ -11407,6 +11558,13 @@ impl<'a> Interpreter<'a> {
                         base: Box::new(vals.into_iter().next().expect("arity checked")),
                         len,
                     })
+                } else if smallvec_array_arg(self_ty).is_some() {
+                    self.smallvec_slice(
+                        frames,
+                        &vals[0],
+                        self_ty,
+                        "DerefMut::deref_mut for SmallVec",
+                    )
                 } else if self_ty == "std::ffi::CString" {
                     // `CString::deref_mut -> &mut CStr`: the
                     // same fat reference `deref` produces.
@@ -22169,6 +22327,288 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Err(unsupported(format!(
             "{what} for {base_ty} -> {target_ty} is not runtime-supported"
         )))
+    }
+
+    /// The reference formed by appending `steps` to the place
+    /// a reference value denotes, when it denotes a live place:
+    /// the multi-step form of [`Self::place_projected_ref`].
+    fn place_projected_ref_steps(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        steps: &[RefProj],
+    ) -> InterpResult<Option<Value>> {
+        Ok(match self.deref_value(frames, arg)? {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.extend(steps.iter().cloned());
+                Some(Value::Ref(RefTarget::Place {
+                    frame: frames[frame_pos].id,
+                    local,
+                    projection,
+                }))
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.extend(steps.iter().cloned());
+                Some(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Resolved::Alloc {
+                id,
+                mut projection,
+            } => {
+                projection.extend(steps.iter().cloned());
+                Some(Value::Ref(RefTarget::Alloc { id, projection }))
+            }
+            Resolved::Value(..) => None,
+        })
+    }
+
+    /// The element form of an array value held in the
+    /// model's scalar-backed form (see
+    /// [`Self::smallvec_slice`]): a tuple whose first slot is
+    /// one scalar carrying the initialised region's bytes and
+    /// whose remaining slots are uninitialised. Only scalar
+    /// element types pack this way, and only the first `len`
+    /// elements are initialised, so the expansion rebuilds
+    /// exactly those from the scalar's little-endian storage
+    /// bytes and leaves the spare slots uninitialised. Any
+    /// other shape is returned unchanged.
+    fn unpack_scalar_backed_array(
+        &self,
+        array: &Value,
+        elem_tag: &str,
+        count: usize,
+        len: usize,
+    ) -> Value {
+        let Value::Tuple(items) = array else {
+            return array.clone();
+        };
+        if items.len() != count || len < 2 || len > count {
+            return array.clone();
+        }
+        if items[1..].iter().any(|item| *item != Value::Uninit) {
+            return array.clone();
+        }
+        let scalar = &items[0];
+        if crate::interp::scalar_storage_len(scalar).is_none() {
+            return array.clone();
+        }
+        let Some((elem_size, _)) = self.layout_of(elem_tag) else {
+            return array.clone();
+        };
+        let elem_size = elem_size as usize;
+        if elem_size == 0 || len * elem_size > 16 {
+            return array.clone();
+        }
+        let mut out: Vec<Value> = Vec::with_capacity(count);
+        for i in 0..len {
+            let mut bytes = [0u8; 16];
+            for (k, byte) in bytes.iter_mut().take(elem_size).enumerate() {
+                match crate::interp::scalar_storage_byte(scalar, i * elem_size + k) {
+                    Some(b) => *byte = b,
+                    None => return array.clone(),
+                }
+            }
+            match scalar_elem_value(elem_tag, &bytes[..elem_size]) {
+                Some(v) => out.push(v),
+                None => return array.clone(),
+            }
+        }
+        out.resize(count, Value::Uninit);
+        Value::Tuple(out)
+    }
+
+    /// `Deref` / `DerefMut` for `smallvec::SmallVec<[T; N]>`
+    /// (smallvec 1.x): the slice the vector's elements form.
+    ///
+    /// The value is the crate's real struct shape
+    /// `{ capacity: usize, data: SmallVecData, .. }`, and the
+    /// capacity word alone selects the storage, by the crate's
+    /// own invariant: at or below the inline capacity `N` the
+    /// word IS the length and the elements sit in the data
+    /// word's inline field; above it the word is the heap
+    /// allocation's capacity and the data word's heap field
+    /// holds the `(pointer, length)` pair. The data word's own
+    /// shape depends on the crate's `union` feature -- a
+    /// two-field union value (inline field first; the inline
+    /// field is a `ManuallyDrop` over the `MaybeUninit`
+    /// buffer) or an enum (`Inline` / `Heap` variants, the
+    /// inline variant holding the `MaybeUninit` directly) --
+    /// and the extraction follows the held value's shape
+    /// rather than the feature: every layer between the data
+    /// word and the element array is a one-field aggregate, so
+    /// the walk that reaches the array value also counts the
+    /// field steps that denote the same array in the vector's
+    /// place, which is what the result's base names when the
+    /// vector is place-backed (so writes through a `deref_mut`
+    /// result land in the vector). A detached vector value
+    /// yields a reference to the extracted array itself, as
+    /// for constant aggregates.
+    fn smallvec_slice(
+        &self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        self_ty: &str,
+        what: &str,
+    ) -> InterpResult<Value> {
+        let (elem_tag, inline_cap) = smallvec_array_arg(self_ty).ok_or_else(|| {
+            unsupported(format!(
+                "{what}: cannot read an inline capacity from {self_ty}"
+            ))
+        })?;
+        let vec = self.resolve_value(frames, arg)?;
+        let Value::Enum { fields, .. } = &vec else {
+            return Err(InterpError::type_mismatch(
+                what,
+                "SmallVec aggregate",
+                vec.kind_name(),
+            ));
+        };
+        if fields.len() < 2 {
+            return Err(InterpError::type_mismatch(
+                what,
+                "SmallVec aggregate with capacity and data fields",
+                vec.kind_name(),
+            ));
+        }
+        let capacity_word = value_as_usize(&fields[0]).ok_or_else(|| {
+            InterpError::type_mismatch(
+                what,
+                "SmallVec capacity word",
+                fields[0].kind_name(),
+            )
+        })?;
+        let data = fields[1].clone();
+        if capacity_word <= inline_cap {
+            // Inline storage: the capacity word is the length.
+            let len = capacity_word as u128;
+            let Value::Enum {
+                fields: data_fields,
+                ..
+            } = &data
+            else {
+                return Err(InterpError::type_mismatch(
+                    what,
+                    "SmallVec data aggregate",
+                    data.kind_name(),
+                ));
+            };
+            let mut node = data_fields.first().cloned().ok_or_else(|| {
+                InterpError::type_mismatch(
+                    what,
+                    "SmallVec data with an inline field",
+                    data.kind_name(),
+                )
+            })?;
+            let mut steps = vec![RefProj::Field(1), RefProj::Field(0)];
+            while let Value::Enum { fields: inner, .. } = &node {
+                if inner.len() != 1 {
+                    break;
+                }
+                node = inner[0].clone();
+                steps.push(RefProj::Field(0));
+            }
+            // The buffer's elements were written through raw
+            // pointers (the crate's own `push` / `grow` paths),
+            // which leaves the array in the model's scalar-backed
+            // form -- the whole initialised region packed into
+            // the first slot's scalar, the remaining slots
+            // uninitialised -- a form structural element reads
+            // cannot take apart. Expand it to the element form
+            // (only the first `len` elements are initialised;
+            // the spare slots stay uninitialised) and, when the
+            // vector is place-backed, write the expansion back
+            // into the vector's place: the representation
+            // changes, the bytes denoted do not, and every later
+            // structural access (this slice's reads and writes
+            // included) sees the elements themselves.
+            let unpacked = self.unpack_scalar_backed_array(
+                &node,
+                &elem_tag,
+                inline_cap,
+                len as usize,
+            );
+            if unpacked != node {
+                if let Ok(target) = self.deref_value(frames, arg) {
+                    let target = match target {
+                        Resolved::Place {
+                            frame_pos,
+                            local,
+                            mut projection,
+                        } => {
+                            projection.extend(steps.iter().cloned());
+                            Some(Resolved::Place {
+                                frame_pos,
+                                local,
+                                projection,
+                            })
+                        }
+                        Resolved::Static {
+                            name,
+                            mut projection,
+                        } => {
+                            projection.extend(steps.iter().cloned());
+                            Some(Resolved::Static { name, projection })
+                        }
+                        Resolved::Alloc {
+                            id,
+                            mut projection,
+                        } => {
+                            projection.extend(steps.iter().cloned());
+                            Some(Resolved::Alloc { id, projection })
+                        }
+                        Resolved::Value(..) => None,
+                    };
+                    if let Some(target) = target {
+                        self.write_resolved(frames, &target, unpacked.clone())?;
+                    }
+                }
+                node = unpacked;
+            }
+            // The base denotes the first element, not the
+            // array itself: the form a raw pointer to the
+            // buffer (the crate's own `as_ptr`) takes, which
+            // is what the slice machinery (index composition,
+            // element iteration bounded by the fat length)
+            // expects of a base whose storage is wider than
+            // the slice.
+            steps.push(RefProj::Index(0));
+            if let Some(place_ref) =
+                self.place_projected_ref_steps(frames, arg, &steps)?
+            {
+                return Ok(Value::FatRef {
+                    base: Box::new(place_ref),
+                    len,
+                });
+            }
+            return Ok(Value::FatRef {
+                base: Box::new(Value::Ref(RefTarget::Value(
+                    Box::new(node),
+                    vec![RefProj::Index(0)],
+                ))),
+                len,
+            });
+        }
+        // Spilled storage: the heap field holds the element
+        // pointer and the length; the capacity word is the
+        // allocation's capacity.
+        let (ptr, len) = smallvec_heap_parts(&data).ok_or_else(|| {
+            InterpError::type_mismatch(
+                what,
+                "SmallVec data holding a (pointer, length) heap field",
+                data.kind_name(),
+            )
+        })?;
+        Ok(Value::FatRef {
+            base: Box::new(ptr),
+            len: len as u128,
+        })
     }
 
     /// The reference `step` inside the place a reference value
