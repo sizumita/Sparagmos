@@ -106,9 +106,40 @@ impl<'a> FnLower<'a> {
                 target,
                 ..
             } => {
-                let text = assert_message_text(msg);
-                let msg_idx = self.messages.intern(&text);
-                let pblk = self.panic_block(msg_idx);
+                // A bounds-check assert carries its message's
+                // operands: the panic text is the index panic
+                // formatted at run time from the actual length
+                // and index, exactly as an index operation's own
+                // check formats it (and as the interpreter
+                // formats the same assert). Every other kind's
+                // message is a static text.
+                let pblk = match &**msg {
+                    mir::AssertMessage::BoundsCheck { len, index } => {
+                        let len_ty = self
+                            .operand_place_ty(len)
+                            .unwrap_or(mir::Ty::Uint(mir::UintTy::Usize));
+                        let idx_ty = self
+                            .operand_place_ty(index)
+                            .unwrap_or(mir::Ty::Uint(mir::UintTy::Usize));
+                        let len_v = self.operand_value(len, &len_ty)?;
+                        let idx_v = self.operand_value(index, &idx_ty)?;
+                        let id = self.new_block();
+                        self.seal_block(
+                            id,
+                            vec![Instr::PanicIndexOob {
+                                len: IrOperand::Value(len_v),
+                                index: IrOperand::Value(idx_v),
+                            }],
+                            IrTerminator::Unreachable,
+                        );
+                        id
+                    }
+                    _ => {
+                        let text = assert_message_text(msg);
+                        let msg_idx = self.messages.intern(&text);
+                        self.panic_block(msg_idx)
+                    }
+                };
                 let v = self.operand_value(cond, &mir::Ty::Bool)?;
                 let (then_blk, else_blk) = if *expected {
                     (target.index() as u32, pblk)
@@ -1608,6 +1639,247 @@ impl<'a> FnLower<'a> {
                     dst,
                     None,
                     vec![IrOperand::Value(handle)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::PanicStr => {
+                // The callee's trailing arguments (a `&Location`
+                // in the current core) are not the message; the
+                // message is the first argument.
+                if args.is_empty() {
+                    return Err(self.err("panic with no arguments"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("panic destination is not never"));
+                }
+                // The argument is a `&str` (a fat pair) -- or, in
+                // the formatted shape the interpreter's builtin
+                // also serves, a `fmt::Arguments` handle, whose
+                // panic is the formatted message. Only a place can
+                // hold the handle shape; a constant argument is
+                // the pair.
+                let is_arguments = match self.operand_place_ty(&args[0]) {
+                    Some(mir::Ty::Adt(def, _)) => {
+                        builtins::canonical_name(&self.callee_name(def))
+                            == "std::fmt::Arguments"
+                    }
+                    _ => false,
+                };
+                if is_arguments {
+                    let handle = self.arg_word(&args[0], "panic argument")?;
+                    self.emit_host_call(
+                        builtins::HOST_PANIC_FMT,
+                        dst,
+                        None,
+                        vec![IrOperand::Value(handle)],
+                    );
+                } else {
+                    let (ptr, len) = self.operand_pair(&args[0])?;
+                    self.emit_host_call(
+                        builtins::HOST_PANIC_STR,
+                        dst,
+                        None,
+                        vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                    );
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::PanicFmt => {
+                // As for `panic`: a trailing `&Location` argument
+                // is not the message.
+                if args.is_empty() {
+                    return Err(self.err("panic_fmt with no arguments"));
+                }
+                let handle = self.arg_word(&args[0], "panic_fmt argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("panic_fmt destination is not never"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_PANIC_FMT,
+                    dst,
+                    None,
+                    vec![IrOperand::Value(handle)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::PanicAny => {
+                // The payload is the first argument; a trailing
+                // `&Location` (the callee is `#[track_caller]`)
+                // is not part of it. The destination is `!`.
+                if args.is_empty() {
+                    return Err(self.err("begin_panic with no arguments"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("begin_panic destination is not never"));
+                }
+                // std's `payload_as_str`: a string payload
+                // reports as itself -- a `&str` payload is the
+                // fat pair itself; a `String` payload is its
+                // (pointer, capacity, length) triple, of which
+                // the panic message is the (pointer, length).
+                // Any other payload reports as the opaque box.
+                // The payload type is the callee's first generic
+                // argument; the operand's own place type is the
+                // fallback (a literal `&str` payload is a
+                // constant, which has no place type).
+                enum Payload {
+                    StrPair,
+                    String,
+                    Opaque,
+                }
+                let payload_ty = generic_args
+                    .first()
+                    .cloned()
+                    .or_else(|| self.operand_place_ty(&args[0]));
+                let shape = match &payload_ty {
+                    Some(mir::Ty::Ref(_, inner, _))
+                        if matches!(&**inner, mir::Ty::Str) =>
+                    {
+                        Payload::StrPair
+                    }
+                    Some(mir::Ty::Adt(def, _))
+                        if builtins::canonical_name(&self.callee_name(*def))
+                            == "std::string::String" =>
+                    {
+                        Payload::String
+                    }
+                    _ => Payload::Opaque,
+                };
+                match shape {
+                    Payload::StrPair => {
+                        let (ptr, len) = self.operand_pair(&args[0])?;
+                        self.emit_host_call(
+                            builtins::HOST_PANIC_STR,
+                            dst,
+                            None,
+                            vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                        );
+                        self.finish_builtin_call(&dst_loc, dst, target, true);
+                    }
+                    Payload::String => {
+                        let ty = self.operand_place_ty(&args[0]).ok_or_else(|| {
+                            self.err("begin_panic String payload without a type")
+                        })?;
+                        let words = flatten(&ty, &self.func.name, self.layouts)?;
+                        let leaves = self.operand_leaves(&args[0], &ty, words)?;
+                        let (Some(&ptr), Some(&len)) =
+                            (leaves.first(), leaves.get(2))
+                        else {
+                            return Err(self.err(
+                                "begin_panic String payload of an unsupported shape",
+                            ));
+                        };
+                        self.emit_host_call(
+                            builtins::HOST_PANIC_STR,
+                            dst,
+                            None,
+                            vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                        );
+                        self.finish_builtin_call(&dst_loc, dst, target, true);
+                    }
+                    Payload::Opaque => {
+                        let msg = self.messages.intern("Box<dyn Any>");
+                        let pblk = self.panic_block(msg);
+                        self.seal_terminator(IrTerminator::Jump(pblk));
+                    }
+                }
+                Ok(())
+            }
+            Builtin::PanicAssertFailed => {
+                if args.len() != 4 {
+                    return Err(self.err("assert_failed with wrong arity"));
+                }
+                let Some(pointee_ty) = generic_args.first() else {
+                    return Err(self.err("assert_failed without a compared type"));
+                };
+                let pointee_ty = pointee_ty.clone();
+                let desc = self.intern_descriptor(FmtTrait::Debug, &pointee_ty)?;
+                let kind = self.arg_word(&args[0], "assert_failed kind")?;
+                // The operands go to the host function as `fmt`
+                // argument handles over the `Debug` descriptor --
+                // the arguments a `format_args!` over the operands
+                // would build.
+                let mut handles = Vec::new();
+                for arg in &args[1..3] {
+                    let arg_ty = self.operand_place_ty(arg).ok_or_else(|| {
+                        self.err("assert_failed operand without a type")
+                    })?;
+                    let words = flatten(&arg_ty, &self.func.name, self.layouts)?;
+                    let (ptr, second, fat) = match words {
+                        1 => (
+                            self.operand_value(arg, &arg_ty)?,
+                            IrOperand::Const(0),
+                            0,
+                        ),
+                        2 => {
+                            let (a, b) = self.operand_pair(arg)?;
+                            (a, IrOperand::Value(b), 1)
+                        }
+                        _ => {
+                            return Err(
+                                self.err("assert_failed operand of an unsupported shape")
+                            )
+                        }
+                    };
+                    let handle = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_ARGUMENT_NEW,
+                        handle,
+                        None,
+                        vec![
+                            IrOperand::Value(ptr),
+                            second,
+                            IrOperand::Const(desc as i64),
+                            IrOperand::Const(fat),
+                        ],
+                    );
+                    self.emit(Instr::CheckPanic);
+                    handles.push(handle);
+                }
+                // The custom message: an `Option<fmt::Arguments>`.
+                // The payload's own layout is the one-word handle
+                // shape, so the option flattens either to the
+                // discriminant plus the handle, or -- under the
+                // niche layout -- to the handle alone (0 for
+                // `None`, as 0 is never a valid handle). The host
+                // function takes the discriminant and the handle,
+                // with -1 for the handle in the niche shape (the
+                // handle is then the discriminant word itself).
+                let opt_ty = self.operand_place_ty(&args[3]).ok_or_else(|| {
+                    self.err("assert_failed message argument without a type")
+                })?;
+                let opt_count = flatten(&opt_ty, &self.func.name, self.layouts)?;
+                let leaves = self.operand_leaves(&args[3], &opt_ty, opt_count)?;
+                let (opt_disc, opt_args) = match leaves.as_slice() {
+                    [disc, handle] => (IrOperand::Value(*disc), IrOperand::Value(*handle)),
+                    [word] => (IrOperand::Value(*word), IrOperand::Const(-1)),
+                    _ => {
+                        return Err(self.err(
+                            "assert_failed message option of an unsupported shape",
+                        ))
+                    }
+                };
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("assert_failed destination is not never"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_PANIC_ASSERT_FAILED,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(kind),
+                        IrOperand::Value(handles[0]),
+                        IrOperand::Value(handles[1]),
+                        opt_disc,
+                        opt_args,
+                    ],
                 );
                 self.finish_builtin_call(&dst_loc, dst, target, true);
                 Ok(())

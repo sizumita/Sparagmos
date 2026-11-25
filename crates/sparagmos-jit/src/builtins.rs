@@ -356,6 +356,30 @@ pub enum Builtin {
     /// format the arguments and raise the guest panic with that
     /// message (the call never returns in core either).
     PanicNounwindFmt,
+    /// `core::panicking::panic(&str)` (and the `&str` panic
+    /// entries that share its shape, `panic_nounwind` and
+    /// `expect_failed`): raise the guest panic with the string
+    /// as its message (the call never returns in core either).
+    PanicStr,
+    /// `std::panicking::begin_panic(payload)` /
+    /// `std::rt::begin_panic(payload)`: raise a guest panic
+    /// carrying the argument as its payload (the sink
+    /// `panic_any` and the pre-2021 `panic!` lower to). The
+    /// reported message is the payload itself when it is a
+    /// string, and the opaque-box text otherwise -- std's
+    /// `payload_as_str` rule, the interpreter's `PanicAny`.
+    PanicAny,
+    /// `std::rt::panic_fmt(Arguments)` /
+    /// `core::panicking::panic_fmt(Arguments)`: format the
+    /// arguments and raise the guest panic with that message
+    /// (the call never returns in core either).
+    PanicFmt,
+    /// `core::panicking::assert_failed(kind, &left, &right,
+    /// args)`: raise the guest panic with core's assertion
+    /// message -- the comparison head, the formatted custom
+    /// message when one was given, and both operands rendered
+    /// with `Debug` (the call never returns in core either).
+    PanicAssertFailed,
     /// `String::new() -> String`: the empty triple.
     StringNew,
     /// `String::len(&String) -> usize`: the triple's length word.
@@ -401,6 +425,15 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::ops::Deref::deref" => Builtin::Deref,
         "std::hint::must_use" => Builtin::MustUse,
         "core::panicking::panic_nounwind_fmt" => Builtin::PanicNounwindFmt,
+        "core::panicking::panic" => Builtin::PanicStr,
+        // `panic_nounwind(&str)` and `Option::expect_failed(&str)`
+        // panic with exactly the given message, as `panic` does
+        // (the interpreter's registry maps them the same way).
+        "core::panicking::panic_nounwind" => Builtin::PanicStr,
+        "std::option::expect_failed" | "core::option::expect_failed" => Builtin::PanicStr,
+        "std::rt::panic_fmt" | "core::panicking::panic_fmt" => Builtin::PanicFmt,
+        "std::panicking::begin_panic" | "std::rt::begin_panic" => Builtin::PanicAny,
+        "core::panicking::assert_failed" => Builtin::PanicAssertFailed,
         "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(0),
         "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(1),
         "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(2),
@@ -849,6 +882,12 @@ pub const HOST_STRING_PUSH: u32 = 24;
 pub const HOST_STR_OP: u32 = 25;
 /// Host table index of [`host_str_eq`].
 pub const HOST_STR_EQ: u32 = 26;
+/// Host table index of [`host_panic_str`].
+pub const HOST_PANIC_STR: u32 = 27;
+/// Host table index of [`host_panic_fmt`].
+pub const HOST_PANIC_FMT: u32 = 28;
+/// Host table index of [`host_panic_assert_failed`].
+pub const HOST_PANIC_ASSERT_FAILED: u32 = 29;
 
 /// The host function table, in [`HOST_*`] index order. The program
 /// layer copies these addresses into the backend's program context.
@@ -881,6 +920,9 @@ pub fn host_fns() -> Vec<usize> {
         host_string_push as usize,
         host_str_op as usize,
         host_str_eq as usize,
+        host_panic_str as usize,
+        host_panic_fmt as usize,
+        host_panic_assert_failed as usize,
     ]
 }
 
@@ -1572,6 +1614,21 @@ extern "C" fn host_str_eq(
     HostRet::one((a == b) as i64)
 }
 
+/// The shared tail of the `fmt::Arguments` panic entries
+/// (`panic_nounwind_fmt`, `panic_fmt`): the message is the
+/// formatted arguments; the call raises the guest panic with
+/// it and never returns a value.
+fn fail_with_arguments(ctx: &mut BuiltinCtx, handle: i64, what: &str) -> HostRet {
+    let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
+        return ctx.fail(&format!("{what} of a value that is not fmt::Arguments"));
+    };
+    let data = data.clone();
+    match format_arguments(ctx, &data) {
+        Ok(text) => ctx.fail(&text),
+        Err(m) => ctx.fail(&m),
+    }
+}
+
 /// `core::panicking::panic_nounwind_fmt(Arguments, bool)`:
 /// the message is the formatted arguments; the call raises the
 /// guest panic with it and never returns a value. Arguments:
@@ -1585,14 +1642,103 @@ extern "C" fn host_panic_nounwind_fmt(
     _d: i64,
 ) -> HostRet {
     let ctx = unsafe { &mut *ctx };
-    let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
-        return ctx.fail("panic_nounwind_fmt of a value that is not fmt::Arguments");
-    };
-    let data = data.clone();
-    match format_arguments(ctx, &data) {
+    fail_with_arguments(ctx, handle, "panic_nounwind_fmt")
+}
+
+/// `std::rt::panic_fmt(Arguments)` /
+/// `core::panicking::panic_fmt(Arguments)`: the message is the
+/// formatted arguments, exactly as for `panic_nounwind_fmt`
+/// (the nounwind flag only controls native backtrace capture,
+/// which no guest program can observe). Arguments:
+/// (arguments handle, _, _, _, _).
+extern "C" fn host_panic_fmt(
+    ctx: *mut BuiltinCtx,
+    handle: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    fail_with_arguments(ctx, handle, "panic_fmt")
+}
+
+/// `core::panicking::panic(&str)` and the `&str` panic entries
+/// that share its shape (`panic_nounwind`, `expect_failed`):
+/// the message is the string itself; the call raises the guest
+/// panic with it and never returns a value. Arguments:
+/// (string pointer, string length, _, _, _).
+extern "C" fn host_panic_str(
+    ctx: *mut BuiltinCtx,
+    ptr: i64,
+    len: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    match read_str(ptr, len) {
         Ok(text) => ctx.fail(&text),
         Err(m) => ctx.fail(&m),
     }
+}
+
+/// `core::panicking::assert_failed(kind, &left, &right, args)`:
+/// the message mirrors core's -- the comparison head for the
+/// kind, the formatted custom message when `args` is `Some`,
+/// and both operands rendered with `Debug`. The front end
+/// hands over the operands as `fmt` argument handles (built
+/// with the `Debug` descriptor of the compared type, exactly
+/// the arguments a `format_args!` for the operands would
+/// build), and the `Option<fmt::Arguments>` message as a
+/// discriminant plus a handle: under the tagged layout the
+/// discriminant is 1 for `Some` and the handle is the second
+/// word; under the niche layout the front end passes -1 for
+/// the handle and the discriminant word is the handle itself
+/// (0 for `None`, as 0 is never a valid handle). Arguments:
+/// (kind word, left argument handle, right argument handle,
+/// message discriminant, message arguments handle or -1).
+extern "C" fn host_panic_assert_failed(
+    ctx: *mut BuiltinCtx,
+    kind: i64,
+    left: i64,
+    right: i64,
+    opt_disc: i64,
+    opt_args: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let mut message = match kind {
+        0 => "assertion `left == right` failed".to_string(),
+        1 => "assertion `left != right` failed".to_string(),
+        2 => "assertion `left matches right` failed".to_string(),
+        _ => "assertion failed".to_string(),
+    };
+    let custom = if opt_args < 0 {
+        // The niche shape: the word is the handle itself.
+        (opt_disc != 0).then_some(opt_disc)
+    } else {
+        (opt_disc != 0).then_some(opt_args)
+    };
+    if let Some(handle) = custom {
+        let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
+            return ctx.fail("assert_failed message of a value that is not fmt::Arguments");
+        };
+        let data = data.clone();
+        match format_arguments(ctx, &data) {
+            Ok(text) => message = format!("{message}: {text}"),
+            Err(m) => return ctx.fail(&m),
+        }
+    }
+    let left = match format_arg(ctx, left, &FmtOptions::new()) {
+        Ok(text) => text,
+        Err(m) => return ctx.fail(&m),
+    };
+    let right = match format_arg(ctx, right, &FmtOptions::new()) {
+        Ok(text) => text,
+        Err(m) => return ctx.fail(&m),
+    };
+    message = format!("{message}\n  left: {left}\n right: {right}");
+    ctx.fail(&message)
 }
 
 /// `std::io::_print(Arguments)` / `_eprint`: format the arguments

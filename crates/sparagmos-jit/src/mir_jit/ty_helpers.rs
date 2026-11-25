@@ -376,7 +376,9 @@ pub(super) fn literal_int_ty(op: &mir::Operand) -> Option<mir::Ty> {
 /// interpreter's rule: a custom message verbatim; for the
 /// compiler-generated kinds, the exact message core panics with;
 /// kinds whose message embeds operand values keep the stable
-/// `assertion failed: <kind>` text.
+/// `assertion failed: <kind>` text. A bounds-check assert never
+/// reaches this function: its caller lowers it to the backend's
+/// run-time-formatted index panic with the assert's operands.
 pub(super) fn assert_message_text(msg: &mir::AssertMessage) -> String {
     use mir::AssertMessage as A;
     match msg {
