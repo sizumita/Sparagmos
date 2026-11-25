@@ -89,6 +89,7 @@ impl<'a> Interpreter<'a> {
             .or_else(|| foreign_helper_lookup(name))
             .or_else(|| intrinsic_lookup(name))
             .or_else(|| fmt_trait_method(name))
+            .or_else(|| net_trait_method(name))
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
         // The closure-taking consumers evaluate their callable
         // operand themselves: the generic evaluation below moves
@@ -2384,6 +2385,11 @@ impl<'a> Interpreter<'a> {
             Builtin::IoSetOsFunctions => {
                 arity(1)?;
                 Ok(Value::Unit)
+            }
+            Builtin::ToSocketAddrs => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                self.exec_to_socket_addrs(frames, self_ty, &vals[0])
             }
             Builtin::IoDecodeErrorKind => {
                 arity(1)?;

@@ -147,6 +147,33 @@ pub fn fmt_trait_method(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// The `std::net::ToSocketAddrs` trait method, named by its
+/// plain trait path: name resolution is std-internal (the
+/// impls for the address and string types ship in the
+/// distributed std without MIR bodies), so a call whose
+/// `Self` instance has no converted body can only be served
+/// by the net model, which resolves the receiver into the
+/// modelled `vec::IntoIter<SocketAddr>` the guest iterates.
+///
+/// Deliberately absent from [`lookup`], for the same reason
+/// as [`fmt_trait_method`]: the registry gates driver
+/// collection, and a collected impl body (a guest type's own
+/// `ToSocketAddrs` impl) is the faithful execution and must
+/// win. This lookup is consulted only where the callee is
+/// already known to have no converted body — conversion's
+/// external-callee path (which carries the call's generic
+/// arguments, the `Self` type first) and the `CallBuiltin`
+/// dispatch in `exec_builtin`, which carries the same tags.
+/// It is not part of the interpreter's run-time name
+/// fallback: that path holds no type tags, and the model
+/// keys nothing on a bare name alone.
+pub fn net_trait_method(canonical: &str) -> Option<Builtin> {
+    match canonical {
+        "std::net::ToSocketAddrs::to_socket_addrs" => Some(Builtin::ToSocketAddrs),
+        _ => None,
+    }
+}
+
 /// Models for body-less foreign callees whose semantics are
 /// fixed outside the guest program: the C helpers of
 /// `rust_test_helpers` (the static library the rustc UI tests

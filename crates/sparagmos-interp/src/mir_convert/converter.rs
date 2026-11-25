@@ -592,6 +592,11 @@ impl<'a> Converter<'a> {
             .iter()
             .map(|decl| self.local_elem_size(&decl.ty))
             .collect();
+        out.char_locals = body
+            .local_decls
+            .iter()
+            .map(|decl| matches!(decl.ty, mir::Ty::Char))
+            .collect();
         out.field_elem_sizes = body
             .local_decls
             .iter()

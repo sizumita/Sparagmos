@@ -110,7 +110,7 @@ pub use self::iterators::{
 };
 pub use self::lookup::{
     consumes_caller_location, fmt_trait_method, foreign_helper_lookup, intrinsic_lookup, lookup,
-    lookup_qualified,
+    lookup_qualified, net_trait_method,
 };
 pub use self::names::{canonical_name, ty_tag};
 pub use self::registry::{
@@ -206,6 +206,146 @@ mod tests {
         // and stays unmodelled.
         assert_eq!(
             default_value_for_tag("tracing_subscriber::filter::targets::Targets"),
+            None
+        );
+    }
+
+    /// The net model's name lookup answers only the one
+    /// `ToSocketAddrs` method name; near-misses (another
+    /// trait's method, the trait path without the method)
+    /// stay unmodelled so a collected body is never shadowed.
+    #[test]
+    fn net_trait_method_matches_only_to_socket_addrs() {
+        assert_eq!(
+            net_trait_method("std::net::ToSocketAddrs::to_socket_addrs"),
+            Some(Builtin::ToSocketAddrs)
+        );
+        assert_eq!(net_trait_method("std::net::ToSocketAddrs"), None);
+        assert_eq!(
+            net_trait_method("std::net::TcpListener::bind"),
+            None
+        );
+    }
+
+    /// Literal socket addresses resolve without any name
+    /// lookup, in the canonical `SocketAddr` shape.
+    #[test]
+    fn socket_addr_str_parses_literals() {
+        assert_eq!(
+            parse_socket_addr_str("127.0.0.1:0"),
+            Ok(vec![socket_addr_v4_value([127, 0, 0, 1], 0)])
+        );
+        assert_eq!(
+            parse_socket_addr_str("192.0.2.7:65535"),
+            Ok(vec![socket_addr_v4_value([192, 0, 2, 7], 65535)])
+        );
+        assert_eq!(
+            parse_socket_addr_str("[::1]:80"),
+            Ok(vec![socket_addr_v6_value(
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                80,
+                0,
+                0
+            )])
+        );
+    }
+
+    /// `localhost` is the one name the model resolves (the
+    /// loopback entry every host table carries); literal
+    /// hosts with ports resolve; every other name is the
+    /// resolver failure, never an invented address.
+    #[test]
+    fn socket_addr_str_resolves_localhost_only() {
+        assert_eq!(
+            parse_socket_addr_str("localhost:80"),
+            Ok(vec![socket_addr_v4_value([127, 0, 0, 1], 80)])
+        );
+        assert_eq!(
+            parse_socket_addr_str("10.0.0.9:22"),
+            Ok(vec![socket_addr_v4_value([10, 0, 0, 9], 22)])
+        );
+        assert_eq!(parse_socket_addr_str("example.invalid:80"), Err(()));
+        assert_eq!(parse_socket_addr_str("localhost"), Err(()));
+        assert_eq!(parse_socket_addr_str("localhost:http"), Err(()));
+        assert_eq!(parse_socket_addr_str("127.0.0.1:99999"), Err(()));
+        assert_eq!(parse_socket_addr_str(""), Err(()));
+    }
+
+    /// A bare `SocketAddrV4` value normalizes into the
+    /// wrapped `SocketAddr` form; a `SocketAddr` passes
+    /// through unchanged; a non-address value is refused.
+    #[test]
+    fn socket_addr_value_normalizes() {
+        let v4 = Value::Enum {
+            variant: 0,
+            fields: vec![ipv4_value([127, 0, 0, 1]), Value::Uint(443)],
+        };
+        assert_eq!(
+            socket_addr_value(&v4),
+            Some(socket_addr_v4_value([127, 0, 0, 1], 443))
+        );
+        let wrapped = socket_addr_v4_value([127, 0, 0, 1], 443);
+        assert_eq!(socket_addr_value(&wrapped), Some(wrapped));
+        assert_eq!(socket_addr_value(&Value::Uint(443)), None);
+        assert_eq!(socket_addr_value(&Value::Str("127.0.0.1:443".into())), None);
+    }
+
+    /// The `(address, port)` pair forms: an `IpAddr` value
+    /// and a bare `Ipv6Addr` value both combine with the
+    /// port.
+    #[test]
+    fn ip_addr_with_port_combines() {
+        let ip = Value::Enum {
+            variant: 0,
+            fields: vec![ipv4_value([127, 0, 0, 1])],
+        };
+        assert_eq!(
+            ip_addr_with_port(&ip, 8080),
+            Some(socket_addr_v4_value([127, 0, 0, 1], 8080))
+        );
+        let mut octets = [0u8; 16];
+        octets[15] = 1;
+        assert_eq!(
+            ip_addr_with_port(&ipv6_value(octets), 8080),
+            Some(socket_addr_v6_value(octets, 8080, 0, 0))
+        );
+        assert_eq!(ip_addr_with_port(&Value::Bool(true), 8080), None);
+    }
+
+    /// Static key resolution: an exact spelling wins; a
+    /// reference spelled through an `extern crate .. as ..`
+    /// alias resolves to the definition's key; a shared name
+    /// resolves through its `#DefId` form; ambiguity and
+    /// absence resolve nothing.
+    #[test]
+    fn resolve_static_key_handles_alias_spellings() {
+        let keys: Vec<String> = vec![
+            "cross_crate_def::EII1_IMPL".to_string(),
+            "other::DECL".to_string(),
+            "dup::ITEM#DefId(0:1)".to_string(),
+            "dup::ITEM#DefId(0:2)".to_string(),
+        ];
+        let mut iter = || keys.iter();
+        assert_eq!(
+            resolve_static_key(iter(), "cross_crate_def::EII1_IMPL"),
+            Some("cross_crate_def::EII1_IMPL")
+        );
+        assert_eq!(
+            resolve_static_key(iter(), "cross_crate_def::codegen::EII1_IMPL"),
+            Some("cross_crate_def::EII1_IMPL")
+        );
+        assert_eq!(
+            resolve_static_key(iter(), "dup::ITEM"),
+            None,
+            "two disambiguated registrations are ambiguous"
+        );
+        assert_eq!(
+            resolve_static_key(iter(), "dup::ITEM#DefId(0:2)"),
+            Some("dup::ITEM#DefId(0:2)")
+        );
+        assert_eq!(resolve_static_key(iter(), "missing::ITEM"), None);
+        assert_eq!(
+            resolve_static_key(iter(), "cross_crate_def::codegen::DECL"),
             None
         );
     }
