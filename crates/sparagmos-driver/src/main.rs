@@ -5547,12 +5547,17 @@ fn collect() -> ControlFlow<()> {
     // Monomorphization failures rustc reports around MIR
     // conversion: the recursion limit the demand passes hit while
     // collecting instances (a mono-collection error, so it takes
-    // precedence), the required-constant evaluation the mono
-    // collector performs over the instances it collects
-    // (also a collection-time error, so it comes next), and the
+    // precedence), the collector verdicts `mono_check` replays
+    // over the instances it collects (the required-constant
+    // evaluation, the per-instance `check_mono_item` checks, the
+    // duplicate-symbol verdict and the panic-runtime validation;
+    // also collection-time errors, so they come next), and the
     // checks of `sparagmos_driver::mono_check` over the converted
     // bodies (invalid SIMD intrinsic instantiations and SIMD
-    // layouts, types too big for the target architecture). A
+    // layouts, types too big for the target architecture), and
+    // finally the deferred `check_mono_item` verdict the
+    // collector walk recorded, whose rejections the body checks
+    // sometimes name more precisely. A
     // failure here fails the whole compilation, the way the
     // corresponding rustc error does. The body scan covers the
     // Stable MIR bodies conversion walked (local seeds, demanded
@@ -5568,7 +5573,8 @@ fn collect() -> ControlFlow<()> {
             }
             sparagmos_driver::mono_check::check_required_consts()
         })
-        .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources));
+        .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources))
+        .or_else(|| sparagmos_driver::mono_check::take_mono_item_finding());
 
     let entry_def_id = entry_point_def_id(&mut conv, &items);
 
