@@ -271,7 +271,7 @@ fn run_mode_iterator_for_each_mutates_captures() {
 
 const ITER_COLLECT_UNSUPPORTED_SRC: &str = r#"
 fn main() {
-    let set: std::collections::HashSet<i32> = (0..3).collect();
+    let set: std::collections::BTreeSet<i32> = (0..3).collect();
     println!("n={}", set.len());
 }
 "#;
@@ -281,6 +281,9 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
     // Targets without a value-model shape fail with the target
     // named, not with an approximation or a conversion error
     // from deep inside the collected FromIterator chain.
+    // (`HashSet` / `HashMap` used to be this test's example;
+    // since #350 their collected bodies execute instead, so
+    // the still-unmodelled `BTreeSet` stands in.)
     let dir = temp_dir("iter_collect_unsupported");
     let src = fixture(&dir, "iter_collect_unsupported.rs", ITER_COLLECT_UNSUPPORTED_SRC);
     let out = run_driver(&src);
@@ -291,7 +294,7 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
         "unmodelled collect target must exit 2; stderr={stderr}"
     );
     assert!(
-        stderr.contains("collect into std::collections::HashSet")
+        stderr.contains("collect into std::collections::BTreeSet")
             && stderr.contains("is not runtime-supported"),
         "the target is named in the reason; stderr={stderr}"
     );
@@ -1504,4 +1507,172 @@ fn run_mode_btree_map_zst_iter_count() {
     // the sized case, and the elided ZST slots fill out to the
     // declared length.
     run_ok("btree-zst-iter", BTREE_ZST_ITER_SRC, "len=1 count=1\nget=true\n");
+}
+
+// ----- HashSet / HashMap collect (FromIterator) execution (#350) -----
+//
+// `Iterator::collect` / `FromIterator::from_iter` into a hash
+// collection cannot be served by the consumer builtin (it builds
+// only the target shapes it models natively), so the collected
+// instance bodies -- `with_hasher` + `extend` over the raw-table
+// memory model -- execute instead. These tests pin that path for
+// the modelled iterator sources (array / slice / range / vec),
+// which previously failed with "collect into std::collections::
+// HashSet<...> is not runtime-supported".
+
+const HASHSET_COLLECT_ARRAY_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let s: HashSet<i32> = [1, 2, 2, 3].into_iter().collect();
+    println!("len={} has2={} sum={}", s.len(), s.contains(&2), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_hashset_collect_from_array() {
+    let dir = temp_dir("hashset-collect-array");
+    let src = fixture(&dir, "hashset_collect_array.rs", HASHSET_COLLECT_ARRAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3 has2=true sum=6\n");
+}
+
+const HASHSET_COLLECT_RANGE_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let s: HashSet<u64> = (0..100).collect();
+    println!("len={} has99={} sum={}", s.len(), s.contains(&99), s.iter().sum::<u64>());
+}
+"#;
+
+#[test]
+fn run_mode_hashset_collect_from_range_grows_table() {
+    let dir = temp_dir("hashset-collect-range");
+    let src = fixture(&dir, "hashset_collect_range.rs", HASHSET_COLLECT_RANGE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=100 has99=true sum=4950\n"
+    );
+}
+
+const HASHSET_COLLECT_VEC_STRING_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let v = vec!["x".to_string(), "y".to_string(), "x".to_string()];
+    let s: HashSet<String> = v.into_iter().collect();
+    println!("len={} hasy={}", s.len(), s.contains("y"));
+}
+"#;
+
+#[test]
+fn run_mode_hashset_collect_from_vec_strings() {
+    let dir = temp_dir("hashset-collect-vec-string");
+    let src = fixture(&dir, "hashset_collect_vec_string.rs", HASHSET_COLLECT_VEC_STRING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=2 hasy=true\n");
+}
+
+const HASHSET_COLLECT_COPIED_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let a = [1, 2, 3, 3];
+    let s: HashSet<i32> = a.iter().copied().collect();
+    println!("len={} sum={}", s.len(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_hashset_collect_copied() {
+    let dir = temp_dir("hashset-collect-copied");
+    let src = fixture(&dir, "hashset_collect_copied.rs", HASHSET_COLLECT_COPIED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3 sum=6\n");
+}
+
+const HASHSET_FROM_ITER_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let s: HashSet<i32> = HashSet::from_iter([7, 8, 8]);
+    println!("len={} has7={}", s.len(), s.contains(&7));
+}
+"#;
+
+#[test]
+fn run_mode_hashset_from_iter_direct() {
+    let dir = temp_dir("hashset-from-iter");
+    let src = fixture(&dir, "hashset_from_iter.rs", HASHSET_FROM_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=2 has7=true\n");
+}
+
+const HASHMAP_COLLECT_ARRAY_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let m: HashMap<&str, i32> = [("a", 1), ("b", 2), ("a", 3)].into_iter().collect();
+    println!("len={} a={:?} b={:?}", m.len(), m.get("a"), m.get("b"));
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_collect_from_array() {
+    let dir = temp_dir("hashmap-collect-array");
+    let src = fixture(&dir, "hashmap_collect_array.rs", HASHMAP_COLLECT_ARRAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=2 a=Some(3) b=Some(2)\n"
+    );
+}
+
+const HASHMAP_COLLECT_VEC_PAIRS_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut v = Vec::new();
+    for i in 0..100u64 {
+        v.push((i, i * 2));
+    }
+    let m: HashMap<u64, u64> = v.into_iter().collect();
+    println!("len={} m77={:?}", m.len(), m.get(&77));
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_collect_from_vec_pairs_grows_table() {
+    let dir = temp_dir("hashmap-collect-vec-pairs");
+    let src = fixture(&dir, "hashmap_collect_vec_pairs.rs", HASHMAP_COLLECT_VEC_PAIRS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=100 m77=Some(154)\n");
+}
+
+const HASHSET_RECOLLECT_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let s: HashSet<i32> = [4, 5, 6].into_iter().collect();
+    let t: HashSet<i32> = s.into_iter().collect();
+    println!("len={} sum={}", t.len(), t.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_hashset_recollect_from_own_into_iter() {
+    let dir = temp_dir("hashset-recollect");
+    let src = fixture(&dir, "hashset_recollect.rs", HASHSET_RECOLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3 sum=15\n");
 }

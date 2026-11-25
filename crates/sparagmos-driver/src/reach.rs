@@ -1420,6 +1420,33 @@ fn consumer_instance_needs_body(
     let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
         return false;
     };
+    // Hash-collection targets of `collect` / `from_iter`: the
+    // consumer builtins drain the iterator themselves and can
+    // only build the target shapes they model natively -- a
+    // hash table is not one of them -- while the instance
+    // bodies (`with_hasher` + `extend` over the raw-table
+    // memory model) are plain collected code that executes
+    // faithfully for any iterator, modelled or not. The body
+    // is therefore demanded whenever the target is a hash
+    // collection, ahead of the modelled-iterator rule below.
+    // The target is the call's second generic argument for
+    // `collect` (whose first is the iterator) and its first
+    // for `from_iter` (whose first is the collection itself).
+    if matches!(
+        canonical,
+        "std::iter::Iterator::collect" | "std::iter::FromIterator::from_iter"
+    ) {
+        let target_arg = if canonical == "std::iter::Iterator::collect" {
+            1
+        } else {
+            0
+        };
+        if let Some(GenericArgKind::Type(target)) = args.0.get(target_arg) {
+            if hash_collection_ty(target) {
+                return true;
+            }
+        }
+    }
     if iterator_self_modelled(ty) {
         return false;
     }
