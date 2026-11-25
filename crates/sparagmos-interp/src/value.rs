@@ -346,6 +346,24 @@ pub enum Value {
         bytes: Vec<Option<u8>>,
         relocs: Vec<(u32, Value)>,
     },
+    /// A union value held as its storage bytes: the form a
+    /// union takes once a write through one field must compose
+    /// with bytes an earlier write through another field left
+    /// behind (see `Interpreter::union_field_read` and the
+    /// cross-field union write path in `interp`). Each entry
+    /// is the byte the last write covering that offset stored,
+    /// or `None` where no write has covered it (an
+    /// uninitialised byte). A field read reinterprets the
+    /// bytes through the field's scalar shape; a field write
+    /// splices the written field's byte image over the prefix
+    /// it covers. The vector's length is the widest span any
+    /// conversion or write has accounted for so far; storage
+    /// past it is uninitialised by definition. Unlike
+    /// [`Value::ErasedBlock`] no relocations are recorded:
+    /// pointer payloads round-trip through synthetic addresses
+    /// exactly as they do for the aggregate union form (the
+    /// scalar flattening path records the exposure).
+    UnionBytes { bytes: Vec<Option<u8>> },
     /// A reference or raw pointer.
     Ref(RefTarget),
     /// A fat pointer (slice reference): base + element count.
@@ -494,6 +512,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
             Value::ErasedBlock { .. } => "erased constant block",
+            Value::UnionBytes { .. } => "union byte storage",
             Value::Ref(_) => "reference",
             Value::FatRef { .. } => "slice reference",
             Value::DynRef { .. } => "dyn reference",
@@ -723,6 +742,9 @@ impl fmt::Display for Value {
             Value::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
             Value::ErasedBlock { bytes, .. } => {
                 write!(f, "<erased block ({} bytes)>", bytes.len())
+            }
+            Value::UnionBytes { bytes } => {
+                write!(f, "<union bytes ({} bytes)>", bytes.len())
             }
             Value::Ref(target) => write!(f, "&({target})"),
             Value::FatRef { len, .. } => write!(f, "&[_; {len}]"),

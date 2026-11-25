@@ -31442,6 +31442,18 @@ fn union_u64_bits(value: &Value) -> Option<u64> {
                 _ => None,
             }
         }
+        Value::UnionBytes { bytes } => {
+            if bytes.iter().all(|b| b.is_none()) {
+                return None;
+            }
+            let mut bits: u64 = 0;
+            for (i, b) in bytes.iter().enumerate().take(8) {
+                if let Some(b) = b {
+                    bits |= u64::from(*b) << (8 * i);
+                }
+            }
+            Some(bits)
+        }
         Value::Tuple(items) if items.len() == 1 => union_u64_bits(&items[0]),
         _ => None,
     }
@@ -31480,6 +31492,16 @@ fn union_with_u64_bits(template: &Value, bits: u64) -> Value {
                 }
                 None => Value::Uint(bits as u128),
             }
+        }
+        Value::UnionBytes { bytes } => {
+            let mut out = bytes.clone();
+            if out.len() < 8 {
+                out.resize(8, None);
+            }
+            for (i, b) in bits.to_le_bytes().iter().enumerate() {
+                out[i] = Some(*b);
+            }
+            Value::UnionBytes { bytes: out }
         }
         Value::Tuple(items) if items.len() == 1 => {
             Value::Tuple(vec![union_with_u64_bits(&items[0], bits)])
