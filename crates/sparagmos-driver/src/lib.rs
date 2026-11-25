@@ -26,6 +26,12 @@
 //! `rustc_public::rustc_internal` span conversions), because that
 //! collapsed attribution is what the compiler's own debuginfo
 //! records and the public span API cannot express it; and
+//! `rustc_crate_store`, `rustc_session`, `rustc_structures` and
+//! `rustc_target` name the
+//! crate-graph types (dependency kinds, crate types, panic
+//! strategies) the monomorphization verdicts in `mono_check` read
+//! from the compiler's own queries, mirroring the dependency-format
+//! validation code generation performs; and
 //! `rustc_attr_ir::lang_items::LangItem` names the `drop_glue` lang
 //! item so drop-glue certification can check the item exists before
 //! asking the compiler to resolve `drop_in_place` (a minicore
@@ -39,13 +45,17 @@
 #![feature(rustc_private)]
 
 extern crate rustc_attr_ir;
+extern crate rustc_crate_store;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_public_bridge;
 extern crate rustc_public;
+extern crate rustc_session;
+extern crate rustc_structures;
 extern crate rustc_span;
+extern crate rustc_target;
 
 pub mod convert;
 pub mod dump;

@@ -77,6 +77,39 @@
 //!   the compiler's internal bodies, which keep both the required
 //!   constants and the mentioned items from before optimization.
 //!
+//! - The collector's own per-instance monomorphization checks
+//!   (the `check_mono_item` query: `mono_checks::abi_check`'s
+//!   target-feature and ABI rules, and `mono_checks::move_check`'s
+//!   `large_assignments` lint): the collector forces that query
+//!   for every instance it collects, before scanning the
+//!   instance's items, and the diagnostics it emits are the
+//!   compilation's own. The walk below forces the same query for
+//!   every instance it processes, and a rise in the session's
+//!   diagnostic error count while forcing it is the rejection
+//!   rustc reports for that instance.
+//!
+//! - Duplicate link symbols over the collected mono items
+//!   (rustc_monomorphize's partitioning asserts all mono-item
+//!   symbols are distinct, fatally), and the entry symbol
+//!   defined both by a mono item and by the entry wrapper code
+//!   generation synthesizes (`rustc_codegen_ssa`'s
+//!   multiple-main check): the symbol of every instance the
+//!   walk collected, of every local static and of every local
+//!   `global_asm!` item is the compiler's own `symbol_name`, so
+//!   a name two distinct items share is the same failure.
+//!
+//! - The panic-runtime validation of the crate graph
+//!   (`rustc_metadata::dependency_format::verify_ok`): code
+//!   generation forces the `dependency_formats` query, whose
+//!   computation validates that at most one panic runtime is
+//!   linked and that its strategy — and every linked crate's
+//!   required strategy — is compatible with the session's.
+//!   The driver's session emits only metadata, so the query's
+//!   lists come back empty and the validation never runs; the
+//!   check below mirrors `verify_ok` over the linkage list the
+//!   computation's static path produces (see
+//!   `panic_runtime_finding`).
+//!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
 //! positively present, mirroring the corresponding rustc error.
@@ -1156,6 +1189,14 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// in practice — the same emission that fails the compilation
 /// under rustc; the returned string is the driver's own record of
 /// the finding.)
+///
+/// The same walk also carries the collector's remaining
+/// verdicts, each described at its site: the per-instance
+/// `check_mono_item` force in `RequiredConstWalk::process`, the
+/// duplicate-symbol verdict over the collected items
+/// (`duplicate_symbol_finding`), and the panic-runtime
+/// validation of the crate graph (`panic_runtime_finding`),
+/// which needs no walk.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1176,10 +1217,279 @@ pub fn check_required_consts() -> Option<String> {
         visited_allocs: std::collections::HashSet::new(),
         queue: std::collections::VecDeque::new(),
         finding: None,
+        mono_finding: None,
     };
     walk.collect_roots();
     walk.run();
+    *MONO_ITEM_FINDING.lock().unwrap() = walk.mono_finding.take();
     walk.finding
+        .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
+        .or_else(|| panic_runtime_finding(tcx))
+}
+
+/// The `check_mono_item` finding of the most recent
+/// `check_required_consts` walk, held for the verdict chain's
+/// last step (`take_mono_item_finding`).
+static MONO_ITEM_FINDING: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// The deferred `check_mono_item` verdict: the rejection the
+/// required-constant walk's per-instance forces produced, if
+/// any. It is chained after `check_bodies` in the driver, so a
+/// body check that names the same rejection more precisely
+/// reports first. Reading clears the slot; the next
+/// `check_required_consts` call overwrites it regardless.
+pub fn take_mono_item_finding() -> Option<String> {
+    MONO_ITEM_FINDING.lock().unwrap().take()
+}
+
+/// The duplicate-symbol verdict over the mono items the
+/// required-constant walk collected, mirroring the partitioning
+/// assertion in rustc_monomorphize (`assert_symbols_are_distinct`,
+/// a fatal error) and the entry-symbol check in
+/// rustc_codegen_ssa's entry-wrapper creation.
+///
+/// The item set is the walk's: every function instance the
+/// collector would codegen locally, plus every local static and
+/// every local `global_asm!` item (both are mono-item roots of
+/// their own). Symbols are the compiler's own `symbol_name`
+/// values, so two distinct items sharing one is exactly the
+/// collision rustc reports. Asking for a symbol can panic for
+/// shapes the compiler cannot name; such an item simply takes
+/// no part in the check.
+fn duplicate_symbol_finding<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    visited: &std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
+) -> Option<String> {
+    // The item set, deduplicated by item (an item the walk
+    // reached and an exported root below are the same mono
+    // item, never two): the walk's instances, plus the local
+    // statics and `global_asm!` items, plus the local functions
+    // carrying an export attribute (`#[export_name]` /
+    // `#[no_mangle]`) — the collector roots its collection at
+    // the exported items as well as at the entry point, so an
+    // exported function is a mono item even in a library crate
+    // that nothing calls.
+    let mut items: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>> =
+        visited.clone();
+    for local_def_id in tcx.iter_local_def_id() {
+        let def_id = local_def_id.to_def_id();
+        let is_export_root = match tcx.def_kind(def_id) {
+            rustc_hir::def::DefKind::Static { .. }
+            | rustc_hir::def::DefKind::GlobalAsm => true,
+            rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn => {
+                let attrs = tcx.codegen_fn_attrs(def_id);
+                attrs.symbol_name.is_some()
+                    || attrs.flags.contains(
+                        rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE,
+                    )
+            }
+            _ => false,
+        };
+        if is_export_root {
+            items.insert(rustc_middle::ty::Instance::mono(tcx, def_id));
+        }
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut duplicate: Option<String> = None;
+    for instance in &items {
+        if !tcx.should_codegen_locally(*instance) {
+            continue;
+        }
+        let symbol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tcx.symbol_name(*instance).name.to_string()
+        }));
+        if let Ok(symbol) = symbol {
+            if duplicate.is_none() && !seen.insert(symbol.clone()) {
+                duplicate = Some(symbol);
+            }
+        }
+    }
+    if let Some(symbol) = duplicate {
+        return Some(format!(
+            "symbol `{symbol}` is already defined \
+             (rustc rejects duplicate symbols among the \
+             monomorphized items of a crate)"
+        ));
+    }
+    // The entry wrapper code generation synthesizes for an
+    // executable's entry point carries the target's entry
+    // symbol; a mono item that already defines that symbol
+    // makes the wrapper a second definition, which
+    // rustc_codegen_ssa reports fatally. A foreign declaration
+    // of the symbol counts for this check (the code generator
+    // looks the symbol up among the declared values), though
+    // declarations are not definitions and never take part in
+    // the duplicate count above.
+    if tcx.entry_fn(()).is_some()
+        && tcx
+            .crate_types()
+            .iter()
+            .any(|ty| *ty == rustc_structures::CrateType::Executable)
+    {
+        let entry_name: &str = tcx.sess.target.entry_name.as_ref();
+        let declared = tcx.iter_local_def_id().any(|local_def_id| {
+            let def_id = local_def_id.to_def_id();
+            tcx.is_foreign_item(def_id)
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tcx.symbol_name(rustc_middle::ty::Instance::mono(tcx, def_id))
+                    .name
+                    .to_string()
+            }))
+            .is_ok_and(|symbol| symbol == entry_name)
+        });
+        if seen.contains(entry_name) || declared {
+            return Some(format!(
+                "entry symbol `{entry_name}` declared multiple times \
+                 (a monomorphized item already defines the symbol \
+                 the entry wrapper synthesizes)"
+            ));
+        }
+    }
+    None
+}
+
+/// Mirror of the panic-runtime validation rustc performs when
+/// code generation computes a crate's dependency formats
+/// (`rustc_metadata::dependency_format::verify_ok`): at most one
+/// panic runtime may be linked, its strategy must be the
+/// session's, and every other linked crate's required panic
+/// strategy must be compatible with it (with the
+/// immediate-abort rule applied to the whole graph first).
+///
+/// The validation is reproduced, not forced: the driver's
+/// session emits only metadata, under which the real
+/// `dependency_formats` computation produces empty lists and
+/// validates nothing. The linkage list here is the one the
+/// computation's static path (`attempt_static`) produces —
+/// the local crate and every unconditional dependency, with
+/// the injected panic runtime activated when no panic runtime
+/// is linked yet. (The computation's dynamic path, taken when
+/// some crate has no rlib source, links the same unconditional
+/// set from dylib sources; which source a crate was loaded
+/// from is a property of this session, not of the program, so
+/// the mirror follows the dependency kinds, which are the
+/// evidence `verify_ok` itself consumes.) An rlib-only
+/// compilation computes an empty list natively and validates
+/// nothing, so it is skipped the same way.
+fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
+    use rustc_crate_store::CrateDepKind;
+    use rustc_structures::CrateType;
+    use rustc_span::def_id::{CrateNum, LOCAL_CRATE};
+    use rustc_target::spec::PanicStrategy;
+
+    if tcx.crate_types().iter().all(|ty| *ty == CrateType::Rlib) {
+        return None;
+    }
+    let crates = tcx.crates(());
+    let mut linked: Vec<CrateNum> = vec![LOCAL_CRATE];
+    for &cnum in crates {
+        if tcx.crate_dep_kind(cnum) == CrateDepKind::Unconditional {
+            linked.push(cnum);
+        }
+    }
+    // The injected panic runtime is activated when no panic
+    // runtime is linked yet (dependency_format's
+    // `activate_injected_dep`): the loader injected the crate
+    // whose name matches the session strategy's runtime, so
+    // that is the crate activation links.
+    let desired = tcx.sess.panic_strategy();
+    if !linked.iter().any(|&cnum| tcx.is_panic_runtime(cnum)) {
+        let wanted = match desired {
+            PanicStrategy::Unwind => Some("panic_unwind"),
+            PanicStrategy::Abort => Some("panic_abort"),
+            PanicStrategy::ImmediateAbort => None,
+        };
+        if let Some(wanted) = wanted {
+            if let Some(&cnum) = crates.iter().find(|&&cnum| {
+                tcx.is_panic_runtime(cnum) && tcx.crate_name(cnum).as_str() == wanted
+            }) {
+                linked.push(cnum);
+            }
+        }
+    }
+    let strategy_name = |strategy: PanicStrategy| match strategy {
+        PanicStrategy::Unwind => "unwind",
+        PanicStrategy::Abort => "abort",
+        PanicStrategy::ImmediateAbort => "immediate-abort",
+    };
+    // The immediate-abort rule applies to the whole graph
+    // before any single runtime is selected.
+    if linked
+        .iter()
+        .any(|&cnum| tcx.required_panic_strategy(cnum) == Some(PanicStrategy::ImmediateAbort))
+    {
+        for &cnum in &linked {
+            if tcx.required_panic_strategy(cnum) != Some(PanicStrategy::ImmediateAbort) {
+                return Some(format!(
+                    "the crate `{}` was compiled with a panic strategy \
+                     which is incompatible with `immediate-abort` \
+                     (rustc validates the panic strategies of the \
+                     whole crate graph at code generation)",
+                    tcx.crate_name(cnum)
+                ));
+            }
+        }
+    }
+    let mut runtime: Option<(CrateNum, PanicStrategy)> = None;
+    for &cnum in &linked {
+        if !tcx.is_panic_runtime(cnum) {
+            continue;
+        }
+        if let Some((prev, _)) = runtime {
+            return Some(format!(
+                "cannot link together two panic runtimes: {} and {} \
+                 (rustc links at most one panic runtime into an output)",
+                tcx.crate_name(prev),
+                tcx.crate_name(cnum)
+            ));
+        }
+        // A panic runtime whose strategy the metadata cannot
+        // determine is a compiler bug in rustc; here it simply
+        // takes no part in the validation.
+        runtime = tcx.required_panic_strategy(cnum).map(|s| (cnum, s));
+    }
+    let (runtime_cnum, found_strategy) = runtime?;
+    if found_strategy != desired {
+        return Some(format!(
+            "the linked panic runtime `{}` is not compiled with this \
+             crate's panic strategy `{}` (rustc validates the linked \
+             panic runtime against the session strategy at code \
+             generation)",
+            tcx.crate_name(runtime_cnum),
+            strategy_name(desired)
+        ));
+    }
+    for &cnum in &linked {
+        if cnum == runtime_cnum || tcx.is_compiler_builtins(cnum) {
+            continue;
+        }
+        if let Some(found) = tcx.required_panic_strategy(cnum) {
+            if found != desired {
+                return Some(format!(
+                    "the crate `{}` requires panic strategy `{}` which \
+                     is incompatible with this crate's strategy of `{}` \
+                     (rustc validates the panic strategies of the \
+                     whole crate graph at code generation)",
+                    tcx.crate_name(cnum),
+                    strategy_name(found),
+                    strategy_name(desired)
+                ));
+            }
+        }
+        if cnum != LOCAL_CRATE
+            && tcx.panic_in_drop_strategy(cnum) != tcx.sess.opts.unstable_opts.panic_in_drop
+        {
+            return Some(format!(
+                "the crate `{}` was compiled with a panic-in-drop \
+                 strategy which is incompatible with this crate's \
+                 (rustc validates the panic strategies of the whole \
+                 crate graph at code generation)",
+                tcx.crate_name(cnum)
+            ));
+        }
+    }
+    None
 }
 
 struct RequiredConstWalk<'tcx> {
@@ -1188,6 +1498,11 @@ struct RequiredConstWalk<'tcx> {
     visited_allocs: std::collections::HashSet<rustc_middle::mir::interpret::AllocId>,
     queue: std::collections::VecDeque<rustc_middle::ty::Instance<'tcx>>,
     finding: Option<String>,
+    /// The first `check_mono_item` rejection the walk's forces
+    /// produced, kept apart from `finding`: it is reported
+    /// after `check_bodies`, whose findings name some of the
+    /// same rejections more precisely.
+    mono_finding: Option<String>,
 }
 
 impl<'tcx> RequiredConstWalk<'tcx> {
@@ -1356,6 +1671,54 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         if !tcx.should_codegen_locally(instance) {
             return;
         }
+        // The instance's display keys, shared by the verdicts
+        // below: the instance's own key, and its definition's —
+        // a generic definition's body is materialized once,
+        // under the definition's key, and its diagnostics are
+        // properties of every instance of it.
+        use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
+        let key = with_resolve_crate_name!(with_no_trimmed_paths!(
+            tcx.def_path_str_with_args(instance.def.def_id(), instance.args)
+        ));
+        let def_key = with_resolve_crate_name!(with_no_trimmed_paths!(
+            tcx.def_path_str(instance.def.def_id())
+        ));
+        // The collector forces the compiler's per-instance
+        // monomorphization checks for every instance it
+        // collects, before scanning the instance's items
+        // (`collect_items_of_instance` in rustc_monomorphize):
+        // the `check_mono_item` query runs the ABI target-feature
+        // rules and the `large_assignments` move check, and its
+        // diagnostics are compilation errors there. Force the
+        // same query here. The diagnostics are the compiler's
+        // own, emitted into the session as the query runs, so a
+        // rise in the diagnostic error count across the force is
+        // the rejection rustc reports for this instance; a panic
+        // inside the query abandons the force, never the walk
+        // (the same discipline as the per-instance walk in
+        // `run`). The finding is recorded separately from the
+        // walk's own and reported last in the verdict chain:
+        // the body checks of `check_bodies` name some of the
+        // same rejections more precisely (the SIMD lane limit
+        // is one), and their findings take precedence.
+        if self.mono_finding.is_none() {
+            let before = tcx.dcx().err_count();
+            let forced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tcx.ensure_ok().check_mono_item(instance);
+            }));
+            if forced.is_ok() && tcx.dcx().err_count() > before {
+                self.mono_finding = Some(format!(
+                    "monomorphization checks rejected `{key}` \
+                     (see the diagnostics above)"
+                ));
+                // The diagnostics stay printed, but the error
+                // count is reset (the discounting discipline of
+                // the speculative body fetches in `convert`):
+                // the verdict is the driver's to report through
+                // the finding chain, not the session's.
+                tcx.dcx().reset_err_count();
+            }
+        }
         // A body the collector collects is one rustc itself
         // materializes in its own pipeline, so the evaluation
         // diagnostics of materializing it are compilation errors
@@ -1373,13 +1736,6 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         // under the definition's key, and its diagnostics are
         // properties of every instance of it.
         {
-            use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
-            let key = with_resolve_crate_name!(with_no_trimmed_paths!(
-                tcx.def_path_str_with_args(instance.def.def_id(), instance.args)
-            ));
-            let def_key = with_resolve_crate_name!(with_no_trimmed_paths!(
-                tcx.def_path_str(instance.def.def_id())
-            ));
             if crate::convert::materialization_emitted(&key)
                 || crate::convert::materialization_emitted(&def_key)
             {
