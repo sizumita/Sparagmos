@@ -947,6 +947,24 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// Run `f` as a detached synchronous drive: a builtin is
+    /// executing guest code synchronously and waiting on the
+    /// result host-side. While it runs, `sync_nesting` is
+    /// raised, so a blocking operation inside cannot suspend
+    /// the thread — the host-side continuation waiting for the
+    /// drive's result (a builtin's local state, a detached
+    /// frame's missing return destination) cannot be saved and
+    /// resumed the way a thread's frames can.
+    pub(crate) fn detached_drive<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> InterpResult<T>,
+    ) -> InterpResult<T> {
+        self.sync_nesting.set(self.sync_nesting.get() + 1);
+        let result = f(self);
+        self.sync_nesting.set(self.sync_nesting.get() - 1);
+        result
+    }
+
     /// Call `func` with evaluated arguments and run the nested
     /// drive region until it returns, yielding its return value.
     pub(crate) fn call_to_completion(
@@ -957,6 +975,16 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let depth = frames.len();
         self.start_detached_call(frames, func, arg_values)?;
+        self.detached_drive(|s| s.call_to_completion_region(frames, depth))
+    }
+
+    /// The drive region behind [`Self::call_to_completion`],
+    /// without the detached-drive marking.
+    fn call_to_completion_region(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        depth: usize,
+    ) -> InterpResult<Value> {
         // A detached call is a scheduled region like any other
         // (see `drive_scheduled`): the try function of a
         // `catch_unwind`, a destructor body, or another runtime
@@ -993,6 +1021,17 @@ impl<'a> Interpreter<'a> {
     /// is [`Self::call_to_completion`]: a detached frame driven by
     /// a nested [`Self::drive`] region, unwinding included.
     pub(crate) fn call_sync(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+    ) -> InterpResult<Value> {
+        self.detached_drive(|s| s.call_sync_inner(frames, func, arg_values))
+    }
+
+    /// The drive behind [`Self::call_sync`], without the
+    /// detached-drive marking.
+    pub(crate) fn call_sync_inner(
         &mut self,
         frames: &mut Vec<Frame>,
         func: &str,
@@ -1470,6 +1509,21 @@ impl<'a> Interpreter<'a> {
     /// persist across repeated calls — the `FnMut` semantics the
     /// iterator consumer builtins (`fold`, `for_each`) rely on.
     pub(crate) fn call_callable_operand_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        operand: &Operand,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        self.detached_drive(|s| {
+            s.call_callable_operand_to_completion_inner(frames, body, operand, args)
+        })
+    }
+
+    /// The drive behind
+    /// [`Self::call_callable_operand_to_completion`], without
+    /// the detached-drive marking.
+    pub(crate) fn call_callable_operand_to_completion_inner(
         &mut self,
         frames: &mut Vec<Frame>,
         body: &Body,

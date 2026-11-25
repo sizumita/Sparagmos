@@ -29,6 +29,17 @@ impl<'a> Interpreter<'a> {
         self.current_thread.get()
     }
 
+    /// Whether the currently executing thread may end its
+    /// activation as a suspension (see
+    /// [`InterpError::Suspended`]): only a spawned thread
+    /// driven by `run_thread` from its own frames — not the
+    /// entry thread, and not code running inside a detached
+    /// synchronous drive (`sync_nesting > 0`), whose host-side
+    /// continuation a suspension would lose.
+    pub(crate) fn suspend_permitted(&self) -> bool {
+        self.current_thread.get() != 1 && self.sync_nesting.get() == 0
+    }
+
     /// Register a spawned thread: the callable is captured, not
     /// run. Returns the new thread's id.
     pub(crate) fn spawn_thread(&self, callable: Value) -> u64 {
@@ -69,23 +80,6 @@ impl<'a> Interpreter<'a> {
             .borrow()
             .get(&id)
             .and_then(|slot| slot.name.clone())
-    }
-
-    /// Whether the thread has been spawned and has no recorded
-    /// outcome yet: it has not started, or it is parked mid-run.
-    pub(crate) fn thread_unfinished(&self, id: u64) -> bool {
-        self.threads
-            .borrow()
-            .get(&id)
-            .is_some_and(|slot| slot.outcome.is_none())
-    }
-
-    /// Whether the thread has been spawned but not yet run.
-    pub(crate) fn thread_pending(&self, id: u64) -> bool {
-        self.threads
-            .borrow()
-            .get(&id)
-            .is_some_and(|slot| slot.callable.is_some())
     }
 
     /// The recorded outcome of a thread that has run.
@@ -160,15 +154,19 @@ impl<'a> Interpreter<'a> {
 
     /// Run one thread for at most one quantum: start it if it
     /// has never run, resume it if it is parked, and drive until
-    /// it finishes or its quantum expires. A finished thread's
-    /// outcome is recorded (a guest panic in the thread is its
-    /// outcome — the `Err` a joiner observes — not a failure of
-    /// the run; any other error, an unsupported feature inside
-    /// the thread, aborts the run, as it would on the entry
-    /// thread). A thread whose quantum expires is parked: its
-    /// frames move into its slot together with the ids of the
-    /// frames below that they reference, and a later call resumes
-    /// it on a stack that still holds those frames.
+    /// it finishes, its quantum expires, or it blocks on a
+    /// channel operation no other thread can currently satisfy.
+    /// A finished thread's outcome is recorded (a guest panic
+    /// in the thread is its outcome — the `Err` a joiner
+    /// observes — not a failure of the run; any other error, an
+    /// unsupported feature inside the thread, aborts the run, as
+    /// it would on the entry thread). A thread whose quantum
+    /// expires, or that blocks, is parked: its frames move into
+    /// its slot together with the ids of the frames below that
+    /// they reference, and a later call resumes it on a stack
+    /// that still holds those frames — the call it blocked in
+    /// re-executes and re-checks its condition, so no
+    /// continuation is ever fabricated.
     pub(crate) fn run_thread(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -214,9 +212,16 @@ impl<'a> Interpreter<'a> {
             thread: id,
             steps0: self.steps,
         });
+        // The thread's own execution starts with a clean
+        // synchronous-drive nesting count (see `sync_nesting`):
+        // its root drive is not a detached drive, so its own
+        // blocking calls may suspend it. The caller's count is
+        // restored when the activation ends, however it ends.
+        let previous_nesting = self.sync_nesting.get();
+        self.sync_nesting.set(0);
         let result = match start {
             Start::Fresh(callable) => {
-                self.call_callable_to_completion(frames, &callable, Vec::new())
+                self.call_callable_impl(frames, &callable, Vec::new())
             }
             Start::Resume(parked_frames) => {
                 frames.extend(parked_frames);
@@ -224,6 +229,7 @@ impl<'a> Interpreter<'a> {
             }
         };
         self.segment = previous_segment;
+        self.sync_nesting.set(previous_nesting);
         if matches!(result, Err(InterpError::Yield)) {
             // The quantum expired mid-flight: park the segment's
             // frames (the drive left them above `base`) and the
@@ -241,6 +247,25 @@ impl<'a> Interpreter<'a> {
                 });
             }
             return Ok(ThreadRun::Yielded);
+        }
+        if matches!(result, Err(InterpError::Suspended)) {
+            // The thread blocked on a channel operation no
+            // other thread could satisfy: park its frames the
+            // same way (the drive left them above `base`). A
+            // later activation restores them verbatim and the
+            // blocked call re-executes. The thread has no
+            // outcome yet, and its TLS destructors have not run:
+            // they belong to its completion, below.
+            let parked_frames = frames.split_off(base);
+            let below = Self::referenced_below_frames(&parked_frames, frames);
+            self.current_thread.set(previous);
+            if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
+                slot.parked = Some(ParkedThread {
+                    frames: parked_frames,
+                    below,
+                });
+            }
+            return Ok(ThreadRun::Blocked);
         }
         // The thread's code has finished: run the thread-local
         // destructors it registered, as the platform does at
@@ -329,7 +354,9 @@ impl<'a> Interpreter<'a> {
             };
             visited.insert(id);
             match self.run_thread(frames, id)? {
-                ThreadRun::Finished | ThreadRun::Yielded => ran = true,
+                ThreadRun::Finished | ThreadRun::Yielded | ThreadRun::Blocked => {
+                    ran = true
+                }
                 ThreadRun::NotRunnable => {}
             }
         }
@@ -360,6 +387,65 @@ impl<'a> Interpreter<'a> {
                 return Ok(());
             }
         }
+    }
+
+    /// One cooperative scheduling round: every runnable thread
+    /// (pending or parked, in spawn order; a thread currently
+    /// in flight — an ancestor of the running one — is neither,
+    /// so it is never re-entered) gets one activation. Returns
+    /// `(ran_any, progressed)`. A round progresses when a
+    /// thread finishes, when a thread's quantum expires while
+    /// it is still runnable, or when any channel's observable
+    /// state changes (the epoch moves): each is a sign that a
+    /// blocked waiter may be able to proceed after another
+    /// round. A round in which every activated thread simply
+    /// blocks again makes no progress — the waiters it could
+    /// not satisfy are in a genuine wait cycle. The round runs
+    /// with a drain on the stack (see `drain_depth`): the
+    /// caller of the round is itself waiting, so a driven
+    /// segment may yield back to it exactly as in a drain.
+    pub(crate) fn schedule_round(
+        &mut self,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<(bool, bool)> {
+        self.drain_depth += 1;
+        let result = self.schedule_round_inner(frames);
+        self.drain_depth -= 1;
+        result
+    }
+
+    /// One scheduling round (see [`Self::schedule_round`]).
+    fn schedule_round_inner(
+        &mut self,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<(bool, bool)> {
+        let epoch_before = self.channel_epoch.get();
+        let mut ids: Vec<u64> = self
+            .threads
+            .borrow()
+            .iter()
+            .filter(|(_, slot)| slot.callable.is_some() || slot.parked.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        let mut ran_any = false;
+        let mut progressed = false;
+        for id in ids {
+            match self.run_thread(frames, id)? {
+                ThreadRun::Finished | ThreadRun::Yielded => {
+                    ran_any = true;
+                    progressed = true;
+                }
+                ThreadRun::Blocked => {
+                    ran_any = true;
+                }
+                ThreadRun::NotRunnable => {}
+            }
+        }
+        if self.channel_epoch.get() != epoch_before {
+            progressed = true;
+        }
+        Ok((ran_any, progressed))
     }
 
     /// Record a thread-local destructor registration for the
@@ -408,25 +494,45 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    /// Join a thread: run it until it finishes, then return its
-    /// recorded outcome. The joiner blocks natively, so the
-    /// joined thread is resumed quantum after quantum; between
-    /// quanta every other runnable thread gets a scheduling pass,
-    /// as an OS scheduler would run them while the joiner waits —
-    /// a joined thread that busy-waits on a third thread's work
-    /// therefore still observes it. Each resumption spends at
-    /// least one quantum of the global step budget, so the loop
-    /// is bounded by it.
+    /// Join a thread: activate it (and, while it stays blocked,
+    /// the threads it may be waiting for) until its outcome is
+    /// recorded, then return the outcome. The joiner blocks
+    /// natively, so the joined thread is resumed quantum after
+    /// quantum; between quanta every other runnable thread gets
+    /// a scheduling pass, as an OS scheduler would run them
+    /// while the joiner waits — a joined thread that busy-waits
+    /// on a third thread's work therefore still observes it.
+    /// Each resumption spends at least one quantum of the
+    /// global step budget, so the loop is bounded by it.
+    /// Returns `None` when the joined thread is blocked and no
+    /// scheduling round can make progress toward unblocking
+    /// it: the join itself cannot complete, and the caller
+    /// decides what that means for the joining thread (see the
+    /// join builtin).
     pub(crate) fn join_thread(
         &mut self,
         frames: &mut Vec<Frame>,
         id: u64,
-    ) -> InterpResult<Result<Value, PanicPayload>> {
-        while self.thread_unfinished(id) {
+    ) -> InterpResult<Option<Result<Value, PanicPayload>>> {
+        loop {
+            if let Some(outcome) = self.thread_outcome(id) {
+                return Ok(Some(outcome));
+            }
+            if !self.threads.borrow().contains_key(&id) {
+                return Err(InterpError::UnsupportedTerminator {
+                    kind: format!("join of unknown thread {id}"),
+                });
+            }
             match self.run_thread(frames, id)? {
-                ThreadRun::Finished => break,
+                ThreadRun::Finished => {}
                 ThreadRun::Yielded => {
                     self.drain_threads(frames)?;
+                }
+                ThreadRun::Blocked => {
+                    let (_, progressed) = self.schedule_round(frames)?;
+                    if !progressed {
+                        return Ok(None);
+                    }
                 }
                 ThreadRun::NotRunnable => {
                     return Err(InterpError::UnsupportedTerminator {
@@ -439,17 +545,29 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        self.thread_outcome(id).ok_or_else(|| InterpError::UnsupportedTerminator {
-            kind: format!("join of unknown thread {id}"),
-        })
     }
 
     /// Call a callable value (a closure or a function pointer)
     /// with `args`, driving the frame stack until the call
     /// returns, and return its return value. Used by builtins
     /// that must execute guest code synchronously (thread join,
-    /// `Once::call_once`, scoped threads).
+    /// `Once::call_once`, scoped threads): the drive is a
+    /// detached synchronous drive (see `detached_drive`).
     pub(crate) fn call_callable_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        callable: &Value,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        self.detached_drive(|s| s.call_callable_impl(frames, callable, args))
+    }
+
+    /// The drive behind [`Self::call_callable_to_completion`],
+    /// without the detached-drive marking: `run_thread` calls
+    /// this directly for a spawned thread's root drive, which
+    /// is not a detached drive (the thread's own blocking calls
+    /// may suspend it).
+    fn call_callable_impl(
         &mut self,
         frames: &mut Vec<Frame>,
         callable: &Value,

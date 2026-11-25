@@ -1437,6 +1437,34 @@ impl<'a> Interpreter<'a> {
                 Err(()) => Ok((state, none_value())),
             };
         }
+        if self_ty.starts_with("std::sync::mpsc::TryIter<") {
+            // The state is the value `Receiver::try_iter`
+            // built: the receiver handle inside a one-field
+            // aggregate (or the handle itself). `next` is
+            // `try_recv`: a queued value yields; an
+            // empty-but-live channel and a disconnected one
+            // both end the iteration.
+            let handle = match &state {
+                Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+                Value::Tuple(fields) if fields.len() == 1 => fields[0].clone(),
+                other => other.clone(),
+            };
+            let id = match channel_handle_id(&handle) {
+                Some(id) => id,
+                None => self.handle_id_of_ref(
+                    frames,
+                    &handle,
+                    "Iterator::next for mpsc::TryIter",
+                )?,
+            };
+            return match self.with_channel(id, |st| st.queue.pop_front()) {
+                Some(Some(value)) => Ok((state, some_value(value))),
+                Some(None) => Ok((state, none_value())),
+                None => Err(unsupported(
+                    "Iterator::next for mpsc::TryIter on an unknown channel".to_string(),
+                )),
+            };
+        }
         if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
             // `Args { inner: ArgsOs }` / `ArgsOs { inner:
             // sys::args::common::Args }` / the common `Args {
@@ -3122,6 +3150,7 @@ impl<'a> Interpreter<'a> {
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<")
             || self_ty.starts_with("std::sync::mpsc::IntoIter<")
+            || self_ty.starts_with("std::sync::mpsc::TryIter<")
         {
             // Not overridden in std: the trait default.
             return Ok(hint(0, None));
@@ -4120,6 +4149,7 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::sync::mpsc::Iter<")
         || self_ty.starts_with("std::sync::mpsc::IntoIter<")
+        || self_ty.starts_with("std::sync::mpsc::TryIter<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")

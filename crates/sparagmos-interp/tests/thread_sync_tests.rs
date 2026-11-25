@@ -168,6 +168,8 @@ const CLO_VALUE: mir::DefId = mir::DefId::new(0, 420);
 const CLO_PANIC: mir::DefId = mir::DefId::new(0, 421);
 const CLO_SEND: mir::DefId = mir::DefId::new(0, 422);
 const CLO_SCOPE: mir::DefId = mir::DefId::new(0, 423);
+const CLO_RENDEZVOUS: mir::DefId = mir::DefId::new(0, 424);
+const CLO_PRODUCE: mir::DefId = mir::DefId::new(0, 425);
 
 fn sender_ty() -> mir::Ty {
     mir::Ty::Adt(SENDER_TY, vec![i32_ty()])
@@ -213,6 +215,8 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (CLO_PANIC, "main::{closure#1}".to_string()),
         (CLO_SEND, "main::{closure#2}".to_string()),
         (CLO_SCOPE, "main::{closure#3}".to_string()),
+        (CLO_RENDEZVOUS, "main::{closure#4}".to_string()),
+        (CLO_PRODUCE, "main::{closure#5}".to_string()),
     ])
 }
 
@@ -385,10 +389,29 @@ fn spawned_thread_panic_becomes_the_join_error() {
 
 #[test]
 fn thread_runs_at_join_not_at_spawn() {
-    // The child sends 7 on a channel whose sender it captured.
-    // main: try_recv before join must see Empty (the child has not
-    // run); after join, recv must see 7.
+    // The child sends 7 twice on a channel whose sender it
+    // captured. `try_recv` is a scheduling point: by the time
+    // main's `try_recv` returns, the child has run, so it
+    // observes the first 7; the second 7 stays queued for the
+    // `recv` after the join.
     let clo_ty = closure_ty(CLO_SEND, vec![], vec![sender_ty()]);
+    let send_block = |next: u32| {
+        block(
+            vec![
+                assign(
+                    place(2),
+                    ref_of(place(1).field(0, sender_ty())),
+                ),
+                assign(place(3), mir::Rvalue::Use(const_i32(7))),
+            ],
+            call(
+                fndef(SEND_FN, vec![i32_ty()]),
+                vec![copy(2), move_(3)],
+                4,
+                next,
+            ),
+        )
+    };
     let clo_body = mir::Body::new(
         decls(&[
             unit_ty(),
@@ -398,24 +421,7 @@ fn thread_runs_at_join_not_at_spawn() {
             result_ty(unit_ty(), unit_ty()),
         ]),
         1,
-        vec![
-            block(
-                vec![
-                    assign(
-                        place(2),
-                        ref_of(place(1).field(0, sender_ty())),
-                    ),
-                    assign(place(3), mir::Rvalue::Use(const_i32(7))),
-                ],
-                call(
-                    fndef(SEND_FN, vec![i32_ty()]),
-                    vec![copy(2), move_(3)],
-                    4,
-                    1,
-                ),
-            ),
-            block(vec![], ret()),
-        ],
+        vec![send_block(1), send_block(2), block(vec![], ret())],
     );
     let pair_ty = mir::Ty::Tuple(vec![sender_ty(), receiver_ty()]);
     let try_result_ty = result_ty(i32_ty(), mir::Ty::Adt(TRYRECVERROR_TY, vec![]));
@@ -492,7 +498,7 @@ fn thread_runs_at_join_not_at_spawn() {
                 vec![
                     assign(
                         place(10),
-                        mir::Rvalue::Discriminant(place(7).field(0, try_result_ty)),
+                        mir::Rvalue::Discriminant(place(7)),
                     ),
                     assign(
                         place(11),
@@ -511,7 +517,7 @@ fn thread_runs_at_join_not_at_spawn() {
         ],
     );
     let value = run(main, &[(CLO_SEND, "main::{closure#2}", clo_body)]);
-    // (TryRecvError::Empty = 0, received 7)
+    // (Result::Ok = 0, received 7)
     assert_eq!(value, Value::Tuple(vec![Value::Uint(0), Value::Int(7)]));
 }
 
@@ -766,4 +772,279 @@ fn cloned_sender_keeps_the_channel_open() {
     );
     let value = run(main, &[]);
     assert_eq!(value, Value::Tuple(vec![Value::Uint(0), Value::Uint(1)]));
+}
+
+// ----- suspension: rendezvous and quantum -------------------------------------
+
+#[test]
+fn blocked_child_rendezvous_through_a_channel() {
+    // The channel-through-channel rendezvous: the child creates
+    // a second channel, sends its sender through the first
+    // channel to main, and blocks receiving on the second.
+    // Main's blocking `recv` on the first channel runs the
+    // child; the child blocks in turn (main is its only possible
+    // sender and is itself blocked in the `recv`); main's `recv`
+    // then observes the sent sender, main sends the answer, and
+    // the join resumes the child, which returns what it
+    // received. Under the run-to-completion model this program
+    // failed with "would block forever"; with suspension the
+    // child's frames survive its block and resume at the join.
+    let sender_of_sender = mir::Ty::Adt(SENDER_TY, vec![sender_ty()]);
+    let receiver_of_sender = mir::Ty::Adt(RECEIVER_TY, vec![sender_ty()]);
+    let pair1_ty = mir::Ty::Tuple(vec![sender_of_sender.clone(), receiver_of_sender.clone()]);
+    let pair2_ty = mir::Ty::Tuple(vec![sender_ty(), receiver_ty()]);
+    let clo_ty = closure_ty(CLO_RENDEZVOUS, vec![], vec![sender_of_sender.clone()]);
+    // child locals: _0 out, _1 self, _2 &tx1, _3 pair2, _4 tx2,
+    // _5 rx2, _6 send result, _7 &rx2, _8 recv result
+    let clo_body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            clo_ty.clone(),
+            ref_ty(sender_of_sender.clone()),
+            pair2_ty,
+            sender_ty(),
+            receiver_ty(),
+            result_ty(unit_ty(), unit_ty()),
+            ref_ty(receiver_ty()),
+            result_ty(i32_ty(), unit_ty()),
+        ]),
+        1,
+        vec![
+            block(
+                vec![],
+                call(fndef(CHANNEL_FN, vec![i32_ty()]), vec![], 3, 1),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(4),
+                        mir::Rvalue::Use(mir::Operand::Move(place(3).field(0, sender_ty()))),
+                    ),
+                    assign(
+                        place(5),
+                        mir::Rvalue::Use(mir::Operand::Move(place(3).field(1, receiver_ty()))),
+                    ),
+                    assign(
+                        place(2),
+                        ref_of(place(1).field(0, sender_of_sender.clone())),
+                    ),
+                ],
+                call(
+                    fndef(SEND_FN, vec![sender_ty()]),
+                    vec![copy(2), move_(4)],
+                    6,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(7), ref_rvalue(5))],
+                call(
+                    fndef(RECV_FN, vec![i32_ty()]),
+                    // A move of the reference temporary, as
+                    // real MIR has it: the suspension must put
+                    // the moved argument back for the
+                    // re-execution (see restore_moved_args).
+                    vec![move_(7)],
+                    8,
+                    3,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Move(place(8).field(0, i32_ty()))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    // main locals: _0 out, _1 pair1, _2 tx1, _3 rx1, _4 closure,
+    // _5 handle, _6 &rx1, _7 recv result, _8 tx2, _9 &tx2,
+    // _10 send result, _11 join result
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            pair1_ty,
+            sender_of_sender.clone(),
+            receiver_of_sender.clone(),
+            clo_ty.clone(),
+            handle_ty(),
+            ref_ty(receiver_of_sender.clone()),
+            result_ty(sender_ty(), unit_ty()),
+            sender_ty(),
+            ref_ty(sender_ty()),
+            result_ty(unit_ty(), unit_ty()),
+            result_ty(i32_ty(), unit_ty()),
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(CHANNEL_FN, vec![sender_ty()]), vec![], 1, 1),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(2),
+                        mir::Rvalue::Use(mir::Operand::Move(
+                            place(1).field(0, sender_of_sender.clone()),
+                        )),
+                    ),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Use(mir::Operand::Move(
+                            place(1).field(1, receiver_of_sender),
+                        )),
+                    ),
+                    assign(
+                        place(4),
+                        closure_aggregate(CLO_RENDEZVOUS, &clo_ty, vec![move_(2)]),
+                    ),
+                ],
+                call(
+                    fndef(SPAWN_FN, vec![clo_ty.clone(), i32_ty()]),
+                    vec![move_(4)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(3))],
+                call(
+                    fndef(RECV_FN, vec![sender_ty()]),
+                    vec![copy(6)],
+                    7,
+                    3,
+                ),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(8),
+                        mir::Rvalue::Use(mir::Operand::Move(place(7).field(0, sender_ty()))),
+                    ),
+                    assign(place(9), ref_of(place(8))),
+                ],
+                call(
+                    fndef(SEND_FN, vec![i32_ty()]),
+                    vec![copy(9), const_i32(7)],
+                    10,
+                    4,
+                ),
+            ),
+            block(
+                vec![],
+                call(fndef(JOIN_FN, vec![i32_ty()]), vec![move_(5)], 11, 5),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Move(place(11).field(0, i32_ty()))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = run(main, &[(CLO_RENDEZVOUS, "main::{closure#4}", clo_body)]);
+    assert_eq!(value, Value::Int(7));
+}
+
+#[test]
+fn unbounded_producer_is_cut_off_by_the_quantum() {
+    // The child produces on an unbounded channel in an endless
+    // loop: its sends never block, so no channel operation of
+    // its own ever yields. Main's `recv` must still observe a
+    // value: the child's activation ends when its step quantum
+    // expires and it is suspended with a queue full of values.
+    // Under the run-to-completion model the child never
+    // finished and the `recv` died at the step limit.
+    let clo_ty = closure_ty(CLO_PRODUCE, vec![], vec![sender_ty()]);
+    // child locals: _0 out, _1 self, _2 &tx, _3 value, _4 result
+    let clo_body = mir::Body::new(
+        decls(&[
+            unit_ty(),
+            clo_ty.clone(),
+            ref_ty(sender_ty()),
+            i32_ty(),
+            result_ty(unit_ty(), unit_ty()),
+        ]),
+        1,
+        vec![block(
+            vec![
+                assign(
+                    place(2),
+                    ref_of(place(1).field(0, sender_ty())),
+                ),
+                assign(place(3), mir::Rvalue::Use(const_i32(1))),
+            ],
+            call(
+                fndef(SEND_FN, vec![i32_ty()]),
+                vec![copy(2), move_(3)],
+                4,
+                0,
+            ),
+        )],
+    );
+    let pair_ty = mir::Ty::Tuple(vec![sender_ty(), receiver_ty()]);
+    // main locals: _0 out, _1 pair, _2 tx, _3 rx, _4 closure,
+    // _5 handle, _6 &rx, _7 recv result
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            pair_ty,
+            sender_ty(),
+            receiver_ty(),
+            clo_ty.clone(),
+            handle_ty(),
+            ref_ty(receiver_ty()),
+            result_ty(i32_ty(), unit_ty()),
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(CHANNEL_FN, vec![i32_ty()]), vec![], 1, 1),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(2),
+                        mir::Rvalue::Use(mir::Operand::Move(place(1).field(0, sender_ty()))),
+                    ),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Use(mir::Operand::Move(place(1).field(1, receiver_ty()))),
+                    ),
+                    assign(
+                        place(4),
+                        closure_aggregate(CLO_PRODUCE, &clo_ty, vec![move_(2)]),
+                    ),
+                ],
+                call(
+                    fndef(SPAWN_FN, vec![clo_ty.clone(), unit_ty()]),
+                    vec![move_(4)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(3))],
+                call(
+                    fndef(RECV_FN, vec![i32_ty()]),
+                    vec![copy(6)],
+                    7,
+                    3,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Move(place(7).field(0, i32_ty()))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = run(main, &[(CLO_PRODUCE, "main::{closure#5}", clo_body)]);
+    assert_eq!(value, Value::Int(1));
 }

@@ -67,6 +67,17 @@ pub enum InterpError {
     /// outcome; any other context observing it has found an
     /// interpreter bug, so its message says so.
     Yield,
+    /// The running thread cannot proceed until another thread
+    /// acts (it blocked on a channel operation no pending thread
+    /// can satisfy). This is not a failure: it is the cooperative
+    /// scheduler's control signal. The thread-running machinery
+    /// ([`crate::interp::Interpreter::run_thread`]) catches it,
+    /// saves the thread's frames, and resumes the thread when a
+    /// later scheduling point (a blocking call, a join) runs it
+    /// again. It never denotes a guest-visible outcome; if it
+    /// escapes a run to the driver it is reported like any other
+    /// oracle failure.
+    Suspended,
     /// The configured step budget was exhausted (probable infinite loop).
     StepLimitExceeded { limit: usize },
     /// The configured call-depth budget was exhausted.
@@ -196,6 +207,9 @@ impl fmt::Display for InterpError {
             }
             InterpError::Yield => {
                 write!(f, "scheduler yield escaped its segment (interpreter bug)")
+            }
+            InterpError::Suspended => {
+                write!(f, "thread suspended (cooperative scheduling)")
             }
             InterpError::Abort { message } => write!(f, "guest abort: {message}"),
             InterpError::StepLimitExceeded { limit } => {
