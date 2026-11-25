@@ -2347,3 +2347,97 @@ fn run_mode_handle_dyn_debug_formats_pointee() {
         "\"rcstr\"\n42\n[1, 2, 3]\n\"bx\"\nHolder { rc: \"held\", bx: [9] }\n",
     );
 }
+const FMT_FORWARD_INT_DEBUG_SRC: &str = r#"
+use std::fmt;
+
+struct SlowFmt(u32);
+impl fmt::Debug for SlowFmt {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+struct Signed(i32);
+impl fmt::Debug for Signed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+fn main() {
+    println!("{:?}{:?}", SlowFmt(7), SlowFmt(7));
+    println!("{:?}", Signed(-7));
+    println!("{:x?} {:X?}", SlowFmt(255), SlowFmt(255));
+    println!("[{:>5?}][{:05?}]", SlowFmt(42), SlowFmt(42));
+}
+"#;
+
+#[test]
+fn run_mode_fmt_forward_integer_debug() {
+    // A guest `Debug` impl forwarding to an integer field's
+    // `Debug` (`self.0.fmt(f)`, the `atomic-print` shape): the
+    // collected body of core's integer `Debug` impl is keyed
+    // under the module-qualified impl name
+    // (`core::fmt::num::<impl Debug for u32>::fmt`) and reads
+    // the `Formatter`'s flag word directly, which the value
+    // model does not reproduce — the call must be served by
+    // the structural fmt engine, like an integer formatted as
+    // an argument. The `{:x?}` / `{:X?}` lines are the flag
+    // word's observable effect. Expected text is native output.
+    run_ok(
+        "fmt-fwd-int-debug",
+        FMT_FORWARD_INT_DEBUG_SRC,
+        "77\n-7\nff FF\n[   42][00042]\n",
+    );
+}
+
+const FMT_FORWARD_INT_DEBUG_TYPES_SRC: &str = r#"
+use std::fmt;
+
+struct Byte(u8);
+impl fmt::Debug for Byte {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+struct Wide(i64);
+impl fmt::Debug for Wide {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+struct Inner(u32);
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+struct Outer(Inner);
+impl fmt::Debug for Outer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+fn main() {
+    println!("{:?} {:?} {:?}", Byte(3), Wide(-9), Outer(Inner(11)));
+}
+"#;
+
+#[test]
+fn run_mode_fmt_forward_integer_debug_types() {
+    // The seam is in the integer `Debug` impl family as a
+    // whole (every integer type's body in `core::fmt::num`
+    // dispatches on the flag word), and it applies at any
+    // forwarding depth: `Outer` forwards to the guest `Inner`,
+    // whose own forwarding to its `u32` field hits the same
+    // foreign body. Expected text is native output.
+    run_ok(
+        "fmt-fwd-int-debug-types",
+        FMT_FORWARD_INT_DEBUG_TYPES_SRC,
+        "3 -9 11\n",
+    );
+}
