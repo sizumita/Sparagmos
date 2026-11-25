@@ -1987,6 +1987,59 @@ impl<'a> Interpreter<'a> {
         {
             return Ok(text);
         }
+        // A deref-forwarding guard value (`std::cell::Ref` /
+        // `RefMut`): core's `Display` and `Debug` impls for the
+        // guard types format the guarded value, and no guest
+        // body serves a core Self type, so the structural
+        // engine forwards here -- the aggregate's first field
+        // is the reference to the guarded value; resolve it
+        // and format the pointee under the guard's element
+        // type. Any other trait keeps the existing behaviour
+        // (the guard types implement no other fmt trait), as
+        // does a guard-shaped value whose first field is not
+        // a reference.
+        if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+            if let Some(elem_ty) = guard_elem_tag(ty) {
+                if let Value::Enum { fields, .. } = value {
+                    // The reference can sit inside one-field
+                    // wrapper aggregates (the storage form a
+                    // guard built by a converted body -- a
+                    // `Ref::map` result -- leaves in its first
+                    // field); the tag names the guard type
+                    // exactly, so the wrappers are transparent,
+                    // as they are for the storage forms above.
+                    let mut first = fields.first();
+                    for _ in 0..4 {
+                        match first {
+                            Some(Value::Enum { fields: inner, .. })
+                                if inner.len() == 1 =>
+                            {
+                                first = inner.first();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Some(first) = first {
+                        if matches!(
+                            first,
+                            Value::Ref(_)
+                                | Value::FatRef { .. }
+                                | Value::DynRef { .. }
+                        ) {
+                            let pointee = self.resolve_value(frames, first)?;
+                            return self.format_value(
+                                frames,
+                                &pointee,
+                                trait_,
+                                &elem_ty,
+                                options,
+                                indent,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(
@@ -4312,6 +4365,41 @@ pub(super) fn pointee_tag(ty: &str) -> &str {
         }
     }
 }
+
+/// The element type a deref-forwarding guard tag names
+/// (`std::cell::Ref<'_, i32>` -> `i32`): the first generic
+/// argument that is not a lifetime. `None` for every other
+/// tag. The guard types are core's `Ref` / `RefMut`, whose
+/// `Display` and `Debug` impls format the guarded value;
+/// both spellings of the defining crate are accepted, as
+/// elsewhere. The head must be followed directly by the
+/// argument list, so a longer name sharing the prefix
+/// (`RefCell`) does not match.
+pub(super) fn guard_elem_tag(ty: &str) -> Option<String> {
+    let plain = pointee_tag(ty);
+    let is_guard = [
+        "std::cell::Ref",
+        "core::cell::Ref",
+        "std::cell::RefMut",
+        "core::cell::RefMut",
+    ]
+    .iter()
+    .any(|head| {
+        plain
+            .strip_prefix(head)
+            .is_some_and(|rest| rest.starts_with('<'))
+    });
+    if !is_guard {
+        return None;
+    }
+    let open = plain.find('<')?;
+    let inner = tag_group_inner(plain, open)?;
+    split_tag_list(inner)
+        .into_iter()
+        .find(|arg| !is_lifetime_arg(arg))
+        .map(str::to_string)
+}
+
 
 /// The base name of a rendered type tag: the last path segment
 /// of the head before any generic argument list or tuple body

@@ -905,10 +905,9 @@ impl<'a> Interpreter<'a> {
     /// receiver has no live storage to alias: a fat base that is
     /// not a reference, a reference to a constant aggregate or
     /// another target without storage a subslice step can
-    /// window, or storage held in the sparse form — a
-    /// `Subslice` step has no sparse arm, so a sparse window
-    /// keeps the materialised sparse snapshot (see
-    /// `sub_snapshot`), whose reads stay exact.
+    /// window. Storage held in the sparse form aliases like
+    /// any other live storage: the projectors' `Subslice` arms
+    /// cover `Value::SparseVec`.
     fn range_view_base(
         &self,
         frames: &[Frame],
@@ -935,14 +934,6 @@ impl<'a> Interpreter<'a> {
         );
         if !live {
             return Ok(None);
-        }
-        if let Ok(target) = self.deref_value(frames, base) {
-            if matches!(
-                self.read_resolved(frames, &target),
-                Ok(Value::SparseVec { .. })
-            ) {
-                return Ok(None);
-            }
         }
         Ok(Some(self.windowed_base(
             frames,
