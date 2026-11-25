@@ -2256,6 +2256,23 @@ impl<'a> Interpreter<'a> {
         if is_str_split_ty(self_ty) {
             return self.str_split_step(state, self_ty, false);
         }
+        if self_ty.starts_with("std::sync::mpsc::Iter<")
+            || self_ty.starts_with("std::sync::mpsc::IntoIter<")
+            || self_ty.starts_with("std::sync::mpsc::TryIter<")
+        {
+            // The mpsc iterators' step lives in
+            // `iterator_next_state` (a blocking `recv` for
+            // `Iter` / `IntoIter`, a `try_recv` for
+            // `TryIter`); it belongs here too because the
+            // adapter arms below step their inner iterators
+            // through this entry (a `Take` over an
+            // `mpsc::Iter` reaches the channel only from
+            // here). The delegation cannot recurse:
+            // `iterator_next_state` serves these types
+            // itself and never falls through to here for
+            // them.
+            return self.iterator_next_state(frames, self_ty, state.clone());
+        }
         let fields = iterator_fields(state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
