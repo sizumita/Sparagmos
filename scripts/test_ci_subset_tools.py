@@ -16,6 +16,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -186,6 +187,7 @@ class MergeCliTests(unittest.TestCase):
 class CheckCandidatesTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.results = self.dir / "merged.json"
         self.results.write_text(json.dumps({"results": [
             {"path": "tests/ui/a.rs", "nature": "exec",

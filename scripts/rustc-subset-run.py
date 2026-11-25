@@ -161,6 +161,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import concurrent.futures
 import hashlib
 import json
@@ -2438,15 +2439,22 @@ def build_proc_macro(test_path, fname, edition, extra_externs=(),
                 result = (name, artifact, None)
         if result is None:
             tmpdir = Path(tempfile.mkdtemp(prefix="sparagmos-pm-build-"))
-            name2, artifact2, err2 = _build_proc_macro_chain(
-                chain, edition, tmpdir, extra_externs)
-            if err2:
-                result = (None, None, err2)
-            else:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                for f in tmpdir.iterdir():
-                    f.replace(cache_dir / f.name)
-                result = (name2, cache_dir / artifact2.name, None)
+            try:
+                name2, artifact2, err2 = _build_proc_macro_chain(
+                    chain, edition, tmpdir, extra_externs)
+                if err2:
+                    result = (None, None, err2)
+                else:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    for f in tmpdir.iterdir():
+                        f.replace(cache_dir / f.name)
+                    result = (name2, cache_dir / artifact2.name, None)
+            finally:
+                # The build scratch is dead once the artifacts
+                # have been moved into the cache (or the build
+                # failed); leaving it behind leaked one directory
+                # per cache miss (#537).
+                shutil.rmtree(tmpdir, ignore_errors=True)
         _PROC_MACRO_CACHE[key] = result
         return result
 
@@ -2614,6 +2622,12 @@ def test_helpers_args(test_path):
         if src is not None:
             outdir = (Path(tempfile.gettempdir())
                       / f"sparagmos-test-helpers-{os.getpid()}")
+            # The directory is private to this process (keyed
+            # by pid, so no later run reuses it); remove it at
+            # exit instead of leaving it behind (#537). Every
+            # compilation that receives it via -Lnative= runs
+            # inside this process's lifetime.
+            atexit.register(shutil.rmtree, outdir, ignore_errors=True)
             lib = outdir / "librust_test_helpers.a"
             try:
                 outdir.mkdir(parents=True, exist_ok=True)

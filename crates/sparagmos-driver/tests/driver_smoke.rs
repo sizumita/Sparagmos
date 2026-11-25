@@ -6,6 +6,34 @@
 
 use std::process::Command;
 
+/// Fixture directories this test process created under the
+/// system temp directory, removed when the process exits.
+/// Tests spawn the driver per case and used to leave every
+/// fixture directory behind (#537); the registry keeps the
+/// per-test `temp_dir` shape and sweeps at exit instead.
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_scratch_dir(dir: &std::path::Path) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let _ = libc::atexit(remove_scratch_dirs);
+    });
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+}
+
+extern "C" fn remove_scratch_dirs() {
+    if let Ok(dirs) = SCRATCH_DIRS.try_lock() {
+        for dir in dirs.iter() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 const FIXTURE: &str = r#"
 pub fn add(a: i32, b: i32) -> i32 { a + b }
 pub fn fib(n: u32) -> u32 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
@@ -19,6 +47,7 @@ fn driver_converts_simple_functions() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join("smoke.rs");
     std::fs::write(&src, FIXTURE).unwrap();
     let dump = dir.join("smoke.dump");
@@ -64,6 +93,7 @@ fn driver_converts_box_deref_transmute() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join("box.rs");
     std::fs::write(&src, BOX_FIXTURE).unwrap();
     let dump = dir.join("box.dump");
@@ -121,6 +151,7 @@ fn driver_forwards_rustc_args() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join("cfg.rs");
     std::fs::write(&src, CFG_FIXTURE).unwrap();
     let bin = env!("CARGO_BIN_EXE_sparagmos-driver");
@@ -163,6 +194,7 @@ fn convert_fixture(name: &str, fixture: &str, rustc_args: &[&str]) -> (Option<i3
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join(format!("{name}.rs"));
     std::fs::write(&src, fixture).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
@@ -322,6 +354,7 @@ fn convert_mode_parse_only_invocation_is_a_successful_empty_conversion() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join("parseonly.rs");
     std::fs::write(&src, "impl <*const u8>::AssocTy {}\n").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
@@ -344,4 +377,48 @@ fn convert_mode_parse_only_invocation_is_a_successful_empty_conversion() {
         !stderr.contains("compilation failed"),
         "a parse-only invocation is not a compilation failure:\n{stderr}"
     );
+}
+
+#[test]
+fn driver_removes_its_out_dir_on_exit() {
+    // The compile flow's scratch out dir (#537) is removed
+    // before the driver exits; under the keep opt-out it stands.
+    let dir = std::env::temp_dir().join(format!(
+        "sparagmos-driver-smoke-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
+    let src = dir.join("scratch.rs");
+    std::fs::write(&src, FIXTURE).unwrap();
+    let run = |keep: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+        cmd.arg(&src);
+        if keep {
+            cmd.env("SPARAGMOS_DRIVER_KEEP_SCRATCH", "1");
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn sparagmos-driver");
+        let out_dir = std::env::temp_dir()
+            .join(format!("sparagmos-driver-out-{}", child.id()));
+        let status = child.wait().expect("failed to wait for sparagmos-driver");
+        assert!(status.success());
+        out_dir
+    };
+    let removed = run(false);
+    assert!(
+        !removed.exists(),
+        "driver left its out dir behind: {}",
+        removed.display()
+    );
+    let kept = run(true);
+    assert!(
+        kept.exists(),
+        "SPARAGMOS_DRIVER_KEEP_SCRATCH=1 must keep the out dir: {}",
+        kept.display()
+    );
+    let _ = std::fs::remove_dir_all(&kept);
 }
