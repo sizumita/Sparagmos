@@ -76,10 +76,13 @@ pub use self::helpers::{
     args_mention_params, closure_kind, coroutine_closure_args, def_fn_abi, instance_fn_abi,
 };
 pub use self::panic::{
-    clear_captured_panic, guarded_ty_kind, is_coroutine_closure_panic, is_instance_const_panic,
+    captured_panic_is_mir_validator_fail, captured_panic_is_normalize_overflow,
+    clear_captured_panic, generated_simd_impl_method, guarded_ty_kind,
+    is_coroutine_closure_panic, is_instance_const_panic,
     is_unsafe_binder_panic, peek_captured_panic, record_captured_panic, stable_mir_panic_reason,
     take_captured_panic, CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON, INSTANCE_CONST_REASON,
-    TAIL_CALL_REASON, UNSAFE_BINDER_REASON,
+    BODY_FETCH_NORMALIZE_OVERFLOW, BODY_FETCH_SIMD_VALIDATOR, TAIL_CALL_REASON,
+    UNSAFE_BINDER_REASON,
 };
 pub use self::screen::{
     unnormalizable_projection_in_body, unnormalizable_projection_in_instance,

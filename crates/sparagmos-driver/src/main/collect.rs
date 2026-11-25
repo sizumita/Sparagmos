@@ -105,6 +105,15 @@ fn collect() -> ControlFlow<()> {
     let mut deferred_closures: Vec<DeferredFn> = Vec::new();
 
     let items = rustc_public::all_local_items();
+    // The first body fetch of the item loop or the
+    // reachability collection whose whole-body normalization
+    // overflowed the trait solver (the demand passes record
+    // theirs on the demand state's own channel): the compiler
+    // itself cannot materialize that instance, so the
+    // compilation fails with the recursion-limit error rustc's
+    // collector reports, folded into the compile verdict
+    // below.
+    let mut body_fetch_recursion_limit: Option<String> = None;
     // Record the local statics' declared types before converting
     // anything: a reference into a static's interior is decoded
     // against the static's own type (see Converter::decode_static_ref),
@@ -258,7 +267,7 @@ fn collect() -> ControlFlow<()> {
                         // through. A constant whose own body is
                         // unavailable too is a trivial constant
                         // (see `account_trivial_const`).
-                        match guard_stable_mir_query(&item.name(), || item.body()) {
+                        match fetch_query_normalize_aware(&item.name(), false, || item.body()) {
                             Ok(Some(body)) => {
                                 let report_idx = report.functions.len();
                                 // A constant whose body mentions
@@ -381,6 +390,48 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
+        let screen_fetch = fetch_query_normalize_aware(
+            &name,
+            sparagmos_driver::convert::generated_simd_impl_method(&instance),
+            || item.body(),
+        );
+        if let Err(reason) = &screen_fetch {
+            if reason
+                == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+            {
+                note_body_fetch_recursion_limit(
+                    &mut body_fetch_recursion_limit,
+                    &instance,
+                );
+                skip_fn(
+                    &mut report,
+                    &name,
+                    sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+                        .to_string(),
+                );
+                continue;
+            }
+            if reason == sparagmos_driver::convert::BODY_FETCH_SIMD_VALIDATOR {
+                // The fetch tripped the MIR validator's ban on
+                // projecting into a SIMD type (MCP#838): the
+                // body — a compiler-generated impl body whose
+                // statements project the ADT's fields, like a
+                // derived `PartialEq::eq` — cannot be
+                // materialized at all. This is the class the
+                // demand passes screen out up front
+                // (`convert::generated_simd_impl_method`); here the fetch
+                // itself is the precise test, so bodies without
+                // a banned projection (a derived `Clone` that
+                // copies the value whole) still convert above.
+                skip_fn(
+                    &mut report,
+                    &name,
+                    sparagmos_driver::convert::BODY_FETCH_SIMD_VALIDATOR
+                        .to_string(),
+                );
+                continue;
+            }
+        }
         // A definition whose types mention a projection that
         // does not normalize in a monomorphized environment:
         // fetching its instance body would pose exactly that
@@ -402,10 +453,10 @@ fn collect() -> ControlFlow<()> {
             sparagmos_driver::convert::unnormalizable_projection_in_instance(
                 &instance,
             )
-            .or_else(|| match guard_stable_mir_query(&name, || item.body()) {
+            .or_else(|| match &screen_fetch {
                 Ok(Some(def_body)) => {
                     sparagmos_driver::convert::unnormalizable_projection_in_body(
-                        &def_body,
+                        def_body,
                     )
                 }
                 _ => None,
@@ -428,7 +479,11 @@ fn collect() -> ControlFlow<()> {
             });
             continue;
         }
-        let body = match guard_stable_mir_query(&instance.name(), || instance.body()) {
+        let body = match fetch_query_normalize_aware(
+            &instance.name(),
+            sparagmos_driver::convert::generated_simd_impl_method(&instance),
+            || instance.body(),
+        ) {
             Ok(Some(body)) => body,
             Ok(None) => {
                 if matches!(item.kind(), ItemKind::Const) {
@@ -449,7 +504,22 @@ fn collect() -> ControlFlow<()> {
                 continue;
             }
             Err(reason) => {
-                skip_fn(&mut report, &name, reason);
+                if reason
+                    == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+                {
+                    note_body_fetch_recursion_limit(
+                        &mut body_fetch_recursion_limit,
+                        &instance,
+                    );
+                    skip_fn(
+                        &mut report,
+                        &name,
+                        sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+                            .to_string(),
+                    );
+                } else {
+                    skip_fn(&mut report, &name, reason);
+                }
                 continue;
             }
         };
@@ -693,6 +763,9 @@ fn collect() -> ControlFlow<()> {
         collection_order,
         &entry_seeds,
     );
+    if body_fetch_recursion_limit.is_none() {
+        body_fetch_recursion_limit = reached.recursion_limit.clone();
+    }
     collected_ids.extend(body_def_ids.iter().copied());
     let mut foreign_taken = 0usize;
     let mut frontier = reached.walked_bodies;
@@ -852,6 +925,9 @@ fn collect() -> ControlFlow<()> {
             collection_order,
             &[],
         );
+        if body_fetch_recursion_limit.is_none() {
+            body_fetch_recursion_limit = reached.recursion_limit.clone();
+        }
         frontier = reached.walked_bodies;
         alias_sources.extend(frontier.iter().cloned());
         alias_sources.extend(new_closure_bodies.iter().cloned());
@@ -925,6 +1001,9 @@ fn collect() -> ControlFlow<()> {
             collection_order,
             &[],
         );
+        if body_fetch_recursion_limit.is_none() {
+            body_fetch_recursion_limit = reached.recursion_limit.clone();
+        }
         alias_sources.extend(reached.walked_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
             .bodies
@@ -1001,6 +1080,9 @@ fn collect() -> ControlFlow<()> {
                 collection_order,
                 &[],
             );
+            if body_fetch_recursion_limit.is_none() {
+                body_fetch_recursion_limit = reached.recursion_limit.clone();
+            }
             alias_sources.extend(reached.walked_bodies.iter().cloned());
             all_bodies.extend(reached.walked_bodies.iter().cloned());
             for ((name, body), (def_id, def_name)) in reached
@@ -1152,7 +1234,7 @@ fn collect() -> ControlFlow<()> {
                          (auxiliary crate function)"
                         .to_string())
                 } else {
-                    guard_stable_mir_query(&fn_def.name(), || fn_def.body())
+                    fetch_query_normalize_aware(&fn_def.name(), false, || fn_def.body())
                 };
                 convert_item(
                     &mut conv,
@@ -1192,6 +1274,7 @@ fn collect() -> ControlFlow<()> {
     let compile_error = demand_state
         .recursion_limit
         .clone()
+        .or_else(|| body_fetch_recursion_limit.clone())
         .or_else(|| {
             if !COMPILE_VERDICT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;

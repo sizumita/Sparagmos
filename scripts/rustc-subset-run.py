@@ -5306,7 +5306,13 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # completeness, so a success-expecting test only passes when the driver
 # compiles it *and* converts every local function (skipped == 0, i.e. a
 # complete MirProgram was obtained). A failure-expecting test passes
-# when the driver reports a clean compilation failure. A crashes test
+# when the driver reports a clean compilation failure, or when the
+# compilation ends with exactly the failure status the test declares
+# for the revision (`//@ failure-status: N`, the comparison compiletest
+# itself makes; a declared crash status additionally requires the
+# internal-compiler-error evidence in the output, and
+# `//@ dont-check-failure-status` opts the test out of the comparison).
+# A crashes test
 # passes when the compilation crashes the driver process the way it
 # crashes rustc under compiletest (exit code other than 0 or 1).
 #
@@ -5706,12 +5712,26 @@ def skip_bucket(skip_totals):
     return f"conversion incomplete ({kind})"
 
 
-def judge_compile(expectation, conv):
+def judge_compile(expectation, conv, declared_status=None,
+                  dont_check_status=False):
     """Compare a convert_side result with the expected outcome.
 
     Returns (status, reason, bucket): status is "pass", "fail" or
     "unsupported" (conversion incomplete on a success-expecting test,
     the stage-1 analogue of the driver reporting exit 2).
+
+    `declared_status` is the failure status the test itself
+    declares for this revision (`//@ failure-status: N`), when it
+    declares one: compiletest compares the compilation's exit
+    status against it (the stage-4 verdict does the same for
+    rustdoc tests), so a failure-expecting test whose compilation
+    ends with exactly the declared status passes on that ground
+    too — for a declared crash status (101) only with the crash
+    evidence the conversion reports (an internal compiler error
+    in the output), never on the exit code alone. With
+    `dont_check_status` the test opts out of the status
+    comparison, as in compiletest, and only the clean-rejection
+    ground applies.
     """
     if conv.get("mem_exceeded"):
         return ("fail",
@@ -5771,6 +5791,12 @@ def judge_compile(expectation, conv):
     if expectation == "failure":
         if code == 1 and conv["compilation_failed"]:
             return ("pass", "", "")
+        if declared_status is not None and not dont_check_status \
+                and declared_status != 1 and code == declared_status \
+                and (declared_status != 101 or conv.get("ice")):
+            return ("pass",
+                    f"compilation failed with the failure status "
+                    f"{declared_status} the test declares", "")
         if code == 1 and conv.get("conversion_panicked"):
             return ("unsupported",
                     "conversion panicked in Stable MIR: "
@@ -5871,7 +5897,8 @@ def jit_bucket(reason):
     return "JIT lowering unsupported (other)"
 
 
-def judge_jit_compile(expectation, conv):
+def judge_jit_compile(expectation, conv, declared_status=None,
+                      dont_check_status=False):
     """Compare a jit-compile result with the expected outcome.
 
     Metric 4's compile-check verdict: the conversion outcome must
@@ -5939,7 +5966,9 @@ def judge_jit_compile(expectation, conv):
                     "and only the JIT lowering is unsupported",
                     "no crash (JIT lowering unsupported)")
         raise ValueError(f"unknown expectation {expectation!r}")
-    verdict, reason, bucket = judge_compile(expectation, conv)
+    verdict, reason, bucket = judge_compile(
+        expectation, conv, declared_status=declared_status,
+        dont_check_status=dont_check_status)
     if verdict == "pass" and expectation == "success":
         if conv.get("jit_compiled") is True:
             return (verdict, reason, bucket)
@@ -6232,10 +6261,16 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                         aux_env_scrub=tuple(cenv),
                         capture_stdout=print_view,
                         **({"jit": True} if jit else {}))
+    declared = view.values("failure-status")
+    declared_status = int(declared[-1].strip()) if declared else None
     if jit:
-        verdict, reason, bucket = judge_jit_compile(expectation, conv)
+        verdict, reason, bucket = judge_jit_compile(
+            expectation, conv, declared_status=declared_status,
+            dont_check_status=view.has("dont-check-failure-status"))
     else:
-        verdict, reason, bucket = judge_compile(expectation, conv)
+        verdict, reason, bucket = judge_compile(
+            expectation, conv, declared_status=declared_status,
+            dont_check_status=view.has("dont-check-failure-status"))
     if print_view and verdict == "pass":
         refined = judge_print_stdout(rec["suite"], view, path,
                                      revision, conv)

@@ -157,6 +157,61 @@ fn guard_stable_mir_query_contained<T>(
     }
 }
 
+/// Run one body fetch through the Stable MIR guard,
+/// additionally containing the trait solver's whole-body
+/// normalization overflow (see
+/// `convert::BODY_FETCH_NORMALIZE_OVERFLOW`): the guard
+/// resumes every panic it does not know, and this class is
+/// known only by its recorded location, so it is caught once
+/// more here and classified from the panic-capture slot the
+/// hook filled (cleared before the fetch, so the record read
+/// back is this fetch's own). The fetch's named reasons pass
+/// through unchanged, and any other resumed panic keeps
+/// unwinding.
+pub(crate) fn fetch_query_normalize_aware<T>(
+    key: &str,
+    simd_generated: bool,
+    query: impl FnOnce() -> T,
+) -> Result<T, String> {
+    sparagmos_driver::convert::clear_captured_panic();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guard_stable_mir_query(key, query)
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let captured = sparagmos_driver::convert::peek_captured_panic();
+            let overflow = captured.as_ref().is_some_and(|text| {
+                sparagmos_driver::convert::captured_panic_is_normalize_overflow(
+                    text,
+                )
+            });
+            // A MIR validation failure is contained only when
+            // the fetch is a compiler-generated impl body over
+            // a SIMD type (`simd_generated`): that is the one
+            // class whose materialization trips the MCP#838
+            // projection ban by construction. Any other
+            // validation failure keeps unwinding.
+            let simd_validator = simd_generated
+                && captured.as_ref().is_some_and(|text| {
+                    sparagmos_driver::convert::captured_panic_is_mir_validator_fail(
+                        text,
+                    )
+                });
+            if overflow {
+                let _ = sparagmos_driver::convert::take_captured_panic();
+                Err(sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+                    .to_string())
+            } else if simd_validator {
+                let _ = sparagmos_driver::convert::take_captured_panic();
+                Err(sparagmos_driver::convert::BODY_FETCH_SIMD_VALIDATOR
+                    .to_string())
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 /// Convert one body through the Stable MIR containment (see
 /// `Converter::convert_body_contained`), clearing the panic
 /// capture slot when a containment fired: the hook recorded
@@ -212,51 +267,14 @@ pub(crate) fn fetch_instance_body(
     {
         return Err(reason);
     }
-    guard_stable_mir_query(&inst.name(), || inst.body())
-}
-
-/// Whether this instance is a compiler-generated impl method
-/// (a derived impl) over a `#[repr(simd)]` `Self` type. A
-/// derived method carries the very span of its impl — both are
-/// the derive attribute's span — while a hand-written method's
-/// span is its own definition inside the impl block, never the
-/// impl's. The distinction matters because a derived body is
-/// synthesized by projecting the ADT's fields, and projecting
-/// into a SIMD type is exactly what rustc's MIR validator
-/// bans (MCP#838): asking for such a body emits the ICE
-/// diagnostic that poisons the whole compilation, even when
-/// the panic itself is contained. A hand-written body chooses
-/// its own accesses (the `as_array` pointer-cast idiom is the
-/// known shape) and is safe to fetch.
-pub(crate) fn generated_simd_impl_method(inst: &Instance) -> bool {
-    use rustc_public::CrateDef as _;
-    let def = inst.def.def_id();
-    let Some(parent) = def.parent() else {
-        return false;
-    };
-    if def.span() != parent.span() {
-        return false;
-    }
-    // The instance's own arguments are relative to the impl
-    // method's definition (its `T`, `N`, ...), not the trait's,
-    // so the `Self` type is read off the method's receiver: the
-    // first input of the instance's signature, behind the
-    // reference a `&self` receiver adds.
-    let Some(sig) = sparagmos_driver::convert::guarded_ty_kind(&inst.ty())
-        .and_then(|kind| kind.fn_sig())
-        .map(|sig| sig.skip_binder())
-    else {
-        return false;
-    };
-    let Some(receiver) = sig.inputs_and_output.first() else {
-        return false;
-    };
-    let self_ty = match sparagmos_driver::convert::guarded_ty_kind(receiver) {
-        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
-        _ => receiver.clone(),
-    };
-    sparagmos_driver::convert::guarded_ty_kind(&self_ty)
-        .is_some_and(|kind| kind.is_simd())
+    // A fetch whose whole-body normalization overflowed the
+    // trait solver is reported under its own name (see
+    // `convert::BODY_FETCH_NORMALIZE_OVERFLOW`): the callers
+    // route it to the recursion-limit compilation failure,
+    // the verdict rustc's collector reports for the same
+    // overflow, instead of recording it as this definition's
+    // demand failure.
+    fetch_query_normalize_aware(&inst.name(), false, || inst.body())
 }
 
 /// Whether a conversion error is one of the contained Stable

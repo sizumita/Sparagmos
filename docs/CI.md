@@ -330,6 +330,24 @@ denominator. Runs on every push to `main` and on manual dispatch.
   crash expectation (`no crash (converted successfully)` /
   `no crash (clean rejection)`) until the crash itself is
   reproduced.
+- A failure-expecting compile-check test that declares the
+  failure status it expects (`//@ failure-status: N`, scoped
+  to the revision being judged) passes stage 2 on either of
+  two grounds: the clean rejection (exit 1 with the driver's
+  compilation-failure report), as for every failure-expecting
+  test, or an exit status exactly equal to the declared one —
+  the comparison compiletest itself makes, which the stage-4
+  verdict applies to rustdoc tests as well. A declared crash
+  status (101) additionally requires the crash evidence in
+  the output (an internal compiler error), so the exit code
+  alone never earns the pass; `//@ dont-check-failure-status`
+  opts a test out of the declared-status ground. The tests
+  this serves are the ones whose expected failure *is* a
+  compiler crash the reference rustc also produces (the
+  MIR-validator and known-bug ICE tests): the driver
+  reproduces the reference compiler's crash, and the record
+  judges that reproduction against the status the test
+  declares for it.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact

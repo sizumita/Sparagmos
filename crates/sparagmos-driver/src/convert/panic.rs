@@ -293,6 +293,110 @@ pub fn stable_mir_panic_reason(
     }
 }
 
+/// The reason a body fetch reports when materializing the
+/// instance's body fails inside the compiler itself: fetching
+/// a body normalizes the body's types after erasing regions
+/// (`TyCtxt::normalize_erasing_regions`), and for an instance
+/// whose instantiation recursion is unbounded the trait solver
+/// overflows inside that normalization, which the compiler
+/// surfaces as a panic at the normalization entry point rather
+/// than as a diagnostic. rustc's monomorphization collector
+/// never materializes such an instance's whole body this way;
+/// it detects the instantiation recursion itself and reports
+/// "reached the recursion limit while instantiating" as a
+/// compilation error. The body fetch sites therefore contain
+/// this panic class (identified by its recorded location, see
+/// [`captured_panic_is_normalize_overflow`]) and report it
+/// under this name; their callers route it to the same
+/// recursion-limit compilation failure as the demand passes'
+/// own depth mirror.
+pub const BODY_FETCH_NORMALIZE_OVERFLOW: &str = "body fetch: type normalization \
+    overflowed the recursion limit";
+
+/// Whether a recorded panic text (the hook text recorded by
+/// `record_captured_panic`: the payload text plus the panic
+/// location) is the trait solver's overflow inside whole-body
+/// normalization after erasing regions. The panic's payload is
+/// a non-string internal-error marker, so the class is
+/// identified by its recorded location instead — the entry
+/// point of `TyCtxt::normalize_erasing_regions` in the pinned
+/// compiler (rustc_middle/src/ty/normalize_erasing_regions.rs:
+/// 202).
+pub fn captured_panic_is_normalize_overflow(text: &str) -> bool {
+    text.contains("rustc_middle/src/ty/normalize_erasing_regions.rs:202:")
+}
+
+/// Fetch-failure reason recorded when fetching a body trips the
+/// MIR validator's ban on projecting into a SIMD type (MCP#838).
+/// Compiler-generated impl bodies over SIMD types (a derived
+/// `PartialEq::eq`, say) project the ADT's fields and cannot be
+/// materialized at all; the demand passes refuse them up front
+/// under this same reason (`generated_simd_impl_method`), and a
+/// body fetch that reaches the validator anyway is contained
+/// and recorded with it. Hand-written bodies are unaffected:
+/// their own field accesses compile to the pointer-cast idiom,
+/// not to a projection the validator bans.
+pub const BODY_FETCH_SIMD_VALIDATOR: &str =
+    "compiler-generated impl body over a SIMD type";
+
+/// Whether a captured panic record is a MIR validation
+/// failure: every failure of the validator's `CfgChecker`
+/// panics at the one `fail` site (`validate.rs:81` in the
+/// pinned toolchain), and the panic payload is a non-string
+/// bug marker, so the recorded location is all the record
+/// carries. The location alone does not say WHICH check
+/// failed; callers contain this class only for fetches of
+/// compiler-generated impl bodies over SIMD types, where the
+/// failing check is the MCP#838 ban on projecting into the
+/// ADT (see `BODY_FETCH_SIMD_VALIDATOR`).
+pub fn captured_panic_is_mir_validator_fail(text: &str) -> bool {
+    text.contains("rustc_mir_transform/src/validate.rs:81:")
+}
+
+/// Whether this instance is a compiler-generated impl method
+/// (a derived impl) over a `#[repr(simd)]` `Self` type. A
+/// derived method carries the very span of its impl — both are
+/// the derive attribute's span — while a hand-written method's
+/// span is its own definition inside the impl block, never the
+/// impl's. The distinction matters because a derived body is
+/// synthesized by projecting the ADT's fields, and projecting
+/// into a SIMD type is exactly what rustc's MIR validator
+/// bans (MCP#838): asking for such a body can emit the ICE
+/// diagnostic that poisons the whole compilation, even when
+/// the panic itself is contained. A hand-written body chooses
+/// its own accesses (the `as_array` pointer-cast idiom is the
+/// known shape) and is safe to fetch.
+pub fn generated_simd_impl_method(inst: &Instance) -> bool {
+    let def = inst.def.def_id();
+    let Some(parent) = def.parent() else {
+        return false;
+    };
+    if def.span() != parent.span() {
+        return false;
+    }
+    // The instance's own arguments are relative to the impl
+    // method's definition (its `T`, `N`, ...), not the trait's,
+    // so the `Self` type is read off the method's receiver: the
+    // first input of the instance's signature, behind the
+    // reference a `&self` receiver adds.
+    let Some(sig) = guarded_ty_kind(&inst.ty())
+        .and_then(|kind| kind.fn_sig())
+        .map(|sig| sig.skip_binder())
+    else {
+        return false;
+    };
+    let Some(receiver) = sig.inputs_and_output.first() else {
+        return false;
+    };
+    let self_ty = match guarded_ty_kind(receiver) {
+        Some(rustc_public::ty::TyKind::RigidTy(
+            rustc_public::ty::RigidTy::Ref(_, inner, _),
+        )) => inner,
+        _ => receiver.clone(),
+    };
+    guarded_ty_kind(&self_ty).is_some_and(|kind| kind.is_simd())
+}
+
 thread_local! {
     /// Memoized results of [`ty_mentions_param`], keyed by the
     /// compiler's type handle. The walk is a pure function of

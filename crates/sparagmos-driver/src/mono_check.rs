@@ -1193,10 +1193,11 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// The same walk also carries the collector's remaining
 /// verdicts, each described at its site: the per-instance
 /// `check_mono_item` force in `RequiredConstWalk::process`, the
-/// duplicate-symbol verdict over the collected items
-/// (`duplicate_symbol_finding`), and the panic-runtime
-/// validation of the crate graph (`panic_runtime_finding`),
-/// which needs no walk.
+/// exported-symbol verdict over the crate's export roots
+/// (`generic_export_finding`), the duplicate-symbol verdict
+/// over the collected items (`duplicate_symbol_finding`), and
+/// the panic-runtime validation of the crate graph
+/// (`panic_runtime_finding`), which needs no walk.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1223,6 +1224,7 @@ pub fn check_required_consts() -> Option<String> {
     walk.run();
     *MONO_ITEM_FINDING.lock().unwrap() = walk.mono_finding.take();
     walk.finding
+        .or_else(|| generic_export_finding(tcx))
         .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
         .or_else(|| panic_runtime_finding(tcx))
 }
@@ -1241,6 +1243,45 @@ static MONO_ITEM_FINDING: std::sync::Mutex<Option<String>> =
 /// `check_required_consts` call overwrites it regardless.
 pub fn take_mono_item_finding() -> Option<String> {
     MONO_ITEM_FINDING.lock().unwrap().take()
+}
+
+/// The exported-symbol verdict over the crate's export roots,
+/// mirroring the check rustc performs when it names the
+/// crate's exported symbols: a function carrying an export
+/// attribute (`#[export_name]` / `#[no_mangle]`) that is
+/// generic over types or consts has no single symbol to
+/// export, and rustc rejects the crate ("functions generic
+/// over types or consts must be mangled"). The root set is
+/// the one `duplicate_symbol_finding` enumerates: the local
+/// functions whose codegen attributes name a symbol or drop
+/// mangling. A generic root is rejected here, so the
+/// duplicate-symbol check below never has to name it.
+fn generic_export_finding<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+) -> Option<String> {
+    for local_def_id in tcx.iter_local_def_id() {
+        let def_id = local_def_id.to_def_id();
+        if !matches!(
+            tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+        ) {
+            continue;
+        }
+        let attrs = tcx.codegen_fn_attrs(def_id);
+        let exported = attrs.symbol_name.is_some()
+            || attrs.flags.contains(
+                rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE,
+            );
+        if exported && tcx.generics_of(def_id).requires_monomorphization(tcx) {
+            return Some(format!(
+                "functions generic over types or consts must be mangled \
+                 (rustc rejects the exported function `{}`: an exported \
+                 symbol cannot name a generic item)",
+                tcx.def_path_str(def_id)
+            ));
+        }
+    }
+    None
 }
 
 /// The duplicate-symbol verdict over the mono items the
@@ -1287,7 +1328,22 @@ fn duplicate_symbol_finding<'tcx>(
             _ => false,
         };
         if is_export_root {
-            items.insert(rustc_middle::ty::Instance::mono(tcx, def_id));
+            // A generic function is not a mono item — asking
+            // `Instance::mono` for one panics — so it takes no
+            // part in the item set: its instances enter through
+            // the walk when demanded with concrete arguments,
+            // and an exported generic function is a compilation
+            // error of its own, which `generic_export_finding`
+            // reports.
+            let generic_fn = matches!(
+                tcx.def_kind(def_id),
+                rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+            ) && tcx
+                .generics_of(def_id)
+                .requires_monomorphization(tcx);
+            if !generic_fn {
+                items.insert(rustc_middle::ty::Instance::mono(tcx, def_id));
+            }
         }
     }
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
