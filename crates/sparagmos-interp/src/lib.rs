@@ -63,7 +63,9 @@ pub mod value;
 pub use error::{InterpError, InterpResult};
 pub use interp::{
     interpret, InterpConfig, Interpreter, ProcessChildOutcome, ProcessHost,
-    ProcessHostError, ProcessHostOps, ProcessSpawnRequest, ProcessStdio,
+    ProcessHostError, ProcessHostOps, ProcessSpawnRequest, ProcessSpawned,
+    StdoutSink,
+    ProcessStdio,
     ToolInterception, ToolRunOutcome, ToolRunRequest, ToolRunner,
 };
 pub use ir::{

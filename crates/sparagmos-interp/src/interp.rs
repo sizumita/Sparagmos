@@ -76,6 +76,16 @@ pub struct InterpConfig {
     /// starts. Tool interception takes precedence for the
     /// programs it claims.
     pub process_host: Option<ProcessHost>,
+    /// The write-through target for the guest's standard
+    /// output (see [`StdoutSink`]); `None` keeps the standing
+    /// behaviour, under which the guest's output is only
+    /// captured. The driver installs it for a run whose own
+    /// stdout is a real stream the guest's writes must reach
+    /// as they happen, errors included: a child process the
+    /// process model re-runs through the driver, whose parent
+    /// may already have closed the pipe (the guest then
+    /// observes the broken pipe, as it would natively).
+    pub stdout_sink: Option<StdoutSink>,
 }
 
 impl Default for InterpConfig {
@@ -88,6 +98,7 @@ impl Default for InterpConfig {
             overflow_checks: true,
             tool_interception: None,
             process_host: None,
+            stdout_sink: None,
         }
     }
 }
@@ -252,26 +263,60 @@ pub enum ProcessHostError {
     Failed(String),
 }
 
+/// What starting one child hands back across the process-host
+/// boundary (see [`ProcessHostOps::spawn`]): the host's child
+/// id, the child's process id, and the pipe ends the guest's
+/// stdio handles denote -- one host file per stream the wiring
+/// piped (the child's stdin write end, its stdout and stderr
+/// read ends). The interpreter registers the files in its file
+/// table, so the guest's `ChildStdin` / `ChildStdout` /
+/// `ChildStderr` handles are ordinary file handles: reads and
+/// writes go through the file model, and dropping a handle
+/// closes its end of the pipe, as a native handle drop does.
+/// A stream the wiring did not pipe (an inherited or nulled
+/// stdin) hands back no file.
+pub struct ProcessSpawned {
+    pub host_id: u64,
+    pub pid: u32,
+    pub stdin: Option<std::fs::File>,
+    pub stdout: Option<std::fs::File>,
+    pub stderr: Option<std::fs::File>,
+}
+
 /// The host side of real child processes: the operations the
 /// interpreter's `Child` model performs against live children
 /// the host started. Child ids are the host's own, handed back
 /// at spawn; the interpreter's child table maps its guest
 /// handles onto them.
 pub trait ProcessHostOps: Send + Sync {
-    /// Start the child the request describes. On success,
-    /// returns the host child id and the child's process id.
+    /// Start the child the request describes and hand back
+    /// its pipe ends (see [`ProcessSpawned`]): the child keeps
+    /// running; the interpreter drives it through the other
+    /// operations and reads and writes its streams through
+    /// the returned files.
     fn spawn(
         &self,
         request: &ProcessSpawnRequest,
-    ) -> Result<(u64, u32), ProcessHostError>;
-    /// Wait for the child to end and collect its outcome.
-    fn wait(&self, child: u64) -> Result<ProcessChildOutcome, ProcessHostError>;
-    /// The child's outcome if it has already ended; `None`
-    /// while it is still running.
-    fn try_wait(
+    ) -> Result<ProcessSpawned, ProcessHostError>;
+    /// Run the child the request describes to completion and
+    /// collect its outcome: the spawn-and-collect path behind
+    /// `Command::status` / `Command::output`, where no guest
+    /// `Child` handle exists and the host drains the streams
+    /// while the child runs, as std's collection does.
+    fn run(
         &self,
-        child: u64,
-    ) -> Result<Option<ProcessChildOutcome>, ProcessHostError>;
+        request: &ProcessSpawnRequest,
+    ) -> Result<ProcessChildOutcome, ProcessHostError>;
+    /// Wait for the child to end; returns its exit code (the
+    /// [`ProcessChildOutcome`] convention: negative when the
+    /// child ended on a signal). The streams are not collected
+    /// here: their bytes move through the files `spawn`
+    /// returned.
+    fn wait(&self, child: u64) -> Result<i32, ProcessHostError>;
+    /// The child's exit code if it has already ended; `None`
+    /// while it is still running.
+    fn try_wait(&self, child: u64)
+        -> Result<Option<i32>, ProcessHostError>;
     /// Kill the child (SIGKILL semantics, as `Child::kill`).
     fn kill(&self, child: u64) -> Result<(), ProcessHostError>;
     /// Forget the host child without waiting for it (the
@@ -301,6 +346,35 @@ impl PartialEq for ProcessHost {
 }
 
 impl Eq for ProcessHost {}
+
+/// The write-through target for the guest's standard output:
+/// the file behind a run's own stdout (see
+/// [`InterpConfig::stdout_sink`]). Writes go through
+/// `&File`, so the interpreter's shared borrow of its
+/// configuration is enough.
+#[derive(Clone)]
+pub struct StdoutSink(pub std::sync::Arc<std::fs::File>);
+
+impl std::fmt::Debug for StdoutSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StdoutSink(..)")
+    }
+}
+
+impl PartialEq for StdoutSink {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StdoutSink {}
+
+/// The file-table id of the guest's standard input (see
+/// `Interpreter::stdin_file_id`): the table hands out ids
+/// from 3 up for files the guest opens (the descriptor
+/// numbers a native run reserves), so 0 names the duplicated
+/// stdin without colliding.
+pub(crate) const STDIN_FILE_ID: u64 = 0;
 
 /// One call frame: a function's locals plus where to resume.
 pub(crate) struct Frame {
@@ -513,11 +587,13 @@ pub(crate) struct ChannelState {
 /// A modelled `std::process::Command` under construction (the
 /// process model in `builtins.rs`): the builder state the sys
 /// `Command` methods record, keyed by the id inside the handle
-/// value the `Command::new` builtin returns. No child process is
-/// ever started; at spawn time the program is resolved
-/// deterministically and the outcome is either the `io::Error`
-/// the resolution failure produces natively or a named
-/// unsupported error (see `process_spawn_error` in `builtins.rs`).
+/// value the `Command::new` builtin returns. At spawn time the
+/// program is first resolved deterministically: a resolution
+/// failure is the `io::Error` it produces natively (see
+/// `process_spawn_error` in `builtins.rs`); a program that
+/// would start goes to the run's tool interception or process
+/// host when one is configured, and is a named unsupported
+/// error in a run with neither.
 /// One C variable argument list's state (see [`Value::VaList`]):
 /// the tail arguments of one variadic call, in order, and the
 /// cursor the next `va_arg` reads. The arguments are the values
@@ -641,28 +717,59 @@ pub(crate) struct CommandState {
 /// One live child process started through the process host
 /// (see [`ProcessHost`]): the host's child id and the child's
 /// process id, the command's stdio configuration (the finished
-/// outcome's bytes are routed by it), and the exit code once
-/// the end has been observed, so repeated `wait` / `try_wait`
-/// calls answer with the same status, as std's cached status
-/// does.
+/// child's stream bytes are routed by it), the file-table ids
+/// of the child's pipe ends (see [`ProcessSpawned`]), the
+/// stream bytes the interpreter has collected from the ends
+/// the guest did not take over, and the exit code once the end
+/// has been observed, so repeated `wait` / `try_wait` calls
+/// answer with the same status, as std's cached status does.
 pub(crate) struct ChildState {
     pub host_id: u64,
     pub pid: u32,
     pub stdout_stdio: Option<StdioConfig>,
     pub stderr_stdio: Option<StdioConfig>,
+    /// The file-table id of the child's stdin write end, when
+    /// the wiring piped it. `wait` / `wait_with_output` close
+    /// it (std drops the handle the `Child` still holds before
+    /// waiting) unless the guest took the handle out of the
+    /// `Child`, in which case the guest owns its lifetime.
+    pub stdin_file: Option<u64>,
+    /// The file-table id of the child's stdout read end.
+    pub stdout_file: Option<u64>,
+    /// The file-table id of the child's stderr read end.
+    pub stderr_file: Option<u64>,
     pub finished: Option<i32>,
-    /// Whether the finished outcome's inherited streams have
+    /// Whether the finished child's inherited streams have
     /// been relayed into the guest's own streams (they join
-    /// them once, at the first observation of the end).
+    /// them once, at the first observation of the end whose
+    /// collected bytes are complete).
     pub relayed: bool,
-    /// The finished child's captured stdout bytes, kept until
-    /// `wait_with_output` collects them (only a piped stream's
-    /// bytes are kept; an inherited stream was relayed, a
-    /// nulled one dropped).
+    /// The child's stdout bytes collected so far from the read
+    /// end (see `collect_child_streams` in `builtins.rs`):
+    /// relayed at the end for an inherited stream, handed to
+    /// `wait_with_output` for a piped one the guest did not
+    /// take out of the `Child`.
     pub stdout: Vec<u8>,
-    /// The finished child's captured stderr bytes; see
+    /// The child's stderr bytes collected so far; see
     /// `stdout`.
     pub stderr: Vec<u8>,
+    /// Stream collections in flight: a drain thread per stream
+    /// reading a cloned handle of its read end, started when a
+    /// blocking call needs the child's end observed without
+    /// starving a child that fills its pipes. Finished drains
+    /// move their bytes into `stdout` / `stderr`.
+    pub drains: Vec<(bool, std::thread::JoinHandle<Vec<u8>>)>,
+}
+
+/// One `std::sync::Barrier`'s shared state (see the
+/// `Barrier` builtins in `builtins.rs`): how many parties
+/// wait at the barrier, how many have arrived in the
+/// current generation, and the generation counter a waiter
+/// watches to learn its generation has been released.
+pub(crate) struct BarrierState {
+    pub parties: usize,
+    pub arrived: usize,
+    pub generation: u64,
 }
 
 /// The channel id carried by an mpsc handle value, if the value
@@ -1051,6 +1158,14 @@ pub struct Interpreter<'a> {
     /// Everything the guest wrote to its stdout (via the runtime
     /// print support) during the most recent run.
     output: String,
+    /// The guest stdout's line buffer, on its way to a
+    /// write-through sink: std's `Stdout` is line-buffered
+    /// (a `LineWriter`), so bytes the guest writes reach the
+    /// stream only through the last newline, at a flush, or
+    /// when the buffer fills — and a stream error surfaces
+    /// at that point, not at the write that merely buffered
+    /// the bytes. Without a sink this stays empty.
+    stdout_line_buffer: Vec<u8>,
     /// Everything the guest wrote to its stderr (via the runtime
     /// print support) during the most recent run.
     error_output: String,
@@ -1182,6 +1297,12 @@ pub struct Interpreter<'a> {
     children: std::cell::RefCell<HashMap<u64, ChildState>>,
     /// The id the next spawned child gets.
     next_child: std::cell::RefCell<u64>,
+    /// Live `std::sync::Barrier` states (see
+    /// [`BarrierState`]), keyed by the id inside the barrier
+    /// handle values.
+    barriers: std::cell::RefCell<HashMap<u64, BarrierState>>,
+    /// The id the next created barrier gets.
+    next_barrier: std::cell::RefCell<u64>,
     /// Captured `core::fmt::Formatter` states (see
     /// [`FmtCapture`]), keyed by the id inside the formatter
     /// handle values.
@@ -2441,6 +2562,7 @@ impl<'a> Interpreter<'a> {
             fat_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             stdout_buffer_modelled: std::cell::Cell::new(false),
             output: String::new(),
+            stdout_line_buffer: Vec::new(),
             error_output: String::new(),
             drop_continuations: Vec::new(),
             glue_unwind_panic: None,
@@ -2467,6 +2589,8 @@ impl<'a> Interpreter<'a> {
             next_command: std::cell::RefCell::new(1),
             children: std::cell::RefCell::new(HashMap::new()),
             next_child: std::cell::RefCell::new(1),
+            barriers: std::cell::RefCell::new(HashMap::new()),
+            next_barrier: std::cell::RefCell::new(1),
             formatters: std::cell::RefCell::new(HashMap::new()),
             next_formatter: std::cell::RefCell::new(1),
             fmt_stream_arm: false,
@@ -2530,6 +2654,96 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn push_output(&mut self, text: &str) {
         self.output.push_str(text);
+    }
+
+    /// Write bytes to the guest's standard output: the
+    /// captured stream records them, as always. A
+    /// write-through sink (see [`InterpConfig::stdout_sink`])
+    /// receives them under std's line-buffering discipline
+    /// (see `stdout_line_buffer`): through the last newline
+    /// the write carried, or when the buffer fills — and a
+    /// stream error there is the outcome, the error a native
+    /// run's write would have produced (a broken pipe above
+    /// all).
+    pub(crate) fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.push_output(&String::from_utf8_lossy(bytes));
+        if self.config.stdout_sink.is_none() {
+            return Ok(());
+        }
+        self.stdout_line_buffer.extend_from_slice(bytes);
+        if bytes.contains(&b'\n') {
+            let last = self
+                .stdout_line_buffer
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .expect("a newline was just appended");
+            self.stdout_sink_write_through(last + 1)?;
+        } else if self.stdout_line_buffer.len() >= 1024 {
+            // std's buffer capacity: a full buffer goes out
+            // whole (a write larger than the buffer bypasses
+            // it the same way, after what was buffered).
+            let len = self.stdout_line_buffer.len();
+            self.stdout_sink_write_through(len)?;
+        }
+        Ok(())
+    }
+
+    /// The single-`write` form of [`Self::write_stdout`]:
+    /// the count is the bytes the guest handed over, as a
+    /// native `write` on a line-buffered stream reports the
+    /// count it accepted into the buffer.
+    pub(crate) fn write_stdout_partial(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        self.write_stdout(bytes)?;
+        Ok(bytes.len())
+    }
+
+    /// Send the first `n` buffered stdout bytes to the
+    /// write-through sink, keeping the rest buffered.
+    fn stdout_sink_write_through(&mut self, n: usize) -> std::io::Result<()> {
+        let sink = self
+            .config
+            .stdout_sink
+            .as_ref()
+            .expect("a sink is installed")
+            .clone();
+        let mut file = &*sink.0;
+        std::io::Write::write_all(&mut file, &self.stdout_line_buffer[..n])?;
+        self.stdout_line_buffer.drain(..n);
+        Ok(())
+    }
+
+    /// Flush the guest's standard output: the line buffer
+    /// goes out whole and the sink is flushed, with the
+    /// sink's error as the outcome. Without a sink the
+    /// captured stream is unbuffered and there is nothing
+    /// to do.
+    pub(crate) fn flush_stdout(&mut self) -> std::io::Result<()> {
+        if self.config.stdout_sink.is_none() {
+            return Ok(());
+        }
+        let len = self.stdout_line_buffer.len();
+        if len > 0 {
+            self.stdout_sink_write_through(len)?;
+        }
+        let sink = self
+            .config
+            .stdout_sink
+            .as_ref()
+            .expect("a sink is installed")
+            .clone();
+        let mut file = &*sink.0;
+        std::io::Write::flush(&mut file)
+    }
+
+    /// End-of-run stdout settlement: whatever the line
+    /// buffer still holds goes to the sink, as std flushes
+    /// the stream when a program ends. An error here has no
+    /// guest left to observe it and is dropped.
+    pub fn finish_stdout(&mut self) {
+        let _ = self.flush_stdout();
     }
 
     /// The current length of the guest's captured stdout, as a
@@ -8538,6 +8752,77 @@ impl<'a> Interpreter<'a> {
     /// `FileHandleDrop` plan's effect): removing the entry drops
     /// the host `File`, closing the descriptor. An id that names
     /// no open file is already closed, so there is nothing to do.
+    /// The file-table id of the guest's standard input,
+    /// registering a duplicate of this process's stdin on
+    /// first use: the guest's `std::io::stdin` reads go
+    /// through the ordinary file model, and in a self-child
+    /// the descriptor is the pipe the parent wired, exactly
+    /// as a native child's stdin is the parent's.
+    pub(crate) fn stdin_file_id(&self) -> u64 {
+        if !self.files.borrow().contains_key(&STDIN_FILE_ID) {
+            use std::os::fd::AsFd as _;
+            if let Ok(owned) =
+                std::io::stdin().as_fd().try_clone_to_owned()
+            {
+                self.files.borrow_mut().insert(
+                    STDIN_FILE_ID,
+                    std::cell::RefCell::new(std::fs::File::from(
+                        owned,
+                    )),
+                );
+            }
+        }
+        STDIN_FILE_ID
+    }
+
+    /// Register a barrier for `parties` parties and return
+    /// its table id.
+    pub(crate) fn new_barrier(&self, parties: usize) -> u64 {
+        let id = {
+            let mut next = self.next_barrier.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.barriers.borrow_mut().insert(
+            id,
+            BarrierState {
+                parties,
+                arrived: 0,
+                generation: 0,
+            },
+        );
+        id
+    }
+
+    /// Record the current thread's arrival at the barrier
+    /// `id`: `(generation, leader)` -- the generation the
+    /// arrival belongs to, and whether this arrival completes
+    /// it (the last party releases the generation: the count
+    /// resets and the generation counter advances). `None`
+    /// for a stale id.
+    pub(crate) fn barrier_arrive(
+        &self,
+        id: u64,
+    ) -> Option<(u64, bool)> {
+        let mut barriers = self.barriers.borrow_mut();
+        let state = barriers.get_mut(&id)?;
+        let generation = state.generation;
+        state.arrived += 1;
+        if state.arrived >= state.parties {
+            state.arrived = 0;
+            state.generation += 1;
+            Some((generation, true))
+        } else {
+            Some((generation, false))
+        }
+    }
+
+    /// The barrier `id`'s current generation counter.
+    pub(crate) fn barrier_generation(&self, id: u64) -> Option<u64> {
+        self.barriers.borrow().get(&id).map(|state| state.generation)
+    }
+
     pub(crate) fn file_handle_closed(&self, id: u64) {
         self.files.borrow_mut().remove(&id);
     }

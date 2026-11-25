@@ -480,6 +480,12 @@ pub enum Builtin {
     /// it are modelled by the `Write` builtins, which dispatch on
     /// the receiver type, not on the handle's contents.
     Stdout,
+    /// `std::io::stdin() -> Stdin`: the standard input handle.
+    /// The handle value is the file value of the run's own
+    /// stdin in the file table (see `Interpreter::stdin_file_id`
+    /// in `interp.rs`), so reads through it -- and through its
+    /// lock -- are the file model's reads.
+    Stdin,
     /// `std::io::Stdout::lock` / `std::io::Stderr::lock`: the
     /// locked handle. The lock value is the handle itself in this
     /// model: writes through it are modelled by the `Write`
@@ -817,6 +823,27 @@ pub enum Builtin {
     /// callable as a pending thread (cooperative model, see
     /// `interp.rs`) and return its join handle.
     ThreadSpawn,
+    /// `std::sync::Barrier::new(n)`: register a barrier in
+    /// the interpreter's barrier table; the handle value
+    /// carries its id (see `barrier_value`).
+    BarrierNew,
+    /// `std::sync::Barrier::wait(&self)`: arrive at the
+    /// barrier; the last party releases the generation, and
+    /// an earlier party's wait is the cooperative scheduling
+    /// point where the remaining parties run (see
+    /// `Interpreter::drain_threads`).
+    BarrierWait,
+    /// `std::backtrace::Backtrace::capture()`: a backtrace of
+    /// the current call stack when the run's backtrace
+    /// settings enable capture, a disabled one otherwise
+    /// (see `backtrace_value`).
+    BacktraceCapture,
+    /// `std::backtrace::Backtrace::force_capture()`: a
+    /// backtrace of the current call stack, always captured.
+    BacktraceForceCapture,
+    /// `std::backtrace::Backtrace::status(&self)`: the
+    /// capture status recorded in the backtrace value.
+    BacktraceStatus,
     /// `std::thread::Builder::spawn(builder, f)` /
     /// `spawn_unchecked(builder, f)`: `ThreadSpawn` with a builder
     /// (the builder's name and stack size are not observable in the
@@ -2428,8 +2455,10 @@ fn stream_is_stderr(self_ty: &str) -> bool {
 }
 
 /// Whether this call is a file-I/O builtin node: a `Read` /
-/// `Write` / `Seek` method whose `Self` is `std::fs::File`,
-/// or one of `File`'s inherent handle methods. Conversion
+/// `Write` / `Seek` method whose `Self` is `std::fs::File`
+/// (or a child-process pipe handle, whose value is a
+/// file-table id like `File`'s), or one of `File`'s inherent
+/// handle methods. Conversion
 /// emits builtin nodes for exactly these calls (see
 /// `file_io_terminator` in mir_convert); the inherent names
 /// are File-unique, and the trait names are gated on the
@@ -2453,14 +2482,45 @@ fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
         | "std::io::Read::read_buf_exact"
         | "std::io::Seek::seek"
         | "std::io::Seek::rewind"
-        | "std::io::Seek::stream_position" => generic_args
-            .first()
-            .map(|tag| {
-                tag.trim_start_matches("&mut ")
-                    .trim_start_matches('&')
-                    .trim()
-            })
-            == Some("std::fs::File"),
+        | "std::io::Seek::stream_position" => {
+            let self_ty = generic_args
+                .first()
+                .map(|tag| {
+                    tag.trim_start_matches("&mut ")
+                        .trim_start_matches('&')
+                        .trim()
+                })
+                .unwrap_or("");
+            // A child's piped output handles are files in the
+            // interpreter's table (see `ProcessSpawned`), so
+            // their reads go through the same arms as `File`'s;
+            // the standard input handle is a file-table entry
+            // too (see `Builtin::Stdin`).
+            self_ty == "std::fs::File"
+                || matches!(
+                    self_ty,
+                    "std::process::ChildStdout"
+                        | "std::process::ChildStderr"
+                        | "std::io::Stdin"
+                        | "std::io::StdinLock"
+                )
+        }
+        "std::io::Stdin::read_line" => true,
+        "std::io::BufRead::read_line"
+        | "std::io::BufRead::read_until" => {
+            let self_ty = generic_args
+                .first()
+                .map(|tag| {
+                    tag.trim_start_matches("&mut ")
+                        .trim_start_matches('&')
+                        .trim()
+                })
+                .unwrap_or("");
+            matches!(
+                self_ty,
+                "std::io::Stdin" | "std::io::StdinLock"
+            )
+        }
         "std::io::Write::write"
         | "std::io::Write::write_all"
         | "std::io::Write::flush" => {
@@ -2472,7 +2532,9 @@ fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
                         .trim()
                 })
                 .unwrap_or("");
-            self_ty == "std::fs::File" || stream_write_receiver(self_ty)
+            self_ty == "std::fs::File"
+                || stream_write_receiver(self_ty)
+                || self_ty == "std::process::ChildStdin"
         }
         _ => false,
     }
@@ -2564,7 +2626,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::IntrinsicsAbort
         }
         "std::io::stdout" => Builtin::Stdout,
-        "std::io::Stdout::lock" | "std::io::Stderr::lock" => Builtin::StdStreamLock,
+        "std::io::stdin" => Builtin::Stdin,
+        "std::io::Stdout::lock" | "std::io::Stderr::lock"
+        | "std::io::Stdin::lock" => Builtin::StdStreamLock,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
         "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
         "std::fmt::format" | "std::fmt::format::format_inner"
@@ -2738,6 +2802,13 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         // model does not serve; the builtins model the observable
         // semantics instead.
         "std::thread::spawn" | "std::thread::spawn_unchecked" => Builtin::ThreadSpawn,
+        "std::sync::Barrier::new" => Builtin::BarrierNew,
+        "std::sync::Barrier::wait" => Builtin::BarrierWait,
+        "std::backtrace::Backtrace::capture" => Builtin::BacktraceCapture,
+        "std::backtrace::Backtrace::force_capture" => {
+            Builtin::BacktraceForceCapture
+        }
+        "std::backtrace::Backtrace::status" => Builtin::BacktraceStatus,
         _ if canonical.starts_with("std::thread::Builder")
             && (canonical.ends_with("::spawn")
                 || canonical.ends_with("::spawn_unchecked")) =>
@@ -5189,7 +5260,15 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
         self.note_stdout_use(frames)?;
         let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
-                self.push_output(&text);
+                // std's `print_to` panics when the write
+                // fails; a write-through sink's error is
+                // that failure (see `write_stdout`).
+                if let Err(error) = self.write_stdout(text.as_bytes()) {
+                    return Err(InterpError::Panic {
+                        message: format!("failed printing to stdout: {error}"),
+                        payload: None,
+                    });
+                }
                 Ok(Value::Unit)
             }
             Builtin::Eprint => {
@@ -5636,6 +5715,10 @@ impl<'a> Interpreter<'a> {
                     fields: vec![Value::Unit],
                 })
             }
+            Builtin::Stdin => {
+                arity(0)?;
+                Ok(file_value(self.stdin_file_id()))
+            }
             Builtin::StdStreamLock => {
                 arity(1)?;
                 let target = self.deref_value(frames, &vals[0])?;
@@ -5654,7 +5737,9 @@ impl<'a> Interpreter<'a> {
                     "std::io::Stdout"
                     | "std::io::StdoutLock"
                     | "std::sys::stdio::unix::Stdout" => {
-                        self.push_output(&text);
+                        if let Err(error) = self.write_stdout(text.as_bytes()) {
+                            return Ok(io_result_err(host_io_error(&error)));
+                        }
                     }
                     "std::io::Stderr"
                     | "std::io::StderrLock"
@@ -7154,7 +7239,8 @@ impl<'a> Interpreter<'a> {
             Builtin::ProcessChildWait => {
                 arity(1)?;
                 let id = self.child_id_of(frames, &vals[0], name)?;
-                match self.child_finish(id, true)? {
+                let slots = self.child_slots_of(frames, &vals[0])?;
+                match self.child_finish(id, true, slots)? {
                     ChildWait::Finished(code) => {
                         Ok(ok_result(exit_status_value(code)))
                     }
@@ -7168,7 +7254,8 @@ impl<'a> Interpreter<'a> {
             Builtin::ProcessChildTryWait => {
                 arity(1)?;
                 let id = self.child_id_of(frames, &vals[0], name)?;
-                match self.child_finish(id, false)? {
+                let slots = self.child_slots_of(frames, &vals[0])?;
+                match self.child_finish(id, false, slots)? {
                     ChildWait::Finished(code) => Ok(ok_result(some_value(
                         exit_status_value(code),
                     ))),
@@ -7212,15 +7299,19 @@ impl<'a> Interpreter<'a> {
             Builtin::ProcessChildWaitWithOutput => {
                 arity(1)?;
                 let id = self.child_id_of(frames, &vals[0], name)?;
-                match self.child_finish(id, true)? {
+                let slots = self.child_slots_of(frames, &vals[0])?;
+                match self.child_finish(id, true, slots)? {
                     ChildWait::Finished(code) => {
                         // The call consumes the `Child`: the
                         // entry leaves the table and the host
                         // forgets its side. The collected bytes
-                        // are the piped streams' (an inherited
-                        // stream was relayed at the end's first
-                        // observation and is not part of the
-                        // `Output`, as in std).
+                        // are the piped streams the `Child` still
+                        // held (a stream the guest took out is
+                        // the guest's to read and contributes
+                        // nothing; an inherited stream was
+                        // relayed at the end's first observation
+                        // and is not part of the `Output`, as in
+                        // std).
                         let state = self.remove_child(id).ok_or_else(|| {
                             unsupported(format!(
                                 "call to {name} on a stale child handle"
@@ -7229,16 +7320,99 @@ impl<'a> Interpreter<'a> {
                         if let Some(host) = self.process_host() {
                             host.0.release(state.host_id);
                         }
+                        let empty: &[u8] = &[];
+                        let stdout = if state.stdout_stdio
+                            == Some(crate::interp::StdioConfig::Piped)
+                            && slots.1
+                        {
+                            &state.stdout
+                        } else {
+                            empty
+                        };
+                        let stderr = if state.stderr_stdio
+                            == Some(crate::interp::StdioConfig::Piped)
+                            && slots.2
+                        {
+                            &state.stderr
+                        } else {
+                            empty
+                        };
                         Ok(ok_result(process_output_value(
-                            code,
-                            &state.stdout,
-                            &state.stderr,
+                            code, stdout, stderr,
                         )))
                     }
                     ChildWait::IoError(error) => Ok(io_result_err(error)),
                     ChildWait::Running => Err(unsupported(
                         "child wait did not observe the child's end"
                             .to_string(),
+                    )),
+                }
+            }
+            Builtin::BarrierNew => {
+                arity(1)?;
+                let parties = match self
+                    .resolve_value(frames, &vals[0])?
+                {
+                    Value::Uint(n) => n as usize,
+                    Value::Int(n) => n as usize,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "a party count",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Ok(barrier_value(self.new_barrier(parties)))
+            }
+            Builtin::BarrierWait => {
+                arity(1)?;
+                let id = self.barrier_id_of(frames, &vals[0], name)?;
+                let (generation, leader) =
+                    self.barrier_arrive(id).ok_or_else(|| {
+                        unsupported(format!(
+                            "call to {name} on a stale barrier handle"
+                        ))
+                    })?;
+                if leader {
+                    return Ok(barrier_wait_result_value(true));
+                }
+                // This party waits for the generation to be
+                // released: the remaining parties are threads
+                // of this run, and this is a place the running
+                // thread would block, so they get their turn
+                // (the cooperative scheduling point).
+                self.drain_threads(frames)?;
+                match self.barrier_generation(id) {
+                    Some(released) if released != generation => {
+                        Ok(barrier_wait_result_value(false))
+                    }
+                    _ => Err(unsupported(
+                        "Barrier::wait: the other parties never arrived (no runnable thread reached the barrier)"
+                            .to_string(),
+                    )),
+                }
+            }
+            Builtin::BacktraceCapture => {
+                arity(0)?;
+                Ok(backtrace_value(frames, false))
+            }
+            Builtin::BacktraceForceCapture => {
+                arity(0)?;
+                Ok(backtrace_value(frames, true))
+            }
+            Builtin::BacktraceStatus => {
+                arity(1)?;
+                let resolved = self.resolve_value(frames, &vals[0])?;
+                match backtrace_status_of(&resolved) {
+                    Some(status) => Ok(Value::Enum {
+                        variant: status,
+                        fields: Vec::new(),
+                    }),
+                    None => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a backtrace value",
+                        resolved.kind_name(),
                     )),
                 }
             }
@@ -7686,6 +7860,10 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Filter<")
                     || self_ty.starts_with("std::iter::FilterMap<")
+                    || self_ty.starts_with("std::io::Lines<")
+                    || self_ty.starts_with("std::io::Bytes<")
+                    || self_ty_is(self_ty, "std::str::Lines")
+                    || self_ty_is(self_ty, "std::str::LinesInclusive")
                     || self_ty.starts_with("std::str::Split<")
                     || self_ty.starts_with("std::str::RSplit<")
                     || self_ty.starts_with("std::str::SplitTerminator<")
@@ -17149,6 +17327,118 @@ fn value_fingerprint(value: &Value) -> u64 {
         Ok((new_state, some_value(item)))
     }
 
+    /// One step of `std::io::Lines<B>`: the state is the
+    /// one-field value the constructor's converted body
+    /// built, holding the reader; the step is `read_line`
+    /// over the reader's file (see `read_until_byte`) with
+    /// std's own post-processing -- no item at end of stream,
+    /// the line terminator (and a carriage return before it)
+    /// stripped, an invalid-UTF-8 line the `InvalidData`
+    /// error `read_line` itself reports. The state itself
+    /// does not change: the reader's position lives in the
+    /// host file.
+    fn io_lines_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: Value,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = aggregate_fields(&state).ok_or_else(|| {
+            InterpError::type_mismatch(
+                "io::Lines state",
+                "an iterator holding a reader",
+                state.kind_name(),
+            )
+        })?;
+        let reader = fields.first().ok_or_else(|| {
+            InterpError::type_mismatch(
+                "io::Lines state",
+                "an iterator holding a reader",
+                state.kind_name(),
+            )
+        })?;
+        let id = self.file_id_of(frames, reader)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        let read = self.with_file(id, |f| {
+            read_until_byte(f, &mut bytes, b'\n')
+        });
+        match read {
+            None => Err(unsupported(
+                "Iterator::next for io::Lines over a handle that is not open"
+                    .to_string(),
+            )),
+            Some(Err(error)) => Ok((
+                state,
+                some_value(err_result(host_io_error(&error))),
+            )),
+            Some(Ok(())) => {
+                if bytes.is_empty() {
+                    return Ok((state, none_value()));
+                }
+                if std::str::from_utf8(&bytes).is_err() {
+                    return Ok((
+                        state,
+                        some_value(err_result(io_simple_error_value(
+                            std::io::ErrorKind::InvalidData as u32,
+                        ))),
+                    ));
+                }
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                let text =
+                    String::from_utf8(bytes).expect("validated above");
+                Ok((state, some_value(ok_result(Value::Str(text)))))
+            }
+        }
+    }
+
+    /// One step of `std::io::Bytes<B>`: a single byte read
+    /// from the state's reader, in the same shape as
+    /// `io_lines_next`.
+    fn io_bytes_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: Value,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = aggregate_fields(&state).ok_or_else(|| {
+            InterpError::type_mismatch(
+                "io::Bytes state",
+                "an iterator holding a reader",
+                state.kind_name(),
+            )
+        })?;
+        let reader = fields.first().ok_or_else(|| {
+            InterpError::type_mismatch(
+                "io::Bytes state",
+                "an iterator holding a reader",
+                state.kind_name(),
+            )
+        })?;
+        let id = self.file_id_of(frames, reader)?;
+        let mut byte = [0u8; 1];
+        let read = self.with_file(id, |f| {
+            <std::fs::File as std::io::Read>::read(f, &mut byte)
+        });
+        match read {
+            None => Err(unsupported(
+                "Iterator::next for io::Bytes over a handle that is not open"
+                    .to_string(),
+            )),
+            Some(Err(error)) => Ok((
+                state,
+                some_value(err_result(host_io_error(&error))),
+            )),
+            Some(Ok(0)) => Ok((state, none_value())),
+            Some(Ok(_)) => Ok((
+                state,
+                some_value(ok_result(Value::Uint(u128::from(byte[0])))),
+            )),
+        }
+    }
+
     pub(crate) fn iterator_next_state(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -17203,6 +17493,12 @@ fn value_fingerprint(value: &Value) -> u64 {
                 },
                 item,
             ));
+        }
+        if self_ty.starts_with("std::io::Lines<") {
+            return self.io_lines_next(frames, state);
+        }
+        if self_ty.starts_with("std::io::Bytes<") {
+            return self.io_bytes_next(frames, state);
         }
         if self_ty.starts_with("std::vec::Drain<")
             || self_ty.starts_with("alloc::vec::Drain<")
@@ -20098,6 +20394,89 @@ fn value_fingerprint(value: &Value) -> u64 {
                     None => Err(not_open("Read::read_to_string")),
                 }
             }
+            "std::io::BufRead::read_line"
+            | "std::io::Stdin::read_line" => {
+                arity(2)?;
+                let id = self.file_id_of(frames, &vals[0])?;
+                let mut bytes: Vec<u8> = Vec::new();
+                let read = self.with_file(id, |f| {
+                    read_until_byte(f, &mut bytes, b'\n')
+                });
+                match read {
+                    Some(Ok(())) => {
+                        // As `read_to_string` does, the line is
+                        // validated as UTF-8 before it joins the
+                        // string; invalid bytes are a bare
+                        // `InvalidData` and the string is left
+                        // untouched, as std's guard leaves it.
+                        let text = match std::str::from_utf8(&bytes) {
+                            Ok(text) => text.to_string(),
+                            Err(_) => {
+                                return Ok(io_result_err(
+                                    io_simple_error_value(
+                                        std::io::ErrorKind::InvalidData
+                                            as u32,
+                                    ),
+                                ))
+                            }
+                        };
+                        let target = self.deref_value(frames, &vals[1])?;
+                        let current =
+                            self.read_resolved(frames, &target)?;
+                        let Value::Str(mut existing) = current else {
+                            return Err(InterpError::type_mismatch(
+                                "BufRead::read_line destination",
+                                "a String value",
+                                current.kind_name(),
+                            ));
+                        };
+                        let n = text.len();
+                        existing.push_str(&text);
+                        self.write_resolved(
+                            frames,
+                            &target,
+                            Value::Str(existing),
+                        )?;
+                        Ok(io_result_ok(Value::Uint(n as u128)))
+                    }
+                    Some(Err(error)) => {
+                        Ok(io_result_err(host_io_error(&error)))
+                    }
+                    None => Err(not_open("BufRead::read_line")),
+                }
+            }
+            "std::io::BufRead::read_until" => {
+                arity(3)?;
+                let id = self.file_id_of(frames, &vals[0])?;
+                let delim = match self.resolve_value(frames, &vals[1])? {
+                    Value::Uint(n) => n as u8,
+                    Value::Int(n) => n as u8,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "BufRead::read_until delimiter",
+                            "a byte",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let mut bytes: Vec<u8> = Vec::new();
+                let read = self.with_file(id, |f| {
+                    read_until_byte(f, &mut bytes, delim)
+                });
+                match read {
+                    Some(Ok(())) => {
+                        let n = bytes.len();
+                        self.append_bytes_to_vec(
+                            frames, &vals[2], &bytes,
+                        )?;
+                        Ok(io_result_ok(Value::Uint(n as u128)))
+                    }
+                    Some(Err(error)) => {
+                        Ok(io_result_err(host_io_error(&error)))
+                    }
+                    None => Err(not_open("BufRead::read_until")),
+                }
+            }
             "std::io::Read::read_buf" | "std::io::Read::read_buf_exact" => {
                 arity(2)?;
                 let id = self.file_id_of(frames, &vals[0])?;
@@ -20226,13 +20605,15 @@ fn value_fingerprint(value: &Value) -> u64 {
                     return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
                 }
                 if stream_write_receiver(self_ty) {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
                     if stream_is_stderr(self_ty) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
                         self.push_error_output(&text);
-                    } else {
-                        self.push_output(&text);
+                        return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
                     }
-                    return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
+                    return match self.write_stdout_partial(&bytes) {
+                        Ok(n) => Ok(io_result_ok(Value::Uint(n as u128))),
+                        Err(error) => Ok(io_result_err(host_io_error(&error))),
+                    };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
                 let written = self.with_file(id, |f| {
@@ -20248,13 +20629,15 @@ fn value_fingerprint(value: &Value) -> u64 {
                     return Ok(io_result_ok(Value::Unit));
                 }
                 if stream_write_receiver(self_ty) {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
                     if stream_is_stderr(self_ty) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
                         self.push_error_output(&text);
-                    } else {
-                        self.push_output(&text);
+                        return Ok(io_result_ok(Value::Unit));
                     }
-                    return Ok(io_result_ok(Value::Unit));
+                    return match self.write_stdout(&bytes) {
+                        Ok(()) => Ok(io_result_ok(Value::Unit)),
+                        Err(error) => Ok(io_result_err(host_io_error(&error))),
+                    };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
                 let written = self.with_file(id, |f| {
@@ -20265,9 +20648,20 @@ fn value_fingerprint(value: &Value) -> u64 {
             "std::io::Write::flush" => {
                 arity(1)?;
                 if stream_write_receiver(self_ty) {
-                    // The captured streams are unbuffered in
-                    // this model; there is nothing to flush.
-                    return Ok(io_result_ok(Value::Unit));
+                    if stream_is_stderr(self_ty) {
+                        // The captured error stream is
+                        // unbuffered in this model; there is
+                        // nothing to flush.
+                        return Ok(io_result_ok(Value::Unit));
+                    }
+                    // The captured output stream is likewise
+                    // unbuffered; a write-through sink (a
+                    // real stream behind the run) is flushed
+                    // for real, and its error is the guest's.
+                    return match self.flush_stdout() {
+                        Ok(()) => Ok(io_result_ok(Value::Unit)),
+                        Err(error) => Ok(io_result_err(host_io_error(&error))),
+                    };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
                 let flushed = self.with_file(id, |f| {
@@ -24205,6 +24599,26 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         })
     }
 
+    /// The barrier-table id a `Barrier` handle value
+    /// denotes: resolve the reference and read the id out of
+    /// the handle (see `barrier_value`).
+    fn barrier_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let target = self.deref_value(frames, value)?;
+        let resolved = self.read_resolved(frames, &target)?;
+        barrier_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a barrier handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
     /// Run this command to completion through the process
     /// host, in the shape of a tool outcome (see
     /// `tool_outcome`). `None` when no host is configured (the
@@ -24221,18 +24635,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         };
         check_host_stdio(state)?;
         let request = process_spawn_request(state, output_captured);
-        let (host_id, _pid) = match host.0.spawn(&request) {
-            Ok(started) => started,
-            Err(crate::interp::ProcessHostError::Io(e)) => {
-                return Ok(Some(Err(host_io_error(&e))));
-            }
-            Err(crate::interp::ProcessHostError::Failed(reason)) => {
-                return Err(unsupported(reason));
-            }
-        };
-        let outcome = host.0.wait(host_id);
-        host.0.release(host_id);
-        match outcome {
+        match host.0.run(&request) {
             Ok(outcome) => Ok(Some(Ok(crate::interp::ToolRunOutcome {
                 exit_code: outcome.exit_code,
                 stdout: outcome.stdout,
@@ -24261,18 +24664,50 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         check_host_stdio(state)?;
         let request = process_spawn_request(state, false);
         match host.0.spawn(&request) {
-            Ok((host_id, pid)) => {
+            Ok(spawned) => {
+                // The child's pipe ends join the file table;
+                // the guest's `Child` value carries a handle
+                // value for each stream it configured piped
+                // (the only slots std fills), while the entry
+                // keeps every end for collection and relay.
+                let stdin_file =
+                    spawned.stdin.map(|file| self.register_file(file));
+                let stdout_file =
+                    spawned.stdout.map(|file| self.register_file(file));
+                let stderr_file =
+                    spawned.stderr.map(|file| self.register_file(file));
+                let stdin_slot = (state.stdin_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stdin_file)
+                .flatten();
+                let stdout_slot = (state.stdout_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stdout_file)
+                .flatten();
+                let stderr_slot = (state.stderr_stdio
+                    == Some(crate::interp::StdioConfig::Piped))
+                .then_some(stderr_file)
+                .flatten();
                 let id = self.new_child(crate::interp::ChildState {
-                    host_id,
-                    pid,
+                    host_id: spawned.host_id,
+                    pid: spawned.pid,
                     stdout_stdio: state.stdout_stdio,
                     stderr_stdio: state.stderr_stdio,
+                    stdin_file,
+                    stdout_file,
+                    stderr_file,
                     finished: None,
                     relayed: false,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
+                    drains: Vec::new(),
                 });
-                Ok(Some(ok_result(child_value(id))))
+                Ok(Some(ok_result(child_value(
+                    id,
+                    stdin_slot,
+                    stdout_slot,
+                    stderr_slot,
+                ))))
             }
             Err(crate::interp::ProcessHostError::Io(e)) => {
                 Ok(Some(err_result(host_io_error(&e))))
@@ -24283,15 +24718,173 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// Which of the guest `Child` value's stdio slots still
+    /// hold their handle (a `Some` slot the guest has not
+    /// taken out). The blocking child operations act on the
+    /// handles the `Child` itself still holds -- std drops
+    /// its stdin handle before waiting, and `wait_with_output`
+    /// collects the streams it still holds -- so they consult
+    /// the receiver value's slots.
+    fn child_slots_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(bool, bool, bool)> {
+        let resolved = self.resolve_value(frames, value)?;
+        let present =
+            |slot: &Value| matches!(slot, Value::Enum { variant: 1, .. });
+        Ok(match &resolved {
+            Value::Enum { fields, .. } if fields.len() == 4 => (
+                present(&fields[1]),
+                present(&fields[2]),
+                present(&fields[3]),
+            ),
+            _ => (false, false, false),
+        })
+    }
+
+    /// Start collecting the child's stream bytes on drain
+    /// threads for the streams this observation needs: an
+    /// inherited (relayed) stream, and a piped stream whose
+    /// handle the `Child` still holds (a taken stream belongs
+    /// to the guest, which reads it itself). Collection runs
+    /// alongside the child, so a child that fills its pipes
+    /// is never starved by a parent blocked in `wait`, as
+    /// std's own collection runs alongside.
+    fn child_start_drains(&self, id: u64, slots: (bool, bool, bool)) {
+        let Some((out_file, err_file, out_cfg, err_cfg, started)) =
+            self.with_child(id, |state| {
+                (
+                    state.stdout_file,
+                    state.stderr_file,
+                    state.stdout_stdio,
+                    state.stderr_stdio,
+                    (
+                        state.drains.iter().any(|(is_err, _)| !*is_err),
+                        state.drains.iter().any(|(is_err, _)| *is_err),
+                    ),
+                )
+            })
+        else {
+            return;
+        };
+        let mut drains = Vec::new();
+        for (is_err, file, cfg, slot, already) in [
+            (false, out_file, out_cfg, slots.1, started.0),
+            (true, err_file, err_cfg, slots.2, started.1),
+        ] {
+            let wanted = stdio_route(cfg, false) == StdioRoute::Relay
+                || (cfg == Some(crate::interp::StdioConfig::Piped) && slot);
+            if already || !wanted {
+                continue;
+            }
+            let Some(file_id) = file else { continue };
+            let Some(Ok(mut clone)) =
+                self.with_file(file_id, |file| file.try_clone())
+            else {
+                continue;
+            };
+            drains.push((
+                is_err,
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ =
+                        std::io::Read::read_to_end(&mut clone, &mut bytes);
+                    bytes
+                }),
+            ));
+        }
+        if !drains.is_empty() {
+            self.with_child(id, |state| state.drains.extend(drains));
+        }
+    }
+
+    /// Move finished drain threads' bytes into the child's
+    /// collected buffers; with `join_all`, wait for every
+    /// drain (a blocking call's collection completes there).
+    /// Returns whether no drain remains in flight.
+    fn child_pump_drains(&self, id: u64, join_all: bool) -> bool {
+        let mut handles = Vec::new();
+        let remaining = self
+            .with_child(id, |state| {
+                let mut kept = Vec::new();
+                for drain in std::mem::take(&mut state.drains) {
+                    if join_all || drain.1.is_finished() {
+                        handles.push(drain);
+                    } else {
+                        kept.push(drain);
+                    }
+                }
+                let remaining = !kept.is_empty();
+                state.drains = kept;
+                remaining
+            })
+            .unwrap_or(false);
+        for (is_err, handle) in handles {
+            let bytes = handle.join().unwrap_or_default();
+            self.with_child(id, |state| {
+                if is_err {
+                    state.stderr.extend_from_slice(&bytes);
+                } else {
+                    state.stdout.extend_from_slice(&bytes);
+                }
+            });
+        }
+        !remaining
+    }
+
+    /// Relay the child's inherited streams into the guest's
+    /// own streams, once their collected bytes are complete:
+    /// the end observed and every drain collected.
+    fn child_relay(&mut self, id: u64) {
+        let Some((finished, relayed, drained, out_cfg, err_cfg)) =
+            self.with_child(id, |state| {
+                (
+                    state.finished.is_some(),
+                    state.relayed,
+                    state.drains.is_empty(),
+                    state.stdout_stdio,
+                    state.stderr_stdio,
+                )
+            })
+        else {
+            return;
+        };
+        if !finished || relayed || !drained {
+            return;
+        }
+        let (stdout, stderr) = self
+            .with_child(id, |state| {
+                (state.stdout.clone(), state.stderr.clone())
+            })
+            .expect("child entry present");
+        if stdio_route(out_cfg, false) == StdioRoute::Relay {
+            self.push_output(&String::from_utf8_lossy(&stdout));
+        }
+        if stdio_route(err_cfg, false) == StdioRoute::Relay {
+            self.push_error_output(&String::from_utf8_lossy(&stderr));
+        }
+        self.with_child(id, |state| state.relayed = true);
+    }
+
     /// Observe the end of the child with the given id,
-    /// waiting for it when `block` is set. On the first
-    /// observation of the end, the outcome's inherited
-    /// streams are relayed into the guest's own streams and
-    /// its piped streams' bytes are kept on the entry for a
-    /// later `wait_with_output`; the exit code is cached, so
-    /// every later observation answers with the same status,
-    /// as std's cached status does.
-    fn child_finish(&mut self, id: u64, block: bool) -> InterpResult<ChildWait> {
+    /// waiting for it when `block` is set. A blocking call
+    /// first closes the stdin end the `Child` still holds
+    /// (std's `wait` / `wait_with_output` drop that handle
+    /// before waiting, so a child reading its stdin to the
+    /// end sees EOF) and starts collecting the streams the
+    /// `Child` still holds; on the first observation of the
+    /// end, the inherited streams are relayed into the
+    /// guest's own streams once their bytes are collected,
+    /// and the exit code is cached, so every later
+    /// observation answers with the same status, as std's
+    /// cached status does.
+    fn child_finish(
+        &mut self,
+        id: u64,
+        block: bool,
+        slots: (bool, bool, bool),
+    ) -> InterpResult<ChildWait> {
         let Some((host_id, finished)) = self.with_child(id, |state| {
             (state.host_id, state.finished)
         }) else {
@@ -24299,19 +24892,33 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 "call on a stale child handle".to_string(),
             ));
         };
+        if block && slots.0 {
+            if let Some(stdin_file) = self
+                .with_child(id, |state| state.stdin_file.take())
+                .flatten()
+            {
+                self.file_handle_closed(stdin_file);
+            }
+        }
         if let Some(code) = finished {
+            self.child_start_drains(id, slots);
+            self.child_pump_drains(id, block);
+            self.child_relay(id);
             return Ok(ChildWait::Finished(code));
         }
         let host = self.process_host().cloned().ok_or_else(|| {
             unsupported("child process without a process host".to_string())
         })?;
+        if block {
+            self.child_start_drains(id, slots);
+        }
         let outcome = if block {
             host.0.wait(host_id).map(Some)
         } else {
             host.0.try_wait(host_id)
         };
-        let outcome = match outcome {
-            Ok(Some(outcome)) => outcome,
+        let code = match outcome {
+            Ok(Some(code)) => code,
             Ok(None) => return Ok(ChildWait::Running),
             Err(crate::interp::ProcessHostError::Io(e)) => {
                 return Ok(ChildWait::IoError(host_io_error(&e)));
@@ -24320,28 +24927,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 return Err(unsupported(reason));
             }
         };
-        let code = outcome.exit_code;
-        let (out_cfg, err_cfg) = self
-            .with_child(id, |state| {
-                (state.stdout_stdio, state.stderr_stdio)
-            })
-            .expect("child entry present");
-        if stdio_route(out_cfg, false) == StdioRoute::Relay {
-            self.push_output(&String::from_utf8_lossy(&outcome.stdout));
-        }
-        if stdio_route(err_cfg, false) == StdioRoute::Relay {
-            self.push_error_output(&String::from_utf8_lossy(&outcome.stderr));
-        }
-        self.with_child(id, |state| {
-            state.finished = Some(code);
-            state.relayed = true;
-            if out_cfg == Some(crate::interp::StdioConfig::Piped) {
-                state.stdout = outcome.stdout;
-            }
-            if err_cfg == Some(crate::interp::StdioConfig::Piped) {
-                state.stderr = outcome.stderr;
-            }
-        });
+        self.with_child(id, |state| state.finished = Some(code));
+        self.child_start_drains(id, slots);
+        self.child_pump_drains(id, block);
+        self.child_relay(id);
         Ok(ChildWait::Finished(code))
     }
 
@@ -29156,13 +29745,23 @@ fn check_host_stdio(
 /// A `std::process::Child` value denoting child-table id
 /// `id`: the handle -- the sys `Process` value, the id in
 /// its first slot and the not-yet-observed status slot
-/// empty -- and the three stdio handle slots, all empty:
-/// the streams live on the host side of the child entry,
-/// where `wait_with_output` collects them. A guest that
-/// takes a stdio handle out of the `Child` therefore
-/// observes `None`; reading or writing a child's pipes
-/// through the handle values is not modelled.
-fn child_value(id: u64) -> Value {
+/// empty -- and the three stdio handle slots. A stream the
+/// guest configured piped carries its handle value: the
+/// pipe end's file-table id under the handle wrapper chain
+/// (see `file_value`), so the guest reads and writes the
+/// pipe through the ordinary file model, and dropping the
+/// handle closes its end. A stream wired any other way
+/// leaves its slot empty, as std leaves it.
+fn child_value(
+    id: u64,
+    stdin: Option<u64>,
+    stdout: Option<u64>,
+    stderr: Option<u64>,
+) -> Value {
+    let slot = |file: Option<u64>| match file {
+        Some(file_id) => some_value(file_value(file_id)),
+        None => none_value(),
+    };
     Value::Enum {
         variant: 0,
         fields: vec![
@@ -29170,10 +29769,136 @@ fn child_value(id: u64) -> Value {
                 variant: 0,
                 fields: vec![Value::Uint(u128::from(id)), none_value()],
             },
-            none_value(),
-            none_value(),
-            none_value(),
+            slot(stdin),
+            slot(stdout),
+            slot(stderr),
         ],
+    }
+}
+
+/// A `std::backtrace::Backtrace` value: the capture status
+/// (`std::backtrace::BacktraceStatus`'s discriminant:
+/// unsupported 0, disabled 1, captured 2) and, for a captured
+/// backtrace, its rendered trace -- the interpreter's own
+/// call stack, innermost frame first, in std's short format.
+/// Whether capture happens follows the environment std
+/// itself consults: `RUST_LIB_BACKTRACE` when set (`0`
+/// disables, anything else enables), else `RUST_BACKTRACE`
+/// (unset or `0` disables); `full` in either selects the
+/// full style. A forced capture always captures.
+fn backtrace_value(frames: &[Frame], force: bool) -> Value {
+    let (status, full) = backtrace_capture_decision(force);
+    let text = if status == 2 {
+        let mut out = String::from("stack backtrace:\n");
+        for (i, frame) in frames.iter().rev().enumerate() {
+            out.push_str(&format!("   {i}: {}\n", frame.func));
+        }
+        if !full {
+            out.push_str(
+                "note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.",
+            );
+        }
+        out
+    } else {
+        String::new()
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Uint(u128::from(status)), Value::Str(text)],
+    }
+}
+
+/// The `(status, full)` a capture with the given force flag
+/// settles on (see `backtrace_value`).
+fn backtrace_capture_decision(force: bool) -> (u32, bool) {
+    if force {
+        let full = std::env::var("RUST_BACKTRACE")
+            .map(|v| v == "full")
+            .unwrap_or(false);
+        return (2, full);
+    }
+    if let Ok(lib) = std::env::var("RUST_LIB_BACKTRACE") {
+        if lib == "0" {
+            return (1, false);
+        }
+        let full = lib == "full"
+            || std::env::var("RUST_BACKTRACE")
+                .map(|v| v == "full")
+                .unwrap_or(false);
+        return (2, full);
+    }
+    match std::env::var("RUST_BACKTRACE") {
+        Ok(v) if v == "0" => (1, false),
+        Ok(v) => (2, v == "full"),
+        Err(_) => (1, false),
+    }
+}
+
+/// The capture status recorded in a `Backtrace` value (see
+/// `backtrace_value`); `None` for any other shape.
+fn backtrace_status_of(value: &Value) -> Option<u32> {
+    let fields = match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    match fields.first() {
+        Some(Value::Uint(status)) => Some(*status as u32),
+        Some(Value::Int(status)) => Some(*status as u32),
+        _ => None,
+    }
+}
+
+/// The text a `Backtrace` value's `Display` / `Debug`
+/// produce: the disabled and unsupported markers, or the
+/// rendered trace recorded at capture.
+fn backtrace_display(value: &Value) -> String {
+    match backtrace_status_of(value) {
+        Some(2) => match value {
+            Value::Enum { fields, .. } | Value::Tuple(fields) => {
+                match fields.get(1) {
+                    Some(Value::Str(text)) => text.clone(),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        },
+        Some(1) => "disabled backtrace".to_string(),
+        _ => "unsupported backtrace".to_string(),
+    }
+}
+
+/// A `std::sync::Barrier` handle value denoting
+/// barrier-table id `id`: the id in the handle's only slot.
+/// The guest treats the value opaquely -- it is stored,
+/// shared through `Arc`, and handed back to `Barrier::wait`
+/// -- and the barrier's state lives in the table.
+fn barrier_value(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Uint(u128::from(id))],
+    }
+}
+
+/// The barrier-table id a `Barrier` handle value carries.
+/// `None` for any other shape.
+fn barrier_handle_id(value: &Value) -> Option<u64> {
+    let fields = match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    match fields.first() {
+        Some(Value::Uint(id)) => Some(*id as u64),
+        Some(Value::Int(id)) => Some(*id as u64),
+        _ => None,
+    }
+}
+
+/// A `std::sync::BarrierWaitResult` value: its one field
+/// is the leader flag `Barrier::wait` reports.
+fn barrier_wait_result_value(leader: bool) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Bool(leader)],
     }
 }
 
@@ -29818,6 +30543,36 @@ fn pathbuf_value(bytes: &[u8]) -> Value {
 /// per layer — `File { inner: sys File { inner: FileDesc {
 /// fd: OwnedFd { fd } } }` — with the table id in the
 /// descriptor slot.
+/// Read from `file` one byte at a time until `delim` has
+/// been read or the stream ends, appending the bytes read:
+/// a line read over an unbuffered host file, where reading
+/// past the delimiter in a chunk could not be handed back
+/// to the stream for the next read.
+fn read_until_byte(
+    file: &mut std::fs::File,
+    bytes: &mut Vec<u8>,
+    delim: u8,
+) -> std::io::Result<()> {
+    let mut byte = [0u8; 1];
+    loop {
+        match <std::fs::File as std::io::Read>::read(file, &mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if byte[0] == delim {
+                    return Ok(());
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn file_value(id: u64) -> Value {
     let mut value = Value::Int(id as i128);
     for _ in 0..4 {
@@ -33527,6 +34282,31 @@ impl<'a> Interpreter<'a> {
         if trait_ == FmtTrait::Debug {
             if let Some(text) = self.format_c_string(frames, value, ty)? {
                 return Ok(text);
+            }
+        }
+        // A `Backtrace` value is the status and the rendered
+        // trace the capture builtin recorded (see
+        // `backtrace_value`); both `Display` and `Debug`
+        // print that rendering, as std's do.
+        if pointee_tag(ty) == "std::backtrace::Backtrace"
+            && matches!(trait_, FmtTrait::Display | FmtTrait::Debug)
+        {
+            return Ok(backtrace_display(value));
+        }
+        // std's `Debug` for `process::ExitStatus` is a manual
+        // impl: it names the raw wait status the value holds
+        // (`ExitStatus(unix_wait_status(N))` on unix), not the
+        // wrapper's fields.
+        if trait_ == FmtTrait::Debug && pointee_tag(ty) == "std::process::ExitStatus" {
+            if let Value::Enum { fields, .. } = value {
+                if let [Value::Enum {
+                    fields: inner, ..
+                }] = fields.as_slice()
+                {
+                    if let [Value::Int(raw)] = inner.as_slice() {
+                        return Ok(format!("ExitStatus(unix_wait_status({raw}))"));
+                    }
+                }
             }
         }
         // A one-field wrapper aggregate around string data,

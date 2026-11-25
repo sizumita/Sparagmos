@@ -528,6 +528,7 @@ fn step_limit_stops_infinite_loop() {
             overflow_checks: true,
             tool_interception: None,
             process_host: None,
+            stdout_sink: None,
         },
     );
     let err = interp.run("forever", vec![]).unwrap_err();
@@ -568,6 +569,7 @@ fn call_depth_limit_stops_unbounded_recursion() {
             overflow_checks: true,
             tool_interception: None,
             process_host: None,
+            stdout_sink: None,
         },
     );
     let err = interp.run("f", vec![]).unwrap_err();

@@ -88,9 +88,11 @@ fn report_records_bodyless_targets_with_reasons() {
     // Fixture note: this used to use Vec::push reaching the
     // allocator shims, but since Lane V those Vec operations are
     // interpreter builtins and are no longer collected; env::args
-    // joined them later (Lane FC), so std::io::stdin — a
-    // non-generic function of another crate, for which no MIR body
-    // is shipped — stands as the body-less witness here.
+    // joined them later (Lane FC), and std::io::stdin — the
+    // previous body-less witness — joined them when the guest
+    // stdin model landed, so the trait method the formatting
+    // path demands, std::fmt::Display::fmt, for which no MIR
+    // body is shipped, stands as the body-less witness here.
     // Iterator::count is likewise an interpreter builtin since
     // Lane EE and is reported with the builtin reason; the local
     // main body stands in as the collected-body witness.
@@ -98,8 +100,14 @@ fn report_records_bodyless_targets_with_reasons() {
     let (stdout, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");
     assert!(
-        stdout.contains("fn std::io::stdin: SKIPPED (no MIR body available"),
+        stdout.contains("fn std::fmt::Display::fmt: SKIPPED (no MIR body available"),
         "body-less target not reported with its reason:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "fn std::io::stdin: SKIPPED (implemented as an interpreter builtin"
+        ),
+        "builtin-owned stdin not reported with its reason:\n{stdout}"
     );
     assert!(
         stdout.contains(

@@ -1463,7 +1463,9 @@ pub fn interpret_mir(
         return Err(MirRunError::Convert(e.clone()));
     }
     let mut interp = Interpreter::new(&ir_program);
-    Ok(interp.run(entry, args)?)
+    let result = interp.run(entry, args);
+    interp.finish_stdout();
+    Ok(result?)
 }
 
 /// The outcome of a run that also captures the guest's stdout: the
@@ -1696,6 +1698,7 @@ fn interpret_mir_captured_impl(
                     Ok(None)
                 })
                 .map_err(MirRunError::from);
+            interp.finish_stdout();
             CapturedRun {
                 result,
                 stdout: interp.output().to_string(),
@@ -9755,16 +9758,18 @@ let inner = match (&src, target) {
     }
 
     /// A direct call to a `std::io::Read` / `Write` / `Seek`
-    /// method whose Self type is `std::fs::File`, or to one of
-    /// `File`'s inherent handle methods, converts to a builtin
-    /// node: those operations act on the interpreter's host file
-    /// table (see `exec_file_io` in `builtins`). The trait names
-    /// are deliberately absent from the builtin registry, so
-    /// reach still collects the other receivers' bodies (a
-    /// `&[u8]` reader's `read`, a `Cursor`'s `seek`); only a call
-    /// whose Self is exactly `File` (or a reference to it) is
-    /// diverted here. The inherent names are `File`'s own, so no
-    /// Self check is needed for them.
+    /// method whose Self type is `std::fs::File` (or a
+    /// child-process pipe handle, whose value is a file-table
+    /// id like `File`'s), or to one of `File`'s inherent handle
+    /// methods, converts to a builtin node: those operations act
+    /// on the interpreter's host file table (see `exec_file_io`
+    /// in `builtins`). The trait names are deliberately absent
+    /// from the builtin registry, so reach still collects the
+    /// other receivers' bodies (a `&[u8]` reader's `read`, a
+    /// `Cursor`'s `seek`); only a call whose Self is exactly
+    /// `File` (or a reference to it) or a pipe handle is
+    /// diverted here. The inherent names are `File`'s own, so
+    /// no Self check is needed for them.
     fn file_io_terminator(
         &self,
         body: &mir::Body,
@@ -9790,6 +9795,8 @@ let inner = match (&src, target) {
             "std::io::Seek::seek",
             "std::io::Seek::rewind",
             "std::io::Seek::stream_position",
+            "std::io::BufRead::read_line",
+            "std::io::BufRead::read_until",
         ];
         const INHERENT_METHODS: &[&str] = &[
             "std::fs::File::metadata",
@@ -9797,6 +9804,7 @@ let inner = match (&src, target) {
             "std::fs::File::sync_all",
             "std::fs::File::sync_data",
             "std::fs::File::set_len",
+            "std::io::Stdin::read_line",
         ];
         let diverted = if TRAIT_METHODS.contains(&canonical.as_str()) {
             let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
@@ -9810,7 +9818,31 @@ let inner = match (&src, target) {
                     "std::io::Write::write"
                         | "std::io::Write::write_all"
                         | "std::io::Write::flush"
-                ) && crate::builtins::stream_write_receiver(self_ty))
+                ) && (crate::builtins::stream_write_receiver(self_ty)
+                    || self_ty == "std::process::ChildStdin"))
+                || (matches!(
+                    canonical.as_str(),
+                    "std::io::Read::read"
+                        | "std::io::Read::read_exact"
+                        | "std::io::Read::read_to_end"
+                        | "std::io::Read::read_to_string"
+                        | "std::io::Read::read_buf"
+                        | "std::io::Read::read_buf_exact"
+                ) && matches!(
+                    self_ty,
+                    "std::process::ChildStdout"
+                        | "std::process::ChildStderr"
+                        | "std::io::Stdin"
+                        | "std::io::StdinLock"
+                ))
+                || (matches!(
+                    canonical.as_str(),
+                    "std::io::BufRead::read_line"
+                        | "std::io::BufRead::read_until"
+                ) && matches!(
+                    self_ty,
+                    "std::io::Stdin" | "std::io::StdinLock"
+                ))
         } else {
             INHERENT_METHODS.contains(&canonical.as_str())
         };
@@ -12611,6 +12643,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             | "std::sys::fd::unix::FileDesc" | "std::os::fd::OwnedFd" => {
                 return Some(P::FileHandleDrop)
             }
+            // The child-process pipe handles: the value is the
+            // pipe end's file-table id under the same wrapper
+            // chain as `File`'s, and the destructor's only
+            // observable effect -- closing the end, which is
+            // what delivers EOF / EPIPE to the other side -- is
+            // the same file-handle drop plan.
+            "std::process::ChildStdin" | "std::process::ChildStdout"
+            | "std::process::ChildStderr" | "std::sys::pipe::Pipe" => {
+                return Some(P::FileHandleDrop)
+            }
             // mpsc handles: the value is the channel id, and the
             // destructor's only observable effect — the shared
             // handle count going down, which is what disconnects
@@ -12661,6 +12703,15 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             }
             // Marker types: no fields with glue, no `Drop` impl.
             "std::marker::PhantomPinned" | "std::marker::PhantomData" => {
+                return Some(P::Trivial)
+            }
+            // A captured backtrace: the model's value is the
+            // capture status and the rendered trace (see
+            // `backtrace_value` in `builtins.rs`); it owns no
+            // host resource, so the native destructor (which
+            // frees the captured frames) has no observable
+            // effect here.
+            "std::backtrace::Backtrace" => {
                 return Some(P::Trivial)
             }
             // The futex-backed sys synchronization primitives:
