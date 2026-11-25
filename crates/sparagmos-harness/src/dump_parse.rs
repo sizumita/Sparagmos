@@ -532,6 +532,7 @@ impl Conv {
             arg_count: atom_parse(field(f, "arg_count")?, "arg_count")?,
             var_debug_info: Vec::new(),
             source_lines: Vec::new(),
+            coverage_owners: Vec::new(),
             span: mir::Span::DUMMY,
             required_consts: Vec::new(),
         })
@@ -749,7 +750,9 @@ impl Conv {
                     Self::variance(&a[1])?,
                 )
             }
-            ("Coverage", Payload::Unit) => mir::StatementKind::Coverage,
+            ("Coverage", Payload::Args(a)) if a.len() == 1 => {
+                mir::StatementKind::Coverage(atom_parse(&a[0], "coverage bcb")?)
+            }
             ("Intrinsic", Payload::Args(a)) if a.len() == 1 => {
                 mir::StatementKind::Intrinsic(Box::new(Self::intrinsic(&a[0])?))
             }

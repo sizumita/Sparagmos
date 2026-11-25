@@ -120,6 +120,10 @@ pub(crate) struct Collected {
     /// (see `Converter::source_files`), for the interpreter's
     /// debugger interface.
     pub(crate) source_files: Vec<String>,
+    /// The crate's coverage mapping table, captured when the
+    /// compilation was instrumented for coverage (see
+    /// `sparagmos_driver::coverage`); empty otherwise.
+    pub(crate) coverage: sparagmos_mir::CoverageMapping,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();

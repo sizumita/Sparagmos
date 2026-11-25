@@ -73,6 +73,7 @@ pub(crate) fn build_program(
     program.fn_shim_locations = c.fn_shim_locations.clone();
     program.link_symbols = c.link_symbols.clone();
     program.source_files = c.source_files.clone();
+    program.coverage = c.coverage.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`

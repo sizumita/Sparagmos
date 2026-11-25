@@ -1,5 +1,7 @@
 //! Auxiliary crates: scanning source declarations and compiling aux sources.
 
+use super::Mode;
+
 
 /// The crate type an auxiliary source declares for itself
 /// (`#![crate_type = "..."]`), if any. When a source declares one,
@@ -627,6 +629,7 @@ pub(crate) fn compile_aux(
     previous: &[AuxBuilt],
     native_lib_dirs: &[std::path::PathBuf],
     env_scrub: &[String],
+    mode: Mode,
 ) -> Result<AuxBuilt, String> {
     let name = spec.name.as_str();
     let src_path = spec.path.as_str();
@@ -662,6 +665,31 @@ pub(crate) fn compile_aux(
     cmd.arg(src_path)
         .arg("-Zalways-encode-mir")
         .arg(format!("--edition={edition}"));
+    // In the coverage modes, compiletest builds auxiliary
+    // crates with the mode's instrumentation flags as well
+    // (its make_compile_args applies them to every compilation
+    // of the mode, and coverage mappings in auxiliary libraries
+    // are merged into the final executable): the auxiliary
+    // functions' coverage info must be encoded in their MIR
+    // for the main capture to read.
+    // The mode's opt level is not applied to auxiliary builds:
+    // at opt-level 2 an auxiliary body's encoded MIR inlines
+    // deeply enough that converting the main test then demands
+    // bodies that have no encoded MIR at all (core's
+    // panic_nounwind and friends). Instrumentation alone gives
+    // the auxiliary functions their coverage info; the records
+    // of generic auxiliary functions are produced by the main
+    // compilation (at its own opt level) anyway.
+    match mode {
+        Mode::CoverageMap => {
+            cmd.arg("-C").arg("instrument-coverage")
+                .arg("-Zno-profiler-runtime");
+        }
+        Mode::CoverageRun => {
+            cmd.arg("-C").arg("instrument-coverage");
+        }
+        _ => {}
+    }
     for cfg in &spec.cfgs {
         cmd.arg("--cfg").arg(cfg);
         cmd.arg("--check-cfg").arg(format!("cfg({cfg})"));

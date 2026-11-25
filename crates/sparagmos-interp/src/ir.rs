@@ -1324,6 +1324,18 @@ pub enum StatementKind {
         count: Operand,
     },
     Nop,
+    /// A coverage counter point: the basic coverage block whose
+    /// physical counter executing this statement increments, and
+    /// the coverage record it counts against (see
+    /// `sparagmos_mir::coverage_mapping`). The record is the
+    /// index into the program's coverage table when the
+    /// statement was attributed at conversion time to the
+    /// instance it was inlined from; `u32::MAX` resolves the
+    /// record from the executing body at run time (the body's
+    /// own statements), and `u32::MAX - 1` counts nothing (the
+    /// attributed instance has no coverage record, so no counter
+    /// was emitted for it natively either). No value effect.
+    Coverage(u32, u32),
     /// Any statement kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
 }
@@ -1343,6 +1355,11 @@ impl Statement {
     pub fn nop() -> Statement {
         Statement {
             kind: StatementKind::Nop,
+        }
+    }
+    pub fn coverage(bcb: u32, record: u32) -> Statement {
+        Statement {
+            kind: StatementKind::Coverage(bcb, record),
         }
     }
 }
@@ -2415,6 +2432,12 @@ pub struct Program {
     /// the conversion made materialising carries the index of
     /// its target pointee's plan here.
     pub mat_plans: Vec<MatPlan>,
+    /// The program's coverage mapping table, as recorded by the
+    /// driver (see `sparagmos_mir::CoverageMapping`): one record
+    /// per instrumented function instance, linked to the body
+    /// whose execution feeds its counters by name. Empty unless
+    /// the crate was compiled with `-C instrument-coverage`.
+    pub coverage: sparagmos_mir::CoverageMapping,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason

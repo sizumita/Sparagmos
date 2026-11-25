@@ -1201,6 +1201,98 @@ fn collect() -> ControlFlow<()> {
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources))
         .or_else(|| sparagmos_driver::mono_check::take_mono_item_finding());
 
+    // The coverage mapping table of an instrumented
+    // compilation: captured from the compiler's own mono
+    // collection and coverage queries, with each record linked
+    // to the converted bodies of its instance (by mangled
+    // symbol name, through the converter's instance registry).
+    // Uninstrumented compilations skip the sweep entirely.
+    let coverage = match sparagmos_driver::convert::compiler_tcx() {
+        Some(tcx)
+            if sparagmos_driver::coverage::instrument_coverage_enabled(tcx) =>
+        {
+            // The interpreter stores bodies under program keys:
+            // the bare name, or `name#DefId` when several bodies
+            // share a name (mir_convert's `program_keys`, over
+            // exactly this body list). Coverage records link to
+            // bodies by that key, so a statement's record is
+            // resolved under the name the executing body carries.
+            let mut name_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for (name, _) in bodies.iter() {
+                *name_counts.entry(name.as_str()).or_default() += 1;
+            }
+            let body_keys: Vec<String> = bodies
+                .iter()
+                .zip(body_def_ids.iter())
+                .map(|((name, _), def)| {
+                    if name_counts[name.as_str()] == 1 {
+                        name.clone()
+                    } else {
+                        format!("{name}#{def}")
+                    }
+                })
+                .collect();
+            let mut by_idx: std::collections::HashMap<u32, &str> =
+                std::collections::HashMap::new();
+            for (i, id) in body_def_ids.iter().enumerate() {
+                by_idx.insert(id.index, body_keys[i].as_str());
+            }
+            let mut converted: std::collections::HashMap<
+                String,
+                Vec<String>,
+            > = std::collections::HashMap::new();
+            for ((_, inst), &idx) in conv.instance_ids() {
+                if let Some(name) = by_idx.get(&idx) {
+                    converted
+                        .entry(inst.mangled_name())
+                        .or_default()
+                        .push(name.to_string());
+                }
+            }
+            let instances: std::collections::HashMap<
+                u32,
+                rustc_public::mir::mono::Instance,
+            > = conv
+                .instance_ids()
+                .iter()
+                .map(|((_, inst), &idx)| (idx, inst.clone()))
+                .collect();
+            let all_body_names: std::collections::HashSet<String> =
+                body_keys.iter().cloned().collect();
+            sparagmos_driver::coverage::capture(
+                tcx,
+                &converted,
+                &instances,
+                &all_body_names,
+            )
+        }
+        _ => sparagmos_mir::CoverageMapping::default(),
+    };
+
+    // Attribute each converted body's coverage statements to
+    // the instance they were inlined from, so execution counts
+    // a statement against its owner's record the way codegen
+    // emits the increment (see `coverage::fill_coverage_owners`).
+    if !coverage.functions.is_empty() {
+        if let Some(tcx) = sparagmos_driver::convert::compiler_tcx() {
+            let instances: std::collections::HashMap<
+                u32,
+                rustc_public::mir::mono::Instance,
+            > = conv
+                .instance_ids()
+                .iter()
+                .map(|((_, inst), &idx)| (idx, inst.clone()))
+                .collect();
+            sparagmos_driver::coverage::fill_coverage_owners(
+                tcx,
+                &instances,
+                &mut bodies,
+                &body_def_ids,
+            );
+        }
+    }
+
     let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
 
     // Certify the dropped types whose drop glue the compiler
@@ -1245,6 +1337,7 @@ fn collect() -> ControlFlow<()> {
         fn_shim_locations: conv.fn_shim_locations.clone(),
         link_symbols: conv.link_symbols.clone(),
         source_files: conv.source_files.clone(),
+        coverage,
     });
     ControlFlow::Continue(())
 }

@@ -11,6 +11,7 @@
 
 pub mod body;
 pub mod coverage;
+pub mod coverage_mapping;
 pub mod operand;
 pub mod place;
 pub mod rvalue;
@@ -18,6 +19,9 @@ pub mod statement;
 pub mod terminator;
 pub mod ty;
 
+pub use coverage_mapping::{
+    CovExpression, CovFunction, CovMapping, CovMappingKind, CovTerm, CoverageMapping,
+};
 pub use body::{
     BasicBlockData, BlockSourceLines, Body, SourceLine, VarDebugInfo, VarDebugInfoContents,
 };

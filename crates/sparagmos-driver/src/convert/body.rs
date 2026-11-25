@@ -156,6 +156,16 @@ impl Converter {
     /// entry is `through`'s name (the spelling call sites and the
     /// builtin registry use), so several instances of one generic
     /// function share a name but never an id.
+    /// The instance registry: (referencing definition, instance)
+    /// -> the Sparagmos `DefId` the instance was registered
+    /// under. Read by the coverage capture to link mono
+    /// instances to the bodies they were converted under.
+    pub fn instance_ids(
+        &self,
+    ) -> &std::collections::HashMap<(rustc_public::DefId, Instance), u32> {
+        &self.instance_ids
+    }
+
     pub fn instance_def_id(
         &mut self,
         through: rustc_public::DefId,

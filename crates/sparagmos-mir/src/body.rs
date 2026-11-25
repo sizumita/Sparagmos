@@ -94,6 +94,16 @@ pub struct Body {
     /// (see [`BlockSourceLines`]). Filled by the driver from the
     /// Stable MIR spans; empty for hand-built bodies.
     pub source_lines: Vec<BlockSourceLines>,
+    /// For each coverage statement in this body (in statement
+    /// order), the mangled symbol of the instance the statement
+    /// was inlined from, when it was inlined from another
+    /// instance; `None` for the body's own statements. Filled by
+    /// the driver's coverage capture from the internal MIR source
+    /// scopes; empty when the body's coverage statements could
+    /// not be aligned with the internal body (the interpreter
+    /// then attributes every statement to the executing body,
+    /// which is exact for bodies without inlined coverage).
+    pub coverage_owners: Vec<Option<String>>,
 }
 impl Body {
     pub fn new(
@@ -109,6 +119,7 @@ impl Body {
             span: Span::DUMMY,
             required_consts: Vec::new(),
             source_lines: Vec::new(),
+            coverage_owners: Vec::new(),
         }
     }
     pub fn return_ty(&self) -> Option<&Ty> {

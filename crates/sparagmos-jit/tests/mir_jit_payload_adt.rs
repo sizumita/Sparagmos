@@ -137,6 +137,7 @@ fn build_with_table(
             .collect(),
         fn_names: names,
         fn_abis: Default::default(),
+        coverage: Default::default(),
         adt_discriminants: table,
         adt_layouts: Default::default(),
         coroutine_layouts: Default::default(),

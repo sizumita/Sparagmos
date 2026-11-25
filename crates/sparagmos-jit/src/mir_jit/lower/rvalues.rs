@@ -20,7 +20,7 @@ impl<'a> FnLower<'a> {
             | S::PlaceMention(_)
             | S::Retag(..)
             | S::AscribeUserType(..)
-            | S::Coverage
+            | S::Coverage(..)
             | S::ConstEvalCounter => Ok(()),
             S::SetDiscriminant {
                 place,

@@ -27,6 +27,8 @@ pub(crate) fn execute(
     program_name: Option<&str>,
     process_host: Option<sparagmos_interp::ProcessHost>,
     self_ctx: &SelfRunContext,
+    coverage_report: bool,
+    coverage_color: bool,
 ) -> i32 {
     // The name the program reads as its argv[0]: the input
     // path by default (the stand-in for the compiled binary's
@@ -171,7 +173,7 @@ pub(crate) fn execute(
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
-        if !guest_stdout_passthrough {
+        if !coverage_report && !guest_stdout_passthrough {
             let _ = out.write_all(run.stdout.as_bytes());
             let _ = out.flush();
         }
@@ -210,7 +212,7 @@ pub(crate) fn execute(
         }
         eprintln!("{line}");
     };
-    match run.result {
+    let exit_code = match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(ref value) if entry_returns_exit_code(c, entry_index) => {
             // The entry reported through `Termination` (a
@@ -319,7 +321,22 @@ pub(crate) fn execute(
             }
             2
         }
+    };
+    if coverage_report {
+        // The llvm-cov style report rendered from the run's
+        // counted counters: the coverage-run mode's stdout, in
+        // place of the guest's own (discarded above).
+        use std::io::Write;
+        let report = sparagmos_driver::coverage::render_report(
+            &program.coverage,
+            &run.coverage_counts,
+            coverage_color,
+        );
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(report.as_bytes());
+        let _ = out.flush();
     }
+    exit_code
 }
 
 /// The `debug` entry point: run a debugger session over the

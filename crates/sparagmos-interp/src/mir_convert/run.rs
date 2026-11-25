@@ -87,6 +87,12 @@ pub struct CapturedRun {
     pub result: Result<Value, MirRunError>,
     pub stdout: String,
     pub stderr: String,
+    /// The run's coverage counter values: one vector of physical
+    /// counter values per record of the program's coverage
+    /// mapping table (empty when the program carries no coverage
+    /// table). Counters of a record whose body was never entered
+    /// stay zero, as they do natively.
+    pub coverage_counts: Vec<Vec<u64>>,
 }
 
 /// Like [`interpret_mir`], but also returns the captured guest stdout.
@@ -179,6 +185,7 @@ fn interpret_mir_captured_impl(
                     result: Err(MirRunError::from(e.clone())),
                     stdout: String::new(),
                     stderr: String::new(),
+                    coverage_counts: Vec::new(),
                 };
             }
             let mut interp = Interpreter::with_config(&ir_program, config);
@@ -313,12 +320,14 @@ fn interpret_mir_captured_impl(
                 result,
                 stdout: interp.output().to_string(),
                 stderr: interp.error_output().to_string(),
+                coverage_counts: interp.coverage_counts(),
             }
         }
         Err(e) => CapturedRun {
             result: Err(MirRunError::from(e)),
             stdout: String::new(),
             stderr: String::new(),
+            coverage_counts: Vec::new(),
         },
     }
 }

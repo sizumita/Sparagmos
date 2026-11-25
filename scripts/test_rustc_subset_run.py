@@ -919,8 +919,11 @@ class RustdocHostToolScopeTests(unittest.TestCase):
 class CoverageScopeTests(unittest.TestCase):
     """exec records of the coverage suites (issue #514).
 
-    The classification returns before any file or process side is
-    touched, so the records need no fixture files.
+    The coverage-run-rustdoc classification, and the coverage
+    classification on the JIT path, return before any file or
+    process side is touched. The coverage suite itself is
+    judged by stage 1 on the interpreter path; the first test
+    drives that path with the process side stubbed.
     """
 
     def rec(self, suite, nature="exec"):
@@ -932,14 +935,39 @@ class CoverageScopeTests(unittest.TestCase):
         return run.process_test(self.rec(suite), Path("/nonexistent"),
                                 Path("/fake/driver"), jit=jit)
 
-    def test_coverage_suite_needs_coverage_instrumentation(self):
-        res = self.run_rec("coverage")
-        self.assertEqual(res["status"], "not-attempted")
-        self.assertEqual(res["bucket"],
-                         "not attempted (coverage instrumentation)")
-        self.assertIn(".cov-map", res["reason"])
-        self.assertIn(".coverage", res["reason"])
-        self.assertIn("issue #514", res["reason"])
+    def test_coverage_suite_is_judged_by_stage_1(self):
+        # On the interpreter path a coverage record is judged by
+        # its two coverage outputs: with the driver side stubbed
+        # to return outputs matching the snapshots, it passes.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            test_dir = root / "tests" / "coverage"
+            test_dir.mkdir(parents=True)
+            (test_dir / "t.rs").write_text("fn main() {}\n")
+            (test_dir / "t.cov-map").write_text(
+                "Function name: t::main\n"
+                "- file 0 => $DIR/t.rs\n")
+            (test_dir / "t.coverage").write_text(
+                "   LL|      1|fn main() {}\n\n")
+
+            def fake_run_cmd(argv, **kw):
+                mode = argv[1]
+                if mode == "coverage-map":
+                    return {"exit_code": 0, "timeout": False,
+                            "stdout": "Function name: t::main\n"
+                                      f"- file 0 => {test_dir}/t.rs\n",
+                            "stderr": ""}
+                assert mode == "coverage-run", argv
+                return {"exit_code": 0, "timeout": False,
+                        "stdout": "    1|      1|fn main() {}\n\n",
+                        "stderr": ""}
+
+            with unittest.mock.patch.object(run, "run_cmd",
+                                            fake_run_cmd):
+                res = run.process_test(self.rec("coverage"), root,
+                                       Path("/fake/driver"))
+            self.assertEqual(res["status"], "pass", res)
+            self.assertEqual(res["mode"], "coverage")
 
     def test_coverage_run_rustdoc_needs_coverage_instrumentation(self):
         res = self.run_rec("coverage-run-rustdoc")
@@ -5215,3 +5243,67 @@ class Stage4RustdocTests(unittest.TestCase):
                                  snapshot="error: boom\n")
         self.assertEqual(res["status"], "unsupported")
         self.assertIn("unsupported: frobnicate", res["reason"])
+
+
+class CoverageNormalizeTests(unittest.TestCase):
+    """compiletest's coverage-output normalisation, ported for
+    the coverage suite's stage-1 path (issue #514)."""
+
+    def test_sections_sorted_and_line_numbers_anonymized(self):
+        text = (
+            "/x/b.rs:\n"
+            "    9|      3|fn b() {}\n"
+            "\n"
+            "/x/a.rs:\n"
+            "    4|      2|fn a() {\n"
+            " ------------------\n"
+            "  |  Branch (4:9): [True: 2, False: 1]\n"
+            " ------------------\n"
+            "\n"
+        )
+        self.assertEqual(
+            run.normalize_coverage_output(text, "/x"),
+            "$DIR/a.rs:\n"
+            "   LL|      2|fn a() {\n"
+            " ------------------\n"
+            "  |  Branch (LL:9): [True: 2, False: 1]\n"
+            " ------------------\n"
+            "\n"
+            "$DIR/b.rs:\n"
+            "   LL|      3|fn b() {}\n"
+            "\n")
+
+    def test_instantiation_subviews_sorted(self):
+        text = (
+            "    1|      2|fn g() {\n"
+            " ------------------\n"
+            "  | z::g::<u32>:\n"
+            "  |    1|      1|fn g() {\n"
+            " ------------------\n"
+            "  | a::g::<f32>:\n"
+            "  |    1|      1|fn g() {\n"
+            " ------------------\n"
+            "\n"
+        )
+        self.assertEqual(
+            run.normalize_coverage_output(text, "/x"),
+            "   LL|      2|fn g() {\n"
+            " ------------------\n"
+            "  | a::g::<f32>:\n"
+            "  |   LL|      1|fn g() {\n"
+            " ------------------\n"
+            "  | z::g::<u32>:\n"
+            "  |   LL|      1|fn g() {\n"
+            " ------------------\n"
+            "\n")
+
+    def test_report_must_end_with_an_extra_blank_line(self):
+        with self.assertRaises(ValueError):
+            run.normalize_coverage_output(
+                "    1|      1|fn a() {}\n", "/x")
+
+    def test_cov_map_normalization_only_substitutes_the_dir(self):
+        text = "Function name: f\n- file 0 => /x/tests/coverage/a.rs\n"
+        self.assertEqual(
+            run.normalize_cov_map_output(text, "/x/tests/coverage"),
+            "Function name: f\n- file 0 => $DIR/a.rs\n")
