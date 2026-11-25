@@ -1549,6 +1549,42 @@ enum UniqueValue {
     Many,
 }
 
+/// The most value nodes one [`Converter::zst_value`] synthesis may
+/// materialise. The synthesis replicates an array's element value
+/// once per element, so a per-level length cap alone does not bound
+/// it: `[[(); 4096]; 4096]` passes a 4096 cap at each level and one
+/// value of over sixteen million nodes. The budget counts nodes
+/// across one whole synthesis (the same discipline as the driver's
+/// `MAX_CONST_TOTAL_ELEMS` for constant decoding); a type whose one
+/// value would exceed it is treated as having many values, which
+/// only loses the unwritten-place synthesis for that type — the
+/// read then takes the ordinary uninitialised path.
+const MAX_ZST_VALUE_NODES: u64 = 1 << 20;
+
+/// Charge `nodes` against a `zst_value` synthesis budget; `false`
+/// when the charge does not fit.
+fn spend_zst_nodes(budget: &mut u64, nodes: u64) -> bool {
+    if nodes > *budget {
+        return false;
+    }
+    *budget -= nodes;
+    true
+}
+
+/// The number of nodes in a value tree (a node is one `Value`;
+/// tuples, enums and closures add their children's counts).
+fn value_nodes(v: &Value) -> u64 {
+    let children: &[Value] = match v {
+        Value::Tuple(vals) => vals,
+        Value::Enum { fields, .. } => fields,
+        Value::Closure { env, .. } => env,
+        _ => return 1,
+    };
+    children
+        .iter()
+        .fold(1u64, |acc, c| acc.saturating_add(value_nodes(c)))
+}
+
 /// Whether `ty` is a thin pointer type: a raw pointer or
 /// reference whose pointee carries no metadata half (not a slice,
 /// `str`, `dyn` or opaque alias pointee). A thin pointer's value
@@ -2793,7 +2829,8 @@ impl<'a> Converter<'a> {
     /// is its one field's value) and opaque aliases (the hidden
     /// type is not visible here).
     fn zst_value(&self, ty: &mir::Ty, depth: u32) -> Option<Value> {
-        match self.unique_value(ty, depth) {
+        let mut budget = MAX_ZST_VALUE_NODES;
+        match self.unique_value(ty, depth, &mut budget) {
             UniqueValue::One(v) => Some(v),
             _ => None,
         }
@@ -3025,21 +3062,39 @@ impl<'a> Converter<'a> {
     /// field type (`Empty`, `!`, a struct containing one) can
     /// never be constructed, so `Option<Empty>` has the single
     /// value `None` even though the enum declares two variants.
-    fn unique_value(&self, ty: &mir::Ty, depth: u32) -> UniqueValue {
+    ///
+    /// Every value constructed charges its node count against
+    /// `budget` (see [`MAX_ZST_VALUE_NODES`]); a construction that
+    /// does not fit reports `Many`, so the synthesis never
+    /// materialises an enormous value tree.
+    fn unique_value(
+        &self,
+        ty: &mir::Ty,
+        depth: u32,
+        budget: &mut u64,
+    ) -> UniqueValue {
         if depth > 32 {
             return UniqueValue::Many;
         }
         match ty {
             mir::Ty::Never => UniqueValue::Uninhabited,
-            mir::Ty::Tuple(ts) if ts.is_empty() => UniqueValue::One(Value::Unit),
+            mir::Ty::Tuple(ts) if ts.is_empty() => {
+                if !spend_zst_nodes(budget, 1) {
+                    return UniqueValue::Many;
+                }
+                UniqueValue::One(Value::Unit)
+            }
             mir::Ty::Tuple(ts) => {
                 let mut vals = Vec::with_capacity(ts.len());
                 for t in ts {
-                    match self.unique_value(t, depth + 1) {
+                    match self.unique_value(t, depth + 1, budget) {
                         UniqueValue::One(v) => vals.push(v),
                         UniqueValue::Uninhabited => return UniqueValue::Uninhabited,
                         UniqueValue::Many => return UniqueValue::Many,
                     }
+                }
+                if !spend_zst_nodes(budget, 1) {
+                    return UniqueValue::Many;
                 }
                 UniqueValue::One(Value::Tuple(vals))
             }
@@ -3049,13 +3104,29 @@ impl<'a> Converter<'a> {
                     _ => return UniqueValue::Many,
                 };
                 if n == 0 {
+                    if !spend_zst_nodes(budget, 1) {
+                        return UniqueValue::Many;
+                    }
                     return UniqueValue::One(Value::Tuple(Vec::new()));
                 }
                 if n > 4096 {
                     return UniqueValue::Many;
                 }
-                match self.unique_value(elem, depth + 1) {
+                match self.unique_value(elem, depth + 1, budget) {
                     UniqueValue::One(v) => {
+                        // Replicating the element value `n` times
+                        // materialises `n - 1` further copies of
+                        // its whole tree: charge them before
+                        // building, so nested zero-sized arrays
+                        // cannot multiply a small type into an
+                        // enormous value (the per-level length cap
+                        // above alone allows 4096 nodes per level,
+                        // multiplied across levels).
+                        let extra =
+                            value_nodes(&v).saturating_mul(u64::from(n) - 1);
+                        if !spend_zst_nodes(budget, extra.saturating_add(1)) {
+                            return UniqueValue::Many;
+                        }
                         UniqueValue::One(Value::Tuple(vec![v; n as usize]))
                     }
                     UniqueValue::Uninhabited => UniqueValue::Uninhabited,
@@ -3093,7 +3164,7 @@ impl<'a> Converter<'a> {
                             .get(*def, args, vi as u32, fi as u32)
                             .cloned()
                             .unwrap_or_else(|| subst_ty(fty, args));
-                        match self.unique_value(&fty, depth + 1) {
+                        match self.unique_value(&fty, depth + 1, budget) {
                             UniqueValue::One(v) => fields.push(v),
                             UniqueValue::Uninhabited => {
                                 inhabited = false;
@@ -3115,6 +3186,9 @@ impl<'a> Converter<'a> {
                 }
                 match single {
                     Some((variant, fields)) => {
+                        if !spend_zst_nodes(budget, 1) {
+                            return UniqueValue::Many;
+                        }
                         UniqueValue::One(Value::Enum { variant, fields })
                     }
                     None => UniqueValue::Uninhabited,
@@ -3124,13 +3198,16 @@ impl<'a> Converter<'a> {
                 Some(mir::Ty::Tuple(ts)) => {
                     let mut env = Vec::with_capacity(ts.len());
                     for t in ts {
-                        match self.unique_value(t, depth + 1) {
+                        match self.unique_value(t, depth + 1, budget) {
                             UniqueValue::One(v) => env.push(v),
                             UniqueValue::Uninhabited => {
                                 return UniqueValue::Uninhabited
                             }
                             UniqueValue::Many => return UniqueValue::Many,
                         }
+                    }
+                    if !spend_zst_nodes(budget, 1) {
+                        return UniqueValue::Many;
                     }
                     UniqueValue::One(Value::Closure {
                         def: self.def_display_name(def),
@@ -3140,6 +3217,9 @@ impl<'a> Converter<'a> {
                 _ => UniqueValue::Many,
             },
             mir::Ty::FnDef(def, _) => {
+                if !spend_zst_nodes(budget, 1) {
+                    return UniqueValue::Many;
+                }
                 UniqueValue::One(Value::FnPtr(self.body_key(def)))
             }
             _ => UniqueValue::Many,

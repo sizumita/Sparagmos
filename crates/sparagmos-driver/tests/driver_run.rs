@@ -389,6 +389,977 @@ fn run_mode_large_byte_table_wrapped_static() {
     );
 }
 
+/// Build a guest source holding a 5,000-element `u32` table
+/// (past the driver's element-wise constant bound of 4,096):
+/// `decl` declares the table (with `ELEMS` as the element list)
+/// and `main` is the caller's entry point.
+fn large_u32_table_src(decl: &str, main: &str) -> String {
+    let elems: Vec<String> = (0..5000)
+        .map(|i| ((i * 3 + 1) % 1009).to_string())
+        .collect();
+    let mut src = decl.replace("ELEMS", &elems.join(", "));
+    src.push_str(main);
+    src
+}
+
+#[test]
+fn run_mode_large_u32_table_static() {
+    // A static `u32` table past the element-wise constant
+    // bound: its elements are present in the allocation, so it
+    // decodes element by element and reads back exactly, both
+    // by value and through a reference. Before the presence
+    // check, the constant kept its `ByRef` identity and the
+    // interpreter rejected the whole body.
+    let src = large_u32_table_src(
+        "static TABLE: [u32; 5000] = [ELEMS];",
+        "fn main() { let mut sum: u64 = 0; for i in 0..5000 { sum += TABLE[i] as u64; } let r: &[u32; 5000] = &TABLE; println!(\"{} {} {}\", sum, r[1234], TABLE[4999]); }",
+    );
+    let dir = temp_dir("large-u32-table");
+    let src = fixture(&dir, "large_u32_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large u32 table must run; stderr={stderr}"
+    );
+    let expect_sum: u64 = (0..5000).map(|i| ((i * 3 + 1) % 1009) as u64).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{} {} {}\n",
+            expect_sum,
+            (1234 * 3 + 1) % 1009,
+            (4999 * 3 + 1) % 1009
+        ),
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_u32_table_const() {
+    // The same table as a `const` item: the constant operand's
+    // allocation decodes by the same presence rule.
+    let src = large_u32_table_src(
+        "const TABLE: [u32; 5000] = [ELEMS];",
+        "fn main() { println!(\"{} {}\", TABLE[42], TABLE[4999]); }",
+    );
+    let dir = temp_dir("large-u32-table-const");
+    let src = fixture(&dir, "large_u32_table_const.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large u32 const table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} {}\n", (42 * 3 + 1) % 1009, (4999 * 3 + 1) % 1009),
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_nested_zst_table_stays_undecoded() {
+    // A nonzero-stride element type can contain zero-sized
+    // arrays whose declared lengths multiply without occupying
+    // allocation bytes: this static is 5,000 bytes of storage
+    // whose element-wise expansion would produce tens of
+    // billions of values. The shared expansion budget keeps
+    // the constant undecoded, so the run stops at it -- the
+    // same outcome as before the presence check existed --
+    // instead of exhausting host memory in the decode.
+    let dir = temp_dir("nested-zst-table");
+    let src = fixture(
+        &dir,
+        "nested_zst_table.rs",
+        "static TABLE: [([[(); 4096]; 4096], bool); 5000] = [([[(); 4096]; 4096], true); 5000]; fn main() { println!(\"{} {}\", TABLE.len(), TABLE[0].1); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "nested zero-sized expansion must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_nested_zst_elements_under_budget() {
+    // The same nesting shape at a size whose total expansion
+    // fits the shared budget still materialises element by
+    // element and reads back exactly.
+    let dir = temp_dir("nested-zst-under-budget");
+    let src = fixture(
+        &dir,
+        "nested_zst_under_budget.rs",
+        "static TABLE: [([[(); 10]; 10], u32); 5000] = [([[(); 10]; 10], 7); 5000]; fn main() { println!(\"{} {} {}\", TABLE.len(), TABLE[0].1, TABLE[4999].1); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "moderate nested expansion must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5000 7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_shared_byte_block_refs_stay_undecoded() {
+    // An array of references to one shared byte block: each
+    // element's decode copies the block's bytes, so counting
+    // decode calls alone would materialise gigabytes here
+    // while spending only ~500,000 budget units. Byte-copying
+    // arms charge the copied length against the shared budget,
+    // so the constant stays undecoded and the run stops at it.
+    let dir = temp_dir("shared-byte-block-refs");
+    let src = fixture(
+        &dir,
+        "shared_byte_block_refs.rs",
+        "static TABLE: [&[u8; 4096]; 500000] = [&[7; 4096]; 500000]; fn main() { println!(\"{}\", TABLE[0][0]); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "repeated copies of one byte block must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_shared_byte_block_refs_under_budget() {
+    // The same shape at a count whose total copied bytes fit
+    // the shared budget still materialises and reads back
+    // exactly.
+    let dir = temp_dir("shared-byte-block-refs-under-budget");
+    let src = fixture(
+        &dir,
+        "shared_byte_block_refs_under_budget.rs",
+        "static TABLE: [&[u8; 4096]; 100] = [&[7; 4096]; 100]; fn main() { println!(\"{} {} {}\", TABLE.len(), TABLE[0][0], TABLE[99][4095]); }",
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "moderate shared byte block refs must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "100 7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_over_budget_fat_pointer_prefix_stays_undecoded() {
+    // A fat-pointer constant whose recorded length is a prefix
+    // of a larger backing allocation, at a size the shared
+    // expansion budget cannot pay for: the constant must stay
+    // undecoded. Reading the whole backing allocation instead
+    // (the plain-pointee shortcut) would silently replace the
+    // recorded length 1,048,577 with the allocation's 1,048,578.
+    let lit = "a".repeat(1048578);
+    let src = format!(
+        "const RAW: &[u8; 1048578] = b\"{lit}\"; const fn prefix(arr: &'static [u8; 1048578]) -> &'static [u8] {{ unsafe {{ std::slice::from_raw_parts(arr.as_ptr(), 1048577) }} }} const S: &[u8] = prefix(RAW); fn main() {{ println!(\"{{}}\", S.len()); }}"
+    );
+    let dir = temp_dir("over-budget-fat-prefix");
+    let src = fixture(&dir, "over_budget_fat_prefix.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget fat-pointer prefix must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_over_budget_str_prefix_stays_undecoded() {
+    // The `&str` form of the same shape: the recorded length
+    // is a prefix of the backing allocation and over the
+    // budget, so the constant stays undecoded rather than
+    // materialising with the allocation's length.
+    let lit = "a".repeat(1048578);
+    let src = format!(
+        "const RAW: &[u8; 1048578] = b\"{lit}\"; const fn prefix_str(arr: &'static [u8; 1048578]) -> &'static str {{ unsafe {{ std::str::from_utf8_unchecked(std::slice::from_raw_parts(arr.as_ptr(), 1048577)) }} }} const T: &str = prefix_str(RAW); fn main() {{ println!(\"{{}}\", T.len()); }}"
+    );
+    let dir = temp_dir("over-budget-str-prefix");
+    let src = fixture(&dir, "over_budget_str_prefix.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget str prefix must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_fat_pointer_prefix_under_budget_reads_back() {
+    // The same prefix shape at a size the budget covers still
+    // materialises with its recorded length, not the backing
+    // allocation's.
+    let lit = "a".repeat(600000);
+    let src = format!(
+        "const RAW: &[u8; 600000] = b\"{lit}\"; const fn prefix(arr: &'static [u8; 600000]) -> &'static [u8] {{ unsafe {{ std::slice::from_raw_parts(arr.as_ptr(), 500000) }} }} const S: &[u8] = prefix(RAW); fn main() {{ println!(\"{{}} {{}}\", S.len(), S[499999]); }}"
+    );
+    let dir = temp_dir("fat-prefix-under-budget");
+    let src = fixture(&dir, "fat_prefix_under_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget fat-pointer prefix must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "500000 97\n",
+        "the recorded prefix length must be preserved"
+    );
+}
+
+#[test]
+fn run_mode_shared_tuple_byte_array_over_budget_stays_undecoded() {
+    // A table of references to one shared aggregate holding a
+    // 1 MiB byte array: each element's decode reaches the inline
+    // byte-array copy in `decode_const` through the tuple, so
+    // the copies are charged against the shared expansion
+    // budget and the table stays undecoded instead of
+    // materialising one 1 MiB copy per element.
+    let src = "static TABLE: [&([u8; 1048576], bool); 4] = [&([7; 1048576], true); 4]; fn main() { println!(\"{} {}\", TABLE[0].0[0], TABLE[3].1); }";
+    let dir = temp_dir("shared-tuple-byte-array-over-budget");
+    let src = fixture(&dir, "shared_tuple_byte_array_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared byte-array table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_shared_tuple_byte_array_under_budget_reads_back() {
+    // The same tuple-wrapped shape at a size the budget covers
+    // still materialises: an over-element-limit byte array
+    // reached through a shared reference table decodes as bytes.
+    let src = "static TABLE: [&([u8; 5000], bool); 3] = [&([9; 5000], true); 3]; fn main() { println!(\"{} {}\", TABLE[2].0[4999], TABLE[0].1); }";
+    let dir = temp_dir("shared-tuple-byte-array-under-budget");
+    let src = fixture(&dir, "shared_tuple_byte_array_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget shared byte-array table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "9 true\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_cstr_table_over_budget_stays_undecoded() {
+    // A table of references to one shared 1 MiB `CStr`: each
+    // element's decode reaches the `CStr` payload copy in
+    // `decode_adt`, so the copies are charged against the
+    // shared expansion budget and the table stays undecoded
+    // instead of materialising one 1 MiB copy per element.
+    let lit = "a".repeat(1048576);
+    let src = format!(
+        "use std::ffi::CStr; static BIG: &CStr = c\"{lit}\"; static TABLE: [&CStr; 5000] = [BIG; 5000]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[0].to_bytes().len()); }}"
+    );
+    let dir = temp_dir("cstr-table-over-budget");
+    let src = fixture(&dir, "cstr_table_over_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared CStr table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_cstr_table_under_budget_reads_back() {
+    // The same shared-`CStr` table shape at a size the budget
+    // covers still materialises and reads back exactly.
+    let lit = "b".repeat(4096);
+    let src = format!(
+        "use std::ffi::CStr; static BIG: &CStr = c\"{lit}\"; static TABLE: [&CStr; 100] = [BIG; 100]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[99].to_bytes().len()); }}"
+    );
+    let dir = temp_dir("cstr-table-under-budget");
+    let src = fixture(&dir, "cstr_table_under_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget shared CStr table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "100 4096\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_str_newtype_table_over_budget_stays_undecoded() {
+    // A table of references to one shared newtype over `str`:
+    // each element's decode copies the trailing `str` field's
+    // bytes, so the copies are charged against the shared
+    // expansion budget and the table stays undecoded.
+    let lit = "a".repeat(1048576);
+    let src = format!(
+        "struct MyStr(str); static S: &str = \"{lit}\"; static BIG: &MyStr = unsafe {{ std::mem::transmute::<&str, &MyStr>(S) }}; static TABLE: [&MyStr; 5000] = [BIG; 5000]; fn main() {{ println!(\"{{}} {{}}\", TABLE.len(), TABLE[0].0.len()); }}"
+    );
+    let dir = temp_dir("str-newtype-table-over-budget");
+    let src = fixture(&dir, "str_newtype_table_over_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared str-newtype table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_bytes_newtype_table_over_budget_stays_undecoded() {
+    // A table of references to one shared newtype over `[u8]`:
+    // each element's decode copies the trailing slice field's
+    // bytes, so the copies are charged against the shared
+    // expansion budget and the table stays undecoded.
+    let src = "struct MyBytes([u8]); static SLICE: &[u8] = &[7u8; 1048576]; static BIG: &MyBytes = unsafe { std::mem::transmute::<&[u8], &MyBytes>(SLICE) }; static TABLE: [&MyBytes; 5000] = [BIG; 5000]; fn main() { println!(\"{} {}\", TABLE.len(), TABLE[0].0.len()); }";
+    let dir = temp_dir("bytes-newtype-table-over-budget");
+    let src = fixture(&dir, "bytes_newtype_table_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget shared bytes-newtype table must stay undecoded; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_several_large_literals_each_decode() {
+    // Several string literals in one body, each comfortably
+    // under the expansion budget on its own: every root
+    // constant starts with a full budget, so all of them
+    // decode -- the third must not be rejected for what the
+    // first two spent.
+    let a = "a".repeat(400000);
+    let b = "a".repeat(400001);
+    let c = "a".repeat(400002);
+    let src = format!(
+        "fn main() {{ let s0 = \"{a}\"; let s1 = \"{b}\"; let s2 = \"{c}\"; println!(\"{{}} {{}} {{}}\", s0.len(), s1.len(), s2.len()); }}"
+    );
+    let dir = temp_dir("several-large-literals");
+    let src = fixture(&dir, "several_large_literals.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "each under-budget literal must decode; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "400000 400001 400002\n",
+        "decoded literal lengths must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_erased_pointer_pair_over_budget_stays_undecoded() {
+    // Two copies of one type-erased pointer (a `*const ()`
+    // denoting a 600,000-byte allocation) in one constant:
+    // each erased decode charges the allocation's bytes
+    // against the shared expansion budget, so the second
+    // copy does not fit. The constant must stay undecoded:
+    // falling back to the declared type's decode for the
+    // second copy would give it a reference to a unit value,
+    // so the two identical pointers would compare unequal
+    // (the run printed `eq=false` before this fix) and the
+    // second pointer's backing bytes would be lost.
+    let src = "static BIG: [u8; 600000] = [7; 600000]; struct Pair(*const (), *const ()); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(BIG.as_ptr() as *const (), BIG.as_ptr() as *const ()); fn main() { println!(\"eq={}\", PAIR.0 == PAIR.1); println!(\"b={}\", unsafe { *(PAIR.1 as *const u8) }); }";
+    let dir = temp_dir("erased-pointer-pair-over-budget");
+    let src = fixture(&dir, "erased_pointer_pair_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget erased pointer pair must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_erased_pointer_pair_under_budget_reads_back() {
+    // The same erased-pointer pair at a size whose two
+    // charges fit the shared budget: both copies decode as
+    // erased blocks, compare equal, and read back exactly.
+    let src = "static BIG: [u8; 400000] = [7; 400000]; struct Pair(*const (), *const ()); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(BIG.as_ptr() as *const (), BIG.as_ptr() as *const ()); fn main() { println!(\"eq={}\", PAIR.0 == PAIR.1); println!(\"b={}\", unsafe { *(PAIR.1 as *const u8) }); }";
+    let dir = temp_dir("erased-pointer-pair-under-budget");
+    let src = fixture(&dir, "erased_pointer_pair_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget erased pointer pair must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq=true\nb=7\n",
+        "decoded erased pointers must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_pair_over_budget_stays_undecoded() {
+    // Two `*mut u32` pointers to one field of a large static
+    // in one constant: building the static-reference seed for
+    // each pointer charges the whole 600,000-byte static
+    // against the shared expansion budget, so the second seed
+    // does not fit. The constant must stay undecoded: falling
+    // back to a snapshot of the pointee for the second pointer
+    // would detach it from the static's storage, so a write
+    // through the first pointer was not observed through the
+    // second (the run printed `v=1` before this fix; the
+    // native program prints `v=99`).
+    let src = "static mut S: ([u8; 600000], u32) = ([7; 600000], 1); struct Pair(*mut u32, *mut u32); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(unsafe { core::ptr::addr_of_mut!(S.1) }, unsafe { core::ptr::addr_of_mut!(S.1) }); fn main() { unsafe { *PAIR.0 = 99; println!(\"v={}\", *PAIR.1); } }";
+    let dir = temp_dir("static-ref-pair-over-budget");
+    let src = fixture(&dir, "static_ref_pair_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-budget static-ref pair must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_pair_under_budget_shares_storage() {
+    // The same static-field pointer pair at a size whose two
+    // seed charges fit the shared budget: both pointers decode
+    // as static references to the one storage, and a write
+    // through the first is observed through the second,
+    // exactly as in the native program.
+    let src = "static mut S: ([u8; 400000], u32) = ([7; 400000], 1); struct Pair(*mut u32, *mut u32); unsafe impl Sync for Pair {} static PAIR: Pair = Pair(unsafe { core::ptr::addr_of_mut!(S.1) }, unsafe { core::ptr::addr_of_mut!(S.1) }); fn main() { unsafe { *PAIR.0 = 99; println!(\"v={}\", *PAIR.1); } }";
+    let dir = temp_dir("static-ref-pair-under-budget");
+    let src = fixture(&dir, "static_ref_pair_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget static-ref pair must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "v=99\n",
+        "both pointers must denote the static's shared storage"
+    );
+}
+
+#[test]
+fn run_mode_uninit_scan_table_over_budget_stays_undecoded() {
+    // A 300-element table of references to one struct whose
+    // 16 MiB `MaybeUninit` payload is uninitialised and whose
+    // `bool` field is set: decoding each element's static seed
+    // scans the payload in full twice (once at the struct,
+    // whose scan runs to the one initialised field, and once
+    // at the payload itself), while the expansion budget
+    // spends only a few units per element. The scan budget
+    // (1 GiB of examinations per root constant) runs out
+    // after about thirty elements; the decode then loses the
+    // `Uninit` shortcut, the payload's structural decode
+    // charges its 16 MiB against the expansion budget, and
+    // the whole table stays undecoded -- in seconds, where
+    // the uncharged scan needed about 0.2 s per element
+    // (a 100,000-element table scanned terabytes in
+    // aggregate) and the table decoded.
+    let src = "#[repr(C)] struct S { payload: std::mem::MaybeUninit<[u8; 16777216]>, flag: bool } static S_VAL: S = S { payload: std::mem::MaybeUninit::uninit(), flag: true }; static TABLE: [&S; 300] = [&S_VAL; 300]; fn main() { println!(\"len={} flag={}\", TABLE.len(), TABLE[0].flag); }";
+    let dir = temp_dir("uninit-scan-table-over-budget");
+    let src = fixture(&dir, "uninit_scan_table_over_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a reference table whose repeated uninit scans exceed the scan budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_uninit_scan_table_under_budget_reads_back() {
+    // The same table at four elements: the repeated scans
+    // total about 128 MiB of examinations, well within the
+    // scan budget, so every element's seed decodes exactly as
+    // before and the run reads the flag back through the
+    // references.
+    let src = "#[repr(C)] struct S { payload: std::mem::MaybeUninit<[u8; 16777216]>, flag: bool } static S_VAL: S = S { payload: std::mem::MaybeUninit::uninit(), flag: true }; static TABLE: [&S; 4] = [&S_VAL; 4]; fn main() { println!(\"len={} flag={}\", TABLE.len(), TABLE[3].flag); }";
+    let dir = temp_dir("uninit-scan-table-under-budget");
+    let src = fixture(&dir, "uninit_scan_table_under_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget uninit-scan table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=4 flag=true\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_table_scan_exhaustion_stays_undecoded() {
+    // A 70,000-element table of pointers to the `flag` field
+    // of one static whose other two fields are 4 KiB
+    // uninitialised payloads. Building each element's static
+    // seed scans about 16 KiB (the struct's scan runs through
+    // both payloads to the one initialised field, and each
+    // payload is scanned again on its own), so the scan
+    // budget (1 GiB of examinations per root constant) runs
+    // out after about 65,000 elements, while the expansion
+    // budget spends only a few units per element (the
+    // payloads decode through the `Uninit` shortcut). Past
+    // exhaustion the payload's structural decode fails on an
+    // uninitialised byte -- an ordinary failure that set no
+    // budget flag -- and the static-reference fallback then
+    // substituted a snapshot of the flag for the remaining
+    // elements: those pointers no longer denoted the static's
+    // storage, and a write through the first was not observed
+    // through the last (the native program prints
+    // `last=true`). With scan exhaustion recorded alongside
+    // expansion exhaustion, the constant stays undecoded.
+    // Two payloads halve the element count at which
+    // exhaustion bites, keeping this test near ten seconds;
+    // the single-payload shape at 140,000 entries behaves
+    // identically.
+    let src = "#[repr(C)] struct S { a: std::mem::MaybeUninit<[u8; 4096]>, b: std::mem::MaybeUninit<[u8; 4096]>, flag: std::cell::Cell<bool> } unsafe impl Sync for S {} static S_VAL: S = S { a: std::mem::MaybeUninit::uninit(), b: std::mem::MaybeUninit::uninit(), flag: std::cell::Cell::new(false) }; struct Table([*const std::cell::Cell<bool>; 70000]); unsafe impl Sync for Table {} static TABLE: Table = Table([core::ptr::addr_of!(S_VAL.flag); 70000]); fn main() { unsafe { (*TABLE.0[0]).set(true); println!(\"last={}\", (*TABLE.0[69999]).get()); } }";
+    let dir = temp_dir("static-ref-table-scan-exhaustion");
+    let src = fixture(&dir, "static_ref_table_scan_exhaustion.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a static-ref table whose seed scans exhaust the scan budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_static_ref_table_scan_within_budget_shares_storage() {
+    // The same flag-pointer table at sixteen elements: the
+    // repeated seed scans total about 256 KiB of
+    // examinations, well within the scan budget, so every
+    // element decodes as a static reference to the one
+    // storage, and a write through the first is observed
+    // through the last, exactly as in the native program.
+    let src = "#[repr(C)] struct S { a: std::mem::MaybeUninit<[u8; 4096]>, b: std::mem::MaybeUninit<[u8; 4096]>, flag: std::cell::Cell<bool> } unsafe impl Sync for S {} static S_VAL: S = S { a: std::mem::MaybeUninit::uninit(), b: std::mem::MaybeUninit::uninit(), flag: std::cell::Cell::new(false) }; struct Table([*const std::cell::Cell<bool>; 16]); unsafe impl Sync for Table {} static TABLE: Table = Table([core::ptr::addr_of!(S_VAL.flag); 16]); fn main() { unsafe { (*TABLE.0[0]).set(true); println!(\"first={} last={}\", (*TABLE.0[0]).get(), (*TABLE.0[15]).get()); } }";
+    let dir = temp_dir("static-ref-table-scan-within-budget");
+    let src = fixture(&dir, "static_ref_table_scan_within_budget.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an under-budget static-ref table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=true last=true\n",
+        "both pointers must denote the static's shared storage"
+    );
+}
+
+#[test]
+fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
+    // One root constant -- a 21-element table of one-byte
+    // slices -- whose elements alternate between ten distinct
+    // 128 MiB statics and two 100 MiB promoted arrays, in an
+    // order that keeps evicting the promoted allocations from
+    // the backing-allocation caches. The two caches (promoted
+    // allocations, static initialisers) share one byte counter
+    // capped at 256 MiB; resetting that counter while dropping
+    // only the promoted-allocation cache left every cached
+    // static initialiser retained but unaccounted, and the
+    // driver's peak RSS grew to about 5.7 GiB. With both
+    // caches dropped together the peak stays near 3.4 GiB
+    // (the compiler itself holds one copy of each backing
+    // allocation). The decoded values must stay exact either
+    // way. The RSS bound is asserted on Linux only, from the
+    // child's VmHWM; elsewhere the run's output is the check.
+    let mut src = String::new();
+    for i in 1..=10 {
+        src.push_str(&format!(
+            "static S{i}: [u8; 134217728] = [{}; 134217728]; ",
+            10 + i
+        ));
+    }
+    src.push_str("const BIG1: [u8; 104857600] = [21; 104857600]; ");
+    src.push_str("const BIG2: [u8; 104857600] = [22; 104857600]; ");
+    let sl = |name: &str| format!("unsafe {{ std::slice::from_raw_parts({name}.as_ptr(), 1) }}");
+    let mut elems = vec![sl("S1"), sl("BIG1"), sl("BIG2")];
+    let mut m = 1;
+    for i in 2..=10 {
+        elems.push(sl(&format!("S{i}")));
+        elems.push(sl(&format!("BIG{m}")));
+        m = 3 - m;
+    }
+    src.push_str(&format!("static TABLE: [&[u8]; 21] = [{}]; ", elems.join(", ")));
+    src.push_str("fn main() { println!(\"{} {} {} {} {} {} {}\", TABLE[0][0], TABLE[3][0], TABLE[1][0], TABLE[2][0], TABLE[19][0], TABLE[20][0], TABLE.len()); }");
+    let dir = temp_dir("slice-table-cache-cap");
+    let src_path = fixture(&dir, "slice_table_cache_cap.rs", &src);
+    // Spawn with output redirected to files so the child's
+    // peak RSS can be polled from /proc while it runs.
+    let out_path = dir.join("stdout.txt");
+    let err_path = dir.join("stderr.txt");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src_path)
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("failed to run sparagmos-driver");
+    let pid = child.id();
+    let mut peak_kib: u64 = 0;
+    let status = loop {
+        #[cfg(target_os = "linux")]
+        if let Ok(proc_status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in proc_status.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Ok(kib) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
+                        peak_kib = peak_kib.max(kib);
+                    }
+                }
+            }
+        }
+        match child.try_wait().expect("failed to poll sparagmos-driver") {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let stdout = std::fs::read_to_string(&out_path).unwrap();
+    let stderr = std::fs::read_to_string(&err_path).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the slice table across large statics must run; stderr={stderr}"
+    );
+    assert_eq!(
+        stdout, "11 12 21 22 20 21 21\n",
+        "decoded slices must match the source program"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        peak_kib < 4_500 * 1024,
+        "peak RSS {peak_kib} KiB must stay bounded by the shared cache cap: \
+         cached static initialisers must not outlive their accounting"
+    );
+}
+
+#[test]
+fn run_mode_alternating_large_statics_table_over_work_budget_stays_undecoded() {
+    // A 40-element table of one-byte slices alternating between
+    // two 129 MiB statics. Together the two backings exceed the
+    // 256 MiB allocation-cache cap, so every element evicts the
+    // other static's initialiser and `eval_initializer`
+    // re-materialises it in full: the retained-bytes cap bounds
+    // what the caches hold, not the cumulative work, and the
+    // expansion budget sees only a few thousand units for the
+    // whole table. The materialisation-work budget charges each
+    // evaluation at its byte size, so the cumulative charge
+    // crosses it at about the thirty-second element and the
+    // root constant stays undecoded. (At 5,000 elements the
+    // same shape copies over 600 GiB; the within-budget
+    // alternating shape is covered by
+    // `run_mode_slice_table_across_large_statics_stays_within_cache_cap`.)
+    let mut src = String::new();
+    src.push_str("static A: [u8; 135266304] = [7; 135266304]; ");
+    src.push_str("static B: [u8; 135266304] = [9; 135266304]; ");
+    let mut elems = Vec::new();
+    for i in 0..40 {
+        let name = if i % 2 == 0 { "A" } else { "B" };
+        elems.push(format!(
+            "unsafe {{ std::slice::from_raw_parts({name}.as_ptr(), 1) }}"
+        ));
+    }
+    src.push_str(&format!("static TABLE: [&[u8]; 40] = [{}]; ", elems.join(", ")));
+    src.push_str(
+        "fn main() { println!(\"{} {} {} {}\", TABLE[0][0], TABLE[1][0], TABLE[39][0], TABLE.len()); }",
+    );
+    let dir = temp_dir("alternating-statics-work-budget");
+    let src = fixture(&dir, "alternating_statics_work_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a slice table whose alternating statics exhaust the materialisation-work budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
+fn run_mode_large_reference_table_reads_back() {
+    // A 400,000-element table of references to one promoted
+    // value: the table's allocation carries 400,000
+    // provenance entries, and each element's decode looks
+    // its entry up in the offset-sorted vector by binary
+    // search. A linear scan made this decode quadratic in
+    // the table length (on the order of 80 billion
+    // comparisons) and the run did not finish in reasonable
+    // time.
+    let src = "static TABLE: [&u32; 400000] = [&7; 400000]; fn main() { println!(\"{} {}\", TABLE[0], TABLE[399999]); }";
+    let dir = temp_dir("large-reference-table");
+    let src = fixture(&dir, "large_reference_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large reference table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_slice_table_into_shared_array_reads_requested_ranges() {
+    // Slices at different offsets into one shared backing
+    // array decode exactly the requested byte ranges: the
+    // fat-pointer decode reads `target.bytes` over the
+    // element's range only, so values at nonzero offsets and
+    // a slice ending at the backing's last byte come back
+    // byte-exact.
+    let src = "static BIG: [u8; 4096] = { let mut a = [0u8; 4096]; let mut i = 0; while i < 4096 { a[i] = (i % 251) as u8; i += 1; } a }; static TABLE: [&[u8]; 3] = unsafe { [std::slice::from_raw_parts(BIG.as_ptr(), 1), std::slice::from_raw_parts(BIG.as_ptr().add(100), 3), std::slice::from_raw_parts(BIG.as_ptr().add(4000), 96)] }; fn main() { println!(\"{} {} {} {}\", TABLE[0][0], TABLE[1][2], TABLE[2][95], TABLE[2].len()); }";
+    let dir = temp_dir("slice-table-ranges");
+    let src = fixture(&dir, "slice_table_ranges.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a slice table into a shared array must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0 102 79 96\n",
+        "slices must read back the requested ranges of the backing array"
+    );
+}
+
+#[test]
+fn run_mode_large_slice_table_into_shared_static_reads_back() {
+    // A 400,000-element table of one-byte slices into one
+    // promoted 16 MiB static: the expansion budget charges
+    // only the requested byte per element, but decoding used
+    // to materialise the whole backing allocation for every
+    // element (over 6 TB of transient copies in total), so
+    // the run could not finish. The static's initialiser is
+    // now evaluated once per root decode and each element
+    // reads only its requested range.
+    let src = "static BIG: [u8; 16777216] = [7; 16777216]; static TABLE: [&[u8]; 400000] = [unsafe { std::slice::from_raw_parts(BIG.as_ptr(), 1) }; 400000]; fn main() { println!(\"{} {} {}\", TABLE[0][0], TABLE[399999][0], TABLE.len()); }";
+    let dir = temp_dir("large-slice-table-static");
+    let src = fixture(&dir, "large_slice_table_static.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large slice table into a shared static must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7 400000\n",
+        "decoded slice values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_slice_table_into_shared_const_reads_back() {
+    // The same table shape with a `const` backing array: the
+    // elements resolve through the memory-allocation arm,
+    // whose materialisation is cached per root decode, so
+    // 1,000 elements into one 16 MiB allocation decode
+    // without re-materialising the backing per element.
+    let src = "const BIGC: [u8; 16777216] = [7; 16777216]; static TABLE: [&[u8]; 1000] = [unsafe { std::slice::from_raw_parts(BIGC.as_ptr(), 1) }; 1000]; fn main() { println!(\"{} {} {}\", TABLE[0][0], TABLE[999][0], TABLE.len()); }";
+    let dir = temp_dir("large-slice-table-const");
+    let src = fixture(&dir, "large_slice_table_const.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large slice table into a shared const must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 7 1000\n",
+        "decoded slice values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_pair_table_static() {
+    // Elements with a stride larger than the element payloads
+    // (a `(u16, u16)` pair): the presence check runs on the
+    // strided byte count, and each pair decodes structurally.
+    let elems: Vec<String> = (0..5000).map(|i| format!("({i}, {})", i * 2)).collect();
+    let src = format!(
+        "static TABLE: [(u16, u16); 5000] = [{}]; fn main() {{ println!(\"{{}} {{}} {{}} {{}}\", TABLE[0].0, TABLE[0].1, TABLE[4999].0, TABLE[4999].1); }}",
+        elems.join(", ")
+    );
+    let dir = temp_dir("large-pair-table");
+    let src = fixture(&dir, "large_pair_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large pair table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0 0 4999 9998\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_f64_table_static() {
+    // A static `f64` table past the bound, computed in a const
+    // block; the spot values are exact binary fractions, so the
+    // printed forms are stable.
+    let src = "static TABLE: [f64; 5000] = { let mut t = [0.0f64; 5000]; let mut i = 0usize; while i < 5000 { t[i] = (i as f64) * 0.5 - 3.0; i += 1; } t }; fn main() { println!(\"{} {} {}\", TABLE[0], TABLE[2500], TABLE[4999]); }";
+    let dir = temp_dir("large-f64-table");
+    let src = fixture(&dir, "large_f64_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large f64 table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-3 1247 2496.5\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_bool_table_static() {
+    // A 9,000-element `bool` table: one byte per element, so
+    // the allocation-presence check is what admits it past the
+    // element bound.
+    let src = "static TABLE: [bool; 9000] = { let mut t = [false; 9000]; let mut i = 0usize; while i < 9000 { t[i] = i % 3 == 0; i += 1; } t }; fn main() { let mut n = 0u32; for b in TABLE.iter() { if *b { n += 1; } } println!(\"{} {} {}\", n, TABLE[3], TABLE[4]); }";
+    let dir = temp_dir("large-bool-table");
+    let src = fixture(&dir, "large_bool_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large bool table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3000 true false\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_u32_table_nested_static() {
+    // The same table as a field of a struct static, behind a
+    // scalar field: the decode runs at a nonzero offset into
+    // the allocation, and the presence check accounts for it.
+    let src = "struct Wrap { tag: u32, table: [u32; 5000] } static W: Wrap = Wrap { tag: 77, table: { let mut t = [0u32; 5000]; let mut i = 0usize; while i < 5000 { t[i] = (i as u32) * 5 + 2; i += 1; } t } }; fn main() { println!(\"{} {} {}\", W.tag, W.table[0], W.table[4999]); }";
+    let dir = temp_dir("large-u32-table-nested");
+    let src = fixture(&dir, "large_u32_table_nested.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested large u32 table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "77 2 24997\n",
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_str_ref_table_static() {
+    // A 5,000-element table of references: each element
+    // decodes through its provenance entry, past the bound.
+    let src = "static NAMES: [&str; 5000] = [\"xy\"; 5000]; fn main() { let mut total = 0usize; for s in NAMES.iter() { total += s.len(); } println!(\"{} {}\", total, NAMES[4999]); }";
+    let dir = temp_dir("large-str-ref-table");
+    let src = fixture(&dir, "large_str_ref_table.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large str ref table must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10000 xy\n",
+        "decoded table values must match the source program"
+    );
+}
+
 #[test]
 fn run_mode_materialised_constant_shapes() {
     // Struct constants, a reference into the middle of an array

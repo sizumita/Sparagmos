@@ -27,7 +27,7 @@ use rustc_public::ty::{
     AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, AssocContainer, AssocKind, Binder,
     ClosureKind, ConstantKind, ExistentialPredicate, ExistentialProjection, ExistentialTraitRef,
     FloatTy as SmirFloatTy, FnDef, FnSig, GenericArgKind, GenericArgs, ImplDef,
-    IntTy as SmirIntTy, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
+    IntTy as SmirIntTy, Prov, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
     TyConstKind, TyKind, UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
@@ -636,6 +636,104 @@ pub struct Converter {
     /// rendered generic arguments).
     const_fn_mentions_seen:
         std::collections::HashSet<(rustc_public::DefId, String)>,
+    /// Expansion budget remaining for the constant currently
+    /// being decoded (see `MAX_CONST_TOTAL_ELEMS`): reset at the
+    /// root of every decoded constant (`const_from_alloc`, and
+    /// at the root of every `decode_const` / `decode_ref` tree
+    /// reached from one) and spent
+    /// once per `decode_const` call, so one constant's total
+    /// materialised size is bounded however its element counts
+    /// nest. Arms that copy a byte payload spend the copied
+    /// length as well: counting calls alone would let a repeated
+    /// reference to one shared byte block copy that block once
+    /// per element, unbounded by the call count.
+    const_budget: usize,
+    /// Set when a `spend_const_budget` charge does not fit.
+    /// Read by the erased-pointer fallback in `decode_ref`,
+    /// which clears it before attempting an erased decode and
+    /// checks it afterwards: a block that failed to build
+    /// because the budget ran out must fail the whole constant
+    /// rather than fall back to the declared type's decode
+    /// (see `decode_ref`).
+    const_budget_failed: bool,
+    /// Set when a `range_all_uninit` scan runs out of scan
+    /// budget before its outcome is decided. Read by the same
+    /// `decode_ref` fallbacks that read `const_budget_failed`,
+    /// which clear it before attempting a decode and check it
+    /// afterwards: a decode that failed after the scan budget
+    /// denied it the `Uninit` shortcut may have failed for
+    /// exactly that reason, so it must fail the whole constant
+    /// rather than fall back to a different value (see
+    /// `decode_ref`).
+    const_scan_failed: bool,
+    /// Scan budget remaining for the constant currently being
+    /// decoded (see `MAX_CONST_SCAN_BYTES`): reset wherever
+    /// `const_budget` resets, and spent by `range_all_uninit`
+    /// once per byte examined, so the uninitialised-range scan
+    /// at the head of `decode_const` -- the one decode step
+    /// whose cost tracks a range's byte size rather than the
+    /// materialised value -- stays bounded when one root
+    /// constant re-decodes a large partially initialised
+    /// pointee once per element. Exhaustion does not by itself
+    /// fail a decode: the scan reports "undecided" and the
+    /// structural decode proceeds, so a value the structural
+    /// decode can still build is never lost. What exhaustion
+    /// does record is `const_scan_failed`: when the structural
+    /// decode then fails anyway, the `decode_ref` fallbacks
+    /// cannot tell that failure apart from one the lost
+    /// shortcut caused, so they keep the constant undecoded
+    /// rather than substitute a snapshot (see `decode_ref`).
+    const_scan_budget: usize,
+    /// Set when a `spend_work_budget` charge does not fit.
+    /// Read by the same `decode_ref` fallbacks that read
+    /// `const_budget_failed`, and by the two materialisation
+    /// points (`resolve_alloc`, `static_initializer`) as a stop
+    /// signal: once the cumulative materialisation work for one
+    /// root constant is over budget, later materialisations in
+    /// the same decode tree are refused without being performed,
+    /// so an eviction-thrashing constant costs the budget, not
+    /// the budget times its element count. Unlike the other two
+    /// exhaustion flags it is also cleared wherever the budgets
+    /// refill: it is read outside the clear/check pairs, so a
+    /// stale set flag would refuse materialisations for unrelated
+    /// later constants (whether a constant decodes must not
+    /// depend on the constants visited before it).
+    const_work_failed: bool,
+    /// Materialisation-work budget remaining for the constant
+    /// currently being decoded (see `MAX_CONST_WORK_BYTES`):
+    /// reset wherever `const_budget` resets, and spent by
+    /// `resolve_alloc` / `static_initializer` once per backing
+    /// allocation actually materialised, at its byte size.
+    /// Cache hits spend nothing: the caches already bound how
+    /// much is *retained*, this budget bounds how much work is
+    /// *done*, which the retained-bytes cap cannot -- two
+    /// allocations that together exceed the cap evict each
+    /// other on every access, so each is re-materialised once
+    /// per element while almost nothing is ever retained.
+    const_work_budget: usize,
+    /// Materialised memory allocations by provenance id,
+    /// shared within one root constant's decode tree and
+    /// cleared wherever `const_budget` resets. Resolving a
+    /// pointer's target through rustc_public materialises the
+    /// whole allocation; a table of references into one shared
+    /// allocation reaches that resolution once per element, so
+    /// without the cache the materialisation alone costs the
+    /// backing size per element -- the same unbounded shape
+    /// the expansion budget exists to bound, one layer down.
+    /// Byte-capped (see `MAX_CACHED_ALLOC_BYTES`): past the
+    /// cap the cache is cleared rather than grown, so one
+    /// constant cannot pin every allocation it merely touches.
+    alloc_cache: std::collections::HashMap<usize, std::rc::Rc<Allocation>>,
+    /// Initialiser allocations of statics, keyed by the static's
+    /// Sparagmos def id: the static arm of `decode_ref` otherwise
+    /// re-evaluates (and thereby re-materialises) the initialiser for
+    /// every reference into the static, so a table of many short
+    /// slices into one large static pays the backing size per
+    /// element. Shares the byte cap and the root-clear discipline of
+    /// `alloc_cache` (see `clear_alloc_caches`).
+    static_inits: std::collections::HashMap<sm::DefId, std::rc::Rc<Allocation>>,
+    /// Total bytes held in `alloc_cache` and `static_inits`.
+    alloc_cache_bytes: usize,
 }
 
 impl Default for Converter {
@@ -3159,6 +3257,35 @@ fn instance_item_body(
     })
 }
 
+/// The outcome of probing a reference constant's allocation for
+/// the fat-pointer shape (see `Converter::read_fat_pointer`).
+/// A resolved provenance target (see `Converter::resolve_alloc`):
+/// a memory allocation, shared through the converter's cache,
+/// or any other global allocation in its bare form.
+enum ResolvedAlloc {
+    Memory(std::rc::Rc<Allocation>),
+    Other(mir::alloc::GlobalAlloc),
+    /// The target is a memory allocation whose materialisation
+    /// the work budget refused (see `MAX_CONST_WORK_BYTES`):
+    /// the decode that needed it fails, so the constant stays
+    /// undecoded rather than taking any fallback value.
+    Refused,
+}
+
+enum FatPointerRead {
+    /// Not a fat pointer: no provenance, a non-memory target, or
+    /// no readable in-bounds length word.
+    NotFat,
+    /// A fat pointer whose payload the remaining expansion
+    /// budget cannot pay for. The length metadata is known, so a
+    /// fallback that rereads the pointee without it would
+    /// silently change the constant's value.
+    OverBudget,
+    /// The pointee bytes (exactly the metadata's byte count)
+    /// and the metadata itself.
+    Data(Vec<u8>, u64),
+}
+
 impl Converter {
     pub fn new() -> Self {
         TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -3203,6 +3330,15 @@ impl Converter {
             const_closure_mentions_seen: std::collections::HashSet::new(),
             const_fn_mentions: Vec::new(),
             const_fn_mentions_seen: std::collections::HashSet::new(),
+            const_budget: MAX_CONST_TOTAL_ELEMS,
+            const_budget_failed: false,
+            const_scan_failed: false,
+            const_scan_budget: MAX_CONST_SCAN_BYTES,
+            const_work_failed: false,
+            const_work_budget: MAX_CONST_WORK_BYTES,
+            alloc_cache: std::collections::HashMap::new(),
+            static_inits: std::collections::HashMap::new(),
+            alloc_cache_bytes: 0,
         }
     }
 
@@ -3279,7 +3415,14 @@ impl Converter {
         if static_is_foreign(&def) {
             return;
         }
-        let Ok(alloc) = def.eval_initializer() else {
+        // Seeding decodes a root constant (the initializer is
+        // decoded at the root of `decode_const` just below), so
+        // the evaluation in `static_initializer` starts from a
+        // full materialisation-work budget rather than whatever
+        // an unrelated earlier constant left behind.
+        self.const_work_budget = MAX_CONST_WORK_BYTES;
+        self.const_work_failed = false;
+        let Some(alloc) = self.static_initializer(&def) else {
             return;
         };
         let Some(init) = self.decode_const(&ty, &alloc, 0, 0) else {
@@ -4803,6 +4946,20 @@ impl Converter {
         ty: &rustc_public::ty::Ty,
         alloc: &Allocation,
     ) -> sm::ConstValue {
+        // Every root constant starts with a full expansion
+        // budget (see `MAX_CONST_TOTAL_ELEMS`). The aggregate
+        // path below reaches a reset at the root of
+        // `decode_const` / `decode_ref`, but the scalar and
+        // reference paths do not: without a reset here, a
+        // reference constant's fat-pointer charge would spend
+        // whatever earlier constants in the same body left
+        // behind, so whether a constant decodes would depend
+        // on the constants visited before it.
+        self.const_budget = MAX_CONST_TOTAL_ELEMS;
+        self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+        self.const_work_budget = MAX_CONST_WORK_BYTES;
+        self.const_work_failed = false;
+        self.clear_alloc_caches();
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
         // `guarded_ty_kind`); the value is a zero-sized closure
@@ -4876,19 +5033,28 @@ impl Converter {
                     ty: float_ty(f),
                 })
             }
-            TyKind::RigidTy(RigidTy::Str) => match alloc.raw_bytes() {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => sm::ConstValue::Str(s),
+            TyKind::RigidTy(RigidTy::Str) => {
+                // The copy below materialises the allocation's
+                // bytes: charge them against the expansion
+                // budget, like every other byte-copying decode.
+                if !self.spend_const_budget(alloc.bytes.len()) {
+                    self.err("ConstantKind::Allocated (str over the expansion budget)");
+                    return sm::ConstValue::ZeroSized;
+                }
+                match alloc.raw_bytes() {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => sm::ConstValue::Str(s),
+                        Err(_) => {
+                            self.err("ConstantKind::Allocated (invalid UTF-8 str)");
+                            sm::ConstValue::ZeroSized
+                        }
+                    },
                     Err(_) => {
-                        self.err("ConstantKind::Allocated (invalid UTF-8 str)");
+                        self.err("ConstantKind::Allocated (unreadable str)");
                         sm::ConstValue::ZeroSized
                     }
-                },
-                Err(_) => {
-                    self.err("ConstantKind::Allocated (unreadable str)");
-                    sm::ConstValue::ZeroSized
                 }
-            },
+            }
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
                 self.ref_const(&inner, alloc)
             }
@@ -4911,22 +5077,137 @@ impl Converter {
         }
     }
 
+    /// Resolve the allocation provenance `prov` names. A
+    /// memory allocation is served from `alloc_cache` when
+    /// this decode tree has already materialised it, and is
+    /// recorded there when it fits the cache's byte cap;
+    /// anything else comes back as the bare `GlobalAlloc` for
+    /// the caller to match on. A materialisation is charged
+    /// against the materialisation-work budget (see
+    /// `MAX_CONST_WORK_BYTES`); when the charge does not fit,
+    /// the resolution is `Refused` and the decode that needed
+    /// it fails.
+    /// Drop both backing-allocation caches and reset their shared
+    /// byte accounting. Called wherever the constant-expansion
+    /// budget resets (the root of every decoded constant), so cached
+    /// materialisations live for one root decode.
+    fn clear_alloc_caches(&mut self) {
+        self.alloc_cache.clear();
+        self.static_inits.clear();
+        self.alloc_cache_bytes = 0;
+    }
+
+    /// The initialiser allocation of the static `def`, evaluated at
+    /// most once per root decode: `eval_initializer` materialises
+    /// the whole allocation on every call, so resolving each element
+    /// of a large table of references into one static through it
+    /// would copy the backing once per element. Each evaluation is
+    /// charged against the materialisation-work budget (see
+    /// `MAX_CONST_WORK_BYTES`): an evaluation repeated because the
+    /// cache evicted the initialiser is not free, so alternating
+    /// references into statics that together exceed the cache cap
+    /// stay bounded in cumulative work.
+    fn static_initializer(
+        &mut self,
+        def: &mir::mono::StaticDef,
+    ) -> Option<std::rc::Rc<Allocation>> {
+        let key = self.crate_def_id(def);
+        if let Some(alloc) = self.static_inits.get(&key) {
+            return Some(alloc.clone());
+        }
+        // Once this root constant's materialisation work is
+        // over budget, further evaluations are refused without
+        // being performed (see `const_work_failed`).
+        if self.const_work_failed {
+            return None;
+        }
+        let alloc = std::rc::Rc::new(def.eval_initializer().ok()?);
+        let len = alloc.bytes.len();
+        if !self.spend_work_budget(len) {
+            return None;
+        }
+        if self.alloc_cache_bytes + len > MAX_CACHED_ALLOC_BYTES {
+            self.clear_alloc_caches();
+        }
+        if len <= MAX_CACHED_ALLOC_BYTES {
+            self.alloc_cache_bytes += len;
+            self.static_inits.insert(key, alloc.clone());
+        }
+        Some(alloc)
+    }
+
+    fn resolve_alloc(&mut self, prov: &Prov) -> ResolvedAlloc {
+        let key = prov.0.to_index();
+        if let Some(alloc) = self.alloc_cache.get(&key) {
+            return ResolvedAlloc::Memory(alloc.clone());
+        }
+        // Once this root constant's materialisation work is
+        // over budget, further materialisations are refused
+        // without being performed (see `const_work_failed`).
+        if self.const_work_failed {
+            return ResolvedAlloc::Refused;
+        }
+        match mir::alloc::GlobalAlloc::from(prov.0) {
+            mir::alloc::GlobalAlloc::Memory(alloc) => {
+                let size = alloc.bytes.len();
+                if !self.spend_work_budget(size) {
+                    return ResolvedAlloc::Refused;
+                }
+                let alloc = std::rc::Rc::new(alloc);
+                if size <= MAX_CACHED_ALLOC_BYTES {
+                    if self.alloc_cache_bytes + size > MAX_CACHED_ALLOC_BYTES {
+                        // The byte counter covers both caches, so
+                        // resetting it must drop both: clearing only
+                        // this map would leave cached static
+                        // initialisers retained but unaccounted, and
+                        // they could then accumulate far past the cap
+                        // across one root decode.
+                        self.clear_alloc_caches();
+                    }
+                    self.alloc_cache_bytes += size;
+                    self.alloc_cache.insert(key, alloc.clone());
+                }
+                ResolvedAlloc::Memory(alloc)
+            }
+            other => ResolvedAlloc::Other(other),
+        }
+    }
+
+    /// The memory allocation provenance `prov` names, if it
+    /// names one (see `resolve_alloc`).
+    fn memory_alloc(&mut self, prov: &Prov) -> Option<std::rc::Rc<Allocation>> {
+        match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(alloc) => Some(alloc),
+            ResolvedAlloc::Other(_) => None,
+            ResolvedAlloc::Refused => None,
+        }
+    }
+
     /// Read a fat-pointer allocation: provenance points at the data
     /// allocation, the second word is the length metadata.
-    fn read_fat_pointer(&mut self, alloc: &Allocation) -> Option<(Vec<u8>, u64)> {
-        let (_, prov) = alloc.provenance.ptrs.first()?;
-        let target = mir::alloc::GlobalAlloc::from(prov.0);
-        let mir::alloc::GlobalAlloc::Memory(target) = target else {
-            return None;
+    fn read_fat_pointer(&mut self, alloc: &Allocation) -> FatPointerRead {
+        let Some((_, prov)) = alloc.provenance.ptrs.first() else {
+            return FatPointerRead::NotFat;
         };
-        let meta = alloc.read_partial_uint(8..16).ok()? as u64;
-        let raw = target.raw_bytes().ok()?;
+        let Some(target) = self.memory_alloc(prov) else {
+            return FatPointerRead::NotFat;
+        };
+        let Ok(meta) = alloc.read_partial_uint(8..16) else {
+            return FatPointerRead::NotFat;
+        };
+        let meta = meta as u64;
         // The data is exactly the metadata's byte count: the
         // backing allocation may extend past it (the file path
         // allocation behind a `Location` constant carries a
-        // trailing NUL byte, for one).
-        let data = raw.get(..meta as usize)?.to_vec();
-        Some((data, meta))
+        // trailing NUL byte, for one), so read only that range
+        // rather than copying the whole backing allocation.
+        let Some(data) = alloc_bytes_in(&target, 0..meta as usize) else {
+            return FatPointerRead::NotFat;
+        };
+        if !self.spend_const_budget(data.len()) {
+            return FatPointerRead::OverBudget;
+        }
+        FatPointerRead::Data(data, meta)
     }
 
     /// Constants of reference type. The allocation of a reference
@@ -4953,8 +5234,8 @@ impl Converter {
         // shortcut; every other shape falls through to the decoder
         // below (a raw-byte slice of wider or non-scalar elements
         // has no value form in the interpreter).
-        if let Some((data, meta)) = self.read_fat_pointer(alloc) {
-            match &inner_kind {
+        match self.read_fat_pointer(alloc) {
+            FatPointerRead::Data(data, meta) => match &inner_kind {
                 Some(TyKind::RigidTy(RigidTy::Str)) => {
                     return match String::from_utf8(data) {
                         Ok(s) => sm::ConstValue::Str(s),
@@ -4973,14 +5254,40 @@ impl Converter {
                     return sm::ConstValue::Slice { data, meta };
                 }
                 _ => {}
+            },
+            FatPointerRead::OverBudget => {
+                // The allocation is a fat pointer whose payload
+                // the expansion budget refused. The plain-pointee
+                // shortcuts below would read the whole backing
+                // allocation and silently replace the recorded
+                // length with the allocation's own, so a reference
+                // of one of those shapes keeps its exact `ByRef`
+                // identity (stays undecoded) instead. Other shapes
+                // have no such shortcut and fall through as
+                // before.
+                let drops_meta = match &inner_kind {
+                    Some(TyKind::RigidTy(RigidTy::Str)) => true,
+                    Some(TyKind::RigidTy(RigidTy::Slice(elem))) => matches!(
+                        elem.kind(),
+                        TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                    ),
+                    _ => false,
+                };
+                if drops_meta {
+                    if let Some((_, prov)) = alloc.provenance.ptrs.first() {
+                        return sm::ConstValue::ByRef {
+                            alloc_id: prov.0.to_index() as u64,
+                            offset: 0,
+                        };
+                    }
+                }
             }
+            FatPointerRead::NotFat => {}
         }
         // Thin-pointer shape: follow the provenance to the pointee.
         if let Some((_, prov)) = alloc.provenance.ptrs.first() {
             let alloc_id = prov.0.to_index() as u64;
-            if let mir::alloc::GlobalAlloc::Memory(pointee) =
-                mir::alloc::GlobalAlloc::from(prov.0)
-            {
+            if let Some(pointee) = self.memory_alloc(prov) {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
                     Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
@@ -5084,6 +5391,87 @@ impl Converter {
         }
     }
 
+    /// Charge `units` against the shared constant-expansion
+    /// budget (see `MAX_CONST_TOTAL_ELEMS`); `false` when the
+    /// charge does not fit, in which case the constant being
+    /// decoded stays undecoded. A failed charge also sets
+    /// `const_budget_failed`, so a caller that would otherwise
+    /// fall back to a different decode can tell budget
+    /// exhaustion apart from ordinary undecodability.
+    fn spend_const_budget(&mut self, units: usize) -> bool {
+        if units > self.const_budget {
+            self.const_budget_failed = true;
+            return false;
+        }
+        self.const_budget -= units;
+        true
+    }
+
+    /// Charge `units` against the materialisation-work budget
+    /// (see `MAX_CONST_WORK_BYTES`); `false` when the charge
+    /// does not fit, in which case the materialisation that
+    /// prompted it is refused and the constant being decoded
+    /// stays undecoded. A failed charge also sets
+    /// `const_work_failed`, so a caller that would otherwise
+    /// fall back to a different decode can tell work exhaustion
+    /// apart from ordinary undecodability, and later
+    /// materialisations in the same decode tree are refused
+    /// without being performed at all.
+    fn spend_work_budget(&mut self, units: usize) -> bool {
+        if units > self.const_work_budget {
+            self.const_work_failed = true;
+            return false;
+        }
+        self.const_work_budget -= units;
+        true
+    }
+
+    /// Whether every byte of `alloc` in `offset..offset + size`
+    /// is uninitialised, spending one unit of the scan budget
+    /// (see `MAX_CONST_SCAN_BYTES`) per byte examined. `None`
+    /// when the budget runs out before the outcome is decided:
+    /// the caller then decodes structurally, so exhaustion
+    /// costs only the `Uninit` shortcut, never a value the
+    /// structural decode could still build. The exhaustion is
+    /// recorded in `const_scan_failed` for the fallbacks in
+    /// `decode_ref`. The scan is the
+    /// one decode step whose cost is proportional to a range's
+    /// byte size rather than to the materialised value -- a
+    /// partially initialised pointee is scanned in full at the
+    /// aggregate (whose scan runs to its one initialised
+    /// field) and again at its uninitialised field -- so
+    /// without a budget of its own, a table repeating one such
+    /// reference scans the same megabytes once per element
+    /// while spending only a few expansion-budget units each
+    /// (a 100,000-element table of references to one struct
+    /// with a 16 MiB uninitialised payload scanned terabytes
+    /// in aggregate). Charging the scan against the expansion
+    /// budget instead would refuse single values outright:
+    /// one 16 MiB uninitialised buffer is a small constant
+    /// (an `Uninit` marker) whose one scan is unremarkable --
+    /// only the repetition is unbounded, and only a budget on
+    /// the examination itself bounds that.
+    fn range_all_uninit(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+        size: usize,
+    ) -> Option<bool> {
+        let range = alloc.bytes.get(offset..offset + size)?;
+        let mut examined = 0usize;
+        let all = range.iter().all(|b| {
+            examined += 1;
+            b.is_none()
+        });
+        if examined > self.const_scan_budget {
+            self.const_scan_budget = 0;
+            self.const_scan_failed = true;
+            return None;
+        }
+        self.const_scan_budget -= examined;
+        Some(all)
+    }
+
     /// Decode the value of type `ty` stored in `alloc` at `offset`
     /// into a structured constant. Aggregates are laid out with the
     /// type's own layout (`Ty::layout`), pointers are followed
@@ -5103,21 +5491,39 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
+        // One shared expansion budget per decoded constant
+        // (see `MAX_CONST_TOTAL_ELEMS`): the root call refills
+        // it and every call spends one unit, so the total
+        // materialised size is bounded even when declared
+        // element counts nest multiplicatively. Byte-copying
+        // arms spend the copied length against the same budget.
+        // A constant whose expansion exhausts it stays undecoded.
+        if depth == 0 {
+            self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+            self.const_work_budget = MAX_CONST_WORK_BYTES;
+            self.const_work_failed = false;
+            self.clear_alloc_caches();
+        }
+        if !self.spend_const_budget(1) {
+            return None;
+        }
         // A range whose bytes are all uninitialized is the
         // uninitialized value of this type (the payload of a
         // `MaybeUninit::uninit()` constant, at whichever nesting
         // level it appears). A partially initialized range falls
         // through to the structural decode below, which reads the
-        // initialized parts field by field.
+        // initialized parts field by field. The scan itself is
+        // charged against the scan budget (see
+        // `range_all_uninit`): a scan the budget cannot pay for
+        // is skipped, and the structural decode proceeds without
+        // the shortcut.
         if let Ok(layout) = ty.layout() {
             let size = layout.shape().size.bytes() as usize;
-            if size > 0
-                && offset + size <= alloc.bytes.len()
-                && alloc.bytes[offset..offset + size]
-                    .iter()
-                    .all(|b| b.is_none())
-            {
-                return Some(sm::ConstValue::Uninit);
+            if size > 0 && offset + size <= alloc.bytes.len() {
+                if let Some(true) = self.range_all_uninit(alloc, offset, size) {
+                    return Some(sm::ConstValue::Uninit);
+                }
             }
         }
         match ty.kind() {
@@ -5163,22 +5569,34 @@ impl Converter {
                 // A `str` value in non-reference position is the
                 // trailing unsized field of an ADT (a newtype over
                 // `str`): its bytes run to the end of the allocation.
-                let raw = alloc.raw_bytes().ok()?;
-                let bytes = raw.get(offset..)?;
-                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+                // The copy is charged against the shared expansion
+                // budget before it is made: a table of references
+                // to one shared value of such a type reaches this
+                // arm once per element, so uncharged copies would
+                // add up past the budget.
+                if !self.spend_const_budget(alloc.bytes.len().saturating_sub(offset)) {
+                    return None;
+                }
+                let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
+                String::from_utf8(bytes).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 // Likewise a slice in non-reference position is a
                 // trailing unsized field (the `[u8]` inside `CStr`
                 // is the canonical case): its elements run to the
                 // end of the allocation.
-                let raw = alloc.raw_bytes().ok()?;
-                let bytes = raw.get(offset..)?;
+                let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
                 if matches!(
                     elem.kind(),
                     TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                 ) {
-                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                    // Charged like the `str` arm above: the tail
+                    // copy spends its length against the shared
+                    // expansion budget.
+                    if !self.spend_const_budget(bytes.len()) {
+                        return None;
+                    }
+                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
                 if stride == 0 || bytes.len() % stride != 0 {
@@ -5209,36 +5627,69 @@ impl Converter {
                 };
                 if layout_count != count { return None; }
                 if count > MAX_CONST_ARRAY_ELEMS {
-                    // Past the element-wise bound, a byte array
-                    // still materialises -- as the raw bytes
-                    // themselves, the form byte arrays take in
-                    // reference position (and byte slices take in
-                    // value position above). The `Bytes` value's
-                    // size is bounded by the allocation, which
-                    // the host already holds, so the resource
+                    // Past the element-wise bound, an array still
+                    // materialises when its elements are provably
+                    // present in the allocation: a byte array as
+                    // the raw bytes themselves -- the form byte
+                    // arrays take in reference position, and byte
+                    // slices in value position above -- and any
+                    // other element type element by element,
+                    // exactly as under the bound. The resource
                     // concern behind the bound -- a declared
                     // length decoupled from the allocation,
                     // expanded into one constant per element --
-                    // does not apply. Any other element type
-                    // keeps the bound and stays undecoded.
-                    if stride.bytes() != 1
-                        || !matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
+                    // is answered by the presence check itself:
+                    // the element-wise decode below only runs
+                    // when `count * stride` bytes lie inside the
+                    // allocation from `offset`, so the work is
+                    // bounded by bytes the host already holds.
+                    // A zero stride proves nothing about the
+                    // count, so zero-sized elements keep the
+                    // bound and stay undecoded. Zero-sized
+                    // descendants of a nonzero-stride element
+                    // are not bounded by the byte count either;
+                    // the shared expansion budget spent by
+                    // every recursive decode bounds those (see
+                    // `MAX_CONST_TOTAL_ELEMS`).
+                    if stride.bytes() == 1
+                        && matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
                     {
+                        // The copy materialises `count` bytes:
+                        // charge them against the shared expansion
+                        // budget before allocating, like the
+                        // byte-copying arms of `decode_ref` do.
+                        // The presence check above bounds one
+                        // decode by the allocation, but a table of
+                        // references to one shared array reaches
+                        // this arm once per element, so without
+                        // the charge the copies add up past the
+                        // budget.
+                        if !self.spend_const_budget(count as usize) {
+                            return None;
+                        }
+                        // Read the array's own byte range, not
+                        // the whole allocation: a static's
+                        // storage is routinely padded past the
+                        // value with uninitialised bytes, which
+                        // must not fail the decode -- but an
+                        // uninitialised byte inside the array
+                        // does.
+                        let end = offset.checked_add(count as usize)?;
+                        let range = alloc.bytes.get(offset..end)?;
+                        let mut bytes = Vec::with_capacity(count as usize);
+                        for byte in range {
+                            bytes.push((*byte)?);
+                        }
+                        return Some(sm::ConstValue::Bytes(bytes));
+                    }
+                    let stride_bytes = stride.bytes();
+                    if stride_bytes == 0 {
                         return None;
                     }
-                    // Read the array's own byte range, not the
-                    // whole allocation: a static's storage is
-                    // routinely padded past the value with
-                    // uninitialised bytes, which must not fail
-                    // the decode -- but an uninitialised byte
-                    // inside the array does.
-                    let end = offset.checked_add(count as usize)?;
-                    let range = alloc.bytes.get(offset..end)?;
-                    let mut bytes = Vec::with_capacity(count as usize);
-                    for byte in range {
-                        bytes.push((*byte)?);
+                    let total = (count as u128).checked_mul(stride_bytes as u128)?;
+                    if offset as u128 + total > alloc.bytes.len() as u128 {
+                        return None;
                     }
-                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let mut elems = Vec::new();
                 for i in 0..count {
@@ -5320,8 +5771,16 @@ impl Converter {
             // the `&[u8]` casts its own methods perform) — so
             // decode them as the byte string they are, like the
             // `[u8]` trailing-slice decode below.
-            let raw = alloc.raw_bytes().ok()?;
-            let bytes = raw.get(offset..)?.to_vec();
+            let bytes = alloc_bytes_in(alloc, offset..alloc.bytes.len())?;
+            // The payload copy is charged against the shared
+            // expansion budget: a table of references to one
+            // shared `CStr` reaches this arm once per element,
+            // so uncharged copies would add up past the budget.
+            // Only the tail from `offset` is copied, not the
+            // whole allocation before it.
+            if !self.spend_const_budget(bytes.len()) {
+                return None;
+            }
             return Some(sm::ConstValue::Adt {
                 variant: 0,
                 fields: vec![sm::ConstValue::Bytes(bytes)],
@@ -5423,11 +5882,7 @@ impl Converter {
                             // another variant (the `Option<&T>` case:
                             // a non-null pointer reads back as
                             // offset 0 in its target allocation).
-                            let has_prov = alloc
-                                .provenance
-                                .ptrs
-                                .iter()
-                                .any(|(o, _)| *o as usize == offset + tag_off);
+                            let has_prov = prov_at(alloc, offset + tag_off).is_some();
                             let idx = if !has_prov
                                 && raw >= *niche_start
                                 && raw - *niche_start <= (end - start) as u128
@@ -5494,11 +5949,7 @@ impl Converter {
         // payload fields overlap its bytes and decode as
         // uninitialized (they are not the live field, and reading
         // them would reinterpret the pointer's representation).
-        let prov_at_offset = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .any(|(at, _)| *at as usize == offset);
+        let prov_at_offset = prov_at(alloc, offset).is_some();
         if prov_at_offset {
             let ptr_fields: Vec<usize> = fields
                 .iter()
@@ -5949,7 +6400,11 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let bytes = alloc.bytes.get(offset..)?.to_vec();
+        let tail = alloc.bytes.get(offset..)?;
+        if !self.spend_const_budget(tail.len()) {
+            return None;
+        }
+        let bytes = tail.to_vec();
         let mut relocs = Vec::new();
         for (o, _) in &alloc.provenance.ptrs {
             let o = *o as usize;
@@ -5979,12 +6434,8 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset);
-        let Some((_, prov)) = prov else {
+        let prov = prov_at(alloc, offset);
+        let Some(prov) = prov else {
             let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
             if addr == 0 {
                 return Some(sm::ConstValue::NullPtr);
@@ -5992,27 +6443,35 @@ impl Converter {
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
-        match mir::alloc::GlobalAlloc::from(prov.0) {
-            mir::alloc::GlobalAlloc::Memory(target) => {
+        match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(target) => {
                 let block = self.decode_erased_alloc(&target, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
-            mir::alloc::GlobalAlloc::Static(def) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
                 if static_is_foreign(&def) {
                     return None;
                 }
-                let init = def.eval_initializer().ok()?;
+                let init = self.static_initializer(&def)?;
                 let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
-            mir::alloc::GlobalAlloc::Function(inst) => self.fn_pointer_value(&inst),
-            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Function(inst)) => {
+                self.fn_pointer_value(&inst)
+            }
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::TypeId { ty: tid_ty }) => {
                 let (lo, _) = type_id_segments(&tid_ty);
                 Some(sm::ConstValue::IntPtr(lo))
             }
-            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
                 Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)))
             }
+            // `resolve_alloc` returns memory allocations in
+            // the `Memory` variant, never wrapped in `Other`.
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => None,
+            // The work budget refused the materialisation:
+            // the constant stays undecoded.
+            ResolvedAlloc::Refused => None,
         }
     }
 
@@ -6071,11 +6530,7 @@ impl Converter {
         alloc: &Allocation,
         offset: usize,
     ) -> Option<sm::ConstValue> {
-        let (_, prov) = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset)?;
+        let prov = prov_at(alloc, offset)?;
         let mir::alloc::GlobalAlloc::Function(inst) =
             mir::alloc::GlobalAlloc::from(prov.0)
         else {
@@ -6240,6 +6695,13 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
+        if depth == 0 {
+            self.const_budget = MAX_CONST_TOTAL_ELEMS;
+            self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+            self.const_work_budget = MAX_CONST_WORK_BYTES;
+            self.const_work_failed = false;
+            self.clear_alloc_caches();
+        }
         // A pointee type passing through a coroutine-closure
         // type cannot be asked its kind (see `guarded_ty_kind`)
         // and has no decodable value form; the caller keeps the
@@ -6254,12 +6716,8 @@ impl Converter {
         if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
             return self.decode_dyn_ref(inner, alloc, offset, depth);
         }
-        let prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset);
-        let Some((_, prov)) = prov else {
+        let prov = prov_at(alloc, offset);
+        let Some(prov) = prov else {
             // No provenance at the pointer slot: a stored
             // zero word is a null pointer (Lane CK). A
             // nonzero word is a dangling address from
@@ -6290,8 +6748,8 @@ impl Converter {
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
-        let (target, static_def) = match mir::alloc::GlobalAlloc::from(prov.0) {
-            mir::alloc::GlobalAlloc::Memory(target) => (target, None),
+        let (target, static_def) = match self.resolve_alloc(prov) {
+            ResolvedAlloc::Memory(target) => (target, None),
             // A reference to a static: the pointee is the static's
             // own storage. The decoded value is the static's
             // initializer allocation (the value the storage holds
@@ -6299,12 +6757,12 @@ impl Converter {
             // static's identity so the interpreter can route reads
             // and writes through the program-level statics store
             // instead of a per-constant snapshot.
-            mir::alloc::GlobalAlloc::Static(def) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
                 if static_is_foreign(&def) {
                     return self
                         .decode_foreign_static_ref(&def, inner, alloc, offset, target_off, depth);
                 }
-                let init = def.eval_initializer().ok()?;
+                let init = self.static_initializer(&def)?;
                 (init, Some(def))
             }
             // A pointer at a function item: the item is zero-sized,
@@ -6312,10 +6770,10 @@ impl Converter {
             // covers both references to function items reached
             // through pointer-typed fields and pointers to functions
             // stored under a cast (`&(foo as *const u8)`).
-            mir::alloc::GlobalAlloc::Function(inst) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Function(inst)) => {
                 return self.fn_pointer_value(&inst);
             }
-            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::TypeId { ty: tid_ty }) => {
                 // A `TypeId` value is a 128-bit hash of the type,
                 // stored as two pointer-sized segments whose first
                 // segment's provenance is this symbolic allocation.
@@ -6343,8 +6801,18 @@ impl Converter {
             // equality / ordering, `ptr::eq` on trait objects), so
             // it decodes to a stable identity number for the
             // (concrete type, trait) pair.
-            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
                 return Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)));
+            }
+            // `resolve_alloc` returns memory allocations in
+            // the `Memory` variant, never wrapped in `Other`.
+            ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => {
+                return None;
+            }
+            // The work budget refused the materialisation:
+            // the constant stays undecoded.
+            ResolvedAlloc::Refused => {
+                return None;
             }
         };
         match inner.kind() {
@@ -6354,9 +6822,11 @@ impl Converter {
                 // slot), as for the slice arm below: the backing
                 // allocation may extend past the string.
                 let len = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
-                let raw = target.raw_bytes().ok()?;
-                let bytes = raw.get(target_off..target_off + len)?;
-                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+                let bytes = alloc_bytes_in(&target, target_off..target_off + len)?;
+                if !self.spend_const_budget(bytes.len()) {
+                    return None;
+                }
+                String::from_utf8(bytes).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
@@ -6374,9 +6844,11 @@ impl Converter {
                     }
                 }
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
-                    let raw = target.raw_bytes().ok()?;
-                    let bytes = raw.get(target_off..target_off + count)?;
-                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                    let bytes = alloc_bytes_in(&target, target_off..target_off + count)?;
+                    if !self.spend_const_budget(bytes.len()) {
+                        return None;
+                    }
+                    return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
                 if stride == 0 && count > 0 { return None; }
@@ -6396,9 +6868,11 @@ impl Converter {
             {
                 // Byte arrays keep the established `Bytes` form (the
                 // fmt pieces template is the canonical case).
-                let raw = target.raw_bytes().ok()?;
-                let bytes = raw.get(target_off..)?;
-                Some(sm::ConstValue::Bytes(bytes.to_vec()))
+                let bytes = alloc_bytes_in(&target, target_off..target.bytes.len())?;
+                if !self.spend_const_budget(bytes.len()) {
+                    return None;
+                }
+                Some(sm::ConstValue::Bytes(bytes))
             }
             _ => {
                 // A type-erased pointee: the declared type is
@@ -6409,20 +6883,70 @@ impl Converter {
                 // only by the casts the guest later performs.
                 // Preserve the allocation exactly so those casts
                 // can materialise it (see `decode_erased_alloc`);
-                // when the block cannot be built, the declared
-                // type's decode below stands.
+                // when the block cannot be built for an ordinary
+                // reason, the declared type's decode below
+                // stands; when the expansion budget ran out, the
+                // constant stays undecoded instead.
                 if self.pointee_is_erased(inner, &target, target_off) {
+                    // A block that cannot be built because the
+                    // expansion budget -- or the scan budget,
+                    // whose exhaustion can equally deny a decode
+                    // its `Uninit` shortcut, or the work budget,
+                    // whose exhaustion can equally refuse a
+                    // backing allocation the decode needs -- ran
+                    // out must not fall
+                    // back to the declared type's decode below:
+                    // that decode names the zero-sized declared
+                    // type, so the constant would hold a
+                    // reference to a unit value where the source
+                    // holds the whole allocation -- and a
+                    // second, identical pointer in the same
+                    // constant that did decode would compare
+                    // unequal to it. An ordinary failure to
+                    // build the block (a relocation that cannot
+                    // be decoded type-free) keeps the declared
+                    // decode, as before.
+                    self.const_budget_failed = false;
+                    self.const_scan_failed = false;
+                    self.const_work_failed = false;
                     if let Some(block) =
                         self.decode_erased_alloc(&target, target_off, depth + 1)
                     {
                         return Some(sm::ConstValue::Ref(Box::new(block)));
                     }
+                    if self.const_budget_failed || self.const_scan_failed || self.const_work_failed
+                    {
+                        return None;
+                    }
                 }
                 if let Some(def) = &static_def {
+                    // A static seed that cannot be built because the
+                    // expansion budget -- or the scan budget,
+                    // whose exhaustion can equally deny the seed
+                    // decode its `Uninit` shortcut, or the work
+                    // budget, whose exhaustion can equally refuse
+                    // a backing allocation the decode needs -- ran
+                    // out must not fall back to
+                    // the snapshot decode below: the snapshot names
+                    // only the pointee's current value, so the
+                    // pointer loses the static's identity -- a
+                    // second, identical pointer in the same constant
+                    // that did decode as a static reference would
+                    // not share storage with it, and writes through
+                    // one would not be observed through the other.
+                    // An ordinary failure to determine the
+                    // projection keeps the snapshot, as before.
+                    self.const_budget_failed = false;
+                    self.const_scan_failed = false;
+                    self.const_work_failed = false;
                     if let Some(c) =
                         self.decode_static_ref(def, inner, &target, target_off, depth)
                     {
                         return Some(c);
+                    }
+                    if self.const_budget_failed || self.const_scan_failed || self.const_work_failed
+                    {
+                        return None;
                     }
                 }
                 // A byte-sized pointee whose target allocation
@@ -6443,10 +6967,13 @@ impl Converter {
                             | RigidTy::Bool
                     )
                 ) {
-                    if let Ok(raw) = target.raw_bytes() {
-                        if raw.len() > target_off + 1 {
+                    if let Some(raw) = alloc_bytes_in(&target, target_off..target.bytes.len()) {
+                        if raw.len() > 1 {
+                            if !self.spend_const_budget(raw.len()) {
+                                return None;
+                            }
                             return Some(sm::ConstValue::Ref(Box::new(
-                                sm::ConstValue::Bytes(raw[target_off..].to_vec()),
+                                sm::ConstValue::Bytes(raw),
                             )));
                         }
                     }
@@ -6479,11 +7006,7 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let vtable_prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .find(|(o, _)| *o as usize == offset + PTR_SIZE);
+        let vtable_prov = prov_at(alloc, offset + PTR_SIZE);
         let Some(vtable_prov) = vtable_prov else {
             // No vtable provenance: the pointer's dispatch
             // identity is unknowable. A data word that names an
@@ -6492,11 +7015,7 @@ impl Converter {
             // (or null) value a thin pointer decodes to -- a
             // dangling fat pointer minted from raw integers,
             // whose only observable property is its address.
-            let has_data_prov = alloc
-                .provenance
-                .ptrs
-                .iter()
-                .any(|(o, _)| *o as usize == offset);
+            let has_data_prov = prov_at(alloc, offset).is_some();
             if has_data_prov {
                 return None;
             }
@@ -6508,7 +7027,7 @@ impl Converter {
             });
         };
         let mir::alloc::GlobalAlloc::VTable(concrete_ty, _) =
-            mir::alloc::GlobalAlloc::from(vtable_prov.1.0)
+            mir::alloc::GlobalAlloc::from(vtable_prov.0)
         else {
             return None;
         };
@@ -6523,11 +7042,7 @@ impl Converter {
         // reference when the pointee is a static's storage, a
         // snapshot otherwise). A data word with no provenance is
         // a null or dangling address, as for a thin pointer.
-        let has_data_prov = alloc
-            .provenance
-            .ptrs
-            .iter()
-            .any(|(o, _)| *o as usize == offset);
+        let has_data_prov = prov_at(alloc, offset).is_some();
         let base = if has_data_prov {
             self.decode_ref(&concrete_ty, alloc, offset, depth + 1)?
         } else {
@@ -8428,13 +8943,78 @@ const MAX_CONST_DEPTH: usize = 32;
 /// Resource bound on array constants materialised element by
 /// element in `decode_const`, mirroring `unique_const_value`'s
 /// bound: an array length is guest-controlled input (`[(); usize::MAX]`
-/// is a legal constant whose allocation is empty), and past this
-/// many elements the value is not materialised element by element
-/// — the decode fails and reference constants keep their `ByRef`
+/// is a legal constant whose allocation is empty), so past this
+/// many elements the decode only proceeds when the elements are
+/// provably present in the allocation — the expansion is then
+/// bounded by bytes the host already holds, not by the declared
+/// length. Arrays that fail that check (and zero-sized-element
+/// arrays, whose bytes prove nothing) keep their `ByRef`
 /// identity instead of the host process aborting on allocation.
-/// Byte arrays are the one exception: they materialise as the
-/// raw `Bytes` value, whose size is the allocation's own.
+/// Byte arrays materialise as the raw `Bytes` value, whose size
+/// is the allocation's own.
 const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
+
+/// Total number of values one constant's materialisation may
+/// produce, summed over every nesting level. The per-array
+/// bound and the over-bound presence check bound a single
+/// array by its own declared length or by the bytes backing
+/// it, but neither bounds the product over nested arrays: an
+/// element type with a nonzero stride can contain zero-sized
+/// arrays whose declared lengths multiply without occupying
+/// allocation bytes -- a `[([[(); 4096]; 4096], bool); 5000]`
+/// static is 5,000 bytes of storage whose element-wise decode
+/// would produce tens of billions of values. The shared
+/// budget spent by every recursive decode answers that: a
+/// constant whose expansion exceeds it stays undecoded, the
+/// same fallback as any other undecodable constant.
+/// Byte-copying arms spend the copied length against it too,
+/// so repeated references to one shared byte block cannot
+/// multiply that block's copies past the budget either.
+const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
+
+/// Work budget for the uninitialised-range scan at the head
+/// of `decode_const` (see `Converter::range_all_uninit`):
+/// bytes of allocation the scan may examine while decoding
+/// one root constant. A single value's own scans total a
+/// small multiple of its allocation size -- its ranges nest,
+/// and each level's scan stops at the first initialised
+/// byte -- so any one value fits easily; the budget exists
+/// for repetition, where one root constant re-decodes the
+/// same large partially initialised pointee once per element
+/// and every re-decode scans it in full. One gibibyte of
+/// examinations bounds that repetition to seconds while
+/// leaving single values of any realistic size untouched.
+const MAX_CONST_SCAN_BYTES: usize = 1 << 30;
+
+/// Work budget for backing-allocation materialisation while
+/// decoding one root constant (see
+/// `Converter::spend_work_budget`): bytes of allocation the
+/// converter may materialise -- through `eval_initializer`
+/// for statics, through the provenance resolution for memory
+/// allocations -- summed over the whole decode, however often
+/// an allocation is re-materialised. The allocation caches
+/// bound what is *retained* at any one time, but retention is
+/// not work: two statics of 129 MiB each, referenced
+/// alternately by one table of one-byte slices, together
+/// exceed the 256 MiB cache cap, so every element evicts the
+/// other static's initialiser and re-materialises it in full
+/// -- a 5,000-element table copies over 600 GiB while
+/// spending only a few thousand expansion-budget units.
+/// Charging each materialisation at its byte size bounds the
+/// cumulative work instead: cache hits are free, a single
+/// large backing is paid for once, and only
+/// re-materialisation spends again. Four gibibytes leaves the
+/// largest measured legitimate shape -- a 21-element table
+/// alternating ten 128 MiB statics and two 100 MiB promoted
+/// arrays, about 2.4 GiB of cumulative materialisation under
+/// the same eviction pattern -- comfortably inside, while a
+/// thrashing root constant stays undecoded after about
+/// thirty re-materialisations instead of five thousand.
+const MAX_CONST_WORK_BYTES: usize = 1 << 32;
+
+/// Cap on the total bytes held in the converter's per-constant
+/// allocation cache (see `Converter::alloc_cache`).
+const MAX_CACHED_ALLOC_BYTES: usize = 1 << 28;
 
 /// Pointer width in bytes on the target this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
@@ -8506,6 +9086,40 @@ fn vtable_id(
 }
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
+/// The provenance recorded for the pointer slot at
+/// `offset` in `alloc`, if any. rustc_public builds
+/// `Allocation::provenance.ptrs` from the compiler's
+/// provenance map, which iterates in offset order, so the
+/// vector is sorted by offset and the entry is found by
+/// binary search. The linear scan this replaces made
+/// decoding a large reference table quadratic in its
+/// length: every element's lookup rescanned the table's
+/// provenance from the start (a 400,000-element table
+/// needed on the order of 80 billion comparisons).
+fn prov_at(alloc: &Allocation, offset: usize) -> Option<&Prov> {
+    let ptrs = &alloc.provenance.ptrs;
+    let idx = ptrs.partition_point(|(o, _)| *o < offset);
+    ptrs.get(idx)
+        .filter(|(o, _)| *o == offset)
+        .map(|(_, prov)| prov)
+}
+
+/// Collect the bytes of `alloc` in `range` into a fresh
+/// vector, failing when the range is out of bounds or any
+/// byte inside it is uninitialised. Unlike
+/// `Allocation::raw_bytes`, which copies the whole
+/// allocation and fails on any uninitialised byte anywhere
+/// in it, this reads only the requested range: a fat pointer
+/// into a large shared allocation -- one element of a big
+/// table of short slices into one promoted array -- must
+/// not copy the entire backing allocation per element (a
+/// 400,000-element table of one-byte slices into a 16 MiB
+/// array copied terabytes in aggregate while charging only
+/// the one-byte results against the expansion budget).
+fn alloc_bytes_in(alloc: &Allocation, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
+    alloc.bytes.get(range)?.iter().copied().collect()
+}
+
 fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {
     if size == 0 || size > 16 {
         return None;
