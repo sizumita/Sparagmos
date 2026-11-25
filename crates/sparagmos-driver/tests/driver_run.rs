@@ -36684,6 +36684,104 @@ fn run_mode_str_pattern_predicate_drops_by_value_captures() {
     );
 }
 
+const STR_PATTERN_PRED_ZST_DROP_SRC: &str = r#"
+struct Bad;
+impl Drop for Bad {
+    fn drop(&mut self) {
+        println!("bad dtor runs");
+    }
+}
+struct Bad2;
+impl Drop for Bad2 {
+    fn drop(&mut self) {
+        println!("bad2 dtor runs");
+    }
+}
+struct Plain;
+
+fn main() {
+    // single all-ZST capture
+    let bad = Bad;
+    let pred = move |_: char| {
+        let _ = &bad;
+        false
+    };
+    println!("single: {}", "ab".contains(pred));
+    // tuple capture
+    let t = (Bad,);
+    let pred = move |_: char| {
+        let _ = &t;
+        false
+    };
+    println!("tuple: {}", "ab".contains(pred));
+    // two distinct ZST captures
+    let a = Bad;
+    let b = Bad2;
+    let pred = move |_: char| {
+        let _ = &a;
+        let _ = &b;
+        true
+    };
+    println!("pair: {}", "ab".contains(pred));
+    // starts_with / ends_with
+    let bad = Bad;
+    let pred = move |_: char| {
+        let _ = &bad;
+        true
+    };
+    println!("starts: {}", "ab".starts_with(pred));
+    let bad = Bad;
+    let pred = move |_: char| {
+        let _ = &bad;
+        true
+    };
+    println!("ends: {}", "ab".ends_with(pred));
+    // empty haystack: never invoked, still dropped
+    let bad = Bad;
+    let pred = move |_: char| {
+        let _ = &bad;
+        true
+    };
+    println!("empty: {}", "".contains(pred));
+    // panicking predicate: dropped by the callee's cleanup
+    let bad = Bad;
+    let pred = move |_: char| -> bool {
+        let _ = &bad;
+        panic!("boom")
+    };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| "ab".contains(pred)));
+    println!("panic caught: {}", r.is_err());
+    // ZST captures without Drop: nothing to run
+    let p = Plain;
+    let pred = move |_: char| {
+        let _ = &p;
+        true
+    };
+    println!("plain: {}", "ab".contains(pred));
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_drops_all_zst_captures() {
+    // A by-value predicate whose captures are all zero-sized
+    // travels as a constant operand, whose type the operand
+    // itself does not preserve: conversion built the call's
+    // `consumed_glue` from the operand's place type alone, so
+    // no glue was attached and the handed-back predicate was
+    // never dropped -- its captures' destructors silently
+    // never ran, on the success path and the unwind path
+    // alike. (A single non-ZST capture made the predicate a
+    // place operand, which is why mixed captures behaved.)
+    // The glue now falls back to the pattern type the
+    // callee's generic arguments name, as `mem_drop_glue`
+    // does for the dropped type.
+    run_ok(
+        "str-pattern-pred-zst-drop",
+        STR_PATTERN_PRED_ZST_DROP_SRC,
+        "bad dtor runs\nsingle: false\nbad dtor runs\ntuple: false\nbad dtor runs\nbad2 dtor runs\npair: true\nbad dtor runs\nstarts: true\nbad dtor runs\nends: true\nbad dtor runs\nempty: false\nbad dtor runs\npanic caught: true\nplain: true\n",
+    );
+}
+
 const STR_PATTERN_PRED_PANIC_DROP_SRC: &str = r#"
 use std::rc::Rc;
 

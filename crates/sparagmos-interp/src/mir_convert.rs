@@ -10251,8 +10251,17 @@ let inner = match (&src, target) {
                         // predicate's reference type, a `char`,
                         // a `&str` and a `&[char]` all have
                         // trivial glue and stay unadorned, as do
-                        // constant arguments (a function item
-                        // carries no captures to drop).
+                        // constant arguments naming a function
+                        // item (it carries no captures to drop).
+                        // A zero-sized predicate travels as a
+                        // constant operand too, whose type the
+                        // operand itself does not preserve; the
+                        // callee's generic arguments still name
+                        // the pattern type then (the fallback
+                        // `mem_drop_glue` uses for the dropped
+                        // type), and a zero-sized closure does
+                        // carry captures to drop, so its glue is
+                        // built from that type the same way.
                         let consumed_glue = consumed_glue.or_else(|| {
                             if matches!(
                                 kind,
@@ -10263,6 +10272,11 @@ let inner = match (&src, target) {
                                 args.get(1)
                                     .and_then(|arg| {
                                         self.operand_place_ty(body, arg)
+                                            .or_else(|| {
+                                                raw_generic_args
+                                                    .first()
+                                                    .cloned()
+                                            })
                                     })
                                     .and_then(|ty| self.drop_glue(&ty))
                                     .filter(|glue| {
