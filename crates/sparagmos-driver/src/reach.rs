@@ -280,6 +280,15 @@ pub struct CollectedFns {
     pub stable_bodies: Vec<mir::Body>,
     /// Whether the collection cap stopped further collection.
     pub limit_reached: bool,
+    /// The first body fetch whose whole-body normalization
+    /// overflowed the trait solver's recursion limit, in the
+    /// compilation-failure form rustc's collector reports
+    /// ("reached the recursion limit while instantiating
+    /// `...`"), if any. The instance's body cannot be
+    /// materialized by the compiler itself, so this is a
+    /// compilation failure, not a body-less record; the
+    /// caller folds it into the compile verdict.
+    pub recursion_limit: Option<String>,
     /// The Stable MIR bodies obtained from foreign instances
     /// during the walk, in discovery order (the seeds are not
     /// included). A body is listed whether or not its conversion
@@ -321,9 +330,24 @@ struct Record {
 /// caller records the instance as body-less with it); any
 /// other panic is resumed — this containment must never paper
 /// over an unrelated compiler failure.
+///
+/// One further class is contained: the trait solver's
+/// overflow inside whole-body normalization after erasing
+/// regions (`crate::convert::BODY_FETCH_NORMALIZE_OVERFLOW`).
+/// That failure is not a body-less outcome — the compiler
+/// itself cannot materialize the instance, and rustc's
+/// collector reports the same overflow as the recursion-limit
+/// compilation error — so the caller additionally records it
+/// as the pass's recursion-limit failure (see
+/// [`CollectedFns::recursion_limit`]).
 fn fetch_body_contained(
     inst: &Instance,
 ) -> Result<Option<mir::Body>, &'static str> {
+    // The panic-capture slot is read back after the fetch to
+    // classify a contained panic by its recorded location;
+    // clear it first, so the record read back is this fetch's
+    // own (the discipline the capture slot documents).
+    crate::convert::clear_captured_panic();
     // An instance whose types mention a projection that
     // does not normalize: fetching its body would pose that
     // normalization and poison the compilation (see
@@ -337,6 +361,23 @@ fn fetch_body_contained(
     })) {
         Ok(body) => Ok(body),
         Err(payload) => {
+            if let Some(text) = crate::convert::peek_captured_panic() {
+                if crate::convert::captured_panic_is_normalize_overflow(&text) {
+                    return Err(crate::convert::BODY_FETCH_NORMALIZE_OVERFLOW);
+                }
+                // A MIR validation failure is contained only
+                // for a compiler-generated impl body over a
+                // SIMD type, whose materialization trips the
+                // MCP#838 projection ban by construction (see
+                // `crate::convert::BODY_FETCH_SIMD_VALIDATOR`).
+                if crate::convert::generated_simd_impl_method(inst)
+                    && crate::convert::captured_panic_is_mir_validator_fail(
+                        &text,
+                    )
+                {
+                    return Err(crate::convert::BODY_FETCH_SIMD_VALIDATOR);
+                }
+            }
             if let Some(reason) = stable_mir_panic_reason(&*payload) {
                 Err(reason)
             } else {
@@ -510,6 +551,7 @@ pub fn collect_reachable(
     }
     let mut bodies_taken = 0usize;
     let mut limit_reached = false;
+    let mut recursion_limit: Option<String> = None;
     let mut walked_bodies: Vec<mir::Body> = Vec::new();
 
     while let Some((distance, body)) = frontier.pop() {
@@ -749,7 +791,19 @@ pub fn collect_reachable(
                         RecordKind::WithBody { inst, body }
                     }
                     Ok(None) => no_body("no MIR body available"),
-                    Err(reason) => no_body(reason),
+                    Err(reason) => {
+                        if reason
+                            == crate::convert::BODY_FETCH_NORMALIZE_OVERFLOW
+                            && recursion_limit.is_none()
+                        {
+                            recursion_limit = Some(format!(
+                                "reached the recursion limit while \
+                                 instantiating `{}`",
+                                inst.name()
+                            ));
+                        }
+                        no_body(reason)
+                    }
                 },
             };
             records.push(Record {
@@ -877,6 +931,7 @@ pub fn collect_reachable(
         reports: Vec::new(),
         stable_bodies: Vec::new(),
         limit_reached,
+        recursion_limit,
         walked_bodies,
     };
     for (i, rec) in records.iter().enumerate() {

@@ -483,3 +483,109 @@ fn hello_world_panic_abort_converts() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
+
+#[test]
+fn generic_export_name_rejected() {
+    // An exported symbol cannot name a generic item: rustc
+    // rejects the crate ("functions generic over types or
+    // consts must be mangled"), where the driver used to panic
+    // asking `Instance::mono` for the generic definition while
+    // collecting the duplicate-symbol check's roots.
+    let case = Case::new("generic-export");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         #[export_name = \"foo\"]\npub fn foo<T>() {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("must be mangled"), "stderr={stderr}");
+}
+
+#[test]
+fn generic_no_mangle_rejected() {
+    let case = Case::new("generic-no-mangle");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         #[no_mangle]\npub fn foo<T>() {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("must be mangled"), "stderr={stderr}");
+}
+
+#[test]
+fn non_generic_export_name_accepted() {
+    let case = Case::new("plain-export");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         #[export_name = \"foo\"]\npub fn foo() {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn unbounded_instantiation_recursion_is_a_recursion_limit_failure() {
+    // The opaque-output recursion of
+    // tests/ui/codegen/normalization-overflow/
+    // recursion-issue-139659.rs: materializing `recurse`'s
+    // body normalizes its types, and the normalization itself
+    // recurses without bound inside the trait solver. rustc's
+    // collector reports the instantiation recursion limit for
+    // the same program; the driver must report that failure
+    // (exit 1), not die on the normalization panic (exit 101).
+    let case = Case::new("normalize-overflow");
+    let src = case.write(
+        "case.rs",
+        "trait Trait { type Output; }\n\
+         impl<O, F: Fn() -> O> Trait for F { type Output = O; }\n\
+         struct Wrap<P>(P);\n\
+         struct WrapOutput<O>(O);\n\
+         impl<P: Trait> Trait for Wrap<P> { type Output = WrapOutput<P::Output>; }\n\
+         fn wrap<P: Trait>(x: P) -> impl Trait { Wrap(x) }\n\
+         fn consume<P: Trait>(_: P) -> P::Output { unimplemented!() }\n\
+         pub fn recurse() -> impl Sized { consume(wrap(recurse)) }\n\
+         pub fn main() {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("reached the recursion limit while instantiating"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn simd_select_mismatched_lengths_rejected() {
+    // The derived PartialEq body over the repr(simd) mask
+    // type must never be fetched (the MIR validator bans
+    // projections into SIMD types, MCP#838); with it screened,
+    // conversion completes and the monomorphization check
+    // reports the intrinsic misuse in `main` — where the
+    // driver used to die on the validator ICE (exit 101)
+    // while asking for the derived body.
+    let case = Case::new("simd-select");
+    let src = case.write(
+        "case.rs",
+        "#![feature(repr_simd, core_intrinsics)]\n\
+         #![allow(non_camel_case_types)]\n\
+         use std::intrinsics::simd::simd_select;\n\
+         #[repr(simd)]\n#[derive(Copy, Clone)]\npub struct u32x4(pub [u32; 4]);\n\
+         #[repr(simd)]\n#[derive(Copy, Clone, PartialEq)]\nstruct b8x4(pub [i8; 4]);\n\
+         #[repr(simd)]\n#[derive(Copy, Clone, PartialEq)]\nstruct b8x8(pub [i8; 8]);\n\
+         fn main() {\n\
+             let m8 = b8x8([0, 0, 0, 0, 0, 0, 0, 0]);\n\
+             let x = u32x4([0, 0, 0, 0]);\n\
+             unsafe { simd_select(m8, x, x); }\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("invalid monomorphization of `simd_select`"),
+        "stderr={stderr}"
+    );
+}

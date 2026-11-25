@@ -17,6 +17,50 @@ fn fail_all(
     }
 }
 
+/// Fail the owners of one demand fetch (`fetch_instance_body`)
+/// with the fetch's reason, translating the body-fetch
+/// normalization overflow (see
+/// `convert::BODY_FETCH_NORMALIZE_OVERFLOW`) into the
+/// recursion-limit compilation failure: the compiler itself
+/// cannot materialize that instance, so the demand failure is
+/// recorded as "recursion limit reached" and the first such
+/// instance is named on the demand state's recursion-limit
+/// channel, exactly as the demand passes' own depth mirror
+/// records its trips.
+fn fail_fetch(
+    demands: &mut HashMap<rustc_public::DefId, Demand>,
+    owners: &[rustc_public::DefId],
+    recursion_limit: &mut Option<String>,
+    inst_name: &str,
+    reason: String,
+) {
+    if reason == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW {
+        if recursion_limit.is_none() {
+            *recursion_limit = Some(format!(
+                "reached the recursion limit while instantiating `{}`",
+                inst_name
+            ));
+        }
+        fail_all(demands, owners, "recursion limit reached".to_string());
+    } else {
+        fail_all(demands, owners, reason);
+    }
+}
+
+/// Record the first body fetch whose whole-body normalization
+/// overflowed the trait solver on the item loop's and the
+/// reachability collection's shared channel, naming the
+/// instance in the compilation-failure form rustc's collector
+/// reports for the same overflow.
+pub(crate) fn note_body_fetch_recursion_limit(slot: &mut Option<String>, inst: &Instance) {
+    if slot.is_none() {
+        *slot = Some(format!(
+            "reached the recursion limit while instantiating `{}`",
+            inst.name()
+        ));
+    }
+}
+
 /// State shared by the demand passes of one program
 /// ([`collect_local_instances`] runs first over the converted
 /// local bodies, then over the foreign bodies the reachability
@@ -287,7 +331,7 @@ pub(crate) fn collect_local_instances(
             // Hand-written methods over SIMD types do not trip
             // the ban (their bodies choose their own accesses)
             // and are fetched as usual.
-            if generated_simd_impl_method(&inst) {
+            if sparagmos_driver::convert::generated_simd_impl_method(&inst) {
                 fail_all(
                     &mut *demands,
                     &owners,
@@ -302,7 +346,13 @@ pub(crate) fn collect_local_instances(
                     continue;
                 }
                 Err(reason) => {
-                    fail_all(&mut *demands, &owners, reason);
+                    fail_fetch(
+                        &mut *demands,
+                        &owners,
+                        recursion_limit,
+                        &inst.name(),
+                        reason,
+                    );
                     continue;
                 }
             };
@@ -563,7 +613,7 @@ pub(crate) fn collect_closure_instances(
                 // As in `collect_local_instances`: a
                 // compiler-generated impl body over a SIMD type
                 // must not be asked for (MCP#838 validation ICE).
-                if generated_simd_impl_method(&inst) {
+                if sparagmos_driver::convert::generated_simd_impl_method(&inst) {
                     fail_all(
                         &mut *target_demands,
                         &owners,
@@ -582,7 +632,13 @@ pub(crate) fn collect_closure_instances(
                         continue;
                     }
                     Err(reason) => {
-                        fail_all(&mut *demands, &owners, reason);
+                        fail_fetch(
+                            &mut *demands,
+                            &owners,
+                            recursion_limit,
+                            &inst.name(),
+                            reason,
+                        );
                         continue;
                     }
                 };
@@ -1169,7 +1225,7 @@ pub(crate) fn collect_coroutine_instances(
                         // compiler-generated impl body over a
                         // SIMD type must not be asked for
                         // (MCP#838 validation ICE).
-                        if generated_simd_impl_method(&inst) {
+                        if sparagmos_driver::convert::generated_simd_impl_method(&inst) {
                             fail_all(
                                 &mut *demands,
                                 &owners,
@@ -1184,7 +1240,7 @@ pub(crate) fn collect_coroutine_instances(
                         if !unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             continue;
                         }
-                        guard_stable_mir_query(&def.name(), || def.body())
+                        fetch_query_normalize_aware(&def.name(), false, || def.body())
                     }
                 };
                 let ibody = match ibody {
@@ -1198,7 +1254,13 @@ pub(crate) fn collect_coroutine_instances(
                         continue;
                     }
                     Err(reason) => {
-                        fail_all(&mut *demands, &owners, reason);
+                        fail_fetch(
+                            &mut *demands,
+                            &owners,
+                            recursion_limit,
+                            base_name,
+                            reason,
+                        );
                         continue;
                     }
                 };
