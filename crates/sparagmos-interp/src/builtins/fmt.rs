@@ -599,33 +599,152 @@ impl<'a> Interpreter<'a> {
     /// erased reference denotes (see
     /// [`Self::coerce_raw_fmt_arg`]).
     fn fmt_arg_target_ty(&self, frames: &[Frame], target: &Value) -> Option<String> {
-        let Value::Ref(RefTarget::Place {
-            frame,
-            local,
-            projection,
-        }) = target
-        else {
-            return None;
-        };
-        if !projection.is_empty() {
-            return None;
-        }
-        let frame = frames.iter().find(|f| f.id == *frame)?;
-        let body = self.program().get(&frame.func)?;
-        for entry in &body.debug_vars {
-            if let crate::ir::DebugVar::Place(l, proj) = &entry.source {
-                if *l == *local && proj.is_empty() {
-                    if let Some(ty) = &entry.ty {
-                        return Some(ty.clone());
-                    }
-                    if entry.is_char {
-                        return Some("char".to_string());
+        match target {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            }) => {
+                if !projection.is_empty() {
+                    return None;
+                }
+                let frame = frames.iter().find(|f| f.id == *frame)?;
+                let body = self.program().get(&frame.func)?;
+                for entry in &body.debug_vars {
+                    if let crate::ir::DebugVar::Place(l, proj) = &entry.source {
+                        if *l == *local && proj.is_empty() {
+                            if let Some(ty) = &entry.ty {
+                                return Some(ty.clone());
+                            }
+                            if entry.is_char {
+                                return Some("char".to_string());
+                            }
+                        }
                     }
                 }
+                let ty = body.local_tys.get(*local)?;
+                // The IR type renders `char` as `Uint(U32)`, so
+                // that one case is decided by the char table
+                // conversion recorded from the MIR types (see
+                // `ir::Body::char_locals`); a body without the
+                // table (hand-built) keeps the honest refusal
+                // `ir_ty_tag` makes for the ambiguous case.
+                if matches!(ty, crate::ir::Ty::Uint(crate::ir::UintTy::U32)) {
+                    return match body.char_locals.get(*local) {
+                        Some(true) => Some("char".to_string()),
+                        Some(false) => Some("u32".to_string()),
+                        None => None,
+                    };
+                }
+                ir_ty_tag(ty)
             }
+            Value::Ref(RefTarget::Static { name, projection }) => {
+                if !projection.is_empty() {
+                    return None;
+                }
+                // The declared type conversion rendered from
+                // the static's MIR type (exact where `char`
+                // and generic arguments are concerned). The
+                // reference's spelling is resolved to the
+                // registered key first: a reference path is
+                // spelled from the referencing crate, so an
+                // `extern crate .. as ..` alias segment or a
+                // `#DefId` disambiguator can separate the two
+                // (see `resolve_static_key`).
+                let program = self.program();
+                if let Some(key) = resolve_static_key(program.static_debug_tags.keys(), name) {
+                    return Some(program.static_debug_tags[key].clone());
+                }
+                let key = resolve_static_key(program.static_tys.keys(), name)?;
+                let ty = program.static_tys.get(key)?;
+                ir_ty_tag(ty)
+            }
+            _ => None,
         }
-        let ty = body.local_tys.get(*local)?;
-        ir_ty_tag(ty)
+    }
+
+    /// `ToSocketAddrs::to_socket_addrs` (see
+    /// [`net_trait_method`]): resolve the receiver into the
+    /// modelled `vec::IntoIter<SocketAddr>` inside the
+    /// `io::Result` the trait returns.
+    pub(super) fn exec_to_socket_addrs(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        receiver: &Value,
+    ) -> InterpResult<Value> {
+        let value = self.resolve_value(frames, receiver)?;
+        match self.resolve_socket_addrs(frames, self_ty, &value)? {
+            Ok(addrs) => Ok(io_result_ok(owned_iter_state(addrs))),
+            Err(()) => Ok(io_result_err(io_simple_error_value(
+                ERROR_KIND_INVALID_INPUT,
+            ))),
+        }
+    }
+
+    /// The addresses a `ToSocketAddrs` receiver denotes:
+    /// `Ok(addrs)` on success, `Err(())` for the outcomes
+    /// std reports as an `io::Error` (an unparseable address,
+    /// a name the resolver cannot resolve). A receiver shape
+    /// the model does not know is an interpreter error, never
+    /// a silent resolution failure. The receiver forms are
+    /// std's own impls: a string (`str` / `String`, reached
+    /// by reference or by value), a single address
+    /// (`SocketAddr` / `SocketAddrV4` / `SocketAddrV6`), an
+    /// `(address, port)` pair, and a slice of addresses.
+    fn resolve_socket_addrs(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        value: &Value,
+    ) -> InterpResult<Result<Vec<Value>, ()>> {
+        let shape_error = |found: &Value| {
+            InterpError::type_mismatch(
+                "ToSocketAddrs::to_socket_addrs",
+                "string, socket address, (address, port) pair or address slice receiver",
+                found.kind_name(),
+            )
+        };
+        // A single address value, in any of its forms.
+        if let Some(addr) = socket_addr_value(value) {
+            return Ok(Ok(vec![addr]));
+        }
+        // A string receiver, in whichever form the model
+        // holds it (a `str` value, a `String` aggregate).
+        if let Ok(text) = self.resolve_string(frames, value) {
+            return Ok(parse_socket_addr_str(&text));
+        }
+        match value {
+            Value::FatRef { .. } => {
+                let resolved = self.resolve_value(frames, value)?;
+                let items = value_elements(&resolved)?;
+                let mut addrs = Vec::with_capacity(items.len());
+                for item in &items {
+                    match socket_addr_value(item) {
+                        Some(addr) => addrs.push(addr),
+                        None => return Err(shape_error(item)),
+                    }
+                }
+                Ok(Ok(addrs))
+            }
+            Value::Tuple(items) if items.len() == 2 => {
+                let Some(port) = net_port(&items[1]) else {
+                    return Err(shape_error(&items[1]));
+                };
+                if let Ok(text) = self.resolve_string(frames, &items[0]) {
+                    return Ok(parse_socket_host(&text, port));
+                }
+                match ip_addr_with_port(&items[0], port) {
+                    Some(addr) => Ok(Ok(vec![addr])),
+                    None => Err(shape_error(&items[0])),
+                }
+            }
+            _ => Err(InterpError::type_mismatch(
+                format!("ToSocketAddrs::to_socket_addrs for {self_ty}"),
+                "string, socket address, (address, port) pair or address slice receiver",
+                value.kind_name(),
+            )),
+        }
     }
 
     fn format_arg(
@@ -3347,6 +3466,278 @@ pub(super) fn ipv4_value(octets: [u8; 4]) -> Value {
             octets.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
         )],
     }
+}
+
+/// An `Ipv6Addr` value in the model's shape: the address
+/// aggregate over a sixteen-byte tuple, mirroring
+/// [`ipv4_value`].
+pub(super) fn ipv6_value(octets: [u8; 16]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Tuple(
+            octets.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
+        )],
+    }
+}
+
+/// A `SocketAddr` value wrapping a V4 address, in the shape
+/// [`format_net_addr`] reads: the enum over the
+/// `SocketAddrV4` aggregate of (address, port).
+pub(super) fn socket_addr_v4_value(octets: [u8; 4], port: u16) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![ipv4_value(octets), Value::Uint(u128::from(port))],
+        }],
+    }
+}
+
+/// A `SocketAddr` value wrapping a V6 address: the enum
+/// over the `SocketAddrV6` aggregate of (address, port,
+/// flowinfo, scope id), std's field order.
+pub(super) fn socket_addr_v6_value(octets: [u8; 16], port: u16, flowinfo: u32, scope_id: u32) -> Value {
+    Value::Enum {
+        variant: 1,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![
+                ipv6_value(octets),
+                Value::Uint(u128::from(port)),
+                Value::Uint(u128::from(flowinfo)),
+                Value::Uint(u128::from(scope_id)),
+            ],
+        }],
+    }
+}
+
+/// The sixteen octets an `Ipv6Addr` value holds, behind the
+/// same wrappers [`ipv4_octets`] looks through.
+fn ipv6_octets(value: &Value) -> Option<[u8; 16]> {
+    fn byte(value: &Value) -> Option<u8> {
+        match value {
+            Value::Uint(v) => u8::try_from(*v).ok(),
+            Value::Int(v) => u8::try_from(*v).ok(),
+            Value::Enum { fields, .. } if fields.len() == 1 => byte(&fields[0]),
+            Value::Tuple(items) if items.len() == 1 => byte(&items[0]),
+            _ => None,
+        }
+    }
+    fn collect_bytes(items: &[Value]) -> Option<[u8; 16]> {
+        if items.len() != 16 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (slot, item) in out.iter_mut().zip(items) {
+            *slot = byte(item)?;
+        }
+        Some(out)
+    }
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => ipv6_octets(&fields[0]),
+        Value::Enum { fields, .. } if fields.len() == 16 => collect_bytes(fields),
+        Value::Tuple(items) if items.len() == 1 => ipv6_octets(&items[0]),
+        Value::Tuple(items) if items.len() == 16 => collect_bytes(items),
+        Value::Bytes(b) if b.len() == 16 => {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(b);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A `u32` field of a net aggregate (a V6 flowinfo or scope
+/// id), behind the same wrappers [`net_port`] looks through.
+fn net_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::Uint(v) => u32::try_from(*v).ok(),
+        Value::Int(v) => u32::try_from(*v).ok(),
+        Value::Enum { fields, .. } if fields.len() == 1 => net_u32(&fields[0]),
+        Value::Tuple(items) if items.len() == 1 => net_u32(&items[0]),
+        _ => None,
+    }
+}
+
+/// The (octets, port) a `SocketAddrV4` aggregate holds.
+fn socket_v4_fields(value: &Value) -> Option<([u8; 4], u16)> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    if fields.len() != 2 {
+        return None;
+    }
+    Some((ipv4_octets(&fields[0])?, net_port(&fields[1])?))
+}
+
+/// The (octets, port, flowinfo, scope id) a `SocketAddrV6`
+/// aggregate holds.
+fn socket_v6_fields(value: &Value) -> Option<([u8; 16], u16, u32, u32)> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    if fields.len() != 4 {
+        return None;
+    }
+    Some((
+        ipv6_octets(&fields[0])?,
+        net_port(&fields[1])?,
+        net_u32(&fields[2])?,
+        net_u32(&fields[3])?,
+    ))
+}
+
+/// A single-address value (`SocketAddr`, `SocketAddrV4` or
+/// `SocketAddrV6`) normalized to the canonical `SocketAddr`
+/// form the modelled iterator yields.
+pub(super) fn socket_addr_value(value: &Value) -> Option<Value> {
+    if let Value::Enum { variant, fields } = value {
+        if fields.len() == 1 {
+            match variant {
+                0 if socket_v4_fields(&fields[0]).is_some() => return Some(value.clone()),
+                1 if socket_v6_fields(&fields[0]).is_some() => return Some(value.clone()),
+                _ => {}
+            }
+        }
+    }
+    if let Some((octets, port)) = socket_v4_fields(value) {
+        return Some(socket_addr_v4_value(octets, port));
+    }
+    if let Some((octets, port, flowinfo, scope_id)) = socket_v6_fields(value) {
+        return Some(socket_addr_v6_value(octets, port, flowinfo, scope_id));
+    }
+    None
+}
+
+/// An `IpAddr` (or a bare `Ipv4Addr` / `Ipv6Addr`) value
+/// combined with a port into a `SocketAddr`.
+pub(super) fn ip_addr_with_port(value: &Value, port: u16) -> Option<Value> {
+    if let Value::Enum {
+        variant: 1,
+        fields,
+    } = value
+    {
+        if fields.len() == 1 {
+            let octets = ipv6_octets(&fields[0])?;
+            return Some(socket_addr_v6_value(octets, port, 0, 0));
+        }
+        return None;
+    }
+    if let Some(octets) = ipv6_octets(value) {
+        return Some(socket_addr_v6_value(octets, port, 0, 0));
+    }
+    let octets = ipv4_octets(value)?;
+    Some(socket_addr_v4_value(octets, port))
+}
+
+/// std's `str::to_socket_addrs` order: a literal socket
+/// address first, then `host:port` with the host resolved
+/// by [`parse_socket_host`]. `Err(())` is every failure —
+/// the `io::Error` std reports — never an invented address.
+pub(super) fn parse_socket_addr_str(text: &str) -> Result<Vec<Value>, ()> {
+    if let Ok(addr) = text.parse::<std::net::SocketAddrV4>() {
+        return Ok(vec![socket_addr_v4_value(
+            addr.ip().octets(),
+            addr.port(),
+        )]);
+    }
+    if let Ok(addr) = text.parse::<std::net::SocketAddrV6>() {
+        return Ok(vec![socket_addr_v6_value(
+            addr.ip().octets(),
+            addr.port(),
+            addr.flowinfo(),
+            addr.scope_id(),
+        )]);
+    }
+    let (host, port) = split_host_port(text).ok_or(())?;
+    parse_socket_host(host, port)
+}
+
+/// Resolve the host part of a `host:port` pair (or the
+/// address part of an `(address, port)` receiver) at a
+/// known port: a literal IP, or the one name the model
+/// resolves without a resolver — `localhost`, the loopback
+/// name every host table carries. Any other name is the
+/// lookup failure std's resolver reports.
+fn parse_socket_host(host: &str, port: u16) -> Result<Vec<Value>, ()> {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return Ok(vec![socket_addr_v4_value(ip.octets(), port)]);
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return Ok(vec![socket_addr_v6_value(ip.octets(), port, 0, 0)]);
+    }
+    if host == "localhost" {
+        return Ok(vec![socket_addr_v4_value([127, 0, 0, 1], port)]);
+    }
+    Err(())
+}
+
+/// Split `host:port`, honouring the bracketed IPv6 form
+/// (`[addr]:port`). A non-numeric port (a service name)
+/// does not split: the model keeps no services database,
+/// and std's failure for an unknown service is the same
+/// resolution error the caller reports.
+fn split_host_port(text: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = text.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = after.strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = text.rsplit_once(':')?;
+    Some((host, port.parse().ok()?))
+}
+
+/// Resolve a static reference's spelling to the program's
+/// registered key for the static, among `keys`: exact match
+/// first, then the unique key equal modulo the `#DefId`
+/// disambiguator a shared name carries and one
+/// `extern crate .. as ..` alias segment (a reference path
+/// is spelled from the referencing crate, so the alias it
+/// names the crate by appears as an extra middle segment
+/// the definition's own key lacks). Ambiguity — or no
+/// candidate at all — resolves nothing.
+pub(super) fn resolve_static_key<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    name: &str,
+) -> Option<&'a str> {
+    let keys: Vec<&String> = keys.collect();
+    if let Some(key) = keys.iter().find(|k| k.as_str() == name) {
+        return Some(key.as_str());
+    }
+    let base = name.split('#').next().unwrap_or(name);
+    let mut found: Option<&str> = None;
+    for key in keys {
+        let kbase = key.split('#').next().unwrap_or(key.as_str());
+        if kbase == base
+            || path_matches_modulo_alias(kbase, base)
+            || path_matches_modulo_alias(base, kbase)
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(key.as_str());
+        }
+    }
+    found
+}
+
+/// Whether `longer` is `shorter` with exactly one extra
+/// middle path segment (the first and last segments — the
+/// crate and the item — must agree).
+fn path_matches_modulo_alias(longer: &str, shorter: &str) -> bool {
+    let l: Vec<&str> = longer.split("::").collect();
+    let sh: Vec<&str> = shorter.split("::").collect();
+    if l.len() != sh.len() + 1 || l.len() < 3 {
+        return false;
+    }
+    if l[0] != sh[0] || l[l.len() - 1] != sh[sh.len() - 1] {
+        return false;
+    }
+    (1..l.len() - 1).any(|i| {
+        let mut v = l.clone();
+        v.remove(i);
+        v == sh
+    })
 }
 
 /// The port a `SocketAddrV4` field holds: a bare `u16` scalar,

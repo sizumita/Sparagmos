@@ -2064,6 +2064,19 @@ impl<'a> Converter<'a> {
                             } else {
                                 None
                             }
+                        })
+                        // A `ToSocketAddrs` call whose `Self`
+                        // instance has no converted body is
+                        // served by the net model (see
+                        // `builtins::net_trait_method`); a
+                        // collected impl body has already won
+                        // above, exactly as for the fmt traits.
+                        .or_else(|| {
+                            if raw_generic_args.first().is_some() {
+                                crate::builtins::net_trait_method(&canonical)
+                            } else {
+                                None
+                            }
                         });
                     if let Some(kind) = kind {
                         let mut ir_args = Vec::with_capacity(args.len());

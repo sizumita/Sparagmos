@@ -2209,6 +2209,16 @@ pub struct Body {
     /// interpreter's sequence-position judgment (see
     /// `array_position`). Empty for hand-built bodies.
     pub local_elem_sizes: Vec<Option<u64>>,
+    /// Whether each local's declared type is `char`, indexed
+    /// by local (conversion-computed; see `mir_convert`). The
+    /// IR type renders `char` as `Uint(U32)`, so the declared
+    /// type alone cannot tell a `char` local from a `u32` one;
+    /// this table carries the distinction conversion computed
+    /// while the MIR type was at hand. Consulted where a
+    /// rendering must differ between the two (the fmt engine's
+    /// raw-argument `Self` recovery). Empty for hand-built
+    /// bodies.
+    pub char_locals: Vec<bool>,
     /// The element sizes of sequence-typed fields of each
     /// local, keyed by local, then by the field-index path from
     /// the local (conversion-computed; see `mir_convert`'s
@@ -2278,6 +2288,7 @@ impl Body {
             local_tys,
             return_discriminants: None,
             local_elem_sizes: Vec::new(),
+            char_locals: Vec::new(),
             field_elem_sizes: Vec::new(),
             blocks,
             zst_locals: Vec::new(),

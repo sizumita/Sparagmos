@@ -776,6 +776,10 @@ pub enum Builtin {
     /// `std::sys::io::error::unix::is_interrupted(errno)`:
     /// the error is `EINTR`.
     IoIsInterrupted,
+    /// `std::net::ToSocketAddrs::to_socket_addrs`: name
+    /// resolution into the modelled address iterator (see
+    /// [`net_trait_method`]).
+    ToSocketAddrs,
     /// `alloc::io::error::custom_owner_from_box(kind, error)`:
     /// build the `Custom` payload of an `io::Error::new` (its
     /// kind, the boxed trait object, and the two drop functions
