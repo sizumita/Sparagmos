@@ -242,6 +242,29 @@ denominator. Runs on every push to `main` and on manual dispatch.
   (the cfi family, memory-passing, dataflow) is judged on
   the instrumented program running clean, which plain
   execution reproduces, so those stay attempted.
+- The `exec` records of the ui suite's `codegen/` subtree
+  whose directive view carries `//@ known-bug:` (12 at the
+  1.100.0 tag, all of the `equal-pointers-unequal` family,
+  rustc #107975) are attempted by no stage. The test pins
+  the codegen backend's current behaviour, which the
+  directive itself marks as a bug; issue #529 proved
+  natively that the behaviour is LLVM's unsound `icmp eq`
+  fold over pointer addresses and that the converted MIR
+  contains a genuine runtime equality the native binary's
+  behaviour contradicts, so no execution of the converted
+  MIR can reproduce it. The runner records them as not
+  attempted under the bucket `not attempted (known-bug)`
+  (issue #546), the same shape as the coverage and
+  sanitizer records above; the denominator is unaffected.
+  Exec known-bug records outside the subtree pin front-end
+  behaviour the driver's embedded rustc reproduces by
+  construction, so they stay attempted (two pass at this
+  tag). Everywhere else the directive has no judging
+  effect the subset performs: compiletest's only effect
+  for it is waiving the expected-error annotation check
+  in UI mode (and forbidding annotations there), a check
+  stage 2 does not perform for any test and stage 4
+  already mirrors where it does.
 - An `//@ aux-bin:` file is built as compiletest builds it:
   after the test's auxiliary crates, into
   `auxiliary/bin/` of the attempt directory, with its own

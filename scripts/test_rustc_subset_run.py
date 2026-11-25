@@ -967,6 +967,137 @@ class CoverageScopeTests(unittest.TestCase):
                                         nature="compile-check")))
 
 
+class KnownBugScopeTests(unittest.TestCase):
+    """Exec views pinning a known codegen bug (issue #546).
+
+    The helper classifies from the record and the directive
+    view alone; the process fixtures stub both sides to a
+    passing pair, so a verdict of not-attempted can only come
+    from the classification.
+    """
+
+    def rec(self, path, nature="exec"):
+        return {"suite": "ui", "path": path, "nature": nature,
+                "single_file": True, "ffi": False,
+                "env_excluded": False}
+
+    def view(self, text):
+        return header(text).view(None)
+
+    def test_codegen_known_bug_run_view_is_classified(self):
+        scope = run.known_bug_scope(
+            self.rec("tests/ui/codegen/equal-pointers-unequal/"
+                     "as-cast/inline1.rs"),
+            self.view("//@ known-bug: #107975\n"
+                      "//@ compile-flags: -Copt-level=2\n"
+                      "//@ run-pass\nfn main() {}\n"))
+        self.assertIsNotNone(scope)
+        reason, bucket = scope
+        self.assertEqual(bucket, "not attempted (known-bug)")
+        self.assertIn("#107975", reason)
+        self.assertIn("#529", reason)
+        self.assertIn("#546", reason)
+
+    def test_known_bug_outside_the_codegen_subtree_stays(self):
+        # Front-end known bugs are reproduced by the driver's
+        # embedded rustc by construction; both such records
+        # pass at the 1.100.0 tag and stay attempted.
+        for path in ("tests/ui/macros/"
+                     "metavar_cross_edition_recursive_macros.rs",
+                     "tests/ui/view-types/must-restrict.rs"):
+            self.assertIsNone(run.known_bug_scope(
+                self.rec(path),
+                self.view("//@ known-bug: #1\n//@ run-pass\n")))
+
+    def test_codegen_without_known_bug_stays(self):
+        # The subtree's fixed-miscompile regression tests
+        # assert the corrected behaviour and stay attempted.
+        self.assertIsNone(run.known_bug_scope(
+            self.rec("tests/ui/codegen/miscompile.rs"),
+            self.view("//@ run-pass\n")))
+
+    def test_compile_check_nature_stays(self):
+        # Stage 2 judges the compile outcome; the directive's
+        # only compiletest effect there (the annotation
+        # relaxation) is not one stage 2 performs.
+        self.assertIsNone(run.known_bug_scope(
+            self.rec("tests/ui/codegen/t.rs",
+                     nature="compile-check"),
+            self.view("//@ known-bug: #1\n//@ run-pass\n")))
+
+    def test_view_without_a_run_mode_stays(self):
+        self.assertIsNone(run.known_bug_scope(
+            self.rec("tests/ui/codegen/t.rs"),
+            self.view("//@ known-bug: #1\n//@ check-pass\n")))
+
+    def test_scoped_directive_classifies_only_its_revision(self):
+        h = header("//@ revisions: rev1\n//@ run-pass\n"
+                   "//@[rev1] known-bug: #1\nfn main() {}\n")
+        rec = self.rec("tests/ui/codegen/t.rs")
+        self.assertIsNone(run.known_bug_scope(rec, h.view(None)))
+        self.assertIsNotNone(
+            run.known_bug_scope(rec, h.view("rev1")))
+
+    def test_carry_scope_reads_the_header(self):
+        # main's carry-through for records no stage selects
+        # consults the same helper through this reader, so
+        # both paths record the same verdict.
+        with __import__("tempfile").TemporaryDirectory() as td:
+            rust_dir = Path(td)
+            p = rust_dir / "tests" / "ui" / "codegen" / "t.rs"
+            p.parent.mkdir(parents=True)
+            p.write_text("//@ known-bug: #107975\n"
+                         "//@ run-pass\nfn main() {}\n")
+            scope = run.known_bug_carry_scope(
+                self.rec("tests/ui/codegen/t.rs"), rust_dir)
+            self.assertIsNotNone(scope)
+            self.assertEqual(scope[1],
+                             "not attempted (known-bug)")
+            self.assertIsNone(run.known_bug_carry_scope(
+                self.rec("tests/ui/codegen/missing.rs"), rust_dir))
+
+    def process_fixture(self, body):
+        tmp = Path(self.enterContext(__import__("tempfile")
+                                     .TemporaryDirectory()))
+        (tmp / "tests" / "ui" / "codegen").mkdir(parents=True)
+        (tmp / "tests" / "ui" / "codegen" / "t.rs").write_text(body)
+        return tmp, self.rec("tests/ui/codegen/t.rs")
+
+    def run_stubbed(self, rec, rust_dir, jit=False):
+        orig_n, orig_s = run.native_side, run.sparagmos_side
+        run.native_side = lambda *a, **kw: (
+            {"exit_code": 0, "stdout": "", "stderr": ""}, None)
+        run.sparagmos_side = lambda *a, **kw: (
+            {"exit_code": 0, "stdout": "", "stderr": ""},
+            "result", "")
+        try:
+            return run.process_test(rec, rust_dir,
+                                    Path("/fake/driver"), jit=jit)
+        finally:
+            run.native_side, run.sparagmos_side = orig_n, orig_s
+
+    def test_process_test_records_the_bucket(self):
+        rust_dir, rec = self.process_fixture(
+            "//@ known-bug: #107975\n//@ run-pass\n"
+            "fn main() {}\n")
+        res = self.run_stubbed(rec, rust_dir)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (known-bug)")
+        self.assertIn("#107975", res["reason"])
+
+    def test_process_test_records_the_bucket_under_jit(self):
+        # The classification is consulted on the shared
+        # fill_result path, so metric 4 records it identically.
+        rust_dir, rec = self.process_fixture(
+            "//@ known-bug: #107975\n//@ run-pass\n"
+            "fn main() {}\n")
+        res = self.run_stubbed(rec, rust_dir, jit=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (known-bug)")
+
+
 class CompileExpectationTests(unittest.TestCase):
     def test_ui_default_is_check_fail(self):
         h = header("fn main() { let x: u8 = \"s\"; }\n")
