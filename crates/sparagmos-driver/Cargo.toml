@@ -30,3 +30,7 @@ inherits = "dev"
 opt-level = 3
 debug = false
 incremental = false
+
+[[test]]
+name = "driver_run"
+path = "tests/driver_run/mod.rs"
