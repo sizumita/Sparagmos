@@ -8351,7 +8351,21 @@ impl<'a> Interpreter<'a> {
             },
         };
         let base = self.read_resolved(frames, &base_target)?;
-        Ok(scalar_storage_byte(&base, disp).map(|byte| Value::Uint(u128::from(byte))))
+        // The base's declared kind, when the target's root
+        // type is recorded and the type walk follows the head
+        // projection to the base's position: a float storage
+        // narrower than the model form yields its own width's
+        // byte (see `scalar_storage_byte_as`), the same
+        // declared-width answer the byte view gives the
+        // targets it judges. An unrecorded root (a value
+        // target above all) keeps the evidence-free byte.
+        let kind = self
+            .byte_view_base(frames, &base_target)
+            .and_then(|(head, _, root_ty, _, _)| {
+                step_ty_across(Some(self.program()), Some(root_ty), head)
+            })
+            .and_then(|ty| byte_scalar_of_ty(Some(&ty)));
+        Ok(scalar_storage_byte_as(&base, kind, disp).map(|byte| Value::Uint(u128::from(byte))))
     }
 
     /// The element copy behind `copy_nonoverlapping`, shared by the
@@ -14637,23 +14651,7 @@ impl<'a> Interpreter<'a> {
                 if pos >= kind.width() {
                     return Some(Err(ByteVerdict::Outside(pos)));
                 }
-                let bits: u128 = match (kind, value) {
-                    (ByteScalar::Int(_), Value::Int(i)) => *i as u128,
-                    (ByteScalar::Uint(_), Value::Uint(u)) => *u,
-                    (ByteScalar::Char, Value::Uint(u)) => *u,
-                    (ByteScalar::Bool, Value::Bool(b)) => u128::from(*b),
-                    (ByteScalar::Float(FloatTy::F16), Value::Float(f)) => {
-                        u128::from(crate::f128::f64_to_f16_bits(*f))
-                    }
-                    (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
-                        u128::from((*f as f32).to_bits())
-                    }
-                    (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => {
-                        u128::from(f.to_bits())
-                    }
-                    (ByteScalar::Float(FloatTy::F128), Value::Float128(bits)) => *bits,
-                    _ => return None,
-                };
+                let bits = scalar_bits_of_kind(value, *kind)?;
                 Some(Ok(StorageByte::Byte((bits >> (8 * pos)) as u8)))
             }
             ByteLayout::Seq(elem, elem_size, count) => {
@@ -22142,13 +22140,17 @@ pub(crate) fn project_value_ev(
                     // through a raw byte pointer (see
                     // `scalar_storage_byte`): the index step
                     // reads the byte at that offset of the
-                    // storage, the only element it has.
-                    if let Some(len) = scalar_storage_len(other) {
+                    // storage, the only element it has. The
+                    // declared type in hand judges the byte
+                    // under the storage's own width (see
+                    // `scalar_storage_byte_as`).
+                    let kind = byte_scalar_of_ty(step_base_ty.as_ref());
+                    if let Some(len) = scalar_storage_len_as(other, kind) {
                         if *idx >= len {
                             return Err(index_oob(len, *idx));
                         }
                         Value::Uint(u128::from(
-                            scalar_storage_byte(other, *idx)
+                            scalar_storage_byte_as(other, kind, *idx)
                                 .expect("index inside the storage"),
                         ))
                     } else {
@@ -22269,7 +22271,8 @@ pub(crate) fn project_value_ev(
                 if *disp == 0 {
                     value
                 } else if *disp >= 0 {
-                    let Some(len) = scalar_storage_len(&value) else {
+                    let kind = byte_scalar_of_ty(step_base_ty.as_ref());
+                    let Some(len) = scalar_storage_len_as(&value, kind) else {
                         return Err(InterpError::UnsupportedProjection {
                             kind: format!(
                                 "read through a pointer displaced {disp} bytes from a value boundary"
@@ -22290,7 +22293,7 @@ pub(crate) fn project_value_ev(
                     // `scalar_storage_byte` describes.
                     let at = *disp as usize + k;
                     step_idx += 1;
-                    match scalar_storage_byte(&value, at) {
+                    match scalar_storage_byte_as(&value, kind, at) {
                         Some(byte) => Value::Uint(u128::from(byte)),
                         None => return Err(index_oob(len, at)),
                     }
@@ -22339,6 +22342,94 @@ fn vec_value_len(value: &Value) -> Option<u128> {
             }
         }
         _ => None,
+    }
+}
+
+/// The bits of a scalar value's storage under a declared
+/// scalar kind: the value serialized at its own declared
+/// width — an `f32`'s bits are its `f32` pattern, not the
+/// widened `f64` model's, and an `f16`'s its `f16` pattern.
+/// `None` when the value does not hold a scalar of the kind.
+/// The byte view's scalar arm (`Interpreter::storage_byte`)
+/// and the projectors' declared-width byte arms (see
+/// [`scalar_storage_byte_as`]) share this extraction.
+fn scalar_bits_of_kind(value: &Value, kind: ByteScalar) -> Option<u128> {
+    Some(match (kind, value) {
+        (ByteScalar::Int(_), Value::Int(i)) => *i as u128,
+        (ByteScalar::Uint(_), Value::Uint(u)) => *u,
+        (ByteScalar::Char, Value::Uint(u)) => *u,
+        (ByteScalar::Bool, Value::Bool(b)) => u128::from(*b),
+        (ByteScalar::Float(FloatTy::F16), Value::Float(f)) => {
+            u128::from(crate::f128::f64_to_f16_bits(*f))
+        }
+        (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
+            u128::from((*f as f32).to_bits())
+        }
+        (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => u128::from(f.to_bits()),
+        (ByteScalar::Float(FloatTy::F128), Value::Float128(bits)) => *bits,
+        _ => return None,
+    })
+}
+
+/// The declared scalar kind a position's type evidence
+/// names, when it names a scalar at all: the scalar arms of
+/// the byte view's layout resolution
+/// (`Interpreter::byte_layout_of_ty`), in the form the
+/// projectors' evidence takes — a `Ty`, not a resolved
+/// layout.
+fn byte_scalar_of_ty(ty: Option<&Ty>) -> Option<ByteScalar> {
+    Some(match ty? {
+        Ty::Bool => ByteScalar::Bool,
+        Ty::Int(t) => ByteScalar::Int(*t),
+        Ty::Uint(t) => ByteScalar::Uint(*t),
+        Ty::Float(t) => ByteScalar::Float(*t),
+        _ => return None,
+    })
+}
+
+/// Whether a declared scalar kind is a float narrower than
+/// the model's `f64` storage: the kinds whose declared bytes
+/// the evidence-free scalar storage forms
+/// ([`scalar_storage_byte`], [`scalar_storage_len`],
+/// [`splice_scalar_storage_byte`]) do not describe, because
+/// they serialize the widened `f64` bits. Every other kind's
+/// evidence-free answers are already its declared ones (an
+/// integer's low bytes, a boolean's byte, an `f128`'s raw
+/// bits), so only these kinds make type evidence change a
+/// byte arm's answer.
+fn narrowed_float_kind(kind: ByteScalar) -> bool {
+    matches!(
+        kind,
+        ByteScalar::Float(FloatTy::F16) | ByteScalar::Float(FloatTy::F32)
+    )
+}
+
+/// [`scalar_storage_len`] under declared-kind evidence (see
+/// [`byte_scalar_of_ty`]): a float storage narrower than the
+/// model form is exactly its declared width long; every
+/// other scalar keeps the evidence-free length.
+fn scalar_storage_len_as(value: &Value, kind: Option<ByteScalar>) -> Option<usize> {
+    match (kind, value) {
+        (Some(kind), Value::Float(_)) if narrowed_float_kind(kind) => Some(kind.width()),
+        _ => scalar_storage_len(value),
+    }
+}
+
+/// [`scalar_storage_byte`] under declared-kind evidence (see
+/// [`byte_scalar_of_ty`]): a float storage narrower than the
+/// model form yields its own width's bytes, and no byte past
+/// them; every other scalar keeps the evidence-free byte,
+/// which is already its declared one.
+fn scalar_storage_byte_as(value: &Value, kind: Option<ByteScalar>, idx: usize) -> Option<u8> {
+    match (kind, value) {
+        (Some(kind), Value::Float(_)) if narrowed_float_kind(kind) => {
+            if idx >= kind.width() {
+                return None;
+            }
+            let bits = scalar_bits_of_kind(value, kind)?;
+            Some((bits >> (8 * idx)) as u8)
+        }
+        _ => scalar_storage_byte(value, idx),
     }
 }
 
@@ -22427,6 +22518,48 @@ fn splice_scalar_storage_byte(slot: &mut Value, idx: usize, byte: u8) -> bool {
         _ => Value::Uint(bits),
     };
     true
+}
+
+/// [`splice_scalar_storage_byte`] under declared-kind
+/// evidence (see [`byte_scalar_of_ty`]): a byte written into
+/// a float storage narrower than the model form splices into
+/// the storage's own width's bits — the write side of
+/// [`scalar_storage_byte_as`], with the same bit conventions
+/// as the byte view's write arm
+/// (`Interpreter::splice_storage_byte`). A byte position
+/// past the declared width does not apply. Every other
+/// scalar keeps the evidence-free splice, whose widening
+/// assumption is already its declared behaviour there.
+fn splice_scalar_storage_byte_as(
+    slot: &mut Value,
+    kind: Option<ByteScalar>,
+    idx: usize,
+    byte: u8,
+) -> bool {
+    match (kind, &*slot) {
+        (Some(kind), Value::Float(f)) if narrowed_float_kind(kind) => {
+            if idx >= kind.width() {
+                return false;
+            }
+            let shift = 8 * idx;
+            let splice = |bits: u128| -> u128 {
+                (bits & !(0xffu128 << shift)) | (u128::from(byte) << shift)
+            };
+            *slot = match kind {
+                ByteScalar::Float(FloatTy::F16) => {
+                    let bits = splice(u128::from(crate::f128::f64_to_f16_bits(*f)));
+                    Value::Float(crate::f128::f16_bits_to_f64(bits as u16))
+                }
+                ByteScalar::Float(FloatTy::F32) => {
+                    let bits = splice(u128::from(crate::f128::f64_to_f32_bits_exact(*f)));
+                    Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32))
+                }
+                _ => unreachable!("narrowed float kind checked"),
+            };
+            true
+        }
+        _ => splice_scalar_storage_byte(slot, idx, byte),
+    }
 }
 
 /// Assign `value` to the slot `projection` selects inside the
@@ -22874,7 +23007,16 @@ fn assign_projected(
                     program,
                     ty.clone(),
                 ) {
-                    if splice_scalar_storage_byte(head_slot, disp as usize, byte) {
+                    // The head slot's declared kind, when the
+                    // type walk follows the head projection: a
+                    // float storage narrower than the model
+                    // form takes the byte at its own width
+                    // (see `splice_scalar_storage_byte_as`).
+                    let head_kind = byte_scalar_of_ty(
+                        step_ty_across(program, ty.clone(), head).as_ref(),
+                    );
+                    if splice_scalar_storage_byte_as(head_slot, head_kind, disp as usize, byte)
+                    {
                         return Ok(());
                     }
                 }
@@ -22913,8 +23055,13 @@ fn assign_projected(
                 // would pack them into one integer and lose the
                 // array. Such a write belongs to the ordinary
                 // navigation below, which materialises the array.
+                // The head slot's declared kind rides along as
+                // at the byte-offset splice above.
+                let head_kind = byte_scalar_of_ty(
+                    step_ty_across(program, ty.clone(), head).as_ref(),
+                );
                 if (byte_displaced || scalar_storage_len(head_slot).is_some())
-                    && splice_scalar_storage_byte(head_slot, idx, byte)
+                    && splice_scalar_storage_byte_as(head_slot, head_kind, idx, byte)
                 {
                     return Ok(());
                 }
@@ -23359,13 +23506,16 @@ pub(crate) fn project_value_ref_ev<'a>(
                 | Value::Float(_)
                 | Value::Float128(_) => {
                     // A scalar's storage byte, as in
-                    // `project_value` (see `scalar_storage_byte`).
-                    let len = scalar_storage_len(cur).expect("scalar storage");
+                    // `project_value` (see `scalar_storage_byte`),
+                    // under the declared type in hand (see
+                    // `scalar_storage_byte_as`).
+                    let kind = byte_scalar_of_ty(step_base_ty.as_ref());
+                    let len = scalar_storage_len_as(cur, kind).expect("scalar storage");
                     if *idx >= len {
                         return Err(index_oob(len, *idx));
                     }
-                    let byte =
-                        scalar_storage_byte(cur, *idx).expect("index inside the storage");
+                    let byte = scalar_storage_byte_as(cur, kind, *idx)
+                        .expect("index inside the storage");
                     let v = Value::Uint(u128::from(byte));
                     return Ok(Cow::Owned(project_value(v, rest, func, place)?));
                 }
@@ -23508,11 +23658,12 @@ pub(crate) fn project_value_ref_ev<'a>(
                     // the index step that follows selects the byte
                     // at the combined offset.
                     if *disp >= 0 {
+                        let kind = byte_scalar_of_ty(step_base_ty.as_ref());
                         if let (Some(len), Some(&RefProj::Index(k))) =
-                            (scalar_storage_len(cur), rest.first())
+                            (scalar_storage_len_as(cur, kind), rest.first())
                         {
                             let at = *disp as usize + k;
-                            let byte = scalar_storage_byte(cur, at)
+                            let byte = scalar_storage_byte_as(cur, kind, at)
                                 .ok_or_else(|| index_oob(len, at))?;
                             let v = Value::Uint(u128::from(byte));
                             return Ok(Cow::Owned(project_value(v, &rest[1..], func, place)?));
