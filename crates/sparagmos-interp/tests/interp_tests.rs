@@ -536,6 +536,80 @@ fn step_limit_stops_infinite_loop() {
 }
 
 #[test]
+fn default_step_budget_admits_long_finite_loops() {
+    // The `sum` body of `loop_sum_1_to_100`, driven far past
+    // the old default budget: each iteration spends 5 steps
+    // (bb1: one statement + terminator, bb2: two statements +
+    // terminator), so sum(300_000) needs 1,500,007 steps --
+    // over the historical 1,000,000 default, far under the
+    // current one (issue #399: the budget is sized from the
+    // measured demand of finite suite programs, whose largest
+    // need is ~2.8e8 steps).
+    // locals: 0 ret, 1 n, 2 i, 3 sum, 4 cond(bool)
+    let body = Body::new(
+        "sum",
+        1,
+        vec![Ty::i64(), Ty::i64(), Ty::i64(), Ty::i64(), Ty::Bool],
+        vec![
+            bb(
+                vec![
+                    assign(2, Rvalue::Use(Operand::const_int(1))),
+                    assign(3, Rvalue::Use(Operand::const_int(0))),
+                ],
+                goto(1),
+            ),
+            bb(
+                vec![assign(
+                    4,
+                    bin(BinOp::Le, Operand::copy_local(2), Operand::copy_local(1)),
+                )],
+                TerminatorKind::SwitchInt {
+                    discr: Operand::copy_local(4),
+                    targets: vec![(1, BasicBlock(2))],
+                    otherwise: BasicBlock(3),
+                },
+            ),
+            bb(
+                vec![
+                    assign(
+                        3,
+                        bin(BinOp::Add, Operand::copy_local(3), Operand::copy_local(2)),
+                    ),
+                    assign(
+                        2,
+                        bin(BinOp::Add, Operand::copy_local(2), Operand::const_int(1)),
+                    ),
+                ],
+                goto(1),
+            ),
+            bb(vec![assign(0, use_local(3))], ret()),
+        ],
+    );
+    let p = program_of(body);
+    // The default configuration (what `interpret` runs with)
+    // admits the run.
+    assert_eq!(
+        interpret(&p, "sum", vec![Value::Int(300_000)]).unwrap(),
+        Value::Int(45_000_150_000)
+    );
+    // The historical budget rejects the same run: the raised
+    // default, not a change to the accounting, is what admits
+    // it.
+    let mut interp = Interpreter::with_config(
+        &p,
+        InterpConfig {
+            max_steps: 1_000_000,
+            ..InterpConfig::default()
+        },
+    );
+    let err = interp.run("sum", vec![Value::Int(300_000)]).unwrap_err();
+    assert!(
+        matches!(err, InterpError::StepLimitExceeded { limit: 1_000_000 }),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn call_depth_limit_stops_unbounded_recursion() {
     // fn f() { call f() -> _0, goto bb1 } bb1: return
     let body = Body::new(

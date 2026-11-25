@@ -114,6 +114,23 @@ denominator. Runs on every push to `main` and on manual dispatch.
   arguments, environment and working directory. Stage-3 runs
   configure tool interception instead and install no process
   host, and the JIT pass (`run-jit`) installs none either.
+- Guest runs are bounded by the interpreter's step budget
+  (`InterpConfig`'s default `max_steps`, 1e9 statements +
+  terminators), which has no counterpart in compiletest --
+  compiletest bounds a test only by wall clock. The budget is
+  a safety bound against guests that never terminate, sized
+  from measured demand (issue #399): the hungriest finite
+  suite programs need ~2.8e8 steps
+  (`tests/ui/range/step_overflowing.rs`), and the budget
+  leaves ~3.6x headroom over that. In practice the runner's
+  per-record wall-clock timeout is the operative bound: a
+  guest whose per-step cost is high (hash-table-heavy code),
+  or one that spins without reaching an interpreter
+  scheduling point (a busy-wait on an atomic, a `try_recv`
+  loop -- the cooperative thread model runs pending threads
+  only where the running thread blocks), exhausts the
+  timeout rather than the step budget, and is recorded as a
+  timeout.
 - The `rustdoc-check` records (1,735) are attempted by the
   stage-4 rustdoc harness for the rustdoc-html (802),
   rustdoc-ui (440), and rustdoc-json (194) suites (see
