@@ -4968,6 +4968,9 @@ fn collect() -> ControlFlow<()> {
     // instance demand, and each round's newly converted closure
     // and coroutine bodies become the next round's scan set, so
     // every converted body is eventually scanned by every pass.
+    // The vtable-demanded bodies converted below join the same
+    // scan set for the same reason (see the note at the
+    // `demand_dyn_instances` call).
     let mut local_scan: Vec<rustc_public::mir::Body> = closure_seeds.clone();
     local_scan.extend(coroutine_seeds.iter().cloned());
     local_scan.extend(const_seeds.iter().cloned());
@@ -5004,7 +5007,19 @@ fn collect() -> ControlFlow<()> {
         &mut dyn_credited,
         &mut dyn_demanded,
     );
-    reach_seeds.extend(dyn_seeds);
+    reach_seeds.extend(dyn_seeds.iter().cloned());
+    // The vtable-demanded bodies also join the instance-demand
+    // scan set: a demanded method body can itself demand generic
+    // local instances concretely (a forwarding trait impl calling
+    // a trait default method on its own fields is the common
+    // shape), and no other pass scans a converted body for that
+    // kind of demand -- the reachability walk collects the
+    // foreign functions such bodies call but skips instances of
+    // local definitions by design, and the rounds below only ever
+    // rescan the bodies their own rounds converted. Without
+    // this, a call inside a vtable-demanded body to a local
+    // default-method instance is left with no converted body.
+    local_scan.extend(dyn_seeds);
 
     // In the executing modes the reachability passes walk
     // execution-first (see `reach::CollectionOrder`): the entry
