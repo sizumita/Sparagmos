@@ -10485,6 +10485,40 @@ let inner = match (&src, target) {
                         // treatment these calls have always had.
                         let elem_glue = if matches!(
                             kind,
+                            crate::builtins::Builtin::SliceToVec
+                        ) {
+                            // `slice::to_vec` clones the
+                            // receiver slice's elements one by
+                            // one in the modelled builtin: build
+                            // the element type's glue from the
+                            // receiver operand's type, so the
+                            // cloned prefix drops when a later
+                            // element's clone panics.
+                            args.first()
+                                .and_then(|arg| {
+                                    self.operand_place_ty(body, arg)
+                                })
+                                .and_then(|ty| match ty {
+                                    mir::Ty::Ref(_, inner, _) => {
+                                        match *inner {
+                                            mir::Ty::Slice(elem) => {
+                                                Some(*elem)
+                                            }
+                                            mir::Ty::Array(elem, _) => {
+                                                Some(*elem)
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    mir::Ty::Slice(elem) => Some(*elem),
+                                    _ => None,
+                                })
+                                .and_then(|elem| self.drop_glue(&elem))
+                                .filter(|glue| {
+                                    glue.root != ir::DropPlan::Trivial
+                                })
+                        } else if matches!(
+                            kind,
                             crate::builtins::Builtin::FromFrom
                                 | crate::builtins::Builtin::IntoInto
                         ) {
@@ -10521,12 +10555,15 @@ let inner = match (&src, target) {
                         };
                         // A `Clone::clone` call on a closure
                         // clones the environment capture by
-                        // capture in the modelled clone: build
-                        // the closure type's glue now (see
-                        // `receiver_glue` in `ir`), so the
-                        // interpreter can drop the captures
-                        // cloned so far when a later capture's
-                        // clone panics. The `Self` type is the
+                        // capture in the modelled clone, and a
+                        // call on a `Vec` / tuple / array / `Box`
+                        // clones element by element (field by
+                        // field, pointee) in the same model:
+                        // build the receiver type's glue now
+                        // (see `receiver_glue` in `ir`), so the
+                        // interpreter can drop the parts cloned
+                        // so far when a later part's clone
+                        // panics. The `Self` type is the
                         // callee's first generic argument. A
                         // trivial glue has nothing to run; a
                         // glue that cannot be accounted for
@@ -10539,7 +10576,30 @@ let inner = match (&src, target) {
                             raw_generic_args
                                 .first()
                                 .and_then(|ty| match ty {
-                                    mir::Ty::Closure(..) => {
+                                    mir::Ty::Closure(..)
+                                    | mir::Ty::Tuple(_)
+                                    | mir::Ty::Array(..) => {
+                                        self.drop_glue(ty)
+                                    }
+                                    mir::Ty::Adt(def, _)
+                                        if self
+                                            .names
+                                            .get(def)
+                                            .or_else(|| {
+                                                self.def_names.get(def)
+                                            })
+                                            .map(String::as_str)
+                                            == Some("std::vec::Vec")
+                                            || self
+                                                .names
+                                                .get(def)
+                                                .or_else(|| {
+                                                    self.def_names
+                                                        .get(def)
+                                                })
+                                                .map(String::as_str)
+                                                == Some("std::boxed::Box") =>
+                                    {
                                         self.drop_glue(ty)
                                     }
                                     _ => None,

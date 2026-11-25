@@ -8955,6 +8955,152 @@ fn run_mode_boxed_slice_from_slice_ref_clone_panic_drops_counted_prefix() {
     );
 }
 
+const VEC_CLONE_CUSTOM_CLONE_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Debug)]
+struct Counted {
+    id: i32,
+    clones: Rc<Cell<i32>>,
+}
+impl Clone for Counted {
+    fn clone(&self) -> Self {
+        self.clones.set(self.clones.get() + 1);
+        Counted { id: self.id + 100, clones: self.clones.clone() }
+    }
+}
+
+fn main() {
+    let counter = Rc::new(Cell::new(0));
+    let v = vec![
+        Counted { id: 1, clones: counter.clone() },
+        Counted { id: 2, clones: counter.clone() },
+        Counted { id: 3, clones: counter.clone() },
+    ];
+    let w = v.clone();
+    println!("clones: {}", counter.get());
+    println!("w: {:?}", w.iter().map(|c| c.id).collect::<Vec<_>>());
+    println!("v: {:?}", v.iter().map(|c| c.id).collect::<Vec<_>>());
+    let tv = vec![(Counted { id: 7, clones: counter.clone() }, 1u32)];
+    let tw = tv.clone();
+    println!("tuple clones: {}", counter.get());
+    println!("tw: {:?}", tw.iter().map(|c| c.0.id).collect::<Vec<_>>());
+    let arr = [
+        Counted { id: 10, clones: counter.clone() },
+        Counted { id: 20, clones: counter.clone() },
+    ];
+    let av = arr.to_vec();
+    println!("to_vec clones: {}", counter.get());
+    println!("av: {:?}", av.iter().map(|c| c.id).collect::<Vec<_>>());
+}
+"#;
+
+#[test]
+fn run_mode_vec_clone_runs_custom_clone() {
+    let dir = temp_dir("vec-clone-custom-clone");
+    let src = fixture(&dir, "vec_clone_custom_clone.rs", VEC_CLONE_CUSTOM_CLONE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::clone must run the elements' own Clone impls; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "clones: 3\nw: [101, 102, 103]\nv: [1, 2, 3]\ntuple clones: 4\ntw: [107]\nto_vec clones: 6\nav: [110, 120]\n"
+    );
+}
+
+const VEC_CLONE_PANIC_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+struct Counted { clones: Rc<Cell<i32>> }
+impl Clone for Counted {
+    fn clone(&self) -> Self { self.clones.set(self.clones.get() + 1); Counted { clones: self.clones.clone() } }
+}
+impl Drop for Counted {
+    fn drop(&mut self) { println!("drop counted"); }
+}
+struct Boom;
+impl Clone for Boom { fn clone(&self) -> Self { panic!("boom clone"); } }
+
+fn main() {
+    let counter = Rc::new(Cell::new(0));
+    let v = vec![
+        (Counted { clones: counter.clone() }, Boom),
+        (Counted { clones: counter.clone() }, Boom),
+    ];
+    println!("before strong: {}", Rc::strong_count(&counter));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _w = v.clone();
+        println!("no panic");
+    }));
+    println!("caught: {}", r.is_err());
+    println!("clones: {}", counter.get());
+    println!("after strong: {}", Rc::strong_count(&counter));
+    println!("source len: {}", v.len());
+    drop(v);
+    println!("final strong: {}", Rc::strong_count(&counter));
+}
+"#;
+
+#[test]
+fn run_mode_vec_clone_panic_drops_prefix_and_keeps_source() {
+    let dir = temp_dir("vec-clone-panic");
+    let src = fixture(&dir, "vec_clone_panic.rs", VEC_CLONE_PANIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a panicking element Clone must unwind out of Vec::clone, dropping the cloned prefix; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before strong: 3\ndrop counted\ncaught: true\nclones: 1\nafter strong: 3\nsource len: 2\ndrop counted\ndrop counted\nfinal strong: 1\n"
+    );
+}
+
+const VEC_CLONE_COUNTED_HANDLES_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+fn main() {
+    let rc = Rc::new(Cell::new(10));
+    let v = vec![rc.clone(), rc.clone()];
+    println!("base: {}", Rc::strong_count(&rc));
+    let w = v.clone();
+    println!("after clone: {}", Rc::strong_count(&rc));
+    w[0].set(99);
+    println!("shared: {}", rc.get());
+    drop(w);
+    println!("after drop clone: {}", Rc::strong_count(&rc));
+}
+"#;
+
+#[test]
+fn run_mode_vec_clone_counted_handles() {
+    let dir = temp_dir("vec-clone-counted-handles");
+    let src = fixture(
+        &dir,
+        "vec_clone_counted_handles.rs",
+        VEC_CLONE_COUNTED_HANDLES_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::clone of counted handles must clone the handles, not copy or deep-clone them; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "base: 3\nafter clone: 5\nshared: 99\nafter drop clone: 3\n"
+    );
+}
+
 const CLOSURE_CLONE_PANIC_SRC: &str = r#"use std::cell::Cell;
 use std::rc::Rc;
 
