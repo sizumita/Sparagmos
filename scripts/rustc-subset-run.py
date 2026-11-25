@@ -5008,6 +5008,17 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     normalization).
     """
     rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
+    if capture_stdout:
+        # compiletest adds these to every compiler invocation:
+        # libstd source spans are simulated as remapped to
+        # /rustc/FAKE_PREFIX, which output normalization then
+        # renders as $SRC_DIR -- the form the snapshots carry.
+        # They shape only how source paths print, so they are
+        # added exactly for the runs whose printed output is
+        # judged.
+        rustc_args += ["-Zsimulate-remapped-rust-src-base="
+                       "/rustc/FAKE_PREFIX",
+                       "-Ztranslate-remapped-path-to-local-path=no"]
     argv = [str(driver_bin)]
     if jit:
         argv.append("jit-compile")
@@ -5028,6 +5039,17 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     for name in aux_env_scrub:
         argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
+    if capture_stdout:
+        # Bootstrap runs compiletest itself with
+        # RUSTC_FORCE_RUSTC_VERSION=compiletest, and the compiler
+        # folds that value into every crate's StableCrateId, so
+        # printed DefIds (a thir dump's `crate[7aaa]`) carry the
+        # hash compiletest's snapshots were blessed with. A
+        # captured-stdout run reproduces the environment the
+        # snapshot was produced under; the test's own rustc-env
+        # (env_extra, applied next) still wins, as it does under
+        # compiletest.
+        env["RUSTC_FORCE_RUSTC_VERSION"] = "compiletest"
     if env_extra:
         env.update(env_extra)
     res = run_cmd(argv,

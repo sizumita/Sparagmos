@@ -2139,6 +2139,13 @@ class ConvertSideTests(unittest.TestCase):
         argv, out = self.run_argv(capture_stdout=True)
         i = argv.index("--compiler-stdout")
         self.assertTrue(argv[i + 1].endswith("stdout.txt"))
+        # compiletest's source-path simulation rides along: the
+        # snapshots carry $SRC_DIR for libstd spans.
+        flat = " ".join(argv)
+        self.assertIn("-Zsimulate-remapped-rust-src-base="
+                      "/rustc/FAKE_PREFIX", flat)
+        self.assertIn("-Ztranslate-remapped-path-to-local-path=no",
+                      flat)
         # The stub never creates the capture file: the result
         # reports the capture as absent, not as empty output.
         self.assertIsNone(out["compiler_stdout"])
@@ -2147,7 +2154,37 @@ class ConvertSideTests(unittest.TestCase):
     def test_no_capture_by_default(self):
         argv, out = self.run_argv()
         self.assertNotIn("--compiler-stdout", argv)
+        self.assertNotIn("simulate-remapped", " ".join(argv))
         self.assertIsNone(out["compiler_stdout"])
+
+    def test_capture_forces_compiletest_crate_version(self):
+        # Bootstrap runs compiletest with
+        # RUSTC_FORCE_RUSTC_VERSION=compiletest, which the
+        # compiler folds into StableCrateId: a captured-stdout
+        # run reproduces that environment so printed DefId
+        # hashes match the snapshots.
+        orig = run.run_cmd
+        seen = {}
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=(), mem_limit_mb=None):
+            seen.update(env_extra or {})
+            return {"exit_code": 0, "timeout": False,
+                    "stdout": "converted: 1, skipped: 0\n",
+                    "stderr": ""}
+
+        run.run_cmd = stub
+        try:
+            run.convert_side(Path("t.rs"), "2021",
+                             Path("/fake/driver"), capture_stdout=True)
+            self.assertEqual(seen.get("RUSTC_FORCE_RUSTC_VERSION"),
+                             "compiletest")
+            seen.clear()
+            run.convert_side(Path("t.rs"), "2021",
+                             Path("/fake/driver"))
+            self.assertNotIn("RUSTC_FORCE_RUSTC_VERSION", seen)
+        finally:
+            run.run_cmd = orig
 
     def test_counts_default_to_none_without_report_lines(self):
         out = self.run_stdout("converted: 1, skipped: 0\n")
