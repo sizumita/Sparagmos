@@ -7171,10 +7171,14 @@ impl<'a> Interpreter<'a> {
                         vals[0].kind_name(),
                     ));
                 };
-                let Some(address) = synthetic_address(&Value::Ref(RefTarget::Alloc {
+                let owner_value = Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
-                })) else {
+                });
+                let Some(address) = self
+                    .arithmetic_price(&owner_value, None, Some(frames))
+                    .or_else(|| synthetic_address(&owner_value))
+                else {
                     return Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
                         "an allocation with a synthetic address",
@@ -12888,6 +12892,7 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
+                let align = u128::from(alloc_align_arg(&vals[1]));
                 // The uninitialised form stores nothing per byte,
                 // so only the zeroed form has a materialisation
                 // limit; past it the shim's failure signal (the
@@ -12907,6 +12912,7 @@ impl<'a> Interpreter<'a> {
                 };
                 let id = self.alloc_insert(content);
                 self.mark_elem_block(id);
+                self.record_alloc_layout(id, size as u64, align as u64);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -12935,6 +12941,7 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
+                let realloc_align = u128::from(alloc_align_arg(&vals[2]));
                 let ptr = unwrap_wrapper(&vals[0]).clone();
                 // A block-base pointer: the empty projection, or
                 // the element-0 form an elem block's base pointer
@@ -12954,6 +12961,11 @@ impl<'a> Interpreter<'a> {
                 };
                 let id = self.alloc_insert(content);
                 self.mark_elem_block(id);
+                self.record_alloc_layout(
+                    id,
+                    new_size as u64,
+                    realloc_align as u64,
+                );
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -12964,6 +12976,7 @@ impl<'a> Interpreter<'a> {
                 let size = alloc_size_arg(name, &vals[0])?;
                 let id = self.alloc_insert(Value::Tuple(Vec::new()));
                 self.mark_elem_block(id);
+                self.record_alloc_layout(id, size as u64, 16);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -12979,6 +12992,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let id = self.alloc_insert(Value::Bytes(vec![0u8; total as usize]));
                 self.mark_elem_block(id);
+                self.record_alloc_layout(id, total as u64, 16);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -13016,6 +13030,7 @@ impl<'a> Interpreter<'a> {
                 };
                 let id = self.alloc_insert(content);
                 self.mark_elem_block(id);
+                self.record_alloc_layout(id, new_size as u64, 16);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -13024,9 +13039,11 @@ impl<'a> Interpreter<'a> {
             Builtin::LibcPosixMemalign => {
                 arity(3)?;
                 let size = alloc_size_arg(name, &vals[2])?;
+                let align = alloc_size_arg(name, &vals[1])?;
                 let _ = size;
                 let id = self.alloc_insert(Value::Tuple(Vec::new()));
                 self.mark_elem_block(id);
+                self.record_alloc_layout(id, size as u64, align as u64);
                 let block = Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -14059,7 +14076,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let lanes = simd_lanes(&vals[0])?;
                 let mut out = Vec::with_capacity(lanes.len());
                 for lane in lanes.iter() {
-                    let addr = synthetic_address(lane).ok_or_else(|| {
+                    let addr = self
+                        .arithmetic_price(lane, None, Some(frames))
+                        .or_else(|| synthetic_address(lane))
+                        .ok_or_else(|| {
                         unsupported("simd_expose_provenance of this lane is not runtime-supported")
                     })?;
                     out.push(Value::Uint(addr));
@@ -30327,6 +30347,26 @@ fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
         }
         _ => return None,
     })
+}
+
+/// The alignment an allocator call declares, read
+/// permissively: the argument is usually a bare integer,
+/// but a `mem::Alignment` (or similar newtype) argument
+/// arrives as an aggregate wrapping the integer. Anything
+/// unrecognised keeps the pointer-width default the
+/// layout fallback has always used.
+fn alloc_align_arg(v: &Value) -> u64 {
+    fn scalar(v: &Value) -> Option<u64> {
+        match v {
+            Value::Uint(n) => u64::try_from(*n).ok(),
+            Value::Int(n) if *n >= 0 => u64::try_from(*n).ok(),
+            Value::Tuple(fields) | Value::Enum { fields, .. } => {
+                fields.first().and_then(scalar)
+            }
+            _ => None,
+        }
+    }
+    scalar(v).filter(|a| a.is_power_of_two()).unwrap_or(8)
 }
 
 /// An allocation-size argument (`usize`, or a non-negative

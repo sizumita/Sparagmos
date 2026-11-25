@@ -998,6 +998,41 @@ pub struct Interpreter<'a> {
     /// the guest deallocator with the pointee's layout, which the
     /// box value itself does not carry.
     box_layouts: std::cell::RefCell<std::collections::HashMap<u64, (u128, u128)>>,
+    /// Stack frames of the arithmetic address model (see
+    /// [`Self::arithmetic_price`]): the frame's function name
+    /// (the body its places resolve against) and the synthetic
+    /// stack address its slot area starts at, recorded when
+    /// the frame is pushed ([`Self::register_frame_base`]). A
+    /// frame keeps the first base it was assigned, so a
+    /// coroutine frame that suspends and resumes — and any
+    /// pointer into a frame priced after the frame popped —
+    /// keeps its addresses, like the storage it models.
+    frame_info:
+        std::cell::RefCell<std::collections::HashMap<u64, (String, u128)>>,
+    /// Per-body stack slot layouts for the arithmetic address
+    /// model, by function name (see [`SlotLayout`]): `None`
+    /// for a body whose layout cannot be computed — its
+    /// places keep synthetic-hash pricing.
+    body_slots: std::cell::RefCell<
+        std::collections::HashMap<String, Option<std::rc::Rc<SlotLayout>>>,
+    >,
+    /// Synthetic addresses of static storages, assigned from
+    /// the statics region in first-pricing order.
+    static_prices: std::cell::RefCell<std::collections::HashMap<String, u128>>,
+    static_cursor: std::cell::Cell<u128>,
+    /// Synthetic addresses of allocation-store allocations,
+    /// assigned from the heap region in allocation-id order:
+    /// `heap_prices` memoises by id, and `heap_cursor` — the
+    /// next unpriced id and its address — advances as layouts
+    /// become known.
+    heap_prices: std::cell::RefCell<std::collections::HashMap<u64, u128>>,
+    heap_cursor: std::cell::Cell<(u64, u128)>,
+    /// Allocation layouts recorded by the raw allocator
+    /// builtins (`__rust_alloc` and the libc family): (size,
+    /// align) by allocation id. Typed creations are covered
+    /// by `alloc_tys` / `box_layouts` instead.
+    alloc_layouts:
+        std::cell::RefCell<std::collections::HashMap<u64, (u64, u64)>>,
     /// Fat pointer values flattened through a fat pointer
     /// shape, by their 128-bit pattern: the pattern's words do
     /// not denote the value on their own (the data word is a
@@ -1509,6 +1544,337 @@ fn hash_address_key(key: &str) -> u128 {
     // keeps every distinctness property of the field while making
     // each address a multiple of 2^16 (see [`synthetic_address`]).
     0x1_0000_0000u128 + u128::from((h >> 12) & 0xFFF_FFFF_FFFF) * 0x1_0000
+}
+
+/// Base of the synthetic stack region: frame bases descend
+/// from here (see [`Interpreter::register_frame_base`]). The
+/// region sits above the synthetic-hash range, and stack
+/// addresses stay far below the statics and heap regions, so
+/// the four address spaces never interleave.
+const STACK_TOP: u128 = 1 << 56;
+/// Base of the synthetic statics region: static storages are
+/// priced upward from here in first-pricing order.
+const STATICS_BASE: u128 = 1 << 61;
+/// Base of the synthetic heap region: allocation-store
+/// allocations are priced upward from here in allocation-id
+/// order (allocation ids are issued in creation order and
+/// never reused, so heap addresses order as the allocations
+/// were created, as natively).
+const HEAP_BASE: u128 = 1 << 62;
+
+/// The address a zero-sized root denotes: no storage backs
+/// it, so — exactly as codegen prices such a pointer — the
+/// address is the type's alignment, the canonical dangling
+/// address (`NonNull::dangling`, an empty allocation's buffer
+/// pointer, a reference to a zero-sized temporary).
+fn dangling_address(align: u64) -> u128 {
+    u128::from(align.max(1))
+}
+
+/// The dangling address of a zero-sized root, displaced by
+/// the projection's byte displacements: every structural
+/// position inside a zero-sized tree sits at the root's
+/// address (the canonical zero-sized normalisation), but a
+/// byte displacement the guest computed (`wrapping_byte_add`
+/// on a dangling pointer) moves the address exactly as it
+/// does natively. A displacement that would leave the
+/// positive range keeps the dangling address, as
+/// `displaced_address` keeps the slot.
+fn dangling_displaced(align: u64, projection: &[RefProj]) -> u128 {
+    let base = dangling_address(align);
+    let mut sum: i128 = 0;
+    for step in projection {
+        if let RefProj::ByteOffset(d) = step {
+            sum += d;
+        }
+    }
+    base.checked_add_signed(sum).unwrap_or(base)
+}
+
+/// `value` rounded up to a multiple of `align` (a power of
+/// two, at least one).
+fn align_up_u128(value: u128, align: u64) -> u128 {
+    let a = u128::from(align.max(1));
+    (value + a - 1) / a * a
+}
+
+/// A root price plus a signed byte displacement, kept only
+/// when the result is a guest-representable address.
+fn displaced_price(base: u128, offset: i128) -> Option<u128> {
+    let p = base as i128 + offset;
+    if p >= 0 && p < (1i128 << 64) {
+        Some(p as u128)
+    } else {
+        None
+    }
+}
+
+/// One body's stack slot layout for the arithmetic address
+/// model (see [`Interpreter::compute_slot_layout`]): the byte
+/// offset of each local's slot within the frame — `None` for
+/// a local the layout does not price (its declared size is
+/// unknown) — and the frame's total extent in bytes.
+struct SlotLayout {
+    slots: Vec<Option<u64>>,
+    extent: u64,
+}
+
+/// The block successors the storage-liveness dataflow runs
+/// over: the terminator's ordinary targets (the body's
+/// unwind cleanup target is added by the caller).
+fn block_successors(block: &BasicBlockData) -> Vec<usize> {
+    let mut out = Vec::new();
+    match &block.terminator {
+        TerminatorKind::Goto { target } => out.push(target.0),
+        TerminatorKind::SwitchInt {
+            targets, otherwise, ..
+        } => {
+            for (_, t) in targets {
+                out.push(t.0);
+            }
+            out.push(otherwise.0);
+        }
+        TerminatorKind::Call { target, .. }
+        | TerminatorKind::CallIndirect { target, .. }
+        | TerminatorKind::CallTrait { target, .. }
+        | TerminatorKind::CallBuiltin { target, .. }
+        | TerminatorKind::InlineAsm { target, .. } => {
+            if let Some(t) = target {
+                out.push(t.0);
+            }
+        }
+        TerminatorKind::Drop { target, .. } => out.push(target.0),
+        TerminatorKind::Assert { target, .. } => out.push(target.0),
+        _ => {}
+    }
+    out
+}
+
+/// Record the live set `cur` at statement boundary `boundary`
+/// of block `bi` into the per-local live-range hulls.
+fn note_live_hull(
+    cur: &[u64],
+    boundary: usize,
+    bi: usize,
+    hulls: &mut [Vec<Option<(usize, usize)>>],
+) {
+    for (l, hull) in hulls.iter_mut().enumerate() {
+        if cur[l / 64] >> (l % 64) & 1 == 1 {
+            let e = &mut hull[bi];
+            *e = Some(match *e {
+                None => (boundary, boundary),
+                Some((f, l)) => (f.min(boundary), l.max(boundary)),
+            });
+        }
+    }
+}
+
+/// Set the bit for local `l` in a liveness bitset.
+fn liveness_set(set: &mut [u64], l: usize, n: usize) {
+    if l < n {
+        set[l / 64] |= 1u64 << (l % 64);
+    }
+}
+
+/// The locals an operand reads: the root local of the place
+/// it copies or moves (a projected place reads its root).
+fn operand_liveness(op: &Operand, uses: &mut [u64], n: usize) {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => {
+            liveness_set(uses, p.local.0, n);
+        }
+        Operand::Constant(_) => {}
+    }
+}
+
+/// The locals an rvalue reads (see [`operand_liveness`]).
+fn rvalue_liveness(rv: &Rvalue, uses: &mut [u64], n: usize) {
+    match rv {
+        Rvalue::Use(op)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(op, _)
+        | Rvalue::Unsize(op, _)
+        | Rvalue::BoxDerefTransmute(op)
+        | Rvalue::DataPtr(op)
+        | Rvalue::Materialize(op, _)
+        | Rvalue::PtrToInt(op)
+        | Rvalue::PtrField(op, _)
+        | Rvalue::PtrFieldFirstElem(op, _)
+        | Rvalue::PtrCastUnits(op, _)
+        | Rvalue::PtrFirstElem(op)
+        | Rvalue::PtrArrayBase(op)
+        | Rvalue::WrapArrayElems(op)
+        | Rvalue::UnwrapArrayElems(op)
+        | Rvalue::UnwrapSliceElems(op)
+        | Rvalue::WrapSliceElems(op)
+        | Rvalue::IntToPtr(op)
+        | Rvalue::EnumToInt(op, ..)
+        | Rvalue::IntToEnum(op, ..)
+        | Rvalue::Reinterpret(op, ..)
+        | Rvalue::IntToPtrWrapped { operand: op, .. }
+        | Rvalue::ScalarToPtrWrapped { operand: op, .. }
+        | Rvalue::EnumToPtrWrapped { operand: op, .. }
+        | Rvalue::IntToEnumWrapped { operand: op, .. } => {
+            operand_liveness(op, uses, n);
+        }
+        Rvalue::BinaryOp(_, pair) | Rvalue::CheckedBinaryOp(_, pair) => {
+            operand_liveness(&pair.0, uses, n);
+            operand_liveness(&pair.1, uses, n);
+        }
+        Rvalue::AggregateTuple(ops) | Rvalue::CoroutineAggregate(ops) => {
+            for op in ops {
+                operand_liveness(op, uses, n);
+            }
+        }
+        Rvalue::AggregateAdt { operands, .. }
+        | Rvalue::ClosureAggregate { operands, .. } => {
+            for op in operands {
+                operand_liveness(op, uses, n);
+            }
+        }
+        Rvalue::RawPtrAggregate { data, meta } => {
+            operand_liveness(data, uses, n);
+            if let Some(meta) = meta {
+                operand_liveness(meta, uses, n);
+            }
+        }
+        Rvalue::PtrOffset(a, b, ..) => {
+            operand_liveness(a, uses, n);
+            operand_liveness(b, uses, n);
+        }
+        Rvalue::Ref(p)
+        | Rvalue::Len(p)
+        | Rvalue::Discriminant(p, ..)
+        | Rvalue::CopyForDeref(p)
+        | Rvalue::Reborrow(p)
+        | Rvalue::ShapedLoad(p, ..) => {
+            liveness_set(uses, p.local.0, n);
+        }
+        Rvalue::ThreadLocalRef(_) | Rvalue::Unsupported(_) => {}
+    }
+}
+
+/// The locals a statement reads (`uses`) and the local it
+/// wholly writes (`defs`): a projected assignment reads its
+/// root (a partial write), an unprojected one defines it.
+fn statement_liveness(
+    kind: &StatementKind,
+    uses: &mut [u64],
+    defs: &mut [u64],
+    n: usize,
+) {
+    match kind {
+        StatementKind::Assign(place, rv) => {
+            rvalue_liveness(rv, uses, n);
+            if place.projection.is_empty() {
+                liveness_set(defs, place.local.0, n);
+            } else {
+                liveness_set(uses, place.local.0, n);
+            }
+        }
+        StatementKind::ShapedStore { place, value, .. } => {
+            operand_liveness(value, uses, n);
+            liveness_set(uses, place.local.0, n);
+        }
+        StatementKind::SetDiscriminant { place, .. } => {
+            liveness_set(uses, place.local.0, n);
+        }
+        StatementKind::Assume(op) => operand_liveness(op, uses, n),
+        StatementKind::CopyNonOverlapping { src, dst, count } => {
+            operand_liveness(src, uses, n);
+            operand_liveness(dst, uses, n);
+            operand_liveness(count, uses, n);
+        }
+        StatementKind::StorageLive(_)
+        | StatementKind::StorageDead(_)
+        | StatementKind::Nop
+        | StatementKind::Unsupported(_) => {}
+    }
+}
+
+/// The locals a terminator reads and the local its call
+/// destination wholly writes (see [`statement_liveness`]).
+fn terminator_liveness(
+    kind: &TerminatorKind,
+    uses: &mut [u64],
+    defs: &mut [u64],
+    n: usize,
+) {
+    fn dest_liveness(
+        place: &Place,
+        uses: &mut [u64],
+        defs: &mut [u64],
+        n: usize,
+    ) {
+        if place.projection.is_empty() {
+            liveness_set(defs, place.local.0, n);
+        } else {
+            liveness_set(uses, place.local.0, n);
+        }
+    }
+    match kind {
+        TerminatorKind::SwitchInt { discr, .. } => {
+            operand_liveness(discr, uses, n);
+        }
+        TerminatorKind::Call {
+            args, destination, ..
+        } => {
+            for op in args {
+                operand_liveness(op, uses, n);
+            }
+            dest_liveness(destination, uses, defs, n);
+        }
+        TerminatorKind::CallIndirect {
+            func,
+            args,
+            destination,
+            ..
+        } => {
+            operand_liveness(func, uses, n);
+            for op in args {
+                operand_liveness(op, uses, n);
+            }
+            dest_liveness(destination, uses, defs, n);
+        }
+        TerminatorKind::CallTrait {
+            receiver,
+            args,
+            stamp,
+            destination,
+            ..
+        } => {
+            operand_liveness(receiver, uses, n);
+            operand_liveness(args, uses, n);
+            if let Some(stamp) = stamp {
+                operand_liveness(stamp, uses, n);
+            }
+            dest_liveness(destination, uses, defs, n);
+        }
+        TerminatorKind::CallBuiltin {
+            args, destination, ..
+        } => {
+            for op in args {
+                operand_liveness(op, uses, n);
+            }
+            dest_liveness(destination, uses, defs, n);
+        }
+        TerminatorKind::Drop { place, .. } => {
+            liveness_set(uses, place.local.0, n);
+        }
+        TerminatorKind::Assert { cond, .. } => {
+            operand_liveness(cond, uses, n);
+        }
+        TerminatorKind::Return => {
+            // The return terminator reads the return place.
+            liveness_set(uses, 0, n);
+        }
+        TerminatorKind::Goto { .. }
+        | TerminatorKind::Resume
+        | TerminatorKind::Abort
+        | TerminatorKind::Unreachable
+        | TerminatorKind::InlineAsm { .. }
+        | TerminatorKind::Unsupported(_) => {}
+    }
 }
 
 /// Whether a stored value's tree contains any scalar content
@@ -2065,6 +2431,13 @@ impl<'a> Interpreter<'a> {
             ),
             pending_string_buffer: std::cell::RefCell::new(None),
             box_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
+            frame_info: std::cell::RefCell::new(std::collections::HashMap::new()),
+            body_slots: std::cell::RefCell::new(std::collections::HashMap::new()),
+            static_prices: std::cell::RefCell::new(std::collections::HashMap::new()),
+            static_cursor: std::cell::Cell::new(STATICS_BASE),
+            heap_prices: std::cell::RefCell::new(std::collections::HashMap::new()),
+            heap_cursor: std::cell::Cell::new((0, 0)),
+            alloc_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
             fat_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             stdout_buffer_modelled: std::cell::Cell::new(false),
             output: String::new(),
@@ -2261,6 +2634,7 @@ impl<'a> Interpreter<'a> {
             locals[i + 1] = arg;
         }
         let entry_id = self.fresh_frame_id();
+        self.register_frame_base(&[], entry_id, entry);
         let mut frames: Vec<Frame> = vec![Frame {
             id: entry_id,
             func: entry.to_string(),
@@ -4784,6 +5158,7 @@ impl<'a> Interpreter<'a> {
             locals[idx] = stamp;
         }
         let frame_id = self.fresh_frame_id();
+        self.register_frame_base(&frames, frame_id, func);
         frames.push(Frame {
             id: frame_id,
             func: func.to_string(),
@@ -4858,6 +5233,7 @@ impl<'a> Interpreter<'a> {
         }
         let incoming_asm = self.pending_asm_incoming.take();
         let id = self.fresh_frame_id();
+        self.register_frame_base(&frames, id, func);
         frames.push(Frame {
             id,
             func: func.to_string(),
@@ -6484,6 +6860,9 @@ impl<'a> Interpreter<'a> {
                                         locals[1 + i] = arg;
                                     }
                                     let frame_id = self.fresh_frame_id();
+                                    self.register_frame_base(
+                                        &frames, frame_id, &drop_fn,
+                                    );
                                     self.drop_continuations.push(DropContinuation {
                                         callee_frame: frame_id,
                                         session: active,
@@ -6702,6 +7081,7 @@ impl<'a> Interpreter<'a> {
                         let mut locals = vec![Value::Uninit; local_count];
                         locals[1] = data;
                         let frame_id = self.fresh_frame_id();
+                        self.register_frame_base(&frames, frame_id, &drop_name);
                         self.drop_continuations.push(DropContinuation {
                             callee_frame: frame_id,
                             session: active,
@@ -7094,6 +7474,7 @@ impl<'a> Interpreter<'a> {
                         let mut locals = vec![Value::Uninit; local_count];
                         locals[1] = dtor_arg;
                         let frame_id = self.fresh_frame_id();
+                        self.register_frame_base(&frames, frame_id, &func);
                         self.drop_continuations.push(DropContinuation {
                             callee_frame: frame_id,
                             session: active,
@@ -12414,9 +12795,948 @@ impl<'a> Interpreter<'a> {
                 return synthetic_address(value);
             }
         }
+        // The arithmetic address model (see
+        // [`Self::arithmetic_price`]): where it derives an
+        // address, that address — not the synthetic hash —
+        // is the pointer's identity, so two storages the
+        // compiler's stack colouring would share a slot
+        // compare equal, a packed field's address is its
+        // base plus its layout offset, and a zero-sized
+        // root's address is its alignment, as natively.
+        if let Some(price) = self.arithmetic_price(value, leaf_ty, Some(frames)) {
+            return Some(price);
+        }
         match self.canonical_address_key(frames, value, leaf_ty) {
             Some((key, offset)) => Some(displaced_address(&key, offset)),
             None => synthetic_address(value),
+        }
+    }
+
+    /// Record the stack base of a freshly pushed frame (see
+    /// the `frame_info` field): the new frame's slot area sits
+    /// one frame extent below the caller's base; the entry
+    /// frame's sits one extent below the stack top. A frame
+    /// id that already has a base keeps it. A body whose slot
+    /// layout is unknown still advances the chain by a
+    /// minimal extent, so its callees' frames price normally.
+    fn register_frame_base(&self, frames: &[Frame], id: u64, func: &str) {
+        let mut info = self.frame_info.borrow_mut();
+        if info.contains_key(&id) {
+            return;
+        }
+        let caller_base = frames
+            .last()
+            .and_then(|f| info.get(&f.id).map(|(_, b)| *b));
+        let extent = self
+            .slot_layout(func)
+            .map(|l| u128::from(l.extent))
+            .unwrap_or(16);
+        let base = match caller_base {
+            Some(cb) => cb - extent,
+            None => STACK_TOP - extent,
+        };
+        info.insert(id, (func.to_string(), base));
+    }
+
+    /// The alignment of a type, mirroring [`Self::ty_size`].
+    fn ty_align(&self, ty: &Ty) -> Option<u64> {
+        Some(match ty {
+            Ty::Unit => 1,
+            Ty::Bool => 1,
+            Ty::Int(t) => u64::from(t.bits() / 8),
+            Ty::Uint(t) => u64::from(t.bits() / 8),
+            Ty::Float(t) => u64::from(t.bits() / 8),
+            Ty::Adt(name) => {
+                let program = self.program();
+                program
+                    .adt_layouts
+                    .get(name)
+                    .map(|&(_, align)| align)
+                    .or_else(|| {
+                        let key = self.adt_instance_key(name)?;
+                        program.adt_layouts.get(&key).map(|&(_, align)| align)
+                    })?
+            }
+            Ty::Ref(_) => 8,
+            Ty::Array(elem, _) => self.ty_align(elem)?,
+            Ty::Slice(elem) => self.ty_align(elem)?,
+            Ty::Str => 1,
+            Ty::Tuple(ts) => ts
+                .iter()
+                .map(|t| self.ty_align(t))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(1),
+            Ty::FnPtr => 8,
+            Ty::FnDef(_) => 1,
+            _ => return None,
+        })
+    }
+
+    /// [`Self::ty_size`], extended with the one composite the
+    /// base table does not fold: a tuple's size from its
+    /// fields' declaration-order layout.
+    fn ty_size_full(&self, ty: &Ty) -> Option<u64> {
+        if let Some(size) = self.ty_size(ty) {
+            return Some(size);
+        }
+        match ty {
+            Ty::Tuple(ts) => {
+                let (_, size) = self.tuple_layout(ts)?;
+                Some(size)
+            }
+            // A bare ADT name (the IR types drop generic
+            // arguments) resolves to the one recorded
+            // instance, as the field-layout lookups resolve
+            // it.
+            Ty::Adt(name) => {
+                let key = self.adt_instance_key(name)?;
+                self.program()
+                    .adt_layouts
+                    .get(&key)
+                    .map(|&(size, _)| size)
+            }
+            _ => None,
+        }
+    }
+
+    /// The (offset, size) of each field of a tuple type under
+    /// the declaration-order layout the value model stores
+    /// tuples in, and the tuple's total size.
+    fn tuple_layout(&self, ts: &[Ty]) -> Option<(Vec<(u64, u64)>, u64)> {
+        let mut offsets = Vec::with_capacity(ts.len());
+        let mut cursor: u128 = 0;
+        let mut max_align = 1u64;
+        for t in ts {
+            let size = self.ty_size_full(t)?;
+            let align = self.ty_align(t)?;
+            max_align = max_align.max(align);
+            cursor = align_up_u128(cursor, align);
+            offsets.push((u64::try_from(cursor).ok()?, size));
+            cursor += u128::from(size);
+        }
+        let total = u64::try_from(align_up_u128(cursor, max_align)).ok()?;
+        Some((offsets, total))
+    }
+
+    /// The slot layout of the body named `func`, computed
+    /// once and cached (see the `body_slots` field).
+    fn slot_layout(&self, func: &str) -> Option<std::rc::Rc<SlotLayout>> {
+        if let Some(hit) = self.body_slots.borrow().get(func) {
+            return hit.clone();
+        }
+        let layout = self
+            .program()
+            .get(func)
+            .and_then(|body| self.compute_slot_layout(body))
+            .map(std::rc::Rc::new);
+        self.body_slots
+            .borrow_mut()
+            .insert(func.to_string(), layout.clone());
+        layout
+    }
+
+    /// Compute a body's stack slot layout from its storage
+    /// statements: two locals may share a slot exactly when
+    /// their storage lifetimes never overlap — the sharing
+    /// the compiler's stack colouring performs, which is
+    /// what makes two sequential scoped temporaries of one
+    /// function share an address natively. Locals the body
+    /// never names in a storage statement are live for the
+    /// whole body (arguments, the return place, and every
+    /// local of a body the compiler emitted no storage
+    /// statements for: such a body shares nothing). A local
+    /// whose declared size is unknown gets no slot.
+    fn compute_slot_layout(&self, body: &Body) -> Option<SlotLayout> {
+        let n = body.local_tys.len();
+        let total_stmts: usize =
+            body.blocks.iter().map(|b| b.statements.len()).sum();
+        if n > 2048 || body.blocks.len() > 8192 || total_stmts > 65536 {
+            return None;
+        }
+        let sizes: Vec<Option<u64>> = body
+            .local_tys
+            .iter()
+            .map(|t| self.ty_size_full(t))
+            .collect();
+        let aligns: Vec<u64> = body
+            .local_tys
+            .iter()
+            .map(|t| self.ty_align(t).unwrap_or(1))
+            .collect();
+        let mut managed = vec![false; n];
+        let mut any_storage = false;
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match stmt.kind {
+                    StatementKind::StorageLive(l)
+                    | StatementKind::StorageDead(l) => {
+                        any_storage = true;
+                        if l.0 < n {
+                            managed[l.0] = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Live ranges of the managed locals, as per-block
+        // hulls over statement boundaries (boundary `i` sits
+        // before statement `i`; boundary `len` after the
+        // last): `hulls[local][block]` is the first and last
+        // boundary the local is live at in that block.
+        let mut hulls: Vec<Vec<Option<(usize, usize)>>> =
+            vec![vec![None; body.blocks.len()]; n];
+        let succs: Vec<Vec<usize>> = body
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(bi, b)| {
+                let mut s = block_successors(b);
+                if let UnwindAction::Cleanup(t) = body.unwind_action(bi) {
+                    s.push(t.0);
+                }
+                s
+            })
+            .collect();
+        if any_storage {
+            let words = n.div_ceil(64).max(1);
+            let mut live_in: Vec<Vec<u64>> =
+                vec![vec![0; words]; body.blocks.len()];
+            loop {
+                let mut changed = false;
+                for bi in (0..body.blocks.len()).rev() {
+                    let mut cur = vec![0u64; words];
+                    for &s in &succs[bi] {
+                        if s < body.blocks.len() {
+                            for w in 0..words {
+                                cur[w] |= live_in[s][w];
+                            }
+                        }
+                    }
+                    for stmt in body.blocks[bi].statements.iter().rev() {
+                        match stmt.kind {
+                            StatementKind::StorageLive(l) if l.0 < n => {
+                                cur[l.0 / 64] &= !(1u64 << (l.0 % 64));
+                            }
+                            StatementKind::StorageDead(l) if l.0 < n => {
+                                cur[l.0 / 64] |= 1u64 << (l.0 % 64);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if cur != live_in[bi] {
+                        live_in[bi] = cur;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for (bi, block) in body.blocks.iter().enumerate() {
+                let mut cur = live_in[bi].clone();
+                note_live_hull(&cur, 0, bi, &mut hulls);
+                for (si, stmt) in block.statements.iter().enumerate() {
+                    match stmt.kind {
+                        StatementKind::StorageLive(l) if l.0 < n => {
+                            cur[l.0 / 64] |= 1u64 << (l.0 % 64);
+                        }
+                        StatementKind::StorageDead(l) if l.0 < n => {
+                            cur[l.0 / 64] &= !(1u64 << (l.0 % 64));
+                        }
+                        _ => {}
+                    }
+                    note_live_hull(&cur, si + 1, bi, &mut hulls);
+                }
+            }
+        }
+        // Live ranges of the unmanaged locals (no storage
+        // statement names them — optimised MIR drops the
+        // markers wholesale), from a def/use liveness at the
+        // same statement precision as the storage ranges:
+        // the hulls of a backward walk per block, seeded
+        // with the block-level live-out. These are the
+        // ranges native stack colouring derives from an
+        // alloca's uses when no lifetime markers remain.
+        // The exact live boundaries of the unmanaged
+        // locals, per (local, block): a hull would fill the
+        // gap between two disjoint live segments in one
+        // block (a local the optimiser reused for two
+        // temporaries), and the filled gap is exactly what
+        // would block their slot sharing.
+        let mut live_points: std::collections::HashMap<
+            (usize, usize),
+            Vec<usize>,
+        > = std::collections::HashMap::new();
+        let mut liveness_computed = false;
+        if (0..n).any(|l| !managed[l] && sizes[l].is_some()) {
+            liveness_computed = true;
+            let words = n.div_ceil(64).max(1);
+            let mut uses: Vec<Vec<u64>> =
+                vec![vec![0; words]; body.blocks.len()];
+            let mut defs: Vec<Vec<u64>> =
+                vec![vec![0; words]; body.blocks.len()];
+            for (bi, block) in body.blocks.iter().enumerate() {
+                for stmt in &block.statements {
+                    statement_liveness(
+                        &stmt.kind,
+                        &mut uses[bi],
+                        &mut defs[bi],
+                        n,
+                    );
+                }
+                terminator_liveness(
+                    &block.terminator,
+                    &mut uses[bi],
+                    &mut defs[bi],
+                    n,
+                );
+            }
+            let mut live_in: Vec<Vec<u64>> =
+                vec![vec![0; words]; body.blocks.len()];
+            let mut live_out: Vec<Vec<u64>> =
+                vec![vec![0; words]; body.blocks.len()];
+            loop {
+                let mut changed = false;
+                for bi in (0..body.blocks.len()).rev() {
+                    let mut out = vec![0u64; words];
+                    for &s in &succs[bi] {
+                        if s < body.blocks.len() {
+                            for w in 0..words {
+                                out[w] |= live_in[s][w];
+                            }
+                        }
+                    }
+                    let mut inn = vec![0u64; words];
+                    for w in 0..words {
+                        inn[w] = uses[bi][w] | (out[w] & !defs[bi][w]);
+                    }
+                    if inn != live_in[bi] || out != live_out[bi] {
+                        live_in[bi] = inn;
+                        live_out[bi] = out;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Backward walk per block: at each statement
+            // boundary, the set of locals live there; a
+            // statement's uses join the set and its def
+            // leaves it, walking against execution order.
+            // Only unmanaged locals are noted: a managed
+            // local's hull stays exactly its storage range.
+            for (bi, block) in body.blocks.iter().enumerate() {
+                let mut cur = live_out[bi].clone();
+                let mut tu = vec![0u64; words];
+                let mut td = vec![0u64; words];
+                terminator_liveness(&block.terminator, &mut tu, &mut td, n);
+                for w in 0..words {
+                    cur[w] = tu[w] | (cur[w] & !td[w]);
+                }
+                for l in 0..n {
+                    if cur[l / 64] >> (l % 64) & 1 == 1 && !managed[l] {
+                        live_points
+                            .entry((l, bi))
+                            .or_default()
+                            .push(block.statements.len());
+                    }
+                }
+                for (si, stmt) in block.statements.iter().enumerate().rev() {
+                    let mut su = vec![0u64; words];
+                    let mut sd = vec![0u64; words];
+                    statement_liveness(&stmt.kind, &mut su, &mut sd, n);
+                    for w in 0..words {
+                        cur[w] = su[w] | (cur[w] & !sd[w]);
+                    }
+                    for l in 0..n {
+                        if cur[l / 64] >> (l % 64) & 1 == 1 && !managed[l] {
+                            live_points.entry((l, bi)).or_default().push(si);
+                        }
+                    }
+                }
+            }
+        }
+        // Two locals interfere when some block has both live
+        // at a common boundary. An unmanaged local whose
+        // liveness was not computed (no sized unmanaged
+        // local exists to price) keeps the live-throughout
+        // reading and interferes with every other.
+        let interferes = |a: usize, b: usize| -> bool {
+            if (!managed[a] && !liveness_computed)
+                || (!managed[b] && !liveness_computed)
+            {
+                return true;
+            }
+            if managed[a] && managed[b] {
+                for bi in 0..body.blocks.len() {
+                    if let (Some((f1, l1)), Some((f2, l2))) =
+                        (hulls[a][bi], hulls[b][bi])
+                    {
+                        if f1 <= l2 && f2 <= l1 {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            // Any pair involving an unmanaged local compares
+            // its exact live boundaries against the other
+            // side: another unmanaged local's boundaries, or
+            // a managed local's (continuous) storage hull.
+            let (u, other) = if !managed[a] { (a, b) } else { (b, a) };
+            for (&(l, bi), pts) in &live_points {
+                if l != u {
+                    continue;
+                }
+                if !managed[other] {
+                    if let Some(opts) = live_points.get(&(other, bi)) {
+                        if pts.iter().any(|p| opts.contains(p)) {
+                            return true;
+                        }
+                    }
+                } else if let Some((f, last)) = hulls[other][bi] {
+                    if pts.iter().any(|p| f <= *p && *p <= last) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        // Greedy slot assignment, largest locals first: a
+        // local joins a slot it fits and whose occupants it
+        // does not interfere with, else it opens a new slot
+        // above the current extent.
+        // Locals whose address is taken (a reference rvalue
+        // names them) are placed first: their slot identity
+        // is the observable the layout exists to model, so
+        // they claim slots before value-only locals of any
+        // size fill them in.
+        let mut addr_taken = vec![false; n];
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                if let StatementKind::Assign(
+                    _,
+                    Rvalue::Ref(p) | Rvalue::Reborrow(p),
+                ) = &stmt.kind
+                {
+                    if p.local.0 < n {
+                        addr_taken[p.local.0] = true;
+                    }
+                }
+            }
+        }
+        let mut order: Vec<usize> =
+            (0..n).filter(|&l| sizes[l].is_some()).collect();
+        order.sort_by_key(|&l| {
+            (
+                std::cmp::Reverse(addr_taken[l]),
+                std::cmp::Reverse(sizes[l].unwrap_or(0)),
+                std::cmp::Reverse(aligns[l]),
+            )
+        });
+        let mut slots: Vec<Option<u64>> = vec![None; n];
+        let mut placed: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+        let mut extent: u64 = 0;
+        for l in order {
+            let size = sizes[l].unwrap_or(0);
+            let align = aligns[l].max(1);
+            // Best fit: the smallest sufficient slot, so a
+            // small local does not pollute a large slot it
+            // would block for the slot's own size class.
+            let mut best: Option<(u64, usize)> = None;
+            for (si, (off, ssize, occupants)) in placed.iter().enumerate() {
+                if *ssize >= size
+                    && *off % align == 0
+                    && occupants.iter().all(|&o| !interferes(l, o))
+                    && best.is_none_or(|(bs, _)| *ssize < bs)
+                {
+                    best = Some((*ssize, si));
+                }
+            }
+            let chosen = best.map(|(_, si)| si);
+            match chosen {
+                Some(si) => {
+                    slots[l] = Some(placed[si].0);
+                    placed[si].2.push(l);
+                }
+                None => {
+                    let off =
+                        u64::try_from(align_up_u128(u128::from(extent), align))
+                            .ok()?;
+                    slots[l] = Some(off);
+                    extent = off.checked_add(size)?;
+                    placed.push((off, size, vec![l]));
+                }
+            }
+        }
+        // A frame always occupies some stack (the return
+        // address and saved registers natively), so a callee's
+        // slots never coincide with its caller's: the extent
+        // is at least one slot of the frame alignment.
+        let extent = u64::try_from(align_up_u128(u128::from(extent), 16).max(16))
+            .ok()?;
+        Some(SlotLayout { slots, extent })
+    }
+
+    /// The arithmetic address of a pointer value (see
+    /// [`Self::pointer_address`]): the price codegen's
+    /// address assignment implies — a place at its frame
+    /// base plus its stack slot plus the projection's byte
+    /// displacement, a static in the statics region, an
+    /// allocation in the heap region, a zero-sized root at
+    /// its alignment — or `None` where the model cannot
+    /// derive it, in which case the caller keeps the
+    /// synthetic-hash price.
+    pub(crate) fn arithmetic_price(
+        &self,
+        value: &Value,
+        leaf_ty: Option<&Ty>,
+        frames: Option<&[Frame]>,
+    ) -> Option<u128> {
+        match value {
+            Value::Ref(target) => self.price_target(target, leaf_ty, frames),
+            // A fat pointer's data address is its base's: the
+            // metadata word is not part of the address.
+            Value::FatRef { base, .. } => {
+                self.arithmetic_price(base, leaf_ty, frames)
+            }
+            Value::DynRef { base, .. } => {
+                self.arithmetic_price(base, None, frames)
+            }
+            _ => None,
+        }
+    }
+
+    /// The arithmetic address of the storage a target
+    /// denotes (see [`Self::arithmetic_price`]).
+    fn price_target(
+        &self,
+        target: &RefTarget,
+        leaf_ty: Option<&Ty>,
+        frames: Option<&[Frame]>,
+    ) -> Option<u128> {
+        match target {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                let (func, base) = self
+                    .frame_info
+                    .borrow()
+                    .get(frame)
+                    .map(|(f, b)| (f.clone(), *b))?;
+                let body = self.program().get(&func)?;
+                let root_ty = body.local_tys.get(*local)?;
+                if self.ty_size_full(root_ty) == Some(0) {
+                    let align = self.ty_align(root_ty)?;
+                    return Some(dangling_displaced(align, projection));
+                }
+                // A first-element position in an empty
+                // sequence value denotes a buffer the value
+                // does not have: its address is the element
+                // type's dangling address (see
+                // `empty_sequence_price`). Only the
+                // frame-carrying entry points can see the
+                // root's current value.
+                if let Some(frames) = frames {
+                    if let Some(price) = self.empty_sequence_price(
+                        frames, *frame, *local, projection, root_ty,
+                    ) {
+                        return Some(price);
+                    }
+                }
+                let layout = self.slot_layout(&func)?;
+                let slot = layout.slots.get(*local).copied()??;
+                let offset =
+                    self.projection_offset(Some(root_ty), projection, leaf_ty)?;
+                displaced_price(base + u128::from(slot), offset)
+            }
+            RefTarget::Static { name, projection } => {
+                let root_ty = self.program().static_tys.get(name);
+                let offset =
+                    self.projection_offset(root_ty, projection, leaf_ty)?;
+                displaced_price(self.static_price(name), offset)
+            }
+            RefTarget::Alloc { id, projection } => {
+                if let Some((size, align)) = self.alloc_layout(*id) {
+                    if size == 0 {
+                        return Some(dangling_displaced(align, projection));
+                    }
+                } else if let Some(Ty::Slice(elem)) = self.alloc_ty(*id) {
+                    // No layout on record because the pointee
+                    // is unsized: a slice allocation with no
+                    // recorded layout is a zero-length slice
+                    // box, whose buffer is the element type's
+                    // dangling address. (The stored value
+                    // cannot decide this: a freshly allocated
+                    // real buffer also stores a scalar-free
+                    // placeholder until it is written.)
+                    if let Some(align) = self.ty_align(&elem) {
+                        return Some(dangling_displaced(align, projection));
+                    }
+                }
+                let root_ty = self.alloc_ty(*id);
+                let offset = self.projection_offset(
+                    root_ty.as_ref(),
+                    projection,
+                    leaf_ty,
+                )?;
+                displaced_price(self.heap_price(*id), offset)
+            }
+            RefTarget::Value(base, projection) => {
+                // A scalar-free value tree is zero-sized
+                // storage: every position in it — the root
+                // included — is the dangling address of the
+                // pointee's alignment, as a reference to a
+                // zero-sized constant temporary (a `&()`, a
+                // zero-sized struct value, an empty array
+                // constant) is natively.
+                if !value_tree_has_scalar(base) {
+                    if let Some(align) =
+                        leaf_ty.and_then(|t| self.ty_align(t))
+                    {
+                        return Some(dangling_displaced(align, projection));
+                    }
+                }
+                if projection.is_empty() {
+                    return None;
+                }
+                // The root prices as the bare value target
+                // does (its synthetic-hash slot); the
+                // projection's displacement is arithmetic
+                // where derivable.
+                let root = Value::Ref(RefTarget::Value(base.clone(), Vec::new()));
+                let key = address_key(&root)?;
+                let offset =
+                    self.projection_offset(None, projection, leaf_ty)?;
+                displaced_price(hash_address_key(&key), offset)
+            }
+            RefTarget::Address(addr) => Some(u128::from(*addr)),
+            RefTarget::Null => Some(0),
+        }
+    }
+
+    /// The synthetic address of a static storage's base,
+    /// assigned from the statics region on first use: each
+    /// static occupies at least its alignment's worth of the
+    /// region, so distinct statics — zero-sized ones
+    /// included — never share an address, and none lands on
+    /// the dangling address its alignment would name.
+    fn static_price(&self, name: &str) -> u128 {
+        if let Some(p) = self.static_prices.borrow().get(name) {
+            return *p;
+        }
+        let (size, align) = match self.program().static_tys.get(name) {
+            Some(ty) => (
+                self.ty_size_full(ty).unwrap_or(0),
+                self.ty_align(ty).unwrap_or(8),
+            ),
+            None => (0, 8),
+        };
+        let price = align_up_u128(self.static_cursor.get(), align);
+        self.static_cursor
+            .set(price + u128::from(size.max(align).max(1)));
+        self.static_prices
+            .borrow_mut()
+            .insert(name.to_string(), price);
+        price
+    }
+
+    /// The (size, align) an allocation was created with,
+    /// from whichever record covers it: the raw allocator
+    /// builtins' table, the box builtins' layout table, or
+    /// the recorded pointee type.
+    fn alloc_layout(&self, id: u64) -> Option<(u64, u64)> {
+        if let Some(l) = self.alloc_layouts.borrow().get(&id) {
+            return Some(*l);
+        }
+        if let Some((size, align)) = self.box_layouts.borrow().get(&id) {
+            return Some((
+                u64::try_from(*size).ok()?,
+                u64::try_from(*align).ok()?,
+            ));
+        }
+        let ty = self.alloc_ty(id)?;
+        Some((self.ty_size_full(&ty)?, self.ty_align(&ty)?))
+    }
+
+    /// Record the layout a raw allocation was created with
+    /// (see the `alloc_layouts` field).
+    pub(crate) fn record_alloc_layout(&self, id: u64, size: u64, align: u64) {
+        self.alloc_layouts.borrow_mut().insert(id, (size, align));
+    }
+
+    /// The synthetic address of an allocation's base (see
+    /// the `heap_prices` field): prices follow allocation-id
+    /// order, each allocation occupying its layout's extent,
+    /// so two live allocations' addresses order as they were
+    /// created and never overlap. An allocation whose layout
+    /// is unknown reserves a nominal extent so later
+    /// allocations still price; only an address comparison
+    /// against an un-layouted allocation's interior can
+    /// observe the approximation.
+    fn heap_price(&self, id: u64) -> u128 {
+        if let Some(p) = self.heap_prices.borrow().get(&id) {
+            return *p;
+        }
+        let (mut next_id, mut cursor) = self.heap_cursor.get();
+        if next_id == 0 {
+            next_id = 1;
+            cursor = HEAP_BASE;
+        }
+        let mut prices = self.heap_prices.borrow_mut();
+        while next_id <= id {
+            let (size, align) = self.alloc_layout(next_id).unwrap_or((16, 8));
+            let price = align_up_u128(cursor, align);
+            prices.insert(next_id, price);
+            cursor = price + u128::from(size.max(align).max(1));
+            next_id += 1;
+        }
+        self.heap_cursor.set((next_id, cursor));
+        prices[&id]
+    }
+
+    /// The price of a first-element position in an empty
+    /// sequence value: the position denotes the sequence's
+    /// buffer, and an empty sequence has no buffer storage
+    /// in this model — its buffer pointer is the element
+    /// type's dangling address, as an empty `Vec`'s data
+    /// pointer is natively. `None` when the projection is
+    /// not the first-element shape (`[Index(0)]` plus any
+    /// trailing byte displacements), the root's current
+    /// value is not an empty sequence aggregate, or the
+    /// root type does not denote a sequence.
+    fn empty_sequence_price(
+        &self,
+        frames: &[Frame],
+        frame_id: u64,
+        local: usize,
+        projection: &[RefProj],
+        root_ty: &Ty,
+    ) -> Option<u128> {
+        let mut end = projection.len();
+        let mut byte_offset: i128 = 0;
+        while end > 0 {
+            match &projection[end - 1] {
+                RefProj::ByteOffset(d) => {
+                    byte_offset += d;
+                    end -= 1;
+                }
+                _ => break,
+            }
+        }
+        if end != 1 || !matches!(projection[0], RefProj::Index(0)) {
+            return None;
+        }
+        let frame = frames.iter().find(|f| f.id == frame_id)?;
+        let value = frame.locals.get(local)?;
+        let empty = match value {
+            Value::SparseVec { len, .. } => *len == 0,
+            Value::Tuple(items) => items.is_empty(),
+            Value::Enum { fields, .. } => fields.is_empty(),
+            _ => false,
+        };
+        if !empty {
+            return None;
+        }
+        let (_, elem_ty) =
+            self.sequence_elem(&WalkTy::Ty(root_ty.clone()))?;
+        let align = match &elem_ty {
+            WalkTy::Ty(t) => self.ty_align(t)?,
+            WalkTy::Tag(tag) => {
+                u64::try_from(self.layout_of(tag)?.1).ok()?
+            }
+        };
+        displaced_price(dangling_address(align), byte_offset)
+    }
+
+    /// The byte displacement a projection denotes from its
+    /// root's base, computed from the program's layout
+    /// tables — the arithmetic the synthetic-hash model
+    /// cannot do: a field sits at its layout offset, an
+    /// element at index × element size. `root_ty` is the
+    /// root's declared type when the interpreter records
+    /// it; without one, only the sequence positions a leaf
+    /// type denominates from the end (a heap buffer's
+    /// element positions) are priced. `None` when any step's
+    /// displacement is not derivable — the caller falls
+    /// back to synthetic-hash pricing for the whole target.
+    fn projection_offset(
+        &self,
+        root_ty: Option<&Ty>,
+        projection: &[RefProj],
+        leaf_ty: Option<&Ty>,
+    ) -> Option<i128> {
+        match root_ty {
+            Some(root) => self.projection_offset_forward(root, projection),
+            None => self.projection_offset_backward(projection, leaf_ty),
+        }
+    }
+
+    /// [`Self::projection_offset`] with a known root type:
+    /// walk the projection with the walk-type cursor the
+    /// canonicalisation walk uses.
+    fn projection_offset_forward(
+        &self,
+        root: &Ty,
+        projection: &[RefProj],
+    ) -> Option<i128> {
+        let mut offset: i128 = 0;
+        let mut cur = Some(WalkTy::Ty(root.clone()));
+        let mut variant: u32 = 0;
+        for step in projection {
+            match step {
+                RefProj::Field(idx) => {
+                    let c = cur.as_ref()?;
+                    offset += i128::from(self.field_offset(c, variant, *idx)?);
+                    cur = self.field_walk_ty(c, variant, *idx);
+                }
+                RefProj::Index(i) => {
+                    let c = cur.as_ref()?;
+                    let (elem_size, elem_ty) = self.sequence_elem(c)?;
+                    offset +=
+                        i128::try_from(*i).ok()? * i128::from(elem_size?);
+                    cur = Some(elem_ty);
+                }
+                RefProj::Subslice { offset: o, .. } => {
+                    let c = cur.as_ref()?;
+                    let (elem_size, _) = self.sequence_elem(c)?;
+                    offset +=
+                        i128::try_from(*o).ok()? * i128::from(elem_size?);
+                }
+                RefProj::Downcast(v) => {
+                    variant = *v;
+                }
+                RefProj::UnionField { .. } => {
+                    // Every field of a union sits at its base;
+                    // the position's type is not tracked past
+                    // it, so a further structural step falls
+                    // back.
+                    cur = None;
+                }
+                RefProj::ByteOffset(d) => {
+                    offset += d;
+                    // The position a byte displacement denotes
+                    // has no tracked type: a further structural
+                    // step falls back.
+                    cur = None;
+                }
+                RefProj::VecLen => return None,
+            }
+        }
+        Some(offset)
+    }
+
+    /// [`Self::projection_offset`] without a root type: only
+    /// a single sequence step (denominated by the leaf type)
+    /// among byte displacements is derivable.
+    fn projection_offset_backward(
+        &self,
+        projection: &[RefProj],
+        leaf_ty: Option<&Ty>,
+    ) -> Option<i128> {
+        let mut offset: i128 = 0;
+        let mut sequence_step = false;
+        for step in projection {
+            match step {
+                RefProj::ByteOffset(d) => offset += d,
+                RefProj::Index(i) => {
+                    if sequence_step {
+                        return None;
+                    }
+                    sequence_step = true;
+                    let elem = self.ty_size_full(leaf_ty?)?;
+                    offset += i128::try_from(*i).ok()? * i128::from(elem);
+                }
+                RefProj::Subslice { offset: o, .. } => {
+                    if sequence_step {
+                        return None;
+                    }
+                    sequence_step = true;
+                    let elem = self.backward_elem_size(leaf_ty?)?;
+                    offset += i128::try_from(*o).ok()? * i128::from(elem);
+                }
+                _ => return None,
+            }
+        }
+        Some(offset)
+    }
+
+    /// The element size of the sequence a leaf type denotes,
+    /// for the backward offset walk: the leaf is the
+    /// sub-sequence itself, so its element is one level in.
+    fn backward_elem_size(&self, leaf: &Ty) -> Option<u64> {
+        match leaf {
+            Ty::Slice(elem) | Ty::Array(elem, _) => self.ty_size_full(elem),
+            Ty::Ref(inner) => self.backward_elem_size(inner),
+            _ => None,
+        }
+    }
+
+    /// The byte offset of field `idx` of the value a walk
+    /// type denotes, from the program's recorded field
+    /// layouts (an ADT instance) or the computed tuple
+    /// layout.
+    fn field_offset(
+        &self,
+        cur: &WalkTy,
+        variant: u32,
+        idx: usize,
+    ) -> Option<u64> {
+        match cur {
+            WalkTy::Ty(Ty::Tuple(ts)) => {
+                self.tuple_layout(ts)?.0.get(idx).map(|&(off, _)| off)
+            }
+            WalkTy::Ty(Ty::Adt(name)) => {
+                let key = self.adt_instance_key(name)?;
+                self.program()
+                    .adt_field_layouts
+                    .get(&key)?
+                    .get(variant as usize)?
+                    .get(idx)
+                    .map(|&(off, _)| off)
+            }
+            WalkTy::Tag(tag) => {
+                let tag = tag.trim();
+                let variants = self
+                    .program()
+                    .adt_field_layouts
+                    .get(tag)
+                    .or_else(|| {
+                        let key = self.adt_instance_key(tag)?;
+                        self.program().adt_field_layouts.get(&key)
+                    });
+                if let Some(variants) = variants {
+                    return variants
+                        .get(variant as usize)?
+                        .get(idx)
+                        .map(|&(off, _)| off);
+                }
+                // A tuple's rendered tag: compute the layout
+                // from the parts' recorded layouts.
+                if tag.starts_with('(') && tag.ends_with(')') {
+                    let parts = split_top_level_str(&tag[1..tag.len() - 1]);
+                    let mut cursor: u128 = 0;
+                    for (i, part) in parts.iter().enumerate() {
+                        let (size, align) = self.layout_of(part.trim())?;
+                        cursor = align_up_u128(
+                            cursor,
+                            u64::try_from(align).ok()?,
+                        );
+                        if i == idx {
+                            return u64::try_from(cursor).ok();
+                        }
+                        cursor += size;
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -19238,6 +20558,16 @@ impl<'a> Interpreter<'a> {
     /// The bit pattern of `value` read through `shape`
     /// (little-endian: earlier array elements and lower fields
     /// occupy the lower bits).
+    /// The data word a fat pointer flattens to: the base's
+    /// arithmetic address where the address model derives
+    /// one — so a flattened fat pointer's data word is the
+    /// address the pointer compares and exposes as — else
+    /// the synthetic-hash word.
+    fn fat_data_word(&self, base: &Value) -> u128 {
+        self.arithmetic_price(base, None, None)
+            .unwrap_or_else(|| data_word(base))
+    }
+
     fn flatten_scalar(
         &self,
         value: &Value,
@@ -19394,7 +20724,10 @@ impl<'a> Interpreter<'a> {
                     ))
                 }
             }
-            (ScalarShape::Ptr | ScalarShape::FnPtr, _) => match synthetic_address(value) {
+            (ScalarShape::Ptr | ScalarShape::FnPtr, _) => match self
+                .arithmetic_price(value, None, None)
+                .or_else(|| synthetic_address(value))
+            {
                 Some(addr) => {
                     self.note_exposed_target(addr as u64, value);
                     Ok(addr & bit_mask(64))
@@ -19433,7 +20766,7 @@ impl<'a> Interpreter<'a> {
                 };
                 let (data, meta_word) = match (meta, value) {
                     (crate::ir::FatMeta::Len, Value::FatRef { base, len }) => {
-                        (data_word(base), *len & bit_mask(64))
+                        (self.fat_data_word(base), *len & bit_mask(64))
                     }
                     (crate::ir::FatMeta::Len, Value::Str(s)) => {
                         (str_data_word(s), s.len() as u128)
@@ -19446,7 +20779,7 @@ impl<'a> Interpreter<'a> {
                             traits,
                             ..
                         },
-                    ) => (data_word(base), vtable_word(concrete, traits)),
+                    ) => (self.fat_data_word(base), vtable_word(concrete, traits)),
                     (
                         crate::ir::FatMeta::Len,
                         Value::Ref(RefTarget::Alloc { id, projection }),
@@ -19472,7 +20805,7 @@ impl<'a> Interpreter<'a> {
                                 ))
                             }
                         };
-                        (data_word(value), len)
+                        (self.fat_data_word(value), len)
                     }
                     _ => {
                         return Err(InterpError::type_mismatch(
@@ -25519,7 +26852,10 @@ pub(crate) fn eval_binary(
                 // pointers over one address -- the null address
                 // included -- with different vtables, which native
                 // wide-pointer equality keeps distinct, so the
-                // comparison key carries a hash of that identity
+                // comparison key carries the vtable word — the
+                // very word the pointer flattens to (see
+                // `vtable_word`), so the comparison order and
+                // the flattened representation's order agree —
                 // alongside the address (the address itself, for
                 // null checks and `PtrToInt`, stays the base's).
                 Value::DynRef {
@@ -25527,9 +26863,7 @@ pub(crate) fn eval_binary(
                 } => addr_of(v).map(|a| {
                     (
                         a,
-                        Some(hash_address_key(&format!(
-                            "vtable:{concrete}:{traits:?}"
-                        ))),
+                        Some(vtable_word(concrete, traits)),
                     )
                 }),
                 Value::Ref(_) | Value::FnPtr(_) => addr_of(v).map(|a| (a, None)),
@@ -25585,14 +26919,34 @@ pub(crate) fn eval_binary(
             // addresses into one storage.
             None
         } else {
-            structural_ptr_order(lhs, rhs).filter(|ord| {
-                // For `Ord::cmp`, an equal position reached by
-                // different projections keeps the address order
-                // below, so `cmp` stays consistent with the
-                // identity equality; the relational operators
-                // take the position order as it stands.
-                op != Cmp || *ord != std::cmp::Ordering::Equal
-            })
+            // A fat pointer's order is (address, metadata):
+            // between two fat pointers at one address whose
+            // metadata words differ (two slices of one buffer
+            // starting at the same position with different
+            // lengths), the position order is Equal and must
+            // not pre-empt the metadata comparison below.
+            let fat_meta_decides = matches!(
+                (lhs, rhs),
+                (
+                    Value::FatRef { .. } | Value::DynRef { .. },
+                    Value::FatRef { .. } | Value::DynRef { .. }
+                )
+            ) && match (ka, kb) {
+                (Some(a), Some(b)) => a.0 == b.0 && a.1 != b.1,
+                _ => false,
+            };
+            if fat_meta_decides {
+                None
+            } else {
+                structural_ptr_order(lhs, rhs).filter(|ord| {
+                    // For `Ord::cmp`, an equal position reached by
+                    // different projections keeps the address order
+                    // below, so `cmp` stays consistent with the
+                    // identity equality; the relational operators
+                    // take the position order as it stands.
+                    op != Cmp || *ord != std::cmp::Ordering::Equal
+                })
+            }
         };
         if let Some(ord) = structural {
             if op == Cmp {
@@ -27270,6 +28624,367 @@ fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
         (Value::Closure { .. }, Ty::Closure(..)) => true,
         (Value::Coroutine { .. }, Ty::Coroutine(_)) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod ptr_equality_tests {
+    use super::*;
+
+    fn probe_frame(func: &str, locals: Vec<Value>) -> Frame {
+        Frame {
+            id: 7,
+            func: func.to_string(),
+            locals,
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }
+    }
+
+    fn place_price(
+        interp: &Interpreter,
+        frames: &[Frame],
+        local: usize,
+        projection: Vec<RefProj>,
+        leaf: Option<&Ty>,
+    ) -> Option<u128> {
+        interp.arithmetic_price(
+            &Value::Ref(RefTarget::Place {
+                frame: 7,
+                local,
+                projection,
+            }),
+            leaf,
+            Some(frames),
+        )
+    }
+
+    fn slots_of(interp: &Interpreter, func: &str) -> Vec<Option<u64>> {
+        interp.slot_layout(func).expect("layout").slots.clone()
+    }
+
+    /// Two temporaries whose storage ranges are disjoint
+    /// share a stack slot (and so compare address-equal,
+    /// as stack colouring makes them natively); a third
+    /// whose range spans both does not.
+    #[test]
+    fn storage_ranges_share_slots() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(
+            vec![
+                Statement { kind: StatementKind::StorageLive(Local(3)) },
+                Statement { kind: StatementKind::StorageLive(Local(1)) },
+                Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(1))),
+                ),
+                Statement { kind: StatementKind::StorageDead(Local(1)) },
+                Statement { kind: StatementKind::StorageLive(Local(2)) },
+                Statement::assign(
+                    Place::from_index(2),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(2))),
+                ),
+                Statement { kind: StatementKind::StorageDead(Local(2)) },
+                Statement { kind: StatementKind::StorageDead(Local(3)) },
+            ],
+            TerminatorKind::Return,
+        );
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Int(IntTy::I32),
+                Ty::Int(IntTy::I32),
+                Ty::Int(IntTy::I32),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(slots[1], slots[2], "disjoint ranges share a slot");
+        assert_ne!(slots[1], slots[3], "a spanning range keeps its own slot");
+    }
+
+    /// Without storage markers (optimised MIR), def/use
+    /// liveness gives the same sharing: two locals used in
+    /// disjoint statement ranges share, one used across
+    /// both does not.
+    #[test]
+    fn def_use_ranges_share_slots() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(
+            vec![
+                Statement::assign(
+                    Place::from_index(3),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(7))),
+                ),
+                Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(1))),
+                ),
+                Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::Copy(Place::from_index(1))),
+                ),
+                Statement::assign(
+                    Place::from_index(2),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(2))),
+                ),
+                Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::Copy(Place::from_index(2))),
+                ),
+                Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::Copy(Place::from_index(3))),
+                ),
+            ],
+            TerminatorKind::Return,
+        );
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+                Ty::Int(IntTy::I32),
+                Ty::Int(IntTy::I32),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(slots[1], slots[2], "disjoint def/use ranges share");
+        assert_ne!(slots[1], slots[3], "a spanning def/use range does not");
+    }
+
+    /// A zero-sized local's address is its alignment (the
+    /// dangling address): 1 for a unit, 4 for an align-4
+    /// zero-sized ADT.
+    #[test]
+    fn zero_sized_locals_price_at_their_alignment() {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("probe::Z".to_string(), (0, 4));
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![Ty::Unit, Ty::Unit, Ty::Adt("probe::Z".to_string())],
+            vec![],
+        ));
+        let interp = Interpreter::new(&program);
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![Value::Unit, Value::Unit, Value::Enum { variant: 0, fields: vec![] }],
+        )];
+        interp.register_frame_base(&[], 7, "probe::f");
+        assert_eq!(
+            place_price(&interp, &frames, 1, vec![], Some(&Ty::Unit)),
+            Some(1),
+        );
+        assert_eq!(
+            place_price(
+                &interp,
+                &frames,
+                2,
+                vec![],
+                Some(&Ty::Adt("probe::Z".to_string())),
+            ),
+            Some(4),
+        );
+    }
+
+    /// A packed field's address is its root's address plus
+    /// its layout offset, unaligned tail included.
+    #[test]
+    fn packed_field_price_is_root_plus_offset() {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("probe::P".to_string(), (9, 1));
+        program.adt_field_layouts.insert(
+            "probe::P".to_string(),
+            vec![vec![(0, 1), (1, 8)]],
+        );
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![Ty::Unit, Ty::Adt("probe::P".to_string())],
+            vec![],
+        ));
+        let interp = Interpreter::new(&program);
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![
+                Value::Unit,
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uint(3), Value::Uint(4)],
+                },
+            ],
+        )];
+        interp.register_frame_base(&[], 7, "probe::f");
+        let root = place_price(&interp, &frames, 1, vec![], None).expect("root");
+        let tail = place_price(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Field(1)],
+            Some(&Ty::Uint(UintTy::U64)),
+        )
+        .expect("tail");
+        assert_eq!(tail, root + 1);
+    }
+
+    /// Statics occupy the statics region in declaration
+    /// order at their own alignments: a u64 static followed
+    /// by a unit static puts the second exactly 8 past the
+    /// first, and the first at the region base.
+    #[test]
+    fn statics_price_in_the_statics_region() {
+        let mut program = Program::new();
+        program
+            .static_tys
+            .insert("probe::A".to_string(), Ty::Uint(UintTy::U64));
+        program
+            .static_tys
+            .insert("probe::B".to_string(), Ty::Unit);
+        let interp = Interpreter::new(&program);
+        let price = |name: &str| {
+            interp
+                .arithmetic_price(
+                    &Value::Ref(RefTarget::Static {
+                        name: name.to_string(),
+                        projection: vec![],
+                    }),
+                    None,
+                    None,
+                )
+                .expect("static price")
+        };
+        let a = price("probe::A");
+        let b = price("probe::B");
+        assert_eq!(a, 1u128 << 61);
+        assert_eq!(b - a, 8);
+    }
+
+    /// Heap allocations price in creation order at their
+    /// recorded alignments, and an element position is the
+    /// base plus the element displacement.
+    #[test]
+    fn alloc_prices_follow_creation_order() {
+        let program = Program::new();
+        let interp = Interpreter::new(&program);
+        let id1 = interp.alloc_insert(Value::Tuple(vec![]));
+        interp.record_alloc_layout(id1, 16, 4);
+        interp.record_alloc_ty(
+            id1,
+            Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 4),
+        );
+        let id2 = interp.alloc_insert(Value::Tuple(vec![]));
+        interp.record_alloc_layout(id2, 8, 8);
+        let price = |id: u64, projection: Vec<RefProj>| {
+            interp
+                .arithmetic_price(
+                    &Value::Ref(RefTarget::Alloc { id, projection }),
+                    Some(&Ty::Uint(UintTy::U32)),
+                    None,
+                )
+                .expect("alloc price")
+        };
+        let base1 = price(id1, vec![]);
+        let base2 = price(id2, vec![]);
+        assert_eq!(base1, 1u128 << 62);
+        assert_eq!(base2 - base1, 16);
+        assert_eq!(price(id1, vec![RefProj::Index(2)]) - base1, 8);
+    }
+
+    /// Fat-pointer order is (address, length): two slices
+    /// of one buffer starting at the same position order
+    /// by length, through the direct binary operation MIR
+    /// lowers `<` to.
+    #[test]
+    fn fat_pointer_order_falls_through_to_length() {
+        let program = Program::new();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![]));
+        interp.record_alloc_layout(id, 16, 4);
+        interp.record_alloc_ty(
+            id,
+            Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 4),
+        );
+        let base = Value::Ref(RefTarget::Alloc {
+            id,
+            projection: vec![],
+        });
+        let p0 = Value::FatRef { base: Box::new(base.clone()), len: 0 };
+        let p1 = Value::FatRef { base: Box::new(base), len: 1 };
+        let addr_of = |v: &Value| interp.pointer_address(&[], v, None);
+        let lt = eval_binary(BinOp::Lt, &p0, &p1, None, false, &addr_of)
+            .expect("lt");
+        assert_eq!(lt.0, Value::Bool(true));
+        let eq = eval_binary(BinOp::Eq, &p0, &p1, None, false, &addr_of)
+            .expect("eq");
+        assert_eq!(eq.0, Value::Bool(false));
+        let cmp = eval_binary(BinOp::Cmp, &p0, &p1, None, false, &addr_of)
+            .expect("cmp");
+        assert_eq!(
+            cmp.0,
+            Value::Enum { variant: 0, fields: vec![] },
+            "cmp is Less"
+        );
+    }
+
+    /// Dyn-pointer order is (address, vtable word): two
+    /// trait objects over one address with different
+    /// vtables are unequal, and their order is the vtable
+    /// words' order — the same words the pointers flatten
+    /// to.
+    #[test]
+    fn dyn_pointer_order_uses_the_vtable_word() {
+        let program = Program::new();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![]));
+        interp.record_alloc_layout(id, 16, 4);
+        let base = Value::Ref(RefTarget::Alloc {
+            id,
+            projection: vec![],
+        });
+        let d1 = Value::DynRef {
+            base: Box::new(base.clone()),
+            concrete: "probe::C".to_string(),
+            traits: vec!["probe::T1".to_string()],
+            drop_glue: None,
+        };
+        let d2 = Value::DynRef {
+            base: Box::new(base),
+            concrete: "probe::C".to_string(),
+            traits: vec!["probe::T2".to_string()],
+            drop_glue: None,
+        };
+        let addr_of = |v: &Value| interp.pointer_address(&[], v, None);
+        let eq = eval_binary(BinOp::Eq, &d1, &d2, None, false, &addr_of)
+            .expect("eq");
+        assert_eq!(eq.0, Value::Bool(false));
+        let w1 = vtable_word("probe::C", &["probe::T1".to_string()]);
+        let w2 = vtable_word("probe::C", &["probe::T2".to_string()]);
+        assert_ne!(w1, w2);
+        let cmp = eval_binary(BinOp::Cmp, &d1, &d2, None, false, &addr_of)
+            .expect("cmp");
+        let want = match w1.cmp(&w2) {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        };
+        assert_eq!(cmp.0, Value::Enum { variant: want, fields: vec![] });
     }
 }
 

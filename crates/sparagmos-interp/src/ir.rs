@@ -951,15 +951,22 @@ pub enum Rvalue {
     /// [`Rvalue::DataPtr`] for a fat operand.
     Materialize(Operand, usize),
     /// A `Transmute` cast from a pointer/reference value to an
-    /// integer: the pointer's address. The model has no flat memory,
-    /// so the address is synthetic: a deterministic, non-zero,
-    /// 65536-aligned value derived from the reference target (the
-    /// same target always yields the same address). That is all the
-    /// observable behavior the model's pointers can honestly offer:
-    /// equality, null and alignment checks (the compiler's UB
-    /// precondition checks transmute pointers to `usize` for exactly
-    /// those) behave correctly; the numeric value itself is not a
-    /// real address and must not be turned back into a pointer.
+    /// integer: the pointer's address. The address is the one
+    /// the arithmetic address model assigns the target (see
+    /// `Interpreter::pointer_address`): a frame base plus a
+    /// stack slot plus the projection's layout offset for a
+    /// place, the statics region for a static, the heap region
+    /// for an allocation, the type's alignment for a
+    /// zero-sized root — deterministic, non-zero for a live
+    /// place, and aligned to the pointee type, which is all
+    /// the observable behaviour the model's pointers can
+    /// honestly offer: equality, null and alignment checks
+    /// (the compiler's UB precondition checks transmute
+    /// pointers to `usize` for exactly those) behave as they
+    /// do natively. Where no arithmetic address is derivable,
+    /// a synthetic fallback address stands in. The numeric
+    /// value is not a real address and must not be turned
+    /// back into a pointer.
     PtrToInt(Operand),
     /// A pointer cast from a transparent single-field wrapper
     /// (`UnsafeCell<T>` / `MaybeUninit<T>`) to the wrapped type

@@ -1787,51 +1787,116 @@ fn usize_ty() -> mir::Ty {
 }
 
 /// `addr_of` helper body: locals _0 usize ret, _1 i32, _2 i32,
-/// _3 &i32, _4 usize; returns the transmute of a reference to
-/// local `which` (1 or 2).
-fn addr_of_body(which: u32) -> mir::Body {
+/// Builds a body that takes the addresses of two i32
+/// locals — by transmute of a reference (`expose` false)
+/// or by expose-provenance of a raw pointer (`expose`
+/// true) — and returns 1 as a usize when both addresses
+/// are non-zero, aligned to the pointee (4), and distinct,
+/// and 0 otherwise. The checks run in the guest as a chain
+/// of switch blocks.
+/// locals: 0 usize (return), 1/2 i32, 3/4 &i32,
+/// 5/6 *const i32 (expose variant only), 7/8 usize
+/// (addresses), 9/10 usize (addresses & 3), 11..15 bool
+/// (distinct, a1 aligned, a2 aligned, a1 non-zero,
+/// a2 non-zero).
+fn addr_pair_body(expose: bool) -> mir::Body {
     let ref_i32 = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
-    mir::Body::new(
-        decls(&[usize_ty(), i32_ty(), i32_ty(), ref_i32, usize_ty()]),
-        0,
-        vec![block(
-            vec![
-                assign(place(1), mir::Rvalue::Use(const_i32(5))),
-                assign(place(2), mir::Rvalue::Use(const_i32(7))),
-                assign(
-                    place(3),
-                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(which)),
-                ),
-                assign(
-                    place(4),
-                    mir::Rvalue::Cast(mir::CastKind::Transmute, copy(3), usize_ty()),
-                ),
-                assign(place(0), mir::Rvalue::Use(copy(4))),
-            ],
-            ret(),
-        )],
-    )
+    let raw_i32 = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
+    let mut tys = vec![
+        usize_ty(),
+        i32_ty(),
+        i32_ty(),
+        ref_i32.clone(),
+        ref_i32,
+        raw_i32.clone(),
+        raw_i32,
+        usize_ty(),
+        usize_ty(),
+        usize_ty(),
+        usize_ty(),
+    ];
+    for _ in 0..5 {
+        tys.push(mir::Ty::Bool);
+    }
+    let mut stmts = vec![
+        assign(place(1), mir::Rvalue::Use(const_i32(5))),
+        assign(place(2), mir::Rvalue::Use(const_i32(7))),
+        assign(
+            place(3),
+            mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+        ),
+        assign(
+            place(4),
+            mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(2)),
+        ),
+    ];
+    if expose {
+        stmts.push(assign(
+            place(5),
+            mir::Rvalue::Cast(mir::CastKind::PtrToPtr, copy(3), raw_i32_ty()),
+        ));
+        stmts.push(assign(
+            place(6),
+            mir::Rvalue::Cast(mir::CastKind::PtrToPtr, copy(4), raw_i32_ty()),
+        ));
+        stmts.push(assign(
+            place(7),
+            mir::Rvalue::Cast(mir::CastKind::PointerExposeProvenance, copy(5), usize_ty()),
+        ));
+        stmts.push(assign(
+            place(8),
+            mir::Rvalue::Cast(mir::CastKind::PointerExposeProvenance, copy(6), usize_ty()),
+        ));
+    } else {
+        stmts.push(assign(
+            place(7),
+            mir::Rvalue::Cast(mir::CastKind::Transmute, copy(3), usize_ty()),
+        ));
+        stmts.push(assign(
+            place(8),
+            mir::Rvalue::Cast(mir::CastKind::Transmute, copy(4), usize_ty()),
+        ));
+    }
+    stmts.push(assign(place(9), binop(mir::BinOp::BitAnd, copy(7), const_int(3, 8))));
+    stmts.push(assign(place(10), binop(mir::BinOp::BitAnd, copy(8), const_int(3, 8))));
+    stmts.push(assign(place(11), binop(mir::BinOp::Ne, copy(7), copy(8))));
+    stmts.push(assign(place(12), binop(mir::BinOp::Eq, copy(9), const_int(0, 8))));
+    stmts.push(assign(place(13), binop(mir::BinOp::Eq, copy(10), const_int(0, 8))));
+    stmts.push(assign(place(14), binop(mir::BinOp::Ne, copy(7), const_int(0, 8))));
+    stmts.push(assign(place(15), binop(mir::BinOp::Ne, copy(8), const_int(0, 8))));
+    // blocks: 0 = statements + switch on local 11;
+    // 1..4 = switches on locals 12..15; 5 = success
+    // (return 1); 6 = failure (return 0).
+    let mut blocks = vec![block(stmts, switch_bool(copy(11), 6, 1))];
+    for (i, local) in [12u32, 13, 14, 15].iter().enumerate() {
+        blocks.push(block(vec![], switch_bool(copy(*local), 6, (i + 2) as u32)));
+    }
+    blocks.push(block(
+        vec![assign(place(0), mir::Rvalue::Use(const_int(1, 8)))],
+        ret(),
+    ));
+    blocks.push(block(
+        vec![assign(place(0), mir::Rvalue::Use(const_int(0, 8)))],
+        ret(),
+    ));
+    mir::Body::new(decls(&tys), 0, blocks)
 }
 
 #[test]
 fn transmute_pointer_to_usize_is_aligned_stable_and_distinct() {
     // The alignment precondition checks rustc emits around raw
     // pointer dereferences transmute the pointer to usize and
-    // test `addr & (align - 1) == 0`; the synthetic address must
-    // be aligned, stable per target, and distinct per place.
+    // test `addr & (align - 1) == 0`; the address must be
+    // aligned to the pointee type (4 for an i32 place), stable
+    // per target, and distinct per place.
     let mut prog = MirProgram::new();
-    prog.add("addr1", addr_of_body(1));
-    let a1 = interpret_mir(&prog, "addr1", vec![]).expect("addr1 must run");
-    let mut prog = MirProgram::new();
-    prog.add("addr2", addr_of_body(2));
-    let a2 = interpret_mir(&prog, "addr2", vec![]).expect("addr2 must run");
-    let (Value::Uint(a1), Value::Uint(a2)) = (a1, a2) else {
-        panic!("expected usize results");
-    };
-    assert_ne!(a1, 0, "a place address is never null");
-    assert_eq!(a1 % 4096, 0, "address must satisfy alignment checks");
-    assert_eq!(a2 % 4096, 0, "address must satisfy alignment checks");
-    assert_ne!(a1, a2, "distinct places get distinct addresses");
+    prog.add("addr_pair", addr_pair_body(false));
+    let v = interpret_mir(&prog, "addr_pair", vec![]).expect("addr_pair must run");
+    assert_eq!(
+        v,
+        Value::Uint(1),
+        "addresses are non-zero, i32-aligned, and distinct"
+    );
 }
 
 #[test]
@@ -2224,11 +2289,12 @@ fn constant_shift_amounts_keep_their_own_type() {
 fn transmute_pointer_to_int_yields_aligned_nonzero_address() {
     // The compiler's UB precondition checks transmute a raw pointer
     // to `usize` to test it for null and misalignment. The model
-    // answers with a synthetic address: non-zero and 4096-aligned.
+    // answers with the pointer's arithmetic address: non-zero and
+    // aligned to the pointee type (4 for an i32 place).
     // fn main() -> i32 {
     //   _1 = 41; _2 = &raw mut _1;
     //   _3 = transmute::<*mut i32, usize>(_2);
-    //   _4 = _3 & 4095; _5 = _3 == 0;
+    //   _4 = _3 & 3; _5 = _3 == 0;
     //   return if _5 { 1000 } else { _4 as i32 };   // 0
     // }
     let body = mir::Body::new(
@@ -2254,7 +2320,7 @@ fn transmute_pointer_to_int_yields_aligned_nonzero_address() {
                         place(3),
                         mir::Rvalue::Cast(mir::CastKind::Transmute, copy(2), usize_ty()),
                     ),
-                    assign(place(4), binop(mir::BinOp::BitAnd, copy(3), const_int(4095, 8))),
+                    assign(place(4), binop(mir::BinOp::BitAnd, copy(3), const_int(3, 8))),
                     assign(place(5), binop(mir::BinOp::Eq, copy(3), const_int(0, 8))),
                 ],
                 switch_bool(copy(5), 1, 2),
@@ -2317,56 +2383,22 @@ fn transmute_between_non_pointers_stays_unsupported() {
 /// `expose_addr_of` helper body: locals _0 usize ret, _1 i32,
 /// _2 i32, _3 &i32, _4 *const i32, _5 usize; returns the
 /// PointerExposeProvenance cast of a raw pointer to local `which`
-/// (1 or 2) — the `ptr as usize` shape.
-fn expose_addr_of_body(which: u32) -> mir::Body {
-    let ref_i32 = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
-    let raw_i32 = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
-    mir::Body::new(
-        decls(&[usize_ty(), i32_ty(), i32_ty(), ref_i32, raw_i32.clone(), usize_ty()]),
-        0,
-        vec![block(
-            vec![
-                assign(place(1), mir::Rvalue::Use(const_i32(5))),
-                assign(place(2), mir::Rvalue::Use(const_i32(7))),
-                assign(
-                    place(3),
-                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(which)),
-                ),
-                assign(
-                    place(4),
-                    mir::Rvalue::Cast(mir::CastKind::PtrToPtr, copy(3), raw_i32.clone()),
-                ),
-                assign(
-                    place(5),
-                    mir::Rvalue::Cast(mir::CastKind::PointerExposeProvenance, copy(4), usize_ty()),
-                ),
-                assign(place(0), mir::Rvalue::Use(copy(5))),
-            ],
-            ret(),
-        )],
-    )
-}
-
 #[test]
 fn expose_provenance_pointer_to_usize_is_aligned_stable_and_distinct() {
     // `ptr as usize` (PointerExposeProvenance) yields the
-    // pointer's synthetic address, like the pointer-to-integer
-    // transmute: aligned, stable per target, distinct per place.
-    // Alignment assertions in guest code (`addr % align == 0`,
-    // e.g. std::mem::align_of checks on raw pointers) read it.
+    // pointer's address, like the pointer-to-integer
+    // transmute: aligned to the pointee type, stable per
+    // target, distinct per place. Alignment assertions in
+    // guest code (`addr % align == 0`, e.g. std::mem::align_of
+    // checks on raw pointers) read it.
     let mut prog = MirProgram::new();
-    prog.add("expose1", expose_addr_of_body(1));
-    let a1 = interpret_mir(&prog, "expose1", vec![]).expect("expose1 must run");
-    let mut prog = MirProgram::new();
-    prog.add("expose2", expose_addr_of_body(2));
-    let a2 = interpret_mir(&prog, "expose2", vec![]).expect("expose2 must run");
-    let (Value::Uint(a1), Value::Uint(a2)) = (a1, a2) else {
-        panic!("expected usize results");
-    };
-    assert_ne!(a1, 0, "a place address is never null");
-    assert_eq!(a1 % 4096, 0, "address must satisfy alignment checks");
-    assert_eq!(a2 % 4096, 0, "address must satisfy alignment checks");
-    assert_ne!(a1, a2, "distinct places get distinct addresses");
+    prog.add("expose_pair", addr_pair_body(true));
+    let v = interpret_mir(&prog, "expose_pair", vec![]).expect("expose_pair must run");
+    assert_eq!(
+        v,
+        Value::Uint(1),
+        "addresses are non-zero, i32-aligned, and distinct"
+    );
 }
 
 #[test]

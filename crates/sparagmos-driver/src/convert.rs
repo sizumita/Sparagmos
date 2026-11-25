@@ -7362,6 +7362,34 @@ impl Converter {
                         }
                     }
                 }
+                // A pointer to a zero-sized pointee at a
+                // nonzero offset into its allocation: the
+                // pointee's value decode below reads nothing,
+                // so the offset would be dropped, but the
+                // offset is the pointer's whole observable
+                // content. Native codegen places a zero-sized
+                // allocation at its alignment (the dangling
+                // address) and the offset moves from there, so
+                // the pointer decodes as that address. A static
+                // pointee keeps the identity path above: its
+                // address is the static's own, not a dangling
+                // address.
+                if static_def.is_none() && target_off != 0 && target.bytes.is_empty() {
+                    if let Ok(layout) = inner.layout() {
+                        if layout.shape().size.bytes() == 0 {
+                            // The dangling base is the target
+                            // allocation's own alignment, not
+                            // the pointee type's: a pointer
+                            // cast to a weaker-aligned type
+                            // keeps the address it was created
+                            // with.
+                            let align = target.align.max(1);
+                            return Some(sm::ConstValue::IntPtr(
+                                align.wrapping_add(target_off as u64),
+                            ));
+                        }
+                    }
+                }
                 let pointee = self.decode_const(inner, &target, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(pointee)))
             }
@@ -9525,7 +9553,7 @@ enum ProvTargetKey {
     Function(rustc_public::DefId, String),
     VTable(String),
     TypeId(String),
-    Memory(Vec<Option<u8>>, Vec<(usize, ProvTargetKey)>),
+    Memory(Vec<Option<u8>>, u64, Vec<(usize, ProvTargetKey)>),
 }
 
 /// The [`ProvTargetKey`] of the allocation `prov` denotes,
@@ -9557,7 +9585,7 @@ fn prov_target_key(prov: &Prov, depth: usize) -> Option<ProvTargetKey> {
             for (off, p) in &alloc.provenance.ptrs {
                 ptrs.push((*off, prov_target_key(p, depth + 1)?));
             }
-            Some(ProvTargetKey::Memory(alloc.bytes, ptrs))
+            Some(ProvTargetKey::Memory(alloc.bytes, alloc.align, ptrs))
         }
     }
 }
