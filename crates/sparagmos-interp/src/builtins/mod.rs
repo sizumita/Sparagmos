@@ -25,7 +25,11 @@
 //!   Rust 1.100.0 `core::fmt` (see `format_template`), and the
 //!   padding rules mirror `Formatter::pad` / `pad_integral`.
 
-
+// The glob re-exports below keep every pre-split `crate::builtins::*`
+// path working. Some of them re-export nothing at `pub(crate)`
+// visibility, and some are not referenced through this facade; both
+// are intentional, so the unused-imports lint is allowed here.
+#![allow(unused_imports)]
 
 use crate::error::InterpError;
 use crate::value::Value;

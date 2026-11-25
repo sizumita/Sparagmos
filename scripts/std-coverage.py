@@ -8,7 +8,7 @@ test-subset stage-1 candidates (exec, single-file, ui / ui-fulldeps,
 3,699 files at tag 1.100.0). A path counts as covered when a call to it
 is executable by the interpreter: the converted program contains a body
 for it, or the interpreter resolves it as a builtin
-(crates/sparagmos-interp/src/builtins.rs `lookup`).
+(crates/sparagmos-interp/src/builtins/ `lookup`).
 
 For every input file the tool runs the driver in dump mode
 (`sparagmos-driver <file.rs> --dump <path> --edition <ed>`, the edition
@@ -114,18 +114,30 @@ def is_std_path(canonical):
 
 
 # ---------------------------------------------------------------------------
-# Builtin registry (parsed from crates/sparagmos-interp/src/builtins.rs)
+# Builtin registry (parsed from crates/sparagmos-interp/src/builtins/)
 # ---------------------------------------------------------------------------
 
+def read_builtins_source(path):
+    """Source text of the interpreter's builtin registry code.
+
+    `path` may name the historical single `builtins.rs` file or the
+    `builtins/` module directory it was split into; a directory is
+    read as the concatenation of its `*.rs` files in name order.
+    """
+    if path.is_dir():
+        return "".join(p.read_text() for p in sorted(path.glob("*.rs")))
+    return path.read_text()
+
+
 class BuiltinRegistry:
-    """The interpreter's builtin support, read from builtins.rs.
+    """The interpreter's builtin support, read from the builtins module.
 
     Exact names come from the match arms of `lookup`; every guard arm
     (`_ if <cond> =>`) is interpreted generically: the condition must
     be a conjunction of `canonical.contains("..")`,
     `canonical.ends_with("..")` and `canonical.starts_with("..")`
     terms. Any other guard shape is a hard error so a future change
-    to builtins.rs cannot silently drift this tool.
+    to the builtins module cannot silently drift this tool.
     """
 
     _TERM = re.compile(
@@ -134,14 +146,14 @@ class BuiltinRegistry:
     def __init__(self, source):
         start = source.find("pub fn lookup")
         if start == -1:
-            raise ValueError("builtins.rs: pub fn lookup not found")
+            raise ValueError("builtins: pub fn lookup not found")
         end = source.find("\n}\n", start)
         if end == -1:
-            raise ValueError("builtins.rs: end of lookup not found")
+            raise ValueError("builtins: end of lookup not found")
         body = source[start:end]
         self.exact = set(re.findall(r'"([^"\n]+)"\s*(?:\||=>)', body))
         if not self.exact:
-            raise ValueError("builtins.rs: no exact builtin names found")
+            raise ValueError("builtins: no exact builtin names found")
         self.guards = []
         for g in re.findall(r"^\s*_ if (.+?) =>", body, re.M):
             terms = []
@@ -149,11 +161,11 @@ class BuiltinRegistry:
                 m = self._TERM.fullmatch(term.strip())
                 if m is None:
                     raise ValueError(
-                        f"builtins.rs: unknown lookup guard: {g}")
+                        f"builtins: unknown lookup guard: {g}")
                 terms.append((m.group(1), m.group(2)))
             self.guards.append(terms)
         if not self.guards:
-            raise ValueError("builtins.rs: no lookup guards found")
+            raise ValueError("builtins: no lookup guards found")
         # Derived flags for the two historical special cases, kept for
         # the report line and the unit tests.
         self.range_inclusive_new = any(
@@ -365,14 +377,14 @@ def main(argv=None):
                     help="rust checkout the candidate paths are relative to")
     ap.add_argument("--driver-bin", required=True)
     ap.add_argument("--builtins-rs", type=Path,
-                    default=Path("crates/sparagmos-interp/src/builtins.rs"))
+                    default=Path("crates/sparagmos-interp/src/builtins"))
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--jobs", type=int, default=48)
     ap.add_argument("--timeout", type=int, default=DRIVER_TIMEOUT)
     ap.add_argument("--only", help="comma-separated path substrings to keep")
     args = ap.parse_args(argv)
 
-    registry = BuiltinRegistry(args.builtins_rs.read_text())
+    registry = BuiltinRegistry(read_builtins_source(args.builtins_rs))
     tasks = []
     for f in sorted(args.corpus_dir.glob("*.rs")):
         tasks.append((str(f), "corpus", str(args.driver_bin), args.timeout))
