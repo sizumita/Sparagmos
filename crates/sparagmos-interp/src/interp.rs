@@ -18461,6 +18461,46 @@ impl<'a> Interpreter<'a> {
         if let Some(v) = self.reinterpret_preserving(value, src, dst) {
             return Ok(v);
         }
+        // An array pair of the same length whose elements
+        // do not all line up structurally: reinterpret
+        // element by element. The whole-value bit path
+        // below packs the array into a single `u128`, which
+        // caps the total width at 128 bits; the elementwise
+        // walk is the same reinterpretation at any length
+        // (element `i` occupies the `i`-th lane of the
+        // pattern in both readings). A byte block is the
+        // one non-tuple array value: its elements are its
+        // bytes.
+        if let (
+            ScalarShape::Array(selem, sn),
+            ScalarShape::Array(delem, dn),
+        ) = (src, dst)
+        {
+            if sn == dn {
+                let items: Option<Vec<Value>> = match value {
+                    Value::Tuple(items) if items.len() as u64 == *sn => {
+                        Some(items.clone())
+                    }
+                    Value::Bytes(b)
+                        if selem.bits() == 8 && b.len() as u64 == *sn =>
+                    {
+                        Some(
+                            b.iter()
+                                .map(|byte| Value::Uint(u128::from(*byte)))
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some(items) = items {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in &items {
+                        out.push(self.reinterpret_value(item, selem, delem)?);
+                    }
+                    return Ok(Value::Tuple(out));
+                }
+            }
+        }
         let bits = self.flatten_scalar(value, src)?;
         self.construct_scalar(bits, dst)
     }
