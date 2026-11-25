@@ -3206,12 +3206,13 @@ fn coroutine_variant_name(variant: usize) -> String {
     }
 }
 
-/// The upvar count of a closure/coroutine instance: the length
-/// of the upvars tuple, the last type argument of the instance.
-fn env_upvar_count(args: &GenericArgs) -> Option<usize> {
+/// The upvar types of a closure/coroutine instance, in
+/// environment field order: the elements of the upvars tuple,
+/// the last type argument of the instance.
+fn env_upvar_tys(args: &GenericArgs) -> Option<Vec<rustc_public::ty::Ty>> {
     args.0.iter().rev().find_map(|a| match a {
         GenericArgKind::Type(t) => match guarded_ty_kind(t) {
-            Some(TyKind::RigidTy(RigidTy::Tuple(ts))) => Some(ts.len()),
+            Some(TyKind::RigidTy(RigidTy::Tuple(ts))) => Some(ts),
             _ => None,
         },
         _ => None,
@@ -8468,10 +8469,15 @@ impl Converter {
     ///
     /// Recording is auxiliary to the conversion in progress,
     /// exactly like `record_debug_shape`: the current body's
-    /// error list is saved and restored around it. An instance
-    /// whose environment fields are not all named by the debug
-    /// info gets no entry - it stays unrenderable in the
-    /// debugger rather than rendering with invented names.
+    /// error list is saved and restored around it. An environment
+    /// field the debug info does not name (the compiler emits no
+    /// entry for a zero-sized capture) is recovered by type from
+    /// the instance's upvars tuple with no name, rather than
+    /// dropping the whole entry: consumers that need only the
+    /// field type tags (the closure clone path among them) still
+    /// get a complete shape, and the debugger renders no invented
+    /// names - a nameless field simply never matches a name
+    /// lookup and keeps the value on the generic render path.
     fn record_env_shape(
         &mut self,
         ty: &rustc_public::ty::Ty,
@@ -8522,7 +8528,7 @@ impl Converter {
             }
             _ => return,
         };
-        let Some(upvar_count) = env_upvar_count(args) else {
+        let Some(upvar_tys) = env_upvar_tys(args) else {
             return;
         };
         let key = self.layout_key(converted);
@@ -8531,7 +8537,7 @@ impl Converter {
             &body,
             &def_name,
             env_dwarf_name(&def_name, label),
-            upvar_count,
+            &upvar_tys,
             &key,
             label == "coroutine",
         );
@@ -8550,10 +8556,11 @@ impl Converter {
         body: &mir::Body,
         def_name: &str,
         dwarf_name: String,
-        upvar_count: usize,
+        upvar_tys: &[rustc_public::ty::Ty],
         key: &str,
         is_coroutine: bool,
     ) -> Option<sm::EnvDebugShape> {
+        let upvar_count = upvar_tys.len();
         // Parse the debug entries into capture and saved-local
         // candidates, grouped by their base local.
         struct Candidate {
@@ -8652,9 +8659,24 @@ impl Converter {
                 }
             }
         }
-        let upvars: Option<Vec<sm::AdtDebugField>> =
-            (0..upvar_count).map(|i| upvars.get(&i).cloned()).collect();
-        let upvars = upvars?;
+        // A field the debug info does not name is recovered
+        // from the upvars tuple: the tuple carries every
+        // capture's type in environment field order, so the
+        // field's type tag is exact; only its name stays `None`
+        // (see `record_env_shape`).
+        let mut filled: Vec<sm::AdtDebugField> = Vec::with_capacity(upvar_count);
+        for i in 0..upvar_count {
+            if let Some(field) = upvars.get(&i) {
+                filled.push(field.clone());
+                continue;
+            }
+            let converted_field = self.ty(&upvar_tys[i]);
+            filled.push(sm::AdtDebugField {
+                name: None,
+                ty: self.layout_key(&converted_field),
+            });
+        }
+        let upvars = filled;
         if !is_coroutine {
             return Some(sm::EnvDebugShape {
                 dwarf_name,
