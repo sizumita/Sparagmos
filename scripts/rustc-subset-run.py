@@ -51,10 +51,14 @@ both sides are judged by compiletest's rules for each suite
 (htmldocck for rustdoc-html, jsondocck and jsondoclint for
 rustdoc-json, the UI verdict for rustdoc-ui). The official
 metric-2(b) measurement runs all four stages (`--stages all`).
-The exec records of the coverage suites belong to no stage:
+The exec records of the coverage suite are judged by stage 1
+through a dedicated path (see `fill_coverage_result` below):
 compiletest judges them by coverage output, not by program
-output (see `coverage_scope` below), so they are among the
-carried not-attempted records, under their own bucket. The
+output, so the driver produces the coverage-map dump and the
+llvm-cov style report from the interpreter's own counted
+execution for comparison. The coverage-run-rustdoc suite's
+exec record stays among the carried not-attempted records,
+under the coverage bucket (see `coverage_scope` below). The
 exec records of the ui suite's codegen/ subtree whose
 directive view carries `//@ known-bug:` belong to no stage
 either: the test pins the codegen backend's current
@@ -4108,7 +4112,425 @@ def rustdoc_host_tool_scope(rec):
     return None
 
 
-# The coverage suites' verdicts are coverage output, in
+# ---------------------------------------------------------------------------
+# Stage 1, coverage suite: coverage-output verdicts (issue #514)
+# ---------------------------------------------------------------------------
+#
+# compiletest judges the coverage suite by coverage output, not
+# by program output. The coverage-map mode compiles the test
+# with -C instrument-coverage (and -Zno-profiler-runtime,
+# -Copt-level=2), saves the LLVM IR, runs the coverage-dump
+# tool on it and compares the dump with the test's .cov-map
+# snapshot; the coverage-run mode compiles with
+# -C instrument-coverage (-Copt-level=2), executes the
+# instrumented program, and compares the llvm-cov text report
+# rendered from the merged counters with the .coverage
+# snapshot. A revision can waive either comparison with
+# ignore-coverage-map / ignore-coverage-run; every revision
+# keeps at least one active.
+#
+# The driver's coverage-map mode prints the mapping dump of
+# its own capture of the compilation's coverage data (the
+# compiler's mono collection and coverage queries, encoded the
+# way the LLVM mapping writer encodes them), and its
+# coverage-run mode executes the converted program in the
+# interpreter -- which counts the physical counters as the
+# guest's coverage statements execute -- and prints the
+# llvm-cov style report rendered from those counts. Both
+# outputs are compared under compiletest's own normalisation
+# (normalize_output for the dump; normalize_coverage_output
+# for the report), ported below. The counts and mappings are
+# the guest's own: nothing is read from the snapshots or from
+# a native run.
+
+
+def _anonymize_coverage_line_numbers(text):
+    """compiletest's anonymize_coverage_line_numbers: replace
+    the line numbers llvm-cov prints (the leading number
+    column, and branch subview line numbers) with `LL`."""
+    text = re.sub(r"(?m:^)((?:  \|)*) *[0-9]+\|", r"\g<1>   LL|", text)
+    text = re.sub(r"(?m:^)((?:  \|)+  Branch \()[0-9]+:", r"\g<1>LL:", text)
+    text = re.sub(
+        r"(?m:^)((?:  \|)+---> MC/DC Decision Region \()[0-9]+:"
+        r"([0-9]+\) to \()[0-9]+:",
+        r"\g<1>LL:\g<2>LL:", text)
+    text = re.sub(
+        r"(?m:^)((?:  \|)+     Condition C[0-9]+ --> \()[0-9]+:",
+        r"\g<1>LL:", text)
+    return text
+
+
+def _sort_coverage_file_sections(lines):
+    """compiletest's sort_coverage_file_sections: a report's
+    per-file sections (separated by blank lines, with a final
+    blank line) are sorted, because the file order depends on
+    implementation details."""
+    sections = [[]]
+    for line in lines:
+        if line == "":
+            sections.append([])
+        else:
+            sections[-1].append(line)
+    if sections[-1] != []:
+        raise ValueError("coverage report should end with an extra blank line")
+    body = sections[:-1]
+    body.sort()
+    out = []
+    for section in body:
+        out.extend(section)
+        out.append("")
+    return out
+
+
+def _sort_coverage_subviews(lines):
+    """compiletest's sort_coverage_subviews: consecutive
+    subviews (each opened by a boundary line) are sorted."""
+    out = []
+    subviews = []
+
+    def flush():
+        nonlocal subviews
+        if not subviews:
+            return
+        keep = subviews[:-1]
+        keep.sort()
+        for view in keep + subviews[-1:]:
+            out.extend(view)
+        subviews = []
+
+    for line in lines:
+        if line.startswith("  ------------------"):
+            subviews.append([line])
+        elif line.startswith("  |"):
+            if not subviews:
+                raise ValueError("subview line outside of a subview")
+            subviews[-1].append(line)
+        else:
+            flush()
+            out.append(line)
+    flush()
+    return out
+
+
+def normalize_coverage_output(text, test_dir):
+    """compiletest's normalize_coverage_output, with its
+    normalize_output reduced to the path substitution that
+    applies to coverage output: the test file's directory is
+    $DIR in the snapshots."""
+    text = text.replace(str(test_dir), "$DIR")
+    text = _anonymize_coverage_line_numbers(text)
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    lines = _sort_coverage_file_sections(lines)
+    lines = _sort_coverage_subviews(lines)
+    return "".join(line + "\n" for line in lines)
+
+
+def normalize_cov_map_output(text, test_dir):
+    """compiletest's normalize_output for a coverage-map dump,
+    reduced to the $DIR path substitution (the dump's only
+    path-bearing lines are its file table entries)."""
+    return text.replace(str(test_dir), "$DIR")
+
+
+def coverage_side(driver_bin, mode, path, edition, cwd, rustc_args,
+                  aux_specs, env_extra, env_remove, aux_env_scrub=(),
+                  driver_flags=()):
+    """Run one of the driver's coverage modes. Returns
+    (result_dict, kind, reason), with kind as in sparagmos_side:
+    "result" (the mode completed; for coverage-run the exit
+    code is the guest's own), "unsupported" (driver exit 2),
+    "timeout", "memory-limit", or "driver-error"."""
+    rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
+    argv = [str(driver_bin), mode, str(path), "--edition", edition]
+    if mode == "coverage-run":
+        # As in run mode, the guest opts into real child
+        # processes on the host.
+        argv.append("--guest-process-host")
+    argv += list(driver_flags)
+    for a in rustc_args:
+        argv += ["--rustc-arg", a]
+    for spec in aux_specs:
+        argv += ["--aux", aux_spec_arg(spec)]
+    for d in aux_native_lib_dirs(path):
+        argv += ["--aux-native-lib", d]
+    for name in aux_env_scrub:
+        argv += ["--aux-env-scrub", name]
+    env = dict(BOOTSTRAP_ENV)
+    lib_dirs = []
+    slib = sysroot_lib()
+    if slib:
+        lib_dirs.append(slib)
+    facts = host_facts()
+    if facts is not None and facts.target_lib_dir() is not None:
+        lib_dirs.append(str(facts.target_lib_dir()))
+    if cwd is not None:
+        lib_dirs.append(str(Path(cwd) / "auxlibs"))
+    if lib_dirs:
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join(
+            lib_dirs + ([prev] if prev else []))
+    if env_extra:
+        env.update(env_extra)
+    res = run_cmd(argv,
+                  timeout=DRIVER_TIMEOUT, cwd=cwd,
+                  env_extra=env, env_remove=env_remove,
+                  mem_limit_mb=DRIVER_MEM_LIMIT_MB)
+    if res.get("mem_exceeded"):
+        return None, "memory-limit", \
+            f"driver exceeded the per-record memory limit of " \
+            f"{DRIVER_MEM_LIMIT_MB} MB"
+    if res["timeout"]:
+        return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
+    if res["exit_code"] == 2:
+        return None, "unsupported", driver_reason(res["stderr"])
+    if res["exit_code"] is None or res["exit_code"] < 0:
+        return None, "driver-error", \
+            f"driver killed by signal {-res['exit_code']}: " \
+            f"{res['stderr'].strip()[:300]}"
+    return res, "result", ""
+
+
+def _coverage_diff_detail(kind, snap_name, want, got):
+    """A one-line summary of the first difference between a
+    snapshot and the driver's normalised coverage output."""
+    want_lines = want.splitlines()
+    got_lines = got.splitlines()
+    for i, (a, b) in enumerate(zip(want_lines, got_lines)):
+        if a != b:
+            return (f"{kind} output differs from {snap_name} at "
+                    f"line {i + 1}: snapshot {a[:120]!r} vs "
+                    f"driver {b[:120]!r}")
+    return (f"{kind} output differs from {snap_name}: snapshot has "
+            f"{len(want_lines)} lines, driver has {len(got_lines)}")
+
+
+def coverage_attempt(rec, view, path, driver_bin, revision,
+                     all_revisions, rust_dir):
+    """Judge one revision view of a coverage-suite record.
+
+    The revision is compiled by the driver under the
+    compilation compiletest's coverage modes perform
+    (-C instrument-coverage, -Copt-level=2, the revision's
+    compile-flags and --cfg), and each comparison the revision
+    keeps active is judged: the coverage-map dump against the
+    revision's .cov-map snapshot, and the coverage-run report
+    (with the guest's exit status checked against
+    failure-status, as compiletest checks it) against the
+    .coverage snapshot. Returns a stage1_attempt-shaped dict.
+    """
+    res = {"status": "not-attempted", "reason": "", "bucket": "",
+           "mode": "coverage"}
+    blocker = stage1_view_blocker(view)
+    if blocker:
+        res["reason"] = blocker
+        res["bucket"] = header_bucket(blocker)
+        return res
+    status, why = applicability(view)
+    if status == "out-of-environment":
+        res["reason"] = why
+        res["bucket"] = "out of environment"
+        return res
+    if status == "unevaluatable":
+        res["reason"] = why
+        res["bucket"] = "not attempted (unevaluatable condition)"
+        return res
+    aux_specs = []
+    if not rec["single_file"]:
+        aux_specs, aux_err = resolve_aux_specs(
+            path, revision, top_proc_macro=False)
+        if aux_err:
+            res["reason"] = aux_err
+            res["bucket"] = "out of stage-1 scope (multi-file)"
+            return res
+    edition = attempt_edition(view)
+    src_base = suite_root(path)
+    stem = path.stem
+    suffix = f".{revision}" if revision else ""
+    with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
+        flags = compile_flags(view, src_base, td)
+        screened = screen_flags(flags, targets={HOST_TARGET})
+        if screened:
+            res["reason"] = screened
+            res["bucket"] = "not attempted (compile-flags)"
+            return res
+        rev_args = (revision_args(view, revision, all_revisions)
+                    if revision else [])
+        pm_args, pm_err = proc_macro_extern_args(path, view, edition)
+        if pm_err:
+            res["reason"] = pm_err
+            res["bucket"] = "auxiliary crate build failure"
+            return res
+        # compiletest's coverage modes set the instrumentation
+        # and the optimisation level the snapshots assume; the
+        # test's own compile-flags follow, so an explicit
+        # opt-level in them still wins.
+        mode_args = ["-C", "instrument-coverage", "-Copt-level=2"]
+        args = rev_args + mode_args + flags + pm_args
+        env_pairs, env_unset = view_env(view, "exec-env",
+                                        "unset-exec-env",
+                                        src_base, td)
+        cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                                src_base, td)
+        denv = dict(cenv)
+        denv.update(env_pairs)
+        denv.setdefault("RUST_TEST_TMPDIR", td)
+        dunset = env_unset + [u for u in cunset if u not in env_unset]
+
+        # The report is rendered with colours when the test's
+        # llvm-cov-flags ask llvm-cov for them (--use-color):
+        # the snapshots preserve the escape sequences.
+        use_color = any(
+            "--use-color" in f.split()
+            for f in view.values("llvm-cov-flags"))
+
+        def side(mode, extra_args=(), driver_flags=()):
+            return coverage_side(
+                driver_bin, mode, path, edition, td,
+                args + list(extra_args), aux_specs, denv, dunset,
+                aux_env_scrub=tuple(cenv), driver_flags=driver_flags)
+
+        def judged_failure(kind, reason):
+            if kind == "unsupported":
+                res["status"] = "unsupported"
+                res["reason"] = reason
+                res["bucket"] = bucket_reason(reason)
+            else:
+                res["status"] = "fail"
+                res["reason"] = reason
+                res["bucket"] = bucket_reason(reason)
+            return res
+
+        if not view.has("ignore-coverage-map"):
+            snap = path.with_name(f"{stem}{suffix}.cov-map")
+            got, kind, reason = side(
+                "coverage-map", ["-Zno-profiler-runtime"])
+            if kind != "result":
+                return judged_failure(kind, reason)
+            if got["exit_code"] != 0:
+                res["status"] = "fail"
+                res["reason"] = (
+                    "coverage-map compilation failed: "
+                    + first_error_line(got["stderr"]))
+                res["bucket"] = "coverage output mismatch"
+                return res
+            # A missing snapshot is an empty expected output
+            # (compiletest's load_expected_output): the
+            # comparison then passes exactly when the driver's
+            # output is empty too.
+            want = snap.read_text(errors="ignore") \
+                if snap.exists() else ""
+            mine = normalize_cov_map_output(got["stdout"], path.parent)
+            if mine != want:
+                res["status"] = "fail"
+                res["reason"] = _coverage_diff_detail(
+                    "coverage-map", snap.name, want, mine)
+                res["bucket"] = "coverage output mismatch"
+                return res
+
+        if not view.has("ignore-coverage-run"):
+            snap = path.with_name(f"{stem}{suffix}.coverage")
+            got, kind, reason = side(
+                "coverage-run",
+                driver_flags=["--coverage-color"] if use_color else [])
+            if kind != "result":
+                return judged_failure(kind, reason)
+            failure = view.values("failure-status")
+            want_status = 0
+            if failure:
+                try:
+                    want_status = int(failure[0])
+                except ValueError:
+                    res["status"] = "fail"
+                    res["reason"] = \
+                        f"unparseable failure-status: {failure[0]!r}"
+                    res["bucket"] = "coverage output mismatch"
+                    return res
+            if got["exit_code"] != want_status:
+                res["status"] = "fail"
+                res["reason"] = (
+                    f"coverage-run guest exit {got['exit_code']} "
+                    f"does not match the expected status "
+                    f"{want_status}")
+                res["bucket"] = "coverage output mismatch"
+                return res
+            # Missing snapshot: an empty expected output, as
+            # on the map side.
+            want = snap.read_text(errors="ignore") \
+                if snap.exists() else ""
+            try:
+                mine = normalize_coverage_output(got["stdout"],
+                                                 path.parent)
+            except ValueError as e:
+                res["status"] = "fail"
+                res["reason"] = f"coverage-run report malformed: {e}"
+                res["bucket"] = "coverage output mismatch"
+                return res
+            if mine != want:
+                res["status"] = "fail"
+                res["reason"] = _coverage_diff_detail(
+                    "coverage-run", snap.name, want, mine)
+                res["bucket"] = "coverage output mismatch"
+                return res
+
+        res["status"] = "pass"
+        return res
+
+
+def fill_coverage_result(rec, rust_dir, driver_bin, out):
+    """Stage-1 judging for a coverage-suite record: each
+    revision is judged by coverage_attempt, and the record
+    passes only when every revision that runs passes (the
+    aggregation fill_result_revisions performs for exec
+    records)."""
+    path = rust_dir / rec["path"]
+    text = path.read_text(errors="ignore")
+    header = Header(text)
+    out["mode"] = "coverage"
+    revs = header.revisions()
+    if not revs:
+        res = coverage_attempt(rec, header.view(None), path,
+                               driver_bin, None, [], rust_dir)
+        out["status"] = res["status"]
+        if res["status"] != "pass":
+            out["reason"] = res["reason"]
+            out["bucket"] = res["bucket"]
+        return
+    per_rev = {}
+    for rev in revs:
+        per_rev[rev] = coverage_attempt(rec, header.view(rev), path,
+                                        driver_bin, rev, revs,
+                                        rust_dir)
+    out["revisions"] = {
+        rev: {k: r[k] for k in ("status", "reason", "bucket", "mode")
+              if r.get(k)}
+        for rev, r in per_rev.items()
+    }
+    ran = {rev: r for rev, r in per_rev.items()
+           if r["bucket"] != "out of environment"}
+    if not ran:
+        first = next(iter(per_rev.values()))
+        out["reason"] = first["reason"]
+        out["bucket"] = "out of environment"
+        return
+    for rev, r in ran.items():
+        if r["status"] == "not-attempted":
+            out["reason"] = f"revision {rev}: {r['reason']}"
+            out["bucket"] = r["bucket"]
+            return
+    for wanted in ("fail", "unsupported"):
+        for rev, r in ran.items():
+            if r["status"] == wanted:
+                out["status"] = wanted
+                out["reason"] = (f"revision {rev}: {r['reason']}"
+                                 if r["reason"] else "")
+                out["bucket"] = r["bucket"]
+                return
+    out["status"] = "pass"
+
+
+# The coverage suite's verdicts are coverage output, in
 # compiletest itself: each test is judged in a coverage-map
 # mode (the coverage-dump tool's output over the test's saved
 # LLVM IR, compared with the test's .cov-map snapshot) and a
@@ -4120,18 +4542,20 @@ def rustdoc_host_tool_scope(rec):
 # whole population at the 1.100.0 tag, every (file, revision)
 # pair keeps at least one of the two comparisons active, so
 # no record's verdict reduces to the plain execution stage 1
-# judges -- and the generic carry-through bucket misdescribed
-# these records as a multi-file exclusion (95 of the 109 are
-# single-file; the rest carry only the aux-crate directives
-# stage 1 already supports for ui tests). Sparagmos has no
-# coverage-instrumentation subsystem -- neither the coverage
-# counters/regions rustc-codegen-llvm materialises, nor the
-# coverage-mapping dump format and llvm-cov's report
-# rendering -- so these records are recorded as not attempted
-# under their own bucket (issue #514). This records the
-# current harness, not an unreachability claim: the suites
-# become attemptable once a coverage subsystem can produce a
-# guest coverage report to compare against the native one.
+# judges elsewhere. Stage 1 judges the coverage suite with
+# the dedicated path above (fill_coverage_result): the driver
+# captures the compilation's coverage mapping from the
+# compiler's own mono collection and coverage queries, its
+# coverage-map mode prints the mapping dump, and its
+# coverage-run mode executes the converted program in the
+# interpreter -- which counts the physical counters as the
+# guest's coverage statements execute -- and prints the
+# llvm-cov style report; both outputs are compared under
+# compiletest's own normalisation. The JIT path produces no
+# coverage verdict, and the coverage-run-rustdoc suite stays
+# not attempted: its single record's verdict also runs the
+# test's doctests under rustdoc --test with instrument
+# coverage, which no stage performs (issue #514).
 COVERAGE_SUITES = ("coverage", "coverage-run-rustdoc")
 
 
@@ -4158,13 +4582,11 @@ def coverage_scope(rec):
             "compiles with -C instrument-coverage, runs the "
             "instrumented binary and compares the llvm-cov "
             "text report rendered from the merged counters "
-            "with the .coverage snapshot. Every revision of "
-            "every test in the suite has at least one of the "
-            "two comparisons active, so no verdict reduces to "
-            "plain execution; Sparagmos implements neither "
-            "the coverage counters/regions rustc-codegen-llvm "
-            "materialises nor the coverage-mapping dump and "
-            "llvm-cov report path (issue #514)",
+            "with the .coverage snapshot. Stage 1 judges these "
+            "records on the interpreter path "
+            "(fill_coverage_result); the path consulting this "
+            "classification (the JIT path, or a run with stage "
+            "1 off) produces no coverage verdict (issue #514)",
             "not attempted (coverage instrumentation)")
     if rec["suite"] == "coverage-run-rustdoc":
         return (
@@ -4317,6 +4739,10 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     scope = rustdoc_host_tool_scope(rec)
     if scope is not None:
         out["reason"], out["bucket"] = scope
+        return
+    if not jit and rec["nature"] == "exec" \
+            and rec["suite"] == "coverage":
+        fill_coverage_result(rec, rust_dir, driver_bin, out)
         return
     scope = coverage_scope(rec)
     if scope is not None:
@@ -8494,7 +8920,7 @@ def main():
 
     def is_candidate(r):
         return (r["nature"] == "exec"
-                and r["suite"] in ("ui", "ui-fulldeps")
+                and r["suite"] in ("ui", "ui-fulldeps", "coverage")
                 and not r["env_excluded"]
                 and (r["single_file"] or has_aux_directives(r)))
 

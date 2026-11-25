@@ -154,25 +154,35 @@ denominator. Runs on every push to `main` and on manual dispatch.
   produces the artifacts and the host tooling is wired in.
   The denominator is unaffected; all 1,735 stay in it as
   non-passes.
-- The `exec` records of the `coverage` suite (108) and the
-  `coverage-run-rustdoc` suite (1) are attempted by no stage.
-  compiletest judges them by coverage output rather than by
-  program output: the coverage-map mode compares the
-  coverage-dump tool's output over the test's saved LLVM IR
-  against its `.cov-map` snapshot, and the coverage-run mode
-  compares the `llvm-cov` text report rendered from an
-  instrumented run's merged counters against its `.coverage`
-  snapshot (the rustdoc suite's record also runs the file's
-  doctests under instrumentation and merges their counters).
+- The `exec` records of the `coverage` suite (108) are
+  judged by stage 1 through a dedicated path. compiletest
+  judges them by coverage output rather than by program
+  output: the coverage-map mode compares the coverage-dump
+  tool's output over the test's saved LLVM IR against its
+  `.cov-map` snapshot, and the coverage-run mode compares
+  the `llvm-cov` text report rendered from an instrumented
+  run's merged counters against its `.coverage` snapshot.
   Every revision of every one of these tests keeps at least
-  one of the two comparisons active, so no verdict reduces to
-  the plain execution stage 1 judges, and Sparagmos implements
-  neither the coverage counters/regions rustc-codegen-llvm
-  materialises nor the coverage-mapping dump and llvm-cov
-  report path, so the runner records them as not attempted
-  under the bucket `not attempted (coverage instrumentation)`
-  (issue #514). The denominator is unaffected; all 109 stay
-  in it as non-passes.
+  one of the two comparisons active, so no verdict reduces
+  to the plain execution stage 1 judges elsewhere. The
+  driver's coverage capture takes the compilation's coverage
+  mapping from the compiler's own mono collection and
+  coverage queries (encoded as LLVM's mapping writer encodes
+  it); its `coverage-map` mode prints the mapping dump and
+  its `coverage-run` mode executes the converted program in
+  the interpreter -- which counts the physical counters as
+  the guest's coverage statements execute, each statement
+  attributed to the instance it was inlined from -- and
+  prints the `llvm-cov` style report rendered from those
+  counts. The runner compares both outputs against the
+  snapshots under compiletest's own normalisation (issue
+  #514). The JIT path produces no coverage verdict. The
+  `coverage-run-rustdoc` suite's single record stays not
+  attempted under the bucket `not attempted (coverage
+  instrumentation)`: its verdict also runs the file's
+  doctests under `rustdoc --test` with instrument coverage
+  and merges their counters, which no stage performs. The
+  denominator is unaffected.
 - A compile-check view whose compile-flags request printed
   output -- a `-Zunpretty` dump or a `--print` answer -- in
   the `ui`, `ui-fulldeps` or `crashes` suites is judged as a

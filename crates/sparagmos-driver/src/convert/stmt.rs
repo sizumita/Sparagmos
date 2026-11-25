@@ -43,7 +43,32 @@ impl Converter {
                 };
                 sm::StatementKind::AscribeUserType(Box::new((p, proj)), variance_of(*variance))
             }
-            SK::Coverage(_) => sm::StatementKind::Coverage,
+            SK::Coverage(cov) => {
+                // The Stable MIR coverage payload is opaque; its
+                // rendered form is the internal `CoverageKind`
+                // debug text, of which only the virtual-counter
+                // form survives into the optimised bodies the
+                // driver converts (the point/block-marker forms
+                // are erased by the coverage pass itself). Any
+                // other shape is a conversion error rather than a
+                // silently dropped counter point: counts taken
+                // from a body whose counter points were misread
+                // would be fabricated data.
+                let text = cov.to_string();
+                match text
+                    .strip_prefix("VirtualCounter(bcb")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .and_then(|digits| digits.parse::<u32>().ok())
+                {
+                    Some(bcb) => sm::StatementKind::Coverage(bcb),
+                    None => {
+                        self.errors.push(format!(
+                            "Coverage statement with unrecognised payload {text}"
+                        ));
+                        sm::StatementKind::Coverage(u32::MAX)
+                    }
+                }
+            }
             SK::Intrinsic(intrinsic) => {
                 sm::StatementKind::Intrinsic(Box::new(self.intrinsic(intrinsic)))
             }

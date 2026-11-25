@@ -64,6 +64,7 @@ extern crate rustc_span;
 extern crate rustc_target;
 
 pub mod convert;
+pub mod coverage;
 pub mod dump;
 pub mod mono_check;
 pub mod reach;

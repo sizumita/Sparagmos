@@ -101,7 +101,13 @@ pub enum StatementKind {
     Retag(RetagKind, Box<Place>),
     PlaceMention(Box<Place>),
     AscribeUserType(Box<(Place, UserTypeProjection)>, Variance),
-    Coverage,
+    /// A coverage counter point: the basic coverage block (BCB)
+    /// whose physical counter the native codegen increments at
+    /// this statement (a `CoverageKind::VirtualCounter` in the
+    /// source MIR). Carries no value effect; the interpreter's
+    /// coverage counting observes it (see
+    /// `crate::coverage_mapping`).
+    Coverage(u32),
     Intrinsic(Box<NonDivergingIntrinsic>),
     ConstEvalCounter,
     Nop,
@@ -117,7 +123,7 @@ impl StatementKind {
             Self::Retag(..) => "Retag",
             Self::PlaceMention(_) => "PlaceMention",
             Self::AscribeUserType(..) => "AscribeUserType",
-            Self::Coverage => "Coverage",
+            Self::Coverage(_) => "Coverage",
             Self::Intrinsic(_) => "Intrinsic",
             Self::ConstEvalCounter => "ConstEvalCounter",
             Self::Nop => "Nop",
@@ -150,7 +156,7 @@ impl StatementKind {
                 )),
                 Variance::Covariant,
             ),
-            Self::Coverage,
+            Self::Coverage(0),
             Self::Intrinsic(Box::new(NonDivergingIntrinsic::Assume(Operand::constant(
                 Constant::bool(true),
             )))),

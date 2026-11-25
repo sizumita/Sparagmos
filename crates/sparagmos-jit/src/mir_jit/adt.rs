@@ -259,7 +259,7 @@ pub(super) fn scan_statement_fields(scan: &mut AdtScan, body: &mir::Body, stmt: 
         },
         S::StorageLive(_)
         | S::StorageDead(_)
-        | S::Coverage
+        | S::Coverage(..)
         | S::ConstEvalCounter
         | S::Nop => {}
     }

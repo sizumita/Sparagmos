@@ -19,6 +19,37 @@ use super::run::*;
 impl<'a> Converter<'a> {
     // ----- statements & terminators ------------------------------------------
 
+    /// The coverage owner the driver recorded for `stmt`:
+    /// `Some(Some(symbol))` when the statement was inlined from
+    /// the instance with that mangled symbol, `Some(None)` for
+    /// the body's own statements, and `None` when the body
+    /// carries no attribution data. The statement is located by
+    /// pointer identity within its body (conversion always
+    /// passes statements borrowed from that body), and its
+    /// coverage index is its position among the body's coverage
+    /// statements, matching the driver's table.
+    fn coverage_owner(
+        &self,
+        body: &mir::Body,
+        stmt: &mir::Statement,
+    ) -> Option<Option<String>> {
+        if body.coverage_owners.is_empty() {
+            return None;
+        }
+        let mut idx = 0usize;
+        for bb in &body.basic_blocks {
+            for s in &bb.statements {
+                if std::ptr::eq(s, stmt) {
+                    return body.coverage_owners.get(idx).cloned();
+                }
+                if matches!(s.kind, mir::StatementKind::Coverage(_)) {
+                    idx += 1;
+                }
+            }
+        }
+        None
+    }
+
     pub(super) fn convert_statement(
         &self,
         body: &mir::Body,
@@ -61,8 +92,25 @@ impl<'a> Converter<'a> {
             | S::PlaceMention(_)
             | S::Retag(..)
             | S::AscribeUserType(..)
-            | S::Coverage
             | S::ConstEvalCounter => ir::Statement::nop(),
+            // A coverage counter point. When the driver
+            // attributed this statement to the instance it was
+            // inlined from, count against that instance's record
+            // (or nothing, when that instance has no record: no
+            // counter was emitted for it natively either);
+            // otherwise the interpreter resolves the record from
+            // the executing body at run time.
+            S::Coverage(bcb) => {
+                let record = match self.coverage_owner(body, stmt) {
+                    Some(Some(symbol)) => self
+                        .coverage_by_symbol
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(u32::MAX - 1),
+                    _ => u32::MAX,
+                };
+                ir::Statement::coverage(*bcb, record)
+            }
             S::SetDiscriminant {
                 place,
                 variant_index,

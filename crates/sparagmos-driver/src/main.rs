@@ -386,6 +386,16 @@ enum Mode {
     /// `debug`: convert and execute in the interpreter under a
     /// debugger session.
     Debug,
+    /// `coverage-map`: convert an instrumented crate and print
+    /// its coverage-mapping dump (the coverage-dump format
+    /// compiletest's coverage-map mode compares).
+    CoverageMap,
+    /// `coverage-run`: convert an instrumented crate, execute
+    /// it in the interpreter counting coverage counters, and
+    /// print the llvm-cov style text report (the format
+    /// compiletest's coverage-run mode compares); the process
+    /// exit code is the guest's own.
+    CoverageRun,
 }
 
 impl Mode {
@@ -394,14 +404,14 @@ impl Mode {
     /// its failure contract (a failed compilation is reported as
     /// unsupported, exit 2).
     fn is_run(self) -> bool {
-        matches!(self, Mode::Run | Mode::RunJit)
+        matches!(self, Mode::Run | Mode::RunJit | Mode::CoverageRun)
     }
 
     /// Modes whose verdict is a compilation outcome (the program
     /// converts, or fails to compile) rather than an execution
     /// outcome.
     fn is_compile_verdict(self) -> bool {
-        matches!(self, Mode::Convert | Mode::JitCompile)
+        matches!(self, Mode::Convert | Mode::JitCompile | Mode::CoverageMap)
     }
 }
 
@@ -522,6 +532,8 @@ fn driver_main_inner() {
     let argv: Vec<String> = std::env::args().collect();
     let mode = match argv.get(1).map(|a| a.as_str()) {
         Some("run") => Mode::Run,
+        Some("coverage-map") => Mode::CoverageMap,
+        Some("coverage-run") => Mode::CoverageRun,
         Some("run-jit") => Mode::RunJit,
         Some("jit-compile") => Mode::JitCompile,
         Some("debug") => Mode::Debug,
@@ -551,6 +563,7 @@ fn driver_main_inner() {
     let mut aux_env_scrub: Vec<String> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
+    let mut coverage_color = false;
     let mut dump_path: Option<String> = None;
     let mut compiler_stdout: Option<String> = None;
     let mut guest_stderr_file: Option<String> = None;
@@ -694,6 +707,9 @@ fn driver_main_inner() {
             "--guest-process-host" => {
                 guest_process_host = true;
             }
+            "--coverage-color" => {
+                coverage_color = true;
+            }
             "--tool-program" => {
                 i += 1;
                 tool_programs.push(argv.get(i).cloned().unwrap_or_else(|| {
@@ -709,7 +725,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -803,6 +819,7 @@ fn driver_main_inner() {
             &aux_built,
             &aux_native_lib_dirs,
             &aux_env_scrub,
+            mode,
         ) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {
@@ -871,9 +888,17 @@ fn driver_main_inner() {
     let caller_sets_crate_type = rustc_args
         .iter()
         .any(|a| a == "--crate-type" || a.starts_with("--crate-type="));
-    if exec_mode && !caller_sets_crate_type {
+    if exec_mode && mode != Mode::CoverageRun && !caller_sets_crate_type {
         args.push("--crate-type=lib".to_string());
     }
+    // The coverage-run mode is the one exec mode without the
+    // lib pin: its coverage capture reads the compilation's
+    // mono partition, which only has the test's functions in
+    // it under the binary shape compiletest compiles coverage
+    // tests in (a lib compilation roots the partition at the
+    // exported items, and the test's own functions vanish from
+    // it). The collected entry point of a binary crate is its
+    // `main`, which the execution path resolves as usual.
     // Lint levels are not part of an execution verdict, and the
     // lib pin above changes them: it removes the entry-point
     // reachability roots a binary crate gets, so a lint a test
@@ -1065,7 +1090,21 @@ fn driver_main_inner() {
                     hide_locals,
                 ));
             }
-            if mode == Mode::Run || mode == Mode::RunJit {
+            if mode == Mode::CoverageMap {
+                // The coverage-mapping dump of the instrumented
+                // crate, on stdout; nothing is executed.
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(
+                    sparagmos_driver::coverage::render_dump(&c.coverage)
+                        .as_bytes(),
+                );
+                let _ = out.flush();
+                std::process::exit(0);
+            }
+            if mode == Mode::Run || mode == Mode::RunJit
+                || mode == Mode::CoverageRun
+            {
                 // A caller reconstructing a run (an artifact run
                 // answering a recipe) hands the environment the
                 // program was invoked with as a complete
@@ -1124,6 +1163,8 @@ fn driver_main_inner() {
                     guest_program_name.as_deref(),
                     process_host,
                     &self_ctx,
+                    mode == Mode::CoverageRun,
+                    coverage_color,
                 ));
             }
             print_convert_report(&c, &input);

@@ -476,6 +476,7 @@ fn statement_liveness(
         StatementKind::StorageLive(_)
         | StatementKind::StorageDead(_)
         | StatementKind::Nop
+        | StatementKind::Coverage(..)
         | StatementKind::Unsupported(_) => {}
     }
 }

@@ -116,6 +116,11 @@ pub struct MirProgram {
     /// Handed to the interpreter program for the debugger
     /// interface.
     pub source_files: Vec<String>,
+    /// The program's coverage mapping table, as recorded by the
+    /// driver (see `mir::CoverageMapping`). Handed to the
+    /// interpreter program, whose execution counts the records'
+    /// physical counters.
+    pub coverage: mir::CoverageMapping,
     /// ADT instantiations whose drop glue the compiler certifies
     /// empty, as recorded by the driver (it resolves each dropped
     /// type's drop-in-place shim through Stable MIR and keeps the

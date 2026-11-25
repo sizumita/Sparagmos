@@ -1804,6 +1804,40 @@ impl<'a> Interpreter<'a> {
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
                 Ok(())
             }
+            // A coverage counter point: increment the physical
+            // counter the statement's coverage record assigns to
+            // this BCB. The record was resolved at conversion
+            // time for statements inlined from another instance;
+            // `u32::MAX` resolves it from the executing body
+            // here, and `u32::MAX - 1` counts nothing (the
+            // attributed instance has no record). Bodies without
+            // a coverage record (the program was not compiled
+            // with coverage, or this body carries none) count
+            // nothing.
+            StatementKind::Coverage(bcb, record) => {
+                let record = if *record == u32::MAX {
+                    self.coverage_by_body.get(&body.name).copied()
+                } else if *record == u32::MAX - 1 {
+                    None
+                } else {
+                    Some(*record as usize)
+                };
+                if let Some(record) = record {
+                    let function = &self.program.coverage.functions[record];
+                    if let Some(Some(counter)) =
+                        function.counter_for_bcb.get(*bcb as usize)
+                    {
+                        let mut counts = self.coverage_counts.borrow_mut();
+                        if let Some(slot) = counts
+                            .get_mut(record)
+                            .and_then(|v| v.get_mut(*counter as usize))
+                        {
+                            *slot += 1;
+                        }
+                    }
+                }
+                Ok(())
+            }
             StatementKind::Assume(op) => {
                 let value = self.eval_operand(frames, body, op)?;
                 match value {

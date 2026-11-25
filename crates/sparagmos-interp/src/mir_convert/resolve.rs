@@ -949,6 +949,7 @@ fn convert_each(
 ) -> (ir::Program, HashMap<String, ConvertError>) {
     let mut out = ir::Program::new();
     out.source_files = program.source_files.clone();
+    out.coverage = program.coverage.clone();
     let mut failures: HashMap<String, ConvertError> = HashMap::new();
     for (func, key) in program.functions.iter().zip(keys) {
         match conv.convert_body(func, key) {

@@ -288,6 +288,14 @@ pub struct Interpreter<'a> {
     program: &'a Program,
     config: InterpConfig,
     steps: usize,
+    /// Coverage counting state: for each record of the program's
+    /// coverage mapping table, the physical counter values the
+    /// run has accumulated so far (indexed by counter id), and
+    /// the body-name -> record-index link the counting statement
+    /// resolves through. Both are empty when the program carries
+    /// no coverage table.
+    coverage_counts: std::cell::RefCell<Vec<Vec<u64>>>,
+    coverage_by_body: std::collections::HashMap<String, usize>,
     next_frame_id: u64,
     /// Buffers of abstract strings created by
     /// `String::with_capacity` under a guest allocator, keyed by
@@ -671,6 +679,14 @@ impl<'a> Interpreter<'a> {
         Interpreter::with_config(program, InterpConfig::default())
     }
 
+    /// The coverage counter values this run has accumulated:
+    /// one vector of physical counter values per record of the
+    /// program's coverage mapping table (see
+    /// [`CapturedRun::coverage_counts`]).
+    pub fn coverage_counts(&self) -> Vec<Vec<u64>> {
+        self.coverage_counts.borrow().clone()
+    }
+
     /// The guest program's command-line arguments after argv[0],
     /// as configured for this run (see [`InterpConfig::guest_args`]).
     pub fn guest_args(&self) -> &[String] {
@@ -705,6 +721,23 @@ impl<'a> Interpreter<'a> {
             program,
             config,
             steps: 0,
+            coverage_counts: std::cell::RefCell::new(
+                program
+                    .coverage
+                    .functions
+                    .iter()
+                    .map(|f| vec![0; f.num_counters as usize])
+                    .collect(),
+            ),
+            coverage_by_body: program
+                .coverage
+                .functions
+                .iter()
+                .enumerate()
+                .flat_map(|(i, f)| {
+                    f.body_names.iter().map(move |name| (name.clone(), i))
+                })
+                .collect(),
             next_frame_id: 0,
             string_buffers: std::cell::RefCell::new(
                 std::collections::HashMap::new(),

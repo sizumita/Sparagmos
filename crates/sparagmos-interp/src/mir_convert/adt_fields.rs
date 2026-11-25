@@ -503,7 +503,7 @@ fn scan_statement_fields(table: &mut AdtFieldTys, body: &mir::Body, stmt: &mir::
         },
         S::StorageLive(_)
         | S::StorageDead(_)
-        | S::Coverage
+        | S::Coverage(..)
         | S::ConstEvalCounter
         | S::Nop => {}
     }

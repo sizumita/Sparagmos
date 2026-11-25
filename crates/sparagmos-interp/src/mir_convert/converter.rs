@@ -117,6 +117,11 @@ pub(super) struct Converter<'a> {
     /// two bodies claim binds nothing, as a duplicate symbol
     /// is a link error natively). See `link_symbol_route`.
     pub(super) link_exports: HashMap<String, String>,
+    /// Coverage record index by mangled symbol, from the
+    /// program's coverage table: a coverage statement the driver
+    /// attributed to an inlined-from instance counts against
+    /// that instance's record.
+    pub(super) coverage_by_symbol: HashMap<String, u32>,
     /// Scalar-shape tables of the program's union instances (see
     /// [`ir::Program::union_tables`]), interned in
     /// `Converter::new` by [`Self::compute_union_tables`]: every
@@ -231,6 +236,13 @@ impl<'a> Converter<'a> {
             static_tys: &program.static_tys,
             static_seeds: std::cell::RefCell::new(HashMap::new()),
             link_exports,
+            coverage_by_symbol: program
+                .coverage
+                .functions
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.symbol.clone(), i as u32))
+                .collect(),
             impl_targets: None,
             unconverted: HashMap::new(),
             union_tables: Vec::new(),
