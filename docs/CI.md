@@ -340,7 +340,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   than an execution host (the wasm32 and nvptx64 families,
   32-bit and other non-hosted targets) are likewise not host
   cases: compiletest matches them against the target, and they
-  belong with cross-target support. The remaining classes are
+  belong with cross-target support. `ignore-auxiliary` is not a
+  host case either: compiletest registers the `auxiliary`
+  condition as unconditionally true, so a file carrying it is
+  never run as a test on any host -- it is a module input to
+  another test, which carries its own record -- and its record
+  is classified out of environment. The remaining classes are
   defined in the runner's host profiles and in the partition
   rule but have no jobs yet, so their records stay in the
   residual class: the aarch64 classes

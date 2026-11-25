@@ -1359,6 +1359,13 @@ def _eval_needs_list(view, name, known, available):
 # run modes measured here they do not apply.
 IGNORE_NEVER_MATCH = {"ignore-pass", "ignore-check", "ignore-pretty"}
 
+# `ignore-*` suffixes compiletest registers as unconditionally true
+# (prepare_conditions in directives/cfg.rs): the condition holds in
+# every configuration, so the directive ignores the test everywhere.
+# `auxiliary` marks a file "used by another main test file":
+# compiletest never runs it as a test itself.
+IGNORE_ALWAYS_MATCH = {"auxiliary"}
+
 
 def eval_cfg_atom(atom):
     """Evaluate one cfg atom against the host. None = cannot evaluate."""
@@ -1394,6 +1401,8 @@ def eval_condition(cond):
         return None
     if cond in IGNORE_NEVER_MATCH:
         return False
+    if cond in IGNORE_ALWAYS_MATCH:
+        return True
     if cond.startswith("cfg(") and cond.endswith(")"):
         return eval_cfg_expr(cond[4:-1])
     return eval_cfg_atom(cond)
