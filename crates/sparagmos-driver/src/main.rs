@@ -5006,6 +5006,27 @@ fn collect() -> ControlFlow<()> {
     );
     reach_seeds.extend(dyn_seeds);
 
+    // In the executing modes the reachability passes walk
+    // execution-first (see `reach::CollectionOrder`): the entry
+    // point's body is scanned ahead of the other seeds, so under
+    // the collection cap the executable core is collected before
+    // speculative periphery. Convert mode keeps the historical
+    // first-in-first-out walk; its report is a measurement
+    // contract.
+    let collection_order = if EXECUTION_FIRST_MODE
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        sparagmos_driver::reach::CollectionOrder::ExecutionFirst
+    } else {
+        sparagmos_driver::reach::CollectionOrder::Fifo
+    };
+    let entry_seeds =
+        if collection_order == sparagmos_driver::reach::CollectionOrder::ExecutionFirst {
+            entry_seed_bodies(&items)
+        } else {
+            Vec::new()
+        };
+
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
@@ -5014,6 +5035,8 @@ fn collect() -> ControlFlow<()> {
         &reach_seeds,
         &local_defs,
         sparagmos_driver::reach::MAX_COLLECTED_BODIES,
+        collection_order,
+        &entry_seeds,
     );
     collected_ids.extend(body_def_ids.iter().copied());
     let mut foreign_taken = 0usize;
@@ -5171,6 +5194,8 @@ fn collect() -> ControlFlow<()> {
             &reach_input,
             &local_defs,
             sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+            collection_order,
+            &[],
         );
         frontier = reached.walked_bodies;
         alias_sources.extend(frontier.iter().cloned());
@@ -5242,6 +5267,8 @@ fn collect() -> ControlFlow<()> {
             &walk_seeds,
             &local_defs,
             sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+            collection_order,
+            &[],
         );
         alias_sources.extend(reached.walked_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
@@ -5316,6 +5343,8 @@ fn collect() -> ControlFlow<()> {
                 &walk_seeds,
                 &local_defs,
                 sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+                collection_order,
+                &[],
             );
             alias_sources.extend(reached.walked_bodies.iter().cloned());
             all_bodies.extend(reached.walked_bodies.iter().cloned());
@@ -5566,6 +5595,41 @@ fn collect() -> ControlFlow<()> {
 /// resolved here through the same instance the item loop
 /// converted, to the id that body carries in
 /// `Collected::body_def_ids`.
+/// The entry point's Stable MIR body, fetched the way the item
+/// loop fetched it, for the reachability collection's
+/// execution-first order: the walk scans it ahead of the other
+/// seeds, so the entry's own demand closure is recorded before
+/// any other local body's. Empty when the crate has no entry
+/// point (a library crate) or the body cannot be materialized.
+fn entry_seed_bodies(
+    items: &[rustc_public::CrateItem],
+) -> Vec<rustc_public::mir::Body> {
+    // The entry item: the one rustc designated when it did
+    // (a binary compilation), and otherwise the first local
+    // item named `main` -- the same resolution `build_program`
+    // applies to the converted bodies, since run mode's lib
+    // pin designates no entry point there.
+    let entry = std::panic::catch_unwind(rustc_public::entry_fn)
+        .ok()
+        .flatten();
+    let item = entry
+        .and_then(|entry| {
+            items.iter().find(|item| item.def_id() == entry.def_id())
+        })
+        .or_else(|| items.iter().find(|item| is_main(&item.name())));
+    let Some(item) = item else {
+        return Vec::new();
+    };
+    let Ok(inst) = Instance::try_from(item.clone()) else {
+        return Vec::new();
+    };
+    sparagmos_driver::convert::with_body_materialization(&inst.name(), || {
+        inst.body()
+    })
+    .into_iter()
+    .collect()
+}
+
 fn entry_point_def_id(
     conv: &mut Converter,
     items: &[rustc_public::CrateItem],
@@ -9064,6 +9128,16 @@ impl Mode {
     }
 }
 
+/// Whether this process's mode is a run-shaped executing mode
+/// (`run` / `run-jit`), set once from the parsed mode before the
+/// compiler runs and read by `collect` (which the compiler
+/// callback reaches without the mode at hand). The reachability
+/// collection walks execution-first in these modes (see
+/// `sparagmos_driver::reach::CollectionOrder`); the other modes
+/// keep the first-in-first-out walk.
+static EXECUTION_FIRST_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether this process's mode judges a compilation verdict, set
 /// once from the parsed mode before the compiler runs and read by
 /// `collect` (which the compiler callback reaches without the
@@ -9110,6 +9184,10 @@ fn driver_main() {
     let run_mode = mode.is_run();
     COMPILE_VERDICT_MODE.store(
         mode.is_compile_verdict(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    EXECUTION_FIRST_MODE.store(
+        run_mode,
         std::sync::atomic::Ordering::Relaxed,
     );
     let debug_mode = mode == Mode::Debug;

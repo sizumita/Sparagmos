@@ -43,6 +43,12 @@
 //!   unlocked), and targets past the cap are recorded with that
 //!   reason instead of being collected, so the cutoff is visible
 //!   in the report.
+//! - The order bodies are scanned in is the pass's
+//!   [`CollectionOrder`]: convert mode walks first-in-first-out,
+//!   while the executing modes walk execution-first (demand
+//!   distance from the entry, call edges before value mentions),
+//!   so when the cap binds the bodies cut are the weakest-demand
+//!   periphery rather than whatever the walk reached last.
 //! - `FnDef` constants a body materializes as *values* are demand
 //!   targets on equal footing with call targets (Lane CP): an
 //!   external constructor or function used as a value (`let f =
@@ -56,7 +62,7 @@
 //!   caller's local-instance collection scans these bodies for
 //!   exactly those demands.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{self, AggregateKind, Operand, Rvalue, StatementKind, TerminatorKind};
@@ -340,6 +346,130 @@ fn fetch_body_contained(
     }
 }
 
+/// How one [`collect_reachable`] pass orders the bodies it
+/// scans. The order decides both the order bodies are recorded
+/// (and so converted) in and — when the collection cap binds —
+/// which bodies the cap cuts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CollectionOrder {
+    /// First-in-first-out breadth-first order: entry seeds,
+    /// then seeds, then bodies in the order their demand was
+    /// first recorded. This is the historical behaviour, and
+    /// convert mode always uses it: its conversion report is a
+    /// published measurement contract (the demand accounting
+    /// included), and it must not change.
+    Fifo,
+    /// Execution-first order, for the executing modes: bodies
+    /// are scanned by demand distance from the entry seeds
+    /// (the entry body itself first, the remaining seeds one
+    /// tier below it), and at equal distance a body demanded
+    /// through a call edge is scanned before one demanded only
+    /// as a value (an `FnDef` constant). The set collected when
+    /// the cap does not bind is the same as
+    /// [`CollectionOrder::Fifo`]; when the cap binds, the
+    /// bodies cut are the weakest-demand periphery instead of
+    /// whatever the breadth-first walk happened to reach last,
+    /// so the executable core is complete before speculative
+    /// periphery is collected.
+    ExecutionFirst,
+}
+
+/// The strength of the edge that demanded a body. A call edge
+/// is stronger than a value mention: a body materializes an
+/// `FnDef` constant for many reasons (a comparison, a function
+/// table entry) that never call it, while a call target runs
+/// whenever its caller runs.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Demand {
+    Call = 0,
+    Value = 1,
+}
+
+/// One queued body in execution-first order.
+struct FrontierEntry<B> {
+    distance: u32,
+    demand: Demand,
+    /// Insertion sequence; makes the order total and stable
+    /// (equal keys pop in insertion order, as the FIFO does).
+    seq: u64,
+    body: B,
+}
+
+impl<B> PartialEq for FrontierEntry<B> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.distance, self.demand, self.seq)
+            == (other.distance, other.demand, other.seq)
+    }
+}
+
+impl<B> Eq for FrontierEntry<B> {}
+
+impl<B> PartialOrd for FrontierEntry<B> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<B> Ord for FrontierEntry<B> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `BinaryHeap` pops the greatest element; the walk
+        // wants the smallest (distance, demand, seq) first.
+        (other.distance, other.demand, other.seq)
+            .cmp(&(self.distance, self.demand, self.seq))
+    }
+}
+
+/// The walk frontier of one [`collect_reachable`] pass: the
+/// bodies still to scan, popped in the pass's
+/// [`CollectionOrder`].
+struct Frontier<B> {
+    order: CollectionOrder,
+    fifo: VecDeque<B>,
+    heap: BinaryHeap<FrontierEntry<B>>,
+    seq: u64,
+}
+
+impl<B> Frontier<B> {
+    fn new(order: CollectionOrder) -> Frontier<B> {
+        Frontier {
+            order,
+            fifo: VecDeque::new(),
+            heap: BinaryHeap::new(),
+            seq: 0,
+        }
+    }
+
+    fn push(&mut self, distance: u32, demand: Demand, body: B) {
+        match self.order {
+            CollectionOrder::Fifo => self.fifo.push_back(body),
+            CollectionOrder::ExecutionFirst => {
+                let seq = self.seq;
+                self.seq += 1;
+                self.heap.push(FrontierEntry {
+                    distance,
+                    demand,
+                    seq,
+                    body,
+                });
+            }
+        }
+    }
+
+    /// Pop the next body to scan, with the demand distance it
+    /// was pushed at. The distance is meaningful only in
+    /// execution-first order; the FIFO does not track it and
+    /// this returns 0 there.
+    fn pop(&mut self) -> Option<(u32, B)> {
+        match self.order {
+            CollectionOrder::Fifo => self.fifo.pop_front().map(|body| (0, body)),
+            CollectionOrder::ExecutionFirst => self
+                .heap
+                .pop()
+                .map(|entry| (entry.distance, entry.body)),
+        }
+    }
+}
+
 /// Collect the bodies of non-local functions reachable from the
 /// converted local bodies (`seeds`, Stable MIR form). `local_defs`
 /// holds the `DefId`s of the local crate's items; targets resolving
@@ -347,22 +477,42 @@ fn fetch_body_contained(
 /// At most `cap` bodies are collected in this pass; the caller
 /// passes the program's remaining budget ([`MAX_COLLECTED_BODIES`]
 /// minus what earlier passes collected).
+///
+/// `order` is the pass's [`CollectionOrder`]. In
+/// execution-first order the caller also passes the entry
+/// point's body as `entry_seeds` (empty when the crate has no
+/// entry point, and always empty in FIFO order's callers): it
+/// is scanned ahead of `seeds`, and the remaining seeds sit
+/// one demand tier below it.
 pub fn collect_reachable(
     conv: &mut Converter,
     seeds: &[mir::Body],
     local_defs: &HashSet<rustc_public::DefId>,
     cap: usize,
+    order: CollectionOrder,
+    entry_seeds: &[mir::Body],
 ) -> CollectedFns {
     let mut records: Vec<Record> = Vec::new();
     let mut by_instance: HashMap<(rustc_public::DefId, Instance), ()> = HashMap::new();
     let mut unresolved_seen: HashSet<(rustc_public::DefId, String)> = HashSet::new();
     let mut builtin_seen: HashSet<rustc_public::DefId> = HashSet::new();
-    let mut queue: VecDeque<mir::Body> = seeds.iter().cloned().collect();
+    let mut frontier = Frontier::new(order);
+    for body in entry_seeds {
+        frontier.push(0, Demand::Call, body.clone());
+    }
+    // With entry seeds, the remaining seeds sit one demand
+    // tier below the entry: their demands must not crowd out
+    // the entry's own closure under the cap. Without entry
+    // seeds they are the walk's roots, at distance 0.
+    let seed_distance = if entry_seeds.is_empty() { 0 } else { 1 };
+    for body in seeds {
+        frontier.push(seed_distance, Demand::Call, body.clone());
+    }
     let mut bodies_taken = 0usize;
     let mut limit_reached = false;
     let mut walked_bodies: Vec<mir::Body> = Vec::new();
 
-    while let Some(body) = queue.pop_front() {
+    while let Some((distance, body)) = frontier.pop() {
         // Demand targets of this body: its `FnDef` call targets,
         // plus every `FnDef` constant it materializes. A foreign
         // function or constructor used *as a value* (assigned to a
@@ -373,9 +523,17 @@ pub fn collect_reachable(
         // unchanged: builtin-owned definitions stay excluded,
         // local targets stay the item loop's business, instances
         // are deduplicated, and the shared cap applies.
-        let mut targets = call_targets(&body);
-        targets.extend(fndef_constants(&body));
-        for (def, args) in targets {
+        let mut targets: Vec<(rustc_public::ty::FnDef, GenericArgs, Demand)> =
+            call_targets(&body)
+                .into_iter()
+                .map(|(def, args)| (def, args, Demand::Call))
+                .collect();
+        targets.extend(
+            fndef_constants(&body)
+                .into_iter()
+                .map(|(def, args)| (def, args, Demand::Value)),
+        );
+        for (def, args, demand) in targets {
             let def_id = def.def_id();
             let def_name = def_id.name();
             // Builtin-owned definitions are not collected (see the
@@ -418,7 +576,7 @@ pub fn collect_reachable(
                             // local-instance pass scans, and the
                             // trait method the formatter names is a
                             // local instance when the type is local.
-                            queue.push_back(ctor_body.clone());
+                            frontier.push(distance + 1, demand, ctor_body.clone());
                             walked_bodies.push(ctor_body);
                         }
                     }
@@ -488,7 +646,7 @@ pub fn collect_reachable(
                         || inst.body(),
                     ) {
                         bodies_taken += 1;
-                        queue.push_back(cbody.clone());
+                        frontier.push(distance + 1, demand, cbody.clone());
                         walked_bodies.push(cbody.clone());
                         RecordKind::WithBody { inst, body: cbody }
                     } else {
@@ -586,7 +744,7 @@ pub fn collect_reachable(
                 _ => match fetch_body_contained(&inst) {
                     Ok(Some(body)) => {
                         bodies_taken += 1;
-                        queue.push_back(body.clone());
+                        frontier.push(distance + 1, demand, body.clone());
                         walked_bodies.push(body.clone());
                         RecordKind::WithBody { inst, body }
                     }
@@ -1969,4 +2127,55 @@ pub fn coroutine_targets(body: &mir::Body) -> Vec<(rustc_public::ty::CoroutineDe
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pop_all<B>(frontier: &mut Frontier<B>) -> Vec<B> {
+        let mut out = Vec::new();
+        while let Some((_, body)) = frontier.pop() {
+            out.push(body);
+        }
+        out
+    }
+
+    #[test]
+    fn fifo_frontier_pops_in_push_order() {
+        let mut frontier = Frontier::new(CollectionOrder::Fifo);
+        frontier.push(0, Demand::Call, "entry");
+        frontier.push(1, Demand::Value, "other");
+        frontier.push(0, Demand::Value, "third");
+        assert_eq!(pop_all(&mut frontier), vec!["entry", "other", "third"]);
+    }
+
+    #[test]
+    fn execution_first_frontier_orders_by_distance_then_demand() {
+        let mut frontier = Frontier::new(CollectionOrder::ExecutionFirst);
+        frontier.push(1, Demand::Call, "seed");
+        frontier.push(0, Demand::Call, "entry");
+        frontier.push(1, Demand::Value, "value-of-seed");
+        frontier.push(2, Demand::Call, "deep-call");
+        frontier.push(1, Demand::Call, "call-of-entry");
+        assert_eq!(
+            pop_all(&mut frontier),
+            vec![
+                "entry",
+                "seed",
+                "call-of-entry",
+                "value-of-seed",
+                "deep-call"
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_first_frontier_is_stable_for_equal_keys() {
+        let mut frontier = Frontier::new(CollectionOrder::ExecutionFirst);
+        frontier.push(1, Demand::Call, "first");
+        frontier.push(1, Demand::Call, "second");
+        frontier.push(1, Demand::Call, "third");
+        assert_eq!(pop_all(&mut frontier), vec!["first", "second", "third"]);
+    }
 }
