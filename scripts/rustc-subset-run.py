@@ -54,8 +54,14 @@ metric-2(b) measurement runs all four stages (`--stages all`).
 The exec records of the coverage suites belong to no stage:
 compiletest judges them by coverage output, not by program
 output (see `coverage_scope` below), so they are among the
-carried not-attempted records, under their own bucket.
-Everything
+carried not-attempted records, under their own bucket. The
+exec records of the ui suite's codegen/ subtree whose
+directive view carries `//@ known-bug:` belong to no stage
+either: the test pins the codegen backend's current
+behaviour, which the directive itself marks as a bug, and
+that behaviour is produced below MIR, so no execution of the
+converted MIR can reproduce it (see `known_bug_scope` below
+and issue #546). Everything
 else in the denominator is reported as not attempted, with a reason;
 unattempted and failed tests alike count against the overall
 metric-2(b) rate, whose denominator is always the full subset
@@ -4175,6 +4181,90 @@ def sanitizer_scope(rec, view):
     return None
 
 
+# The ui suite's codegen/ subtree holds the tests whose
+# subject is the codegen backend's behaviour. An exec record
+# there whose directive view carries `//@ known-bug:` pins the
+# backend's *current* behaviour, which the directive itself
+# marks as a bug: within the subtree the directive is exactly
+# what separates a test asserting a bug's behaviour from the
+# fixed-miscompile regression tests asserting the corrected
+# behaviour (those carry no known-bug and stay attempted). The
+# pinned behaviour is produced by LLVM below MIR -- for the
+# whole population at the 1.100.0 tag (the
+# equal-pointers-unequal family, rustc #107975) issue #529
+# proved natively that it is LLVM's unsound `icmp eq` fold
+# over pointer addresses, and that the converted MIR contains
+# a genuine runtime equality the native binary's behaviour
+# contradicts. No execution of the converted MIR can
+# reproduce a contradiction of the MIR itself, so the verdict
+# cannot reduce to plain execution -- the same shape as the
+# coverage (issue #514) and sanitizer (issue #532)
+# classifications. Outside the subtree an exec known-bug
+# record pins front-end behaviour the driver's embedded rustc
+# reproduces by construction (macro expansion, type
+# checking), and those records pass and stay attempted: at
+# this tag they are
+# tests/ui/macros/metavar_cross_edition_recursive_macros.rs
+# (#130484) and tests/ui/view-types/must-restrict.rs.
+# Everywhere else the directive changes nothing the subset
+# judges: compiletest's only judging effect for it is waiving
+# the expected-error annotation check (and forbidding
+# annotations) in UI mode, a check stage 2 deliberately does
+# not perform for any test and stage 4 already mirrors where
+# it does perform it (issue #546).
+CODEGEN_KNOWN_BUG_PREFIX = "tests/ui/codegen/"
+
+
+def known_bug_scope(rec, view):
+    """(reason, bucket) for an exec view pinning a known
+    codegen bug's behaviour, else None.
+
+    Consulted per directive view next to sanitizer_scope (so
+    a revision-scoped `//@ known-bug:` classifies only its
+    own revision), and by main's carry-through via
+    known_bug_carry_scope, so the paths record the same
+    verdict. The view must carry a run mode: a view without
+    one is judged as a compile check, where the directive's
+    only compiletest effect (the annotation relaxation) is
+    not one stage 2 performs.
+    """
+    if rec["nature"] != "exec":
+        return None
+    if not rec["path"].startswith(CODEGEN_KNOWN_BUG_PREFIX):
+        return None
+    if run_mode(view) is None:
+        return None
+    if not view.has("known-bug"):
+        return None
+    values = ", ".join(view.values("known-bug"))
+    return (
+        f"//@ known-bug: {values} on a tests/ui/codegen/ "
+        "test: the test pins the codegen backend's current "
+        "behaviour, which the directive itself marks as a "
+        "bug; that behaviour is produced by LLVM below MIR "
+        "(for this population, rustc #107975's unsound "
+        "`icmp eq` fold over pointer addresses -- the "
+        "converted MIR holds a genuine runtime equality the "
+        "native binary's behaviour contradicts, issue #529), "
+        "so no execution of the converted MIR under "
+        "Sparagmos can reproduce it (issue #546)",
+        "not attempted (known-bug)")
+
+
+def known_bug_carry_scope(rec, rust_dir):
+    """known_bug_scope for main's carry-through: the record
+    was selected by no stage, so no header was parsed for it
+    yet; read and parse it here, the way has_aux_directives
+    reads headers in main. Unreadable files stay
+    unclassified."""
+    try:
+        text = (Path(rust_dir) / rec["path"]).read_text(
+            errors="ignore")
+    except OSError:
+        return None
+    return known_bug_scope(rec, Header(text).view(None))
+
+
 def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     scope = rustdoc_host_tool_scope(rec)
     if scope is not None:
@@ -4249,6 +4339,10 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         view = header.view(None)
         scope = sanitizer_scope(rec, view)
+        if scope is not None:
+            out["reason"], out["bucket"] = scope
+            return
+        scope = known_bug_scope(rec, view)
         if scope is not None:
             out["reason"], out["bucket"] = scope
             return
@@ -4579,6 +4673,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                         rev_args, flags, aux_specs,
                                         rust_dir, jit=jit)
         scope = sanitizer_scope(rec, view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
+        scope = known_bug_scope(rec, view)
         if scope is not None:
             res["reason"], res["bucket"] = scope
             return res
@@ -8321,6 +8419,8 @@ def main():
         scope = rustdoc_host_tool_scope(r)
         if scope is None:
             scope = coverage_scope(r)
+        if scope is None:
+            scope = known_bug_carry_scope(r, args.rust_dir)
         if scope is not None:
             reason, bucket = scope
         else:
