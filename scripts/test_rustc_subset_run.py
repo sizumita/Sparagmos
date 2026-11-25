@@ -1423,6 +1423,46 @@ class JudgeCompileTests(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("crash", bucket)
 
+    def test_failure_declared_crash_status_passes(self):
+        status, _r, _b = run.judge_compile(
+            "failure", conv(exit_code=101, ice=True, converted=None,
+                            skipped=None),
+            declared_status=101)
+        self.assertEqual(status, "pass")
+
+    def test_failure_declared_status_needs_ice_evidence(self):
+        status, _r, bucket = run.judge_compile(
+            "failure", conv(exit_code=101, converted=None,
+                            skipped=None),
+            declared_status=101)
+        self.assertEqual(status, "fail")
+        self.assertIn("crash", bucket)
+
+    def test_failure_declared_status_mismatch_is_fail(self):
+        status, _r, _b = run.judge_compile(
+            "failure", conv(exit_code=101, ice=True, converted=None,
+                            skipped=None),
+            declared_status=102)
+        self.assertEqual(status, "fail")
+
+    def test_failure_declared_status_opt_out_is_fail(self):
+        status, _r, _b = run.judge_compile(
+            "failure", conv(exit_code=101, ice=True, converted=None,
+                            skipped=None),
+            declared_status=101, dont_check_status=True)
+        self.assertEqual(status, "fail")
+
+    def test_failure_clean_rejection_passes_with_declared_status(self):
+        # The declared status adds the crash ground; it does not
+        # revoke the clean-rejection ground (a test declaring
+        # failure-status: 101 whose error the driver reports as
+        # a clean rejection still passes, as before).
+        status, _r, _b = run.judge_compile(
+            "failure", conv(exit_code=1, compilation_failed=True,
+                            converted=None, skipped=None),
+            declared_status=101)
+        self.assertEqual(status, "pass")
+
     def test_crash_reproduced_passes(self):
         status, _r, _b = run.judge_compile(
             "crash", conv(exit_code=101, ice=True, converted=None,
