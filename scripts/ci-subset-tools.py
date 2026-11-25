@@ -353,11 +353,13 @@ def cmd_diff(args):
 
 #: Host classes for the partitioned measurement, by short name: the
 #: runner target whose environment model judges the class. The
-#: workflow enables linux-x86_64, linux-aarch64 and darwin-aarch64;
-#: the Windows classes are defined so the partition rule is complete
-#: (their jobs wait on the runner's process layer, which is POSIX
-#: only today -- see issue #517), and darwin-x86_64 rides on a
-#: retiring runner image.
+#: workflow enables linux-x86_64 and darwin-x86_64; the other
+#: classes are defined so the partition rule is complete, and
+#: their records stay in the residual class until they get jobs:
+#: the aarch64 classes wait on the driver building for aarch64
+#: (sparagmos-jit's entry trampoline is x86_64 assembly today),
+#: and the Windows classes additionally wait on the runner's
+#: process layer, which is POSIX only (see issue #517).
 HOST_CLASSES = {
     "linux-x86_64": "x86_64-unknown-linux-gnu",
     "linux-aarch64": "aarch64-unknown-linux-gnu",
@@ -370,8 +372,7 @@ HOST_CLASSES = {
 #: The classes the official workflow partitions into, in priority
 #: order: a record goes to the first class that admits it, and the
 #: first class is the residual class for records no class admits.
-DEFAULT_PARTITION_CLASSES = ["linux-x86_64", "linux-aarch64",
-                             "darwin-aarch64"]
+DEFAULT_PARTITION_CLASSES = ["linux-x86_64", "darwin-x86_64"]
 
 
 def _load_runner_module():

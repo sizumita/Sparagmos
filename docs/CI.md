@@ -252,14 +252,14 @@ denominator. Runs on every push to `main` and on manual dispatch.
   condition as the reason; a condition that cannot be decided
   is `not attempted (unevaluatable condition)`).
 - The enabled classes are `linux-x86_64` (the `measure` shards
-  on `ubuntu-latest`), `linux-aarch64` (`ubuntu-24.04-arm`), and
-  `darwin-aarch64` (`macos-latest`); the latter two run as the
-  `measure-host` jobs, with drivers the `build-host` jobs build
-  natively on the class's runner and the runner's host model
-  selected through `SPARAGMOS_HOST_TARGET`. On the survey of
-  run 45564001677 the partition moves 85 records off the Linux
-  class (56 to `linux-aarch64`, 29 to `darwin-aarch64`); every
-  other record is judged exactly where it was judged before.
+  on `ubuntu-latest`) and `darwin-x86_64` (`macos-15-intel`);
+  the latter runs as the `measure-host` jobs, with a driver the
+  `build-host` job builds natively on the class's runner and the
+  runner's host model selected through
+  `SPARAGMOS_HOST_TARGET`. On the survey of run 45564001677 the
+  partition moves 29 records off the Linux class to
+  `darwin-x86_64`; every other record is judged exactly where it
+  was judged before.
   The host jobs do not restore the rustdoc artifact tree (it is
   a Linux-built tree), so a class record whose stage 4 needs it
   records the same not-attempted verdict the Linux jobs record
@@ -278,14 +278,21 @@ denominator. Runs on every push to `main` and on manual dispatch.
   than an execution host (the wasm32 and nvptx64 families,
   32-bit and other non-hosted targets) are likewise not host
   cases: compiletest matches them against the target, and they
-  belong with cross-target support. The Windows classes
-  (`x86_64-pc-windows-msvc` and `x86_64-pc-windows-gnu`) are
+  belong with cross-target support. The remaining classes are
   defined in the runner's host profiles and in the partition
-  rule but have no jobs yet: the runner's process layer
-  (process groups, `/proc`-based memory accounting) is
-  POSIX-only, so a Windows runner would record internal errors
-  instead of verdicts; their records stay in the residual class
-  until that port lands (issue #517).
+  rule but have no jobs yet, so their records stay in the
+  residual class: the aarch64 classes
+  (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`) wait on
+  the driver building for aarch64 -- sparagmos-jit's entry
+  trampoline (`crates/sparagmos-jit/src/program.rs`) is x86_64
+  naked assembly with no aarch64 counterpart, and the driver
+  links the JIT crate on every host (the class builds in run
+  45575305504 fail with 90 inline-asm errors each) -- and the
+  Windows classes (`x86_64-pc-windows-msvc`,
+  `x86_64-pc-windows-gnu`) wait on that plus the runner's
+  process layer (process groups, `/proc`-based memory
+  accounting), which is POSIX-only, so a Windows runner would
+  record internal errors instead of verdicts (issue #517).
 - The cached source tree's sparse checkout additionally includes
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the

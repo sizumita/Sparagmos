@@ -35,13 +35,16 @@ name: Official Measurement
 #   a class runs the same binary;
 # - the metric-2(b) pass is partitioned by host class
 #   (ci-subset-tools.py partition; docs/CI.md): the Linux x86_64
-#   class keeps the sharded measure jobs, and the aarch64-linux and
-#   aarch64-darwin classes are judged by the measure-host jobs on
-#   their native runners, so records conditioned on those hosts
-#   are attempted instead of recorded out of environment. Metric 4
-#   and metric 3 stay on the Linux host over the full survey: the
-#   JIT lowers x86_64 machine code, and metric 3's candidate
-#   predicate reads only survey-classified properties;
+#   class keeps the sharded measure jobs, and the x86_64-darwin
+#   class is judged by the measure-host jobs on its native
+#   runner, so records conditioned on that host are attempted
+#   instead of recorded out of environment. (The aarch64 classes
+#   have no jobs yet: the driver does not build for aarch64 --
+#   sparagmos-jit's entry trampoline is x86_64 assembly; their
+#   records stay in the Linux residual class. Issue #517.)
+#   Metric 4 and metric 3 stay on the Linux host over the full
+#   survey: the JIT lowers x86_64 machine code, and metric 3's
+#   candidate predicate reads only survey-classified properties;
 # - metric 3 reads its stage-1 candidate set from the survey, not
 #   from the merged subset results (the candidate predicate reads only
 #   survey-classified properties), so it runs alongside the shards;
@@ -242,10 +245,9 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The other host classes' drivers, built natively on each
-  # class's own runner: the driver is a rustc driver bound to its
-  # host toolchain, so the aarch64 and macOS classes cannot run
-  # the Linux build.
+  # The other host class's driver, built natively on the class's
+  # own runner: the driver is a rustc driver bound to its host
+  # toolchain, so the macOS class cannot run the Linux build.
   build-host:
     name: build driver (${{ matrix.class }})
     runs-on: ${{ matrix.runner }}
@@ -254,10 +256,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - class: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - class: darwin-aarch64
-            runner: macos-latest
+          - class: darwin-x86_64
+            runner: macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -624,21 +624,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - class: linux-aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+          - class: darwin-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
             shard: 0
-          - class: linux-aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            shard: 1
-          - class: darwin-aarch64
-            target: aarch64-apple-darwin
-            runner: macos-latest
-            shard: 0
-          - class: darwin-aarch64
-            target: aarch64-apple-darwin
-            runner: macos-latest
+          - class: darwin-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
             shard: 1
     steps:
       - name: Checkout
