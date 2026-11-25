@@ -23,13 +23,28 @@ name: Official Measurement
 #
 #   prepare (survey) ──┬─> measure     (x SHARDS)     ──┐
 #   build (driver)  ───┼─> measure-jit (x JIT_SHARDS) ──┼─> aggregate
+#   build-host       ──┴─> measure-host (host classes) ─┘
 #                      └─> metric3     (std coverage) ──┘
 #
-# - the driver is built once, in the build job, with the `measure`
-#   profile (the dev profile's debug assertions and overflow checks,
-#   optimizer on; crates/sparagmos-driver/Cargo.toml) and handed to
-#   every other job as an artifact, so no shard compiles it and every
-#   shard runs the same binary;
+# - the driver is built once per host class (the build job for
+#   Linux x86_64, the build-host jobs for the other classes), with
+#   the `measure` profile (the dev profile's debug assertions and
+#   overflow checks, optimizer on;
+#   crates/sparagmos-driver/Cargo.toml) and handed to that class's
+#   jobs as an artifact, so no shard compiles it and every shard of
+#   a class runs the same binary;
+# - the metric-2(b) pass is partitioned by host class
+#   (ci-subset-tools.py partition; docs/CI.md): the Linux x86_64
+#   class keeps the sharded measure jobs, and the x86_64-darwin
+#   class is judged by the measure-host jobs on its native
+#   runner, so records conditioned on that host are attempted
+#   instead of recorded out of environment. (The aarch64 classes
+#   have no jobs yet: the driver does not build for aarch64 --
+#   sparagmos-jit's entry trampoline is x86_64 assembly; their
+#   records stay in the Linux residual class. Issue #517.)
+#   Metric 4 and metric 3 stay on the Linux host over the full
+#   survey: the JIT lowers x86_64 machine code, and metric 3's
+#   candidate predicate reads only survey-classified properties;
 # - metric 3 reads its stage-1 candidate set from the survey, not
 #   from the merged subset results (the candidate predicate reads only
 #   survey-classified properties), so it runs alongside the shards;
@@ -154,6 +169,29 @@ jobs:
           path: ${{ env.SURVEY_JSON }}
           retention-days: 7
 
+      # The partition evaluates every record's headers under each
+      # host class's model; the target-spec facts come from the
+      # pinned toolchain, so install it (no extra components) for
+      # that query.
+      - name: Install Rust 1.100.0 (for the partition's spec query)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+
+      - name: Partition survey by host class
+        run: |
+          python3 scripts/ci-subset-tools.py partition \
+            --survey "$SURVEY_JSON" \
+            --tree "$RUST_SURVEY_DIR" \
+            --out-dir "$RUNNER_TEMP/host-surveys"
+
+      - name: Upload host-class surveys
+        uses: actions/upload-artifact@v4
+        with:
+          name: subset-survey-hosts
+          path: ${{ runner.temp }}/host-surveys
+          retention-days: 7
+
       - name: Compute shard lists
         id: list
         run: |
@@ -203,6 +241,52 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sparagmos-driver
+          path: crates/sparagmos-driver/target/measure/sparagmos-driver
+          retention-days: 7
+          if-no-files-found: error
+
+  # The other host class's driver, built natively on the class's
+  # own runner: the driver is a rustc driver bound to its host
+  # toolchain, so the macOS class cannot run the Linux build.
+  build-host:
+    name: build driver (${{ matrix.class }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - class: darwin-x86_64
+            runner: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+
+      - name: Cache cargo registry and driver target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/sparagmos-driver -> target
+          cache-workspace-crates: true
+
+      - name: Build driver (measure profile)
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          cargo build --profile measure \
+            --manifest-path crates/sparagmos-driver/Cargo.toml
+          ls -la crates/sparagmos-driver/target/measure/sparagmos-driver
+
+      - name: Upload driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparagmos-driver-${{ matrix.class }}
           path: crates/sparagmos-driver/target/measure/sparagmos-driver
           retention-days: 7
           if-no-files-found: error
@@ -310,11 +394,16 @@ jobs:
           key: rust-survey-1.100.0-v4
           fail-on-cache-miss: true
 
-      - name: Download survey
+      # The Linux class's slice of the host partition (the
+      # prepare job's partition step): these jobs judge exactly
+      # the records the Linux host model admits, plus the records
+      # no enabled class admits, which stay here as the residual
+      # class.
+      - name: Download host-class surveys
         uses: actions/download-artifact@v4
         with:
-          name: subset-survey
-          path: ${{ runner.temp }}
+          name: subset-survey-hosts
+          path: ${{ runner.temp }}/host-surveys
 
       # upload-artifact does not keep file modes, so the executable
       # bit is restored after the download.
@@ -349,7 +438,7 @@ jobs:
       - name: Run shard
         run: |
           python3 scripts/ci-subset-tools.py shard \
-            --survey "$RUNNER_TEMP/subset-survey.json" \
+            --survey "$RUNNER_TEMP/host-surveys/subset-survey-linux-x86_64.json" \
             --count "$SHARDS" --index "${{ matrix.shard }}" \
             --out "$RUNNER_TEMP/shard-survey.json"
           python3 scripts/rustc-subset-run.py \
@@ -514,6 +603,184 @@ jobs:
           path: ${{ runner.temp }}/subset-jit-shard-${{ matrix.shard }}.json
           retention-days: 30
 
+  # The host classes' metric-2(b) shards: each class's records
+  # are judged natively on a runner of that host, with the driver
+  # the matching build-host job built there and the runner's host
+  # model selected through SPARAGMOS_HOST_TARGET. The result
+  # files carry the measure jobs' subset-shard-* names, so the
+  # aggregate merges them with no special case; the partition
+  # guarantees the classes are disjoint and cover the survey, so
+  # the aggregate's denominator assertion is unchanged. The
+  # rustdoc artifact tree is NOT restored here: it is a
+  # Linux-built tree, so a class record whose stage 4 needs it
+  # records the same not-attempted verdict the Linux jobs record
+  # on a cache miss.
+  measure-host:
+    name: measure (${{ matrix.class }}) shard ${{ matrix.shard }}
+    needs: [prepare, build-host]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - class: darwin-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            shard: 0
+          - class: darwin-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            shard: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The hosted macOS image's python3 is the Xcode CLT 3.9;
+      # the runner scripts need a current Python on every host.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+          # The same target set as the Linux measure jobs: the
+          # runner screens compile-flags --target against the
+          # class host's own installed targets.
+          targets: >-
+            aarch64-apple-darwin,
+            aarch64-linux-android,
+            aarch64-pc-windows-gnullvm,
+            aarch64-pc-windows-msvc,
+            aarch64-unknown-fuchsia,
+            aarch64-unknown-linux-gnu,
+            aarch64-unknown-none,
+            aarch64-unknown-none-softfloat,
+            arm-unknown-linux-gnueabi,
+            arm64ec-pc-windows-msvc,
+            armv5te-unknown-linux-gnueabi,
+            armv7-linux-androideabi,
+            armv7-unknown-linux-gnueabi,
+            armv7-unknown-linux-gnueabihf,
+            armv7r-none-eabi,
+            armv7r-none-eabihf,
+            armv8r-none-eabihf,
+            i586-unknown-linux-gnu,
+            i686-pc-windows-gnu,
+            i686-pc-windows-msvc,
+            i686-unknown-freebsd,
+            i686-unknown-linux-gnu,
+            i686-unknown-linux-musl,
+            loongarch32-unknown-none,
+            loongarch32-unknown-none-softfloat,
+            loongarch64-unknown-linux-gnu,
+            loongarch64-unknown-none,
+            loongarch64-unknown-none-softfloat,
+            nvptx64-nvidia-cuda,
+            powerpc-unknown-linux-gnu,
+            powerpc64-unknown-linux-gnu,
+            powerpc64le-unknown-linux-gnu,
+            riscv32i-unknown-none-elf,
+            riscv32im-unknown-none-elf,
+            riscv32imac-unknown-none-elf,
+            riscv32imc-unknown-none-elf,
+            riscv64gc-unknown-linux-gnu,
+            riscv64gc-unknown-none-elf,
+            riscv64imac-unknown-none-elf,
+            s390x-unknown-linux-gnu,
+            sparc64-unknown-linux-gnu,
+            sparcv9-sun-solaris,
+            thumbv6m-none-eabi,
+            thumbv7em-none-eabi,
+            thumbv7em-none-eabihf,
+            thumbv8m.main-none-eabi,
+            thumbv8m.main-none-eabihf,
+            wasm32-unknown-emscripten,
+            wasm32-unknown-unknown,
+            wasm32-wasip1,
+            x86_64-apple-darwin,
+            x86_64-fortanix-unknown-sgx,
+            x86_64-pc-windows-gnu,
+            x86_64-pc-windows-msvc,
+            x86_64-unknown-linux-gnu,
+            x86_64-unknown-linux-gnux32,
+            x86_64-unknown-linux-musl,
+            x86_64-unknown-none,
+            x86_64-unknown-uefi
+      - name: Restore rust source tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
+          key: rust-survey-1.100.0-v4
+
+      # The cache service segments entries by runner OS, so the
+      # tree the Linux prepare job saved is not visible here: on
+      # a miss this job fetches and widens the tree exactly as
+      # prepare does (and the cache step above then saves the
+      # macOS entry under the same key for later runs).
+      - name: Fetch rust tree and generate survey (on cache miss)
+        run: |
+          if [ ! -d "$RUST_SURVEY_DIR" ]; then
+            python3 scripts/rustc-subset-survey.py --fetch \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          elif [ ! -f "$SURVEY_JSON" ]; then
+            python3 scripts/rustc-subset-survey.py \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          fi
+          git -C "$RUST_SURVEY_DIR" sparse-checkout add \
+            src/tools/run-make-support src/build_helper \
+            src/rustdoc-json-types src/etc \
+            src/librustdoc/html/static/css src/tools/jsondocck \
+            src/tools/jsondoclint src/tools/rustdoc
+
+      - name: Download host-class surveys
+        uses: actions/download-artifact@v4
+        with:
+          name: subset-survey-hosts
+          path: ${{ runner.temp }}/host-surveys
+
+      # upload-artifact does not keep file modes, so the
+      # executable bit is restored after the download.
+      - name: Download driver
+        uses: actions/download-artifact@v4
+        with:
+          name: sparagmos-driver-${{ matrix.class }}
+          path: ${{ github.workspace }}/.ci/driver
+
+      - name: Make driver executable
+        run: |
+          chmod +x "$DRIVER_BIN"
+          ls -la "$DRIVER_BIN"
+
+      - name: Run shard
+        env:
+          SPARAGMOS_HOST_TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/ci-subset-tools.py shard \
+            --survey "$RUNNER_TEMP/host-surveys/subset-survey-${{ matrix.class }}.json" \
+            --count 2 --index "${{ matrix.shard }}" \
+            --out "$RUNNER_TEMP/shard-survey.json"
+          python3 scripts/rustc-subset-run.py \
+            --survey-json "$RUNNER_TEMP/shard-survey.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$DRIVER_BIN" \
+            --out "$RUNNER_TEMP/subset-shard-${{ matrix.class }}-${{ matrix.shard }}.json" \
+            --stages all \
+            --jobs 2
+
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: subset-shard-${{ matrix.class }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/subset-shard-${{ matrix.class }}-${{ matrix.shard }}.json
+          retention-days: 30
+
   # Metric 3 over the survey's stage-1 candidates, alongside the
   # shards (the aggregate job checks the candidate set against the
   # merged results).
@@ -578,9 +845,10 @@ jobs:
 
   aggregate:
     name: aggregate metrics
-    needs: [measure, measure-jit, metric3]
+    needs: [measure, measure-host, measure-jit, metric3]
     if: >-
       always() && needs.measure.result == 'success' &&
+      needs.measure-host.result == 'success' &&
       needs.metric3.result == 'success' &&
       (needs.measure-jit.result == 'success' || needs.measure-jit.result == 'skipped')
     runs-on: ubuntu-latest

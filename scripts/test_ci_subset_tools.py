@@ -221,5 +221,82 @@ class CheckCandidatesTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
 
 
+class PartitionTests(unittest.TestCase):
+    """The host partition (issue #517): a record lands in the first
+    class whose host model admits it, a record no class admits
+    stays in the first (residual) class, and the classes cover the
+    survey exactly once."""
+
+    CLASSES = [("linux-x86_64", "x86_64-unknown-linux-gnu"),
+               ("linux-aarch64", "aarch64-unknown-linux-gnu"),
+               ("darwin-aarch64", "aarch64-apple-darwin")]
+    SPECS = {
+        "x86_64-unknown-linux-gnu":
+            {"supported-sanitizers": ["address"]},
+        "aarch64-unknown-linux-gnu":
+            {"supported-sanitizers": ["address", "hwaddress"]},
+        "aarch64-apple-darwin":
+            {"supported-sanitizers": ["address"]},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tree = Path(self.tmp.name)
+        files = {
+            "tests/ui/plain.rs": "fn main() {}\n",
+            "tests/ui/arm-only.rs":
+                "//@ only-aarch64\nfn main() {}\n",
+            "tests/ui/apple-only.rs":
+                "//@ only-apple\nfn main() {}\n",
+            "tests/ui/win-only.rs":
+                "//@ only-windows\nfn main() {}\n",
+            "tests/ui/hwaddr.rs":
+                "//@ needs-sanitizer-hwaddress\nfn main() {}\n",
+        }
+        for rel, text in files.items():
+            path = self.tree / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        self.survey = {"tests": [
+            {"path": rel, "nature": "compile-check"} for rel in files
+        ] + [{"path": "tests/ui/excluded.rs",
+              "nature": "env_excluded"}]}
+        self.runner = tools._load_runner_module()
+
+    def partition(self):
+        return tools.partition_survey(
+            self.runner, self.survey, self.tree, self.CLASSES,
+            self.SPECS)
+
+    def test_assignment(self):
+        by_class = self.partition()
+        paths = {name: {r["path"] for r in records}
+                 for name, records in by_class.items()}
+        self.assertEqual(paths["linux-aarch64"],
+                         {"tests/ui/arm-only.rs",
+                          "tests/ui/hwaddr.rs"})
+        self.assertEqual(paths["darwin-aarch64"],
+                         {"tests/ui/apple-only.rs"})
+        # plain.rs is admitted everywhere and goes to the first
+        # class; win-only.rs is admitted by no class in the list
+        # and excluded.rs is env_excluded: both stay residual.
+        self.assertEqual(paths["linux-x86_64"],
+                         {"tests/ui/plain.rs", "tests/ui/win-only.rs",
+                          "tests/ui/excluded.rs"})
+
+    def test_coverage_is_exactly_once(self):
+        by_class = self.partition()
+        seen = [r["path"] for records in by_class.values()
+                for r in records]
+        self.assertEqual(len(seen), len(self.survey["tests"]))
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_partition_restores_the_default_profile(self):
+        self.partition()
+        self.assertEqual(self.runner.HOST_TARGET,
+                         self.runner.DEFAULT_HOST_TARGET)
+
+
 if __name__ == "__main__":
     unittest.main()

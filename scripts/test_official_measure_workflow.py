@@ -5,7 +5,8 @@ Run with: python3 -m pytest scripts/test_official_measure_workflow.py
 (or directly: python3 scripts/test_official_measure_workflow.py)
 
 The survey source tree is produced once by the prepare job and restored
-by the measure, measure-jit and metric3 jobs through actions/cache.
+by the measure, measure-host, measure-jit and metric3 jobs through
+actions/cache.
 actions/cache never re-saves on an exact key hit, so the cached tree's
 shape (its sparse-checkout set) is part of the cache key's meaning:
 every job must name one and the same key, and widening the checkout
@@ -28,8 +29,9 @@ def workflow_text():
 class SurveyCacheKeyTest(unittest.TestCase):
     def test_all_survey_cache_keys_are_one_value(self):
         keys = re.findall(r"key:\s*(rust-survey-\S+)", workflow_text())
-        # prepare (save) + measure, measure-jit, metric3 (restore).
-        self.assertEqual(len(keys), 4, keys)
+        # prepare (save) + measure, measure-host, measure-jit,
+        # metric3 (restore).
+        self.assertEqual(len(keys), 5, keys)
         self.assertEqual(len(set(keys)), 1, keys)
 
     def test_prepare_widens_checkout_for_stage3_oracles(self):
@@ -44,14 +46,16 @@ class SurveyCacheKeyTest(unittest.TestCase):
 
 class DriverArtifactTest(unittest.TestCase):
     def test_jobs_run_the_shared_measure_profile_driver(self):
-        # The driver is built once (build job, measure profile) and
-        # every job runs that artifact; no job builds its own driver
-        # or points at a debug build.
+        # The driver is built once per host class (the build job
+        # for Linux x86_64, the build-host job for the other
+        # classes; both build with the measure profile) and every
+        # judging job runs its class's artifact; no job builds its
+        # own driver or points at a debug build.
         text = workflow_text()
-        self.assertEqual(text.count("cargo build"), 1)
+        self.assertEqual(text.count("cargo build"), 2)
         self.assertIn("cargo build --profile measure", text)
         self.assertNotIn("target/debug/sparagmos-driver", text)
-        self.assertEqual(text.count('--driver-bin "$DRIVER_BIN"'), 3)
+        self.assertEqual(text.count('--driver-bin "$DRIVER_BIN"'), 4)
 
     def test_measure_profile_keeps_dev_checks(self):
         cargo = (WORKFLOW.parent.parent.parent / "crates"
