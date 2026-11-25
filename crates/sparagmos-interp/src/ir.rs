@@ -1151,6 +1151,30 @@ pub enum Rvalue {
         field_count: usize,
         fill: Vec<(u32, Constant)>,
     },
+    /// A `Transmute` cast from a pointer to a slice (or an
+    /// array) of a fieldless enum to the same pointer shape over
+    /// an integer: each element is reinterpreted through the
+    /// discriminant table baked in at conversion time (variant
+    /// index -> discriminant value, the convention of
+    /// `Rvalue::EnumToInt`), converted to the target integer
+    /// type the `Ty` names. The fat-pointer identity the general
+    /// transmute conversion gives pointer pairs cannot express
+    /// this cast: the elements own values differ across it (a
+    /// variant index on one side, its discriminant on the
+    /// other). Execution materialises the reinterpreted
+    /// elements into a fresh value target holding a snapshot
+    /// of them; the storage the operand denotes is never
+    /// rewritten, as the slice wrapper casts require (see
+    /// `Rvalue::WrapSliceElems`).
+    SliceEnumToInt(Operand, Vec<i128>, Ty),
+    /// The reverse cast: a pointer to a slice (or an array) of
+    /// integers to the same pointer shape over a fieldless
+    /// enum -- each element becomes the variant whose
+    /// discriminant equals it, through the same baked table
+    /// convention. An element matching no discriminant is an
+    /// explicit error at execution, as for
+    /// `Rvalue::IntToEnum`.
+    SliceIntToEnum(Operand, Vec<i128>),
     /// A `Transmute` cast between scalar-shaped types of equal
     /// total size: the operand's bit pattern, flattened through
     /// the source [`ScalarShape`], reinterpreted through the

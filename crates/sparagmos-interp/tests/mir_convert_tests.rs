@@ -4143,3 +4143,146 @@ fn transmute_out_of_cell_wrapper_stays_unsupported() {
         "expected UnsupportedRvalue, got {err}"
     );
 }
+
+// ----- slice element reinterpretation (Issue #513) --------------------------
+
+fn usize_const(v: u64) -> mir::Operand {
+    const_int(v as u128, 8)
+}
+
+fn ref_of(inner: mir::Ty) -> mir::Ty {
+    mir::Ty::Ref(mir::Region::Erased, Box::new(inner), mir::Mutability::Not)
+}
+
+#[test]
+fn transmute_slice_of_fieldless_enum_to_ints_reads_discriminants() {
+    // fn f() -> i32 {
+    //   _1 = [Small::B, Small::C, Small::A];
+    //   _2 = &_1;
+    //   _3 = _2 as &[Small];
+    //   _4 = transmute(_3) as &[i32];
+    //   return (*_4)[1];   // the Small::C discriminant: 9
+    // }
+    // The pointer-identity reading of the transmute would hand
+    // back the enum elements themselves, and the read of an
+    // i32 element out of them is the type mismatch the
+    // enum-univariant-repr record fails with.
+    let small_arr_ty = mir::Ty::Array(Box::new(small_ty()), mir::ArrayLen::Known(3));
+    let ref_slice_small = ref_of(mir::Ty::Slice(Box::new(small_ty())));
+    let ref_slice_i32 = ref_of(mir::Ty::Slice(Box::new(i32_ty())));
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            small_arr_ty.clone(),
+            ref_of(small_arr_ty),
+            ref_slice_small.clone(),
+            ref_slice_i32.clone(),
+            usize_ty(),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(small_ty())),
+                        vec![const_small(1), const_small(2), const_small(0)],
+                    ),
+                ),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                        copy(2),
+                        ref_slice_small,
+                    ),
+                ),
+                assign(place(4), transmute(copy(3), ref_slice_i32)),
+                assign(place(5), mir::Rvalue::Use(usize_const(1))),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(
+                        place(4).deref().index(mir::Local(5)),
+                    )),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("slice enum-to-int transmute runs"),
+        Value::Int(9)
+    );
+}
+
+#[test]
+fn transmute_slice_of_ints_to_fieldless_enum_reads_variants() {
+    // fn f() -> u8 {
+    //   _1 = [5i32, 1i32];
+    //   _2 = &_1;
+    //   _3 = _2 as &[i32];
+    //   _4 = transmute(_3) as &[Small];
+    //   _5 = (*_4)[0];
+    //   return transmute(_5) as u8;   // back to the discriminant: 5
+    // }
+    let i32_arr_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(2));
+    let ref_slice_i32 = ref_of(mir::Ty::Slice(Box::new(i32_ty())));
+    let ref_slice_small = ref_of(mir::Ty::Slice(Box::new(small_ty())));
+    let body = mir::Body::new(
+        decls(&[
+            u8_ty(),
+            i32_arr_ty.clone(),
+            ref_of(i32_arr_ty),
+            ref_slice_i32.clone(),
+            ref_slice_small.clone(),
+            small_ty(),
+            usize_ty(),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(i32_ty())),
+                        vec![const_i32(5), const_i32(1)],
+                    ),
+                ),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                        copy(2),
+                        ref_slice_i32,
+                    ),
+                ),
+                assign(place(4), transmute(copy(3), ref_slice_small)),
+                assign(place(6), mir::Rvalue::Use(usize_const(0))),
+                assign(
+                    place(5),
+                    mir::Rvalue::Use(mir::Operand::Copy(
+                        place(4).deref().index(mir::Local(6)),
+                    )),
+                ),
+                assign(place(0), transmute(copy(5), u8_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("slice int-to-enum transmute runs"),
+        Value::Uint(5)
+    );
+}

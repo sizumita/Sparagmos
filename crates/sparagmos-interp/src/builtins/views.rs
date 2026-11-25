@@ -544,6 +544,38 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether the value a fat pointer base target denotes is
+    /// itself a sequence of exactly the fat length: the base
+    /// then denotes that sequence directly -- an array value or
+    /// a `Vec` value in element form sitting at an element
+    /// position of an outer container, which a deref / unsizing
+    /// formation ranges over its own elements -- not the outer
+    /// container elements from that position on (the raw-parts
+    /// reading `target_ends_at_element` describes). The two
+    /// readings collide exactly when the lengths agree; as in
+    /// `entry_suffix_denotes_elements`, the direct reading wins
+    /// that collision.
+    fn fat_base_is_the_sequence(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        len: u128,
+    ) -> bool {
+        match self.read_resolved(frames, target) {
+            Ok(value) => {
+                matches!(
+                    value,
+                    Value::Tuple(_)
+                        | Value::Enum { .. }
+                        | Value::SparseVec { .. }
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                ) && value.len() == Some(len)
+            }
+            Err(_) => false,
+        }
+    }
+
     pub(super) fn slice_elements_ref<'x>(
         &self,
         frames: &'x [Frame],
@@ -569,7 +601,17 @@ impl<'a> Interpreter<'a> {
                         self.read_resolved(frames, &target),
                         Ok(Value::SparseVec { .. })
                     );
+                    // A base denoting a value that is itself a
+                    // sequence of exactly the fat length denotes
+                    // that sequence directly (see
+                    // `fat_base_is_the_sequence`): the sibling
+                    // walk below would read the elements of the
+                    // outer container the value sits in where
+                    // the sequence elements belong.
+                    let direct_target = !sparse_target
+                        && self.fat_base_is_the_sequence(frames, &target, *len);
                     if !sparse_target
+                        && !direct_target
                         && target_ends_at_element(&target)
                         && self.sibling_span_fits(frames, &target, *len)
                     {
@@ -696,7 +738,11 @@ impl<'a> Interpreter<'a> {
         // the fat length is the direct reading's shape.
         let target_is_the_sequence = matches!(
             value,
-            Value::Tuple(_) | Value::SparseVec { .. } | Value::Bytes(_) | Value::Str(_)
+            Value::Tuple(_)
+                | Value::Enum { .. }
+                | Value::SparseVec { .. }
+                | Value::Bytes(_)
+                | Value::Str(_)
         ) && value.len() == Some(fat_len);
         !target_is_the_sequence
     }

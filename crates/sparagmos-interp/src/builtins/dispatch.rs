@@ -5055,16 +5055,9 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let suffix = self.resolve_string(frames, &vals[1])?;
                 let target = self.deref_value(frames, &vals[0])?;
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Str(s) => {
-                        s.push_str(&suffix);
-                        Ok(Value::Unit)
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "String::push_str",
-                        "string value",
-                        other.kind_name(),
-                    )),
+                self.modify_string(frames, &target, "String::push_str", |text| {
+                    text.push_str(&suffix);
+                    Ok(Value::Unit)
                 })
             }
             Builtin::StringPush => {
@@ -5089,16 +5082,9 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let target = self.deref_value(frames, &vals[0])?;
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Str(s) => {
-                        s.push(c);
-                        Ok(Value::Unit)
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "String::push",
-                        "string value",
-                        other.kind_name(),
-                    )),
+                self.modify_string(frames, &target, "String::push", |text| {
+                    text.push(c);
+                    Ok(Value::Unit)
                 })
             }
             Builtin::StrChars => {
@@ -5114,21 +5100,19 @@ impl<'a> Interpreter<'a> {
             Builtin::StrMakeAsciiCase(upper) => {
                 arity(1)?;
                 let target = self.deref_value(frames, &vals[0])?;
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Str(s) => {
+                self.modify_string(
+                    frames,
+                    &target,
+                    "str::make_ascii_uppercase/lowercase",
+                    |text| {
                         if upper {
-                            s.make_ascii_uppercase();
+                            text.make_ascii_uppercase();
                         } else {
-                            s.make_ascii_lowercase();
+                            text.make_ascii_lowercase();
                         }
                         Ok(Value::Unit)
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "str::make_ascii_uppercase/lowercase",
-                        "string value",
-                        other.kind_name(),
-                    )),
-                })
+                    },
+                )
             }
             Builtin::StrBytes => {
                 arity(1)?;

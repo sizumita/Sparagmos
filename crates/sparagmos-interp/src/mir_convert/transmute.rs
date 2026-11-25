@@ -286,6 +286,42 @@ impl<'a> Converter<'a> {
         ))
     }
 
+    /// The transmute between a pointer to a slice (or an
+    /// array) of a fieldless enum and the same pointer shape
+    /// over an integer, in either direction: the elements
+    /// reinterpret through the enum discriminant table (see
+    /// `ir::Rvalue::SliceEnumToInt`), which the pointer-identity
+    /// arms of `convert_transmute` cannot express. `None` for
+    /// every other pair of types.
+    fn slice_enum_transmute(
+        &self,
+        v: &ir::Operand,
+        src: &Option<mir::Ty>,
+        target: &mir::Ty,
+    ) -> Option<ir::Rvalue> {
+        fn elem_of(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ptr_pointee(ty)? {
+                mir::Ty::Slice(elem) => Some(elem),
+                mir::Ty::Array(elem, _) => Some(elem),
+                _ => None,
+            }
+        }
+        let src_elem = elem_of(src.as_ref()?)?;
+        let dst_elem = elem_of(target)?;
+        match (src_elem, dst_elem) {
+            (mir::Ty::Adt(def, _), mir::Ty::Int(_) | mir::Ty::Uint(_)) => {
+                let table = self.fieldless_enum_discriminants(def)?;
+                let int_ty = self.convert_ty(dst_elem, "cast target").ok()?;
+                Some(ir::Rvalue::SliceEnumToInt(v.clone(), table, int_ty))
+            }
+            (mir::Ty::Int(_) | mir::Ty::Uint(_), mir::Ty::Adt(def, _)) => {
+                let table = self.fieldless_enum_discriminants(def)?;
+                Some(ir::Rvalue::SliceIntToEnum(v.clone(), table))
+            }
+            _ => None,
+        }
+    }
+
     /// Convert a `CastKind::Transmute` rvalue: `operand` is the
     /// MIR operand, `v` its converted IR form, `target` the cast's
     /// target type. Only the shapes this value model can
@@ -695,6 +731,9 @@ impl<'a> Converter<'a> {
                     }
                 }
             }
+        }
+        if let Some(rv) = self.slice_enum_transmute(&v, &src, target) {
+            return rv;
         }
 let inner = match (&src, target) {
             // Pointer -> integer: the synthetic address (what the
