@@ -1299,58 +1299,50 @@ impl<'a> Interpreter<'a> {
             }
             false
         };
-        // Greedy slot assignment, largest locals first: a
-        // local joins a slot it fits and whose occupants it
-        // does not interfere with, else it opens a new slot
-        // above the current extent.
-        // Locals whose address is taken (a reference rvalue
-        // names them) are placed first: their slot identity
-        // is the observable the layout exists to model, so
-        // they claim slots before value-only locals of any
-        // size fill them in.
-        let mut addr_taken = vec![false; n];
-        for block in &body.blocks {
-            for stmt in &block.statements {
-                if let StatementKind::Assign(
-                    _,
-                    Rvalue::Ref(p) | Rvalue::Reborrow(p),
-                ) = &stmt.kind
-                {
-                    if p.local.0 < n {
-                        addr_taken[p.local.0] = true;
-                    }
-                }
-            }
-        }
-        let mut order: Vec<usize> =
+        // Slot assignment in local order: the order the
+        // compiler creates a function's allocas and lays out
+        // its frame. A local takes the lowest existing slot
+        // that holds it and whose occupants it does not
+        // interfere with; failing that, it opens a slot of
+        // its own size at the current extent. Stack colouring
+        // then shows up only as this reuse rule: two
+        // sequential temporaries of a size class land in the
+        // same slot, the second finding the first's slot
+        // free, so addresses the compiler makes coincide do
+        // coincide here.
+        // Two other orders misprice real shapes. Placing
+        // largest-first with best fit let a small temporary
+        // squat inside a larger local's slot -- one whose
+        // range had not even begun -- and its same-sized
+        // successor, which does interfere with the larger
+        // local, was scattered to a different slot. Placing
+        // in live-range start order let the swarm of
+        // entry-block temporaries claim every low offset
+        // first and pushed a large long-lived local to an
+        // offset with an arbitrary alignment residue, which
+        // address arithmetic on packed fields observes.
+        let order: Vec<usize> =
             (0..n).filter(|&l| sizes[l].is_some()).collect();
-        order.sort_by_key(|&l| {
-            (
-                std::cmp::Reverse(addr_taken[l]),
-                std::cmp::Reverse(sizes[l].unwrap_or(0)),
-                std::cmp::Reverse(aligns[l]),
-            )
-        });
         let mut slots: Vec<Option<u64>> = vec![None; n];
         let mut placed: Vec<(u64, u64, Vec<usize>)> = Vec::new();
         let mut extent: u64 = 0;
         for l in order {
             let size = sizes[l].unwrap_or(0);
             let align = aligns[l].max(1);
-            // Best fit: the smallest sufficient slot, so a
-            // small local does not pollute a large slot it
-            // would block for the slot's own size class.
-            let mut best: Option<(u64, usize)> = None;
+            // First fit in offset order: the lowest slot
+            // that holds the local and whose occupants it
+            // does not interfere with. Slots are created in
+            // offset order, so the scan is in offset order.
+            let mut chosen: Option<usize> = None;
             for (si, (off, ssize, occupants)) in placed.iter().enumerate() {
                 if *ssize >= size
                     && *off % align == 0
                     && occupants.iter().all(|&o| !interferes(l, o))
-                    && best.is_none_or(|(bs, _)| *ssize < bs)
                 {
-                    best = Some((*ssize, si));
+                    chosen = Some(si);
+                    break;
                 }
             }
-            let chosen = best.map(|(_, si)| si);
             match chosen {
                 Some(si) => {
                     slots[l] = Some(placed[si].0);
@@ -3591,6 +3583,66 @@ mod ptr_equality_tests {
         let slots = slots_of(&interp, "probe::f");
         assert_eq!(slots[1], slots[2], "disjoint ranges share a slot");
         assert_ne!(slots[1], slots[3], "a spanning range keeps its own slot");
+    }
+
+    /// A larger local created between two same-sized
+    /// temporaries does not capture the first temporary's
+    /// slot: slots are claimed in local (creation) order,
+    /// so the first temporary owns a slot of its own size
+    /// class and the second -- which interferes with the
+    /// larger local but not with the first temporary --
+    /// reuses it. (Largest-first best fit placed the first
+    /// temporary inside the larger local's slot and
+    /// scattered the second: the equal-pointers-unequal
+    /// inline2 shape.)
+    #[test]
+    fn creation_order_keeps_size_class_slots() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(
+            vec![
+                Statement { kind: StatementKind::StorageLive(Local(1)) },
+                Statement { kind: StatementKind::StorageLive(Local(2)) },
+                Statement::assign(
+                    Place::from_index(2),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(1))),
+                ),
+                Statement { kind: StatementKind::StorageDead(Local(2)) },
+                Statement { kind: StatementKind::StorageLive(Local(3)) },
+                Statement::assign(
+                    Place::from_index(3),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(3))),
+                ),
+                Statement { kind: StatementKind::StorageLive(Local(4)) },
+                Statement::assign(
+                    Place::from_index(4),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(4))),
+                ),
+                Statement { kind: StatementKind::StorageDead(Local(4)) },
+                Statement { kind: StatementKind::StorageDead(Local(3)) },
+                Statement { kind: StatementKind::StorageDead(Local(1)) },
+            ],
+            TerminatorKind::Return,
+        );
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(
+            slots[2], slots[4],
+            "sequential same-sized temporaries share a slot"
+        );
+        assert_ne!(slots[2], slots[3], "the intervening larger local does not");
+        assert_ne!(slots[2], slots[1], "the long-lived local does not");
     }
 
     /// Without storage markers (optimised MIR), def/use
