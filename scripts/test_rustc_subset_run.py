@@ -1812,6 +1812,49 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertIn("dep-graph", res["bucket"])
         self.assertIn("a.rs", res["reason"])
 
+    def test_incremental_aux_partition_assertion_not_attempted(self):
+        # A partition assertion inside an auxiliary crate is
+        # checked against that crate's own code generation work
+        # products, which no session of this harness produces:
+        # the record is not attempted, with the auxiliary file
+        # named in the reason.
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "//@ aux-build: a.rs\n"
+            "extern crate a;\nfn main() {}\n",
+            suite="incremental")
+        rec["single_file"] = False
+        aux_dir = self.rust_dir / "tests" / "ui" / "auxiliary"
+        aux_dir.mkdir()
+        (aux_dir / "a.rs").write_text(
+            "#![feature(rustc_attrs)]\n"
+            "#![rustc_partition_reused(module=\"a\", cfg=\"rpass2\")]\n"
+            "pub fn g() {}\n")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("dep-graph", res["bucket"])
+        self.assertIn("a.rs", res["reason"])
+        self.assertIn("rustc_partition_reused", res["reason"])
+
+    def test_incremental_partition_codegened_only_not_attempted(self):
+        # A record asserting only that a module was codegened
+        # stays out of scope too: a conversion session reuses
+        # nothing, so the assertion would hold vacuously. The
+        # verdict must come from real code generation work
+        # products, not from their absence.
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#![rustc_partition_codegened(module=\"t\", cfg=\"rpass2\")]\n"
+            "fn main() {}\n",
+            suite="incremental")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("dep-graph", res["bucket"])
+        self.assertIn("rustc_partition_codegened", res["reason"])
+
     def test_incremental_assert_incr_state_loaded_judged(self):
         # Sequential sessions share one incremental directory, so
         # the second session starts from the first session's cache

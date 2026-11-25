@@ -457,6 +457,52 @@ denominator. Runs on every push to `main` and on manual dispatch.
   the directives (`add-minicore` cannot be used to run the
   test binary), so the file is never compiled — the one suite
   file with both is a should-fail self-test of that rejection.
+- The `incremental` suite's records (180) are judged per
+  revision like other compile-check records, except where a
+  verdict is defined over state carried between compilation
+  sessions. Those revisions run as sequential conversion
+  sessions over one shared incremental directory -- the
+  directory compiletest chains its own sessions through --
+  with one check-mode lint level set for the whole sequence,
+  when the state takes a form the sessions reproduce:
+  `#[rustc_clean]` / `#[rustc_dirty]` assertions on items of
+  the test file itself, which the driver's embedded rustc
+  checks at session finalization (`check_clean_annotations`,
+  run from `save_dep_graph`) against the dep graph loaded
+  from the previous session, and a compile-flags assertion
+  that the previous session's cache is loaded at startup
+  (`-Zassert-incr-state=loaded`), which the shared directory
+  satisfies by construction. A revision whose compilation
+  fails solely on clean assertions over MIR dep nodes
+  (`optimized_mir` / `promoted_mir`) is not attempted:
+  conversion forces MIR bodies for every definition in the
+  crate, the reference compilation only for codegen-reached
+  items, so those nodes' coloring under conversion reports
+  the harness's demand pattern rather than the test, in
+  either direction. Records carrying a codegen-partition
+  assertion (`#![rustc_partition_reused]` /
+  `#![rustc_partition_codegened]`, in the test file or in an
+  auxiliary crate) are not attempted under the bucket
+  `out of stage-2 scope (incremental dep-graph assertions)`:
+  rustc checks the assertion when a session codegens,
+  against the work products the previous session's code
+  generation persisted (which codegen units were reused,
+  which were re-codegened), and a conversion session never
+  codegens -- measured on
+  tests/incremental/change_private_fn, its sessions persist
+  the dep graph and the query cache but no reusable work
+  products (the work-products file records none and no
+  object files are written), and a copy of the test whose
+  partition assertion is falsified still converts cleanly,
+  so a conversion verdict would report nothing about the
+  assertion. The prerequisite is a session mode that
+  codegens incrementally and persists real work products
+  across the sequence. A dep-graph assertion inside an
+  auxiliary crate is likewise not attempted: the runner
+  hands auxiliary crates to the driver per conversion and
+  does not chain the auxiliary crate's own sessions. The
+  denominator is unaffected; these records stay in it as
+  non-passes (issue #383).
 - The cached source tree's sparse checkout additionally includes
   `src/tools/run-make-support`, `src/build_helper`, and
   `src/rustdoc-json-types` (the prepare job widens it before the
