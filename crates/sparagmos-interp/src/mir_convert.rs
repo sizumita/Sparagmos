@@ -2894,6 +2894,28 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The discriminant table of the body's return type, when
+    /// that type is a fieldless (C-like) enum: the integer each
+    /// variant stands for, in variant order. Baked into the
+    /// converted body (see `ir::Body::return_discriminants`)
+    /// while the definition's shape and discriminant table are
+    /// at hand. `None` for every other return type: an enum
+    /// with any fielded variant is not represented as a bare
+    /// integer, and its return values cross as aggregates.
+    fn return_discriminants(&self, body: &mir::Body) -> Option<Vec<i128>> {
+        let ret_ty = &body.local_decls.first()?.ty;
+        let mir::Ty::Adt(def, _) = ret_ty else {
+            return None;
+        };
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Enum
+            || !shape.variants.iter().all(|fields| fields.is_empty())
+        {
+            return None;
+        }
+        self.discriminants.get(def).cloned()
+    }
+
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
         BODY_CONVERSIONS.with(|c| c.set(c.get() + 1));
         let body = &func.body;
@@ -2945,6 +2967,7 @@ impl<'a> Converter<'a> {
             blocks.push(self.convert_block(body, bb, fn_abi)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
+        out.return_discriminants = self.return_discriminants(body);
         out.local_elem_sizes = body
             .local_decls
             .iter()

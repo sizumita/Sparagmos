@@ -21074,6 +21074,21 @@ fn value_fingerprint(value: &Value) -> u64 {
                 };
                 return self.values_equal(frames, &field, bytes_side);
             }
+            // A byte string against a vector in its element
+            // form: the ADT value's fields ARE the elements
+            // (the shape a `Vec<u8>` built element by element
+            // takes, see `string_from_element_form`), so the
+            // field list itself is the byte sequence -- unlike
+            // the holder above, whose single field holds it.
+            (Value::Enum { variant: 0, fields: x }, Value::Bytes(y))
+            | (Value::Bytes(y), Value::Enum { variant: 0, fields: x })
+                if x.iter().all(|f| Self::element_form_byte(f).is_some()) =>
+            {
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(elem, byte)| Self::element_form_byte(elem) == Some(*byte))
+            }
             // The same holder against a tuple, when the tuple
             // cannot be the holder's field list (its length
             // differs from the field count): it is the held
@@ -21135,10 +21150,30 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// which the caller's recursion unwraps one layer at a time.
     fn dyn_pointee(&self, frames: &[Frame], value: &Value) -> InterpResult<Value> {
         match value {
-            Value::DynRef { base, .. } => match &**base {
-                Value::Enum { fields, .. } if fields.len() == 1 => Ok(fields[0].clone()),
-                _ => self.resolve_value(frames, base),
-            },
+            Value::DynRef { base, .. } => {
+                // A reference-counted handle's pointee lives in
+                // the shared allocation, not in the handle: the
+                // handle aggregate is the pointer chain plus
+                // metadata, and the value is field 2 of the
+                // RcInner / ArcInner aggregate the allocation
+                // holds ({strong, weak, value}). The store check
+                // is the deciding evidence -- a Box handle has
+                // the same shape, but its allocation holds the
+                // value itself (see `rc_inner_id`).
+                if let Some(id) = self.rc_inner_id(base) {
+                    if let Ok(Value::Enum { fields, .. }) = self.alloc_base(id) {
+                        if let Some(pointee) = fields.get(2) {
+                            return Ok(pointee.clone());
+                        }
+                    }
+                }
+                match &**base {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        Ok(fields[0].clone())
+                    }
+                    _ => self.resolve_value(frames, base),
+                }
+            }
             other => Ok(other.clone()),
         }
     }
@@ -21175,6 +21210,25 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// and booleans by value, strings byte-wise (as `str`'s `Ord`
     /// is), aggregates lexicographically with enum variants ordered
     /// by declaration order — the derived semantics.
+/// The byte an element-form field denotes, when it denotes
+/// one: a byte-valued integer, possibly holding the
+/// `MaybeUninit` union form (a one-field variant-0 wrapper)
+/// the buffer's spare-capacity region stores. Any other
+/// shape denotes no byte.
+fn element_form_byte(elem: &Value) -> Option<u8> {
+    let elem = match elem {
+        Value::Enum {
+            variant: 0, fields, ..
+        } if fields.len() == 1 => &fields[0],
+        other => other,
+    };
+    match elem {
+        Value::Uint(b) if *b <= 0xFF => Some(*b as u8),
+        Value::Int(b) if (0..=255).contains(b) => Some(*b as u8),
+        _ => None,
+    }
+}
+
 /// The discriminant value a variant index stands for in a
 /// structural comparison: the baked table's entry when the
 /// comparison's `Self` type has one, else the index itself (the
@@ -24252,7 +24306,32 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// `string_from_real_aggregate`). Any other shape returns
     /// `None`.
     fn string_from_element_form(&self, vec: &Value) -> Option<String> {
-        let (elems, len): (&[Value], usize) = match vec {
+        // Wrapper newtypes between the string type and its
+        // byte vector (an `OsString` is a `Buf` around the
+        // `Vec<u8>`) nest single-field variant-0 aggregates
+        // around the element list. Descend through them: a
+        // byte vector's element list cannot itself consist of
+        // one aggregate -- its elements are bytes (each
+        // possibly in a one-field union wrapper, handled per
+        // element below) -- so a lone aggregate field is a
+        // wrapper around the vector, not an element of it.
+        let mut cur = vec;
+        loop {
+            match cur {
+                Value::Enum {
+                    variant: 0, fields, ..
+                } if fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        Value::Enum { .. } | Value::SparseVec { .. }
+                    ) =>
+                {
+                    cur = &fields[0];
+                }
+                _ => break,
+            }
+        }
+        let (elems, len): (&[Value], usize) = match cur {
             // A vector is a struct: its value carries variant
             // 0. (A one-field wrapper around an empty or
             // small aggregate of any other variant — an

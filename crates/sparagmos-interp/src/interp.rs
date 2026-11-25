@@ -4143,6 +4143,39 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A fieldless enum return value crossing into an
+        // integer-typed destination place: the destination's
+        // declared type is the integer the enum is represented
+        // as (the call's function type was transmuted -- an
+        // FFI signature reinterpreted through a function
+        // pointer), so the value crosses as its discriminant,
+        // the callee body's baked table supplying the value
+        // (see `Body::return_discriminants`). Any other shape
+        // keeps the ordinary write below, whose judgment
+        // stands.
+        if let Some(callee_body) = self.program.get(&frame.func) {
+            if let Some(table) = &callee_body.return_discriminants {
+                if let Value::Enum { variant, fields } = &value {
+                    if fields.is_empty() {
+                        if let Some(discr) = table.get(*variant as usize) {
+                            match cast_place_ty(caller_body, &dest) {
+                                Some(Ty::Int(it)) => {
+                                    value =
+                                        Value::Int(wrap_signed(*discr, it.bits()));
+                                }
+                                Some(Ty::Uint(ut)) => {
+                                    value = Value::Uint(wrap_unsigned(
+                                        *discr as u128,
+                                        ut.bits(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.write_place(frames, caller_body, &dest, value)?;
         match resume {
             Some(bb) => {
