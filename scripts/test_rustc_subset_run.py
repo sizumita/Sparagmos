@@ -5256,18 +5256,18 @@ class CoverageNormalizeTests(unittest.TestCase):
             "\n"
             "/x/a.rs:\n"
             "    4|      2|fn a() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  |  Branch (4:9): [True: 2, False: 1]\n"
-            " ------------------\n"
+            "  ------------------\n"
             "\n"
         )
         self.assertEqual(
             run.normalize_coverage_output(text, "/x"),
             "$DIR/a.rs:\n"
             "   LL|      2|fn a() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  |  Branch (LL:9): [True: 2, False: 1]\n"
-            " ------------------\n"
+            "  ------------------\n"
             "\n"
             "$DIR/b.rs:\n"
             "   LL|      3|fn b() {}\n"
@@ -5276,25 +5276,25 @@ class CoverageNormalizeTests(unittest.TestCase):
     def test_instantiation_subviews_sorted(self):
         text = (
             "    1|      2|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  | z::g::<u32>:\n"
             "  |    1|      1|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  | a::g::<f32>:\n"
             "  |    1|      1|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "\n"
         )
         self.assertEqual(
             run.normalize_coverage_output(text, "/x"),
             "   LL|      2|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  | a::g::<f32>:\n"
             "  |   LL|      1|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "  | z::g::<u32>:\n"
             "  |   LL|      1|fn g() {\n"
-            " ------------------\n"
+            "  ------------------\n"
             "\n")
 
     def test_report_must_end_with_an_extra_blank_line(self):
