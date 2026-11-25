@@ -75,6 +75,22 @@ pub(crate) use project::*;
 pub(crate) use state::*;
 pub(crate) use values::*;
 
+/// The default scheduler quantum, in interpreter steps (see
+/// [`InterpConfig::thread_quantum`]). The size is set by the
+/// spin-heavy end of the thread suite: a guest spin iteration
+/// is a handful of steps, so the quantum is the number of spin
+/// iterations a thread burns before its partner runs. Measured
+/// on a strict two-thread rendezvous (2,000 ping-pong rounds on
+/// one atomic, debug build): 8,192 steps took 139 s, 1,024 took
+/// 17.7 s, and 256 took 4.4 s — the wasted spin shrinks with the
+/// quantum while the switch cost (moving the segment's frame
+/// vector, scanning its locals for the frames it references)
+/// stays invisible at this size, so 256 it is. A slice still
+/// holds dozens of spin iterations, far more than a channel
+/// operation's step cost, so lock-step protocols are not
+/// chopped mid-operation.
+pub const DEFAULT_THREAD_QUANTUM: usize = 256;
+
 /// Interpreter limits / configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpConfig {
@@ -95,6 +111,16 @@ pub struct InterpConfig {
     /// the per-record wall-clock timeout stays the operative
     /// bound for guests whose per-step cost is high.
     pub max_steps: usize,
+    /// The scheduler quantum: the number of steps one thread
+    /// segment may execute before it yields to another runnable
+    /// thread (see [`Interpreter::run_thread`]). Yielding is the
+    /// cooperative scheduler's preemption: a guest that busy-waits
+    /// (a spin on an atomic, a `try_recv` polling loop) cannot
+    /// monopolise the interpreter, exactly as an OS scheduler
+    /// preempts it. The step budget ([`InterpConfig::max_steps`])
+    /// is global and unaffected: a yield consumes no budget reset,
+    /// it only changes which thread executes next.
+    pub thread_quantum: usize,
     /// Maximum number of simultaneously live call frames.
     pub max_call_depth: usize,
     /// The guest program's command-line arguments after argv[0]
@@ -148,6 +174,7 @@ impl Default for InterpConfig {
     fn default() -> Self {
         InterpConfig {
             max_steps: 1_000_000_000,
+            thread_quantum: DEFAULT_THREAD_QUANTUM,
             max_call_depth: 8192,
             guest_args: Vec::new(),
             program_path: String::new(),
@@ -439,6 +466,26 @@ pub struct Interpreter<'a> {
     /// The thread whose code is currently executing (the entry
     /// thread outside any spawned thread's run).
     current_thread: std::cell::Cell<u64>,
+    /// The depth of the innermost active
+    /// [`Interpreter::drive`] region (0 outside any drive).
+    drive_depth: usize,
+    /// The thread segment the scheduler is currently driving, if
+    /// any: runtime support that drives guest code outside a
+    /// segment (the termination report, a thread's TLS
+    /// destructors) runs with no segment marked, and its drives
+    /// never yield.
+    segment: Option<SegmentMark>,
+    /// How many scheduler drains (`drain_threads`) are currently
+    /// on the stack. While a drain runs, some thread is blocked
+    /// waiting for state another thread may produce, so a driven
+    /// segment may yield back to the drain even when no other
+    /// thread is runnable: the waiter itself is who the segment
+    /// yields to. (An unbounded producer drained by a `recv` on
+    /// the entry thread is the shape that needs it: the producer
+    /// is the only spawned thread, and without the yield it
+    /// would fill the channel until the step budget ends the
+    /// run.)
+    drain_depth: usize,
     /// mpsc channel states (see [`ChannelState`]), keyed by the id
     /// carried inside the handle values.
     channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
@@ -692,6 +739,9 @@ impl<'a> Interpreter<'a> {
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
             current_thread: std::cell::Cell::new(1),
+            drive_depth: 0,
+            segment: None,
+            drain_depth: 0,
             channels: std::cell::RefCell::new(HashMap::new()),
             wake_dispatch: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
@@ -906,6 +956,62 @@ impl<'a> Interpreter<'a> {
     /// limit instead of looping forever.
     pub(crate) fn tick_step(&mut self) -> InterpResult<()> {
         self.tick()
+    }
+
+    /// Whether the segment currently being driven must yield to
+    /// the scheduler at this statement boundary. True only when
+    /// the segment's quantum has expired, the drive is the
+    /// segment's own drive loop (not a nested drive a builtin
+    /// started, whose interpreter-side continuation parking would
+    /// lose), no guest panic is mid-unwind inside the segment
+    /// (the unwinder's state lives in the interpreter's own call
+    /// stack and cannot be parked), no debugger session is
+    /// attached (a session observes one thread's positions at a
+    /// time), and at least one other thread can run against the
+    /// current frame stack. A single-threaded program therefore
+    /// never yields, and its verdicts are unchanged. The scans
+    /// run only once the quantum has actually expired, so the
+    /// per-statement cost is one subtraction.
+    fn yield_due(&self, frames: &[Frame], stop_depth: usize) -> bool {
+        let Some(mark) = self.segment else {
+            return false;
+        };
+        if self.drive_depth != mark.depth {
+            return false;
+        }
+        if self.steps.wrapping_sub(mark.steps0) < self.config.thread_quantum {
+            return false;
+        }
+        if self.debug_ctl.is_some() || self.glue_unwind_panic.is_some() {
+            return false;
+        }
+        if frames[stop_depth..]
+            .iter()
+            .any(|f| f.in_cleanup || f.unwind_payload.is_some())
+        {
+            return false;
+        }
+        // A drain on the stack means a waiter: the segment may
+        // yield back to it even if no other thread is runnable.
+        self.drain_depth > 0 || self.other_thread_runnable(frames, mark.thread)
+    }
+
+    /// Whether a thread other than `except` could run against
+    /// the current frame stack: it has not started yet (its
+    /// callable is still captured), or it is parked and every
+    /// frame it was suspended above is still on the stack (see
+    /// [`ParkedThread`]).
+    fn other_thread_runnable(&self, frames: &[Frame], except: u64) -> bool {
+        self.threads.borrow().iter().any(|(id, slot)| {
+            *id != except
+                && (slot.callable.is_some()
+                    || slot.parked.as_ref().is_some_and(|parked| {
+                        parked
+                            .below
+                            .iter()
+                            .all(|fid| frames.iter().any(|f| f.id == *fid))
+                    }))
+        })
     }
 
     fn fresh_frame_id(&mut self) -> u64 {

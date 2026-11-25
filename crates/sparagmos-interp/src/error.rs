@@ -54,6 +54,19 @@ pub enum InterpError {
     /// code, distinct from both a completed `main` (code 0) and
     /// every error outcome.
     ProcessExit { code: i32 },
+    /// The running thread segment's scheduler quantum expired
+    /// while another thread could run: the cooperative
+    /// scheduler's preemption signal. Like
+    /// [`InterpError::ProcessExit`] this is control flow, not a
+    /// failure — it travels as an error so it can unwind the
+    /// interpreter's own call stack out of the drive loop, and
+    /// the segment's driver (a spawned thread's
+    /// `Interpreter::run_thread`, the entry thread's scheduler
+    /// loop in `Interpreter::run_with_report`) catches it, parks
+    /// the segment's frames, and reschedules. It is never a run
+    /// outcome; any other context observing it has found an
+    /// interpreter bug, so its message says so.
+    Yield,
     /// The configured step budget was exhausted (probable infinite loop).
     StepLimitExceeded { limit: usize },
     /// The configured call-depth budget was exhausted.
@@ -180,6 +193,9 @@ impl fmt::Display for InterpError {
             InterpError::Panic { message, .. } => write!(f, "guest panic: {message}"),
             InterpError::ProcessExit { code } => {
                 write!(f, "guest exited with code {code}")
+            }
+            InterpError::Yield => {
+                write!(f, "scheduler yield escaped its segment (interpreter bug)")
             }
             InterpError::Abort { message } => write!(f, "guest abort: {message}"),
             InterpError::StepLimitExceeded { limit } => {

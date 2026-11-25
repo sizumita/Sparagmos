@@ -6,22 +6,85 @@ use crate::error::{InterpError, InterpResult};
 use crate::value::{PanicPayload, RefProj, RefTarget, Value};
 
 /// One spawned thread of the cooperative thread model: the
-/// callable captured at `spawn` time, and the outcome once it has
-/// run. A spawned thread never runs concurrently with the thread
-/// that spawned it; it runs to completion when the running thread
-/// reaches a point where it would block (see
-/// [`Interpreter::drain_threads`]).
+/// callable captured at `spawn` time, the frames of a run
+/// suspended at a quantum boundary, and the outcome once it has
+/// finished. A spawned thread never runs concurrently with the
+/// thread that spawned it; it runs when the running thread
+/// reaches a scheduling point (a point where it would block, a
+/// join, a scope exit — see [`Interpreter::drain_threads`]) or
+/// when the running thread's quantum expires, and it runs for at
+/// most one quantum at a time (see [`Interpreter::run_thread`]),
+/// so a busy-waiting thread cannot starve the threads it waits
+/// for, exactly as under an OS scheduler.
 pub(crate) struct ThreadSlot {
     /// The name the thread's `std::thread::Builder` set (read
     /// back by `std::thread::Thread::name`); `None` for an
     /// unnamed thread.
     pub name: Option<String>,
     pub callable: Option<Value>,
+    /// The frames of a run suspended at a quantum boundary, if
+    /// this thread has started but not finished.
+    pub parked: Option<ParkedThread>,
     /// The thread's outcome: its return value, or the panic
     /// payload it ended with (kept whole, so `join`'s error can
     /// be the `Box<dyn Any>` the guest downcasts).
     pub outcome: Option<Result<Value, PanicPayload>>,
 }
+/// A thread segment suspended at a quantum boundary: its call
+/// frames (the bottom frame is the thread's entry frame), and
+/// the ids of the frames below the segment that its frames
+/// actually reference. The segment may resume only on a stack
+/// that still holds every one of those frames: its places name
+/// frames by id, and a referenced frame that has since returned
+/// is storage the segment may still point into (a scoped
+/// thread's borrowed locals), so resuming without it would read
+/// dead storage. Frames the segment was merely driven *above*
+/// — a transient runtime region that has since returned —
+/// do not pin it: a `'static` spawned thread references no frame
+/// below itself and can resume on any stack. Every frame the
+/// segment itself owns travels with it, and channel /
+/// allocation / static targets are id-keyed, so referenced
+/// frames below are the only external dependency.
+pub(crate) struct ParkedThread {
+    pub frames: Vec<Frame>,
+    pub below: Vec<u64>,
+}
+
+/// What one [`Interpreter::run_thread`] call did.
+pub(crate) enum ThreadRun {
+    /// The thread finished; its outcome is recorded.
+    Finished,
+    /// The thread's quantum expired; its frames are parked and
+    /// it will resume at a later scheduling point.
+    Yielded,
+    /// The thread is parked above frames that are not on the
+    /// current stack, so it cannot resume in this context.
+    NotRunnable,
+}
+
+/// The scheduler's record of the thread segment currently being
+/// driven (see the `segment` field of [`Interpreter`]): the
+/// drive depth at which its loop runs, the thread it belongs
+/// to, and the step count at which the current quantum began.
+/// Set by the entry drive, by `run_thread`, and by scheduled
+/// regions (`drive_scheduled`) for the duration of one drive;
+/// `None` outside any drive.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentMark {
+    /// The drive depth of the segment's own drive loop. A yield
+    /// is honoured only at exactly this depth: inside a nested
+    /// drive (a builtin executing a callable — a `Once` closure,
+    /// a waker wake, a comparator) the interpreter's own call
+    /// stack carries a continuation that parking would lose, so
+    /// nested drives always run to completion and the yield is
+    /// taken when control returns to the segment's own loop.
+    pub depth: usize,
+    /// The thread the segment belongs to (1 is the entry thread).
+    pub thread: u64,
+    /// The interpreter's step count when this quantum began.
+    pub steps0: usize,
+}
+
 
 /// The shared state of one `std::sync::mpsc` channel, keyed by the
 /// id carried inside the `Sender` / `Receiver` handle values.

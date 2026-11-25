@@ -66,7 +66,30 @@ impl<'a> Interpreter<'a> {
             call_once_env_drop: None,
             incoming_asm: None,
         }];
-        let result = self.drive_frames(&mut frames, 0);
+        // The entry thread's scheduler loop: drive the entry
+        // segment one quantum at a time; when its quantum expires
+        // with other threads runnable, give each of them a
+        // quantum on this stack (the entry's frames stay resident
+        // below theirs, so every frame a spawned segment may name
+        // is live) and resume the entry segment. With no other
+        // thread runnable the drive never yields and this is a
+        // single drive, exactly as before.
+        let result = loop {
+            let previous_segment = self.segment.replace(SegmentMark {
+                depth: self.drive_depth + 1,
+                thread: 1,
+                steps0: self.steps,
+            });
+            let driven = self.drive_frames(&mut frames, 0);
+            self.segment = previous_segment;
+            match driven {
+                Err(InterpError::Yield) => {
+                    self.drain_threads(&mut frames)?;
+                    continue;
+                }
+                other => break other,
+            }
+        };
         // The termination report applies here: after the entry
         // has returned, before its thread's TLS teardown (see
         // [`Interpreter::run_with_report`]).
@@ -103,7 +126,14 @@ impl<'a> Interpreter<'a> {
     pub(crate) fn drive_frames(&mut self, frames_out: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
         let mut frames: Vec<Frame> = std::mem::take(frames_out);
         let result = self.drive(&mut frames, base);
-        frames.truncate(base);
+        // A scheduler yield leaves the driven segment's frames
+        // live above `base`: the segment's driver parks them and
+        // the segment later resumes from exactly this stack.
+        // Every other outcome restores the caller's stack depth
+        // as documented above.
+        if !matches!(result, Err(InterpError::Yield)) {
+            frames.truncate(base);
+        }
         *frames_out = frames;
         result
     }
@@ -125,6 +155,20 @@ impl<'a> Interpreter<'a> {
     /// Non-panic errors never unwind: they are oracle failures,
     /// not guest control flow.
     pub(crate) fn drive(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        stop_depth: usize,
+    ) -> InterpResult<Value> {
+        // Every drive region counts toward the depth the
+        // scheduler's segment marks name, whichever entry built
+        // it (`drive_frames`, `call_to_completion`).
+        self.drive_depth += 1;
+        let result = self.drive_inner(frames, stop_depth);
+        self.drive_depth -= 1;
+        result
+    }
+
+    fn drive_inner(
         &mut self,
         frames: &mut Vec<Frame>,
         stop_depth: usize,
@@ -333,6 +377,9 @@ impl<'a> Interpreter<'a> {
             None;
         let mut func_name = String::new();
         'drive: loop {
+            if self.yield_due(frames, stop_depth) {
+                return Err(InterpError::Yield);
+            }
             let (block_idx, stmt_idx) = {
                 let frame = frames
                     .last()
