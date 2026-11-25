@@ -718,7 +718,26 @@ jobs:
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
           key: rust-survey-1.100.0-v4
-          fail-on-cache-miss: true
+
+      # The cache service segments entries by runner OS, so the
+      # tree the Linux prepare job saved is not visible here: on
+      # a miss this job fetches and widens the tree exactly as
+      # prepare does (and the cache step above then saves the
+      # macOS entry under the same key for later runs).
+      - name: Fetch rust tree and generate survey (on cache miss)
+        run: |
+          if [ ! -d "$RUST_SURVEY_DIR" ]; then
+            python3 scripts/rustc-subset-survey.py --fetch \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          elif [ ! -f "$SURVEY_JSON" ]; then
+            python3 scripts/rustc-subset-survey.py \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          fi
+          git -C "$RUST_SURVEY_DIR" sparse-checkout add \
+            src/tools/run-make-support src/build_helper \
+            src/rustdoc-json-types src/etc \
+            src/librustdoc/html/static/css src/tools/jsondocck \
+            src/tools/jsondoclint src/tools/rustdoc
 
       - name: Download host-class surveys
         uses: actions/download-artifact@v4
