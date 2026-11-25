@@ -1213,11 +1213,22 @@ fn walk_closure_args(args: &GenericArgs, out: &mut Vec<(ClosureDef, GenericArgs)
 fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
     // A type whose conversion tree passes through a coroutine-
     // closure type cannot be asked its kind at all (the bridge
-    // leaves that conversion unimplemented); nothing can be
-    // extracted from it here. The aggregate that creates an async
-    // closure's value carries the demand instead (see
-    // `closure_targets`).
+    // leaves that conversion unimplemented). The aggregate that
+    // creates an async closure's value carries the demand
+    // instead (see `closure_targets`) - but an async closure
+    // whose captures are all zero-sized is created by a
+    // zero-sized constant, not by an aggregate, and then the
+    // type mention itself (a local's declaration, an operand,
+    // a call target's generic arguments) is the only carrier of
+    // the demand. For that case the definition and arguments
+    // are read through the compiler context.
     let Some(kind) = guarded_ty_kind(ty) else {
+        if let Some((def, args, _)) =
+            crate::convert::coroutine_closure_const_parts(ty)
+        {
+            out.push((ClosureDef(def), args.clone()));
+            walk_closure_args(&args, out);
+        }
         return;
     };
     match kind {

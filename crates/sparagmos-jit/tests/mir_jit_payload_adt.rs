@@ -160,6 +160,7 @@ fn build_with_table(
         fn_shim_locations: Default::default(),
         link_symbols: Default::default(),
         intrinsic_defs: Default::default(),
+        async_closure_defs: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)

@@ -2403,6 +2403,43 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                 } => {
+                    // An `Fn`-family call whose receiver is an
+                    // async closure value is served as the
+                    // corresponding `AsyncFn` call below: the
+                    // closure's own body is not in the program
+                    // (it mentions the coroutine-closure type,
+                    // which Stable MIR cannot convert), and the
+                    // call's meaning is the `AsyncFn` one - it
+                    // constructs the closure's coroutine from
+                    // the call arguments and the environment.
+                    let async_kind;
+                    let kind = match kind {
+                        FnCallKind::CallOnce
+                            if self.fn_call_receiver_is_async_closure(
+                                frames, body, receiver, true,
+                            ) =>
+                        {
+                            async_kind = FnCallKind::AsyncCallOnce;
+                            &async_kind
+                        }
+                        FnCallKind::CallMut
+                            if self.fn_call_receiver_is_async_closure(
+                                frames, body, receiver, false,
+                            ) =>
+                        {
+                            async_kind = FnCallKind::AsyncCallMut;
+                            &async_kind
+                        }
+                        FnCallKind::Call
+                            if self.fn_call_receiver_is_async_closure(
+                                frames, body, receiver, false,
+                            ) =>
+                        {
+                            async_kind = FnCallKind::AsyncCall;
+                            &async_kind
+                        }
+                        other => other,
+                    };
                     // The `AsyncFn` family: the call runs no body.
                     // It creates the async closure's coroutine -
                     // the value the compiler's shim body for the
@@ -5004,6 +5041,65 @@ impl<'a> Interpreter<'a> {
             _ => Value::Ref(RefTarget::value(callable.clone())),
         };
         Ok((callable, env))
+    }
+
+    /// Whether the receiver of an `Fn`-family trait call is
+    /// an async closure value: a closure whose definition the
+    /// conversion recorded as a coroutine closure (see
+    /// `Program::async_closure_captures`, which the recorded
+    /// definitions are folded into). For `call_once` the
+    /// receiver is the value itself; for `call` / `call_mut`
+    /// it is a reference to the value. A receiver that cannot
+    /// be read as a closure value is not one - the call's own
+    /// dispatch produces its usual outcome for it.
+    fn fn_call_receiver_is_async_closure(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        receiver: &Operand,
+        by_value: bool,
+    ) -> bool {
+        // Read the receiver without consuming it: this is a
+        // peek ahead of the real dispatch, which evaluates the
+        // operand itself - evaluating a `Move` operand here
+        // would move the closure out of its place and leave the
+        // dispatch reading an uninitialised place. Place
+        // operands are read in place (the same read
+        // `eval_callable` performs); constants are pure.
+        let recv = match receiver {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let Ok(resolved) = self.resolve_place(frames, body, place) else {
+                    return false;
+                };
+                let Ok(value) = self.read_resolved(frames, &resolved) else {
+                    return false;
+                };
+                value
+            }
+            Operand::Constant(c) => {
+                let Ok(value) = self.eval_constant(c) else {
+                    return false;
+                };
+                value
+            }
+        };
+        let value = if by_value {
+            recv
+        } else {
+            let Ok(resolved) = self.deref_value(frames, &recv) else {
+                return false;
+            };
+            let Ok(value) = self.read_resolved(frames, &resolved) else {
+                return false;
+            };
+            value
+        };
+        match value {
+            Value::Closure { def, .. } => {
+                self.program.async_closure_captures.contains_key(&def)
+            }
+            _ => false,
+        }
     }
 
     fn eval_callable(
@@ -16804,6 +16900,16 @@ impl<'a> Interpreter<'a> {
             | (Some(Ty::FnPtr), Value::Closure { .. })
             | (Some(Ty::FnDef(_)), Value::FnPtr(_))
             | (Some(Ty::Closure(..)), Value::Closure { .. }) => Ok(value),
+            // A coroutine-closure (async closure) place whose
+            // type the driver recorded as the unit placeholder
+            // (the type's kind is unaskable through Stable MIR;
+            // see `coroutine_closure_creation` in mir_convert):
+            // the place's real type is the closure type, and the
+            // closure value its creation aggregate produced is
+            // the value the place holds. A genuine unit place
+            // only ever receives a unit value in well-typed MIR,
+            // so the arm cannot bless a wrong store.
+            (Some(Ty::Unit), Value::Closure { .. }) => Ok(value),
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
