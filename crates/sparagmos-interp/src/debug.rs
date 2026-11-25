@@ -511,154 +511,16 @@ fn exec_session_command(
     }
 }
 
-/// Collect the program's statics' initializer constants, by
-/// static key: walk every body's operands for the `StaticRef`
-/// constants the conversion embedded (each carries its
-/// static's full initializer as its seed). A static no body
-/// references has no seed here; a print of it stays an explicit
-/// error, as it did before statics could be printed at all.
+/// The program's statics' initializer constants, by static
+/// key: the seed table the conversion recorded in the program
+/// (see `ir::Program::static_seeds`). A static no converted
+/// reference names has no seed here; a print of it stays an
+/// explicit error, as it did before statics could be printed
+/// at all.
 fn collect_static_seeds(
     program: &Program,
 ) -> HashMap<String, crate::ir::Constant> {
-    use crate::ir::{Operand, Rvalue, StatementKind, TerminatorKind};
-    fn collect_constant(
-        c: &crate::ir::Constant,
-        seeds: &mut HashMap<String, crate::ir::Constant>,
-    ) {
-        match c {
-            crate::ir::Constant::StaticRef { name, value, .. } => {
-                seeds
-                    .entry(name.clone())
-                    .or_insert_with(|| (**value).clone());
-                collect_constant(value, seeds);
-            }
-            crate::ir::Constant::Ref(inner) => collect_constant(inner, seeds),
-            crate::ir::Constant::DynRef { base, .. } => {
-                collect_constant(base, seeds)
-            }
-            crate::ir::Constant::Tuple(items)
-            | crate::ir::Constant::SliceVal(items) => {
-                for item in items {
-                    collect_constant(item, seeds);
-                }
-            }
-            crate::ir::Constant::Adt { fields, .. } => {
-                for field in fields {
-                    collect_constant(field, seeds);
-                }
-            }
-            crate::ir::Constant::ErasedAlloc { relocs, .. } => {
-                for (_, reloc) in relocs {
-                    collect_constant(reloc, seeds);
-                }
-            }
-            _ => {}
-        }
-    }
-    fn collect_operand(
-        op: &Operand,
-        seeds: &mut HashMap<String, crate::ir::Constant>,
-    ) {
-        if let Operand::Constant(c) = op {
-            collect_constant(c, seeds);
-        }
-    }
-    fn collect_rvalue(
-        rv: &Rvalue,
-        seeds: &mut HashMap<String, crate::ir::Constant>,
-    ) {
-        match rv {
-            Rvalue::Use(op)
-            | Rvalue::UnaryOp(_, op)
-            | Rvalue::Cast(op, _)
-            | Rvalue::Unsize(op, _)
-            | Rvalue::BoxDerefTransmute(op)
-            | Rvalue::DataPtr(op)
-            | Rvalue::Materialize(op, _)
-            | Rvalue::PtrToInt(op)
-            | Rvalue::PtrField(op, _)
-            | Rvalue::PtrFieldFirstElem(op, _)
-            | Rvalue::PtrCastUnits(op, _)
-            | Rvalue::PtrFirstElem(op)
-            | Rvalue::PtrArrayBase(op)
-            | Rvalue::WrapArrayElems(op)
-            | Rvalue::UnwrapArrayElems(op)
-            | Rvalue::IntToPtr(op)
-            | Rvalue::EnumToInt(op, _, _)
-            | Rvalue::Reinterpret(op, _, _)
-            | Rvalue::IntToEnum(op, _) => collect_operand(op, seeds),
-            Rvalue::BinaryOp(_, pair) | Rvalue::CheckedBinaryOp(_, pair) => {
-                collect_operand(&pair.0, seeds);
-                collect_operand(&pair.1, seeds);
-            }
-            Rvalue::AggregateTuple(ops) | Rvalue::CoroutineAggregate(ops) => {
-                for op in ops {
-                    collect_operand(op, seeds);
-                }
-            }
-            Rvalue::AggregateAdt { operands, .. }
-            | Rvalue::ClosureAggregate { operands, .. } => {
-                for op in operands {
-                    collect_operand(op, seeds);
-                }
-            }
-            Rvalue::RawPtrAggregate { data, meta } => {
-                collect_operand(data, seeds);
-                if let Some(meta) = meta {
-                    collect_operand(meta, seeds);
-                }
-            }
-            Rvalue::PtrOffset(a, b, ..) => {
-                collect_operand(a, seeds);
-                collect_operand(b, seeds);
-            }
-            _ => {}
-        }
-    }
-    let mut seeds = HashMap::new();
-    for body in program.functions.values() {
-        for entry in &body.debug_vars {
-            if let crate::ir::DebugVar::Constant(c) = &entry.source {
-                collect_constant(c, &mut seeds);
-            }
-        }
-        for block in &body.blocks {
-            for stmt in &block.statements {
-                match &stmt.kind {
-                    StatementKind::Assign(_, rv) => {
-                        collect_rvalue(rv, &mut seeds)
-                    }
-                    StatementKind::Assume(op) => collect_operand(op, &mut seeds),
-                    _ => {}
-                }
-            }
-            match &block.terminator {
-                TerminatorKind::SwitchInt { discr, .. } => {
-                    collect_operand(discr, &mut seeds)
-                }
-                TerminatorKind::Call { args, .. }
-                | TerminatorKind::CallBuiltin { args, .. } => {
-                    for op in args {
-                        collect_operand(op, &mut seeds);
-                    }
-                }
-                TerminatorKind::CallIndirect { func, args, .. } => {
-                    collect_operand(func, &mut seeds);
-                    for op in args {
-                        collect_operand(op, &mut seeds);
-                    }
-                }
-                TerminatorKind::CallTrait {
-                    receiver, args, ..
-                } => {
-                    collect_operand(receiver, &mut seeds);
-                    collect_operand(args, &mut seeds);
-                }
-                _ => {}
-            }
-        }
-    }
-    seeds
+    program.static_seeds.clone()
 }
 
 /// The drive loop's debugger hook: consulted before the statement
@@ -1201,11 +1063,12 @@ fn resolve_static_base(
         }
     }
     let key = exact.or(by_segment)?;
-    let seed = ctl.static_seeds.get(key)?;
+    if !ctl.static_seeds.contains_key(key) {
+        return None;
+    }
     let reference = interp
         .eval_constant(&crate::ir::Constant::StaticRef {
             name: key.clone(),
-            value: Box::new(seed.clone()),
             projection: Vec::new(),
             len: None,
         })

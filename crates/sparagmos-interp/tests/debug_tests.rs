@@ -693,7 +693,6 @@ fn static_program() -> Program {
                     Place::from_index(1),
                     Rvalue::Use(Operand::Constant(Constant::StaticRef {
                         name: "test::COUNTER".to_string(),
-                        value: Box::new(Constant::Int(7)),
                         projection: vec![],
                         len: None,
                     })),
@@ -718,6 +717,8 @@ fn static_program() -> Program {
     p.source_files = vec!["test.rs".to_string()];
     p.static_debug_tags
         .insert("test::COUNTER".to_string(), "i64".to_string());
+    p.static_seeds
+        .insert("test::COUNTER".to_string(), Constant::Int(7));
     p
 }
 
