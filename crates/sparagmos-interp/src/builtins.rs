@@ -614,6 +614,15 @@ pub enum Builtin {
     /// modelled by driving the `next` state transition and
     /// invoking `f` synchronously per item.
     IteratorFold,
+    /// `std::iter::Iterator::try_fold(iter, init, f)`: the
+    /// same `next` loop as `fold`, with the `Try` branching of
+    /// `f`'s result deciding whether the loop continues. The
+    /// specialised bodies several iterator types override
+    /// `try_fold` with (a `vec::IntoIter`'s, notably) loop
+    /// over the iterator's raw pointer fields instead of
+    /// calling `next`, a representation the value model does
+    /// not reproduce; the observable result is the loop's.
+    IteratorTryFold,
     /// `std::iter::Iterator::for_each(iter, f)`: a `next` loop
     /// invoking `f` per item, discarding the results.
     IteratorForEach,
@@ -2667,6 +2676,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::iter::Iterator::count" => Builtin::IteratorCount,
         "std::iter::Iterator::nth" => Builtin::IteratorNth,
         "std::iter::Iterator::fold" => Builtin::IteratorFold,
+        "std::iter::Iterator::try_fold" => Builtin::IteratorTryFold,
         "std::iter::Iterator::for_each" => Builtin::IteratorForEach,
         "std::iter::Iterator::collect" => Builtin::IteratorCollect,
         "std::iter::FromIterator::from_iter" => Builtin::FromIteratorFromIter,
@@ -5070,6 +5080,9 @@ impl<'a> Interpreter<'a> {
         if matches!(kind, Builtin::IteratorFold | Builtin::IteratorForEach) {
             return self.exec_iterator_fold_like(frames, body, kind, generic_args, args);
         }
+        if matches!(kind, Builtin::IteratorTryFold) {
+            return self.exec_iterator_try_fold(frames, body, generic_args, args);
+        }
         let mut vals = Vec::with_capacity(args.len());
         for arg in args {
             vals.push(self.eval_operand(frames, body, arg)?);
@@ -7412,7 +7425,12 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 let value = vals.into_iter().next().expect("arity checked");
-                if self_ty.starts_with("std::ops::Range<")
+                // A trait-object iterator value (a `Box<dyn
+                // Iterator>` or `&dyn Iterator`) is already an
+                // iterator, so the blanket identity below covers
+                // it whatever its rendered Self type.
+                if matches!(value, Value::DynRef { .. })
+                    || self_ty.starts_with("std::ops::Range<")
                     || self_ty.starts_with("std::ops::RangeInclusive<")
                     || self_ty.starts_with("std::iter::Rev<")
                     || self_ty.starts_with("std::slice::Iter<")
@@ -7710,7 +7728,7 @@ impl<'a> Interpreter<'a> {
                 let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
                 self.slice_iter_as_slice(frames, elem_tag, &vals[0])
             }
-            Builtin::IteratorFold | Builtin::IteratorForEach => {
+            Builtin::IteratorFold | Builtin::IteratorForEach | Builtin::IteratorTryFold => {
                 unreachable!("fold-like builtins are dispatched before argument evaluation")
             }
             Builtin::IteratorCount => {
@@ -16895,6 +16913,55 @@ fn value_fingerprint(value: &Value) -> u64 {
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        // A trait-object iterator (`Box<dyn Iterator>`, or a
+        // `&dyn Iterator` receiver): the state is the dyn
+        // reference the unsizing cast formed, and stepping it
+        // steps the concrete iterator it wraps - in place when
+        // the wrapper holds a pointer to the concrete value,
+        // functionally when it holds the value itself - and the
+        // result is rewrapped in the same dyn reference.
+        if let Value::DynRef {
+            base,
+            concrete,
+            traits,
+            drop_glue,
+        } = &state
+        {
+            // The pointer to the concrete value: the base
+            // itself for a reference coercion, or the single
+            // field of the box aggregate for a `Box` coercion.
+            let pointer = match &**base {
+                Value::Ref(_) | Value::FatRef { .. } => Some((**base).clone()),
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    match &fields[0] {
+                        Value::Ref(_) | Value::FatRef { .. } => {
+                            Some(fields[0].clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(pointer) = pointer {
+                let target = self.deref_value(frames, &pointer)?;
+                let inner = self.read_resolved(frames, &target)?;
+                let (new_inner, item) =
+                    self.iterator_next_state(frames, concrete, inner)?;
+                self.write_resolved(frames, &target, new_inner)?;
+                return Ok((state, item));
+            }
+            let (new_base, item) =
+                self.iterator_next_state(frames, concrete, (**base).clone())?;
+            return Ok((
+                Value::DynRef {
+                    base: Box::new(new_base),
+                    concrete: concrete.clone(),
+                    traits: traits.clone(),
+                    drop_glue: drop_glue.clone(),
+                },
+                item,
+            ));
+        }
         if self_ty.starts_with("std::vec::Drain<")
             || self_ty.starts_with("alloc::vec::Drain<")
         {
@@ -17650,7 +17717,21 @@ fn value_fingerprint(value: &Value) -> u64 {
             || self_ty.starts_with("std::option::IntoIter<")
             || self_ty.starts_with("std::collections::btree_set::IntoIter<")
             || self_ty.starts_with("std::collections::btree_map::IntoIter<")
+            || (self_ty.starts_with("dyn ")
+                && fields.len() == 2
+                && matches!(fields[0], Value::Tuple(_))
+                && matches!(fields[1], Value::Uint(_)))
         {
+            // The `dyn` case: a provided method of the trait
+            // object (a `max` / `fold` shim instantiated for
+            // `dyn Iterator`) calls `next` with the trait-object
+            // tag, while the receiver place has already resolved
+            // through the dyn reference to the concrete value.
+            // When that value is the owned-iterator state the
+            // `IntoIter` models build - the only state form this
+            // arm steps - the step is the same; any other
+            // trait-object state keeps the unsupported error
+            // below.
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
                     "array::IntoIter state",
@@ -20378,6 +20459,165 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
         self.note_consumed_iter_final(state);
         Ok(accum)
+    }
+
+    /// Execute `Iterator::try_fold`: drive the modelled `next`
+    /// state transition over the iterator and invoke `f` per
+    /// item with the accumulator, exactly the loop the core
+    /// default body spells out. The receiver arrives in the
+    /// shape the call site passes it: the iterator value itself
+    /// for a by-value operand, or a reference to it for the
+    /// forwarded `&mut self` of another consumer's body - the
+    /// reference form steps the iterator in place. `f` returns
+    /// a `Try` value: its branch decides the loop, in the shape
+    /// of the `Try` implementations the standard consumers use -
+    /// `ControlFlow` (continue on variant 0, break on variant
+    /// 1, the break carrying its payload into the result),
+    /// `Result` (continue on `Ok`, return the `Err` value
+    /// unchanged), `Option` (continue on `Some`, return
+    /// `None`), and `NeverShortCircuit` (the single-field
+    /// wrapper `count` and friends fold through, which never
+    /// breaks). When the iterator runs out, the result is the
+    /// `Try` type's output form of the final accumulator
+    /// (`Continue` / `Ok` / `Some` / the wrapper itself). The
+    /// result type is the call's fourth generic argument.
+    fn exec_iterator_try_fold(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        generic_args: &[String],
+        args: &[Operand],
+    ) -> InterpResult<Value> {
+        if args.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "builtin Iterator::try_fold",
+                "3 argument(s)",
+                format!("{} argument(s)", args.len()),
+            ));
+        }
+        let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+        let r_ty = generic_args.get(3).map(String::as_str).unwrap_or("");
+        #[derive(Clone, Copy, PartialEq)]
+        enum TryShape {
+            ControlFlow,
+            Result,
+            Option,
+            NeverShortCircuit,
+        }
+        let shape = if r_ty.contains("ControlFlow<") {
+            TryShape::ControlFlow
+        } else if r_ty.contains("Result<") {
+            TryShape::Result
+        } else if r_ty.contains("Option<") {
+            TryShape::Option
+        } else if r_ty.contains("NeverShortCircuit<") {
+            TryShape::NeverShortCircuit
+        } else {
+            return Err(InterpError::type_mismatch(
+                "builtin Iterator::try_fold",
+                "a ControlFlow / Result / Option / NeverShortCircuit try type",
+                r_ty,
+            ));
+        };
+        let recv = self.eval_operand(frames, body, &args[0])?;
+        // A reference receiver steps the iterator in place (the
+        // `&mut self` a consumer body forwards); any other value
+        // is the iterator state itself, stepped functionally and
+        // handed back through the consumed-iterator channel.
+        enum Drive {
+            InPlace(Resolved),
+            Owned(Value),
+        }
+        let mut drive = match self.deref_value(frames, &recv) {
+            Ok(target) => Drive::InPlace(target),
+            Err(_) => Drive::Owned(recv),
+        };
+        let mut accum = self.eval_operand(frames, body, &args[1])?;
+        let f = &args[2];
+        let break_value = loop {
+            self.tick_step()?;
+            let item = match &mut drive {
+                Drive::InPlace(target) => {
+                    self.iterator_next_at(frames, self_ty, target)?
+                }
+                Drive::Owned(state) => {
+                    let (next_state, item) = self.iterator_next_state(
+                        frames,
+                        self_ty,
+                        std::mem::replace(state, Value::Unit),
+                    )?;
+                    *state = next_state;
+                    item
+                }
+            };
+            let Some(item) = option_payload(item)? else {
+                break None;
+            };
+            let out = self.call_callable_operand_to_completion(
+                frames,
+                body,
+                f,
+                vec![std::mem::replace(&mut accum, Value::Unit), item],
+            )?;
+            let Value::Enum { variant, fields } = out else {
+                return Err(InterpError::type_mismatch(
+                    "builtin Iterator::try_fold",
+                    "try-typed closure result",
+                    out.kind_name(),
+                ));
+            };
+            match (shape, variant) {
+                (TryShape::ControlFlow, 0)
+                | (TryShape::Result, 0)
+                | (TryShape::Option, 1)
+                | (TryShape::NeverShortCircuit, 0) => {
+                    let mut fields = fields.into_iter();
+                    accum = fields.next().ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "builtin Iterator::try_fold",
+                            "continue variant carrying the accumulator",
+                            "empty variant",
+                        )
+                    })?;
+                }
+                (TryShape::ControlFlow, 1) | (TryShape::Result, 1) => {
+                    break Some(Value::Enum { variant: 1, fields });
+                }
+                (TryShape::Option, 0) => {
+                    break Some(Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    });
+                }
+                _ => {
+                    return Err(InterpError::type_mismatch(
+                        "builtin Iterator::try_fold",
+                        "a two-variant try-typed closure result",
+                        format!("variant {variant}"),
+                    ));
+                }
+            }
+        };
+        if let Drive::Owned(state) = drive {
+            self.note_consumed_iter_final(state);
+        }
+        if let Some(value) = break_value {
+            return Ok(value);
+        }
+        Ok(match shape {
+            TryShape::ControlFlow | TryShape::Result => Value::Enum {
+                variant: 0,
+                fields: vec![accum],
+            },
+            TryShape::Option => Value::Enum {
+                variant: 1,
+                fields: vec![accum],
+            },
+            TryShape::NeverShortCircuit => Value::Enum {
+                variant: 0,
+                fields: vec![accum],
+            },
+        })
     }
 
     /// Semantic (derived `PartialEq`) equality of two values:
@@ -25229,6 +25469,15 @@ fn iterator_next_back_state(
     }
     if self_ty.starts_with("std::iter::Empty<") {
         return Ok((state.clone(), None));
+    }
+    if self_ty.starts_with("dyn ")
+        && fields.len() == 2
+        && matches!(fields[0], Value::Tuple(_))
+        && matches!(fields[1], Value::Uint(_))
+    {
+        // A trait-object tag over an owned-iterator state, as
+        // in the front step (see `iterator_next_state`).
+        return step_owned_iter_back(state, self_ty);
     }
     Err(unsupported(format!(
         "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"

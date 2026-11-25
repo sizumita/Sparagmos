@@ -182,6 +182,10 @@ struct Collected {
     /// Sparagmos ids of the definitions the compiler classifies
     /// as compiler intrinsics (see `Converter::intrinsic_defs`).
     intrinsic_defs: std::collections::HashSet<sparagmos_mir::DefId>,
+    /// Sparagmos ids of the coroutine-closure (async closure)
+    /// definitions conversion met (see
+    /// `Converter::async_closure_defs`).
+    async_closure_defs: std::collections::HashSet<sparagmos_mir::DefId>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
     adt_discriminants: sparagmos_mir::AdtDiscriminants,
@@ -5587,6 +5591,7 @@ fn collect() -> ControlFlow<()> {
         entry_def_id,
         def_names: conv.def_names.clone(),
         intrinsic_defs: conv.intrinsic_defs.clone(),
+        async_closure_defs: conv.async_closure_defs.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),
@@ -7685,6 +7690,7 @@ fn build_program(
         );
     }
     program.intrinsic_defs = c.intrinsic_defs.clone();
+    program.async_closure_defs = c.async_closure_defs.clone();
     program.fn_abis = c.fn_abis.clone();
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();

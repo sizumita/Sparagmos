@@ -408,6 +408,45 @@ fn static_is_foreign(def: &mir::mono::StaticDef) -> bool {
     tcx.is_foreign_item(internal)
 }
 
+/// The static that provides the storage of the extern-item-impl
+/// (EII) declaration `def`, when `def` is one. An EII
+/// declaration (`#[eii(name)] static X: T;`, or one carrying a
+/// default initializer) is a foreign item: it has no
+/// initializer of its own and evaluating it panics (see
+/// `static_is_foreign`). The value lives in the one
+/// implementation registered for the declaration in this
+/// compilation - an explicit `#[name] static Y: T = ..;` or
+/// the declaration's own default, which the compiler registers
+/// as an implementation too - and that implementation is an
+/// ordinary static whose storage IS the declaration's storage.
+/// The compiler's `externally_implementable_items` registry
+/// names it. `None` when the item is not an EII declaration,
+/// when no implementation is registered, when several are
+/// (the compiler reports the duplication itself), or when the
+/// implementation cannot be named as a `StaticDef`.
+fn eii_impl_static(
+    def: &mir::mono::StaticDef,
+) -> Option<mir::mono::StaticDef> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal =
+            rustc_public::rustc_internal::internal(tcx, def.def_id());
+        let map = tcx.externally_implementable_items(internal.krate);
+        let (_, impls) = map.get(&internal)?;
+        if impls.len() != 1 {
+            return None;
+        }
+        let impl_internal = *impls.keys().next()?;
+        let impl_id = rustc_public::rustc_internal::stable(impl_internal);
+        let mut crates = vec![rustc_public::local_crate()];
+        crates.extend(rustc_public::external_crates());
+        crates
+            .iter()
+            .flat_map(|krate| krate.statics())
+            .find(|candidate| candidate.def_id() == impl_id)
+    })
+}
+
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
@@ -432,6 +471,16 @@ pub struct Converter {
     /// keeps its recorded conversion failure instead of being
     /// silently served by the builtin.
     pub intrinsic_defs: std::collections::HashSet<sm::DefId>,
+    /// Sparagmos ids of the definitions of coroutine closures
+    /// (async closures) whose types or values conversion has
+    /// met, as recorded by [`Converter::note_async_closure`].
+    /// Handed to the interpreter with the converted program:
+    /// an async closure's own body is not convertible (it
+    /// mentions the coroutine-closure type), so a call through
+    /// the `Fn` trait family on one of these definitions is
+    /// served by constructing the closure's coroutine, exactly
+    /// as an `AsyncFn` call does.
+    pub async_closure_defs: std::collections::HashSet<sm::DefId>,
     /// Discriminant values of every enum ADT converted so far,
     /// keyed by the converted `DefId` (variant index -> value).
     /// Handed to the interpreter with the converted program: its
@@ -3063,6 +3112,74 @@ pub fn clear_captured_panic() {
 /// The type's definition and arguments are not recoverable from
 /// the opaque handle in that case. Any other panic is resumed —
 /// only this one known gap is tolerated.
+/// The definition and upvars-tuple type of a coroutine-closure
+/// (async closure) type, read through the compiler context
+/// installed for the conversion. The type's kind cannot be
+/// asked through Stable MIR (the bridge's conversion of the
+/// kind panics; see `guarded_ty_kind`), but a zero-sized
+/// constant of the type is a closure value, and naming it
+/// needs exactly these two facts. `None` when the type is not
+/// a coroutine-closure type, when no compiler context is
+/// installed, or when the trailing type arguments do not have
+/// the expected shape: the closure signature (a function
+/// pointer type), the upvars tuple, and the by-reference
+/// captures signature (also a function pointer type).
+pub(crate) fn coroutine_closure_const_parts(
+    ty: &rustc_public::ty::Ty,
+) -> Option<(
+    rustc_public::DefId,
+    rustc_public::ty::GenericArgs,
+    rustc_public::ty::Ty,
+)> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, ty.clone());
+        let rustc_middle::ty::TyKind::CoroutineClosure(def, args) =
+            internal.kind()
+        else {
+            return None;
+        };
+        let tys: Vec<rustc_middle::ty::Ty<'_>> = args
+            .iter()
+            .filter_map(|arg| match arg.kind() {
+                rustc_middle::ty::GenericArgKind::Type(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        if tys.len() < 3 {
+            return None;
+        }
+        let upvars = tys[tys.len() - 2];
+        if !matches!(upvars.kind(), rustc_middle::ty::TyKind::Tuple(_)) {
+            return None;
+        }
+        let def = rustc_public::rustc_internal::stable(def);
+        let args = rustc_public::ty::GenericArgs(
+            args.iter()
+                .map(|arg| match arg.kind() {
+                    rustc_middle::ty::GenericArgKind::Lifetime(l) => {
+                        rustc_public::ty::GenericArgKind::Lifetime(
+                            rustc_public::rustc_internal::stable(l),
+                        )
+                    }
+                    rustc_middle::ty::GenericArgKind::Type(t) => {
+                        rustc_public::ty::GenericArgKind::Type(
+                            rustc_public::rustc_internal::stable(t),
+                        )
+                    }
+                    rustc_middle::ty::GenericArgKind::Const(c) => {
+                        rustc_public::ty::GenericArgKind::Const(
+                            rustc_public::rustc_internal::stable(c),
+                        )
+                    }
+                })
+                .collect(),
+        );
+        let upvars = rustc_public::rustc_internal::stable(upvars);
+        Some((def, args, upvars))
+    })
+}
+
 pub fn guarded_ty_kind(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::TyKind> {
     clear_captured_panic();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.kind())) {
@@ -3356,6 +3473,7 @@ impl Converter {
             instance_ids: HashMap::new(),
             def_names: Vec::new(),
             intrinsic_defs: std::collections::HashSet::new(),
+            async_closure_defs: std::collections::HashSet::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
@@ -4736,10 +4854,14 @@ impl Converter {
                 def: self.crate_def_id(def),
                 generic_args: self.type_args(args),
             },
-            A::CoroutineClosure(def, args) => sm::AggregateKind::CoroutineClosure {
-                def: self.crate_def_id(def),
-                generic_args: self.type_args(args),
-            },
+            A::CoroutineClosure(def, args) => {
+                let d = self.crate_def_id(def);
+                self.async_closure_defs.insert(d);
+                sm::AggregateKind::CoroutineClosure {
+                    def: d,
+                    generic_args: self.type_args(args),
+                }
+            }
             A::RawPtr(ty, m) => sm::AggregateKind::RawPtr {
                 data_ty: self.ty(ty),
                 mutability: mutability(*m),
@@ -4863,6 +4985,32 @@ impl Converter {
                         ty: None,
                     };
                 }
+                // A zero-sized constant whose type is a
+                // coroutine-closure (async closure) type is a
+                // closure value too: every capture is zero-sized,
+                // so the constant is the closure itself. The type's
+                // kind cannot be asked through Stable MIR (see
+                // `guarded_ty_kind`), so the definition and the
+                // upvars tuple are read through the compiler
+                // context; the recorded type is shaped like a
+                // plain closure type whose last generic argument
+                // is the upvars tuple, which is all the conversion
+                // of a closure constant reads.
+                if let Some((def, _, upvars)) =
+                    coroutine_closure_const_parts(&ty)
+                {
+                    let d = self.def_id(def);
+                    self.async_closure_defs.insert(d);
+                    let upvars = self.ty(&upvars);
+                    return sm::Constant {
+                        literal: sm::ConstKind::Ty(sm::Ty::Closure(
+                            d,
+                            vec![upvars],
+                        )),
+                        user_ty: None,
+                        ty: None,
+                    };
+                }
                 // Any other zero-sized constant still has a typed
                 // value when its type determines one (a unit struct,
                 // a single-variant enum, a tuple of zero-sized
@@ -4903,6 +5051,24 @@ impl Converter {
                         let t = self.ty(ty);
                         return sm::Constant {
                             literal: sm::ConstKind::Ty(t),
+                            user_ty: None,
+                            ty: None,
+                        };
+                    }
+                    // A zero-sized type constant of
+                    // coroutine-closure type is a closure value,
+                    // as for the `ZeroSized` literal kind above.
+                    if let Some((def, _, upvars)) =
+                        coroutine_closure_const_parts(ty)
+                    {
+                        let d = self.def_id(def);
+                        self.async_closure_defs.insert(d);
+                        let upvars = self.ty(&upvars);
+                        return sm::Constant {
+                            literal: sm::ConstKind::Ty(sm::Ty::Closure(
+                                d,
+                                vec![upvars],
+                            )),
                             user_ty: None,
                             ty: None,
                         };
@@ -6645,9 +6811,16 @@ impl Converter {
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
-                if static_is_foreign(&def) {
-                    return None;
-                }
+                // As in `decode_ref`: an extern-item-impl
+                // declaration's storage is its implementation's.
+                let def = if static_is_foreign(&def) {
+                    match eii_impl_static(&def) {
+                        Some(impl_def) => impl_def,
+                        None => return None,
+                    }
+                } else {
+                    def
+                };
                 let init = self.static_initializer(&def)?;
                 let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
@@ -6954,10 +7127,25 @@ impl Converter {
             // and writes through the program-level statics store
             // instead of a per-constant snapshot.
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Static(def)) => {
-                if static_is_foreign(&def) {
-                    return self
-                        .decode_foreign_static_ref(&def, inner, alloc, offset, target_off, depth);
-                }
+                // An extern-item-impl (EII) declaration is a
+                // foreign item - it has no initializer of its
+                // own, and evaluating it panics - but its storage
+                // is the registered implementation's storage:
+                // decode the reference against the implementation,
+                // an ordinary static, so reads and writes through
+                // the declaration land in the one storage.
+                let def = if static_is_foreign(&def) {
+                    match eii_impl_static(&def) {
+                        Some(impl_def) => impl_def,
+                        None => {
+                            return self.decode_foreign_static_ref(
+                                &def, inner, alloc, offset, target_off, depth,
+                            );
+                        }
+                    }
+                } else {
+                    def
+                };
                 let init = self.static_initializer(&def)?;
                 (init, Some(def))
             }
@@ -9075,6 +9263,7 @@ impl Converter {
             }
             RigidTy::CoroutineClosure(def, args) => {
                 let d = self.crate_def_id(def);
+                self.async_closure_defs.insert(d);
                 sm::Ty::Coroutine(d, self.type_args(args))
             }
             RigidTy::CoroutineWitness(def, args) => {
@@ -10273,4 +10462,5 @@ fn ty_mentions_param_walk(ty: &Ty) -> bool {
         _ => false,
     }
 }
+
 

@@ -241,6 +241,17 @@ pub struct MirProgram {
     /// whose conversion failed) keeps that failure even when
     /// its name matches an intrinsic's.
     pub intrinsic_defs: std::collections::HashSet<mir::DefId>,
+    /// Definitions of coroutine closures (async closures) the
+    /// driver met while converting, keyed like the bodies.
+    /// An async closure's own body cannot be converted (it
+    /// mentions the coroutine-closure type, which Stable MIR
+    /// cannot convert), so the conversion records the
+    /// definition here instead: a definition in this set is
+    /// served at call time by constructing the closure's
+    /// coroutine, for the `Fn` trait family exactly as for
+    /// the `AsyncFn` family. Populated from type mentions,
+    /// creation aggregates and zero-sized closure constants.
+    pub async_closure_defs: std::collections::HashSet<mir::DefId>,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -2425,6 +2436,18 @@ impl<'a> Converter<'a> {
     /// [`async_capture_by_ref`]), keyed by the closure's program
     /// key - the key the created `Value::Closure` carries.
     fn compute_async_closure_captures(&mut self, program: &MirProgram) {
+        // Definitions the driver recorded as coroutine closures
+        // from type mentions and zero-sized constants, which no
+        // creation aggregate names (a zero-sized async closure
+        // is created by a constant, not an aggregate): the
+        // definition is an async closure, with its captures'
+        // by-reference flags unknown - an empty entry, whose
+        // per-capture lookups fall back like a missing one.
+        for def in &program.async_closure_defs {
+            self.async_closure_captures
+                .entry(self.body_key(def))
+                .or_insert_with(Vec::new);
+        }
         for func in &program.functions {
             for bb in &func.body.basic_blocks {
                 for stmt in &bb.statements {
@@ -8962,6 +8985,7 @@ let inner = match (&src, target) {
         let iter_ty = match kind {
             crate::builtins::Builtin::IteratorCount
             | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorTryFold
             | crate::builtins::Builtin::IteratorForEach
             | crate::builtins::Builtin::IteratorCollect
             | crate::builtins::Builtin::IteratorNth
@@ -8998,6 +9022,7 @@ let inner = match (&src, target) {
         let iter_ty = match kind {
             crate::builtins::Builtin::IteratorCount
             | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorTryFold
             | crate::builtins::Builtin::IteratorForEach
             | crate::builtins::Builtin::IteratorCollect => raw_generic_args.first(),
             crate::builtins::Builtin::FromIteratorFromIter => raw_generic_args.get(2),
@@ -9033,6 +9058,7 @@ let inner = match (&src, target) {
             }
             crate::builtins::Builtin::IteratorCount
             | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorTryFold
             | crate::builtins::Builtin::IteratorForEach
             | crate::builtins::Builtin::IteratorCollect
             | crate::builtins::Builtin::IteratorNth => {
@@ -10288,11 +10314,24 @@ let inner = match (&src, target) {
                             // writes - and the fields begin with
                             // the call arguments, so the captures
                             // are what remains.
+                            // For the `Fn` family the count is
+                            // computed as well: a call whose
+                            // receiver is an async closure value
+                            // is served as the corresponding
+                            // `AsyncFn` call (the closure's own
+                            // body is not convertible), and a
+                            // zero-sized such closure needs the
+                            // count exactly as an `AsyncFn` call
+                            // does. For any other receiver the
+                            // value is never read.
                             let async_captures = if matches!(
                                 kind,
                                 ir::FnCallKind::AsyncCall
                                     | ir::FnCallKind::AsyncCallMut
                                     | ir::FnCallKind::AsyncCallOnce
+                                    | ir::FnCallKind::Call
+                                    | ir::FnCallKind::CallMut
+                                    | ir::FnCallKind::CallOnce
                             ) {
                                 let arg_count = match raw_generic_args.get(1) {
                                     Some(mir::Ty::Tuple(ts)) => ts.len(),
@@ -11289,6 +11328,7 @@ fn builtin_arg_ctx(
         // type instead of the default unsigned rendering.
         Builtin::IteratorCount
         | Builtin::IteratorFold
+        | Builtin::IteratorTryFold
         | Builtin::IteratorForEach
         | Builtin::IteratorCollect => raw_generic_args.get(arg_index).cloned(),
         Builtin::FromIteratorFromIter => {
