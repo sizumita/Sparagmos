@@ -631,6 +631,48 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        // The reference-wrapped forwarding of `next_on_state`,
+        // for the back step: core's blanket
+        // `DoubleEndedIterator` impl for `&mut I` (and `&I`)
+        // forwards to the pointee; the reference itself is
+        // the state and is returned unchanged.
+        if let Some(inner_ty) = self_ty
+            .strip_prefix("&mut ")
+            .or_else(|| self_ty.strip_prefix('&'))
+        {
+            match &state {
+                Value::Ref(RefTarget::Value(pointee, projection))
+                    if projection.is_empty() =>
+                {
+                    let (new_inner, item) = self.next_back_on_state(
+                        frames,
+                        inner_ty,
+                        (**pointee).clone(),
+                    )?;
+                    return Ok((
+                        Value::Ref(RefTarget::Value(
+                            Box::new(new_inner),
+                            projection.clone(),
+                        )),
+                        item,
+                    ));
+                }
+                Value::Ref(_) => {
+                    let target = self.deref_value(frames, &state)?;
+                    let item =
+                        self.iterator_next_back_at(frames, inner_ty, &target)?;
+                    return Ok((state, item));
+                }
+                _ => {}
+            }
+        }
+        if self_ty.starts_with("std::slice::Chunks<")
+            || self_ty.starts_with("std::slice::RChunks<")
+            || self_ty.starts_with("std::slice::ChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+        {
+            return self.chunk_step_state(frames, self_ty, &state, true);
+        }
         if is_str_split_ty(self_ty) {
             return self.str_split_step(&state, self_ty, true);
         }
@@ -1617,6 +1659,13 @@ impl<'a> Interpreter<'a> {
             };
             return Ok((new_state, some_value(item)));
         }
+        if self_ty.starts_with("std::slice::Chunks<")
+            || self_ty.starts_with("std::slice::RChunks<")
+            || self_ty.starts_with("std::slice::ChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+        {
+            return self.chunk_step_state(frames, self_ty, &state, false);
+        }
         if self_ty_is(self_ty, "std::env::SplitPaths") {
             // The state is the owned-iterator state the
             // `split_paths` builtin snapshots ([parts, next
@@ -1663,6 +1712,114 @@ impl<'a> Interpreter<'a> {
         }
         let (new_state, result) = self.next_on_state(frames, self_ty, &state)?;
         Ok((new_state, result))
+    }
+
+    /// One step of a slice chunk iterator's state (`Chunks`,
+    /// `RChunks` and their `Exact` variants), in the front
+    /// direction when `from_back` is false and in the back
+    /// direction when it is true. The state is the one the
+    /// collected `slice::chunks` family bodies build:
+    /// [remaining slice, chunk size] for the plain variants
+    /// and [remaining whole-chunk slice, remainder slice,
+    /// chunk size] for the `Exact` variants, whose stored
+    /// slice holds only whole chunks, so either end takes a
+    /// full chunk or none. For the plain variants the short
+    /// chunk sits at the end the primary direction yields
+    /// last: `Chunks` splits anchored at the front (short
+    /// chunk at the tail), `RChunks` anchored at the back
+    /// (short chunk at the head), and a back step of either
+    /// takes that short chunk first. The yielded
+    /// sub-slices are snapshot fat references, the form the
+    /// `Windows` step above yields: the chunk family
+    /// modelled here yields shared slices, whose reads the
+    /// snapshot serves exactly. The `Mut` variants are not
+    /// modelled -- a snapshot cannot serve a mutable
+    /// slice's writes -- so they keep the fallthrough.
+    fn chunk_step_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: &Value,
+        from_back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let reverse = self_ty.starts_with("std::slice::RChunks<")
+            || self_ty.starts_with("std::slice::RChunksExact<");
+        let exact = self_ty.starts_with("std::slice::ChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExact<");
+        let take_back = reverse != from_back;
+        let fields = iterator_fields(state, self_ty)?;
+        let (slice_field, rest_fields): (&Value, Vec<Value>) = if exact {
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "[remaining slice, remainder slice, chunk size]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            (&fields[0], vec![fields[1].clone(), fields[2].clone()])
+        } else {
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "[remaining slice, chunk size]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            (&fields[0], vec![fields[1].clone()])
+        };
+        let size = chunk_size_of(rest_fields.last().expect("size field"), self_ty)?;
+        let (elems, _) = self.slice_elements(frames, slice_field)?;
+        let len = elems.len();
+        if size == 0 || len == 0 {
+            return Ok((state.clone(), none_value()));
+        }
+        let sub_slice = |part: &[Value]| Value::FatRef {
+            base: Box::new(Value::Ref(RefTarget::Value(
+                Box::new(Value::Tuple(part.to_vec())),
+                vec![RefProj::Index(0)],
+            ))),
+            len: part.len() as u128,
+        };
+        // The plain variants' short chunk sits at the end
+        // the primary direction yields last: a front step
+        // always takes a full chunk (or what remains), and a
+        // back step takes the short chunk first -- the tail
+        // chunk of a `Chunks` (whose splitting is anchored at
+        // the front) and the head chunk of an `RChunks`
+        // (whose splitting is anchored at the back) alike.
+        let (item_elems, rest_elems): (&[Value], &[Value]) = if exact {
+            if len < size {
+                return Ok((state.clone(), none_value()));
+            }
+            if take_back {
+                (&elems[len - size..], &elems[..len - size])
+            } else {
+                (&elems[..size], &elems[size..])
+            }
+        } else if from_back {
+            let n = match len % size {
+                0 => size,
+                r => r,
+            };
+            if take_back {
+                (&elems[len - n..], &elems[..len - n])
+            } else {
+                (&elems[..n], &elems[n..])
+            }
+        } else {
+            let n = size.min(len);
+            if take_back {
+                (&elems[len - n..], &elems[..len - n])
+            } else {
+                (&elems[..n], &elems[n..])
+            }
+        };
+        let mut new_fields = vec![sub_slice(rest_elems)];
+        new_fields.extend(rest_fields);
+        Ok((
+            rebuild_state(state, new_fields),
+            some_value(sub_slice(item_elems)),
+        ))
     }
 
     /// One step of a `std::path::Components` state, wrapping
@@ -1966,6 +2123,49 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         state: &Value,
     ) -> InterpResult<(Value, Value)> {
+        // A reference-wrapped iterator (`&mut I`, and the
+        // shared `&I` form): core's blanket `Iterator` impl
+        // forwards the step to the pointee, and the modelled
+        // consumers that compose steps hand the stored
+        // reference value here with the reference tag (a `Zip`
+        // steps its `&mut I` side as a state field), so the
+        // forwarding belongs to the state machine as well as
+        // to the collected blanket body. The step is in place
+        // when the reference denotes a place, functional when
+        // it denotes a value; the reference itself is the
+        // state and is returned unchanged. A state that is not
+        // a reference value (a fat trait-object reference, a
+        // materialised aggregate) declines and falls through
+        // to the tag dispatch below, exactly as before.
+        if let Some(inner_ty) = self_ty
+            .strip_prefix("&mut ")
+            .or_else(|| self_ty.strip_prefix('&'))
+        {
+            match state {
+                Value::Ref(RefTarget::Value(pointee, projection))
+                    if projection.is_empty() =>
+                {
+                    let (new_inner, item) = self.iterator_next_state(
+                        frames,
+                        inner_ty,
+                        (**pointee).clone(),
+                    )?;
+                    return Ok((
+                        Value::Ref(RefTarget::Value(
+                            Box::new(new_inner),
+                            projection.clone(),
+                        )),
+                        item,
+                    ));
+                }
+                Value::Ref(_) => {
+                    let target = self.deref_value(frames, state)?;
+                    let item = self.iterator_next_at(frames, inner_ty, &target)?;
+                    return Ok((state.clone(), item));
+                }
+                _ => {}
+            }
+        }
         if self_ty.is_empty() {
             // No type tag: the caller stayed in generic form (a
             // trait method taken as a function value, an
@@ -2001,6 +2201,19 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
+        }
+        if self_ty.starts_with("std::slice::Chunks<")
+            || self_ty.starts_with("std::slice::RChunks<")
+            || self_ty.starts_with("std::slice::ChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+        {
+            // The chunk step also lives in
+            // `iterator_next_state`; it belongs here too
+            // because the adapter arms below step their inner
+            // iterators through this entry (a `Map` over a
+            // `Chunks` reaches the chunk state only from
+            // here).
+            return self.chunk_step_state(frames, self_ty, state, false);
         }
         if self_ty.starts_with("std::option::Iter<")
             || self_ty.starts_with("std::option::IterMut<")
@@ -4098,6 +4311,89 @@ pub fn hash_collection_tag(self_ty: &str) -> bool {
         || hash_iterator_tag(self_ty)
 }
 
+/// Whether this type is one of the concrete collection
+/// iterators whose `next` the modelled state machine does
+/// not step -- the `LinkedList` / `VecDeque` / `BinaryHeap`
+/// iterator forms -- so their collected bodies are the
+/// faithful execution, the arrangement the hash iterators
+/// use (see `hash_iterator_tag`). A reference-wrapped tag
+/// names the blanket `&mut I` / `&I` impl, whose step is
+/// the pointee's, so the prefix is stripped before judging,
+/// as for the hash tags.
+pub fn collection_iterator_tag(self_ty: &str) -> bool {
+    let bare = self_ty
+        .strip_prefix("&mut ")
+        .or_else(|| self_ty.strip_prefix('&'))
+        .unwrap_or(self_ty);
+    [
+        "std::collections::linked_list::Iter<",
+        "std::collections::linked_list::IterMut<",
+        "std::collections::linked_list::IntoIter<",
+        "alloc::collections::linked_list::Iter<",
+        "alloc::collections::linked_list::IterMut<",
+        "alloc::collections::linked_list::IntoIter<",
+        "std::collections::vec_deque::Iter<",
+        "std::collections::vec_deque::IterMut<",
+        "std::collections::vec_deque::IntoIter<",
+        "alloc::collections::vec_deque::Iter<",
+        "alloc::collections::vec_deque::IterMut<",
+        "alloc::collections::vec_deque::IntoIter<",
+        "std::collections::binary_heap::Iter<",
+        "std::collections::binary_heap::IntoIter<",
+    ]
+    .iter()
+    .any(|prefix| bare.starts_with(prefix))
+}
+
+/// Whether this type is one of the concrete collection
+/// containers (`LinkedList` / `VecDeque` / `BinaryHeap`)
+/// whose by-value `IntoIterator` conversion builds a
+/// real-layout owning iterator the builtin does not model,
+/// so the collected body is the faithful execution (the
+/// hash containers' arrangement, see `hash_collection_tag`).
+pub fn collection_container_tag(self_ty: &str) -> bool {
+    [
+        "std::collections::LinkedList<",
+        "alloc::collections::LinkedList<",
+        "std::collections::VecDeque<",
+        "alloc::collections::VecDeque<",
+        "std::collections::BinaryHeap<",
+    ]
+    .iter()
+    .any(|prefix| self_ty.starts_with(prefix))
+}
+
+/// Whether the pointee of a reference `Self` type is a
+/// container whose own reference `IntoIterator` impl yields
+/// a distinct iterator type (`&mut VecDeque` yields
+/// `vec_deque::IterMut`, and so on), as opposed to an
+/// iterator type itself, for which the blanket
+/// `IntoIterator for &mut I` / `&I` impl is the identity.
+pub(super) fn ref_pointee_is_container(inner: &str) -> bool {
+    inner.starts_with('[')
+        || [
+            "std::vec::Vec<",
+            "alloc::vec::Vec<",
+            "std::collections::VecDeque<",
+            "alloc::collections::VecDeque<",
+            "std::collections::HashMap<",
+            "std::collections::HashSet<",
+            "std::collections::BTreeMap<",
+            "std::collections::BTreeSet<",
+            "std::collections::LinkedList<",
+            "alloc::collections::LinkedList<",
+            "std::collections::BinaryHeap<",
+            "std::string::String",
+            "alloc::string::String",
+            "std::boxed::Box<",
+            "alloc::boxed::Box<",
+            "std::option::Option<",
+            "core::option::Option<",
+        ]
+        .iter()
+        .any(|prefix| inner.starts_with(prefix))
+}
+
 /// Whether the modelled `ExactSizeIterator::len` serves
 /// this type: the slice-state iterators whose remaining
 /// count the unified bounds read (see
@@ -4146,6 +4442,10 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "std::fs::ReadDir")
         || self_ty_is(self_ty, "std::env::SplitPaths")
         || self_ty.starts_with("std::slice::Windows<")
+        || self_ty.starts_with("std::slice::Chunks<")
+        || self_ty.starts_with("std::slice::RChunks<")
+        || self_ty.starts_with("std::slice::ChunksExact<")
+        || self_ty.starts_with("std::slice::RChunksExact<")
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::sync::mpsc::Iter<")
         || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -4191,6 +4491,10 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::array::IntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
+        || self_ty.starts_with("std::slice::Chunks<")
+        || self_ty.starts_with("std::slice::RChunks<")
+        || self_ty.starts_with("std::slice::ChunksExact<")
+        || self_ty.starts_with("std::slice::RChunksExact<")
         || self_ty.starts_with("std::option::IntoIter<")
         || self_ty.starts_with("std::option::Iter<")
         || self_ty.starts_with("std::option::IterMut<")
@@ -4244,6 +4548,32 @@ pub(super) fn self_ty_is(self_ty: &str, name: &str) -> bool {
 }
 
 /// The fields of an iterator state value (ADT aggregate or tuple).
+/// The chunk size a chunk iterator state stores: a plain
+/// integer, or a `NonZero` size wrapped in one-field
+/// aggregates (the shape core's `chunks` constructors store).
+fn chunk_size_of(f: &Value, self_ty: &str) -> InterpResult<usize> {
+    let mut cur = f;
+    loop {
+        match cur {
+            Value::Uint(v) => return Ok(*v as usize),
+            Value::Int(v) if *v >= 0 => return Ok(*v as usize),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            Value::Tuple(fields) if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("chunk size of {self_ty}"),
+                    "non-zero integer",
+                    other.kind_name(),
+                ))
+            }
+        }
+    }
+}
+
 /// One step of an owned-sequence iterator state (see
 /// [`owned_iter_state`]): returns the new state and the yielded
 /// item, or `None` when the sequence is exhausted (the state is

@@ -2847,6 +2847,24 @@ impl<'a> Interpreter<'a> {
                     || self_ty_is(self_ty, "core::str::Chars")
                     || self_ty_is(self_ty, "std::str::Bytes")
                     || self_ty_is(self_ty, "core::str::Bytes")
+                    || self_ty.starts_with("std::collections::linked_list::Iter<")
+                    || self_ty.starts_with("std::collections::linked_list::IterMut<")
+                    || self_ty.starts_with("std::collections::linked_list::IntoIter<")
+                    || self_ty.starts_with("alloc::collections::linked_list::Iter<")
+                    || self_ty.starts_with("alloc::collections::linked_list::IterMut<")
+                    || self_ty.starts_with("alloc::collections::linked_list::IntoIter<")
+                    || self_ty.starts_with("std::collections::vec_deque::Iter<")
+                    || self_ty.starts_with("std::collections::vec_deque::IterMut<")
+                    || self_ty.starts_with("std::collections::vec_deque::IntoIter<")
+                    || self_ty.starts_with("alloc::collections::vec_deque::Iter<")
+                    || self_ty.starts_with("alloc::collections::vec_deque::IterMut<")
+                    || self_ty.starts_with("alloc::collections::vec_deque::IntoIter<")
+                    || self_ty.starts_with("std::collections::binary_heap::Iter<")
+                    || self_ty.starts_with("std::collections::binary_heap::IntoIter<")
+                    || self_ty.starts_with("std::slice::Chunks<")
+                    || self_ty.starts_with("std::slice::ChunksExact<")
+                    || self_ty.starts_with("std::slice::RChunks<")
+                    || self_ty.starts_with("std::slice::RChunksExact<")
                 {
                     // These types are their own iterator: the
                     // blanket `IntoIterator for I: Iterator` impl
@@ -3063,15 +3081,35 @@ impl<'a> Interpreter<'a> {
                         || inner.starts_with("core::option::Option<")
                     {
                         self.option_ref_into_iter(frames, &value, true)
-                    } else {
+                    } else if ref_pointee_is_container(inner) {
                         Err(unsupported(format!(
                             "IntoIterator::into_iter for {self_ty} is not runtime-supported"
                         )))
+                    } else {
+                        // The blanket `IntoIterator for &mut I`
+                        // (I: Iterator): the reference itself is
+                        // the iterator and is returned unchanged,
+                        // the identity the blanket body performs.
+                        // A container pointee, whose own `&mut`
+                        // impl yields a distinct IterMut type,
+                        // keeps the unsupported error above.
+                        Ok(value)
                     }
                 } else if self_ty.starts_with("&std::option::Option<")
                     || self_ty.starts_with("&core::option::Option<")
                 {
                     self.option_ref_into_iter(frames, &value, false)
+                } else if let Some(inner) = self_ty.strip_prefix('&') {
+                    if ref_pointee_is_container(inner) {
+                        Err(unsupported(format!(
+                            "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                        )))
+                    } else {
+                        // The blanket `IntoIterator for &I`
+                        // (I: Iterator): the reference itself is
+                        // the iterator, returned unchanged.
+                        Ok(value)
+                    }
                 } else {
                     Err(unsupported(format!(
                         "IntoIterator::into_iter for {self_ty} is not runtime-supported"

@@ -1427,14 +1427,36 @@ fn consumer_instance_needs_body(
         };
         return if canonical.ends_with("next") {
             hash_iterator_ty(ty)
+                || collection_iterator_ty(ty)
                 || (str_iter_ty(ty) && !str_split_char_ty(ty))
                 || foreign_adt_ty(ty)
         } else {
             hash_collection_ty(ty)
+                || collection_collection_ty(ty)
                 || drain_ty(ty)
                 || str_iter_ty(ty)
                 || foreign_adt_ty(ty)
         };
+    }
+    // The nested / in-place collect entries for `Vec`: the
+    // builtin pre-empts them for iterators the modelled
+    // state machine drains, but for a body-served iterator
+    // (a hash iterator or a concrete collection iterator)
+    // the entry's own body chain -- which steps the source
+    // through its collected `next` body -- is the only
+    // faithful execution, so the instance is collected (the
+    // conversion side lifts the pre-emption for the same
+    // shapes; see `body_served_iterator_arg`).
+    if matches!(
+        canonical,
+        "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter"
+            | "std::vec::in_place_collect::from_iter_in_place"
+            | "alloc::vec::in_place_collect::from_iter_in_place"
+    ) {
+        return args.0.iter().any(|arg| {
+            matches!(arg, GenericArgKind::Type(ty)
+                if hash_iterator_ty(ty) || collection_iterator_ty(ty))
+        });
     }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
@@ -1691,6 +1713,63 @@ fn hash_collection_ty(ty: &Ty) -> bool {
         ),
         Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => {
             hash_collection_ty(&inner) || hash_iterator_ty(&inner)
+        }
+        _ => false,
+    }
+}
+
+/// Whether this type is a concrete collection iterator
+/// (the `LinkedList` / `VecDeque` / `BinaryHeap` iterator
+/// forms), judged by the ADT definition name, as in
+/// `hash_iterator_ty`. The `&mut I` / `&I` blanket `Iterator`
+/// impls name the reference as their `Self` type, so a
+/// reference is peeled before judging.
+fn collection_iterator_ty(ty: &Ty) -> bool {
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return collection_iterator_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    [
+        "std::collections::linked_list::Iter",
+        "std::collections::linked_list::IntoIter",
+        "alloc::collections::linked_list::Iter",
+        "alloc::collections::linked_list::IntoIter",
+        "std::collections::vec_deque::Iter",
+        "std::collections::vec_deque::IntoIter",
+        "alloc::collections::vec_deque::Iter",
+        "alloc::collections::vec_deque::IntoIter",
+        "std::collections::binary_heap::Iter",
+        "std::collections::binary_heap::IntoIter",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether this `IntoIterator` `Self` type is a concrete
+/// collection container (`LinkedList` / `VecDeque` /
+/// `BinaryHeap`), or a reference to one, or a reference to
+/// a concrete collection iterator (the `&mut I` blanket
+/// impl) -- the shapes whose conversion builds a
+/// real-layout iterator the builtin does not model, as
+/// with `hash_collection_ty`.
+fn collection_collection_ty(ty: &Ty) -> bool {
+    if collection_iterator_ty(ty) {
+        return true;
+    }
+    match guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => matches!(
+            def.name().as_str(),
+            "std::collections::LinkedList"
+                | "alloc::collections::LinkedList"
+                | "std::collections::VecDeque"
+                | "alloc::collections::VecDeque"
+                | "std::collections::BinaryHeap"
+        ),
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => {
+            collection_collection_ty(&inner) || collection_iterator_ty(&inner)
         }
         _ => false,
     }

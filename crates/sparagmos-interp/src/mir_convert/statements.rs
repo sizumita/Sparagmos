@@ -267,8 +267,16 @@ impl<'a> Converter<'a> {
         // collected body here, exactly as the registry pre-empts
         // collection for directly named calls. The same holds
         // for the nested specialization entry the builtin also
-        // serves.
-        if Self::vec_from_iter_nested_entry(&name) {
+        // serves. The one exception is a body-served iterator
+        // (see `body_served_iterator_arg`): the builtin's
+        // drain drives the modelled `next` state machine,
+        // which cannot step a hash table or a concrete
+        // collection iterator, so for those sources the
+        // collected body chain is the only faithful execution
+        // and the pre-emption is lifted.
+        if Self::vec_from_iter_nested_entry(&name)
+            && !self.body_served_iterator_arg(func)
+        {
             return None;
         }
         // An iterator consumer (`count` / `fold` / `for_each` /
@@ -319,6 +327,30 @@ impl<'a> Converter<'a> {
             return None;
         }
         Some(name)
+    }
+
+    /// Whether any of the call's generic arguments is an
+    /// iterator type the modelled consumers cannot drain: a
+    /// hash-collection iterator or one of the concrete
+    /// collection iterators whose collected `next` bodies are
+    /// the faithful execution (see
+    /// `builtins::collection_iterator_tag`). The in-place /
+    /// nested collect entries are pre-empted by the builtin
+    /// only for iterators the state machine serves; for a
+    /// body-served iterator the entry's own body chain --
+    /// which steps the source through its collected `next`
+    /// body -- is the faithful execution, and the builtin's
+    /// drain would fail on the first step.
+    fn body_served_iterator_arg(&self, func: &mir::Operand) -> bool {
+        let Some((_, _, raw_generic_args)) = self.resolve_external_callee(func)
+        else {
+            return false;
+        };
+        raw_generic_args.iter().any(|ty| {
+            let tag = crate::builtins::ty_tag(ty, self.names);
+            crate::builtins::hash_iterator_tag(&tag)
+                || crate::builtins::collection_iterator_tag(&tag)
+        })
     }
 
     /// The guest allocation shim serving a call to one of the
@@ -514,11 +546,13 @@ impl<'a> Converter<'a> {
         // the body is preferred exactly for the hash shapes.
         match kind {
             crate::builtins::Builtin::IteratorNext => {
-                return crate::builtins::hash_iterator_tag(&tag)
+                return (crate::builtins::hash_iterator_tag(&tag)
+                    || crate::builtins::collection_iterator_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
             }
             crate::builtins::Builtin::IntoIter => {
-                return crate::builtins::hash_collection_tag(&tag)
+                return (crate::builtins::hash_collection_tag(&tag)
+                    || crate::builtins::collection_container_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
             }
             _ => {}
