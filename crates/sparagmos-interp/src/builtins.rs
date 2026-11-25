@@ -14016,6 +14016,33 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
     }
 
+    /// Re-read the value a clone source reference denotes
+    /// right now, in place of the snapshot taken when the
+    /// conversion began: the real field-wise construction
+    /// reads each field and element from live storage as it
+    /// reaches it, so a part cloned after an earlier part's
+    /// `Clone` body ran observes that body's mutations
+    /// through interior mutability (a sibling field's `Cell`
+    /// the earlier clone rewrote, reached through a stored
+    /// reference or pointer). The snapshot stays the value
+    /// cloned when the target denotes no readable storage,
+    /// or when the read fails: such a source has no live
+    /// storage a clone body could have written through, so
+    /// the snapshot is all there is to observe.
+    fn clone_reread_source(
+        &self,
+        frames: &[Frame],
+        target: &RefTarget,
+        snapshot: &Value,
+    ) -> Value {
+        let resolved = match self.deref_value(frames, &Value::Ref(target.clone())) {
+            Ok(resolved) => resolved,
+            Err(_) => return snapshot.clone(),
+        };
+        self.read_resolved(frames, &resolved)
+            .unwrap_or_else(|_| snapshot.clone())
+    }
+
     /// Clone one element of a slice being re-owned by a
     /// `From<&[T]>` / borrowed-`Cow<[T]>` conversion to
     /// `Box<[T]>`, where the element type tag `elem_ty` is
@@ -14217,6 +14244,14 @@ fn value_fingerprint(value: &Value) -> u64 {
         let mut cloned: Vec<(Value, Option<crate::ir::DropGlue>)> =
             Vec::with_capacity(elements.len());
         for (e, e_ref) in elements {
+            // The element is read from its live source right
+            // before it is cloned: an earlier element's clone
+            // may have rewritten it through interior
+            // mutability (see `clone_reread_source`).
+            let live = e_ref
+                .as_ref()
+                .map(|target| self.clone_reread_source(frames, target, e));
+            let e = live.as_ref().unwrap_or(e);
             match self.clone_boxed_slice_element(
                 frames,
                 e,
@@ -14325,6 +14360,15 @@ fn value_fingerprint(value: &Value) -> u64 {
                     let field_glue = glue.and_then(|g| g.field_plan(None, i));
                     let field_ref =
                         value_ref.and_then(|t| t.projected(RefProj::Field(i)));
+                    // The field is read from its live source
+                    // right before it is cloned: an earlier
+                    // field's clone may have rewritten it
+                    // through interior mutability (see
+                    // `clone_reread_source`).
+                    let live = field_ref
+                        .as_ref()
+                        .map(|target| self.clone_reread_source(frames, target, f));
+                    let f = live.as_ref().unwrap_or(f);
                     match self.clone_boxed_slice_element(
                         frames,
                         f,
@@ -14366,6 +14410,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                 for (i, f) in items.iter().enumerate() {
                     let elem_ref =
                         value_ref.and_then(|t| t.projected(RefProj::Index(i)));
+                    let live = elem_ref
+                        .as_ref()
+                        .map(|target| self.clone_reread_source(frames, target, f));
+                    let f = live.as_ref().unwrap_or(f);
                     match self.clone_boxed_slice_element(
                         frames,
                         f,
@@ -14410,6 +14458,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                     for (i, f) in fields.iter().enumerate() {
                         let elem_ref =
                             value_ref.and_then(|t| t.projected(RefProj::Index(i)));
+                        let live = elem_ref
+                            .as_ref()
+                            .map(|target| self.clone_reread_source(frames, target, f));
+                        let f = live.as_ref().unwrap_or(f);
                         match self.clone_boxed_slice_element(
                             frames,
                             f,
@@ -14434,6 +14486,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                     for (i, f) in elems.iter().enumerate() {
                         let elem_ref =
                             value_ref.and_then(|t| t.projected(RefProj::Index(i)));
+                        let live = elem_ref
+                            .as_ref()
+                            .map(|target| self.clone_reread_source(frames, target, f));
+                        let f = live.as_ref().unwrap_or(f);
                         match self.clone_boxed_slice_element(
                             frames,
                             f,
@@ -14477,6 +14533,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                     glue.and_then(|g| g.field_plan(Some(*variant as usize), i));
                 let field_ref =
                     value_ref.and_then(|t| t.projected(RefProj::Field(i)));
+                let live = field_ref
+                    .as_ref()
+                    .map(|target| self.clone_reread_source(frames, target, f));
+                let f = live.as_ref().unwrap_or(f);
                 match self.clone_boxed_slice_element(
                     frames,
                     f,
@@ -14534,6 +14594,10 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let capture_glue = glue.and_then(|g| g.field_plan(None, i));
                 let capture_ref =
                     value_ref.and_then(|t| t.projected(RefProj::Field(i)));
+                let live = capture_ref
+                    .as_ref()
+                    .map(|target| self.clone_reread_source(frames, target, capture));
+                let capture = live.as_ref().unwrap_or(capture);
                 match self.clone_boxed_slice_element(
                     frames,
                     capture,

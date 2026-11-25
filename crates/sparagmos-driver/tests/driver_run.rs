@@ -8135,6 +8135,136 @@ fn run_mode_boxed_slice_from_slice_ref_custom_clone_gets_source_ref() {
     );
 }
 
+const BOXED_SLICE_FROM_SLICE_REF_CLONE_READS_FIELDS_LIVE_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Bump {
+    target: *const Cell<i32>,
+}
+
+impl Clone for Bump {
+    fn clone(&self) -> Self {
+        unsafe {
+            if !self.target.is_null() {
+                (*self.target).set(42);
+            }
+        }
+        Bump { target: self.target }
+    }
+}
+
+struct E {
+    target: *const Cell<i32>,
+    cell: Cell<i32>,
+}
+
+impl Clone for E {
+    fn clone(&self) -> Self {
+        unsafe {
+            if !self.target.is_null() {
+                (*self.target).set(43);
+            }
+        }
+        E { target: self.target, cell: Cell::new(self.cell.get()) }
+    }
+}
+
+#[derive(Clone)]
+struct Pair {
+    bump: Bump,
+    cell: Cell<i32>,
+}
+
+fn main() {
+    // 1. Tuple element: field 0's Clone mutates field 1 (a
+    //    Cell) through a pointer to the tuple's own second
+    //    field. The field-wise construction reads field 1
+    //    after field 0's clone ran, so the clone holds 42.
+    {
+        let mut src = [(Bump { target: std::ptr::null() }, Cell::new(0))];
+        src[0].0.target = &src[0].1 as *const Cell<i32>;
+        let s: &[(Bump, Cell<i32>)] = &src;
+        let boxed: Box<[(Bump, Cell<i32>)]> = Box::from(s);
+        println!("tuple boxed={} src={}", boxed[0].1.get(), src[0].1.get());
+    }
+    // 2. Array element: item 0's Clone mutates item 1's cell.
+    {
+        let mut src = [[
+            E { target: std::ptr::null(), cell: Cell::new(0) },
+            E { target: std::ptr::null(), cell: Cell::new(0) },
+        ]];
+        src[0][0].target = &src[0][1].cell as *const Cell<i32>;
+        let s: &[[E; 2]] = &src;
+        let boxed: Box<[[E; 2]]> = Box::from(s);
+        println!("array boxed={} src={}", boxed[0][1].cell.get(), src[0][1].cell.get());
+    }
+    // 3. Nested tuple: the mutation crosses one structural
+    //    level (the outer field 0 is an inner tuple whose
+    //    field 0 mutates the outer field 1).
+    {
+        let mut src = [((Bump { target: std::ptr::null() }, 7u32), Cell::new(0))];
+        src[0].0 .0.target = &src[0].1 as *const Cell<i32>;
+        let s: &[((Bump, u32), Cell<i32>)] = &src;
+        let boxed: Box<[((Bump, u32), Cell<i32>)]> = Box::from(s);
+        println!("nested boxed={} src={}", boxed[0].1.get(), src[0].1.get());
+    }
+    // 4. Cross-element: element 0's field clone mutates
+    //    element 1's cell field in the source slice.
+    {
+        let mut src = [
+            (Bump { target: std::ptr::null() }, Cell::new(0)),
+            (Bump { target: std::ptr::null() }, Cell::new(0)),
+        ];
+        src[0].0.target = &src[1].1 as *const Cell<i32>;
+        let s: &[(Bump, Cell<i32>)] = &src;
+        let boxed: Box<[(Bump, Cell<i32>)]> = Box::from(s);
+        println!("cross boxed={} src={}", boxed[1].1.get(), src[1].1.get());
+    }
+    // 5. Struct element: the first field's Clone mutates the
+    //    second field.
+    {
+        let mut src = [Pair { bump: Bump { target: std::ptr::null() }, cell: Cell::new(0) }];
+        src[0].bump.target = &src[0].cell as *const Cell<i32>;
+        let s: &[Pair] = &src;
+        let boxed: Box<[Pair]> = Box::from(s);
+        println!("struct boxed={} src={}", boxed[0].cell.get(), src[0].cell.get());
+    }
+    // 6. Vec element: item 0's field clone mutates item 1's
+    //    cell inside the vector.
+    {
+        let mut src = [vec![
+            (Bump { target: std::ptr::null() }, Cell::new(0)),
+            (Bump { target: std::ptr::null() }, Cell::new(0)),
+        ]];
+        src[0][0].0.target = &src[0][1].1 as *const Cell<i32>;
+        let s: &[Vec<(Bump, Cell<i32>)>] = &src;
+        let boxed: Box<[Vec<(Bump, Cell<i32>)>]> = Box::from(s);
+        println!("vec boxed={} src={}", boxed[0][1].1.get(), src[0][1].1.get());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_slice_ref_clone_reads_fields_live() {
+    let dir = temp_dir("boxed-from-slice-ref-clone-reads-fields-live");
+    let src = fixture(
+        &dir,
+        "boxed_from_slice_ref_clone_reads_fields_live.rs",
+        BOXED_SLICE_FROM_SLICE_REF_CLONE_READS_FIELDS_LIVE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a field cloned after a sibling's Clone rewrote it must observe the mutation; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "tuple boxed=42 src=42\narray boxed=43 src=43\nnested boxed=42 src=42\ncross boxed=42 src=42\nstruct boxed=42 src=42\nvec boxed=42 src=42\n"
+    );
+}
+
 const BOXED_SLICE_FROM_SLICE_REF_CLONE_PANIC_AGGREGATE_DROP_ORDER_SRC: &str = r#"
 struct G(i32);
 impl Clone for G {
