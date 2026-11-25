@@ -184,6 +184,19 @@ class ApplicabilityTests(unittest.TestCase):
         self.assertEqual(status, "unevaluatable")
         self.assertIn("needs-sanitizer-support", why)
 
+    def test_ignore_auxiliary_out_of_environment(self):
+        # compiletest registers the `auxiliary` condition as true
+        # unconditionally (prepare_conditions in directives/cfg.rs):
+        # the file is "used by another main test file" and is never
+        # run as a test itself, on any host.
+        self.assertTrue(run.eval_condition("auxiliary"))
+        status, why = run.applicability(header("//@ ignore-auxiliary\n"))
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("ignore-auxiliary", why)
+        # An ordinary bare-name ignore still follows the host: it
+        # does not match here.
+        self.assertFalse(run.eval_condition("windows"))
+
 
 class FakeFacts:
     """Canned ToolchainFacts answers for eval_needs tests."""
@@ -676,6 +689,18 @@ class ProcessTestTests(unittest.TestCase):
         res = run.process_test(rec, self.rust_dir, Path("/fake/driver"))
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("nature", res["bucket"])
+
+    def test_ignore_auxiliary_compile_check_not_attempted(self):
+        # A compile-check record for an auxiliary file is classified
+        # out of environment by the stage-2 entry, before any side
+        # runs: compiletest never runs the file as a test.
+        rec = self.write_test("//@ ignore-auxiliary\npub fn helper() {}\n")
+        rec["nature"] = "compile-check"
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "out of environment")
+        self.assertIn("ignore-auxiliary", res["reason"])
 
 
 
