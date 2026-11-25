@@ -865,3 +865,119 @@ fn run_mode_scheduler_harness_test_body_interleaves() {
         "stdout={stdout}"
     );
 }
+
+// ----- mpsc iterators behind adapters (Issue #513) -----
+//
+// The mpsc iterator step (`Iter` / `IntoIter` blocking on
+// `recv`, `TryIter` on `try_recv`) lives in
+// `iterator_next_state`; the adapter arms (`Take`, `Map`,
+// ...) step their inner iterators through `next_on_state`,
+// which had no mpsc arms, so an mpsc iterator behind an
+// adapter died with "Iterator::next for
+// std::sync::mpsc::Iter<usize> is not runtime-supported" --
+// the shape `tests/ui/threads-sendsync/mpsc_stress.rs`
+// reaches through `rx.iter().take(N).collect()`.
+
+const MPSC_ITER_TAKE_SRC: &str = r#"
+use std::sync::mpsc::channel;
+fn main() {
+    let (tx, rx) = channel();
+    for i in 0..5usize { tx.send(i).unwrap(); }
+    let v: Vec<_> = rx.iter().take(3).collect();
+    println!("take: {v:?}");
+}
+"#;
+
+#[test]
+fn run_mode_mpsc_iter_take_collect() {
+    run_ok("mpsc-iter-take", MPSC_ITER_TAKE_SRC, "take: [0, 1, 2]\n");
+}
+
+const MPSC_ITER_TAKE_BLOCKING_SRC: &str = r#"
+use std::sync::mpsc::channel;
+use std::thread;
+fn main() {
+    let (tx, rx) = channel::<usize>();
+    let th = thread::spawn(move || {
+        for i in 0..4usize { tx.send(i).expect("send"); }
+    });
+    let mut v: Vec<_> = rx.iter().take(4).collect();
+    v.sort();
+    println!("take: {v:?}");
+    th.join().unwrap();
+}
+"#;
+
+#[test]
+fn run_mode_mpsc_iter_take_blocking_producer() {
+    // The blocking `recv` inside the adapter step runs
+    // scheduling rounds: the spawned producer is driven
+    // while the entry thread waits on the empty channel.
+    run_ok(
+        "mpsc-iter-take-blocking",
+        MPSC_ITER_TAKE_BLOCKING_SRC,
+        "take: [0, 1, 2, 3]\n",
+    );
+}
+
+const MPSC_INTO_ITER_BLOCKING_SRC: &str = r#"
+use std::sync::mpsc::channel;
+use std::thread;
+fn main() {
+    let (tx, rx) = channel::<usize>();
+    let _ = tx.clone(); // convert to shared; the clone drops at once
+    let th = thread::spawn(move || {
+        tx.send(17).expect("send");
+        drop(tx);
+    });
+    let v: Vec<_> = rx.into_iter().collect();
+    println!("into_iter: {v:?}");
+    th.join().unwrap();
+}
+"#;
+
+#[test]
+fn run_mode_mpsc_into_iter_blocking_collect() {
+    // The only live sender is the spawned thread's: the
+    // collect must not report a would-block error before
+    // that thread has run, and must end when it drops the
+    // sender after sending.
+    run_ok(
+        "mpsc-into-iter-blocking",
+        MPSC_INTO_ITER_BLOCKING_SRC,
+        "into_iter: [17]\n",
+    );
+}
+
+const MPSC_TRY_ITER_TAKE_SRC: &str = r#"
+use std::sync::mpsc::channel;
+fn main() {
+    let (tx, rx) = channel::<usize>();
+    tx.send(1).unwrap();
+    tx.send(2).unwrap();
+    tx.send(3).unwrap();
+    let v: Vec<_> = rx.try_iter().take(2).collect();
+    println!("try_take: {v:?}");
+}
+"#;
+
+#[test]
+fn run_mode_mpsc_try_iter_take_collect() {
+    run_ok("mpsc-try-iter-take", MPSC_TRY_ITER_TAKE_SRC, "try_take: [1, 2]\n");
+}
+
+const MPSC_ITER_MAP_SRC: &str = r#"
+use std::sync::mpsc::channel;
+fn main() {
+    let (tx, rx) = channel::<usize>();
+    tx.send(2).unwrap();
+    drop(tx);
+    let v: Vec<_> = rx.iter().map(|x| x * 10).collect();
+    println!("map: {v:?}");
+}
+"#;
+
+#[test]
+fn run_mode_mpsc_iter_map_collect() {
+    run_ok("mpsc-iter-map", MPSC_ITER_MAP_SRC, "map: [20]\n");
+}
