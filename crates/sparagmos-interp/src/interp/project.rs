@@ -2086,6 +2086,33 @@ pub(crate) fn project_value_ev(
                         check_subslice(fields.len(), start, *len)?;
                         Value::Tuple(fields[start..end].to_vec())
                     }
+                    // A sparse vector value (see
+                    // `Value::SparseVec`): the window's elements
+                    // as a slice value, as for the aggregate form
+                    // above -- the stored elements read as
+                    // themselves and the unmaterialised tail as
+                    // the uninitialised slots it denotes, exactly
+                    // as the sparse `Index` arm reads one element.
+                    // The window is bounded by the declared
+                    // length: the elements of the vector value
+                    // are its first `len`, whatever spare
+                    // capacity the storage accounts beyond them.
+                    Value::SparseVec {
+                        ref elems,
+                        len: vec_len,
+                        ..
+                    } => {
+                        let total =
+                            usize::try_from(vec_len).unwrap_or(usize::MAX);
+                        check_subslice(total, start, *len)?;
+                        Value::Tuple(
+                            (start..end)
+                                .map(|i| {
+                                    elems.get(i).cloned().unwrap_or(Value::Uninit)
+                                })
+                                .collect(),
+                        )
+                    }
                     // A sub-slice of a fat reference value (a
                     // constant slice's representation): a zero
                     // offset only adjusts the carried length; a
@@ -3228,6 +3255,22 @@ pub(crate) fn project_value_ref_ev<'a>(
                         check_subslice(fields.len(), start, *len)?;
                         Value::Tuple(fields[start..end].to_vec())
                     }
+                    Value::SparseVec {
+                        elems,
+                        len: vec_len,
+                        ..
+                    } => {
+                        let total =
+                            usize::try_from(*vec_len).unwrap_or(usize::MAX);
+                        check_subslice(total, start, *len)?;
+                        Value::Tuple(
+                            (start..end)
+                                .map(|i| {
+                                    elems.get(i).cloned().unwrap_or(Value::Uninit)
+                                })
+                                .collect(),
+                        )
+                    }
                     Value::FatRef {
                         base,
                         len: fat_len,
@@ -3932,6 +3975,48 @@ pub(crate) fn navigate_mut_grow<'x>(
                             }
                             navigate_mut_grow(
                                 &mut fields[target],
+                                rest,
+                                func,
+                                place,
+                                grow,
+                                None,
+                                None,
+                            )
+                        }
+                        // A sparse vector value (see
+                        // `Value::SparseVec`): the composed index
+                        // addresses a storage slot under the same
+                        // discipline as the sparse `Index` arm --
+                        // the write must land within the storage
+                        // the value accounts, a slot one past the
+                        // stored end extends the storage by the
+                        // element being written, and a write into
+                        // the unmaterialised tail materialises the
+                        // gap with uninitialised slots, bounded by
+                        // the same materialisation limit.
+                        Value::SparseVec { elems, cap, .. } => {
+                            let extent = (*cap).max(elems.len() as u128);
+                            if target as u128 > extent {
+                                return Err(index_oob(extent as usize, target));
+                            }
+                            if target >= elems.len()
+                                && target
+                                    >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS
+                            {
+                                return Err(InterpError::UnsupportedProjection {
+                                    kind: format!(
+                                        "index write at {target} into a vector whose elements are not materialised"
+                                    ),
+                                });
+                            }
+                            if target >= elems.len() {
+                                elems.resize(target + 1, Value::Uninit);
+                                if (elems.len() as u128) > *cap {
+                                    *cap = elems.len() as u128;
+                                }
+                            }
+                            navigate_mut_grow(
+                                &mut elems[target],
                                 rest,
                                 func,
                                 place,

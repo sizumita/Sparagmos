@@ -2564,6 +2564,21 @@ pub(crate) fn subslice_value(value: &Value, offset: usize, len: usize) -> Option
         }
         Value::Bytes(b) => Some(Value::Bytes(b.get(offset..end)?.to_vec())),
         Value::Str(text) => Some(Value::Str(text.get(offset..end)?.to_string())),
+        // A sparse vector value: the window's elements as a
+        // tuple, as for the aggregate forms above -- the stored
+        // elements as themselves and the unmaterialised tail as
+        // the uninitialised slots it denotes. The window is
+        // bounded by the declared length, as in the projectors.
+        Value::SparseVec { elems, len, .. } => {
+            if end as u128 > *len {
+                return None;
+            }
+            Some(Value::Tuple(
+                (offset..end)
+                    .map(|i| elems.get(i).cloned().unwrap_or(Value::Uninit))
+                    .collect(),
+            ))
+        }
         _ => None,
     }
 }

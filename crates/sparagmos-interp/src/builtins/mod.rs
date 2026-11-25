@@ -349,4 +349,38 @@ mod tests {
             None
         );
     }
+
+    /// The guard tag parser the `format_value` forwarding arm
+    /// keys on: without it the arm never fires (the driver
+    /// tests for guard formatting fail with it broken), and a
+    /// loose match would forward for the cell itself.
+    #[test]
+    fn guard_elem_tag_names_the_guarded_type() {
+        // Both crate spellings, the lifetime rendered or
+        // elided, and both guard types.
+        assert_eq!(
+            guard_elem_tag("std::cell::Ref<'_, i32>"),
+            Some("i32".to_string())
+        );
+        assert_eq!(
+            guard_elem_tag("core::cell::Ref<'a, String>"),
+            Some("String".to_string())
+        );
+        assert_eq!(guard_elem_tag("std::cell::Ref<i32>"), Some("i32".to_string()));
+        assert_eq!(
+            guard_elem_tag("std::cell::RefMut<'_, alloc::vec::Vec<i32>>"),
+            Some("alloc::vec::Vec<i32>".to_string())
+        );
+        assert_eq!(
+            guard_elem_tag("&std::cell::Ref<'_, bool>"),
+            Some("bool".to_string())
+        );
+        // The cell itself and unrelated types are not guards:
+        // the head must be followed directly by the argument
+        // list.
+        assert_eq!(guard_elem_tag("std::cell::RefCell<i32>"), None);
+        assert_eq!(guard_elem_tag("std::cell::RefCell<'_, i32>"), None);
+        assert_eq!(guard_elem_tag("my_crate::Ref<'_, i32>"), None);
+        assert_eq!(guard_elem_tag("i32"), None);
+    }
 }

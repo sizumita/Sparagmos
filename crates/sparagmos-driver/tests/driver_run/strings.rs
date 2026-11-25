@@ -477,6 +477,264 @@ fn run_mode_debug_format_mut_vec_slice() {
     );
 }
 
+const REFCELL_GUARD_DISPLAY_SRC: &str = r#"
+use std::cell::RefCell;
+
+fn main() {
+    let c = RefCell::new(42i32);
+    println!("display-ref: {}", c.borrow());
+    {
+        let mut m = c.borrow_mut();
+        *m += 1;
+        println!("display-refmut: {}", m);
+    }
+    let s = RefCell::new(String::from("hello"));
+    println!("str-guard: {}", s.borrow());
+    let arr = [RefCell::new(7i32), RefCell::new(8i32)];
+    println!("from-array: {}", arr[0].borrow());
+}
+"#;
+
+#[test]
+fn run_mode_refcell_guard_display_formats_pointee() {
+    let dir = temp_dir("refcell-guard-display");
+    let src = fixture(&dir, "refcell_guard_display.rs", REFCELL_GUARD_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Display for a RefCell guard formats the guarded value; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "display-ref: 42\ndisplay-refmut: 43\nstr-guard: hello\nfrom-array: 7\n"
+    );
+}
+
+const REFCELL_GUARD_DEBUG_SRC: &str = r#"
+use std::cell::RefCell;
+
+fn main() {
+    let c = RefCell::new(42i32);
+    println!("debug-ref: {:?}", c.borrow());
+    let s = RefCell::new(String::from("hello"));
+    println!("str-guard-debug: {:?}", s.borrow());
+    let v = RefCell::new(vec![1, 2, 3]);
+    println!("vec-guard-debug: {:?}", v.borrow());
+}
+"#;
+
+#[test]
+fn run_mode_refcell_guard_debug_formats_pointee() {
+    let dir = temp_dir("refcell-guard-debug");
+    let src = fixture(&dir, "refcell_guard_debug.rs", REFCELL_GUARD_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Debug for a RefCell guard formats the guarded value, not the guard aggregate; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "debug-ref: 42\nstr-guard-debug: \"hello\"\nvec-guard-debug: [1, 2, 3]\n"
+    );
+}
+
+const REFCELL_GUARD_MAPPED_SRC: &str = r#"
+use std::cell::{Ref, RefCell};
+
+fn main() {
+    let c = RefCell::new(42i32);
+    let mapped: Ref<'_, i32> = Ref::map(c.borrow(), |v| v);
+    println!("mapped: {}", mapped);
+    let p = RefCell::new((11i32, 22i32));
+    let f = Ref::map(p.borrow(), |v| &v.1);
+    println!("field: {}", f);
+    let t = c.try_borrow().unwrap();
+    println!("try: {}", t);
+}
+"#;
+
+#[test]
+fn run_mode_refcell_guard_mapped_formats_pointee() {
+    let dir = temp_dir("refcell-guard-mapped");
+    let src = fixture(&dir, "refcell_guard_mapped.rs", REFCELL_GUARD_MAPPED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a guard built by Ref::map's converted body formats its pointee like a builtin-built one; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mapped: 42\nfield: 22\ntry: 42\n"
+    );
+}
+
+const REFCELL_GUARD_CUSTOM_SRC: &str = r#"
+use std::cell::RefCell;
+use std::fmt;
+
+struct Point { x: i32, y: i32 }
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "P({},{})", self.x, self.y)
+    }
+}
+
+impl fmt::Debug for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Pt[{},{}]", self.x, self.y)
+    }
+}
+
+fn main() {
+    let c = RefCell::new(42i32);
+    println!("width: [{:>6}]", c.borrow());
+    println!("width-debug: [{:^8?}]", c.borrow());
+    let p = RefCell::new(Point { x: 3, y: 4 });
+    println!("custom: {}", p.borrow());
+    println!("custom-debug: {:?}", p.borrow());
+}
+"#;
+
+#[test]
+fn run_mode_refcell_guard_format_options_and_custom_pointee() {
+    let dir = temp_dir("refcell-guard-custom");
+    let src = fixture(&dir, "refcell_guard_custom.rs", REFCELL_GUARD_CUSTOM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guard formatting forwards the placeholder options and runs the pointee's own impl body; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "width: [    42]\nwidth-debug: [   42   ]\ncustom: P(3,4)\ncustom-debug: Pt[3,4]\n"
+    );
+}
+
+const RANGE_SLICE_VIEW_SPARSE_SRC: &str = r#"
+use std::cell::Cell;
+
+fn main() {
+    let mut v: Vec<Cell<i32>> = Vec::new();
+    for i in 0..6 {
+        v.push(Cell::new(i * 10));
+    }
+    let view = &v[1..4];
+    view[0].set(111);
+    view[2].set(333);
+    println!("src: {} {} {}", v[1].get(), v[2].get(), v[3].get());
+    v[2].set(222);
+    println!("view: {} {} {}", view[0].get(), view[1].get(), view[2].get());
+}
+"#;
+
+#[test]
+fn run_mode_range_slice_view_sparse_cell_writes_reach_source() {
+    let dir = temp_dir("range-slice-view-sparse");
+    let src = fixture(&dir, "range_slice_view_sparse.rs", RANGE_SLICE_VIEW_SPARSE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a shared range slice over sparse-backed storage must alias it, not snapshot it; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "src: 111 20 333\nview: 111 222 333\n"
+    );
+}
+
+const RANGE_SLICE_VIEW_SPARSE_KINDS_SRC: &str = r#"
+use std::cell::Cell;
+
+fn main() {
+    let mut v: Vec<Cell<i32>> = Vec::with_capacity(100);
+    for i in 0..6 { v.push(Cell::new(i * 10)); }
+    let tail = &v[3..];
+    tail[0].set(300);
+    println!("from: {}", v[3].get());
+    let head = &v[..2];
+    head[1].set(100);
+    println!("to: {}", v[1].get());
+    let full = &v[..];
+    full[4].set(400);
+    println!("full: {}", v[4].get());
+    let incl = &v[1..=2];
+    incl[1].set(222);
+    println!("incl: {}", v[2].get());
+    let nested = &v[1..5][1..3];
+    nested[0].set(999);
+    println!("nested: {}", v[2].get());
+    let mut w: Vec<i32> = Vec::new();
+    for i in 0..6 { w.push(i * 10); }
+    println!("win: {:?}", &w[1..4]);
+    println!("winfmt: {:?}", &w[2..]);
+    let view = &v[2..5];
+    let e = &view[1];
+    e.set(333);
+    println!("elem: {}", v[3].get());
+}
+"#;
+
+#[test]
+fn run_mode_range_slice_view_sparse_range_kinds_alias_source() {
+    let dir = temp_dir("range-slice-view-sparse-kinds");
+    let src = fixture(
+        &dir,
+        "range_slice_view_sparse_kinds.rs",
+        RANGE_SLICE_VIEW_SPARSE_KINDS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "every range kind over sparse-backed storage must alias it; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from: 300\nto: 100\nfull: 400\nincl: 222\nnested: 999\nwin: [10, 20, 30]\nwinfmt: [20, 30, 40, 50]\nelem: 333\n"
+    );
+}
+
+const RANGE_SLICE_MUT_SPARSE_SRC: &str = r#"
+use std::cell::Cell;
+
+fn main() {
+    let mut v: Vec<Cell<i32>> = Vec::new();
+    for i in 0..6 {
+        v.push(Cell::new(i * 10));
+    }
+    let view = &mut v[1..4];
+    view[0].set(111);
+    println!("src: {}", v[1].get());
+}
+"#;
+
+#[test]
+fn run_mode_range_slice_mut_sparse_cell_writes_reach_source() {
+    let dir = temp_dir("range-slice-mut-sparse");
+    let src = fixture(&dir, "range_slice_mut_sparse.rs", RANGE_SLICE_MUT_SPARSE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a mutable range slice over sparse-backed storage must navigate its elements; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "src: 111\n");
+}
+
+
 #[test]
 fn run_mode_byte_string_pattern_match() {
     let dir = temp_dir("bytes-match");
