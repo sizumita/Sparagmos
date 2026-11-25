@@ -28,6 +28,36 @@ fn run_driver(src: &Path) -> Output {
         .expect("failed to run sparagmos-driver")
 }
 
+fn run_driver_opt(src: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--rustc-arg")
+        .arg("-O")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+fn assert_run_opt(tag: &str, src: &str, expected_stdout: &str) {
+    let dir = temp_dir(tag);
+    let src = fixture(&dir, "prog.rs", src);
+    let out = run_driver_opt(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected_stdout,
+        "stdout must match the native run"
+    );
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "sparagmos-driver-exec-conversion-{}-{tag}",
@@ -168,6 +198,51 @@ fn main() {
 }
 "#;
     assert_run("eii-default", src, "5\n");
+}
+
+// A defaulted EII declaration with an explicit implementation:
+// the registry then holds two implementations (the default,
+// registered under an item carrying the declaration's own
+// name, and the explicit one), and the explicit implementation
+// overrides the default. The unmodified driver required
+// exactly one registered implementation and read the
+// declaration as uninitialised storage.
+#[test]
+fn eii_static_explicit_impl_overrides_default() {
+    let src = r#"#![feature(extern_item_impls)]
+
+#[eii(eii1)]
+pub static DECL1: u64 = 5;
+
+#[eii1]
+pub static EII1_IMPL: u64 = 10;
+
+fn main() {
+    println!("{DECL1}");
+}
+"#;
+    assert_run("eii-default-explicit", src, "10\n");
+}
+
+// At -O a small vec is built as a `Box<MaybeUninit<[i8; 2]>>`:
+// the guest writes the array through the union's declared
+// members (`value: ManuallyDrop<T>`) into fresh allocation
+// storage, and the later slice read dereferences the pointer
+// the `assume_init` transmute produced. The write must
+// partially initialise the fresh union storage instead of
+// erroring on the never-written member, and the read must
+// enter the raw two-field storage form the field-by-field
+// write produced (the payload sits in the `value` member,
+// not in the normalised one-field form), judging the payload
+// against the slice pointee. The unmodified driver failed
+// the write with an uninitialised read and, past it, the
+// read with a transmute type mismatch.
+#[test]
+fn optimized_vec_element_read_through_slice() {
+    let src = r#"fn qux(z: &[i8]) -> i8 { z[0] + z[1] }
+fn main() { let z = vec![42i8, 43]; println!("{}", qux(&z)); }
+"#;
+    assert_run_opt("vec-opt-slice-read", src, "85\n");
 }
 
 // `Iterator::all` funnels into the specialised `try_fold` of

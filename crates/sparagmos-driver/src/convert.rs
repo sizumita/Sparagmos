@@ -420,10 +420,12 @@ fn static_is_foreign(def: &mir::mono::StaticDef) -> bool {
 /// as an implementation too - and that implementation is an
 /// ordinary static whose storage IS the declaration's storage.
 /// The compiler's `externally_implementable_items` registry
-/// names it. `None` when the item is not an EII declaration,
-/// when no implementation is registered, when several are
-/// (the compiler reports the duplication itself), or when the
-/// implementation cannot be named as a `StaticDef`.
+/// names them; an explicit implementation overrides the
+/// default (see the selection in the body). `None` when the
+/// item is not an EII declaration, when no implementation is
+/// registered, when the registrations do not resolve to one
+/// implementation, or when the implementation cannot be named
+/// as a `StaticDef`.
 fn eii_impl_static(
     def: &mir::mono::StaticDef,
 ) -> Option<mir::mono::StaticDef> {
@@ -433,10 +435,31 @@ fn eii_impl_static(
             rustc_public::rustc_internal::internal(tcx, def.def_id());
         let map = tcx.externally_implementable_items(internal.krate);
         let (_, impls) = map.get(&internal)?;
-        if impls.len() != 1 {
-            return None;
-        }
-        let impl_internal = *impls.keys().next()?;
+        // The registry holds every implementation of the
+        // declaration, the declaration's own default among
+        // them when it has one: the default is registered
+        // under an item carrying the declaration's own name.
+        // An explicit implementation overrides the default,
+        // so with several registrations the implementation
+        // is the one whose name is not the declaration's.
+        // Several such registrations are a duplication the
+        // compiler itself reports; none at all (a default
+        // registered beside a same-named item in another
+        // module) leaves the declaration unimplemented here.
+        let impl_internal = if impls.len() == 1 {
+            *impls.keys().next()?
+        } else {
+            let decl_name = tcx.item_name(internal);
+            let explicit: Vec<_> = impls
+                .keys()
+                .filter(|id| tcx.item_name(**id) != decl_name)
+                .collect();
+            if explicit.len() == 1 {
+                *explicit[0]
+            } else {
+                return None;
+            }
+        };
         let impl_id = rustc_public::rustc_internal::stable(impl_internal);
         let mut crates = vec![rustc_public::local_crate()];
         crates.extend(rustc_public::external_crates());
