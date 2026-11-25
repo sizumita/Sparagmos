@@ -37247,3 +37247,160 @@ fn run_mode_os_str_from_element_base_keeps_length() {
         "len3: len=3 sum=294\nlen0: len=0 sum=0\nlen1: len=1 sum=97\nwhole: len=3 sum=294\n",
     );
 }
+
+// ---------------------------------------------------------------------
+// Counted handles inside aggregate elements of a one-element `Vec`
+// (Issue #473). A vector value is the aggregate of its elements, so
+// a one-element vector whose element is a tuple or an array has the
+// same stored shape as the single-array-field pun's wrapper (a
+// one-field aggregate whose only field is a tuple). Indexing such a
+// vector must select the element, never range inside it: the
+// element's fields are not the vector's elements. Without the
+// declared type's say, the projection descended into the element
+// and the field steps that followed read the handle's own fields
+// (an `Rc`'s `NonNull` field, a channel's id word) in its place.
+// ---------------------------------------------------------------------
+
+const VEC_ONE_TUPLE_RC_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+fn main() {
+    let src: Vec<(Rc<Cell<i32>>,)> = vec![(Rc::new(Cell::new(8)),)];
+    println!("get={}", src[0].0.get());
+}
+"#;
+
+#[test]
+fn run_mode_vec_one_tuple_elem_rc_deref() {
+    run_ok("vec-one-tuple-rc", VEC_ONE_TUPLE_RC_SRC, "get=8\n");
+}
+
+const VEC_ARRAY_RC_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+fn main() {
+    let a = Rc::new(Cell::new(1));
+    let b = Rc::new(Cell::new(2));
+    let v: Vec<[Rc<Cell<i32>>; 2]> = vec![[a, b]];
+    println!("v01={}", v[0][1].get());
+    let w = Rc::downgrade(&v[0][1]);
+    println!("weak={}", w.upgrade().unwrap().get());
+}
+"#;
+
+#[test]
+fn run_mode_vec_array_elem_rc_deref_and_downgrade() {
+    run_ok("vec-array-rc", VEC_ARRAY_RC_SRC, "v01=2\nweak=2\n");
+}
+
+const VEC_TUPLE_CHANNEL_SRC: &str = r#"
+use std::sync::mpsc::channel;
+
+fn main() {
+    let (tx, rx) = channel::<i32>();
+    let src = vec![(tx,)];
+    src[0].0.send(9).unwrap();
+    println!("recv {}", rx.recv().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_vec_tuple_elem_channel_send() {
+    run_ok("vec-tuple-channel", VEC_TUPLE_CHANNEL_SRC, "recv 9\n");
+}
+
+const VEC_TUPLE_PAIR_RC_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+fn main() {
+    let a = Rc::new(Cell::new(1));
+    let b = Rc::new(Cell::new(2));
+    let src: Vec<(Rc<Cell<i32>>, Rc<Cell<i32>>)> = vec![(a, b)];
+    println!("f0={}", src[0].0.get());
+    println!("f1={}", src[0].1.get());
+}
+"#;
+
+#[test]
+fn run_mode_vec_tuple_pair_second_field_read() {
+    run_ok("vec-tuple-pair-rc", VEC_TUPLE_PAIR_RC_SRC, "f0=1\nf1=2\n");
+}
+
+const VEC_ONE_TUPLE_RC_CLONE_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+fn main() {
+    let a = Rc::new(Cell::new(8));
+    let probe = a.clone();
+    let src: Vec<(Rc<Cell<i32>>,)> = vec![(a,)];
+    println!("before={}", Rc::strong_count(&probe));
+    let keep = src[0].0.clone();
+    println!("after keep={}", Rc::strong_count(&probe));
+    drop(keep);
+    println!("after drop={}", Rc::strong_count(&probe));
+    println!("probe val={}", probe.get());
+}
+"#;
+
+#[test]
+fn run_mode_vec_one_tuple_elem_rc_clone_counts() {
+    run_ok(
+        "vec-one-tuple-rc-clone",
+        VEC_ONE_TUPLE_RC_CLONE_SRC,
+        "before=2\nafter keep=3\nafter drop=2\nprobe val=8\n",
+    );
+}
+
+const VEC_TUPLE_RC_OVERWRITE_SRC: &str = r#"
+use std::cell::Cell;
+use std::rc::Rc;
+
+fn main() {
+    let mut v: Vec<(Rc<Cell<i32>>,)> = vec![(Rc::new(Cell::new(1)),)];
+    v[0].0 = Rc::new(Cell::new(42));
+    println!("w1={}", v[0].0.get());
+    v[0].0.set(43);
+    println!("w1b={}", v[0].0.get());
+}
+"#;
+
+#[test]
+fn run_mode_vec_tuple_elem_overwrite_drops_old_handle() {
+    // Assigning over the element's field drops the old handle:
+    // the drop glue's read of the place must resolve the handle
+    // as the ordinary read does.
+    run_ok(
+        "vec-tuple-rc-overwrite",
+        VEC_TUPLE_RC_OVERWRITE_SRC,
+        "w1=42\nw1b=43\n",
+    );
+}
+
+const VEC_TUPLE_ELEM_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<(i32, i32)> = vec![(1, 2)];
+    v.push((3, 4));
+    println!("w2={} {}", v[1].0, v[1].1);
+    let mut w: Vec<[i32; 2]> = vec![[5, 6]];
+    w.push([7, 8]);
+    println!("w2b={} {}", w[1][0], w[1][1]);
+    w[0] = [9, 10];
+    println!("w2c={} {}", w[0][0], w[0][1]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_tuple_elem_push_and_replace() {
+    // The write direction of the same shape: appends and
+    // element writes on a one-element vector of tuples address
+    // the element, not the inside of the element.
+    run_ok(
+        "vec-tuple-elem-write",
+        VEC_TUPLE_ELEM_WRITE_SRC,
+        "w2=3 4\nw2b=7 8\nw2c=9 10\n",
+    );
+}

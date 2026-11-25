@@ -5147,7 +5147,13 @@ impl<'a> Interpreter<'a> {
                 if base == Value::Uninit {
                     return Ok(None);
                 }
-                match self.project_value_t(base, &projection, "<drop>", "drop glue", None) {
+                match self.project_value_t(
+                    base,
+                    &projection,
+                    "<drop>",
+                    "drop glue",
+                    self.alloc_ty(id),
+                ) {
                     Ok(v) if v == Value::Uninit => Ok(None),
                     Ok(v) => Ok(Some(v)),
                     Err(InterpError::UninitializedRead { .. }) => Ok(None),
@@ -5170,7 +5176,13 @@ impl<'a> Interpreter<'a> {
         root: &RefTarget,
         path: &[RefProj],
     ) -> InterpResult<Option<Value>> {
-        let (base, prefix): (Value, &[RefProj]) = match root {
+        // The declared type of the root value, stepped alongside
+        // the walk below as `read_place`'s reads step theirs: the
+        // projectors' shape-only judgments (the single-array-field
+        // pun above all) misread a one-element `Vec` of tuples
+        // without it, and drop glue reads the same places the
+        // ordinary reads do.
+        let (base, prefix, root_ty): (Value, &[RefProj], Option<Ty>) = match root {
             RefTarget::Place {
                 frame,
                 local,
@@ -5215,17 +5227,25 @@ impl<'a> Interpreter<'a> {
                 } else {
                     base
                 };
-                (base, projection)
+                let root_ty = self
+                    .program()
+                    .get(&frame.func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
+                (base, projection, root_ty)
             }
-            RefTarget::Value(v, projection) => ((**v).clone(), projection),
-            RefTarget::Static { name, projection } => (self.static_base(name)?, projection),
+            RefTarget::Value(v, projection) => ((**v).clone(), projection, None),
+            RefTarget::Static { name, projection } => {
+                let root_ty = self.program().static_tys.get(name).cloned();
+                (self.static_base(name)?, projection, root_ty)
+            }
             RefTarget::Alloc { id, projection } => {
                 // A freed allocation holds nothing to read glue
                 // from, as with a null pointer below.
                 let Ok(base) = self.alloc_base(*id) else {
                     return Ok(None);
                 };
-                (base, projection)
+                (base, projection, self.alloc_ty(*id))
             }
             // A null pointer denotes nothing; there is no drop
             // glue to read through it.
@@ -5235,6 +5255,7 @@ impl<'a> Interpreter<'a> {
             RefTarget::Address(_) => return Ok(None),
         };
         let mut value = base;
+        let mut cur_ty = root_ty;
         let steps: Vec<RefProj> = prefix.iter().chain(path.iter()).cloned().collect();
         let mut step_idx = 0;
         while step_idx < steps.len() {
@@ -5243,10 +5264,22 @@ impl<'a> Interpreter<'a> {
             }
             // A previous step crossed a box's field 0: the value
             // here is the box's allocation pointer and this step
-            // applies inside the allocation.
+            // applies inside the allocation. The evidence follows
+            // the crossing: the followed value's type is the
+            // allocation's recorded type stepped across the
+            // pointer's own projection.
+            let followed_ty = match &value {
+                Value::Ref(RefTarget::Alloc { id, projection }) => Some(
+                    step_ty_across(Some(self.program()), self.alloc_ty(*id), projection),
+                ),
+                _ => None,
+            };
             match self.follow_alloc(value)? {
                 Some(v) => value = v,
                 None => return Ok(None),
+            }
+            if let Some(followed) = followed_ty {
+                cur_ty = followed;
             }
             // A coroutine downcast only names the state whose saved
             // storage the following field step addresses, so the two
@@ -5265,12 +5298,17 @@ impl<'a> Interpreter<'a> {
                 &steps[step_idx..step_idx + take],
                 "<drop>",
                 "drop glue",
-                None,
+                cur_ty.clone(),
             ) {
                 Ok(v) => value = v,
                 Err(InterpError::UninitializedRead { .. }) => return Ok(None),
                 Err(e) => return Err(e),
             }
+            cur_ty = step_ty_across(
+                Some(self.program()),
+                cur_ty,
+                &steps[step_idx..step_idx + take],
+            );
             step_idx += take;
         }
         if value == Value::Uninit {
@@ -21689,6 +21727,10 @@ pub(crate) fn project_value_ev(
                 };
             }
         }
+        // The declared type of the value in hand, before this
+        // step moves it: the index arm's single-array-field pun
+        // consults it (see there).
+        let step_base_ty = cur_ty.clone();
         // The declared type steps alongside the value, so the
         // next step's descent judgment sees the type of the
         // value it judges. A step the type walk cannot follow
@@ -22016,12 +22058,27 @@ pub(crate) fn project_value_ev(
                 // pun (a pointer cast between a `#[repr(simd)]`
                 // struct and `[T; N]`, as `Simd::as_array`
                 // does): the index step continues into the
-                // field's elements.
+                // field's elements. The shapes collide when a
+                // `Vec` value holds exactly one element and
+                // that element is itself a tuple or a byte
+                // block: the value is then a one-field
+                // aggregate whose only field is a tuple, and
+                // shape alone cannot say whether the index
+                // selects the element or ranges inside it.
+                // The declared type decides: a base the
+                // evidence types as a `Vec` is the element
+                // aggregate the arm below reads, so the pun
+                // does not apply to it. Without evidence the
+                // shape-only judgment stands, as elsewhere.
                 Value::Enum { ref fields, .. }
                     if fields.len() == 1
                         && matches!(
                             fields[0],
                             Value::Tuple(_) | Value::Bytes(_)
+                        )
+                        && !matches!(
+                            &step_base_ty,
+                            Some(ty) if is_vec_adt_ty(ty)
                         ) =>
                 {
                     project_value(
@@ -22973,6 +23030,10 @@ pub(crate) fn project_value_ref_ev<'a>(
         }
         rest = tail;
         let step_state = downcast_state.take();
+        // The declared type of the value in hand, before this
+        // step moves it: the index arm's single-array-field pun
+        // consults it (see `project_value_ev`).
+        let step_base_ty = cur_ty.clone();
         // The declared type steps alongside the value (see
         // `project_value_ev`); the field step steps inside its
         // arm, past its wrapper descent.
@@ -23209,11 +23270,19 @@ pub(crate) fn project_value_ref_ev<'a>(
                         && matches!(
                             fields[0],
                             Value::Tuple(_) | Value::Bytes(_)
+                        )
+                        && !matches!(
+                            &step_base_ty,
+                            Some(ty) if is_vec_adt_ty(ty)
                         ) =>
                 {
                     // The single-array-field pun, as in
                     // `project_value`: the index step continues
-                    // into the field's elements.
+                    // into the field's elements. A base the
+                    // type evidence names as a `Vec` is the
+                    // element aggregate instead (see
+                    // `project_value_ev`), so the pun is gated
+                    // on the evidence as there.
                     match project_value_ref(
                         &fields[0],
                         std::slice::from_ref(step),
@@ -23826,14 +23895,23 @@ pub(crate) fn navigate_mut_grow<'x>(
             // range over the field's elements, not the
             // aggregate's.
             Value::Enum { .. } => {
+                // A slot the type evidence names as a `Vec`
+                // holds the element aggregate, never the
+                // single-array-field pun's wrapper (see
+                // `project_value_ev`): neither the pun descent
+                // below nor its exemption from the append point
+                // applies to it.
+                let vec_typed =
+                    matches!(&ty, Some(t) if is_vec_adt_ty(t));
                 let append_point = match slot {
                     Value::Enum { fields, .. } => {
                         *idx == fields.len()
-                            && !(fields.len() == 1
-                                && matches!(
-                                    fields[0],
-                                    Value::Tuple(_) | Value::Bytes(_)
-                                ))
+                            && (vec_typed
+                                || !(fields.len() == 1
+                                    && matches!(
+                                        fields[0],
+                                        Value::Tuple(_) | Value::Bytes(_)
+                                    )))
                     }
                     _ => false,
                 };
@@ -23858,6 +23936,7 @@ pub(crate) fn navigate_mut_grow<'x>(
                         fields[0],
                         Value::Tuple(_) | Value::Bytes(_)
                     )
+                    && !vec_typed
                 {
                     // The single-array-field pun, as in
                     // `project_value`: the write continues into
