@@ -173,6 +173,30 @@ denominator. Runs on every push to `main` and on manual dispatch.
   under the bucket `not attempted (coverage instrumentation)`
   (issue #514). The denominator is unaffected; all 109 stay
   in it as non-passes.
+- A compile-check view whose compile-flags request printed
+  output -- a `-Zunpretty` dump or a `--print` answer -- in
+  the `ui`, `ui-fulldeps` or `crashes` suites is judged as a
+  print invocation (issue #548). The driver captures the
+  embedded compiler's stdout for the run
+  (`--compiler-stdout`), the exit outcome is judged as for
+  any compile-check view, and a passing verdict is refined
+  by comparing the captured stdout against the view's
+  `.stdout` snapshot under compiletest's normalization (the
+  stage-4 machinery; an absent snapshot compares as empty).
+  `//@ dont-check-compiler-stdout` views are exempt from the
+  comparison by declaration, and the crashes suite is exempt
+  because its verdict is the crash itself; a capture that
+  was not produced fails the view rather than passing it
+  silently. The driver's compiler callbacks set the
+  session's trimmed-paths option for printing invocations,
+  as the real rustc entry point does, so printed type names
+  match rustc's own. One record's asserted output is a
+  link-stage note the driver cannot produce
+  (tests/ui/codegen/empty-static-libs-issue-108825.rs,
+  `--print=native-static-libs` emits it while linking, and
+  the driver never links): the record is judged by
+  conversion completeness, the stage-2 contract that checks
+  no stderr annotations for any record.
 - An executed run's verdict follows compiletest's own for the
   run (runtest/ui.rs): the run's exit must classify as the
   mode requires (run-pass: pass class, exit 0; run-fail:
