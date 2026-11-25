@@ -923,6 +923,7 @@ impl<'a> Converter<'a> {
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
+            zeroed_value: None,
         }))
     }
 
@@ -977,6 +978,7 @@ impl<'a> Converter<'a> {
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
+            zeroed_value: None,
         }))
     }
 
@@ -1090,6 +1092,7 @@ impl<'a> Converter<'a> {
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
+            zeroed_value: None,
         }))
     }
 
@@ -2406,6 +2409,43 @@ impl<'a> Converter<'a> {
                         } else {
                             None
                         };
+                        // A `mem::zeroed` call materializes the
+                        // zero bit pattern of its type: for the
+                        // types the builtin's own tag-based
+                        // construction cannot describe (enums and
+                        // ADT aggregates), build the denoted
+                        // value while the type and the layout
+                        // tables are at hand (see `zeroed_value`
+                        // in `ir`).
+                        let zeroed_value = if kind
+                            == crate::builtins::Builtin::MemZeroed
+                        {
+                            raw_generic_args
+                                .first()
+                                .and_then(|ty| self.zeroed_model_value(ty, 0))
+                        } else if kind == crate::builtins::Builtin::WriteBytes
+                            && matches!(
+                                args.get(1).and_then(|arg| {
+                                    self.convert_operand(body, arg, None).ok()
+                                }),
+                                Some(ir::Operand::Constant(
+                                    ir::Constant::Uint(0)
+                                ))
+                            )
+                        {
+                            // A `write_bytes` whose fill byte is
+                            // the constant zero (`MaybeUninit::
+                            // zeroed` is its canonical use): the
+                            // filled region holds the zero
+                            // pattern of the pointee type, whose
+                            // denoted value is baked like
+                            // `mem::zeroed`'s.
+                            raw_generic_args
+                                .first()
+                                .and_then(|ty| self.zeroed_model_value(ty, 0))
+                        } else {
+                            None
+                        };
                         if unaccountable_drop {
                             ir::TerminatorKind::Unsupported(
                                 "Call to std::mem::drop (drop glue cannot be accounted for)"
@@ -2426,6 +2466,7 @@ impl<'a> Converter<'a> {
                                 cmp_discriminants,
                                 result_unsize,
                                 unique_elem,
+                                zeroed_value,
                             }
                         }
                     } else if args.first().is_some_and(|a| {
@@ -2542,7 +2583,9 @@ impl<'a> Converter<'a> {
                         target: ir::BasicBlock(target.index()),
                         glue,
                     },
-                    None => ir::TerminatorKind::Unsupported("Drop".to_string()),
+                    None => {
+                        ir::TerminatorKind::Unsupported("Drop".to_string())
+                    }
                 }
             }
             T::Resume => ir::TerminatorKind::Resume,

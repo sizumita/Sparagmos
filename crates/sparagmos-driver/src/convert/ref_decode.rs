@@ -311,7 +311,9 @@ impl Converter {
             // it decodes to a stable identity number for the
             // (concrete type, trait) pair.
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
-                return Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)));
+                let id = vtable_id(&vty, &trait_ref);
+                self.note_vtable_identity(id, &vty, &trait_ref);
+                return Some(sm::ConstValue::VTablePtr(id));
             }
             // `resolve_alloc` returns memory allocations in
             // the `Memory` variant, never wrapped in `Other`.
@@ -595,6 +597,32 @@ impl Converter {
             concrete: self.ty(&concrete_ty),
             traits,
         })
+    }
+
+    /// Record the (concrete type, principal trait) pair a
+    /// vtable identity number denotes. The concrete type
+    /// converts through `ty`, exactly as a vtable constant's
+    /// own decode renders it, and the trait is the principal's
+    /// def name, the form a `Ty::Dynamic` bound carries.
+    pub(super) fn note_vtable_identity(
+        &mut self,
+        id: u64,
+        vty: &rustc_public::ty::Ty,
+        trait_ref: &Option<rustc_public::ty::Binder<rustc_public::ty::ExistentialTraitRef>>,
+    ) {
+        if self.vtable_identities.contains_key(&id) {
+            return;
+        }
+        let concrete = self.ty(vty);
+        let traits = trait_ref
+            .as_ref()
+            .map(|binder| vec![binder.value.def_id.name()])
+            .unwrap_or_default();
+        self.vtable_identities.insert(id, (concrete, traits));
+        if let Some(binder) = trait_ref {
+            self.vtable_demand
+                .push(binder.value.with_self_ty(*vty));
+        }
     }
 
     /// Decode a reference whose provenance names the static

@@ -1720,7 +1720,9 @@ impl Converter {
                 Some(sm::ConstValue::IntPtr(lo))
             }
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {
-                Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)))
+                let id = vtable_id(&vty, &trait_ref);
+                self.note_vtable_identity(id, &vty, &trait_ref);
+                Some(sm::ConstValue::VTablePtr(id))
             }
             // `resolve_alloc` returns memory allocations in
             // the `Memory` variant, never wrapped in `Other`.

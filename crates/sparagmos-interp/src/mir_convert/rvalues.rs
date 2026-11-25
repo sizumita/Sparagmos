@@ -641,8 +641,9 @@ impl<'a> Converter<'a> {
                     // itself), two for an unsized one (data pointer
                     // plus metadata). Slice metadata is a length and
                     // becomes a fat reference; `dyn` metadata is a
-                    // vtable pointer, whose concrete type is erased
-                    // here, so it stays unsupported.
+                    // `DynMetadata` value, whose vtable the
+                    // evaluation resolves through the program's
+                    // vtable identity table.
                     let data_ctx = mir::Ty::RawPtr(
                         Box::new(data_ty.clone()),
                         mir::Mutability::Not,
@@ -661,9 +662,19 @@ impl<'a> Converter<'a> {
                                 meta: Some(meta),
                             }
                         }
-                        (mir::Ty::Dynamic(..), _) => ir::Rvalue::Unsupported(
-                            "Aggregate RawPtr (dyn metadata)".to_string(),
-                        ),
+                        (mir::Ty::Dynamic(..), 2) => {
+                            // As the generic two-operand shape
+                            // below: the metadata operand converts
+                            // without a context, and the evaluation
+                            // resolves the vtable it names.
+                            let data =
+                                self.convert_operand(body, &ops[0], Some(&data_ctx))?;
+                            let meta = self.convert_operand(body, &ops[1], None)?;
+                            ir::Rvalue::RawPtrAggregate {
+                                data,
+                                meta: Some(meta),
+                            }
+                        }
                         (_, 1) => {
                             let data =
                                 self.convert_operand(body, &ops[0], Some(&data_ctx))?;

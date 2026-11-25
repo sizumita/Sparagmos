@@ -1398,6 +1398,7 @@ fn collect() -> ControlFlow<()> {
         def_names: conv.def_names.clone(),
         intrinsic_defs: conv.intrinsic_defs.clone(),
         async_closure_defs: conv.async_closure_defs.clone(),
+        vtable_identities: conv.vtable_identities.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),

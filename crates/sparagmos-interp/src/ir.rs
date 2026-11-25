@@ -1942,6 +1942,20 @@ pub enum TerminatorKind {
         /// has many values (an unwritten slot is then a genuine
         /// uninitialized read).
         unique_elem: Option<Value>,
+        /// The value the all-zeroes bit pattern of the type
+        /// `std::mem::zeroed` materializes denotes, built by
+        /// conversion for that call from the recorded layout:
+        /// an enum is the variant its layout assigns to the
+        /// zero pattern (the variant whose discriminant is
+        /// zero, or the niche variant when zero lies in the
+        /// recorded niche range) with zeroed fields, and an
+        /// aggregate is built field by field. The builtin's
+        /// tag-based construction covers scalars, tuples and
+        /// arrays on its own; this value serves the types only
+        /// the layout can describe. `None` for every other
+        /// builtin call, and when the zero pattern denotes no
+        /// value conversion can build.
+        zeroed_value: Option<Value>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and
@@ -2306,6 +2320,18 @@ impl Body {
     }
 }
 
+/// The identity a vtable pointer denotes in this model: the
+/// concrete type a `dyn` pointer's data has, the trait bounds
+/// the pointer was formed for, and the concrete type's drop
+/// glue (the vtable's drop shim). Mirrors what a
+/// conversion-baked [`Constant::DynRef`] carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VTableIdentity {
+    pub concrete: String,
+    pub traits: Vec<String>,
+    pub glue: Option<DropGlue>,
+}
+
 /// A whole program: a set of named function bodies in one module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
@@ -2331,6 +2357,17 @@ pub struct Program {
     /// consulted by the `size_of` / `align_of` / `size_of_val`
     /// builtins for ADT tags the static layout table cannot answer.
     pub adt_layouts: std::collections::HashMap<String, (u64, u64)>,
+    /// What each vtable-pointer identity number in the program
+    /// denotes: the concrete type and trait bounds a `dyn`
+    /// pointer formed for that vtable answers to, with the
+    /// concrete type's drop glue. Filled from
+    /// [`crate::mir_convert::MirProgram::vtable_identities`] at
+    /// conversion. A vtable pointer that reaches the
+    /// interpreter as a bare address -- recovered from a
+    /// `DynMetadata` aggregate constant, or read back from a
+    /// header word stored ahead of a thin pointer's pointee --
+    /// resolves to a `DynRef` through this table.
+    pub vtable_identities: std::collections::HashMap<u64, VTableIdentity>,
     /// Per-variant field byte layouts of the program's
     /// monomorphic ADT instances, keyed like `adt_layouts`, as
     /// recorded by the driver (see

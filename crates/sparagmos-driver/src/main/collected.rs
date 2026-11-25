@@ -26,6 +26,10 @@ pub(crate) struct Collected {
     /// definitions conversion met (see
     /// `Converter::async_closure_defs`).
     pub(crate) async_closure_defs: std::collections::HashSet<sparagmos_mir::DefId>,
+    /// Vtable identities minted while decoding constants (see
+    /// `Converter::vtable_identities`).
+    pub(crate) vtable_identities:
+        std::collections::HashMap<u64, (sparagmos_mir::Ty, Vec<String>)>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
     pub(crate) adt_discriminants: sparagmos_mir::AdtDiscriminants,

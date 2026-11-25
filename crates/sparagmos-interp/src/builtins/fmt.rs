@@ -1572,6 +1572,37 @@ impl<'a> Interpreter<'a> {
                 _ => None,
             };
             if let Some(address) = address {
+                // A reference to a zero-sized pointee at a
+                // storage-less address (the dangling pointer
+                // std serves a zero-sized allocation with)
+                // denotes the pointee's single value, which
+                // is what its formatting runs on. A raw
+                // pointer keeps the address forms below: its
+                // own `Debug` is the address text, and it has
+                // no other fmt impl.
+                let raw_pointer = {
+                    let t = ty.trim_start();
+                    t.starts_with("*const ") || t.starts_with("*mut ")
+                };
+                let storage_less = match target {
+                    RefTarget::Null => true,
+                    RefTarget::Address(addr) => self.address_owner(*addr).is_none(),
+                    _ => false,
+                };
+                if !raw_pointer && storage_less {
+                    if let Some(single) = ty_from_tag(pointee_tag(ty))
+                        .and_then(|t| self.zst_single_value(&t))
+                    {
+                        return self.format_value(
+                            frames,
+                            &single,
+                            trait_,
+                            pointee_tag(ty),
+                            options,
+                            indent,
+                        );
+                    }
+                }
                 return match trait_ {
                     FmtTrait::Pointer | FmtTrait::Debug => Ok(format_pointer(address, options)),
                     FmtTrait::DebugNoop => Ok(String::new()),
@@ -1631,6 +1662,31 @@ impl<'a> Interpreter<'a> {
                             frames, &decoded, trait_, ty, options, indent,
                         );
                     }
+                }
+            }
+        }
+        // `ThinBox<T>`'s `Display` and `Debug` impls forward
+        // to the pointee through `Deref` (they are the type's
+        // only fmt impls): format the dereferenced value with
+        // the pointee's tag, exactly as the forwarding body
+        // would.
+        if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+            let plain = pointee_tag(ty);
+            if let Some(pointee_ty) = plain
+                .strip_prefix("std::boxed::ThinBox<")
+                .and_then(|rest| rest.strip_suffix('>'))
+            {
+                if matches!(value, Value::Enum { .. }) {
+                    let derefed =
+                        self.thin_box_deref(frames, value, plain, "formatting a ThinBox")?;
+                    return self.format_value(
+                        frames,
+                        &derefed,
+                        trait_,
+                        pointee_ty,
+                        options,
+                        indent,
+                    );
                 }
             }
         }
@@ -2475,9 +2531,11 @@ impl<'a> Interpreter<'a> {
             Value::Tuple(_) => Err(unsupported(
                 "Display formatting for a tuple value (core has no such impl)",
             )),
-            Value::Enum { .. } => Err(unsupported(
-                "Display formatting for an ADT value (its impl lives in unconverted code)",
-            )),
+            Value::Enum { .. } => {
+                Err(unsupported(
+                    "Display formatting for an ADT value (its impl lives in unconverted code)",
+                ))
+            }
             other => Err(InterpError::type_mismatch(
                 "Display formatting",
                 "integer, bool, float, string or char value",
@@ -3846,7 +3904,7 @@ fn array_tag_len(tag: &str) -> Option<usize> {
     None
 }
 
-fn pointee_tag(ty: &str) -> &str {
+pub(super) fn pointee_tag(ty: &str) -> &str {
     let mut ty = ty;
     loop {
         ty = ty.trim_start();

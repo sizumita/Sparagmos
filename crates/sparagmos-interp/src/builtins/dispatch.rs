@@ -46,6 +46,7 @@ impl<'a> Interpreter<'a> {
         skipped_glue: Option<&crate::ir::DropGlue>,
         elem_glue: Option<&crate::ir::DropGlue>,
         receiver_glue: Option<&crate::ir::DropGlue>,
+        zeroed_value: Option<&Value>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -138,7 +139,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("five arguments");
             self.note_forwarded_panic_stamp(frames, stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue, zeroed_value)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -159,6 +160,7 @@ impl<'a> Interpreter<'a> {
         skipped_glue: Option<&crate::ir::DropGlue>,
         elem_glue: Option<&crate::ir::DropGlue>,
         receiver_glue: Option<&crate::ir::DropGlue>,
+        zeroed_value: Option<&Value>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -4680,6 +4682,13 @@ impl<'a> Interpreter<'a> {
                     // A one-field newtype wrapper: the result is a
                     // reference to the held value.
                     self.field_zero_ref(frames, &vals[0], "Deref::deref for ManuallyDrop")
+                } else if self_ty.starts_with("std::boxed::ThinBox<") {
+                    self.thin_box_deref(
+                        frames,
+                        &vals[0],
+                        self_ty,
+                        "Deref::deref for ThinBox",
+                    )
                 } else if self_ty.starts_with("std::panic::AssertUnwindSafe<") {
                     // A one-field newtype wrapper: the result is a
                     // reference to the held value.
@@ -7217,6 +7226,13 @@ impl<'a> Interpreter<'a> {
                         &vals[0],
                         "DerefMut::deref_mut for ManuallyDrop",
                     )
+                } else if self_ty.starts_with("std::boxed::ThinBox<") {
+                    self.thin_box_deref(
+                        frames,
+                        &vals[0],
+                        self_ty,
+                        "DerefMut::deref_mut for ThinBox",
+                    )
                 } else if self_ty.starts_with("std::rc::Rc<")
                     || self_ty.starts_with("std::sync::Arc<")
                 {
@@ -7642,6 +7658,10 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(Value::Uint(len * elem_size))
+                } else if let Some((size, _)) =
+                    self.dyn_layout_of(frames, &vals[0], tag)
+                {
+                    Ok(Value::Uint(size))
                 } else {
                     match self.layout_of(tag) {
                         Some((size, _)) => Ok(Value::Uint(size)),
@@ -7663,6 +7683,10 @@ impl<'a> Interpreter<'a> {
                             "align_of_val for {tag} is not runtime-supported"
                         ))
                     })?;
+                    Ok(Value::Uint(align))
+                } else if let Some((_, align)) =
+                    self.dyn_layout_of(frames, &vals[0], tag)
+                {
                     Ok(Value::Uint(align))
                 } else {
                     match self.layout_of(tag) {
@@ -8013,9 +8037,18 @@ impl<'a> Interpreter<'a> {
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 match zeroed_value_for_tag(tag) {
                     Some(value) => Ok(value),
-                    None => Err(unsupported(format!(
-                        "mem::zeroed for {tag} is not runtime-supported"
-                    ))),
+                    // The tag-based construction names scalars,
+                    // tuples and arrays; a type only the layout
+                    // describes (an enum, an ADT aggregate)
+                    // materializes as the value conversion
+                    // built for this call from the recorded
+                    // layout (see `zeroed_value` in `ir`).
+                    None => match zeroed_value {
+                        Some(value) => Ok(value.clone()),
+                        None => Err(unsupported(format!(
+                            "mem::zeroed for {tag} is not runtime-supported"
+                        ))),
+                    },
                 }
             }
             Builtin::IntBitOp(op) => {
@@ -8518,6 +8551,18 @@ impl<'a> Interpreter<'a> {
                 };
                 let fill = byte_fill_value(tag, byte)
                     .or_else(|| self.wrapped_byte_fill(tag, byte, 0))
+                    .or_else(|| {
+                        // A zero fill over a type the byte
+                        // patterns above cannot describe (an
+                        // enum): conversion baked the value
+                        // the zero pattern denotes (see
+                        // `zeroed_value` in `ir`).
+                        if byte == 0 {
+                            zeroed_value.cloned()
+                        } else {
+                            None
+                        }
+                    })
                     .ok_or_else(|| {
                         unsupported(format!(
                             "write_bytes for {tag} is not runtime-supported"

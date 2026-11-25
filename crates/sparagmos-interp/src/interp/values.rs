@@ -627,11 +627,22 @@ impl<'a> Interpreter<'a> {
                 Ok(value)
             }
             (Some(expected), other) => {
-                Err(InterpError::type_mismatch(
-                    "assignment",
-                    format!("{expected:?}"),
-                    other.kind_name(),
-                ))
+                // A zero-sized place holds the type's single
+                // value, whatever shape the operand took: the
+                // read that produced it may have read the
+                // storage a zero-sized header shares with the
+                // value behind it (a sized `ThinBox`'s
+                // metadata is the unit value, read through a
+                // header pointer that aliases the value
+                // itself).
+                match zst_value_of_ty(expected) {
+                    Some(single) => Ok(single),
+                    None => Err(InterpError::type_mismatch(
+                        "assignment",
+                        format!("{expected:?}"),
+                        other.kind_name(),
+                    )),
+                }
             }
         }
     }
@@ -1267,6 +1278,69 @@ impl<'a> Interpreter<'a> {
                         format!("bit pattern {pattern:#x}"),
                     )),
                 }
+            }
+        }
+    }
+
+    /// The `DynRef` a vtable identity number denotes over the
+    /// given data-pointer value, resolved through the program's
+    /// vtable identity table (see
+    /// `ir::Program::vtable_identities`): `None` when the
+    /// identity is not one the driver recorded.
+    pub(crate) fn dyn_ref_from_vtable(&self, id: u64, base: Value) -> Option<Value> {
+        let identity = self.program.vtable_identities.get(&id)?;
+        Some(Value::DynRef {
+            base: Box::new(base),
+            concrete: identity.concrete.clone(),
+            traits: identity.traits.clone(),
+            drop_glue: identity.glue.clone().map(Box::new),
+        })
+    }
+
+    /// The vtable identity a metadata value names, if any: a
+    /// `DynMetadata` value is an aggregate whose vtable word is
+    /// a leaf under one-field wrappers, and a bare vtable
+    /// pointer is the address itself. Only an address the
+    /// driver recorded as a vtable identity counts -- the
+    /// search descends aggregate fields, but an address is a
+    /// vtable identity only when the table names it one.
+    pub(crate) fn vtable_id_in_metadata(&self, value: &Value) -> Option<u64> {
+        match value {
+            Value::Ref(RefTarget::Address(id)) => self
+                .program
+                .vtable_identities
+                .contains_key(id)
+                .then_some(*id),
+            Value::Enum { fields, .. } | Value::Tuple(fields) => {
+                fields.iter().find_map(|f| self.vtable_id_in_metadata(f))
+            }
+            _ => None,
+        }
+    }
+
+    /// Rebase a metadata value onto a data pointer: a `DynRef`
+    /// metadata (the form the pointer-metadata model hands
+    /// back for a `dyn` pointee) keeps its identity over the
+    /// new base; a `DynMetadata` aggregate or bare vtable
+    /// pointer resolves through the vtable identity table.
+    /// `None` when the metadata names no vtable (a length, a
+    /// unit, or an unrecorded identity).
+    pub(crate) fn dyn_ref_from_metadata(&self, meta: &Value, base: Value) -> Option<Value> {
+        match meta {
+            Value::DynRef {
+                concrete,
+                traits,
+                drop_glue,
+                ..
+            } => Some(Value::DynRef {
+                base: Box::new(base),
+                concrete: concrete.clone(),
+                traits: traits.clone(),
+                drop_glue: drop_glue.clone(),
+            }),
+            _ => {
+                let id = self.vtable_id_in_metadata(meta)?;
+                self.dyn_ref_from_vtable(id, base)
             }
         }
     }

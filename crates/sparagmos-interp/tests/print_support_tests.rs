@@ -636,6 +636,7 @@ fn run_steps(local_tys: Vec<Ty>, steps: Vec<Step>) -> String {
                         cmp_discriminants: None,
                         result_unsize: None,
                         unique_elem: None,
+                        zeroed_value: None,
                     },
                 ));
             }

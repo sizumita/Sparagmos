@@ -123,6 +123,25 @@ pub struct Converter {
     /// served by constructing the closure's coroutine, exactly
     /// as an `AsyncFn` call does.
     pub async_closure_defs: std::collections::HashSet<sm::DefId>,
+    /// Vtable identities minted while decoding constants: for
+    /// each `ConstValue::VTablePtr` identity number, the
+    /// (concrete type, principal trait) pair it denotes, in the
+    /// form the interpreter's `DynRef` values carry. Handed to
+    /// the interpreter with the converted program: a vtable
+    /// pointer that reaches it as a bare address (recovered
+    /// from a metadata aggregate, or read back from a stored
+    /// header word) resolves through this table.
+    pub vtable_identities: HashMap<u64, (sm::Ty, Vec<String>)>,
+    /// Vtable trait references named by the constants decoded
+    /// so far, in the order their identities were first
+    /// recorded: a vtable formed inside a constant (a
+    /// `DynMetadata` in a trait-info table is the common shape)
+    /// is a vtable formation no cast in any scanned body
+    /// names, so the dyn demand pass takes its trait
+    /// references from here as well (see
+    /// `demand_dyn_instances` in the driver). Drained by that
+    /// pass.
+    pub vtable_demand: Vec<rustc_public::ty::TraitRef>,
     /// Discriminant values of every enum ADT converted so far,
     /// keyed by the converted `DefId` (variant index -> value).
     /// Handed to the interpreter with the converted program: its

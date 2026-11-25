@@ -688,6 +688,67 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The resolution of a dereference of a storage-less
+    /// pointer -- a null pointer, or an address no allocation
+    /// owns (the dangling pointer std serves every zero-sized
+    /// allocation with) -- whose pointee type is zero-sized:
+    /// the pointee's single value, which needs no storage to
+    /// denote. `None` when the pointer denotes storage, the
+    /// pointee type is unknown or not zero-sized, or its
+    /// single value cannot be fabricated.
+    pub(super) fn storage_less_zst_deref(
+        &self,
+        value: &Value,
+        pointee_ty: Option<&Ty>,
+    ) -> Option<Resolved> {
+        let storage_less = match value {
+            Value::Ref(RefTarget::Null) => true,
+            Value::Ref(RefTarget::Address(addr)) => {
+                self.address_owner(*addr).is_none()
+            }
+            _ => false,
+        };
+        if !storage_less {
+            return None;
+        }
+        let single = self.zst_single_value(pointee_ty?)?;
+        Some(Resolved::Value(single, Vec::new()))
+    }
+
+    /// The single value of a zero-sized type, when the type
+    /// has one and it can be fabricated: the structural forms
+    /// [`zst_value_of_ty`] covers, and a single-variant ADT
+    /// whose fields are all single-valued (their declared
+    /// types are the program's recorded field skeletons).
+    /// `None` for a type of unknown or nonzero size, a
+    /// multi-variant ADT (its zero-sized values are not
+    /// unique), or a field whose skeleton names no type.
+    pub(crate) fn zst_single_value(&self, ty: &Ty) -> Option<Value> {
+        if self.ty_size_full(ty) != Some(0) {
+            return None;
+        }
+        if let Some(value) = zst_value_of_ty(ty) {
+            return Some(value);
+        }
+        match ty {
+            Ty::Adt(name) => {
+                let variants = self.program().adt_field_tys.get(name)?;
+                if variants.len() != 1 {
+                    return None;
+                }
+                let mut fields = Vec::with_capacity(variants[0].len());
+                for field in &variants[0] {
+                    fields.push(self.zst_single_value(field.as_ref()?)?);
+                }
+                Some(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Follow a reference value to what it points at.
     pub(crate) fn deref_value(
         &self,
@@ -2633,6 +2694,20 @@ impl<'a> Interpreter<'a> {
                     return view;
                 }
             }
+        }
+        // A write of a zero-sized value through a dereference
+        // that denoted no storage (see
+        // `storage_less_zst_deref`) stores nothing: the value
+        // has no scalar content, and every later read of the
+        // pointee fabricates the same single value.
+        if matches!(target, Resolved::Value(..))
+            && !value_tree_has_scalar(&value)
+            && place
+                .projection
+                .iter()
+                .any(|step| matches!(step, ProjectionElem::Deref))
+        {
+            return Ok(());
         }
         let root_ty = self.resolved_root_ty(body, place);
         self.write_resolved_typed(frames, &target, value, root_ty.as_ref())

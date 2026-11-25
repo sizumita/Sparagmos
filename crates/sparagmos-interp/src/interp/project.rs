@@ -2166,31 +2166,60 @@ pub(crate) fn project_value_ev(
                 if *disp == 0 {
                     value
                 } else if *disp >= 0 {
-                    let kind = byte_scalar_of_ty(step_base_ty.as_ref());
-                    let Some(len) = scalar_storage_len_as(&value, kind) else {
-                        return Err(InterpError::UnsupportedProjection {
-                            kind: format!(
-                                "read through a pointer displaced {disp} bytes from a value boundary"
-                            ),
-                        });
+                    // A byte-displaced pointer into an element
+                    // block (an allocation's storage, whose
+                    // slots are byte positions): the aggregate
+                    // stored at the displaced position is the
+                    // pointee, when the step that follows is
+                    // not the index step of the byte view below.
+                    let elem_block_value = if !matches!(
+                        projection.get(step_idx),
+                        Some(RefProj::Index(_))
+                    ) {
+                        match &value {
+                            Value::Tuple(items) => items
+                                .get(*disp as usize)
+                                .filter(|elem| {
+                                    matches!(
+                                        elem,
+                                        Value::Enum { .. } | Value::Tuple(_)
+                                    )
+                                })
+                                .cloned(),
+                            _ => None,
+                        }
+                    } else {
+                        None
                     };
-                    let Some(&RefProj::Index(k)) = projection.get(step_idx) else {
-                        return Err(InterpError::UnsupportedProjection {
-                            kind: format!(
-                                "read through a pointer displaced {disp} bytes from a value boundary"
-                            ),
-                        });
-                    };
-                    // A byte read through a pointer displaced into
-                    // a scalar's storage: the index step that
-                    // follows selects the byte at the combined
-                    // offset, the read side of the byte view
-                    // `scalar_storage_byte` describes.
-                    let at = *disp as usize + k;
-                    step_idx += 1;
-                    match scalar_storage_byte_as(&value, kind, at) {
-                        Some(byte) => Value::Uint(u128::from(byte)),
-                        None => return Err(index_oob(len, at)),
+                    if let Some(elem) = elem_block_value {
+                        elem
+                    } else {
+                        let kind = byte_scalar_of_ty(step_base_ty.as_ref());
+                        let Some(len) = scalar_storage_len_as(&value, kind) else {
+                            return Err(InterpError::UnsupportedProjection {
+                                kind: format!(
+                                    "read through a pointer displaced {disp} bytes from a value boundary"
+                                ),
+                            });
+                        };
+                        let Some(&RefProj::Index(k)) = projection.get(step_idx) else {
+                            return Err(InterpError::UnsupportedProjection {
+                                kind: format!(
+                                    "read through a pointer displaced {disp} bytes from a value boundary"
+                                ),
+                            });
+                        };
+                        // A byte read through a pointer displaced into
+                        // a scalar's storage: the index step that
+                        // follows selects the byte at the combined
+                        // offset, the read side of the byte view
+                        // `scalar_storage_byte` describes.
+                        let at = *disp as usize + k;
+                        step_idx += 1;
+                        match scalar_storage_byte_as(&value, kind, at) {
+                            Some(byte) => Value::Uint(u128::from(byte)),
+                            None => return Err(index_oob(len, at)),
+                        }
                     }
                 } else {
                     // The position does not coincide with a value
@@ -3342,6 +3371,27 @@ pub(crate) fn project_value_ref_ev<'a>(
                                 .ok_or_else(|| index_oob(len, at))?;
                             let v = Value::Uint(u128::from(byte));
                             return Ok(Cow::Owned(project_value(v, &rest[1..], func, place)?));
+                        }
+                        // An element block's aggregate at the
+                        // displaced byte position, as in
+                        // `project_value`.
+                        if !matches!(rest.first(), Some(RefProj::Index(_))) {
+                            if let Value::Tuple(items) = cur {
+                                if let Some(elem) = items
+                                    .get(*disp as usize)
+                                    .filter(|elem| {
+                                        matches!(
+                                            elem,
+                                            Value::Enum { .. } | Value::Tuple(_)
+                                        )
+                                    })
+                                    .cloned()
+                                {
+                                    return Ok(Cow::Owned(project_value(
+                                        elem, rest, func, place,
+                                    )?));
+                                }
+                            }
                         }
                     }
                     // The position does not coincide with a value

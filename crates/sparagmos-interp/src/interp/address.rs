@@ -566,6 +566,46 @@ fn terminator_liveness(
     }
 }
 
+/// The byte size of `value`'s storage, when it is known
+/// from the value's shape alone: pointer-shaped leaves have
+/// the model's pointer widths, aggregates sum their fields,
+/// and byte/string data is its length. Scalar leaves carry
+/// no width in the value and answer `None`.
+fn value_storage_size(value: &Value) -> Option<usize> {
+    match value {
+        Value::Ref(_) => Some(8),
+        Value::FatRef { .. } | Value::DynRef { .. } => Some(16),
+        Value::Tuple(fields) => fields.iter().map(value_storage_size).sum(),
+        Value::Enum { fields, .. } => fields.iter().map(value_storage_size).sum(),
+        Value::Bytes(bytes) => Some(bytes.len()),
+        Value::Str(text) => Some(text.len()),
+        _ => None,
+    }
+}
+
+/// The byte offset of each field of an aggregate constant
+/// (plus the total size as the last entry), when every
+/// field's byte size is known (see [`value_storage_size`]).
+/// Byte data is one field per byte.
+fn aggregate_field_offsets(value: &Value) -> Option<Vec<usize>> {
+    let sizes: Vec<usize> = match value {
+        Value::Tuple(fields) | Value::Enum { fields, .. } => fields
+            .iter()
+            .map(value_storage_size)
+            .collect::<Option<Vec<_>>>()?,
+        Value::Bytes(bytes) => vec![1; bytes.len()],
+        _ => return None,
+    };
+    let mut offsets = Vec::with_capacity(sizes.len() + 1);
+    let mut at = 0usize;
+    for size in sizes {
+        offsets.push(at);
+        at += size;
+    }
+    offsets.push(at);
+    Some(offsets)
+}
+
 /// A type in the middle of a projection walk (see
 /// [`Interpreter::canonical_projection`]): either an IR type, or
 /// a rendered type tag — the form an ADT field's type takes in
@@ -970,7 +1010,7 @@ impl<'a> Interpreter<'a> {
     /// [`Self::ty_size`], extended with the one composite the
     /// base table does not fold: a tuple's size from its
     /// fields' declaration-order layout.
-    fn ty_size_full(&self, ty: &Ty) -> Option<u64> {
+    pub(super) fn ty_size_full(&self, ty: &Ty) -> Option<u64> {
         if let Some(size) = self.ty_size(ty) {
             return Some(size);
         }
@@ -2527,7 +2567,7 @@ impl<'a> Interpreter<'a> {
 
     /// A reference target advanced by a pointer offset (see
     /// [`Self::ptr_offset_value`]).
-    fn offset_target(
+    pub(crate) fn offset_target(
         &self,
         target: RefTarget,
         frames: &[Frame],
@@ -2619,12 +2659,64 @@ impl<'a> Interpreter<'a> {
             RefTarget::Value(v, projection) => {
                 if projection.is_empty() {
                     // An unprojected value target denotes the
-                    // aggregate itself: the offset is applied
-                    // eagerly to the constant value.
-                    Ok(RefTarget::value(
-                        self.offset_value_target(*v, count, elem_size)?,
-                    ))
+                    // aggregate itself: for the element-shaped
+                    // constants (tuples, byte strings) the offset
+                    // is applied eagerly to the constant value.
+                    // Any other aggregate's storage is a byte
+                    // extent the offset denotes a position in --
+                    // a one-past-the-end pointer into a constant
+                    // allocation is the shape `ThinBox`'s ZST
+                    // construction forms -- so the displacement
+                    // is carried on the projection, as the
+                    // projected arm below carries it.
+                    match &*v {
+                        Value::Tuple(_) | Value::Bytes(_) => Ok(RefTarget::value(
+                            self.offset_value_target(*v, count, elem_size)?,
+                        )),
+                        _ => {
+                            let projection = self.offset_projection(
+                                frames,
+                                None,
+                                None,
+                                Vec::new(),
+                                disp,
+                                elem_size,
+                                Some(&v),
+                                count,
+                            )?;
+                            Ok(RefTarget::Value(v, projection))
+                        }
+                    }
                 } else if let Some((&RefProj::Index(i), head)) = projection.split_last() {
+                    // A byte-denominated offset (the pointer
+                    // was cast to a byte pointer before the
+                    // arithmetic, as `ThinBox`'s header
+                    // back-step casts the data pointer to
+                    // `*mut u8` and subtracts the header size)
+                    // does not count in the elements the index
+                    // denotes: translate it through the
+                    // aggregate's field offsets when every
+                    // field's byte size is known and the
+                    // displacement lands on a field boundary.
+                    if head.is_empty() {
+                        if let Some(es) = elem_size {
+                            if let Some(offsets) = aggregate_field_offsets(&v) {
+                                if let Some(pos) = offsets.get(i).copied() {
+                                    let landed = pos as i128
+                                        + count * i128::from(es);
+                                    if let Some(j) = offsets
+                                        .iter()
+                                        .position(|&o| o as i128 == landed)
+                                    {
+                                        return Ok(RefTarget::Value(
+                                            v,
+                                            vec![RefProj::Index(j)],
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // A value target projected to an element of
                     // the constant aggregate (the shape a
                     // first-element cast of a constant array or

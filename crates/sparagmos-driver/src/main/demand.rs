@@ -1856,6 +1856,17 @@ pub(crate) fn demand_dyn_instances(
     let mut queue: VecDeque<rustc_public::mir::Body> = sources.iter().cloned().collect();
     let mut seen_refs: HashSet<String> = HashSet::new();
     let mut new_bodies: Vec<rustc_public::mir::Body> = Vec::new();
+    // The trait references of the vtables the constants
+    // decoded so far form (see `Converter::vtable_demand`):
+    // no scanned body's cast names them, so they ride the
+    // first scanned body's iteration.
+    let mut extra_refs: Vec<rustc_public::ty::TraitRef> = if queue.is_empty() {
+        // No scanned body to ride: leave the recorded refs for
+        // a later call of this pass.
+        Vec::new()
+    } else {
+        std::mem::take(&mut conv.vtable_demand)
+    };
     while let Some(body) = queue.pop_front() {
         // Vtable queries go through the compiler's internals and
         // can panic on exotic traits; isolate each scanned body
@@ -1863,7 +1874,10 @@ pub(crate) fn demand_dyn_instances(
         // never make a crate convert worse.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut converted_now: Vec<rustc_public::mir::Body> = Vec::new();
-            for tref in dyn_trait_refs(&body) {
+            for tref in dyn_trait_refs(&body)
+                .into_iter()
+                .chain(extra_refs.drain(..))
+            {
                 if !seen_refs.insert(format!("{tref:?}")) {
                     continue;
                 }

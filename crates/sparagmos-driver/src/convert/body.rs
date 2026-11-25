@@ -13,6 +13,8 @@ impl Converter {
             def_names: Vec::new(),
             intrinsic_defs: std::collections::HashSet::new(),
             async_closure_defs: std::collections::HashSet::new(),
+            vtable_identities: HashMap::new(),
+            vtable_demand: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),

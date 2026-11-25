@@ -177,6 +177,7 @@ fn build_with_table(
         adt_shapes: Default::default(),
         adt_debug_shapes: Default::default(),
         adt_field_layouts: Default::default(),
+        vtable_identities: Default::default(),
         tuple_layouts: Default::default(),
         adt_tag_layouts: Default::default(),
         env_debug_shapes: Default::default(),

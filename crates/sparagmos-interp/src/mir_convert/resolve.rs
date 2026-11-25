@@ -7,6 +7,7 @@ use sparagmos_mir as mir;
 use crate::ir;
 
 use super::converter::*;
+use super::drop_glue::DropGlueBuilder;
 use super::errors::*;
 use super::program::*;
 
@@ -544,6 +545,24 @@ fn convert_all_with(
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
+    // The vtable identities the driver recorded as it minted
+    // vtable-pointer constants, with each concrete type's name
+    // rendered and its drop glue built the way a
+    // conversion-baked `DynRef` constant carries them.
+    out.vtable_identities = program
+        .vtable_identities
+        .iter()
+        .map(|(id, (concrete, traits))| {
+            (
+                *id,
+                ir::VTableIdentity {
+                    concrete: conv.concrete_ty_name(concrete),
+                    traits: traits.clone(),
+                    glue: DropGlueBuilder::build(&conv, concrete),
+                },
+            )
+        })
+        .collect();
     out.adt_field_layouts = program.adt_field_layouts.clone();
     out.adt_tag_layouts = program.adt_tag_layouts.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();

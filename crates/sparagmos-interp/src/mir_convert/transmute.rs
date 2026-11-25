@@ -4,6 +4,7 @@
 use sparagmos_mir as mir;
 
 use crate::ir;
+use crate::value::{Value};
 
 use super::adt_fields::*;
 use super::converter::*;
@@ -2270,6 +2271,143 @@ let inner = match (&src, target) {
         match self.discriminants.get(def) {
             Some(table) if !table.is_empty() => Some(table.clone()),
             _ => Some((0..shape.variants.len() as i128).collect()),
+        }
+    }
+
+    /// The value the all-zeroes bit pattern of `ty` denotes, in
+    /// the model's structural form -- what `std::mem::zeroed`
+    /// materializes. Scalars are their zero; a tuple or array
+    /// is built element by element; an ADT is built field by
+    /// field, an enum taking the variant the recorded layout
+    /// assigns to the zero pattern: the niche variant when
+    /// zero lies in the recorded niche range, otherwise the
+    /// variant whose discriminant is zero. `None` when the
+    /// pattern denotes no value this construction can build:
+    /// an enum with no zero-discriminant variant and no niche
+    /// covering zero, a `dyn` fat pointer (a null vtable names
+    /// no identity), a function pointer, an unrecorded ADT, a
+    /// union other than `MaybeUninit`.
+    pub(super) fn zeroed_model_value(&self, ty: &mir::Ty, depth: u32) -> Option<Value> {
+        use crate::value::RefTarget;
+        if depth > 8 {
+            return None;
+        }
+        match ty {
+            mir::Ty::Bool => Some(Value::Bool(false)),
+            mir::Ty::Char => Some(Value::Uint(0)),
+            mir::Ty::Int(_) => Some(Value::Int(0)),
+            mir::Ty::Uint(_) => Some(Value::Uint(0)),
+            mir::Ty::Float(ft) => Some(match ft.bits() {
+                128 => Value::Float128(0),
+                _ => Value::Float(0.0),
+            }),
+            mir::Ty::Tuple(ts) => {
+                if ts.is_empty() {
+                    return Some(Value::Unit);
+                }
+                let mut fields = Vec::with_capacity(ts.len());
+                for t in ts {
+                    fields.push(self.zeroed_model_value(t, depth + 1)?);
+                }
+                Some(Value::Tuple(fields))
+            }
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n > 4096 {
+                    return None;
+                }
+                let elem = self.zeroed_model_value(elem, depth + 1)?;
+                Some(Value::Tuple(vec![elem; *n as usize]))
+            }
+            // A zeroed thin pointer is the null pointer; a
+            // zeroed slice or string pointer is the null fat
+            // pointer of length zero.
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                match &**inner {
+                    mir::Ty::Slice(_) | mir::Ty::Str => Some(Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::Null)),
+                        len: 0,
+                    }),
+                    mir::Ty::Dynamic(..) => None,
+                    _ => Some(Value::Ref(RefTarget::Null)),
+                }
+            }
+            mir::Ty::Adt(def, args) => {
+                // `MaybeUninit<T>` holds its payload at field 0
+                // in this model, and its `zeroed` constructor is
+                // exactly the zeroed payload in that slot.
+                if matches!(
+                    self.def_display_name(def).as_str(),
+                    "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+                ) {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    let payload = self.zeroed_model_value(&args[0], depth + 1)?;
+                    return Some(Value::Enum {
+                        variant: 0,
+                        fields: vec![payload],
+                    });
+                }
+                let shape = self.adt_shapes.get(def)?;
+                let zeroed_fields = |variant: u32| -> Option<Vec<Value>> {
+                    let ftys = self.instantiated_field_tys(def, args, variant)?;
+                    let mut fields = Vec::with_capacity(ftys.len());
+                    for fty in &ftys {
+                        fields.push(self.zeroed_model_value(fty, depth + 1)?);
+                    }
+                    Some(fields)
+                };
+                match shape.kind {
+                    mir::AdtShapeKind::Union => None,
+                    mir::AdtShapeKind::Struct => Some(Value::Enum {
+                        variant: 0,
+                        fields: zeroed_fields(0)?,
+                    }),
+                    mir::AdtShapeKind::Enum => {
+                        // A niche-encoded instance: the recorded
+                        // niche decides which variant the zero
+                        // pattern denotes (the window the pattern
+                        // reads in the niche scalar is zero).
+                        let tag = crate::builtins::ty_tag(
+                            &mir::Ty::Adt(*def, args.to_vec()),
+                            self.names,
+                        );
+                        if let Some(niche) = self.adt_niches.get(&tag) {
+                            let mask = if niche.tag_bits >= 128 {
+                                u128::MAX
+                            } else {
+                                (1u128 << niche.tag_bits) - 1
+                            };
+                            let offset =
+                                0u128.wrapping_sub(niche.niche_start) & mask;
+                            let span = u128::from(
+                                niche.niche_variants.1 - niche.niche_variants.0,
+                            );
+                            if offset <= span {
+                                return Some(Value::Enum {
+                                    variant: niche.niche_variants.0
+                                        + offset as u32,
+                                    fields: Vec::new(),
+                                });
+                            }
+                            return Some(Value::Enum {
+                                variant: niche.untagged_variant,
+                                fields: zeroed_fields(niche.untagged_variant)?,
+                            });
+                        }
+                        // A direct-tag instance: the variant
+                        // whose discriminant is zero.
+                        let table = self.discriminants.get(def)?;
+                        let variant =
+                            table.iter().position(|d| *d == 0)? as u32;
+                        Some(Value::Enum {
+                            variant,
+                            fields: zeroed_fields(variant)?,
+                        })
+                    }
+                }
+            }
+            _ => None,
         }
     }
 
