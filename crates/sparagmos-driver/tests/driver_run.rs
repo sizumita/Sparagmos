@@ -23710,6 +23710,89 @@ fn run_mode_byte_copy_through_scalar_storage() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok 197121\n");
 }
 
+const F32_BYTE_INDEX_READ_SRC: &str = r#"
+static SX: f32 = 1.0;
+struct Wrap { f: f32 }
+fn main() {
+    let x: f32 = 1.0;
+    let bs = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u8, 4) };
+    println!("local {} {} {} {}", bs[0], bs[1], bs[2], bs[3]);
+    let ss = unsafe { std::slice::from_raw_parts(&SX as *const f32 as *const u8, 4) };
+    println!("stat {} {} {} {}", ss[0], ss[1], ss[2], ss[3]);
+    let w = Wrap { f: 2.5 };
+    let fb = unsafe { std::slice::from_raw_parts(&w.f as *const f32 as *const u8, 4) };
+    println!("field {} {} {} {}", fb[0], fb[1], fb[2], fb[3]);
+    let bx = Box::new(1.0f32);
+    let bb = unsafe { std::slice::from_raw_parts(&*bx as *const f32 as *const u8, 4) };
+    println!("boxed {} {} {} {}", bb[0], bb[1], bb[2], bb[3]);
+    let n: u32 = 0x0a0b0c0d;
+    let nb = unsafe { std::slice::from_raw_parts(&n as *const u32 as *const u8, 4) };
+    println!("int {} {} {} {}", nb[0], nb[1], nb[2], nb[3]);
+}
+"#;
+
+#[test]
+fn run_mode_byte_index_read_of_f32_storage() {
+    // Index reads through a `&[u8]` view of an f32's storage
+    // yield the f32's own bytes, not the widened f64 model's
+    // (Issue #475): 1.0f32 is [0, 0, 128, 63], where the f64
+    // form's low bytes are all zero. The local, static, field
+    // and boxed positions all route through the projectors'
+    // index arm, whose declared type in hand judges the byte.
+    // A multi-byte integer's bytes are the same under either
+    // form: the guard that the declared-width path leaves the
+    // kinds that were already right alone.
+    let dir = temp_dir("f32-byte-index-read");
+    let src = fixture(&dir, "f32_byte_index_read.rs", F32_BYTE_INDEX_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "local 0 0 128 63\nstat 0 0 128 63\nfield 0 0 32 64\nboxed 0 0 128 63\nint 13 12 11 10\n"
+    );
+}
+
+const F32_BYTE_INDEX_WRITE_SRC: &str = r#"
+fn main() {
+    let mut y: f32 = 0.0;
+    let ws = unsafe { std::slice::from_raw_parts_mut(&mut y as *mut f32 as *mut u8, 4) };
+    ws[3] = 0x3f;
+    ws[2] = 0x80;
+    println!("local {}", y.to_bits());
+    let mut bx = Box::new(0.0f32);
+    let bw = unsafe { std::slice::from_raw_parts_mut(&mut *bx as *mut f32 as *mut u8, 4) };
+    bw[3] = 0x3f;
+    bw[2] = 0x80;
+    println!("boxed {}", bx.to_bits());
+    let mut z: f32 = 0.0;
+    let zw = unsafe { std::slice::from_raw_parts_mut(&mut z as *mut f32 as *mut u8, 4) };
+    zw[0] = 0x00;
+    zw[1] = 0x00;
+    zw[2] = 0x20;
+    zw[3] = 0xc0;
+    println!("full {}", z);
+}
+"#;
+
+#[test]
+fn run_mode_byte_index_write_of_f32_storage() {
+    // Byte writes through a `&mut [u8]` view of an f32's
+    // storage splice into the f32's own bits (Issue #475):
+    // bytes [0, 0, 128, 63] assemble 1.0f32. Splicing into
+    // the widened f64 form instead loses the write entirely
+    // when the value is read back at its declared width.
+    let dir = temp_dir("f32-byte-index-write");
+    let src = fixture(&dir, "f32_byte_index_write.rs", F32_BYTE_INDEX_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "local 1065353216\nboxed 1065353216\nfull -2.5\n"
+    );
+}
+
 const C_MAIN_SRC: &str = r#"
 #![no_std]
 #![no_main]
