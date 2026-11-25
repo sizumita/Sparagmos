@@ -1676,3 +1676,186 @@ fn run_mode_hashset_recollect_from_own_into_iter() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3 sum=15\n");
 }
+
+const CHUNKS_ITERATION_SRC: &str = r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    let mut c = v.chunks(2);
+    println!("{:?}", c.next());
+    println!("{:?}", c.next_back());
+    println!("{:?}", c.next());
+    println!("{:?}", c.next());
+    let r: Vec<&[i32]> = v.rchunks(2).collect();
+    println!("{:?}", r);
+    let ce: Vec<&[i32]> = v.chunks_exact(2).collect();
+    println!("{:?}", ce);
+    println!("rem {:?}", v.chunks_exact(2).remainder());
+    let mut rc = v.rchunks_exact(2);
+    println!("{:?}", rc.next());
+    println!("{:?}", rc.next_back());
+    println!("{:?}", rc.next());
+    println!("count {}", v.chunks(3).count());
+    let s: i32 = v.chunks(2).map(|c| c.iter().sum::<i32>()).sum();
+    println!("sum {}", s);
+}
+"#;
+
+#[test]
+fn run_mode_chunks_family_iteration() {
+    // The slice chunk family (`Chunks` / `RChunks` and their
+    // `Exact` variants) had a modelled `size_hint` but no
+    // modelled step: every `next` on their real-layout state
+    // ([remaining slice, chunk size], the `Exact` variants
+    // adding a remainder slice) died as not runtime-supported.
+    // The state machine now steps them, including the short
+    // chunk each family yields last in its primary direction.
+    // The outputs are native rustc 1.100.0's.
+    let dir = temp_dir("chunks-iteration");
+    let src = fixture(&dir, "chunks_iteration.rs", CHUNKS_ITERATION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "chunks iteration must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some([1, 2])\nSome([5])\nSome([3, 4])\nNone\n[[4, 5], [2, 3], [1]]\n[[1, 2], [3, 4]]\nrem [5]\nSome([4, 5])\nSome([2, 3])\nNone\ncount 2\nsum 15\n"
+    );
+}
+
+const COLLECTION_ITERATORS_SRC: &str = r#"
+use std::collections::{BinaryHeap, LinkedList, VecDeque};
+fn main() {
+    let mut l = LinkedList::new();
+    l.push_back(5); l.push_back(7); l.push_back(9);
+    let mut it = l.iter();
+    println!("{:?} {:?} {:?}", it.next(), it.next_back(), it.next());
+    println!("count {}", l.iter().count());
+    let mut s = 0;
+    for x in l.into_iter() { s += x; }
+    println!("sum {}", s);
+    let mut h = BinaryHeap::with_capacity(4);
+    h.push(3); h.push(9); h.push(5);
+    let mut hi = h.iter();
+    println!("{:?} {:?}", hi.next(), hi.next());
+    println!("hcount {}", h.iter().count());
+    let mut d = VecDeque::new();
+    d.push_back(4); d.push_back(6); d.push_front(2);
+    let mut di = d.iter();
+    println!("{:?} {:?} {:?}", di.next(), di.next_back(), di.next());
+    let mut dsum = 0;
+    for x in d.into_iter() { dsum += x; }
+    println!("dsum {}", dsum);
+}
+"#;
+
+#[test]
+fn run_mode_collection_iterators_next() {
+    // The concrete collection iterators (`LinkedList` /
+    // `VecDeque` / `BinaryHeap` in their `Iter` and
+    // `IntoIter` forms) step through their collected bodies,
+    // like the hash iterators: neither reach nor conversion
+    // demanded or preferred those bodies, so `next` and the
+    // containers' by-value `into_iter` died as not
+    // runtime-supported (the iterators' own identity
+    // `into_iter` is served by the builtin). The outputs are
+    // native rustc 1.100.0's.
+    let dir = temp_dir("collection-iterators");
+    let src = fixture(&dir, "collection_iterators.rs", COLLECTION_ITERATORS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collection iterators must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some(5) Some(9) Some(7)\ncount 3\nsum 21\nSome(9) Some(3)\nhcount 3\nSome(2) Some(6) Some(4)\ndsum 12\n"
+    );
+}
+
+const MUT_REF_ITERATOR_SRC: &str = r#"
+fn main() {
+    let v = vec![10u32, 20, 30, 40];
+    let mut it = v.iter().cloned();
+    let mut sum = 0u32;
+    for x in &mut it { sum += x; }
+    println!("sum={} after={:?}", sum, it.next());
+    let a = [1u64, 2, 3];
+    let b = [100u64, 200, 300];
+    let mut ci = a.iter().cloned();
+    let z: Vec<(u64, u64)> = b.iter().cloned().zip(&mut ci).collect();
+    println!("{:?} ci={:?}", z, ci.next());
+    let mut m = v.iter().map(|x| x + 1);
+    println!("{:?}", (&mut m).next());
+    println!("{:?}", m.next());
+}
+"#;
+
+#[test]
+fn run_mode_mut_ref_iterator_forwarding() {
+    // The `&mut I: Iterator` / `IntoIterator` blanket shapes:
+    // `into_iter` on a `&mut` iterator is the identity (the
+    // reference itself is the iterator), and its `next`
+    // forwards to the pointee -- including the `&mut` side a
+    // `Zip` state holds, which the modelled consumer steps
+    // as a state field. All three shapes died as not
+    // runtime-supported. The outputs are native
+    // rustc 1.100.0's.
+    let dir = temp_dir("mut-ref-iterator");
+    let src = fixture(&dir, "mut_ref_iterator.rs", MUT_REF_ITERATOR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "&mut iterator forwarding must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sum=100 after=None\n[(100, 1), (200, 2), (300, 3)] ci=None\nSome(11)\nSome(21)\n"
+    );
+}
+
+const HASH_SET_COLLECT_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let mut s = HashSet::new();
+    s.insert(3u32); s.insert(1); s.insert(2);
+    let mut v: Vec<u32> = s.into_iter().collect();
+    v.sort_unstable();
+    println!("{:?}", v);
+    let mut s2 = HashSet::new();
+    s2.insert(10u32); s2.insert(20);
+    println!("count {}", s2.into_iter().count());
+}
+"#;
+
+#[test]
+fn run_mode_hash_set_collect_into_vec() {
+    // `collect::<Vec>()` over a hash-set iterator: the
+    // nested specialization entry (`SpecFromIterNested`)
+    // was pre-empted by the builtin for every iterator, and
+    // the builtin's drain drives the modelled `next` state
+    // machine, which cannot walk a raw table -- the collect
+    // died on the first step even though the direct `next`
+    // body chain worked. For a body-served iterator the
+    // entry's collected body chain is the execution. The
+    // outputs are native rustc 1.100.0's.
+    let dir = temp_dir("hash-set-collect");
+    let src = fixture(&dir, "hash_set_collect.rs", HASH_SET_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "hash set collect must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2, 3]\ncount 2\n"
+    );
+}
