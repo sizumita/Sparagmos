@@ -51,6 +51,10 @@ both sides are judged by compiletest's rules for each suite
 (htmldocck for rustdoc-html, jsondocck and jsondoclint for
 rustdoc-json, the UI verdict for rustdoc-ui). The official
 metric-2(b) measurement runs all four stages (`--stages all`).
+The exec records of the coverage suites belong to no stage:
+compiletest judges them by coverage output, not by program
+output (see `coverage_scope` below), so they are among the
+carried not-attempted records, under their own bucket.
 Everything
 else in the denominator is reported as not attempted, with a reason;
 unattempted and failed tests alike count against the overall
@@ -3560,8 +3564,88 @@ def rustdoc_host_tool_scope(rec):
     return None
 
 
+# The coverage suites' verdicts are coverage output, in
+# compiletest itself: each test is judged in a coverage-map
+# mode (the coverage-dump tool's output over the test's saved
+# LLVM IR, compared with the test's .cov-map snapshot) and a
+# coverage-run mode (the llvm-cov text report rendered from
+# an instrumented run's merged counters, compared with the
+# .coverage snapshot), with `//@ ignore-coverage-map` /
+# `//@ ignore-coverage-run` (revision-scoped forms included)
+# able to waive one mode per revision. Measured over the
+# whole population at the 1.100.0 tag, every (file, revision)
+# pair keeps at least one of the two comparisons active, so
+# no record's verdict reduces to the plain execution stage 1
+# judges -- and the generic carry-through bucket misdescribed
+# these records as a multi-file exclusion (95 of the 109 are
+# single-file; the rest carry only the aux-crate directives
+# stage 1 already supports for ui tests). Sparagmos has no
+# coverage-instrumentation subsystem -- neither the coverage
+# counters/regions rustc-codegen-llvm materialises, nor the
+# coverage-mapping dump format and llvm-cov's report
+# rendering -- so these records are recorded as not attempted
+# under their own bucket (issue #514). This records the
+# current harness, not an unreachability claim: the suites
+# become attemptable once a coverage subsystem can produce a
+# guest coverage report to compare against the native one.
+COVERAGE_SUITES = ("coverage", "coverage-run-rustdoc")
+
+
+def coverage_scope(rec):
+    """(reason, bucket) for an exec record whose verdict is
+    coverage output the harness cannot produce, else None.
+
+    Consulted both by fill_result (a record dispatched through
+    process_test) and by main's carry-through for records no
+    stage selects, so the two paths record the same verdict.
+    """
+    if rec["nature"] != "exec":
+        return None
+    if rec["suite"] not in COVERAGE_SUITES:
+        return None
+    if rec["suite"] == "coverage":
+        return (
+            f"suite={rec['suite']}: compiletest judges coverage "
+            "tests by coverage output, not by the program's "
+            "output -- the coverage-map mode compiles the test, "
+            "saves the LLVM IR, runs the coverage-dump tool on "
+            "the IR and compares its output with the test's "
+            ".cov-map snapshot, and the coverage-run mode "
+            "compiles with -C instrument-coverage, runs the "
+            "instrumented binary and compares the llvm-cov "
+            "text report rendered from the merged counters "
+            "with the .coverage snapshot. Every revision of "
+            "every test in the suite has at least one of the "
+            "two comparisons active, so no verdict reduces to "
+            "plain execution; Sparagmos implements neither "
+            "the coverage counters/regions rustc-codegen-llvm "
+            "materialises nor the coverage-mapping dump and "
+            "llvm-cov report path (issue #514)",
+            "not attempted (coverage instrumentation)")
+    if rec["suite"] == "coverage-run-rustdoc":
+        return (
+            f"suite={rec['suite']}: compiletest judges this "
+            "suite by the llvm-cov text report rendered from "
+            "an instrumented run -- the test binary is "
+            "compiled with -C instrument-coverage and "
+            "executed, its doctests are run under "
+            "rustdoc --test with instrument-coverage, and the "
+            "merged counters are compared with the test's "
+            ".coverage snapshot. The verdict never reduces to "
+            "plain execution; Sparagmos implements neither "
+            "the coverage counters/regions rustc-codegen-llvm "
+            "materialises nor the llvm-cov report path "
+            "(issue #514)",
+            "not attempted (coverage instrumentation)")
+    return None
+
+
 def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     scope = rustdoc_host_tool_scope(rec)
+    if scope is not None:
+        out["reason"], out["bucket"] = scope
+        return
+    scope = coverage_scope(rec)
     if scope is not None:
         out["reason"], out["bucket"] = scope
         return
@@ -7636,6 +7720,8 @@ def main():
 
     for r in others:
         scope = rustdoc_host_tool_scope(r)
+        if scope is None:
+            scope = coverage_scope(r)
         if scope is not None:
             reason, bucket = scope
         else:
