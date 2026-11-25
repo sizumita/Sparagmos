@@ -522,12 +522,77 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(run.judge("run-pass", h, native, got), ("pass", ""))
 
     def test_stdout_mismatch_fails(self):
-        h = header("//@ run-pass\n")
-        native = {"exit_code": 0, "stdout": "hi\n"}
-        got = {"exit_code": 0, "stdout": "bye\n"}
+        # check-run-results is the one directive under which
+        # compiletest compares run output at all.
+        h = header("//@ run-pass\n//@ check-run-results\n")
+        native = {"exit_code": 0, "stdout": "hi\n", "stderr": ""}
+        got = {"exit_code": 0, "stdout": "bye\n", "stderr": ""}
         status, detail = run.judge("run-pass", h, native, got)
         self.assertEqual(status, "fail")
         self.assertIn("stdout", detail)
+
+    def test_stdout_not_compared_without_check_run_results(self):
+        # Without the directive compiletest judges the run by
+        # its exit class alone: libtest completion order, thread
+        # interleaving and address-valued prints make the stream
+        # non-reproducible, and the verdict must not see them.
+        h = header("//@ run-pass\n")
+        native = {"exit_code": 0, "stdout": "hi\n", "stderr": ""}
+        got = {"exit_code": 0, "stdout": "bye\n", "stderr": ""}
+        self.assertEqual(run.judge("run-pass", h, native, got),
+                         ("pass", ""))
+
+    def test_check_run_results_thread_id_normalized(self):
+        # compiletest's normalize_output rewrites the numeric
+        # thread id in panic lines to $TID on both sides: the
+        # native run's OS thread id and the guest's modelled
+        # one can never agree literally.
+        h = header("//@ run-fail\n//@ check-stdout\n"
+                   "//@ check-run-results\n")
+        native = {"exit_code": 101, "stdout": "",
+                  "stderr": "thread 'foo' (3584591) panicked at "
+                            "src/main.rs:2:5:\nboom\n"}
+        got = {"exit_code": 101, "stdout": "",
+               "stderr": "thread 'foo' (1) panicked at "
+                         "src/main.rs:2:5:\nboom\n",
+               "stderr_clean": True}
+        import pathlib
+        status, detail = run.judge(
+            "run-fail", h, native, got,
+            path=pathlib.Path("/x/tests/ui/t.rs"),
+            base_dir="/tmp/td")
+        self.assertEqual((status, detail), ("pass", ""))
+
+    def test_check_run_results_stderr_compared_when_clean(self):
+        h = header("//@ run-pass\n//@ check-run-results\n")
+        native = {"exit_code": 0, "stdout": "", "stderr": "a\n"}
+        got = {"exit_code": 0, "stdout": "", "stderr": "b\n",
+               "stderr_clean": True}
+        import pathlib
+        status, detail = run.judge(
+            "run-pass", h, native, got,
+            path=pathlib.Path("/x/tests/ui/t.rs"),
+            base_dir="/tmp/td")
+        self.assertEqual(status, "fail")
+        self.assertEqual(detail, "stderr mismatch")
+        self.assertEqual(run.failure_bucket(detail),
+                         "stderr mismatch")
+
+    def test_check_run_results_stderr_skipped_when_not_clean(self):
+        # A guest result without the clean-stderr mark (the JIT
+        # run's shared channel) is judged without the stderr
+        # half: the driver process's own diagnostics ride that
+        # stream and are not the guest's output.
+        h = header("//@ run-pass\n//@ check-run-results\n")
+        native = {"exit_code": 0, "stdout": "", "stderr": "a\n"}
+        got = {"exit_code": 0, "stdout": "",
+               "stderr": "driver diagnostics\n"}
+        import pathlib
+        status, _ = run.judge(
+            "run-pass", h, native, got,
+            path=pathlib.Path("/x/tests/ui/t.rs"),
+            base_dir="/tmp/td")
+        self.assertEqual(status, "pass")
 
     def test_run_fail_default_status_101(self):
         h = header("//@ run-fail\n")
@@ -536,11 +601,91 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(run.judge("run-fail", h, native, got)[0], "pass")
 
     def test_run_fail_custom_failure_status(self):
+        # failure-status constrains the COMPILE phase's status
+        # only (compiletest's check_correct_failure_status); the
+        # run verdict is the RunResult class, so a native exit
+        # of 7 and a guest panic exit of 101 -- both Fail --
+        # satisfy run-fail together.
         h = header("//@ run-fail\n//@ failure-status: 7\n")
-        self.assertEqual(run.expected_exit("run-fail", h), 7)
-        native = {"exit_code": 7, "stdout": ""}
-        got = {"exit_code": 101, "stdout": ""}
-        self.assertEqual(run.judge("run-fail", h, native, got)[0], "fail")
+        native = {"exit_code": 7, "stdout": "", "stderr": ""}
+        got = {"exit_code": 101, "stdout": "", "stderr": ""}
+        self.assertEqual(run.judge("run-fail", h, native, got)[0],
+                         "pass")
+
+    def test_run_fail_any_fail_class_code_passes(self):
+        # A sanitizer runtime's default exit (23) and a plain
+        # process::exit(1) are the same RunResult::Fail class
+        # as a panic's 101.
+        h = header("//@ run-fail\n")
+        for native_code, got_code in ((23, 1), (1, 101), (101, 42)):
+            native = {"exit_code": native_code, "stdout": "",
+                      "stderr": ""}
+            got = {"exit_code": got_code, "stdout": "", "stderr": ""}
+            self.assertEqual(
+                run.judge("run-fail", h, native, got)[0], "pass",
+                (native_code, got_code))
+
+    def test_run_fail_guest_success_fails(self):
+        h = header("//@ run-fail\n")
+        native = {"exit_code": 101, "stdout": "", "stderr": ""}
+        got = {"exit_code": 0, "stdout": "", "stderr": ""}
+        status, detail = run.judge("run-fail", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertIn("exit mismatch", detail)
+
+    def test_run_pass_guest_failure_fails(self):
+        h = header("//@ run-pass\n")
+        native = {"exit_code": 0, "stdout": "", "stderr": ""}
+        got = {"exit_code": 101, "stdout": "", "stderr": ""}
+        self.assertEqual(run.judge("run-pass", h, native, got)[0],
+                         "fail")
+
+    def test_error_pattern_checked_against_run_stderr(self):
+        h = header("//@ run-fail\n"
+                   "//@ error-pattern: LeakSanitizer: detected "
+                   "memory leaks\n")
+        native = {"exit_code": 23, "stdout": "",
+                  "stderr": "==1==ERROR: LeakSanitizer: detected "
+                            "memory leaks\n"}
+        self.assertIsNone(run.native_mismatch("run-fail", h,
+                                              native))
+        got = {"exit_code": 101, "stdout": "",
+               "stderr": "panicked: no leak here\n"}
+        status, detail = run.judge("run-fail", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertIn("error pattern", detail)
+
+    def test_error_pattern_missing_on_native_is_oracle_failure(self):
+        h = header("//@ run-fail\n//@ error-pattern: boom\n")
+        native = {"exit_code": 101, "stdout": "",
+                  "stderr": "something else\n"}
+        self.assertIn("error pattern",
+                      run.native_mismatch("run-fail", h, native))
+
+    def test_error_pattern_check_stdout_uses_combined_stream(self):
+        h = header("//@ run-fail\n//@ check-stdout\n"
+                   "//@ error-pattern: in stdout\n")
+        native = {"exit_code": 101, "stdout": "in stdout\n",
+                  "stderr": ""}
+        self.assertIsNone(run.native_mismatch("run-fail", h,
+                                              native))
+        # Without check-stdout the same pattern in stdout does
+        # not count: get_output is the stderr alone.
+        h2 = header("//@ run-fail\n"
+                    "//@ error-pattern: in stdout\n")
+        self.assertIn("error pattern",
+                      run.native_mismatch("run-fail", h2, native))
+
+    def test_regex_error_pattern(self):
+        h = header("//@ run-fail\n"
+                   "//@ regex-error-pattern: thread '.+' panicked\n")
+        native = {"exit_code": 101, "stdout": "",
+                  "stderr": "thread 'foo' panicked at x\n"}
+        self.assertIsNone(run.native_mismatch("run-fail", h,
+                                              native))
+        got = {"exit_code": 101, "stdout": "", "stderr": "quiet\n"}
+        self.assertEqual(run.judge("run-fail", h, native, got)[0],
+                         "fail")
 
     def test_run_result_class_matches_compiletest(self):
         # runtest/ui.rs's RunResult: success is Pass, 1..=127 is
@@ -601,9 +746,17 @@ class JudgeTests(unittest.TestCase):
     def test_native_mismatch_fixed_code_modes(self):
         h = header("//@ run-pass\n")
         self.assertIsNone(run.native_mismatch(
-            "run-pass", h, {"exit_code": 0}))
+            "run-pass", h, {"exit_code": 0, "stderr": ""}))
         self.assertIn("does not match", run.native_mismatch(
-            "run-pass", h, {"exit_code": 101}))
+            "run-pass", h, {"exit_code": 101, "stderr": ""}))
+        # run-fail is a class, not the fixed code 101.
+        hf = header("//@ run-fail\n")
+        self.assertIsNone(run.native_mismatch(
+            "run-fail", hf, {"exit_code": 23, "stderr": ""}))
+        self.assertIsNone(run.native_mismatch(
+            "run-fail", hf, {"exit_code": 1, "stderr": ""}))
+        self.assertIn("does not match", run.native_mismatch(
+            "run-fail", hf, {"exit_code": 0, "stderr": ""}))
 
 
 class BucketReasonTests(unittest.TestCase):
@@ -1387,7 +1540,8 @@ class ProcessStage2Tests(unittest.TestCase):
         captured = {}
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             captured["rustc_args"] = list(rustc_args)
             return conv_result
 
@@ -1481,7 +1635,8 @@ class ProcessStage2Tests(unittest.TestCase):
         calls = []
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             calls.append(list(rustc_args))
             return conv()
 
@@ -1503,7 +1658,8 @@ class ProcessStage2Tests(unittest.TestCase):
         calls = []
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             calls.append(list(rustc_args))
             for rev, res in by_rev.items():
                 if rev in rustc_args or \
@@ -1689,7 +1845,8 @@ class ProcessStage2Tests(unittest.TestCase):
             suite="incremental")
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -1946,7 +2103,8 @@ class ProcessStage2AuxTests(unittest.TestCase):
         orig = run.convert_side
 
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -2296,7 +2454,8 @@ class ProcessStage2RevisionTests(unittest.TestCase):
     def run_with_fake(self, rec, fake):
         orig = run.convert_side
         def stub(path, edition, driver_bin, rustc_args=(),
-                 aux_specs=(), env_extra=None, env_remove=()):
+                 aux_specs=(), env_extra=None, env_remove=(),
+                 jit=False, aux_env_scrub=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -2783,8 +2942,12 @@ class ProcessStage1RevisionTests(unittest.TestCase):
         self.assertEqual(res["revisions"]["b"]["status"], "pass")
 
     def test_one_revision_stdout_mismatch_fails(self):
+        # check-run-results puts the run's stdout under
+        # comparison (compiletest compares it for no other
+        # directive); revision b's guest prints the wrong line.
         rec = self.write_test(
             "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@ check-run-results\n"
             "fn main() {}\n")
 
         def spar(seen):
@@ -3103,7 +3266,8 @@ class ProcMacroExternTests(unittest.TestCase):
         orig = run.convert_side
 
         def capture(path, edition, driver_bin, rustc_args=(),
-                    aux_specs=(), env_extra=None, env_remove=()):
+                    aux_specs=(), env_extra=None, env_remove=(),
+                    jit=False, aux_env_scrub=()):
             seen["args"] = list(rustc_args)
             return conv()
 

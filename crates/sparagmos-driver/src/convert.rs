@@ -61,7 +61,7 @@ pub fn set_compiler_tcx(tcx: Option<rustc_middle::ty::TyCtxt<'_>>) {
     COMPILER_TCX.with(|slot| slot.set(erased));
 }
 
-pub(crate) fn compiler_tcx() -> Option<rustc_middle::ty::TyCtxt<'static>> {
+pub fn compiler_tcx() -> Option<rustc_middle::ty::TyCtxt<'static>> {
     COMPILER_TCX.with(|slot| slot.get())
 }
 

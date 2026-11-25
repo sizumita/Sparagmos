@@ -1515,18 +1515,65 @@ def applicability(header, facts=None):
 # Verdict logic (pure; unit-tested with fixtures)
 # ---------------------------------------------------------------------------
 
-def expected_exit(mode, header):
-    """Exit code the mode expects from the program run."""
+def mode_satisfied(mode, exit_code):
+    """Whether a finished run's exit code satisfies the mode,
+    judged the way compiletest judges an executed run
+    (runtest/ui.rs): run-pass needs RunResult::Pass (exit 0),
+    run-fail needs RunResult::Fail (any exit in 1..=127), and
+    run-crash needs RunResult::Crash. The class is all that is
+    checked: a test's `failure-status` directive is compared
+    against the COMPILE phase's status only (runtest.rs's
+    check_correct_failure_status), never the run's, so a run-fail
+    program exiting 23 (a sanitizer runtime's default) or 1
+    satisfies the mode exactly as one exiting 101 does."""
+    cls = run_result_class(exit_code)
     if mode == "run-pass":
-        return 0
+        return cls == "pass"
     if mode == "run-fail":
-        for v in header.values("failure-status"):
-            try:
-                return int(v.strip())
-            except ValueError:
-                pass
-        return 101
-    return None  # run-crash: no fixed code; judged by run class
+        return cls == "fail"
+    if mode == "run-crash":
+        return cls == "crash"
+    return False
+
+
+def run_pattern_output(view, result):
+    """The stream compiletest checks error patterns against for
+    an executed run (runtest.rs's get_output): the run's stderr,
+    or its stdout followed by its stderr when the view declares
+    check-stdout."""
+    if view.has("check-stdout"):
+        return result.get("stdout", "") + result.get("stderr", "")
+    return result.get("stderr", "")
+
+
+def missing_run_patterns(view, result):
+    """The view's error-pattern / regex-error-pattern directives
+    that the run's pattern stream does not contain, judged the
+    way compiletest's check_all_error_patterns judges an executed
+    run: a plain pattern matches as a substring (of the trimmed
+    pattern), a regex pattern by search, both against the raw
+    stream with no normalization. An unparseable regex counts as
+    missing on both sides alike (compiletest rejects the test
+    itself for one), so the native-side check reports the record
+    unjudgeable rather than failing the guest for it."""
+    patterns = view.values("error-pattern")
+    regexes = view.values("regex-error-pattern")
+    if not patterns and not regexes:
+        return []
+    output = run_pattern_output(view, result)
+    missing = []
+    for pattern in patterns:
+        if pattern.strip() not in output:
+            missing.append(pattern)
+    for pattern in regexes:
+        try:
+            rx = re.compile(_stage4_translate_posix(pattern.strip()))
+        except re.error:
+            missing.append(pattern)
+            continue
+        if not rx.search(output):
+            missing.append(pattern)
+    return missing
 
 
 def run_result_class(exit_code):
@@ -1546,22 +1593,26 @@ def run_result_class(exit_code):
 
 
 def native_mismatch(mode, header, native):
-    """Why the native run does not behave as the mode expects,
+    """Why the native run does not behave as the test expects,
     or None when it does: the oracle check every execution
-    attempt applies before the Sparagmos side is judged.
-    run-pass / run-fail expect the one fixed exit code of
-    expected_exit; run-crash expects the run to classify as a
-    crash (see run_result_class).
+    attempt applies before the Sparagmos side is judged. The
+    run's exit must satisfy the mode (mode_satisfied's class
+    check) and the run's output must contain the view's error
+    patterns (missing_run_patterns): a native run failing
+    either is a broken oracle for this record, not a Sparagmos
+    verdict.
     """
     if mode == "run-crash":
         if run_result_class(native["exit_code"]) != "crash":
             return (f"native run exit {native['exit_code']} does "
                     f"not crash as the mode expects")
-        return None
-    exp = expected_exit(mode, header)
-    if native["exit_code"] != exp:
+    elif not mode_satisfied(mode, native["exit_code"]):
         return (f"native run exit {native['exit_code']} does "
-                f"not match the mode expectation {exp}")
+                f"not match the mode expectation {mode}")
+    missing = missing_run_patterns(header, native)
+    if missing:
+        return (f"native run output does not contain the "
+                f"error pattern {missing[0]!r}")
     return None
 
 
@@ -1569,17 +1620,33 @@ def failure_bucket(detail):
     """The aggregate bucket for a judged execution failure."""
     if detail == "stdout mismatch":
         return "stdout mismatch"
+    if detail == "stderr mismatch":
+        return "stderr mismatch"
     if detail.startswith("guest did not crash"):
         return "guest did not crash"
     return "exit-code mismatch"
 
 
-def judge(mode, header, native, sparagmos):
+def judge(mode, header, native, sparagmos, path=None, base_dir=None):
     """Compare native and Sparagmos results for one attempted test.
 
-    `native` / `sparagmos` are dicts with exit_code (int or None) and
-    stdout (str). Returns (status, detail): status is "pass" or
-    "fail".
+    `native` / `sparagmos` are dicts with exit_code (int or None),
+    stdout and stderr. Returns (status, detail): status is "pass"
+    or "fail". The verdict follows compiletest's for an executed
+    run: each side's exit must satisfy the mode's run class
+    (mode_satisfied), the guest's run output must contain the
+    view's error patterns, and -- only when the view declares
+    check-run-results, the one directive under which compiletest
+    compares run output at all -- the guest's stdout must equal
+    the native run's after compiletest's output normalization
+    (its stderr too, when the guest's stderr arrived on its own
+    channel: a `stderr_clean` result). Without check-run-results
+    the streams are not compared: libtest's parallel completion
+    order, thread interleaving and address-valued prints make a
+    run's stdout non-reproducible in ways compiletest never
+    judges. Callers that pass no normalization context (path /
+    base_dir) keep the raw stdout comparison under
+    check-run-results.
     """
     if mode == "run-crash":
         # compiletest's run-crash verdict: the run must classify
@@ -1594,16 +1661,45 @@ def judge(mode, header, native, sparagmos):
         if sparagmos["stdout"] != native["stdout"]:
             return ("fail", "stdout mismatch")
         return ("pass", "")
-    exp = expected_exit(mode, header)
-    if native["exit_code"] != exp:
+    if not mode_satisfied(mode, native["exit_code"]):
         return ("fail",
-                f"native exit {native['exit_code']} != expected {exp}")
-    if sparagmos["exit_code"] != native["exit_code"]:
+                f"native exit {native['exit_code']} does not "
+                f"satisfy the mode {mode}")
+    if not mode_satisfied(mode, sparagmos["exit_code"]):
         return ("fail",
                 f"exit mismatch: native {native['exit_code']}, "
                 f"sparagmos {sparagmos['exit_code']}")
-    if sparagmos["stdout"] != native["stdout"]:
-        return ("fail", "stdout mismatch")
+    missing = missing_run_patterns(header, sparagmos)
+    if missing:
+        return ("fail",
+                f"error pattern not found in run output: "
+                f"{missing[0]}")
+    if header.has("check-run-results"):
+        if path is not None and base_dir is not None:
+            json_mode = stage4_json_mode(header)
+            out_rules = stage4_normalize_rules(header,
+                                               "normalize-stdout")
+            n_out = stage4_normalize_output(native["stdout"], path,
+                                            base_dir, out_rules,
+                                            json_mode)
+            g_out = stage4_normalize_output(sparagmos["stdout"],
+                                            path, base_dir,
+                                            out_rules, json_mode)
+            if g_out != n_out:
+                return ("fail", "stdout mismatch")
+            if sparagmos.get("stderr_clean"):
+                err_rules = stage4_normalize_rules(
+                    header, "normalize-stderr")
+                n_err = stage4_normalize_output(
+                    native.get("stderr", ""), path, base_dir,
+                    err_rules, json_mode)
+                g_err = stage4_normalize_output(
+                    sparagmos.get("stderr", ""), path, base_dir,
+                    err_rules, json_mode)
+                if g_err != n_err:
+                    return ("fail", "stderr mismatch")
+        elif sparagmos["stdout"] != native["stdout"]:
+            return ("fail", "stdout mismatch")
     return ("pass", "")
 
 
@@ -2492,6 +2588,7 @@ def proc_macro_extern_args(test_path, view, edition):
 
 
 _SYSROOT_EXTERN_CACHE = None
+_SYSROOT_EXTERN_LOCK = threading.Lock()
 _SYSROOT_RMETA_RE = re.compile(r"^lib(.+)-([0-9a-f]{16})\.(rmeta|rlib)$")
 _EXTERN_CRATE_RE = re.compile(r"\bextern\s+crate\s+([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -2513,30 +2610,38 @@ def ambiguous_sysroot_crates():
     """
     global _SYSROOT_EXTERN_CACHE
     if _SYSROOT_EXTERN_CACHE is None:
-        facts = host_facts()
-        if facts is None:
-            return {}
-        _SYSROOT_EXTERN_CACHE = {}
-        libdir = facts.target_lib_dir()
-        if libdir is not None:
-            try:
-                entries = os.listdir(libdir)
-            except OSError:
-                entries = []
-            by_name = {}
-            for entry in entries:
-                m = _SYSROOT_RMETA_RE.match(entry)
-                if m:
-                    by_name.setdefault(m.group(1), {}) \
-                        .setdefault(m.group(2), set()).add(m.group(3))
-            for name, hashes in by_name.items():
-                if len(hashes) < 2:
-                    continue
-                linkable = [h for h, kinds in hashes.items()
-                            if kinds == {"rmeta", "rlib"}]
-                if len(linkable) == 1:
-                    _SYSROOT_EXTERN_CACHE[name] = str(
-                        libdir / f"lib{name}-{linkable[0]}.rmeta")
+        # The map is built under a lock and published whole:
+        # stage attempts run on a thread pool, and a reader
+        # that observed the map mid-build would pin nothing
+        # and fail its compilation with E0464.
+        with _SYSROOT_EXTERN_LOCK:
+            if _SYSROOT_EXTERN_CACHE is None:
+                facts = host_facts()
+                if facts is None:
+                    return {}
+                cache = {}
+                libdir = facts.target_lib_dir()
+                if libdir is not None:
+                    try:
+                        entries = os.listdir(libdir)
+                    except OSError:
+                        entries = []
+                    by_name = {}
+                    for entry in entries:
+                        m = _SYSROOT_RMETA_RE.match(entry)
+                        if m:
+                            by_name.setdefault(m.group(1), {}) \
+                                .setdefault(m.group(2), set()) \
+                                .add(m.group(3))
+                    for name, hashes in by_name.items():
+                        if len(hashes) < 2:
+                            continue
+                        linkable = [h for h, kinds in hashes.items()
+                                    if kinds == {"rmeta", "rlib"}]
+                        if len(linkable) == 1:
+                            cache[name] = str(
+                                libdir / f"lib{name}-{linkable[0]}.rmeta")
+                _SYSROOT_EXTERN_CACHE = cache
     return _SYSROOT_EXTERN_CACHE
 
 
@@ -2576,7 +2681,20 @@ def sysroot_extern_args(path, flags):
     args = []
     for name in sorted(set(_EXTERN_CRATE_RE.findall(text))):
         if name in ambiguous and name not in bound:
-            args += ["--extern", f"{name}={ambiguous[name]}"]
+            rmeta = ambiguous[name]
+            args += ["--extern", f"{name}={rmeta}"]
+            # The pinned hash's rlib sibling (its presence is
+            # what made the hash the linkable candidate): a link
+            # that needs the crate's code -- a no_std root crate
+            # linking libc directly under panic=abort, say --
+            # fails with "required to be available in rlib
+            # format" when only the metadata form is pinned, and
+            # an rlib-only pin fails the other way ("only
+            # metadata stub found"); rustc takes the pair as one
+            # crate's two forms.
+            rlib = rmeta[:-len(".rmeta")] + ".rlib"
+            if Path(rlib).exists():
+                args += ["--extern", f"{name}={rlib}"]
     return args
 
 
@@ -2641,10 +2759,108 @@ def aux_header_view(text):
     return Header(text).view(None)
 
 
+def aux_bin_specs(path, view):
+    """(stem, source) pairs for the view's `//@ aux-bin:` files.
+
+    compiletest builds each file a `//@ aux-bin:` directive names
+    as a binary into the run's auxiliary/bin directory, which the
+    test spawns by relative path from its working directory (the
+    runner's attempt directory, for both run sides). The files
+    resolve the way auxiliary files do: the auxiliary/
+    subdirectory first, then the test's own directory. The stem
+    is the binary's file name verbatim (dashes kept: the test
+    names it literally)."""
+    out = []
+    for v in view.values("aux-bin"):
+        words = v.strip().split()
+        if not words:
+            continue
+        fname = words[0]
+        for base in (path.parent / "auxiliary", path.parent):
+            cand = base / fname
+            if cand.is_file():
+                out.append((Path(fname).stem, cand))
+                break
+    return out
+
+
+def build_native_aux(spec, edition, auxdir, lib, helpers, workdir,
+                     prev_built):
+    """Build one auxiliary crate natively into auxdir against
+    the crates in prev_built ((binding, artifact) pairs).
+    Returns ((binding, artifact), None) or (None, reason).
+    Shared by a test's own auxiliary crates and an aux-bin
+    file's own."""
+    spec = as_aux_spec(spec)
+    name, src = spec.name, spec.path
+    text = src.read_text(errors="ignore")
+    declared = declared_crate_type(text)
+    eff_name = declared_crate_name(text) or name
+    aview = aux_header_view(text)
+    aux_no_pd = aview.has("no-prefer-dynamic")
+    aux_flags = compile_flags(aview, suite_root(src), workdir)
+    if screen_flags(aux_flags, targets={HOST_TARGET}):
+        aux_flags = []
+    # A source declaring several crate types builds one
+    # artifact per type; the one a dependent compilation
+    # can link against is the first linkable declared
+    # type (a cdylib-only auxiliary stays unbound, as
+    # before). With no declared type, the directive's
+    # forced type or compiletest's default applies.
+    linkable = [t for t in declared_crate_types(text)
+                if t in ("rlib", "lib", "dylib", "proc-macro")]
+    if linkable:
+        effective = linkable[0]
+    elif declared is not None:
+        effective = declared
+    else:
+        effective = spec.crate_type or (
+            "rlib" if aux_no_pd else "dylib")
+    cmd = rustc_cmd() + ["--edition", spec.edition or edition,
+                         "--out-dir", str(auxdir)]
+    if lib:
+        cmd += ["-L", lib]
+    cmd += ["-L", f"dependency={auxdir}"]
+    cmd += helpers
+    if declared is None:
+        cmd += ["--crate-type", effective]
+    if declared_crate_name(text) is None:
+        cmd += ["--crate-name", name]
+    if not aux_no_pd and not any(
+            "prefer-dynamic" in f for f in aux_flags):
+        cmd += ["-C", "prefer-dynamic"]
+    for prev_binding, prev_artifact in prev_built:
+        if prev_artifact is not None:
+            cmd += ["--extern",
+                    f"{prev_binding}={prev_artifact}"]
+    cmd += sysroot_extern_args(src, ())
+    cmd += aux_flags
+    cmd += [str(src)]
+    apairs, aunset = view_env(aview, "rustc-env",
+                              "unset-rustc-env",
+                              suite_root(src), workdir)
+    aenv = dict(BOOTSTRAP_ENV)
+    aenv.update(apairs)
+    build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                    env_extra=aenv, env_remove=aunset)
+    if build["timeout"]:
+        return None, "native compile timed out"
+    if build["exit_code"] != 0:
+        first = first_error_line(build["stderr"])
+        return None, f"native compile failed: {first}"
+    artifact = (find_artifact(auxdir, eff_name)
+                if effective in ("rlib", "lib", "dylib",
+                                 "proc-macro")
+                else None)
+    binding = (f"{spec.modifiers}:{eff_name}"
+               if spec.modifiers else eff_name)
+    return (binding, artifact), None
+
+
 def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
                 run_args=(), run_env_extra=None, run_env_remove=(),
                 compile_env_extra=None, compile_env_remove=(),
-                no_prefer_dynamic=False):
+                no_prefer_dynamic=False, aux_bins=()):
     """Compile and run natively. Returns (result_dict, error_reason).
 
     error_reason is None when the native run completed (whatever its
@@ -2685,72 +2901,84 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
         auxdir.mkdir()
         built = []
         for spec in aux_specs:
-            spec = as_aux_spec(spec)
-            name, src = spec.name, spec.path
-            text = src.read_text(errors="ignore")
-            declared = declared_crate_type(text)
-            eff_name = declared_crate_name(text) or name
-            aview = aux_header_view(text)
-            aux_no_pd = aview.has("no-prefer-dynamic")
-            aux_flags = compile_flags(aview, suite_root(src), workdir)
-            if screen_flags(aux_flags, targets={HOST_TARGET}):
-                aux_flags = []
-            # A source declaring several crate types builds one
-            # artifact per type; the one a dependent compilation
-            # can link against is the first linkable declared
-            # type (a cdylib-only auxiliary stays unbound, as
-            # before). With no declared type, the directive's
-            # forced type or compiletest's default applies.
-            linkable = [t for t in declared_crate_types(text)
-                        if t in ("rlib", "lib", "dylib", "proc-macro")]
-            if linkable:
-                effective = linkable[0]
-            elif declared is not None:
-                effective = declared
-            else:
-                effective = spec.crate_type or (
-                    "rlib" if aux_no_pd else "dylib")
-            cmd = rustc_cmd() + ["--edition", spec.edition or edition,
-                                 "--out-dir", str(auxdir)]
+            pair, err = build_native_aux(spec, edition, auxdir, lib,
+                                         helpers, workdir, built)
+            if err:
+                return None, err
+            built.append(pair)
+            if pair[1] is not None:
+                externs += ["--extern", f"{pair[0]}={pair[1]}"]
+    bins_built_libs = False
+    if aux_bins:
+        # `//@ aux-bin:` binaries, built after the auxiliary
+        # crates (compiletest's order: bins link the crates built
+        # before them) into <workdir>/auxiliary/bin, the relative
+        # path the test spawns them by from its working
+        # directory. They stay in the shared attempt directory,
+        # so the Sparagmos run -- a separate process working in
+        # the same directory -- spawns the very same binaries.
+        bin_dir = Path(workdir) / "auxiliary" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        built_pairs = built if aux_specs else []
+        for stem, bsrc in aux_bins:
+            btext = bsrc.read_text(errors="ignore")
+            bview = aux_header_view(btext)
+            # The bin file's own auxiliary crates: an aux-bin
+            # file's own `//@ aux-crate:` / `//@ aux-build:`
+            # directives are resolved and built for the bin,
+            # as compiletest builds them (the on-broken-pipe
+            # bins name sigpipe_utils this way, a crate the
+            # test itself never declares).
+            bin_specs, bin_err = resolve_aux_specs(bsrc)
+            if bin_err:
+                return None, bin_err
+            bin_built = []
+            if bin_specs:
+                auxdir.mkdir(exist_ok=True)
+                for bspec in bin_specs:
+                    pair, err = build_native_aux(
+                        bspec, edition, auxdir, lib, helpers,
+                        workdir, bin_built)
+                    if err:
+                        return None, err
+                    bin_built.append(pair)
+            bin_pairs = built_pairs + bin_built
+            if bin_built:
+                bins_built_libs = True
+            bflags = compile_flags(bview, suite_root(bsrc), workdir)
+            if screen_flags(bflags, targets={HOST_TARGET}):
+                bflags = []
+            bedition = (attempt_edition(bview)
+                        if bview.values("edition") else edition)
+            bcmd = rustc_cmd() + ["--edition", bedition,
+                                  "-o", str(bin_dir / stem)]
             if lib:
-                cmd += ["-L", lib]
-            cmd += ["-L", f"dependency={auxdir}"]
-            cmd += helpers
-            if declared is None:
-                cmd += ["--crate-type", effective]
-            if declared_crate_name(text) is None:
-                cmd += ["--crate-name", name]
-            if not aux_no_pd and not any(
-                    "prefer-dynamic" in f for f in aux_flags):
-                cmd += ["-C", "prefer-dynamic"]
-            for prev_binding, prev_artifact in built:
+                bcmd += ["-L", lib]
+            if aux_specs or bin_built:
+                bcmd += ["-L", f"dependency={auxdir}"]
+            bcmd += helpers
+            if not bview.has("no-prefer-dynamic") and not any(
+                    "prefer-dynamic" in f for f in bflags):
+                bcmd += ["-C", "prefer-dynamic"]
+            for prev_binding, prev_artifact in bin_pairs:
                 if prev_artifact is not None:
-                    cmd += ["--extern",
-                            f"{prev_binding}={prev_artifact}"]
-            cmd += sysroot_extern_args(src, ())
-            cmd += aux_flags
-            cmd += [str(src)]
-            apairs, aunset = view_env(aview, "rustc-env",
+                    bcmd += ["--extern",
+                             f"{prev_binding}={prev_artifact}"]
+            bcmd += sysroot_extern_args(bsrc, bflags)
+            bcmd += bflags
+            bcmd += [str(bsrc)]
+            bpairs, bunset = view_env(bview, "rustc-env",
                                       "unset-rustc-env",
-                                      suite_root(src), workdir)
-            aenv = dict(BOOTSTRAP_ENV)
-            aenv.update(apairs)
-            build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
-                            env_extra=aenv, env_remove=aunset)
-            if build["timeout"]:
+                                      suite_root(bsrc), workdir)
+            benv = dict(BOOTSTRAP_ENV)
+            benv.update(bpairs)
+            bbuild = run_cmd(bcmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                             env_extra=benv, env_remove=bunset)
+            if bbuild["timeout"]:
                 return None, "native compile timed out"
-            if build["exit_code"] != 0:
-                first = first_error_line(build["stderr"])
+            if bbuild["exit_code"] != 0:
+                first = first_error_line(bbuild["stderr"])
                 return None, f"native compile failed: {first}"
-            artifact = (find_artifact(auxdir, eff_name)
-                        if effective in ("rlib", "lib", "dylib",
-                                         "proc-macro")
-                        else None)
-            binding = (f"{spec.modifiers}:{eff_name}"
-                       if spec.modifiers else eff_name)
-            built.append((binding, artifact))
-            if artifact is not None:
-                externs += ["--extern", f"{binding}={artifact}"]
     main_cmd = (
         rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
         + (["-L", lib] if lib else [])
@@ -2783,7 +3011,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
     facts = host_facts()
     if facts is not None and facts.target_lib_dir() is not None:
         lib_dirs.append(str(facts.target_lib_dir()))
-    if aux_specs:
+    if aux_specs or bins_built_libs:
         lib_dirs.append(str(auxdir))
     if lib_dirs:
         prev = os.environ.get("LD_LIBRARY_PATH", "")
@@ -2800,9 +3028,20 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
     return run, None
 
 
+def aux_native_lib_dirs(path):
+    """Directories holding librust_test_helpers.a, as plain
+    paths: the `-L native=` directories of test_helpers_args,
+    forwarded to the driver so its auxiliary builds link the
+    same native library the native auxiliary builds link."""
+    args = test_helpers_args(path)
+    return [args[i + 1][len("native="):]
+            for i in range(len(args) - 1)
+            if args[i] == "-L" and args[i + 1].startswith("native=")]
+
+
 def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
                    aux_specs=(), guest_args=(), env_extra=None,
-                   env_remove=(), jit=False):
+                   env_remove=(), jit=False, aux_env_scrub=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (the run completed; the exit code is the
@@ -2840,7 +3079,50 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
         argv += ["--aux", aux_spec_arg(spec)]
     for a in guest_args:
         argv += ["--guest-arg", a]
+    # The guest's stderr on its own channel: the driver process's
+    # stderr also carries the conversion's diagnostics, which are
+    # not the guest's output, and the judge's run-output checks
+    # (error patterns, check-run-results) need the guest stream
+    # alone. The JIT run keeps the shared channel (execute_jit
+    # takes no separate guest stderr), so its results carry no
+    # clean-stderr mark and are judged without the stderr half of
+    # the output comparison.
+    guest_stderr_path = None
+    if not jit and cwd is not None:
+        guest_stderr_path = Path(cwd) / "guest-stderr.txt"
+        argv += ["--guest-stderr-file", str(guest_stderr_path)]
+    # The native library the test's auxiliary crates link
+    # (librust_test_helpers.a): the native auxiliary builds get
+    # its directory as `-L native=` (test_helpers_args); the
+    # driver's auxiliary builds get it as --aux-native-lib.
+    for d in aux_native_lib_dirs(path):
+        argv += ["--aux-native-lib", d]
+    # The test's rustc-env names ride this process's
+    # environment into the main conversion (env!/option_env!
+    # read it there), but compiletest configures an auxiliary
+    # build's environment separately: the driver scrubs these
+    # names from its auxiliary builds' environments.
+    for name in aux_env_scrub:
+        argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
+    # The library path the native run gets (see native_side):
+    # the guest's host children are real binaries that load
+    # the shared std and the attempt's dylib auxiliaries, and
+    # they inherit this process's environment. A test's own
+    # exec-env still wins (applied after).
+    lib_dirs = []
+    slib = sysroot_lib()
+    if slib:
+        lib_dirs.append(slib)
+    facts = host_facts()
+    if facts is not None and facts.target_lib_dir() is not None:
+        lib_dirs.append(str(facts.target_lib_dir()))
+    if cwd is not None:
+        lib_dirs.append(str(Path(cwd) / "auxlibs"))
+    if lib_dirs:
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join(
+            lib_dirs + ([prev] if prev else []))
     if env_extra:
         env.update(env_extra)
     res = run_cmd(argv,
@@ -2859,6 +3141,13 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
         return None, "driver-error", \
             f"driver killed by signal {-res['exit_code']}: " \
             f"{res['stderr'].strip()[:300]}"
+    if guest_stderr_path is not None:
+        try:
+            res["stderr"] = guest_stderr_path.read_text(
+                errors="replace")
+            res["stderr_clean"] = True
+        except OSError:
+            pass
     # The run-mode contract passes the guest's own exit code
     # through (a `Termination` failure is 1, `process::exit(n)`
     # is n, a guest panic is 101): the code is the result the
@@ -3547,7 +3836,8 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
             edition, args, aux_specs, cenv, cunset, _ep, _eu = asm
             conv = convert_side(path, edition, driver_bin,
                                 rustc_args=args, aux_specs=aux_specs,
-                                env_extra=cenv, env_remove=cunset)
+                                env_extra=cenv, env_remove=cunset,
+                                aux_env_scrub=tuple(cenv))
             if conv["timeout"]:
                 out["reason"] = "driver timed out"
                 out["bucket"] = "timeout"
@@ -3840,6 +4130,51 @@ def coverage_scope(rec):
     return None
 
 
+def sanitizer_scope(rec, view):
+    """(reason, bucket) for an exec view whose verdict is a
+    sanitizer report, else None.
+
+    A view compiled with a `-Z sanitizer=...` flag is judged by
+    compiletest on the sanitizer runtime's own behaviour: the
+    instrumented binary's exit class and the error-pattern
+    naming the sanitizer's diagnostic ("LeakSanitizer: detected
+    memory leaks", "MemorySanitizer: use-of-uninitialized
+    -value", ...). The instrumentation is added by LLVM at
+    codegen; no MIR the interpreter executes carries it, the
+    guest program is never instrumented, and the sanitizer's
+    exit code (LeakSanitizer's default 23) is the runtime's, not
+    the program's. The verdict cannot reduce to plain execution
+    under Sparagmos -- the same shape as coverage
+    instrumentation (coverage_scope, issue #514). The native
+    compilation and run remain legitimate (the host profile's
+    needs-sanitizer-* rules already gate them); only the
+    execution verdict is out of scope. See issue #532.
+    """
+    if rec["nature"] != "exec":
+        return None
+    # Only a run-fail verdict is the sanitizer's report: a
+    # run-pass sanitizer test (the cfi family, memory-passing,
+    # dataflow) is judged on the instrumented program running
+    # clean, which plain execution of the same program
+    # reproduces -- those stay attempted.
+    if run_mode(view) != "run-fail":
+        return None
+    for flag in view.values("compile-flags"):
+        for token in flag.split():
+            opt = token[2:] if token.startswith("-Z") else token
+            if opt.startswith("sanitizer="):
+                name = opt.partition("=")[2]
+                return (
+                    f"compile-flags request -Z sanitizer={name}: "
+                    "the verdict is the sanitizer runtime's "
+                    "report on the instrumented binary (its exit "
+                    "class and diagnostic pattern), which no "
+                    "execution of the uninstrumented program "
+                    "under Sparagmos can reproduce",
+                    "not attempted (sanitizer instrumentation)")
+    return None
+
+
 def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     scope = rustdoc_host_tool_scope(rec)
     if scope is not None:
@@ -3873,7 +4208,15 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
 
     aux_specs = []
     if not rec["single_file"]:
-        aux_specs, aux_err = resolve_aux_specs(path)
+        # The test's own `//@ proc-macro:` crates are not specs:
+        # proc_macro_extern_args builds them once (shared cache)
+        # and binds them for both sides, the way stage 2 resolves
+        # them. Resolving them as specs too bound every such
+        # crate twice in the native compilation -- the per-test
+        # auxiliary build and the cache build -- and rustc
+        # rejects the duplicate with E0464.
+        aux_specs, aux_err = resolve_aux_specs(path,
+                                               top_proc_macro=False)
         if aux_err:
             out["reason"] = aux_err
             out["bucket"] = "out of stage-1 scope (multi-file)"
@@ -3894,7 +4237,8 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
         out["bucket"] = "not attempted (unevaluatable condition)"
         return
 
-    if not rec["single_file"] and not aux_specs:
+    if not rec["single_file"] and not aux_specs \
+            and not header.has("proc-macro"):
         out["reason"] = "multi-file / auxiliary crates (not in stage-1 scope)"
         out["bucket"] = "out of stage-1 scope (multi-file)"
         return
@@ -3904,6 +4248,10 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         view = header.view(None)
+        scope = sanitizer_scope(rec, view)
+        if scope is not None:
+            out["reason"], out["bucket"] = scope
+            return
         flags = compile_flags(view, src_base, td)
         screened = screen_flags(flags, targets={HOST_TARGET})
         if screened:
@@ -3923,14 +4271,17 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
         cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                                 src_base, td)
         run_flags = view_run_flags(view, src_base, td)
+        run_env = dict(env_pairs)
+        run_env.setdefault("RUST_TEST_TMPDIR", td)
         native, err = native_side(path, edition, td, flags, aux_specs,
                                   run_args=run_flags,
-                                  run_env_extra=env_pairs,
+                                  run_env_extra=run_env,
                                   run_env_remove=env_unset,
                                   compile_env_extra=cenv,
                                   compile_env_remove=cunset,
                                   no_prefer_dynamic=view.has(
-                                      "no-prefer-dynamic"))
+                                      "no-prefer-dynamic"),
+                                  aux_bins=aux_bin_specs(path, view))
         if err:
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
@@ -3943,6 +4294,7 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
             return
         denv = dict(cenv)
         denv.update(env_pairs)
+        denv.setdefault("RUST_TEST_TMPDIR", td)
         dunset = env_unset + [u for u in cunset if u not in env_unset]
         got, kind, reason = sparagmos_side(path, edition, driver_bin, td,
                                            rustc_args=flags,
@@ -3950,6 +4302,7 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             out["status"] = "unsupported"
@@ -3961,7 +4314,8 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
             out["reason"] = reason
             out["bucket"] = bucket_reason(reason)
             return
-        verdict, detail = judge(mode, header, native, got)
+        verdict, detail = judge(mode, header, native, got,
+                                path=path, base_dir=td)
         out["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             out["reason"] = detail
@@ -4133,6 +4487,7 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                                                      revision),
                         env_extra=cenv,
                         env_remove=cunset,
+                        aux_env_scrub=tuple(cenv),
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
@@ -4199,7 +4554,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
         return res
     aux_specs = []
     if not rec["single_file"]:
-        aux_specs, aux_err = resolve_aux_specs(path, revision)
+        # top_proc_macro=False: the test's own proc-macro crates
+        # come from proc_macro_extern_args alone (see fill_result).
+        aux_specs, aux_err = resolve_aux_specs(
+            path, revision, top_proc_macro=False)
         if aux_err:
             res["reason"] = aux_err
             res["bucket"] = "out of stage-1 scope (multi-file)"
@@ -4220,6 +4578,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                         revision, res, edition,
                                         rev_args, flags, aux_specs,
                                         rust_dir, jit=jit)
+        scope = sanitizer_scope(rec, view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
         pm_args, pm_err = proc_macro_extern_args(path, view, edition)
         if pm_err:
             res["reason"] = pm_err
@@ -4233,14 +4595,23 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
         cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                                 src_base, td)
         run_flags = view_run_flags(view, src_base, td)
+        # compiletest's parent (bootstrap) exports
+        # RUST_TEST_TMPDIR to the whole test process tree and
+        # tests read it at run time (stdio-from.rs's parent()
+        # unwraps it): both runs get the attempt's own temp
+        # directory -- the directory both already work in --
+        # unless the test's own exec-env sets the variable.
+        run_env = dict(env_pairs)
+        run_env.setdefault("RUST_TEST_TMPDIR", td)
         native, err = native_side(path, edition, td, args, aux_specs,
                                   run_args=run_flags,
-                                  run_env_extra=env_pairs,
+                                  run_env_extra=run_env,
                                   run_env_remove=env_unset,
                                   compile_env_extra=cenv,
                                   compile_env_remove=cunset,
                                   no_prefer_dynamic=view.has(
-                                      "no-prefer-dynamic"))
+                                      "no-prefer-dynamic"),
+                                  aux_bins=aux_bin_specs(path, view))
         if err:
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
@@ -4253,6 +4624,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             return res
         denv = dict(cenv)
         denv.update(env_pairs)
+        denv.setdefault("RUST_TEST_TMPDIR", td)
         dunset = env_unset + [u for u in cunset if u not in env_unset]
         got, kind, reason = sparagmos_side(path, edition, driver_bin,
                                            td, rustc_args=args,
@@ -4260,6 +4632,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"
@@ -4271,7 +4644,8 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
             return res
-        verdict, detail = judge(mode, view, native, got)
+        verdict, detail = judge(mode, view, native, got,
+                                path=path, base_dir=td)
         res["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             res["reason"] = detail
@@ -4549,7 +4923,8 @@ _TARGET_NOT_DEMANDED_RE = re.compile(
 
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
-                 env_extra=None, env_remove=(), jit=False):
+                 env_extra=None, env_remove=(), jit=False,
+                 aux_env_scrub=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -4589,6 +4964,10 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    for d in aux_native_lib_dirs(path):
+        argv += ["--aux-native-lib", d]
+    for name in aux_env_scrub:
+        argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
     if env_extra:
         env.update(env_extra)
@@ -5159,6 +5538,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=specs, env_extra=cenv,
                         env_remove=cunset,
+                        aux_env_scrub=tuple(cenv),
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
@@ -5243,14 +5623,23 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
         cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                                 src_base, td)
         run_flags = view_run_flags(view, src_base, td)
+        # compiletest's parent (bootstrap) exports
+        # RUST_TEST_TMPDIR to the whole test process tree and
+        # tests read it at run time (stdio-from.rs's parent()
+        # unwraps it): both runs get the attempt's own temp
+        # directory -- the directory both already work in --
+        # unless the test's own exec-env sets the variable.
+        run_env = dict(env_pairs)
+        run_env.setdefault("RUST_TEST_TMPDIR", td)
         native, err = native_side(path, edition, td, args, aux_specs,
                                   run_args=run_flags,
-                                  run_env_extra=env_pairs,
+                                  run_env_extra=run_env,
                                   run_env_remove=env_unset,
                                   compile_env_extra=cenv,
                                   compile_env_remove=cunset,
                                   no_prefer_dynamic=view.has(
-                                      "no-prefer-dynamic"))
+                                      "no-prefer-dynamic"),
+                                  aux_bins=aux_bin_specs(path, view))
         if err:
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
@@ -5263,6 +5652,7 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
             return res
         denv = dict(cenv)
         denv.update(env_pairs)
+        denv.setdefault("RUST_TEST_TMPDIR", td)
         dunset = env_unset + [u for u in cunset if u not in env_unset]
         got, kind, reason = sparagmos_side(path, edition, driver_bin,
                                            td, rustc_args=args,
@@ -5270,6 +5660,7 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
                                            guest_args=run_flags,
                                            env_extra=denv,
                                            env_remove=dunset,
+                                           aux_env_scrub=tuple(cenv),
                                            jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"
@@ -5281,7 +5672,8 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
             res["reason"] = reason
             res["bucket"] = bucket_reason(reason)
             return res
-        verdict, detail = judge(mode, view, native, got)
+        verdict, detail = judge(mode, view, native, got,
+                                path=path, base_dir=td)
         res["status"] = "pass" if verdict == "pass" else "fail"
         if verdict != "pass":
             res["reason"] = detail

@@ -1713,6 +1713,19 @@ fn pointee_plan_in(plan: &DropPlan, adts: &[DropPlan]) -> Option<DropPlan> {
     }
 }
 
+/// An assertion message formatted at run time from the
+/// assertion's own operands, with core's exact text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertFormat {
+    /// `index out of bounds: the len is {len} but the index
+    /// is {index}` -- operands are (len, index).
+    BoundsCheck,
+    /// `misaligned pointer dereference: address must be a
+    /// multiple of {required} but is {found}` -- operands
+    /// are (required, found).
+    MisalignedPointerDeref,
+}
+
 /// Terminator kinds (subset of rustc MIR `TerminatorKind`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminatorKind {
@@ -1937,6 +1950,14 @@ pub enum TerminatorKind {
         expected: bool,
         target: BasicBlock,
         message: String,
+        /// A message whose text embeds operand values (a
+        /// bounds check, a misaligned-pointer dereference):
+        /// the operands the message is formatted from when
+        /// the assertion fires, in message order. `message`
+        /// keeps the kind text as the fallback for a value
+        /// that does not render as an integer.
+        format: Option<AssertFormat>,
+        operands: Vec<Operand>,
         /// The assertion guards an arithmetic overflow (a MIR
         /// `AssertMessage::Overflow` / `OverflowNeg`): the kind of
         /// assertion a checked build emits after a

@@ -4710,8 +4710,7 @@ fn test_exit_code(byte: u128) -> Value {
 /// only together with `-Z unstable-options`). Flags the model
 /// does not act on (thread counts, colors, log files) are
 /// accepted and ignored: they cannot change a sequential
-/// run's output. The terse run format is only honored for
-/// `--list`.
+/// run's output.
 /// How a run treats `#[ignore]`d tests (libtest's
 /// `RunIgnored`): by default they are skipped and reported as
 /// ignored; `--include-ignored` runs them with the rest;
@@ -6326,6 +6325,23 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut failure_names: Vec<String> = Vec::new();
                 let mut failure_sections: Vec<String> = Vec::new();
+                // TerseFormatter's progress state (libtest's
+                // formatters/terse.rs): how many results have
+                // been reported, and the column the short results
+                // have filled on the current line. Only the
+                // terse format reads them.
+                let total_tests = selected.len();
+                let mut terse_count = 0usize;
+                let mut terse_column = 0usize;
+                // The run's ignored test, for the terse finish
+                // line a single ignored test with a message gets.
+                let mut single_ignore: Option<(String, Option<String>)> = None;
+                // std's panic output carries the backtrace note
+                // on the process's first panic only (panicking's
+                // FIRST_PANIC): a run whose first failure's
+                // section includes it has spent it for every
+                // later failure's section.
+                let mut backtrace_note_pending = true;
                 if opts.json {
                     self.push_output(&format!(
                         "{{ \"type\": \"suite\", \"event\": \"started\", \
@@ -6365,6 +6381,23 @@ impl<'a> Interpreter<'a> {
                                 json_escape(&test.name),
                                 message
                             ));
+                        } else if opts.terse {
+                            // TerseFormatter::write_ignored: a
+                            // short result, like a pass.
+                            single_ignore = Some((
+                                test.name.clone(),
+                                test.ignore_message.clone(),
+                            ));
+                            self.push_output("i");
+                            terse_count += 1;
+                            terse_column += 1;
+                            if terse_column % 88 == 87 {
+                                self.push_output(&format!(
+                                    " {}/{}\n",
+                                    terse_count, total_tests
+                                ));
+                                terse_column = 0;
+                            }
                         } else {
                             let note = match &test.ignore_message {
                                 Some(msg) => format!(", {msg}"),
@@ -6383,7 +6416,7 @@ impl<'a> Interpreter<'a> {
                              \"name\": \"{}\" }}\n",
                             json_escape(&test.name)
                         ));
-                    } else if opts.nocapture {
+                    } else if opts.nocapture && !opts.terse {
                         self.push_output(&format!(
                             "test {}{} ... ",
                             test.name, annotation
@@ -6430,9 +6463,66 @@ impl<'a> Interpreter<'a> {
                         },
                         Err(InterpError::Panic { message, payload }) => {
                             self.note_panic_consumed();
+                            if opts.nocapture
+                                && !matches!(test.should_panic, ShouldPanic::No)
+                            {
+                                // In nocapture mode the panic's
+                                // report goes to the guest's
+                                // stderr as it runs (the default
+                                // hook prints it at panic time):
+                                // a should-panic test's panic is
+                                // printed there too, whether the
+                                // harness then counts the test as
+                                // passed or failed. The backtrace
+                                // note is spent on the process's
+                                // first printed report.
+                                let report = if backtrace_note_pending {
+                                    backtrace_note_pending = false;
+                                    panic_report_full(
+                                        test,
+                                        self.current_thread_id(),
+                                        self.panic_location(),
+                                        &message,
+                                    )
+                                } else {
+                                    panic_report_head(
+                                        test,
+                                        self.current_thread_id(),
+                                        self.panic_location(),
+                                        &message,
+                                    )
+                                };
+                                self.push_error_output(&report);
+                            }
                             match &test.should_panic {
                                 ShouldPanic::No => {
                                     if opts.nocapture {
+                                        // The report the default
+                                        // hook prints to the
+                                        // guest's stderr as the
+                                        // panic runs (see the
+                                        // should-panic arms): in
+                                        // nocapture mode there
+                                        // is no captured section,
+                                        // so this print is the
+                                        // failure's only account.
+                                        let report = if backtrace_note_pending {
+                                            backtrace_note_pending = false;
+                                            panic_report_full(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        } else {
+                                            panic_report_head(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        };
+                                        self.push_error_output(&report);
                                         Some(None)
                                     } else {
                                         let report = match self.panic_location() {
@@ -6521,6 +6611,33 @@ impl<'a> Interpreter<'a> {
                         }
                         Err(e) => return Err(e),
                     };
+                    if pass_note.is_some() {
+                        // A should-panic test's expected panic
+                        // is still a panic of the process: it
+                        // spends the note's one appearance even
+                        // though its own account omits it.
+                        backtrace_note_pending = false;
+                    }
+                    // Spend the backtrace note on the first
+                    // failure section that carries it (see
+                    // backtrace_note_pending): later sections
+                    // lose the note line, as the native run's do.
+                    let failure_body = match failure_body {
+                        Some(Some(body)) => {
+                            const NOTE: &str = "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+                            if body.contains(NOTE) {
+                                if backtrace_note_pending {
+                                    backtrace_note_pending = false;
+                                    Some(Some(body))
+                                } else {
+                                    Some(Some(body.replace(NOTE, "")))
+                                }
+                            } else {
+                                Some(Some(body))
+                            }
+                        }
+                        other => other,
+                    };
                     match failure_body {
                         None => {
                             passed += 1;
@@ -6553,6 +6670,18 @@ impl<'a> Interpreter<'a> {
                                     json_escape(&test.name),
                                     stdout
                                 ));
+                            } else if opts.terse {
+                                // TerseFormatter::write_ok.
+                                self.push_output(".");
+                                terse_count += 1;
+                                terse_column += 1;
+                                if terse_column % 88 == 87 {
+                                    self.push_output(&format!(
+                                        " {}/{}\n",
+                                        terse_count, total_tests
+                                    ));
+                                    terse_column = 0;
+                                }
                             } else if opts.nocapture {
                                 self.push_output("ok\n");
                             } else {
@@ -6594,6 +6723,25 @@ impl<'a> Interpreter<'a> {
                                     json_escape(&test.name),
                                     stdout
                                 ));
+                            } else if opts.terse {
+                                // TerseFormatter::write_failed:
+                                // the progress line first (unless
+                                // the column is already fresh),
+                                // then the failure on its own
+                                // line, without the should-panic
+                                // annotation.
+                                if terse_column != 0 {
+                                    self.push_output(&format!(
+                                        " {}/{}\n",
+                                        terse_count, total_tests
+                                    ));
+                                    terse_column = 0;
+                                }
+                                terse_count += 1;
+                                self.push_output(&format!(
+                                    "{} --- FAILED\n",
+                                    test.name
+                                ));
                             } else if opts.nocapture {
                                 self.push_output("FAILED\n");
                             } else {
@@ -6634,6 +6782,17 @@ impl<'a> Interpreter<'a> {
                          {ignored} ignored; 0 measured; {filtered_out} filtered out; \
                          finished in 0.00s\n\n"
                     ));
+                    // TerseFormatter::write_run_finish's special
+                    // case: a run of exactly one test, ignored
+                    // with a message, restates the reason after
+                    // the summary.
+                    if opts.terse && total_tests == 1 && ignored == 1 {
+                        if let Some((name, Some(msg))) = &single_ignore {
+                            self.push_output(&format!(
+                                "test: {name}, ignore_message: {msg}\n\n"
+                            ));
+                        }
+                    }
                 }
                 // `ExitCode`: success is 0, any failure is 101,
                 // as in libtest.

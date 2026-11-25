@@ -3997,6 +3997,8 @@ impl<'a> Interpreter<'a> {
                     expected,
                     target,
                     message,
+                    format,
+                    operands,
                     overflow,
                 } => {
                     // An overflow assertion in a session compiled
@@ -4012,7 +4014,23 @@ impl<'a> Interpreter<'a> {
                             InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
                         })?;
                         if actual != *expected {
-                            return Err(InterpError::panic(message.clone()));
+                            // A message embedding operand values
+                            // is formatted from them now, with
+                            // core's exact text; the baked kind
+                            // text is the fallback for a value
+                            // that does not render as an integer.
+                            let text = match format {
+                                Some(kind) => {
+                                    let mut vals = Vec::with_capacity(operands.len());
+                                    for op in operands {
+                                        vals.push(self.eval_operand(frames, body, op)?);
+                                    }
+                                    format_assert_message(*kind, &vals)
+                                        .unwrap_or_else(|| message.clone())
+                                }
+                                None => message.clone(),
+                            };
+                            return Err(InterpError::panic(text));
                         }
                         Self::jump(frames, body, *target)?;
                     }
@@ -29775,5 +29793,35 @@ mod resolved_route_tests {
             interp.read_resolved(&frames, &readback).expect("read"),
             Value::Int(20),
         );
+    }
+}
+
+/// Format an assertion message from its operand values, with
+/// core's exact text (`core::panicking`'s messages for the
+/// bounds-check and misaligned-dereference assertions).
+/// Returns None when a value does not render as an integer,
+/// leaving the caller its baked fallback text.
+fn format_assert_message(
+    kind: crate::ir::AssertFormat,
+    vals: &[Value],
+) -> Option<String> {
+    fn num(v: &Value) -> Option<String> {
+        match v {
+            Value::Int(i) => Some(i.to_string()),
+            Value::Uint(u) => Some(u.to_string()),
+            _ => None,
+        }
+    }
+    match kind {
+        crate::ir::AssertFormat::BoundsCheck => Some(format!(
+            "index out of bounds: the len is {} but the index is {}",
+            num(vals.first()?)?,
+            num(vals.get(1)?)?,
+        )),
+        crate::ir::AssertFormat::MisalignedPointerDeref => Some(format!(
+            "misaligned pointer dereference: address must be a multiple of {} but is {}",
+            num(vals.first()?)?,
+            num(vals.get(1)?)?,
+        )),
     }
 }

@@ -40162,3 +40162,259 @@ fn run_mode_write_on_stdout_and_vec() {
         "direct write\nwrite all\nwrite ok\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Imported `main` (issue #532): a crate-root re-export as the
+// entry point. Run mode pins `--crate-type=lib`, under which
+// rustc designates no entry point at all (its entry search only
+// runs for an executable crate type); the driver replays the
+// resolver's root-module resolution (root_main_target) and
+// designates the re-export's target.
+// ---------------------------------------------------------------------------
+
+const IMPORTED_MAIN_INNER_SRC: &str = r#"
+pub mod foo {
+    pub fn bar() {
+        println!("Hello world!");
+    }
+}
+use foo::bar as main;
+"#;
+
+#[test]
+fn run_mode_imported_main_from_inner_mod() {
+    let dir = temp_dir("imported-main-inner");
+    let src = fixture(&dir, "imported_main_from_inner_mod.rs", IMPORTED_MAIN_INNER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "Hello world!\n", "stderr={stderr}");
+}
+
+const IMPORTED_MAIN_AUX_SRC: &str = r#"
+pub fn boilerplate() {
+    println!("Hello world!");
+}
+"#;
+
+const IMPORTED_MAIN_EXTERN_SRC: &str = r#"
+extern crate main_functions;
+pub use main_functions::boilerplate as main;
+"#;
+
+#[test]
+fn run_mode_imported_main_from_extern_crate() {
+    let dir = temp_dir("imported-main-extern");
+    let aux = fixture(&dir, "main_functions.rs", IMPORTED_MAIN_AUX_SRC);
+    let src = fixture(
+        &dir,
+        "imported_main_from_extern_crate.rs",
+        IMPORTED_MAIN_EXTERN_SRC,
+    );
+    let spec = format!("main_functions={}", aux.display());
+    let out = run_driver_extra(&src, &["--aux", &spec]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "Hello world!\n", "stderr={stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// The libtest terse format (issue #532): `--quiet` /
+// `--format terse` prints libtest's TerseFormatter output --
+// one short result per test (`.` / `i`), a progress line every
+// 88 columns and before each failure, and failures as
+// `{name} --- FAILED`. The harness model used to print the
+// pretty format for every format flag.
+// ---------------------------------------------------------------------------
+
+const TERSE_SRC: &str = r#"
+#[test]
+fn a_pass() {}
+#[test]
+fn b_fail() { panic!("boom"); }
+#[test]
+#[ignore]
+fn c_ignored() {}
+#[test]
+fn d_pass() {}
+"#;
+
+#[test]
+fn run_mode_libtest_terse_format() {
+    let dir = temp_dir("libtest-terse");
+    let src = fixture(&dir, "terse.rs", TERSE_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--quiet"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr} stdout={stdout}");
+    // The pass prints ".", the failure first completes the
+    // progress line (" 1/4") and then stands on its own line,
+    // the ignored test prints "i", the last pass ".".
+    assert!(
+        stdout.starts_with("\nrunning 4 tests\n. 1/4\nb_fail --- FAILED\ni."),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("test result: FAILED. 2 passed; 1 failed; 1 ignored"),
+        "stdout={stdout}"
+    );
+    // The pretty per-test lines must not appear.
+    assert!(!stdout.contains("... ok"), "stdout={stdout}");
+    assert!(!stdout.contains("... FAILED"), "stdout={stdout}");
+    assert!(!stdout.contains("... ignored"), "stdout={stdout}");
+}
+
+const TWO_FAILURES_SRC: &str = r#"
+#[test]
+fn a_fail() { panic!("first"); }
+#[test]
+fn b_fail() { panic!("second"); }
+"#;
+
+#[test]
+fn run_mode_libtest_backtrace_note_once() {
+    // std's panic output carries the backtrace note on the
+    // process's first panic only: of the two failure sections,
+    // exactly one carries it, as in the native run.
+    let dir = temp_dir("libtest-note-once");
+    let src = fixture(&dir, "two_failures.rs", TWO_FAILURES_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert_eq!(
+        stdout.matches("run with `RUST_BACKTRACE=1`").count(),
+        1,
+        "stdout={stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sysroot extern pins (issue #532): an auxiliary crate whose
+// source declares `extern crate libc;` must compile in a
+// rustup sysroot that offers two libc candidates for the host
+// target (the rust-std rlib+rmeta pair and the rustc-dev
+// component's rmeta-only build) among the dozens of targets
+// a toolchain can carry std for. The pin scan considers the
+// host target's lib dir only; scanning every target's dir
+// finds a complete candidate under most of them and pins
+// nothing (E0464).
+// ---------------------------------------------------------------------------
+
+const USES_LIBC_AUX_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+pub fn answer() -> i32 {
+    42
+}
+"#;
+
+const USES_LIBC_MAIN_SRC: &str = r#"
+extern crate uses_libc;
+
+fn main() {
+    assert_eq!(uses_libc::answer(), 42);
+    println!("answer ok");
+}
+"#;
+
+#[test]
+fn run_mode_aux_extern_crate_libc_compiles() {
+    let dir = temp_dir("aux-libc-pin");
+    let aux = fixture(&dir, "uses_libc.rs", USES_LIBC_AUX_SRC);
+    let src = fixture(&dir, "uses_libc_main.rs", USES_LIBC_MAIN_SRC);
+    let spec = format!("uses_libc={}", aux.display());
+    let out = run_driver_extra(&src, &["--aux", &spec]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "answer ok\n", "stderr={stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// Aux env scrub (issue #532): the test's own rustc-env
+// variables ride the driver process's environment into the
+// main conversion, but an auxiliary build's environment is
+// configured separately (compiletest): the driver scrubs
+// the named variables from its auxiliary builds, whose own
+// rustc-env directives are applied after the scrub.
+// ---------------------------------------------------------------------------
+
+const SCRUB_AUX_SRC: &str = r#"
+pub fn baked() -> Option<&'static str> {
+    option_env!("COMPILETEST_FOO")
+}
+"#;
+
+const SCRUB_MAIN_SRC: &str = r#"
+extern crate scrub_aux;
+
+fn main() {
+    // The main compilation sees the variable (the driver
+    // process carries it); the auxiliary build must not.
+    assert_eq!(env!("COMPILETEST_FOO"), "foo");
+    assert_eq!(scrub_aux::baked(), None);
+    println!("scrub ok");
+}
+"#;
+
+#[test]
+fn run_mode_aux_env_scrub() {
+    let dir = temp_dir("aux-env-scrub");
+    let aux = fixture(&dir, "scrub_aux.rs", SCRUB_AUX_SRC);
+    let src = fixture(&dir, "scrub_main.rs", SCRUB_MAIN_SRC);
+    let spec = format!("scrub_aux={}", aux.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--aux")
+        .arg(&spec)
+        .arg("--aux-env-scrub")
+        .arg("COMPILETEST_FOO")
+        .env("COMPILETEST_FOO", "foo")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "scrub ok\n", "stderr={stderr}");
+}
+
+const NOCAPTURE_SRC: &str = r#"
+#[test]
+fn a_fail() { panic!("boom nocapture"); }
+#[test]
+fn b_pass() {}
+"#;
+
+#[test]
+fn run_mode_libtest_nocapture_prints_panic_report() {
+    // In --nocapture mode the default panic hook prints the
+    // failing test's report to stderr as the panic runs; the
+    // harness model used to drop it (its failure account
+    // assumed the report had already been printed).
+    let dir = temp_dir("libtest-nocapture");
+    let src = fixture(&dir, "nocapture.rs", NOCAPTURE_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--nocapture"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("thread 'a_fail' (1) panicked at"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("boom nocapture"), "stderr={stderr}");
+    assert_eq!(
+        stderr.matches("run with `RUST_BACKTRACE=1`").count(),
+        1,
+        "stderr={stderr}"
+    );
+}

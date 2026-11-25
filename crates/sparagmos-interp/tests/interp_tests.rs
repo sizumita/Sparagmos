@@ -463,6 +463,8 @@ fn assert_terminator_panics_on_failure() {
                     expected: true,
                     target: BasicBlock(1),
                     message: "x must be positive".into(),
+                    format: None,
+                    operands: Vec::new(),
                     overflow: false,
                 },
             ),
@@ -778,4 +780,41 @@ fn mixed_type_shift_amount_overflow_wraps() {
         interpret(&p, "shl", vec![Value::Int(1), Value::Uint(32)]).unwrap(),
         Value::Int(1)
     );
+}
+
+#[test]
+fn assert_bounds_check_message_formats_operands() {
+    // A bounds-check assertion's panic message is formatted
+    // from the assertion's operands at run time, with core's
+    // exact text -- the message a native run prints and a
+    // `catch_unwind` caller observes.
+    let body = Body::new(
+        "bounds",
+        0,
+        vec![Ty::i64(), Ty::Bool],
+        vec![
+            bb(
+                vec![assign(1, Rvalue::Use(Operand::const_bool(false)))],
+                TerminatorKind::Assert {
+                    cond: Operand::copy_local(1),
+                    expected: true,
+                    target: BasicBlock(1),
+                    message: "assertion failed: BoundsCheck".into(),
+                    format: Some(sparagmos_interp::ir::AssertFormat::BoundsCheck),
+                    operands: vec![Operand::const_uint(5), Operand::const_uint(5)],
+                    overflow: false,
+                },
+            ),
+            bb(vec![], ret()),
+        ],
+    );
+    let p = program_of(body);
+    let err = interpret(&p, "bounds", vec![]).unwrap_err();
+    match err {
+        InterpError::Panic { message, .. } => assert_eq!(
+            message,
+            "index out of bounds: the len is 5 but the index is 5"
+        ),
+        other => panic!("got: {other}"),
+    }
 }

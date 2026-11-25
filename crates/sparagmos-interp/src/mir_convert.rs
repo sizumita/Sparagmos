@@ -11210,16 +11210,45 @@ let inner = match (&src, target) {
                 msg,
                 target,
                 ..
-            } => ir::TerminatorKind::Assert {
-                cond: self.convert_operand(body, cond, Some(&mir::Ty::Bool))?,
-                expected: *expected,
-                target: ir::BasicBlock(target.index()),
-                message: assert_message_text(msg),
-                overflow: matches!(
-                    &**msg,
-                    mir::AssertMessage::Overflow(..) | mir::AssertMessage::OverflowNeg(..)
-                ),
-            },
+            } => {
+                // The kinds whose message embeds the assertion's
+                // operand values keep the operands for run-time
+                // formatting (assert_message_text's kind text
+                // stays as the fallback).
+                let (format, operands) = match &**msg {
+                    mir::AssertMessage::BoundsCheck { len, index } => (
+                        Some(ir::AssertFormat::BoundsCheck),
+                        vec![
+                            self.convert_operand(body, len, None)?,
+                            self.convert_operand(body, index, None)?,
+                        ],
+                    ),
+                    mir::AssertMessage::MisalignedPointerDereference {
+                        required,
+                        found,
+                    } => (
+                        Some(ir::AssertFormat::MisalignedPointerDeref),
+                        vec![
+                            self.convert_operand(body, required, None)?,
+                            self.convert_operand(body, found, None)?,
+                        ],
+                    ),
+                    _ => (None, Vec::new()),
+                };
+                ir::TerminatorKind::Assert {
+                    cond: self.convert_operand(body, cond, Some(&mir::Ty::Bool))?,
+                    expected: *expected,
+                    target: ir::BasicBlock(target.index()),
+                    message: assert_message_text(msg),
+                    format,
+                    operands,
+                    overflow: matches!(
+                        &**msg,
+                        mir::AssertMessage::Overflow(..)
+                            | mir::AssertMessage::OverflowNeg(..)
+                    ),
+                }
+            }
             // The imaginary edge of a false edge is never taken at run
             // time; execution continues at the real target.
             T::FalseEdge { real_target, .. } | T::FalseUnwind { real_target, .. } => {
