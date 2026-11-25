@@ -2040,6 +2040,69 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A lock guard value (`MutexGuard`, `RwLockReadGuard`,
+        // `RwLockWriteGuard`): std's `Display` and `Debug` impls
+        // for the guard types format the guarded value, exactly
+        // as the `RefCell` guards above, and no guest body
+        // serves a std Self type, so the structural engine
+        // forwards here. The pointee is reached through the
+        // guard's first field: for `MutexGuard` /
+        // `RwLockWriteGuard` it is the reference to the lock,
+        // and the guarded value is the lock aggregate's data
+        // field (field 2, the `UnsafeCell`'s field 0); for
+        // `RwLockReadGuard` it is the `NonNull` data pointer
+        // the guard's constructor took from the lock. A
+        // guard-shaped value whose first field does not resolve
+        // this way keeps the existing behaviour.
+        if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+            if let Some((elem_ty, read_guard)) = sync_guard_elem_tag(ty) {
+                if let Value::Enum { fields, .. } = value {
+                    let pointee = if read_guard {
+                        let mut first = fields.first();
+                        for _ in 0..4 {
+                            match first {
+                                Some(Value::Enum {
+                                    fields: inner, ..
+                                }) if inner.len() == 1 => {
+                                    first = inner.first();
+                                }
+                                _ => break,
+                            }
+                        }
+                        match first {
+                            Some(
+                                first @ (Value::Ref(_)
+                                | Value::FatRef { .. }
+                                | Value::DynRef { .. }),
+                            ) => super::sync::project_pointee_cell(first.clone())
+                                .ok()
+                                .and_then(|p| self.resolve_value(frames, &p).ok()),
+                            _ => None,
+                        }
+                    } else {
+                        match fields.first() {
+                            Some(Value::Ref(target)) => target
+                                .projected(RefProj::Field(2))
+                                .and_then(|t| t.projected(RefProj::Field(0)))
+                                .and_then(|data| {
+                                    self.resolve_value(frames, &Value::Ref(data)).ok()
+                                }),
+                            _ => None,
+                        }
+                    };
+                    if let Some(pointee) = pointee {
+                        return self.format_value(
+                            frames,
+                            &pointee,
+                            trait_,
+                            &elem_ty,
+                            options,
+                            indent,
+                        );
+                    }
+                }
+            }
+        }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(
@@ -4375,6 +4438,43 @@ pub(super) fn pointee_tag(ty: &str) -> &str {
 /// elsewhere. The head must be followed directly by the
 /// argument list, so a longer name sharing the prefix
 /// (`RefCell`) does not match.
+/// The element type tag of a std lock guard type tag
+/// (`std::sync::MutexGuard<T>`, `std::sync::RwLockReadGuard<T>`,
+/// `std::sync::RwLockWriteGuard<T>`, and the `nonpoison`
+/// spellings), paired with whether the guard is a read guard:
+/// a read guard's first field is the `NonNull` data pointer its
+/// constructor took from the lock, where the other guards'
+/// first field is the reference to the lock itself. The head
+/// must be followed directly by the argument list, as in
+/// `guard_elem_tag`.
+pub(super) fn sync_guard_elem_tag(ty: &str) -> Option<(String, bool)> {
+    let plain = pointee_tag(ty);
+    let mut read_guard = None;
+    for (head, is_read) in [
+        ("std::sync::RwLockReadGuard", true),
+        ("std::sync::nonpoison::RwLockReadGuard", true),
+        ("std::sync::MutexGuard", false),
+        ("std::sync::RwLockWriteGuard", false),
+        ("std::sync::nonpoison::MutexGuard", false),
+        ("std::sync::nonpoison::RwLockWriteGuard", false),
+    ] {
+        if plain
+            .strip_prefix(head)
+            .is_some_and(|rest| rest.starts_with('<'))
+        {
+            read_guard = Some(is_read);
+            break;
+        }
+    }
+    let read_guard = read_guard?;
+    let open = plain.find('<')?;
+    let inner = tag_group_inner(plain, open)?;
+    split_tag_list(inner)
+        .into_iter()
+        .find(|arg| !is_lifetime_arg(arg))
+        .map(|elem| (elem.to_string(), read_guard))
+}
+
 pub(super) fn guard_elem_tag(ty: &str) -> Option<String> {
     let plain = pointee_tag(ty);
     let is_guard = [

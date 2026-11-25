@@ -643,20 +643,45 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let inner = self.plan(args.first()?)?;
                 return Some(at_field0(inner));
             }
-            // Lock guards: the destructor releases the lock,
-            // which the value model does not track as state, so
-            // the glue is the fields' (a lock reference and a
-            // poison flag - neither carries glue of its own).
-            // The guarded value is borrowed, never dropped
-            // through the guard. `Hook` is the panic hook holder:
-            // its one field is the boxed hook, whose glue the
-            // evidenced-fields plan reaches through the `Box`
-            // plan. A thread handle's fields are its id and name.
+            // Lock guards: the destructor releases the lock
+            // (and poisons it when the guard is dropped while
+            // unwinding). The lock state is real state in this
+            // model -- the converted lock bodies maintain it in
+            // the lock aggregate's futex word -- so the release
+            // must actually run: the guard's converted `Drop`
+            // body is the glue (a `GuardDtor` plan, which runs
+            // the body only on a value shaped like a guard the
+            // lock bodies built -- the stdio lock types hold a
+            // guard field whose value the io builtins forge),
+            // followed by the fields' glue as in the generic
+            // path below. When the program has no converted
+            // body for the impl, the fields plan stands (the
+            // guarded value is borrowed, never dropped through
+            // the guard, and neither field carries glue of its
+            // own).
             "std::sync::MutexGuard" | "std::sync::RwLockReadGuard"
             | "std::sync::RwLockWriteGuard" | "std::sync::nonpoison::MutexGuard"
             | "std::sync::nonpoison::RwLockReadGuard"
-            | "std::sync::nonpoison::RwLockWriteGuard" | "std::panicking::Hook"
-            | "std::thread::Thread" | "std::thread::thread::Inner" => {
+            | "std::sync::nonpoison::RwLockWriteGuard" => {
+                let fields = self.variant_fields_plan(def, args)?;
+                let ty_key = format!("{:?}", mir::Ty::Adt(def, args.to_vec()));
+                let dtor = self
+                    .conv
+                    .dtor_bodies
+                    .get(&ty_key)
+                    .cloned()
+                    .or_else(|| self.conv.dtor_body(&name, args));
+                return Some(match dtor {
+                    Some(func) => collapse_seq(vec![P::GuardDtor { func }, fields]),
+                    None => fields,
+                });
+            }
+            // `Hook` is the panic hook holder: its one field is
+            // the boxed hook, whose glue the evidenced-fields
+            // plan reaches through the `Box` plan. A thread
+            // handle's fields are its id and name.
+            "std::panicking::Hook" | "std::thread::Thread"
+            | "std::thread::thread::Inner" => {
                 return Some(self.variant_fields_plan(def, args)?);
             }
             // `std::io::Error` (the payload of a `Builder::spawn`

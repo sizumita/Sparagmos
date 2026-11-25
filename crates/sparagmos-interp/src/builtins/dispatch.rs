@@ -4737,6 +4737,25 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty_is(self_ty, "std::sync::MutexGuard")
+                    || self_ty_is(self_ty, "std::sync::RwLockWriteGuard")
+                {
+                    // A lock guard: field 0 is the reference to
+                    // the lock the converted lock body stored;
+                    // the guarded value is the lock's data field.
+                    self.lock_guard_deref(
+                        frames,
+                        &vals[0],
+                        "Deref::deref for lock guard",
+                    )
+                } else if self_ty_is(self_ty, "std::sync::RwLockReadGuard") {
+                    // A read guard: field 0 is the `NonNull` data
+                    // pointer its constructor took from the lock.
+                    self.read_guard_deref(
+                        frames,
+                        &vals[0],
+                        "Deref::deref for RwLockReadGuard",
+                    )
                 } else if self_ty.starts_with('&') {
                     // A reference's own `Deref` returns the inner
                     // reference itself: `<&T as Deref>::deref` and
@@ -7332,6 +7351,17 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty_is(self_ty, "std::sync::MutexGuard")
+                    || self_ty_is(self_ty, "std::sync::RwLockWriteGuard")
+                {
+                    // A lock guard: field 0 is the reference to
+                    // the lock the converted lock body stored;
+                    // the guarded value is the lock's data field.
+                    self.lock_guard_deref(
+                        frames,
+                        &vals[0],
+                        "DerefMut::deref_mut for lock guard",
+                    )
                 } else if self_ty.starts_with("&mut ") {
                     // A mutable reference's own `DerefMut` returns
                     // the inner `&mut T` itself: the argument is
