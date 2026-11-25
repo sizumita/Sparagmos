@@ -2,9 +2,13 @@
 //!
 //! rustc rejects some programs only after monomorphization
 //! begins: duplicate link symbols among the collected items, a
-//! panic runtime whose strategy mismatches the session's, and
+//! panic runtime whose strategy mismatches the session's
+//! (linked statically, or pulled in through the `std` dylib
+//! of a `-C prefer-dynamic` link), and
 //! the per-instance `check_mono_item` checks (ABI target
-//! features, the `large_assignments` move check). Conversion
+//! features — including definitions no entry point reaches,
+//! rooted by the reachability analysis alone — and the
+//! `large_assignments` move check). Conversion
 //! used to accept all of these, so compile-check records whose
 //! expected outcome is a failure of one of those kinds flipped
 //! to "expected failure but conversion succeeded" (Issue #509).
@@ -355,6 +359,105 @@ fn panic_runtime_matching_strategy_converts() {
             "-Cpanic=abort",
         ],
         true,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn simd_abi_definition_in_rootless_lib_rejected() {
+    // A library crate has no entry point and nothing calls
+    // this `#[no_mangle]` definition: the collector roots it
+    // through the reachability analysis alone (its export
+    // level is below the rlib threshold), so the definition's
+    // own ABI check fires — with avx disabled, an
+    // `extern "C"` definition taking `__m256` is rejected for
+    // its signature, with no call site involved.
+    let case = Case::new("simd-def-lib");
+    let src = case.write(
+        "case.rs",
+        "#![feature(portable_simd)]\n#![feature(simd_ffi)]\n\
+         #![crate_type = \"rlib\"]\n\
+         #![allow(improper_ctypes_definitions)]\n\
+         use std::arch::x86_64::*;\n\
+         #[no_mangle]\n\
+         pub unsafe extern \"C\" fn f(_: __m256) {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Ctarget-feature=-avx"],
+        true,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("requires the `avx` target feature"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn simd_abi_definition_in_rootless_lib_with_feature_converts() {
+    // The same rootless definition with the feature enabled:
+    // the definition is rooted and forced, and the ABI check
+    // finds nothing to reject.
+    let case = Case::new("simd-def-lib-ok");
+    let src = case.write(
+        "case.rs",
+        "#![feature(portable_simd)]\n#![feature(simd_ffi)]\n\
+         #![crate_type = \"rlib\"]\n\
+         #![allow(improper_ctypes_definitions)]\n\
+         use std::arch::x86_64::*;\n\
+         #[no_mangle]\n\
+         pub unsafe extern \"C\" fn f(_: __m256) {}\n",
+    );
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Ctarget-feature=+avx"],
+        true,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn prefer_dynamic_panic_runtime_mismatch_rejected() {
+    // Under `-C prefer-dynamic` the executable links the
+    // `std` dylib, whose recorded dylib dependency formats
+    // include the `panic_unwind` runtime it was built with as
+    // a static dependency; the injected abort runtime is
+    // therefore never activated, and the linked runtime's
+    // strategy mismatches the abort session.
+    let case = Case::new("panic-dylib");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "-Cpanic=abort",
+            "--rustc-arg",
+            "-Cprefer-dynamic",
+        ],
+        false,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("panic_unwind")
+            && stderr.contains("is not compiled with this crate's panic strategy"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn prefer_dynamic_matching_panic_runtime_converts() {
+    // The same dynamic linkage with the session's strategy
+    // left at unwind: the runtime the sweep links is the one
+    // the session wants.
+    let case = Case::new("panic-dylib-ok");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Cprefer-dynamic"],
+        false,
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");

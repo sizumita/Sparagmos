@@ -1360,54 +1360,243 @@ fn duplicate_symbol_finding<'tcx>(
 /// The validation is reproduced, not forced: the driver's
 /// session emits only metadata, under which the real
 /// `dependency_formats` computation produces empty lists and
-/// validates nothing. The linkage list here is the one the
-/// computation's static path (`attempt_static`) produces —
-/// the local crate and every unconditional dependency, with
-/// the injected panic runtime activated when no panic runtime
-/// is linked yet. (The computation's dynamic path, taken when
-/// some crate has no rlib source, links the same unconditional
-/// set from dylib sources; which source a crate was loaded
-/// from is a property of this session, not of the program, so
-/// the mirror follows the dependency kinds, which are the
-/// evidence `verify_ok` itself consumes.) An rlib-only
-/// compilation computes an empty list natively and validates
-/// nothing, so it is skipped the same way.
+/// validates nothing, so the linkage list of each crate type
+/// is reconstructed here from the facts the session does hold
+/// (dependency kinds, the dylib dependency formats recorded in
+/// each crate's metadata, and the session's linkage options),
+/// following the computation's own construction:
+///
+/// - the preferred linkage of a crate type is static, except
+///   that an executable with `-C prefer-dynamic` (and no
+///   crt-static), a dylib with `-C prefer-dynamic`, and a
+///   static library built with
+///   `-Zstaticlib-prefer-dynamic` prefer dynamic linkage;
+/// - the static list is the local crate and every
+///   unconditional dependency (`attempt_static`), with the
+///   injected panic runtime activated when no panic runtime
+///   is linked yet;
+/// - the dynamic list is the sweep over the graph's dylibs:
+///   each dylib is linked dynamically and the crates its
+///   recorded dylib dependency formats name are linked as
+///   recorded (a crate recorded `RequireStatic` is included
+///   in the dylib), after which unconditional crates no dylib
+///   claims are linked statically. The injected panic runtime
+///   is activated only when the sweep linked no panic
+///   runtime — which is how a `prefer-dynamic` executable
+///   whose standard library was built with the unwind runtime
+///   comes to link `panic_unwind` (recorded as a static
+///   dependency of the `std` dylib) under an abort session.
+///
+/// Two facts of the metadata session shape the reconstruction.
+/// The loaded source of every crate reports an rmeta and no
+/// rlib or dylib, so which crates are available as dylibs
+/// cannot be read from the sources; a crate's metadata records
+/// its dylib dependency formats exactly when the crate was
+/// itself compiled as a dylib (the formats are the linkage
+/// that dylib was built with), so the crates with non-empty
+/// recorded formats are taken as the graph's dylibs. (A dylib
+/// with no upstream crates records an empty list and escapes
+/// the identification; it can be neither a panic runtime nor
+/// a crate with a required panic strategy in any graph the
+/// formats describe, and the sweep's static fill still links
+/// it when it is unconditional.) And whether the static
+/// construction would fall back to the dynamic sweep for want
+/// of an rlib source is likewise not decidable here, so the
+/// static list is used whenever the preferred linkage is
+/// static. An rlib-only compilation computes an empty list
+/// natively and validates nothing, so it is skipped the same
+/// way.
 fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
-    use rustc_crate_store::CrateDepKind;
     use rustc_structures::CrateType;
-    use rustc_span::def_id::{CrateNum, LOCAL_CRATE};
-    use rustc_target::spec::PanicStrategy;
 
-    if tcx.crate_types().iter().all(|ty| *ty == CrateType::Rlib) {
-        return None;
-    }
     let crates = tcx.crates(());
-    let mut linked: Vec<CrateNum> = vec![LOCAL_CRATE];
+    let desired = tcx.sess.panic_strategy();
+    for ty in tcx.crate_types() {
+        // The preferred linkage of the crate type
+        // (`dependency_format::calculate_type`): an rlib
+        // computes no linkage list at all.
+        let dynamic = match ty {
+            CrateType::Executable => {
+                tcx.sess.opts.cg.prefer_dynamic && !tcx.sess.crt_static(Some(*ty))
+            }
+            CrateType::Dylib | CrateType::Cdylib | CrateType::Sdylib => {
+                tcx.sess.opts.cg.prefer_dynamic
+            }
+            CrateType::StaticLib => tcx.sess.opts.unstable_opts.staticlib_prefer_dynamic,
+            CrateType::ProcMacro => false,
+            CrateType::Rlib => continue,
+        };
+        let (linked, conflict) = if dynamic {
+            dynamic_linkage_list(tcx, crates, desired)
+        } else {
+            (static_linkage_list(tcx, crates, desired), None)
+        };
+        if let Some(finding) = conflict {
+            return Some(finding);
+        }
+        if let Some(finding) = verify_panic_linkage(tcx, &linked, desired) {
+            return Some(finding);
+        }
+    }
+    None
+}
+
+/// The panic runtime the loader injected for the session
+/// strategy: the panic-runtime crate whose name matches the
+/// strategy's runtime — the name the loader itself injects
+/// under, which is how the crate store's injected-runtime
+/// slot is populated.
+fn injected_panic_runtime(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    crates: &[rustc_span::def_id::CrateNum],
+    desired: rustc_target::spec::PanicStrategy,
+) -> Option<rustc_span::def_id::CrateNum> {
+    use rustc_target::spec::PanicStrategy;
+    let wanted = match desired {
+        PanicStrategy::Unwind => Some("panic_unwind"),
+        PanicStrategy::Abort => Some("panic_abort"),
+        PanicStrategy::ImmediateAbort => None,
+    }?;
+    crates
+        .iter()
+        .copied()
+        .find(|&cnum| tcx.is_panic_runtime(cnum) && tcx.crate_name(cnum).as_str() == wanted)
+}
+
+/// The static linkage list (`dependency_format`'s
+/// `attempt_static` result): the local crate and every
+/// unconditional dependency, with the injected panic runtime
+/// activated when no panic runtime is linked yet
+/// (`activate_injected_dep`).
+fn static_linkage_list(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    crates: &[rustc_span::def_id::CrateNum],
+    desired: rustc_target::spec::PanicStrategy,
+) -> Vec<rustc_span::def_id::CrateNum> {
+    use rustc_crate_store::CrateDepKind;
+    use rustc_span::def_id::LOCAL_CRATE;
+
+    let mut linked: Vec<rustc_span::def_id::CrateNum> = vec![LOCAL_CRATE];
     for &cnum in crates {
         if tcx.crate_dep_kind(cnum) == CrateDepKind::Unconditional {
             linked.push(cnum);
         }
     }
-    // The injected panic runtime is activated when no panic
-    // runtime is linked yet (dependency_format's
-    // `activate_injected_dep`): the loader injected the crate
-    // whose name matches the session strategy's runtime, so
-    // that is the crate activation links.
-    let desired = tcx.sess.panic_strategy();
     if !linked.iter().any(|&cnum| tcx.is_panic_runtime(cnum)) {
-        let wanted = match desired {
-            PanicStrategy::Unwind => Some("panic_unwind"),
-            PanicStrategy::Abort => Some("panic_abort"),
-            PanicStrategy::ImmediateAbort => None,
-        };
-        if let Some(wanted) = wanted {
-            if let Some(&cnum) = crates.iter().find(|&&cnum| {
-                tcx.is_panic_runtime(cnum) && tcx.crate_name(cnum).as_str() == wanted
-            }) {
-                linked.push(cnum);
+        if let Some(injected) = injected_panic_runtime(tcx, crates, desired) {
+            linked.push(injected);
+        }
+    }
+    linked
+}
+
+/// The dynamic linkage list (`dependency_format`'s sweep for a
+/// dynamically-preferring crate type), in crate-number order,
+/// with the injected panic runtime activated when the sweep
+/// linked no panic runtime. The second return value is the
+/// finding for a crate the sweep would have to link in two
+/// formats, which the computation rejects outright
+/// (`CrateDepMultiple`).
+fn dynamic_linkage_list(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    crates: &[rustc_span::def_id::CrateNum],
+    desired: rustc_target::spec::PanicStrategy,
+) -> (Vec<rustc_span::def_id::CrateNum>, Option<String>) {
+    use rustc_crate_store::{CrateDepKind, LinkagePreference};
+    use rustc_span::def_id::{CrateNum, LOCAL_CRATE};
+
+    // The graph's dylibs, identified by the recorded dylib
+    // dependency formats as described at `panic_runtime_finding`.
+    let all_dylibs: Vec<CrateNum> = crates
+        .iter()
+        .copied()
+        .filter(|&cnum| {
+            !tcx.crate_dep_kind(cnum).macros_only()
+                && !tcx.dylib_dependency_formats(cnum).is_empty()
+        })
+        .collect();
+    // With `rustc_private`, a crate some dylib statically
+    // requires is linked inside that dylib and is not swept
+    // as a dylib in its own right.
+    let mut upstream_in_dylibs: std::collections::HashSet<CrateNum> =
+        std::collections::HashSet::new();
+    if tcx.features().rustc_private() {
+        for &cnum in &all_dylibs {
+            for &(depnum, style) in tcx.dylib_dependency_formats(cnum) {
+                if style == LinkagePreference::RequireStatic {
+                    upstream_in_dylibs.insert(depnum);
+                }
             }
         }
     }
+    let mut formats: std::collections::HashMap<CrateNum, LinkagePreference> =
+        std::collections::HashMap::new();
+    let mut conflict: Option<CrateNum> = None;
+    let mut add_library = |cnum: CrateNum, link: LinkagePreference| {
+        if let Some(&existing) = formats.get(&cnum) {
+            if (existing != link || link == LinkagePreference::RequireStatic)
+                && conflict.is_none()
+            {
+                conflict = Some(cnum);
+            }
+        }
+        formats.insert(cnum, link);
+    };
+    for &cnum in &all_dylibs {
+        if upstream_in_dylibs.contains(&cnum) {
+            continue;
+        }
+        add_library(cnum, LinkagePreference::RequireDynamic);
+        for &(depnum, style) in tcx.dylib_dependency_formats(cnum) {
+            add_library(depnum, style);
+        }
+    }
+    if let Some(cnum) = conflict {
+        return (
+            Vec::new(),
+            Some(format!(
+                "crate `{}` is required to be available in multiple \
+                 formats (rustc rejects a crate that would be linked \
+                 both statically and dynamically)",
+                tcx.crate_name(cnum)
+            )),
+        );
+    }
+    // Unconditional crates no dylib claims and that are not
+    // themselves dylibs are linked statically.
+    for &cnum in crates {
+        if !all_dylibs.contains(&cnum)
+            && !formats.contains_key(&cnum)
+            && tcx.crate_dep_kind(cnum) == CrateDepKind::Unconditional
+        {
+            formats.insert(cnum, LinkagePreference::RequireStatic);
+        }
+    }
+    let mut linked: Vec<CrateNum> = vec![LOCAL_CRATE];
+    for &cnum in crates {
+        if formats.contains_key(&cnum) {
+            linked.push(cnum);
+        }
+    }
+    if !linked.iter().any(|&cnum| tcx.is_panic_runtime(cnum)) {
+        if let Some(injected) = injected_panic_runtime(tcx, crates, desired) {
+            linked.push(injected);
+            linked.sort_unstable();
+        }
+    }
+    (linked, None)
+}
+
+/// The validation itself (`dependency_format::verify_ok`) over
+/// one constructed linkage list.
+fn verify_panic_linkage(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    linked: &[rustc_span::def_id::CrateNum],
+    desired: rustc_target::spec::PanicStrategy,
+) -> Option<String> {
+    use rustc_span::def_id::{CrateNum, LOCAL_CRATE};
+    use rustc_target::spec::PanicStrategy;
+
     let strategy_name = |strategy: PanicStrategy| match strategy {
         PanicStrategy::Unwind => "unwind",
         PanicStrategy::Abort => "abort",
@@ -1419,7 +1608,7 @@ fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
         .iter()
         .any(|&cnum| tcx.required_panic_strategy(cnum) == Some(PanicStrategy::ImmediateAbort))
     {
-        for &cnum in &linked {
+        for &cnum in linked {
             if tcx.required_panic_strategy(cnum) != Some(PanicStrategy::ImmediateAbort) {
                 return Some(format!(
                     "the crate `{}` was compiled with a panic strategy \
@@ -1432,7 +1621,7 @@ fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
         }
     }
     let mut runtime: Option<(CrateNum, PanicStrategy)> = None;
-    for &cnum in &linked {
+    for &cnum in linked {
         if !tcx.is_panic_runtime(cnum) {
             continue;
         }
@@ -1460,7 +1649,7 @@ fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
             strategy_name(desired)
         ));
     }
-    for &cnum in &linked {
+    for &cnum in linked {
         if cnum == runtime_cnum || tcx.is_compiler_builtins(cnum) {
             continue;
         }
@@ -1569,6 +1758,39 @@ impl<'tcx> RequiredConstWalk<'tcx> {
     /// compiler.
     fn collect_roots(&mut self) {
         let tcx = self.tcx;
+        // The collector's root predicate for functions is
+        // `tcx.is_reachable_non_generic`, but that query's
+        // provider returns an empty map when the session does
+        // not codegen (the `should_codegen` gate in
+        // `rustc_codegen_ssa::back::symbol_export`), and this
+        // driver's session emits only metadata — through the
+        // query, no function would ever be a root, and in a
+        // crate with no entry point (a library, or a test whose
+        // definitions the entry point never mentions) the walk
+        // would have no roots at all. `reachable_non_generics_helper`
+        // is the provider's own computation without the gate
+        // (exposed for Miri, whose sessions have the same
+        // metadata-only shape); testing its result against the
+        // session's export threshold is exactly what the
+        // query's local provider does in a code-generating
+        // session. A panic in the computation abandons it and
+        // leaves the walk with the entry point and the flag
+        // roots alone, never a finding.
+        let reachable_non_generics = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| {
+                rustc_codegen_ssa::back::symbol_export::reachable_non_generics_helper(tcx)
+            }),
+        )
+        .unwrap_or_default();
+        let export_threshold =
+            rustc_codegen_ssa::back::symbol_export::crates_export_threshold(
+                tcx.crate_types(),
+            );
+        let is_collector_root = |def_id: rustc_span::def_id::DefId| {
+            reachable_non_generics.get(&def_id).is_some_and(|info| {
+                info.level.is_below_threshold(export_threshold)
+            })
+        };
         if let Some((entry_def_id, _)) = tcx.entry_fn(()) {
             self.enqueue(rustc_middle::ty::Instance::mono(tcx, entry_def_id));
         }
@@ -1596,7 +1818,7 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                             return;
                         }
                         let flags = tcx.codegen_fn_attrs(def_id).flags;
-                        if tcx.is_reachable_non_generic(def_id)
+                        if is_collector_root(def_id)
                             || flags.intersects(
                                 rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
                                     | rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM,

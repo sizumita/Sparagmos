@@ -32,6 +32,11 @@
 //! strategies) the monomorphization verdicts in `mono_check` read
 //! from the compiler's own queries, mirroring the dependency-format
 //! validation code generation performs; and
+//! `rustc_codegen_ssa::back::symbol_export` names the collector
+//! root set's own computation, whose query form is gated on the
+//! session code-generating — which this driver's metadata-only
+//! session never does — so `mono_check` applies the provider's
+//! ungated helper to the same export threshold; and
 //! `rustc_attr_ir::lang_items::LangItem` names the `drop_glue` lang
 //! item so drop-glue certification can check the item exists before
 //! asking the compiler to resolve `drop_in_place` (a minicore
@@ -45,6 +50,7 @@
 #![feature(rustc_private)]
 
 extern crate rustc_attr_ir;
+extern crate rustc_codegen_ssa;
 extern crate rustc_crate_store;
 extern crate rustc_driver;
 extern crate rustc_hir;
