@@ -136,6 +136,7 @@
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
+extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_public;
@@ -5576,7 +5577,7 @@ fn collect() -> ControlFlow<()> {
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources))
         .or_else(|| sparagmos_driver::mono_check::take_mono_item_finding());
 
-    let entry_def_id = entry_point_def_id(&mut conv, &items);
+    let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
 
     // Certify the dropped types whose drop glue the compiler
     // knows is empty, over the same body set the monomorphization
@@ -5653,7 +5654,17 @@ fn entry_seed_bodies(
         .and_then(|entry| {
             items.iter().find(|item| item.def_id() == entry.def_id())
         })
-        .or_else(|| items.iter().find(|item| is_main(&item.name())));
+        .or_else(|| items.iter().find(|item| is_main(&item.name())))
+        .or_else(|| {
+            // An imported `main` (a crate-root re-export of a
+            // local function): the root module's `main` child
+            // (root_main_target) names the item by its def
+            // path, which is the item's name in Stable MIR's
+            // spelling.
+            let tcx = sparagmos_driver::convert::compiler_tcx()?;
+            let path = tcx.def_path_str(root_main_target()?);
+            items.iter().find(|item| item.name() == path)
+        });
     let Some(item) = item else {
         return Vec::new();
     };
@@ -5670,13 +5681,75 @@ fn entry_seed_bodies(
 fn entry_point_def_id(
     conv: &mut Converter,
     items: &[rustc_public::CrateItem],
+    body_def_ids: &[sparagmos_mir::DefId],
 ) -> Option<sparagmos_mir::DefId> {
-    let entry = std::panic::catch_unwind(rustc_public::entry_fn).ok()??;
-    let item = items.iter().find(|item| item.def_id() == entry.def_id())?;
-    match Instance::try_from(item.clone()) {
-        Ok(inst) => Some(conv.instance_def_id(item.def_id(), &inst)),
-        Err(_) => None,
+    let entry = std::panic::catch_unwind(rustc_public::entry_fn)
+        .ok()
+        .flatten();
+    if let Some(entry) = entry {
+        let item = items.iter().find(|item| item.def_id() == entry.def_id())?;
+        return match Instance::try_from(item.clone()) {
+            Ok(inst) => Some(conv.instance_def_id(item.def_id(), &inst)),
+            Err(_) => None,
+        };
     }
+    resolver_main_def_id(conv, body_def_ids)
+}
+
+/// The target of the crate root's `main` child: the function a
+/// crate-root item named `main` resolves to, following a
+/// re-export (`use foo::bar as main;`,
+/// `pub use main_functions::boilerplate as main;`). This is the
+/// resolution rustc's own entry search performs in
+/// rustc_resolve's `resolve_main` -- which, like the entry_fn
+/// query, only runs for an executable crate type, so under run
+/// mode's lib pin neither record exists and the resolution is
+/// replayed here from the root module's children.
+fn root_main_target() -> Option<rustc_span::def_id::DefId> {
+    let tcx = sparagmos_driver::convert::compiler_tcx()?;
+    let root = rustc_span::def_id::CRATE_DEF_ID;
+    for child in tcx.module_children_local(root) {
+        if child.ident.name == rustc_span::sym::main {
+            if let rustc_hir::def::Res::Def(_, did) = child.res {
+                return Some(did);
+            }
+        }
+    }
+    None
+}
+
+/// The entry point an imported `main` designates, for the
+/// compilations where `rustc_public::entry_fn` designates none
+/// (see root_main_target). The target's def-path string names
+/// the converted instance: the converter's def table spells a
+/// foreign item with the local crate's prefix
+/// (`<crate>::main_functions::boilerplate`), so an exact match
+/// or a `::{path}` suffix match identifies it. Only a def with
+/// a converted body qualifies, and only when the match is
+/// unique: naming a def conversion skipped, or one of several
+/// same-named instances, would designate an entry execution
+/// cannot run or cannot identify.
+fn resolver_main_def_id(
+    conv: &Converter,
+    body_def_ids: &[sparagmos_mir::DefId],
+) -> Option<sparagmos_mir::DefId> {
+    let tcx = sparagmos_driver::convert::compiler_tcx()?;
+    let path = tcx.def_path_str(root_main_target()?);
+    let suffix = format!("::{path}");
+    let mut found: Option<sparagmos_mir::DefId> = None;
+    for (idx, name) in conv.def_names.iter().enumerate() {
+        if name == &path || name.ends_with(&suffix) {
+            let id = sparagmos_mir::DefId::new(0, idx as u32);
+            if !body_def_ids.contains(&id) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
+        }
+    }
+    found
 }
 
 fn is_main(name: &str) -> bool {
@@ -7912,9 +7985,10 @@ fn build_program(
     let entry_index = c
         .entry_def_id
         .and_then(|def| {
-            c.body_def_ids[..c.local_body_count]
-                .iter()
-                .position(|id| *id == def)
+            // The designated entry is authoritative wherever
+            // its body sits: an imported `main` from a foreign
+            // crate is a demanded body, past the local prefix.
+            c.body_def_ids.iter().position(|id| *id == def)
         })
         .or_else(|| {
             c.bodies[..c.local_body_count]
@@ -9218,6 +9292,150 @@ fn declared_compile_flags(src_text: &str) -> Vec<String> {
     flags
 }
 
+/// Directive scan shared by the auxiliary-header readers
+/// below: yields each `//@` directive's text with any
+/// `//@[revision]` scope prefix stripped, the approximation
+/// declared_compile_flags already applies.
+fn aux_directive_texts(src_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src_text.lines() {
+        let Some(at) = line.find("//@") else { continue };
+        let rest = line[at + 3..].trim_start();
+        let rest = if rest.starts_with('[') {
+            match rest.find(']') {
+                Some(end) => rest[end + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        out.push(rest.to_string());
+    }
+    out
+}
+
+/// Whether an auxiliary source opts out of the prefer-dynamic
+/// auxiliary build (`//@ no-prefer-dynamic`).
+fn declared_no_prefer_dynamic(src_text: &str) -> bool {
+    aux_directive_texts(src_text)
+        .iter()
+        .any(|d| d.starts_with("no-prefer-dynamic"))
+}
+
+/// An auxiliary source's own `//@ rustc-env:` pairs and
+/// `//@ unset-rustc-env:` names.
+fn declared_rustc_env(src_text: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut pairs = Vec::new();
+    let mut unset = Vec::new();
+    for d in aux_directive_texts(src_text) {
+        if let Some(value) = d.strip_prefix("rustc-env:") {
+            if let Some((name, value)) = value.trim().split_once('=') {
+                pairs.push((name.trim().to_string(), value.trim().to_string()));
+            }
+        } else if let Some(value) = d.strip_prefix("unset-rustc-env:") {
+            unset.push(value.trim().to_string());
+        }
+    }
+    (pairs, unset)
+}
+
+/// The sysroot crates a source's `extern crate` items name that
+/// the sysroot's target lib dir offers ambiguously, as
+/// (name, rmeta, rlib) pins.
+///
+/// A rustup sysroot carrying the rustc-dev component holds two
+/// rmetas for crates such as libc in its target lib dir: the
+/// rust-std build's, paired with an rlib, and the compiler's
+/// own build's, metadata only. An `extern crate` lookup then
+/// fails with E0464 (multiple candidates), where the bootstrap
+/// sysroot compiletest runs against holds a single candidate
+/// per crate. The pin names the one candidate whose hash also
+/// names an rlib -- the only linkable one -- in both its forms,
+/// the pairing rustc takes as one crate (an rmeta-only pin
+/// fails links that need the code; an rlib-only pin fails with
+/// "only metadata stub found"). Mirrors the subset runner's
+/// ambiguous_sysroot_crates for its native compilations.
+fn sysroot_extern_pins(
+    sysroot: &str,
+    src_text: &str,
+) -> Vec<(String, std::path::PathBuf, std::path::PathBuf)> {
+    let mut declared: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for line in src_text.lines() {
+        if let Some(name) = extern_crate_item_name(line) {
+            declared.insert(name);
+        }
+    }
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    // crate name -> hash -> (lib dir, has rmeta, has rlib)
+    let mut by_name: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, (std::path::PathBuf, bool, bool)>,
+    > = std::collections::HashMap::new();
+    let rustlib = std::path::Path::new(sysroot).join("lib").join("rustlib");
+    let Ok(targets) = std::fs::read_dir(&rustlib) else {
+        return Vec::new();
+    };
+    for target in targets.flatten() {
+        let libdir = target.path().join("lib");
+        let Ok(entries) = std::fs::read_dir(&libdir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = fname.strip_prefix("lib") else {
+                continue;
+            };
+            let Some((stem, ext)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            if ext != "rmeta" && ext != "rlib" {
+                continue;
+            }
+            let Some((name, hash)) = stem.rsplit_once('-') else {
+                continue;
+            };
+            if hash.len() != 16 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            if !declared.contains(name) {
+                continue;
+            }
+            let slot = by_name
+                .entry(name.to_string())
+                .or_default()
+                .entry(hash.to_string())
+                .or_insert_with(|| (libdir.clone(), false, false));
+            if ext == "rmeta" {
+                slot.1 = true;
+            } else {
+                slot.2 = true;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (name, hashes) in by_name {
+        if hashes.len() < 2 {
+            continue;
+        }
+        let linkable: Vec<(&String, &(std::path::PathBuf, bool, bool))> = hashes
+            .iter()
+            .filter(|(_, (_, rmeta, rlib))| *rmeta && *rlib)
+            .collect();
+        if linkable.len() == 1 {
+            let (hash, (dir, _, _)) = linkable[0];
+            out.push((
+                name.clone(),
+                dir.join(format!("lib{name}-{hash}.rmeta")),
+                dir.join(format!("lib{name}-{hash}.rlib")),
+            ));
+        }
+    }
+    out
+}
+
 /// Expand compiletest's `{{...}}` template variables in an
 /// auxiliary crate's declared compile flags. compiletest expands
 /// every directive value before compiling an auxiliary crate with
@@ -9401,6 +9619,7 @@ fn compile_aux(
     aux_dir: &std::path::Path,
     spec: &AuxSpec,
     previous: &[AuxBuilt],
+    native_lib_dirs: &[std::path::PathBuf],
 ) -> Result<AuxBuilt, String> {
     let name = spec.name.as_str();
     let src_path = spec.path.as_str();
@@ -9444,6 +9663,15 @@ fn compile_aux(
         .arg(format!("--sysroot={sysroot}"))
         .arg("-L")
         .arg(format!("dependency={}", aux_dir.display()));
+    // The harness's native support library (librust_test_helpers
+    // .a, built once by the subset runner from the test tree's
+    // rust_test_helpers.c): auxiliary crates that name it in a
+    // `#[link]` attribute fail with "could not find native
+    // static library" when their build cannot see the directory
+    // the native auxiliary builds are handed.
+    for dir in native_lib_dirs {
+        cmd.arg("-L").arg(format!("native={}", dir.display()));
+    }
     if declared.is_none() {
         cmd.arg(format!("--crate-type={effective_type}"));
     }
@@ -9470,6 +9698,46 @@ fn compile_aux(
                     .arg(format!("{}={}", bind, artifact.display()));
             }
         }
+    }
+    // Pin the sysroot crates this source declares that the
+    // sysroot offers ambiguously (sysroot_extern_pins): the
+    // same disambiguation the subset runner applies to its
+    // native builds, without which an auxiliary source's
+    // `extern crate libc;` fails with E0464 in a rustup sysroot
+    // carrying the rustc-dev component. A name the source binds
+    // to an auxiliary crate built above keeps that binding.
+    for (name, rmeta, rlib) in sysroot_extern_pins(sysroot, &src_text) {
+        if binding_declared.contains(&name) {
+            continue;
+        }
+        cmd.arg("--extern").arg(format!("{name}={}", rmeta.display()));
+        cmd.arg("--extern").arg(format!("{name}={}", rlib.display()));
+    }
+    // compiletest compiles an auxiliary crate with
+    // `-C prefer-dynamic` unless the crate opts out with
+    // `//@ no-prefer-dynamic` or sets the flag itself (the
+    // subset runner's native auxiliary builds do the same): a
+    // dylib auxiliary built without it cannot satisfy the
+    // "std only shows up once" requirement against the
+    // prefer-dynamic sysroot std (linkage-attr/issue-12133-3).
+    if !declared_no_prefer_dynamic(&src_text)
+        && !own_flags.iter().any(|f| f.contains("prefer-dynamic"))
+    {
+        cmd.arg("-C").arg("prefer-dynamic");
+    }
+    // The auxiliary crate's own `//@ rustc-env:` /
+    // `//@ unset-rustc-env:`: compiletest configures each
+    // auxiliary build's environment from the auxiliary file's
+    // own directives, separately from the test's (the
+    // compiletest-self-test env.rs auxiliary reads
+    // COMPILETEST_BAR through env!() and does not compile
+    // without it).
+    let (aux_env, aux_unset) = declared_rustc_env(&src_text);
+    for name in &aux_unset {
+        cmd.env_remove(name);
+    }
+    for (name, value) in &aux_env {
+        cmd.env(name, expand_aux_flag_variables(value, src_path));
     }
     // The auxiliary crate's own `//@ compile-flags:` (compiletest
     // compiles each auxiliary crate with its own file's flags,
@@ -9600,9 +9868,10 @@ fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
     let entry_index = c
         .entry_def_id
         .and_then(|def| {
-            c.body_def_ids[..c.local_body_count]
-                .iter()
-                .position(|id| *id == def)
+            // The designated entry is authoritative wherever
+            // its body sits: an imported `main` from a foreign
+            // crate is a demanded body, past the local prefix.
+            c.body_def_ids.iter().position(|id| *id == def)
         })
         .or_else(|| {
             c.bodies[..c.local_body_count]
@@ -9875,6 +10144,7 @@ fn driver_main() {
     let mut input: Option<String> = None;
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
     let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut aux_native_lib_dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
     let mut dump_path: Option<String> = None;
@@ -9989,6 +10259,14 @@ fn driver_main() {
                     }
                 }
             }
+            "--aux-native-lib" => {
+                i += 1;
+                let dir = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--aux-native-lib needs a directory path");
+                    std::process::exit(2);
+                });
+                aux_native_lib_dirs.push(std::path::PathBuf::from(dir));
+            }
             "--guest-process-host" => {
                 guest_process_host = true;
             }
@@ -10007,7 +10285,7 @@ fn driver_main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--tool-program <path>] [--guest-process-host] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -10092,7 +10370,14 @@ fn driver_main() {
     let _ = std::fs::create_dir_all(&aux_dir);
     let mut aux_built: Vec<AuxBuilt> = Vec::new();
     for spec in &aux_specs {
-        match compile_aux(&sysroot, &edition, &aux_dir, spec, &aux_built) {
+        match compile_aux(
+            &sysroot,
+            &edition,
+            &aux_dir,
+            spec,
+            &aux_built,
+            &aux_native_lib_dirs,
+        ) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {
                 if mode == Mode::RunJit {

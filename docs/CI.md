@@ -156,6 +156,47 @@ denominator. Runs on every push to `main` and on manual dispatch.
   under the bucket `not attempted (coverage instrumentation)`
   (issue #514). The denominator is unaffected; all 109 stay
   in it as non-passes.
+- An executed run's verdict follows compiletest's own for the
+  run (runtest/ui.rs): the run's exit must classify as the
+  mode requires (run-pass: pass class, exit 0; run-fail:
+  failure class, any exit in 1..=127 -- the class, not one
+  fixed code: a test's `failure-status` directive constrains
+  the compile phase's status only, and a sanitizer runtime's
+  exit or a plain `process::exit(1)` is the same class as a
+  panic's 101), the run's output must contain the test's
+  `error-pattern` / `regex-error-pattern` directives (checked
+  against the run's stderr, or its stdout followed by stderr
+  under `check-stdout`), and the run's streams are compared
+  only when the test declares `check-run-results` -- the one
+  directive under which compiletest compares run output at
+  all -- after compiletest's output normalization (path
+  rules, the thread-id rule, the test's own
+  `normalize-stdout` / `normalize-stderr` rules). A native run
+  failing the class or pattern checks is a broken oracle for
+  the record and is recorded as a native mismatch, not judged.
+  Without `check-run-results` the streams are not compared:
+  libtest's parallel completion order, thread interleaving
+  and address-valued prints make a run's output
+  non-reproducible in ways compiletest never judges. The
+  guest's stderr reaches the judge on its own channel
+  (`--guest-stderr-file`), apart from the driver process's
+  diagnostics; the JIT run shares the driver's channel, so
+  its check-run-results verdict compares stdout only. Both
+  runs also receive `RUST_TEST_TMPDIR` (the attempt's temp
+  directory), which bootstrap exports to the whole test
+  process tree and tests read at run time.
+- The exec records compiled with a `-Z sanitizer=...` flag
+  (the `tests/ui/sanitizer` family) are attempted by no
+  stage. compiletest judges them by the sanitizer runtime's
+  own report on the instrumented binary -- its exit class
+  and the diagnostic its `error-pattern` names -- and the
+  instrumentation is LLVM-level: no MIR the interpreter
+  executes carries it and the guest program is never
+  instrumented, so no verdict reduces to plain execution.
+  The runner records them as not attempted under the bucket
+  `not attempted (sanitizer instrumentation)` (issue #532),
+  the same shape as the coverage records above. The
+  denominator is unaffected.
 - The exec records whose mode is run-crash are attempted by
   stages 1 and 2 and judged by crash class, following
   compiletest's own classification of a finished run
@@ -167,7 +208,7 @@ denominator. Runs on every push to `main` and on manual dispatch.
   agrees with the native run's; when the native run does not
   crash, the record is not judged and keeps the
   native-expectation bucket, as a native mismatch does for
-  the fixed-code modes. To make the classes distinguishable,
+  the other modes. To make the classes distinguishable,
   the driver reports a guest crash -- a guest panic that may
   not unwind (panic=abort, a nounwind assertion failure, a
   second panic while a panic is in flight) -- with exit code
