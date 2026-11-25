@@ -33652,6 +33652,31 @@ fn run_mode_iterator_nth_range_advances_directly() {
     );
 }
 
+const LONG_WHILE_SRC: &str = r#"
+#![allow(unused_variables)]
+fn main() {
+    let mut i: isize = 0;
+    while i < 300_000 {
+        i += 1;
+        let x = 3;
+    }
+    println!("done {i}");
+}
+"#;
+
+#[test]
+fn run_mode_long_loop_within_step_budget() {
+    // A plain counting loop spends ~7 steps per iteration in
+    // the interpreter, so 300k iterations (~2.1M steps) cross
+    // the old 1,000,000 default step budget even though the
+    // program is trivially finite -- the suite's own
+    // tests/ui/for-loop-while/long-while.rs needs 7,000,006
+    // steps for its 1M iterations. The default budget is now
+    // sized from measured demand (issue #399), and the run
+    // completes.
+    run_ok("step-budget-long-while", LONG_WHILE_SRC, "done 300000\n");
+}
+
 const NTH_CHAR_RANGE_GAP_SRC: &str = r#"
 fn show(tag: &str, v: Option<char>) {
     match v {

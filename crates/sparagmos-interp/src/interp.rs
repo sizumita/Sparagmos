@@ -38,6 +38,21 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpConfig {
     /// Maximum number of statements + terminators executed in one run.
+    ///
+    /// The default budget is a safety bound against guests that
+    /// never terminate, not a model of any limit the native run
+    /// has: compiletest bounds a test only by wall clock, so a
+    /// finite guest must never meet this bound first. It is
+    /// sized from measured demand (issue #399): the hungriest
+    /// finite test-suite programs need ~2.8e8 steps
+    /// (`tests/ui/range/step_overflowing.rs`; the plain-loop
+    /// programs need ~1e6-7e6), so 1e9 leaves ~3.6x headroom
+    /// over the largest measured need, while a guest that
+    /// truly never terminates still dies with
+    /// `StepLimitExceeded` -- in minutes for a plain loop,
+    /// rather than running forever. In the measurement runner
+    /// the per-record wall-clock timeout stays the operative
+    /// bound for guests whose per-step cost is high.
     pub max_steps: usize,
     /// Maximum number of simultaneously live call frames.
     pub max_call_depth: usize,
@@ -81,7 +96,7 @@ pub struct InterpConfig {
 impl Default for InterpConfig {
     fn default() -> Self {
         InterpConfig {
-            max_steps: 1_000_000,
+            max_steps: 1_000_000_000,
             max_call_depth: 8192,
             guest_args: Vec::new(),
             program_path: String::new(),
