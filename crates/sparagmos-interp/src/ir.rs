@@ -2136,6 +2136,17 @@ pub struct Body {
     pub name: String,
     pub arg_count: usize,
     pub local_tys: Vec<Ty>,
+    /// Discriminant values of the body's return type when
+    /// that type is a fieldless (C-like) enum, in variant
+    /// order (conversion-computed; see `mir_convert`'s
+    /// `return_discriminants`). A fieldless enum is
+    /// represented as exactly its discriminant integer, so
+    /// where a return value crosses into an integer-typed
+    /// destination place -- a call through a transmuted
+    /// function pointer, the FFI shape -- the value is read
+    /// as that integer. `None` for every other return type,
+    /// and for hand-built bodies.
+    pub return_discriminants: Option<Vec<i128>>,
     /// The element size of each local whose declared type is a
     /// sequence type — an array's element type, or an ADT's first
     /// generic argument (a `Vec`'s element type) — indexed by
@@ -2215,6 +2226,7 @@ impl Body {
             name: name.into(),
             arg_count,
             local_tys,
+            return_discriminants: None,
             local_elem_sizes: Vec::new(),
             field_elem_sizes: Vec::new(),
             blocks,
