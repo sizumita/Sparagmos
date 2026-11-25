@@ -674,6 +674,57 @@ class RustdocHostToolScopeTests(unittest.TestCase):
             self.assertEqual(res["bucket"], "out of stage-1 scope (nature)")
 
 
+class CoverageScopeTests(unittest.TestCase):
+    """exec records of the coverage suites (issue #514).
+
+    The classification returns before any file or process side is
+    touched, so the records need no fixture files.
+    """
+
+    def rec(self, suite, nature="exec"):
+        return {"suite": suite, "path": f"tests/{suite}/t.rs",
+                "nature": nature, "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def run_rec(self, suite, jit=False):
+        return run.process_test(self.rec(suite), Path("/nonexistent"),
+                                Path("/fake/driver"), jit=jit)
+
+    def test_coverage_suite_needs_coverage_instrumentation(self):
+        res = self.run_rec("coverage")
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (coverage instrumentation)")
+        self.assertIn(".cov-map", res["reason"])
+        self.assertIn(".coverage", res["reason"])
+        self.assertIn("issue #514", res["reason"])
+
+    def test_coverage_run_rustdoc_needs_coverage_instrumentation(self):
+        res = self.run_rec("coverage-run-rustdoc")
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (coverage instrumentation)")
+        self.assertIn("doctest", res["reason"])
+        self.assertIn("issue #514", res["reason"])
+
+    def test_classification_applies_to_the_jit_pass_too(self):
+        res = self.run_rec("coverage", jit=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (coverage instrumentation)")
+
+    def test_helper_classifies_only_the_coverage_suites(self):
+        # main's carry-through for records no stage selects
+        # consults the same helper, so pin its contract directly.
+        self.assertIsNotNone(run.coverage_scope(self.rec("coverage")))
+        self.assertIsNotNone(
+            run.coverage_scope(self.rec("coverage-run-rustdoc")))
+        self.assertIsNone(run.coverage_scope(self.rec("ui")))
+        self.assertIsNone(
+            run.coverage_scope(self.rec("coverage",
+                                        nature="compile-check")))
+
+
 class CompileExpectationTests(unittest.TestCase):
     def test_ui_default_is_check_fail(self):
         h = header("fn main() { let x: u8 = \"s\"; }\n")
