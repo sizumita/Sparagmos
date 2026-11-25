@@ -1099,6 +1099,52 @@ fn run_mode_slice_table_across_large_statics_stays_within_cache_cap() {
 }
 
 #[test]
+fn run_mode_alternating_large_statics_table_over_work_budget_stays_undecoded() {
+    // A 40-element table of one-byte slices alternating between
+    // two 129 MiB statics. Together the two backings exceed the
+    // 256 MiB allocation-cache cap, so every element evicts the
+    // other static's initialiser and `eval_initializer`
+    // re-materialises it in full: the retained-bytes cap bounds
+    // what the caches hold, not the cumulative work, and the
+    // expansion budget sees only a few thousand units for the
+    // whole table. The materialisation-work budget charges each
+    // evaluation at its byte size, so the cumulative charge
+    // crosses it at about the thirty-second element and the
+    // root constant stays undecoded. (At 5,000 elements the
+    // same shape copies over 600 GiB; the within-budget
+    // alternating shape is covered by
+    // `run_mode_slice_table_across_large_statics_stays_within_cache_cap`.)
+    let mut src = String::new();
+    src.push_str("static A: [u8; 135266304] = [7; 135266304]; ");
+    src.push_str("static B: [u8; 135266304] = [9; 135266304]; ");
+    let mut elems = Vec::new();
+    for i in 0..40 {
+        let name = if i % 2 == 0 { "A" } else { "B" };
+        elems.push(format!(
+            "unsafe {{ std::slice::from_raw_parts({name}.as_ptr(), 1) }}"
+        ));
+    }
+    src.push_str(&format!("static TABLE: [&[u8]; 40] = [{}]; ", elems.join(", ")));
+    src.push_str(
+        "fn main() { println!(\"{} {} {} {}\", TABLE[0][0], TABLE[1][0], TABLE[39][0], TABLE.len()); }",
+    );
+    let dir = temp_dir("alternating-statics-work-budget");
+    let src = fixture(&dir, "alternating_statics_work_budget.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a slice table whose alternating statics exhaust the materialisation-work budget must stay undecoded; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "no wrong value may be printed for an undecoded constant"
+    );
+}
+
+#[test]
 fn run_mode_large_reference_table_reads_back() {
     // A 400,000-element table of references to one promoted
     // value: the table's allocation carries 400,000

@@ -684,6 +684,33 @@ pub struct Converter {
     /// shortcut caused, so they keep the constant undecoded
     /// rather than substitute a snapshot (see `decode_ref`).
     const_scan_budget: usize,
+    /// Set when a `spend_work_budget` charge does not fit.
+    /// Read by the same `decode_ref` fallbacks that read
+    /// `const_budget_failed`, and by the two materialisation
+    /// points (`resolve_alloc`, `static_initializer`) as a stop
+    /// signal: once the cumulative materialisation work for one
+    /// root constant is over budget, later materialisations in
+    /// the same decode tree are refused without being performed,
+    /// so an eviction-thrashing constant costs the budget, not
+    /// the budget times its element count. Unlike the other two
+    /// exhaustion flags it is also cleared wherever the budgets
+    /// refill: it is read outside the clear/check pairs, so a
+    /// stale set flag would refuse materialisations for unrelated
+    /// later constants (whether a constant decodes must not
+    /// depend on the constants visited before it).
+    const_work_failed: bool,
+    /// Materialisation-work budget remaining for the constant
+    /// currently being decoded (see `MAX_CONST_WORK_BYTES`):
+    /// reset wherever `const_budget` resets, and spent by
+    /// `resolve_alloc` / `static_initializer` once per backing
+    /// allocation actually materialised, at its byte size.
+    /// Cache hits spend nothing: the caches already bound how
+    /// much is *retained*, this budget bounds how much work is
+    /// *done*, which the retained-bytes cap cannot -- two
+    /// allocations that together exceed the cap evict each
+    /// other on every access, so each is re-materialised once
+    /// per element while almost nothing is ever retained.
+    const_work_budget: usize,
     /// Materialised memory allocations by provenance id,
     /// shared within one root constant's decode tree and
     /// cleared wherever `const_budget` resets. Resolving a
@@ -3238,6 +3265,11 @@ fn instance_item_body(
 enum ResolvedAlloc {
     Memory(std::rc::Rc<Allocation>),
     Other(mir::alloc::GlobalAlloc),
+    /// The target is a memory allocation whose materialisation
+    /// the work budget refused (see `MAX_CONST_WORK_BYTES`):
+    /// the decode that needed it fails, so the constant stays
+    /// undecoded rather than taking any fallback value.
+    Refused,
 }
 
 enum FatPointerRead {
@@ -3302,6 +3334,8 @@ impl Converter {
             const_budget_failed: false,
             const_scan_failed: false,
             const_scan_budget: MAX_CONST_SCAN_BYTES,
+            const_work_failed: false,
+            const_work_budget: MAX_CONST_WORK_BYTES,
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
             alloc_cache_bytes: 0,
@@ -3381,6 +3415,13 @@ impl Converter {
         if static_is_foreign(&def) {
             return;
         }
+        // Seeding decodes a root constant (the initializer is
+        // decoded at the root of `decode_const` just below), so
+        // the evaluation in `static_initializer` starts from a
+        // full materialisation-work budget rather than whatever
+        // an unrelated earlier constant left behind.
+        self.const_work_budget = MAX_CONST_WORK_BYTES;
+        self.const_work_failed = false;
         let Some(alloc) = self.static_initializer(&def) else {
             return;
         };
@@ -4916,6 +4957,8 @@ impl Converter {
         // on the constants visited before it.
         self.const_budget = MAX_CONST_TOTAL_ELEMS;
         self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+        self.const_work_budget = MAX_CONST_WORK_BYTES;
+        self.const_work_failed = false;
         self.clear_alloc_caches();
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
@@ -5039,7 +5082,11 @@ impl Converter {
     /// this decode tree has already materialised it, and is
     /// recorded there when it fits the cache's byte cap;
     /// anything else comes back as the bare `GlobalAlloc` for
-    /// the caller to match on.
+    /// the caller to match on. A materialisation is charged
+    /// against the materialisation-work budget (see
+    /// `MAX_CONST_WORK_BYTES`); when the charge does not fit,
+    /// the resolution is `Refused` and the decode that needed
+    /// it fails.
     /// Drop both backing-allocation caches and reset their shared
     /// byte accounting. Called wherever the constant-expansion
     /// budget resets (the root of every decoded constant), so cached
@@ -5054,7 +5101,12 @@ impl Converter {
     /// most once per root decode: `eval_initializer` materialises
     /// the whole allocation on every call, so resolving each element
     /// of a large table of references into one static through it
-    /// would copy the backing once per element.
+    /// would copy the backing once per element. Each evaluation is
+    /// charged against the materialisation-work budget (see
+    /// `MAX_CONST_WORK_BYTES`): an evaluation repeated because the
+    /// cache evicted the initialiser is not free, so alternating
+    /// references into statics that together exceed the cache cap
+    /// stay bounded in cumulative work.
     fn static_initializer(
         &mut self,
         def: &mir::mono::StaticDef,
@@ -5063,8 +5115,17 @@ impl Converter {
         if let Some(alloc) = self.static_inits.get(&key) {
             return Some(alloc.clone());
         }
+        // Once this root constant's materialisation work is
+        // over budget, further evaluations are refused without
+        // being performed (see `const_work_failed`).
+        if self.const_work_failed {
+            return None;
+        }
         let alloc = std::rc::Rc::new(def.eval_initializer().ok()?);
         let len = alloc.bytes.len();
+        if !self.spend_work_budget(len) {
+            return None;
+        }
         if self.alloc_cache_bytes + len > MAX_CACHED_ALLOC_BYTES {
             self.clear_alloc_caches();
         }
@@ -5080,10 +5141,19 @@ impl Converter {
         if let Some(alloc) = self.alloc_cache.get(&key) {
             return ResolvedAlloc::Memory(alloc.clone());
         }
+        // Once this root constant's materialisation work is
+        // over budget, further materialisations are refused
+        // without being performed (see `const_work_failed`).
+        if self.const_work_failed {
+            return ResolvedAlloc::Refused;
+        }
         match mir::alloc::GlobalAlloc::from(prov.0) {
             mir::alloc::GlobalAlloc::Memory(alloc) => {
-                let alloc = std::rc::Rc::new(alloc);
                 let size = alloc.bytes.len();
+                if !self.spend_work_budget(size) {
+                    return ResolvedAlloc::Refused;
+                }
+                let alloc = std::rc::Rc::new(alloc);
                 if size <= MAX_CACHED_ALLOC_BYTES {
                     if self.alloc_cache_bytes + size > MAX_CACHED_ALLOC_BYTES {
                         // The byte counter covers both caches, so
@@ -5109,6 +5179,7 @@ impl Converter {
         match self.resolve_alloc(prov) {
             ResolvedAlloc::Memory(alloc) => Some(alloc),
             ResolvedAlloc::Other(_) => None,
+            ResolvedAlloc::Refused => None,
         }
     }
 
@@ -5336,6 +5407,25 @@ impl Converter {
         true
     }
 
+    /// Charge `units` against the materialisation-work budget
+    /// (see `MAX_CONST_WORK_BYTES`); `false` when the charge
+    /// does not fit, in which case the materialisation that
+    /// prompted it is refused and the constant being decoded
+    /// stays undecoded. A failed charge also sets
+    /// `const_work_failed`, so a caller that would otherwise
+    /// fall back to a different decode can tell work exhaustion
+    /// apart from ordinary undecodability, and later
+    /// materialisations in the same decode tree are refused
+    /// without being performed at all.
+    fn spend_work_budget(&mut self, units: usize) -> bool {
+        if units > self.const_work_budget {
+            self.const_work_failed = true;
+            return false;
+        }
+        self.const_work_budget -= units;
+        true
+    }
+
     /// Whether every byte of `alloc` in `offset..offset + size`
     /// is uninitialised, spending one unit of the scan budget
     /// (see `MAX_CONST_SCAN_BYTES`) per byte examined. `None`
@@ -5411,6 +5501,8 @@ impl Converter {
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
             self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+            self.const_work_budget = MAX_CONST_WORK_BYTES;
+            self.const_work_failed = false;
             self.clear_alloc_caches();
         }
         if !self.spend_const_budget(1) {
@@ -6377,6 +6469,9 @@ impl Converter {
             // `resolve_alloc` returns memory allocations in
             // the `Memory` variant, never wrapped in `Other`.
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => None,
+            // The work budget refused the materialisation:
+            // the constant stays undecoded.
+            ResolvedAlloc::Refused => None,
         }
     }
 
@@ -6603,6 +6698,8 @@ impl Converter {
         if depth == 0 {
             self.const_budget = MAX_CONST_TOTAL_ELEMS;
             self.const_scan_budget = MAX_CONST_SCAN_BYTES;
+            self.const_work_budget = MAX_CONST_WORK_BYTES;
+            self.const_work_failed = false;
             self.clear_alloc_caches();
         }
         // A pointee type passing through a coroutine-closure
@@ -6712,6 +6809,11 @@ impl Converter {
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::Memory(_)) => {
                 return None;
             }
+            // The work budget refused the materialisation:
+            // the constant stays undecoded.
+            ResolvedAlloc::Refused => {
+                return None;
+            }
         };
         match inner.kind() {
             TyKind::RigidTy(RigidTy::Str) => {
@@ -6789,7 +6891,10 @@ impl Converter {
                     // A block that cannot be built because the
                     // expansion budget -- or the scan budget,
                     // whose exhaustion can equally deny a decode
-                    // its `Uninit` shortcut -- ran out must not fall
+                    // its `Uninit` shortcut, or the work budget,
+                    // whose exhaustion can equally refuse a
+                    // backing allocation the decode needs -- ran
+                    // out must not fall
                     // back to the declared type's decode below:
                     // that decode names the zero-sized declared
                     // type, so the constant would hold a
@@ -6803,12 +6908,14 @@ impl Converter {
                     // decode, as before.
                     self.const_budget_failed = false;
                     self.const_scan_failed = false;
+                    self.const_work_failed = false;
                     if let Some(block) =
                         self.decode_erased_alloc(&target, target_off, depth + 1)
                     {
                         return Some(sm::ConstValue::Ref(Box::new(block)));
                     }
-                    if self.const_budget_failed || self.const_scan_failed {
+                    if self.const_budget_failed || self.const_scan_failed || self.const_work_failed
+                    {
                         return None;
                     }
                 }
@@ -6816,8 +6923,10 @@ impl Converter {
                     // A static seed that cannot be built because the
                     // expansion budget -- or the scan budget,
                     // whose exhaustion can equally deny the seed
-                    // decode its `Uninit` shortcut -- ran out must
-                    // not fall back to
+                    // decode its `Uninit` shortcut, or the work
+                    // budget, whose exhaustion can equally refuse
+                    // a backing allocation the decode needs -- ran
+                    // out must not fall back to
                     // the snapshot decode below: the snapshot names
                     // only the pointee's current value, so the
                     // pointer loses the static's identity -- a
@@ -6829,12 +6938,14 @@ impl Converter {
                     // projection keeps the snapshot, as before.
                     self.const_budget_failed = false;
                     self.const_scan_failed = false;
+                    self.const_work_failed = false;
                     if let Some(c) =
                         self.decode_static_ref(def, inner, &target, target_off, depth)
                     {
                         return Some(c);
                     }
-                    if self.const_budget_failed || self.const_scan_failed {
+                    if self.const_budget_failed || self.const_scan_failed || self.const_work_failed
+                    {
                         return None;
                     }
                 }
@@ -8874,6 +8985,32 @@ const MAX_CONST_TOTAL_ELEMS: usize = 1 << 20;
 /// examinations bounds that repetition to seconds while
 /// leaving single values of any realistic size untouched.
 const MAX_CONST_SCAN_BYTES: usize = 1 << 30;
+
+/// Work budget for backing-allocation materialisation while
+/// decoding one root constant (see
+/// `Converter::spend_work_budget`): bytes of allocation the
+/// converter may materialise -- through `eval_initializer`
+/// for statics, through the provenance resolution for memory
+/// allocations -- summed over the whole decode, however often
+/// an allocation is re-materialised. The allocation caches
+/// bound what is *retained* at any one time, but retention is
+/// not work: two statics of 129 MiB each, referenced
+/// alternately by one table of one-byte slices, together
+/// exceed the 256 MiB cache cap, so every element evicts the
+/// other static's initialiser and re-materialises it in full
+/// -- a 5,000-element table copies over 600 GiB while
+/// spending only a few thousand expansion-budget units.
+/// Charging each materialisation at its byte size bounds the
+/// cumulative work instead: cache hits are free, a single
+/// large backing is paid for once, and only
+/// re-materialisation spends again. Four gibibytes leaves the
+/// largest measured legitimate shape -- a 21-element table
+/// alternating ten 128 MiB statics and two 100 MiB promoted
+/// arrays, about 2.4 GiB of cumulative materialisation under
+/// the same eviction pattern -- comfortably inside, while a
+/// thrashing root constant stays undecoded after about
+/// thirty re-materialisations instead of five thousand.
+const MAX_CONST_WORK_BYTES: usize = 1 << 32;
 
 /// Cap on the total bytes held in the converter's per-constant
 /// allocation cache (see `Converter::alloc_cache`).
