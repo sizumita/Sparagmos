@@ -21,6 +21,7 @@ pub(crate) fn execute(
     input: &str,
     guest_args: &[String],
     overflow_checks: bool,
+    panic_abort: bool,
     tool_programs: &[String],
     guest_stderr_file: Option<&str>,
     guest_stdout_passthrough: bool,
@@ -105,6 +106,7 @@ pub(crate) fn execute(
         guest_args: guest_args.to_vec(),
         program_path: program_name.to_string(),
         overflow_checks,
+        panic_abort,
         // Real child processes in any run that named no
         // tool programs: a recipe's invocations are the
         // tool runner's to answer, and its runs configure
@@ -196,22 +198,7 @@ pub(crate) fn execute(
             let _ = err.flush();
         }
     }
-    // Lines this entry point renders onto the guest's stderr
-    // itself (the panic and abort reports below): they are
-    // part of the guest's stream, so with a separate guest
-    // stderr channel they join it there, after the output
-    // already relayed, instead of this process's stderr.
-    let guest_report_line = |line: &str| {
-        use std::io::Write as _;
-        if let Some(path) = guest_stderr_file {
-            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-                if writeln!(file, "{line}").is_ok() {
-                    return;
-                }
-            }
-        }
-        eprintln!("{line}");
-    };
+
     let exit_code = match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(ref value) if entry_returns_exit_code(c, entry_index) => {
@@ -289,24 +276,28 @@ pub(crate) fn execute(
             code
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Panic {
-            message,
             ..
         })) => {
-            guest_report_line(&format!("thread 'main' panicked: {message}"));
+            // The guest's panic report (std's default hook
+            // output) is already in the captured stderr: the
+            // interpreter prints it when the panic is raised.
+            // Only the exit code remains to apply.
             101
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Abort {
-            message,
+            ..
         })) => {
-            // A panic that escaped a cleanup (a native double
-            // panic aborts the process): the guest crashed. The
-            // abort reason goes to the guest's stderr, a marker
-            // on the driver's own stderr names the outcome, and
-            // the exit code is the crash code (128 + SIGABRT)
+            // The guest crashed (a native double panic aborts
+            // the process): whatever the abort printed — the
+            // panic report and the runtime's abort lines — is
+            // already in the captured stderr, printed by the
+            // interpreter at the abort point. A marker on the
+            // driver's own stderr names the outcome (a parent
+            // reconstructing this run reads the crash from it),
+            // and the exit code is the crash code (128 + SIGABRT)
             // the native process's death carries, so a crash
             // stays distinct from a guest panic that unwound to
             // the top of the run (101).
-            guest_report_line(&format!("thread 'main' aborted: {message}"));
             eprintln!("sparagmos-driver run: guest crashed: abort");
             134
         }
@@ -388,6 +379,7 @@ pub(crate) fn execute_debug(
     input: &str,
     guest_args: &[String],
     overflow_checks: bool,
+    panic_abort: bool,
     script_path: Option<&str>,
     dialect_name: &str,
     hide_locals: bool,
@@ -429,6 +421,7 @@ pub(crate) fn execute_debug(
         guest_args: guest_args.to_vec(),
         program_path: input.to_string(),
         overflow_checks,
+        panic_abort,
         ..sparagmos_interp::InterpConfig::default()
     };
     let mut session = match sparagmos_interp::debug_mir(

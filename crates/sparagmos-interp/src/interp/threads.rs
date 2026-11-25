@@ -203,6 +203,12 @@ impl<'a> Interpreter<'a> {
         };
         let previous = self.current_thread.get();
         self.current_thread.set(id);
+        // The thread's own stack starts here: the frames below
+        // belong to the thread that spawned this one (threads
+        // run cooperatively on one stack), and a rendered
+        // backtrace for this thread's panics stops at the base.
+        let saved_stack_base = self.thread_stack_base.get();
+        self.thread_stack_base.set(frames.len());
         let previous_segment = self.segment.replace(SegmentMark {
             depth: self.drive_depth + 1,
             thread: id,
@@ -227,6 +233,7 @@ impl<'a> Interpreter<'a> {
             let parked_frames = frames.split_off(base);
             let below = Self::referenced_below_frames(&parked_frames, frames);
             self.current_thread.set(previous);
+            self.thread_stack_base.set(saved_stack_base);
             if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
                 slot.parked = Some(ParkedThread {
                     frames: parked_frames,
@@ -247,15 +254,30 @@ impl<'a> Interpreter<'a> {
         let result = match &result {
             Ok(_) | Err(InterpError::Panic { .. }) => match self.run_tls_dtors(frames, id) {
                 Ok(()) => result,
+                Err(InterpError::Panic { .. }) => {
+                    // A panic in a thread-local destructor: the
+                    // destructor's own report has been printed;
+                    // std follows it with the fatal line and
+                    // aborts the process — the panic does not
+                    // become the thread's join outcome.
+                    self.push_error_output(
+                        "fatal runtime error: thread local panicked on drop, aborting\n",
+                    );
+                    Err(InterpError::Abort {
+                        message: "thread local panicked on drop".to_string(),
+                    })
+                }
                 Err(e) => Err(e),
             },
             Err(_) => result,
         };
         self.current_thread.set(previous);
+        self.thread_stack_base.set(saved_stack_base);
         let outcome = match result {
             Ok(value) => Ok(value),
             Err(InterpError::Panic { message, payload }) => {
                 self.hook_fired_depth = None;
+                self.note_panic_finished(id);
                 Err(payload.unwrap_or_else(|| PanicPayload {
                     ty: "&str".to_string(),
                     value: Box::new(Value::Str(message)),

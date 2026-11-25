@@ -625,11 +625,13 @@ pub enum Builtin {
     /// `std::panic::set_hook(hook)`: install the panic hook.
     PanicSetHook,
     /// `std::panic::set_backtrace_style(style)`: record the
-    /// backtrace style the guest configured. No converted
-    /// reader exists (std reads it inside its own unconverted
-    /// backtrace machinery), so recording it is observationally
-    /// exact.
+    /// backtrace style the guest configured; the default panic
+    /// report's style resolution reads it (see
+    /// `Interpreter::report_backtrace`).
     PanicSetBacktraceStyle,
+    /// `std::panic::always_abort()`: from now on every panic
+    /// aborts without the hook running.
+    PanicAlwaysAbort,
     /// `std::panic::take_hook()`: take the panic hook, leaving
     /// the default in its place.
     PanicTakeHook,

@@ -3351,6 +3351,164 @@ impl<'a> Interpreter<'a> {
 }
 
 #[cfg(test)]
+mod panic_report_tests {
+    use super::*;
+
+    fn location_stamp(file: &str, line: u128, col: u128) -> Value {
+        Value::Ref(RefTarget::value(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Str(file.to_string()),
+                Value::Uint(line),
+                Value::Uint(col),
+            ],
+        }))
+    }
+
+    fn report_frame(func: &str) -> Frame {
+        Frame {
+            id: 1,
+            func: func.to_string(),
+            locals: Vec::new(),
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
+            call_once_env_drop: None,
+            incoming_asm: None,
+        }
+    }
+
+    /// Note one `&str`-payload panic at `guest.rs:3:7` on the
+    /// interpreter, as its entry point would.
+    fn note_str_panic(interp: &Interpreter) {
+        interp.note_panic_stamp(location_stamp("guest.rs", 3, 7));
+        interp.note_panic_origin(PanicOrigin::PanicFn);
+        interp.note_panic_no_backtrace(false);
+    }
+
+    /// The default report for an uncaught panic: the head with
+    /// the thread's name and id and the panic's location, the
+    /// message, and the backtrace note (the style is Off).
+    #[test]
+    fn default_report_prints_head_message_and_note() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        // `BacktraceStyle::Off` (variant 2 in std's order).
+        interp.set_backtrace_style(Value::Enum {
+            variant: 2,
+            fields: Vec::new(),
+        });
+        note_str_panic(&interp);
+        let mut frames = Vec::new();
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        assert_eq!(
+            interp.error_output(),
+            "\nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n\
+             note: run with `RUST_BACKTRACE=1` environment variable \
+             to display a backtrace\n"
+        );
+    }
+
+    /// The note is once per process (std's FIRST_PANIC): a
+    /// second Off-style report in the same run omits it.
+    #[test]
+    fn default_report_note_prints_once() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        interp.set_backtrace_style(Value::Enum {
+            variant: 2,
+            fields: Vec::new(),
+        });
+        let mut frames = Vec::new();
+        note_str_panic(&interp);
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        interp.note_panic_consumed();
+        note_str_panic(&interp);
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        assert_eq!(
+            interp.error_output(),
+            "\nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n\
+             note: run with `RUST_BACKTRACE=1` environment variable \
+             to display a backtrace\n\
+             \nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n"
+        );
+    }
+
+    /// A second panic while the first is still in flight (a
+    /// destructor panicking during cleanup) forces the full
+    /// backtrace shape even when the configured style is Short.
+    #[test]
+    fn second_in_flight_panic_forces_full_backtrace() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        // `BacktraceStyle::Short` (variant 0 in std's order).
+        interp.set_backtrace_style(Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        });
+        let mut frames = vec![report_frame("guest::main"), report_frame("guest::main")];
+        note_str_panic(&interp);
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        let first = interp.error_output().to_string();
+        assert!(first.contains("   0: __rustc::rust_begin_unwind\n"), "{first}");
+        assert!(first.contains("note: Some details are omitted"), "{first}");
+        // No consumption: the first panic is still in flight
+        // when the second fires (at the same stack depth, as a
+        // cleanup panic fires below its raise point).
+        note_str_panic(&interp);
+        interp.fire_panic_hook(&mut frames, 2, "boom again", &None);
+        let second = &interp.error_output()[first.len()..];
+        assert!(
+            second.contains("   0:     0x555555554000 - __rustc::rust_begin_unwind\n"),
+            "{second}"
+        );
+        assert!(!second.contains("note: Some details are omitted"), "{second}");
+    }
+
+    /// A panic raised while the hook runs prints the
+    /// processing-panic sequence — the second panic's location
+    /// and (for a static `&str` payload) its message, then the
+    /// abort line — and marks the run for abort.
+    #[test]
+    fn panic_inside_hook_prints_processing_sequence() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        interp.set_in_panic_hook(true);
+        note_str_panic(&interp);
+        let payload = Some(PanicPayload {
+            ty: "&str".to_string(),
+            value: Box::new(Value::Str("hook boom".to_string())),
+        });
+        let mut frames = Vec::new();
+        interp.fire_panic_hook(&mut frames, 0, "hook boom", &payload);
+        assert_eq!(
+            interp.error_output(),
+            "panicked at guest.rs:3:7:\nhook boom\n\
+             thread panicked while processing panic. aborting.\n"
+        );
+        assert!(interp.hook_abort.get());
+    }
+
+    /// While an enclosing model produces the reports itself
+    /// (the libtest harness model), the general printing is
+    /// suppressed.
+    #[test]
+    fn suppressed_report_prints_nothing() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        interp.set_panic_report_suppressed(true);
+        note_str_panic(&interp);
+        let mut frames = Vec::new();
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        assert_eq!(interp.error_output(), "");
+    }
+}
+
+
+#[cfg(test)]
 mod ptr_equality_tests {
     use super::*;
 

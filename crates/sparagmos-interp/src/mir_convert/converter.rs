@@ -615,11 +615,12 @@ impl<'a> Converter<'a> {
                 statements: b
                     .statements
                     .iter()
-                    .map(|s| ir::SourceLine { file: s.file, line: s.line })
+                    .map(|s| ir::SourceLine { file: s.file, line: s.line, col: s.col })
                     .collect(),
                 terminator: ir::SourceLine {
                     file: b.terminator.file,
                     line: b.terminator.line,
+                    col: b.terminator.col,
                 },
             })
             .collect();

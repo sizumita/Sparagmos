@@ -148,6 +148,15 @@ pub struct InterpConfig {
     /// wrap either way, exactly as in MIR. Defaults to `true`
     /// (the debug-profile default).
     pub overflow_checks: bool,
+    /// The session's panic strategy, as the driver resolved it
+    /// from the compilation's flags: `true` when the guest was
+    /// compiled with `-C panic=abort`. Under the abort strategy
+    /// a panic prints its report and the run aborts at the
+    /// panic site: nothing unwinds, so the nounwind-boundary
+    /// sequence (a `panic_cannot_unwind` report and the
+    /// non-unwinding line) never appears. Defaults to `false`
+    /// (the unwind strategy).
+    pub panic_abort: bool,
     /// Tool interception for this run (see [`ToolInterception`]);
     /// `None` keeps the process model's standing behaviour, under
     /// which no child process ever starts.
@@ -179,11 +188,73 @@ impl Default for InterpConfig {
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
+            panic_abort: false,
             tool_interception: None,
             process_host: None,
             stdout_sink: None,
         }
     }
+}
+
+/// The panic entry path a freshly raised panic arrived by: it
+/// decides the panic-machinery frames a rendered backtrace
+/// starts with, which differ by entry in std's own traces (a
+/// literal `panic!` reaches `begin_panic::<&str>` through
+/// `panic_display`, a formatted one goes through `panic_fmt`).
+/// Recorded by the panic entry points alongside the
+/// caller-location stamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PanicOrigin {
+    /// `core::panicking::panic` with a `&str` payload (a
+    /// literal `panic!`, `todo!`, an explicit `panic("...")`):
+    /// the payload's capture sits in std's `begin_panic::<&str>`,
+    /// which heads the trace alone.
+    PanicFn,
+    /// A formatted `panic_fmt` / `panic_nounwind_fmt`: the
+    /// trace heads with `__rustc::rust_begin_unwind` and
+    /// `core::panicking::panic_fmt`.
+    PanicFmt,
+    /// `panic_any::<T>`: the trace heads with
+    /// `std::panicking::begin_panic::<T>` and
+    /// `std::panic::panic_any::<T>`.
+    BeginPanic(String),
+    PanicAny(String),
+    /// `core::option::expect_failed`: the trace heads with
+    /// `__rustc::rust_begin_unwind`, `core::panicking::panic_fmt`,
+    /// `core::panicking::panic_display::<&str>` and itself.
+    ExpectFailed,
+    /// `core::option::unwrap_failed`: the trace heads with
+    /// `__rustc::rust_begin_unwind`, `core::panicking::panic_fmt`,
+    /// `core::panicking::panic` and itself.
+    OptionUnwrap,
+    /// `core::result::unwrap_failed`: the trace heads with
+    /// `__rustc::rust_begin_unwind`, `core::panicking::panic_fmt`
+    /// and itself.
+    ResultUnwrap,
+    /// `assert_failed`: the trace heads with
+    /// `__rustc::rust_begin_unwind`, `core::panicking::panic_fmt`,
+    /// `core::panicking::assert_failed_inner` and the
+    /// `assert_failed::<T, U>` frame named here (empty when the
+    /// call's generic arguments are unknown).
+    AssertFailed(String),
+    /// An `Assert` terminator (a bounds check, an arithmetic
+    /// overflow, a misalignment check): the trace heads with
+    /// `__rustc::rust_begin_unwind`, `core::panicking::panic_fmt`
+    /// and the check's own entry, named here.
+    Assert(&'static str),
+}
+
+/// A resolved backtrace style for one panic report, mirroring
+/// std's `BacktraceStyle` plus the force-no-backtrace case,
+/// which prints neither a trace nor the note.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportBacktrace {
+    /// Force-no-backtrace: nothing follows the report head.
+    None,
+    /// No trace; the once-per-process note may follow.
+    Off,
+    Short,
+    Full,
 }
 
 /// One call frame: a function's locals plus where to resume.
@@ -410,10 +481,9 @@ pub struct Interpreter<'a> {
     pending_asm_outgoing: Option<([u64; 48], [bool; 48])>,
     /// The guest's panic hook, installed by `std::panic::set_hook`
     /// (the boxed `dyn Fn` value as the guest handed it over);
-    /// `None` is the default hook, which this runtime does not
-    /// call (its observable output is the driver's own panic
-    /// report). Interior-mutable: most execution paths hold only
-    /// `&self`.
+    /// `None` is the default hook, whose report
+    /// [`Interpreter::fire_panic_hook`] prints itself.
+    /// Interior-mutable: most execution paths hold only `&self`.
     panic_hook: std::cell::RefCell<Option<Value>>,
     /// The backtrace style installed by
     /// `std::panic::set_backtrace_style`; recorded for the
@@ -439,6 +509,44 @@ pub struct Interpreter<'a> {
     /// continues in the caller) from a fresh panic raised directly
     /// in a cleanup frame (which aborts).
     resume_signaled: bool,
+    /// The panics currently in flight on each thread (raised and
+    /// not yet consumed: caught, turned into a thread outcome,
+    /// or taken by the libtest harness model), keyed by thread
+    /// id. std's per-thread panic count: a panic raised while
+    /// another is in flight on the same thread forces a full
+    /// backtrace in its report.
+    panics_in_flight: std::cell::RefCell<HashMap<u64, usize>>,
+    /// Whether the process's first Off-style panic report has
+    /// printed the `RUST_BACKTRACE=1` note (std's FIRST_PANIC):
+    /// spent only by a report that prints the note.
+    panic_note_spent: std::cell::Cell<bool>,
+    /// Whether the default panic reports are suppressed because
+    /// an enclosing model produces them itself: the libtest
+    /// harness model sets this while it runs tests, since it
+    /// synthesizes the captured reports (see
+    /// `set_panic_report_suppressed`).
+    panic_report_suppressed: std::cell::Cell<bool>,
+    /// Whether `std::panic::always_abort` has run: every later
+    /// panic aborts without the hook running.
+    always_abort: std::cell::Cell<bool>,
+    /// Set when a panic raised inside the panic hook has printed
+    /// the processing-panic abort lines: the unwinder turns the
+    /// in-flight panic into an abort when it sees this (see
+    /// [`Interpreter::fire_panic_hook`]).
+    hook_abort: std::cell::Cell<bool>,
+    /// Whether the panic currently being raised forbids a
+    /// backtrace (`panic_nounwind_fmt`'s flag): recorded by the
+    /// entry point alongside the location stamp.
+    last_panic_no_backtrace: std::cell::Cell<bool>,
+    /// The entry path of the panic currently being raised (see
+    /// [`PanicOrigin`]).
+    last_panic_origin: std::cell::RefCell<Option<PanicOrigin>>,
+    /// The frame-stack index the current thread's own stack
+    /// starts at: frames below it belong to the thread that
+    /// spawned this one (threads run cooperatively on one
+    /// stack), so a rendered backtrace stops there. Set by
+    /// `run_thread`; the entry thread's base is 0.
+    thread_stack_base: std::cell::Cell<usize>,
     /// The debugger session's control state, when this run is
     /// driven by the debugger interface ([`crate::debug`]): the
     /// drive loop consults it at every source-line change. `None`
@@ -766,6 +874,14 @@ impl<'a> Interpreter<'a> {
             last_panic_stamp: std::cell::RefCell::new(None),
             in_panic_hook: false,
             hook_fired_depth: None,
+            panics_in_flight: std::cell::RefCell::new(HashMap::new()),
+            panic_note_spent: std::cell::Cell::new(false),
+            panic_report_suppressed: std::cell::Cell::new(false),
+            always_abort: std::cell::Cell::new(false),
+            hook_abort: std::cell::Cell::new(false),
+            last_panic_no_backtrace: std::cell::Cell::new(false),
+            last_panic_origin: std::cell::RefCell::new(None),
+            thread_stack_base: std::cell::Cell::new(0),
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),

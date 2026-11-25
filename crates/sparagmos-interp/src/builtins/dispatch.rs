@@ -10,7 +10,7 @@ use crate::interp::{
     float_to_uint, rc_handle_id,
     round_to_f16, synthetic_address,
     FmtBuilderKind, FmtBuilderState,
-    Frame, Interpreter, Resolved,
+    Frame, Interpreter, PanicOrigin, Resolved,
 };
 use crate::ir::{Body, Operand, Ty};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -64,7 +64,7 @@ impl<'a> Interpreter<'a> {
             // as the panic builtins do with theirs.
             if vals.len() == 3 {
                 let stamp = vals.pop().expect("three values checked");
-                self.note_panic_stamp(stamp);
+                self.note_forwarded_panic_stamp(frames, stamp);
             }
             let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
             return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
@@ -115,7 +115,28 @@ impl<'a> Interpreter<'a> {
         ) && vals.len() == 2
         {
             let stamp = vals.pop().expect("two arguments");
-            self.note_panic_stamp(stamp);
+            self.note_forwarded_panic_stamp(frames, stamp);
+        }
+        if matches!(kind, Builtin::PanicNounwindFmt) && vals.len() == 3 {
+            let stamp = vals.pop().expect("three arguments");
+            self.note_forwarded_panic_stamp(frames, stamp);
+        }
+        // The modelled `#[track_caller]` operations receive
+        // the caller-location stamp as one trailing argument
+        // past their declared arity (see
+        // `consumes_caller_location`): record it, so a panic
+        // they raise reports the baked location.
+        if (matches!(kind, Builtin::OptionUnwrap | Builtin::ResultUnwrap)
+            && vals.len() == 2)
+            || (matches!(kind, Builtin::IndexIndex | Builtin::IndexMut)
+                && vals.len() == 3)
+        {
+            let stamp = vals.pop().expect("the caller-location stamp");
+            self.note_forwarded_panic_stamp(frames, stamp);
+        }
+        if matches!(kind, Builtin::AssertFailed) && vals.len() == 5 {
+            let stamp = vals.pop().expect("five arguments");
+            self.note_forwarded_panic_stamp(frames, stamp);
         }
         self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue)
     }
@@ -1340,6 +1361,13 @@ impl<'a> Interpreter<'a> {
                         if selected.len() == 1 { "test" } else { "tests" }
                     ));
                 }
+                // The harness model synthesizes the panic
+                // reports in its captured sections itself, so
+                // the general default-report printing is
+                // suppressed while the tests run: a test's panic
+                // must not also print straight to the guest's
+                // stderr.
+                self.set_panic_report_suppressed(true);
                 for test in selected {
                     let annotation = match test.should_panic {
                         ShouldPanic::No => "",
@@ -1742,6 +1770,7 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                self.set_panic_report_suppressed(false);
                 if opts.json {
                     let event = if failed == 0 { "ok" } else { "failed" };
                     self.push_output(&format!(
@@ -1796,6 +1825,11 @@ impl<'a> Interpreter<'a> {
             Builtin::PanicSetBacktraceStyle => {
                 arity(1)?;
                 self.set_backtrace_style(vals.into_iter().next().expect("one argument"));
+                Ok(Value::Unit)
+            }
+            Builtin::PanicAlwaysAbort => {
+                arity(0)?;
+                self.note_always_abort();
                 Ok(Value::Unit)
             }
             Builtin::PanicTakeHook => {
@@ -5118,6 +5152,15 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PanicStr => {
                 arity(1)?;
+                // `expect_failed` is the one `&str`-message
+                // entry whose trace does not head with
+                // `begin_panic::<&str>` (see the origin's doc).
+                if name.ends_with("expect_failed") {
+                    self.note_panic_origin(PanicOrigin::ExpectFailed);
+                } else {
+                    self.note_panic_origin(PanicOrigin::PanicFn);
+                }
+                self.note_panic_no_backtrace(false);
                 // `core::panicking::panic` takes the message as a
                 // string; formatted-panic shapes hand over a built
                 // `fmt::Arguments` instead. The payload mirrors
@@ -5128,11 +5171,8 @@ impl<'a> Interpreter<'a> {
                         Err(InterpError::panic_str_payload(text.clone()))
                     }
                     Value::FmtArguments(_) => {
-                        let message = self.format_arguments(
-                            frames,
-                            &self.coerce_arguments(frames, &vals[0], name)?,
-                            0,
-                        )?;
+                        let args = self.coerce_arguments(frames, &vals[0], name)?;
+                        let message = self.format_panic_message(frames, &args)?;
                         Err(InterpError::panic_string_payload(message))
                     }
                     _ => {
@@ -5143,20 +5183,37 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PanicFmt => {
                 arity(1)?;
-                // A verbatim `Arguments` (a literal message) is a
-                // `&str` payload; a formatted one is a `String`.
+                self.note_panic_origin(PanicOrigin::PanicFmt);
+                self.note_panic_no_backtrace(false);
+                // The payload mirrors std's creation: a
+                // verbatim `Arguments` (a literal-only panic,
+                // whose `as_str` is the message itself) becomes
+                // a `&str` payload; a formatted panic's payload
+                // is the `String` its formatting produced. A
+                // hook or a catch downcasting the payload
+                // observes exactly that split natively.
                 match self.coerce_arguments(frames, &vals[0], name)? {
                     FmtArguments::Plain(text) => {
                         Err(InterpError::panic_str_payload(text))
                     }
                     args => {
-                        let message = self.format_arguments(frames, &args, 0)?;
+                        let message = self.format_panic_message(frames, &args)?;
                         Err(InterpError::panic_string_payload(message))
                     }
                 }
             }
             Builtin::AssertFailed => {
                 arity(4)?;
+                let frame = if generic_args.len() >= 2 {
+                    format!(
+                        "core::panicking::assert_failed::<{}, {}>",
+                        generic_args[0], generic_args[1]
+                    )
+                } else {
+                    String::new()
+                };
+                self.note_panic_origin(PanicOrigin::AssertFailed(frame));
+                self.note_panic_no_backtrace(false);
                 // (kind, &left, &right, Option<fmt::Arguments>): the
                 // message mirrors core's: the comparison, the custom
                 // message when one was given, and both operands.
@@ -5191,10 +5248,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PanicNounwindFmt => {
                 // `panic_nounwind_fmt(args, force_no_backtrace)`:
-                // the flag only controls backtrace capture in the
-                // native runtime, which no guest program can
-                // observe; the panic carries the formatted message,
-                // exactly as `panic_fmt`'s does.
+                // the flag is the panic's force-no-backtrace
+                // (std's `panic_in_cleanup` path passes `true`),
+                // which the default report honours; the panic
+                // carries the formatted message, exactly as
+                // `panic_fmt`'s does.
                 if vals.is_empty() || vals.len() > 2 {
                     return Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -5202,24 +5260,31 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
+                self.note_panic_origin(PanicOrigin::PanicFmt);
+                let force_no_backtrace = matches!(vals.get(1), Some(Value::Bool(true)));
+                self.note_panic_no_backtrace(force_no_backtrace);
                 match self.coerce_arguments(frames, &vals[0], name)? {
                     FmtArguments::Plain(text) => {
                         Err(InterpError::panic_str_payload(text))
                     }
                     args => {
-                        let message = self.format_arguments(frames, &args, 0)?;
+                        let message = self.format_panic_message(frames, &args)?;
                         Err(InterpError::panic_string_payload(message))
                     }
                 }
             }
             Builtin::OptionUnwrapFailed => {
                 arity(0)?;
+                self.note_panic_origin(PanicOrigin::OptionUnwrap);
+                self.note_panic_no_backtrace(false);
                 Err(InterpError::panic_str_payload(
                     "called `Option::unwrap()` on a `None` value",
                 ))
             }
             Builtin::ResultUnwrapFailed => {
                 arity(2)?;
+                self.note_panic_origin(PanicOrigin::ResultUnwrap);
+                self.note_panic_no_backtrace(false);
                 // `unwrap_failed(msg, error: &dyn Debug)` panics
                 // with "{msg}: {error:?}"; the Debug rendering is
                 // the fmt engine's, the same one `panic!` uses.
@@ -5379,6 +5444,16 @@ impl<'a> Interpreter<'a> {
             Builtin::PanicAny => {
                 arity(1)?;
                 let ty = generic_args.first().cloned().unwrap_or_default();
+                // This kind serves `std::panic::panic_any` and
+                // the `begin_panic` entry points alike; only an
+                // explicit `panic_any` call shows a `panic_any`
+                // frame under `begin_panic` in a native trace.
+                if name == "std::panic::panic_any" {
+                    self.note_panic_origin(PanicOrigin::PanicAny(ty.clone()));
+                } else {
+                    self.note_panic_origin(PanicOrigin::BeginPanic(ty.clone()));
+                }
+                self.note_panic_no_backtrace(false);
                 let value = vals.into_iter().next().expect("arity checked");
                 // The message the default hook reports for the
                 // payload: a string payload reports as itself,
@@ -5401,6 +5476,29 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ResumeUnwind => {
                 arity(1)?;
+                // std's `resume_unwind` runs the same
+                // must-abort checks as a fresh panic, in the
+                // same order (the always-abort flag first, then
+                // the in-hook state), each with its own line.
+                if self.always_abort() {
+                    self.push_error_output("aborting due to panic\n");
+                    return Err(InterpError::Abort {
+                        message:
+                            "`resume_unwind` after `panic::always_abort`: the run aborts"
+                                .to_string(),
+                    });
+                }
+                if self.in_panic_hook() {
+                    self.push_error_output(
+                        "thread panicked while processing panic. aborting.\n",
+                    );
+                    return Err(InterpError::Abort {
+                        message:
+                            "`resume_unwind` while the panic hook was running: \
+                             the run aborts"
+                                .to_string(),
+                    });
+                }
                 // A resumed panic is not a new panic: the hook
                 // (already fired at the original raise) must not
                 // fire again, which the unwinder's resumed flag
@@ -6824,9 +6922,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let (elems, len) = self.slice_elements_ref(frames, &vals[0])?;
                 if idx as u128 >= len {
-                return Err(InterpError::panic(format!(
-                        "index out of bounds: the len is {len} but the index is {idx}"
-                    )));
+                return Err(self.bounds_check_panic(frames, len as u128, idx as u128));
                 }
                 // A receiver with no live place behind it (a
                 // constant aggregate, a detached value): reads
@@ -6889,9 +6985,7 @@ impl<'a> Interpreter<'a> {
                             })?,
                         };
                         if idx as u128 >= len {
-                return Err(InterpError::panic(format!(
-                                "index out of bounds: the len is {len} but the index is {idx}"
-                            )));
+                return Err(self.bounds_check_panic(frames, len as u128, idx as u128));
                         }
                         // An element-entry suffix (see
                         // `element_entry_suffix`): the element is
@@ -6956,9 +7050,7 @@ impl<'a> Interpreter<'a> {
                             )
                         })?;
                         if idx as u128 >= len {
-                return Err(InterpError::panic(format!(
-                                "index out of bounds: the len is {len} but the index is {idx}"
-                            )));
+                return Err(self.bounds_check_panic(frames, len as u128, idx as u128));
                         }
                         if fat_len.map_or(false, |len| {
                             self.entry_suffix_denotes_elements(frames, &target, len)
@@ -7000,9 +7092,7 @@ impl<'a> Interpreter<'a> {
                             )
                         })?;
                         if idx as u128 >= len {
-                return Err(InterpError::panic(format!(
-                                "index out of bounds: the len is {len} but the index is {idx}"
-                            )));
+                return Err(self.bounds_check_panic(frames, len as u128, idx as u128));
                         }
                         if fat_len.map_or(false, |len| {
                             self.entry_suffix_denotes_elements(frames, &target, len)
@@ -7331,9 +7421,19 @@ impl<'a> Interpreter<'a> {
                     Value::Enum { variant: 1, fields } if fields.len() == 1 => {
                         Ok(fields.into_iter().next().expect("len checked"))
                     }
-                    Value::Enum { variant: 0, .. } => Err(InterpError::panic(
-                        "called `Option::unwrap()` on a `None` value",
-                    )),
+                    Value::Enum { variant: 0, .. } => {
+                        // The modelled operation raises the
+                        // panic `unwrap_failed` raises natively:
+                        // its location is the caller-location
+                        // stamp the call carried (noted in
+                        // `exec_builtin`), its entry path
+                        // `unwrap_failed`'s.
+                        self.note_panic_origin(PanicOrigin::OptionUnwrap);
+                        self.note_panic_no_backtrace(false);
+                        Err(InterpError::panic_str_payload(
+                            "called `Option::unwrap()` on a `None` value",
+                        ))
+                    }
                     ref other => Err(InterpError::type_mismatch(
                         "Option::unwrap",
                         "Option value",
@@ -7352,7 +7452,12 @@ impl<'a> Interpreter<'a> {
                             .into_iter()
                             .next()
                             .unwrap_or(Value::Unit);
-                        Err(InterpError::panic(format!(
+                        // As for `Option::unwrap` above: the
+                        // panic is `unwrap_failed`'s, located by
+                        // the stamp the call carried.
+                        self.note_panic_origin(PanicOrigin::ResultUnwrap);
+                        self.note_panic_no_backtrace(false);
+                        Err(InterpError::panic_string_payload(format!(
                             "called `Result::unwrap()` on an `Err` value: {err}"
                         )))
                     }

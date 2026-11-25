@@ -11,7 +11,7 @@ use sparagmos_interp::{
 const SOURCE: &str = "fn main() {\n    let x = 40 + 2;\n    zzz();\n}\n";
 
 fn line(n: u32) -> SourceLine {
-    SourceLine { file: 0, line: n }
+    SourceLine { file: 0, line: n, col: 0 }
 }
 
 /// fn main() { let x = 40 + 2; zzz(); }

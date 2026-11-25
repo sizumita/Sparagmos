@@ -1238,7 +1238,7 @@ fn run_mode_unwind_drop_panics_aborts_uncaught_by_catch_unwind() {
         "only the first unwind drop runs before the abort; stderr={stderr}"
     );
     assert!(
-        stderr.contains("aborted"),
+        stderr.contains("aborting"),
         "the abort must be named on stderr; stderr={stderr}"
     );
 }
@@ -1725,14 +1725,22 @@ fn run_mode_termination_report_unwind_drop_and_streaming() {
     assert_eq!(out.status.code(), Some(7), "drop exits during unwind cleanup");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: dropped\n"
+        format!(
+            "Error: \nthread 'main' (1) panicked at {}:6:9:\nfmt exploded\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ndropped\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(&dir, "err_fmt_panic_drop.rs", RESULT_ERR_FMT_PANIC_DROP_SRC);
     let out = run_driver(&src);
     assert_eq!(out.status.code(), Some(101), "drop runs during unwind cleanup");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: dropped\nthread 'main' panicked: fmt exploded\n"
+        format!(
+            "Error: \nthread 'main' (1) panicked at {}:6:9:\nfmt exploded\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ndropped\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(
         &dir,
@@ -1743,10 +1751,19 @@ fn run_mode_termination_report_unwind_drop_and_streaming() {
     assert_eq!(out.status.code(), Some(134), "second panic aborts");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: thread 'main' aborted: panic `drop exploded` raised in the \
-         drop of the Termination report payload while unwinding: \
-         panicking while unwinding aborts the run\n\
-         sparagmos-driver run: guest crashed: abort\n"
+        format!(
+            "Error: \nthread 'main' (1) panicked at {0}:6:9:\nfmt exploded\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+             \nthread 'main' (1) panicked at {0}:11:9:\ndrop exploded\nstack backtrace:\n\
+             \u{20}  0:     0x555555554000 - __rustc::rust_begin_unwind\n\
+             \u{20}  1:     0x555555554010 - core::panicking::panic_fmt\n\
+             \u{20}  2:     0x555555554020 - <err_fmt_panic_drop_panics::E as std::ops::Drop>::drop\n\
+             \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs:233:5:\n\
+             panic in a destructor during cleanup\n\
+             thread caused non-unwinding panic. aborting.\n\
+             sparagmos-driver run: guest crashed: abort\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(&dir, "err_streaming_debug.rs", RESULT_ERR_STREAMING_DEBUG_SRC);
     let out = run_driver(&src);
@@ -1764,7 +1781,11 @@ fn run_mode_termination_report_unwind_drop_and_streaming() {
     assert_eq!(out.status.code(), Some(101), "partial text stands on panic");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: partialthread 'main' panicked: fmt exploded\n"
+        format!(
+            "Error: partial\nthread 'main' (1) panicked at {}:7:9:\nfmt exploded\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            src.display()
+        )
+        .as_str()
     );
     let src = fixture(
         &dir,
@@ -1882,8 +1903,9 @@ fn run_mode_termination_report_fmt_error_panics() {
     assert_eq!(out.status.code(), Some(101), "fmt error panics the report");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: thread 'main' panicked: a formatting trait implementation \
-         returned an error when the underlying stream did not\n"
+        "Error: \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs:411:17:\n\
+         a formatting trait implementation returned an error when the underlying stream did not\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
     );
     let src = fixture(&dir, "err_fmt_error_drop.rs", RESULT_ERR_FMT_ERROR_DROP_SRC);
     let out = run_driver(&src);
@@ -1894,8 +1916,9 @@ fn run_mode_termination_report_fmt_error_panics() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: dropped\nthread 'main' panicked: a formatting trait \
-         implementation returned an error when the underlying stream did not\n"
+        "Error: \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs:411:17:\n\
+         a formatting trait implementation returned an error when the underlying stream did not\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ndropped\n"
     );
     let src = fixture(
         &dir,
@@ -1910,8 +1933,9 @@ fn run_mode_termination_report_fmt_error_panics() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: partialthread 'main' panicked: a formatting trait \
-         implementation returned an error when the underlying stream did not\n"
+        "Error: partial\nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs:411:17:\n\
+         a formatting trait implementation returned an error when the underlying stream did not\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
     );
     let src = fixture(
         &dir,
@@ -1924,7 +1948,12 @@ fn run_mode_termination_report_fmt_error_panics() {
         Some(7),
         "drop exits during unwind cleanup"
     );
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: dropped\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs:411:17:\n\
+         a formatting trait implementation returned an error when the underlying stream did not\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ndropped\n"
+    );
     let src = fixture(
         &dir,
         "err_fmt_error_drop_panics.rs",
@@ -1934,10 +1963,20 @@ fn run_mode_termination_report_fmt_error_panics() {
     assert_eq!(out.status.code(), Some(134), "second panic aborts");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: thread 'main' aborted: panic `drop exploded` raised in the \
-         drop of the Termination report payload while unwinding: \
-         panicking while unwinding aborts the run\n\
-         sparagmos-driver run: guest crashed: abort\n"
+        format!(
+            "Error: \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs:411:17:\n\
+             a formatting trait implementation returned an error when the underlying stream did not\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+             \nthread 'main' (1) panicked at {0}:11:9:\ndrop exploded\nstack backtrace:\n\
+             \u{20}  0:     0x555555554000 - __rustc::rust_begin_unwind\n\
+             \u{20}  1:     0x555555554010 - core::panicking::panic_fmt\n\
+             \u{20}  2:     0x555555554020 - <err_fmt_error_drop_panics::E as std::ops::Drop>::drop\n\
+             \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs:233:5:\n\
+             panic in a destructor during cleanup\n\
+             thread caused non-unwinding panic. aborting.\n\
+             sparagmos-driver run: guest crashed: abort\n",
+            src.display()
+        )
+        .as_str()
     );
 }
 
@@ -2620,7 +2659,7 @@ fn run_mode_str_pattern_predicate_cleanup_panic_aborts() {
             "only the cleanup destructor runs before the abort ({name}); stderr={stderr}"
         );
         assert!(
-            stderr.contains("aborted"),
+            stderr.contains("aborting"),
             "the abort must be named on stderr ({name}); stderr={stderr}"
         );
     }

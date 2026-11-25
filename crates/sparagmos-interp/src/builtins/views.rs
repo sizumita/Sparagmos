@@ -435,9 +435,7 @@ impl<'a> Interpreter<'a> {
             },
         };
         if idx as u128 >= len {
-                return Err(InterpError::panic(format!(
-                "index out of bounds: the len is {len} but the index is {idx}"
-            )));
+                return Err(self.bounds_check_panic(frames, len as u128, idx as u128));
         }
         if entry_suffix {
             // The bounds check above ran against the fat length.

@@ -269,13 +269,30 @@ fn interpret_mir_captured_impl(
                             if matches!(e, InterpError::Panic { .. }) {
                                 match drop_payload(interp, frames, payload) {
                                     Ok(()) => return Err(e),
-                                    Err(InterpError::Panic {
-                                        message, ..
-                                    }) => {
-                                        return Err(InterpError::Abort {
-                                            message: format!(
-                                                "panic `{message}` raised in the drop of the Termination report payload while unwinding: panicking while unwinding aborts the run"
+                                    Err(InterpError::Panic { .. }) => {
+                                        // A panic in the payload's
+                                        // drop while the rendering's
+                                        // panic unwinds through the
+                                        // report is std's cleanup
+                                        // panic: its own report at
+                                        // the fixed core position,
+                                        // the abort line after it,
+                                        // and the run aborts.
+                                        interp.fire_nounwind_abort_panic(
+                                            frames,
+                                            (
+                                                "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                                    .to_string(),
+                                                233,
+                                                5,
                                             ),
+                                            "panic in a destructor during cleanup",
+                                            true,
+                                        );
+                                        return Err(InterpError::Abort {
+                                            message:
+                                                "a panic in the Termination report payload's drop while unwinding: the run aborts"
+                                                    .to_string(),
                                         });
                                     }
                                     Err(e2) => return Err(e2),

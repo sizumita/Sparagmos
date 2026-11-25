@@ -46,6 +46,10 @@ pub fn consumes_caller_location(kind: Builtin) -> bool {
             | Builtin::PanicStr
             | Builtin::PanicFmt
             | Builtin::PanicAny
+            | Builtin::OptionUnwrap
+            | Builtin::ResultUnwrap
+            | Builtin::IndexIndex
+            | Builtin::IndexMut
     )
 }
 
@@ -721,6 +725,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::panic::set_hook" => Builtin::PanicSetHook,
         "std::panic::set_backtrace_style" => Builtin::PanicSetBacktraceStyle,
+        "std::panic::always_abort" => Builtin::PanicAlwaysAbort,
         "std::panic::take_hook" => Builtin::PanicTakeHook,
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,

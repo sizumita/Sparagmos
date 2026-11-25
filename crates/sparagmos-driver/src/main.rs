@@ -294,6 +294,39 @@ fn session_overflow_checks(args: &[String]) -> bool {
     opt_is_zero
 }
 
+/// The session's panic strategy, resolved from the final rustc
+/// argument list the way rustc resolves it: the last
+/// `-C panic=<strategy>` wins; without one the strategy is
+/// `unwind`. The interpreter needs the resolved value because
+/// the abort strategy changes what a panic prints (see
+/// `InterpConfig::panic_abort`).
+fn session_panic_abort(args: &[String]) -> bool {
+    let mut panic: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let text: Option<&str> = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(rest) = a.strip_prefix("--codegen=") {
+            Some(rest)
+        } else if let Some(rest) = a.strip_prefix("-C") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(t) = text {
+            if let Some((name, value)) = t.split_once('=') {
+                if name == "panic" {
+                    panic = Some(value.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    panic.as_deref() == Some("abort")
+}
+
 /// Print the convert-mode conversion report for a collected
 /// program (the report `jit-compile` prints as well, before its
 /// own `jit-compiled:` line).
@@ -994,6 +1027,7 @@ fn driver_main_inner() {
     //   process's stdout is reserved for the driver's own report —
     //   in run mode, for the guest program's output alone.
     let overflow_checks = session_overflow_checks(&args);
+    let panic_abort = session_panic_abort(&args);
     let previous_hook = begin_panic_capture();
     let mut stdout_guard = match &compiler_stdout {
         Some(path) => StdoutToStderr::to_file(std::path::Path::new(path)),
@@ -1085,6 +1119,7 @@ fn driver_main_inner() {
                     &input,
                     &guest_args,
                     overflow_checks,
+                    panic_abort,
                     debug_script.as_deref(),
                     &debug_dialect,
                     hide_locals,
@@ -1157,6 +1192,7 @@ fn driver_main_inner() {
                     &input,
                     &guest_args,
                     overflow_checks,
+                    panic_abort,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
                     guest_stdout_passthrough,
