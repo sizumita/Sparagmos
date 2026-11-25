@@ -14218,30 +14218,27 @@ fn main() {
     unsafe {
         let mut u = U { b: 0xDEAD_DEAD };
         u.a.0 = 0xBEEF;
-        println!("should not reach");
+        println!("{}", u.b);
     }
 }
 "#;
 
 #[test]
-fn run_mode_union_write_inside_unheld_field_is_explicit() {
+fn run_mode_union_write_inside_unheld_field_composes() {
     // Writing inside a field the value does not currently hold
-    // would have to preserve the held field's remaining bytes;
-    // the model holds one field's value, so the write stays an
-    // uninitialized error rather than fabricating the field.
+    // composes with the held field's bytes: the written part
+    // changes, the held field's remaining bytes survive, and
+    // reading the held field back shows both (0xDEAD_BEEF).
     let dir = temp_dir("union-nested-write");
     let src = fixture(&dir, "union_nested_write.rs", UNION_NESTED_WRITE_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "a write inside an unheld union field must fail explicitly; stderr={stderr}"
+        Some(0),
+        "a write inside an unheld union field must compose; stderr={stderr}"
     );
-    assert!(
-        stderr.contains("uninitialized"),
-        "stderr must name the uninitialized field; stderr={stderr}"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3735928559\n");
 }
 
 const WEAK_COW_DROP_SRC: &str = r#"

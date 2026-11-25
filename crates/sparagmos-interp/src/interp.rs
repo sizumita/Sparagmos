@@ -553,6 +553,24 @@ pub(crate) enum Resolved {
     },
 }
 
+/// How a write through one field of a union composes with a
+/// value another field of the same union currently holds (see
+/// `Interpreter::union_crossing_write`).
+enum UnionCross {
+    /// The held field's span fits inside the written field's
+    /// span: the union keeps its aggregate form, now holding
+    /// the written field, whose pre-write value the read side
+    /// decodes from the held field's bits.
+    Switch,
+    /// The held field is wider than the written field, or the
+    /// union's storage is already in byte form: the union's
+    /// storage continues as bytes (`Value::UnionBytes`) — the
+    /// held field's byte image, with the written field's image
+    /// spliced over the prefix it covers — so the bytes past
+    /// the written field survive for later reads.
+    Bytes { source: Vec<Option<u8>> },
+}
+
 /// One spawned thread of the cooperative thread model: the
 /// callable captured at `spawn` time, and the outcome once it has
 /// run. A spawned thread never runs concurrently with the thread
@@ -2051,6 +2069,10 @@ fn value_tree_has_scalar(value: &Value) -> bool {
         Value::ErasedBlock { bytes, relocs } => {
             !bytes.is_empty() || relocs.iter().any(|(_, v)| value_tree_has_scalar(v))
         }
+        // A union in its byte form holds scalar content
+        // exactly where a write covered a byte; a span no
+        // write covered holds nothing.
+        Value::UnionBytes { bytes } => bytes.iter().any(|b| b.is_some()),
         Value::Closure { env, .. } => env.iter().any(value_tree_has_scalar),
         Value::Coroutine { fields, saved, .. } => {
             fields.iter().any(value_tree_has_scalar)
@@ -16037,6 +16059,38 @@ impl<'a> Interpreter<'a> {
         value: Value,
         root_ty: Option<&Ty>,
     ) -> InterpResult<()> {
+        // A write crossing a union field boundary composes
+        // with the held field's bytes (see
+        // `union_crossing_write`); every other write takes the
+        // ordinary path below.
+        let grow = matches!(target, Resolved::Alloc { .. });
+        let mut pending = Some(value);
+        let crossed = self.union_crossing_write(
+            frames,
+            target,
+            true,
+            |temp, rest, func, place| {
+                let value = pending
+                    .take()
+                    .expect("a crossing write applies the value once");
+                assign_projected(
+                    temp,
+                    rest,
+                    value,
+                    func,
+                    place,
+                    grow,
+                    Some(self.program()),
+                    None,
+                )
+            },
+        );
+        if let Some(done) = crossed {
+            return done;
+        }
+        let value = pending
+            .take()
+            .expect("a declined crossing leaves the value unapplied");
         match target {
             Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
@@ -16237,6 +16291,41 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         f: impl FnOnce(&mut Value) -> InterpResult<R>,
     ) -> InterpResult<R> {
+        // A modification crossing a union field boundary
+        // composes with the held field's bytes (see
+        // `union_crossing_write`); every other target takes
+        // the paths below. A projection ending in a vector
+        // length step is left to the length-slot pre-pass: the
+        // length is not storage inside the field value the
+        // crossing materialises.
+        let grow = matches!(target, Resolved::Place { .. });
+        let mut pending = Some(f);
+        let crossed = self.union_crossing_write(
+            frames,
+            target,
+            false,
+            |temp, rest, func, place| {
+                let f = pending
+                    .take()
+                    .expect("a crossing modification applies once");
+                let slot = navigate_mut_grow(
+                    temp,
+                    rest,
+                    func,
+                    place,
+                    grow,
+                    Some(self.program()),
+                    None,
+                )?;
+                f(slot)
+            },
+        );
+        if let Some(done) = crossed {
+            return done;
+        }
+        let f = pending
+            .take()
+            .expect("a declined crossing leaves the modification unapplied");
         // A read-modify-write through a vector length-slot
         // reference (see [`RefProj::VecLen`]): the slot is not
         // storage inside the vector value, so the modification
@@ -20364,6 +20453,29 @@ impl<'a> Interpreter<'a> {
                 place: place.to_string(),
             });
         }
+        // A union in its byte form (see `Value::UnionBytes`):
+        // the field's value is decoded from the storage bytes
+        // through the field's scalar shape — the same
+        // reinterpretation the aggregate form performs through
+        // the held field, with the bytes the writes left
+        // behind as the source of truth.
+        if let Value::UnionBytes { bytes } = &value {
+            let shapes = self.program.union_tables.get(table).ok_or_else(|| {
+                InterpError::type_mismatch(
+                    format!("union field read on {place}"),
+                    "a union instance with a scalar-shape table",
+                    "a union instance without one",
+                )
+            })?;
+            let dst = shapes.get(idx).and_then(|o| o.as_ref()).ok_or_else(|| {
+                InterpError::type_mismatch(
+                    format!("union field read on {place}"),
+                    "a scalar-shaped union field",
+                    "a union field whose type has no scalar shape",
+                )
+            })?;
+            return self.union_bytes_decode(bytes, dst, func, place);
+        }
         let Value::Enum { ref fields, .. } = value else {
             return Err(InterpError::type_mismatch(
                 format!("union field read on {place}"),
@@ -20412,6 +20524,564 @@ impl<'a> Interpreter<'a> {
         };
         let bits = self.flatten_scalar(&stored, src)?;
         self.construct_scalar(bits, dst)
+    }
+
+    /// The byte width a union field's scalar shape spans, when
+    /// the width is a whole number of bytes (every shape the
+    /// union tables record is: scalar widths are byte-sized by
+    /// construction and aggregate widths are layout sizes).
+    /// A zero-width shape spans nothing a write could cover.
+    fn union_shape_width(shape: &ScalarShape) -> Option<usize> {
+        let bits = shape.bits();
+        if bits == 0 || bits % 8 != 0 {
+            return None;
+        }
+        Some((bits / 8) as usize)
+    }
+
+    /// Splice `src` over `dst` at byte offset `at`, growing
+    /// `dst` with uninitialised bytes where the splice reaches
+    /// past its current end.
+    fn splice_union_bytes(dst: &mut Vec<Option<u8>>, at: usize, src: &[Option<u8>]) {
+        if dst.len() < at + src.len() {
+            dst.resize(at + src.len(), None);
+        }
+        dst[at..at + src.len()].copy_from_slice(src);
+    }
+
+    /// The storage bytes of a union field's value under its
+    /// scalar shape: one entry per byte the shape spans, `None`
+    /// for a byte no part of the value initialises. The outer
+    /// `None` is a value the byte rendering cannot express
+    /// under the shape (a shape past the scalar pattern domain
+    /// with no structural decomposition, or a value whose form
+    /// the shape does not describe); callers fall back to the
+    /// behaviour the value model had before byte storage.
+    fn union_field_bytes(&self, value: &Value, shape: &ScalarShape) -> Option<Vec<Option<u8>>> {
+        let width = Self::union_shape_width(shape)?;
+        if matches!(value, Value::Uninit) {
+            return Some(vec![None; width]);
+        }
+        // An aggregate shape renders structurally first, at
+        // any width: the pattern flattening below cannot
+        // express a value some part of which is uninitialised
+        // (a partially written tuple field of the union), and
+        // the byte image must keep exactly those parts
+        // uninitialised. A value whose form the shape does not
+        // describe falls through to the flattening.
+        if let Some(bytes) = self.union_field_bytes_structural(value, shape, width) {
+            return Some(bytes);
+        }
+        if width <= 16 {
+            let bits = self.flatten_scalar(value, shape).ok()?;
+            return Some((0..width).map(|i| Some((bits >> (8 * i)) as u8)).collect());
+        }
+        None
+    }
+
+    /// The structural byte rendering of an aggregate-shaped
+    /// union field's value (see [`Self::union_field_bytes`]):
+    /// per-part images spliced at the parts' offsets over a
+    /// zero-filled padding image, with an uninitialised part's
+    /// span left uninitialised. `None` where the value's form
+    /// is not the aggregate the shape describes.
+    fn union_field_bytes_structural(
+        &self,
+        value: &Value,
+        shape: &ScalarShape,
+        width: usize,
+    ) -> Option<Vec<Option<u8>>> {
+        match shape {
+            ScalarShape::Array(elem, n) => {
+                let Value::Tuple(items) = value else {
+                    return None;
+                };
+                if items.len() as u64 != *n {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(width);
+                for item in items {
+                    out.extend(self.union_field_bytes(item, elem)?);
+                }
+                Some(out)
+            }
+            ScalarShape::AdtFields { fields, .. } => {
+                let Value::Enum { fields: vals, .. } = value else {
+                    return None;
+                };
+                let mut out = vec![Some(0u8); width];
+                for (index, offset, fshape) in fields {
+                    let part = self.union_field_bytes(vals.get(*index as usize)?, fshape)?;
+                    Self::splice_union_bytes(&mut out, (*offset / 8) as usize, &part);
+                }
+                Some(out)
+            }
+            ScalarShape::Fields { fields, .. } => {
+                let Value::Tuple(vals) = value else {
+                    return None;
+                };
+                let mut out = vec![Some(0u8); width];
+                for (i, (offset, fshape)) in fields.iter().enumerate() {
+                    let part = self.union_field_bytes(vals.get(i)?, fshape)?;
+                    Self::splice_union_bytes(&mut out, (*offset / 8) as usize, &part);
+                }
+                Some(out)
+            }
+            ScalarShape::AdtField { index, inner, .. } => {
+                // The payload sits at offset 0 and every other
+                // field is zero-sized, so the byte image is the
+                // payload's own image at the shape's full width.
+                let payload = match value {
+                    Value::Enum { fields, .. } => fields.get(*index as usize)?,
+                    other => other,
+                };
+                let mut out = self.union_field_bytes(payload, inner)?;
+                out.resize(width, Some(0));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// One part of a union field's value decoded from storage
+    /// bytes (see [`Self::union_bytes_decode`]): `None` where
+    /// the bytes cannot be rendered under the shape, and a
+    /// wholly uninitialised span decodes to the uninitialised
+    /// marker, so a read of that part raises the error at its
+    /// own point of use.
+    fn union_bytes_part(&self, span: &[Option<u8>], shape: &ScalarShape) -> Option<Value> {
+        if span.iter().all(|b| b.is_none()) {
+            return Some(Value::Uninit);
+        }
+        let width = Self::union_shape_width(shape)?;
+        debug_assert_eq!(span.len(), width);
+        // An aggregate shape decodes structurally first, at
+        // any width: the pattern construction below zero-fills
+        // a part no write covered, where the part must stay
+        // uninitialised so its own read raises the error. A
+        // shape the structural decoding cannot render falls
+        // through to the construction.
+        if let Some(value) = self.union_bytes_part_structural(span, shape) {
+            return Some(value);
+        }
+        if width <= 16 {
+            let mut bits: u128 = 0;
+            for (i, b) in span.iter().enumerate() {
+                if let Some(b) = b {
+                    bits |= u128::from(*b) << (8 * i);
+                }
+            }
+            return self.construct_scalar(bits, shape).ok();
+        }
+        None
+    }
+
+    /// The structural decoding of one part of a union field's
+    /// value from storage bytes (see [`Self::union_bytes_part`]):
+    /// each part decodes from its own span, so a part no write
+    /// covered stays uninitialised. `None` where the shape is
+    /// not an aggregate the decoding decomposes.
+    fn union_bytes_part_structural(&self, span: &[Option<u8>], shape: &ScalarShape) -> Option<Value> {
+        match shape {
+            ScalarShape::Array(elem, n) => {
+                let ew = Self::union_shape_width(elem)?;
+                let mut items = Vec::with_capacity(*n as usize);
+                for i in 0..*n as usize {
+                    items.push(self.union_bytes_part(&span[i * ew..(i + 1) * ew], elem)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            ScalarShape::AdtFields {
+                count,
+                fill,
+                fields,
+                ..
+            } => {
+                let mut vals = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    vals[*i as usize] = self.eval_constant(c).ok()?;
+                }
+                for (index, offset, fshape) in fields {
+                    let fw = Self::union_shape_width(fshape)?;
+                    let at = (*offset / 8) as usize;
+                    vals[*index as usize] = self.union_bytes_part(&span[at..at + fw], fshape)?;
+                }
+                Some(Value::Enum {
+                    variant: 0,
+                    fields: vals,
+                })
+            }
+            ScalarShape::Fields { fields, .. } => {
+                let mut items = Vec::with_capacity(fields.len());
+                for (offset, fshape) in fields {
+                    let fw = Self::union_shape_width(fshape)?;
+                    let at = (*offset / 8) as usize;
+                    items.push(self.union_bytes_part(&span[at..at + fw], fshape)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            ScalarShape::AdtField {
+                index,
+                count,
+                fill,
+                inner,
+            } => {
+                let mut vals = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    vals[*i as usize] = self.eval_constant(c).ok()?;
+                }
+                vals[*index as usize] = self.union_bytes_part(span, inner)?;
+                Some(Value::Enum {
+                    variant: 0,
+                    fields: vals,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Decode a union field's value from the union's storage
+    /// bytes (the read side of `Value::UnionBytes`): the bytes
+    /// the field's span covers, reinterpreted through the
+    /// field's scalar shape. A span no write has covered is an
+    /// uninitialised read; a partially covered span reads its
+    /// uncovered bytes as zero, the convention the aggregate
+    /// form's cross-field read already keeps for the bytes
+    /// past the held field's width.
+    fn union_bytes_decode(
+        &self,
+        bytes: &[Option<u8>],
+        shape: &ScalarShape,
+        func: &str,
+        place: &str,
+    ) -> InterpResult<Value> {
+        let width = Self::union_shape_width(shape).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "a byte-wide union field shape",
+                "a union field shape with no byte width",
+            )
+        })?;
+        let mut span: Vec<Option<u8>> = bytes.iter().take(width).cloned().collect();
+        span.resize(width, None);
+        if span.iter().all(|b| b.is_none()) {
+            return Err(InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            });
+        }
+        self.union_bytes_part(&span, shape).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "a union field value its bytes decode to",
+                "storage bytes no value of the field's shape matches",
+            )
+        })
+    }
+
+    /// Whether a write through union field `idx` (of the union
+    /// instance with scalar-shape table `table`) into the union
+    /// value `current` crosses fields, and how the write
+    /// composes with what the union holds (see
+    /// [`Self::union_crossing_write`]). `None` when the write
+    /// stays inside the held field, the union holds nothing, or
+    /// a field the composition needs has no scalar shape.
+    fn union_cross_plan(&self, current: &Value, idx: usize, table: usize) -> Option<UnionCross> {
+        let shapes = self.program.union_tables.get(table)?;
+        let dst = shapes.get(idx).and_then(|o| o.as_ref())?;
+        let dst_width = Self::union_shape_width(dst)?;
+        match current {
+            Value::UnionBytes { bytes } => Some(UnionCross::Bytes {
+                source: bytes.clone(),
+            }),
+            Value::Enum { fields, .. } => {
+                // The widest field other than the written one
+                // that holds a value: its span is what the
+                // write must compose with. (A union value built
+                // by guest writes holds at most one field; a
+                // materialised constant can hold several, all
+                // read from the same bytes, so the widest one's
+                // image covers the others' spans.)
+                let mut source: Option<(&Value, &ScalarShape, usize)> = None;
+                for (i, v) in fields.iter().enumerate() {
+                    if i == idx || *v == Value::Uninit {
+                        continue;
+                    }
+                    let Some(shape) = shapes.get(i).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    let Some(w) = Self::union_shape_width(shape) else {
+                        continue;
+                    };
+                    if source.is_none_or(|(_, _, sw)| w > sw) {
+                        source = Some((v, shape, w));
+                    }
+                }
+                let (held, held_shape, held_width) = source?;
+                if held_width <= dst_width {
+                    Some(UnionCross::Switch)
+                } else {
+                    Some(UnionCross::Bytes {
+                        source: self.union_field_bytes(held, held_shape)?,
+                    })
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The aggregate union value holding field `idx`'s value
+    /// and no other field: the form a cross-field write leaves
+    /// when the written field's span covers the held field's.
+    /// The field vector keeps the length the current value's
+    /// form already accounts for.
+    fn union_holding(idx: usize, temp: Value, current: &Value) -> Value {
+        let len = match current {
+            Value::Enum { fields, .. } => fields.len().max(idx + 1),
+            _ => idx + 1,
+        };
+        let mut fields = vec![Value::Uninit; len];
+        fields[idx] = temp;
+        Value::Enum {
+            variant: 0,
+            fields,
+        }
+    }
+
+    /// Store `value` at the place `head` (a projection prefix)
+    /// of `target` denotes, through the same projected
+    /// assignment the write path performs for the target kind.
+    fn store_union_at_head(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        head: &[RefProj],
+        value: Value,
+    ) -> InterpResult<()> {
+        match target {
+            Resolved::Value(..) => Err(InterpError::type_mismatch(
+                "assignment",
+                "mutable place",
+                "constant aggregate",
+            )),
+            Resolved::Static { name, .. } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store
+                    .get_mut(name)
+                    .ok_or_else(|| self.missing_static(name))?;
+                let place_desc = format!("static {name}");
+                let root_ty = self.program().static_tys.get(name).cloned();
+                assign_projected(
+                    slot,
+                    head,
+                    value,
+                    "<static>",
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )
+            }
+            Resolved::Alloc { id, .. } => {
+                let head = self.elem_block_projection(*id, head);
+                let mut store = self.allocs.borrow_mut();
+                let slot = store
+                    .get_mut(id)
+                    .ok_or_else(|| self.missing_alloc(*id))?;
+                let place_desc = format!("allocation #{id}");
+                let alloc_root = self.alloc_ty(*id);
+                let alloc_root = match alloc_root {
+                    Some(element_ty) if self.is_elem_block(*id) => {
+                        Some(Ty::Slice(Box::new(element_ty)))
+                    }
+                    other => other,
+                };
+                grow_tuples_along(slot, &head, Some(self.program()), alloc_root.clone());
+                assign_projected(
+                    slot,
+                    &head,
+                    value,
+                    "<allocation>",
+                    &place_desc,
+                    true,
+                    Some(self.program()),
+                    alloc_root,
+                )
+            }
+            Resolved::Place {
+                frame_pos, local, ..
+            } => {
+                let func = frames[*frame_pos].func.clone();
+                let root_ty = self
+                    .program()
+                    .get(&func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned();
+                let frame = &mut frames[*frame_pos];
+                let place_desc = describe_resolved(*local, head);
+                let slot = frame.locals.get_mut(*local).ok_or_else(|| InterpError::UnknownLocal {
+                    func: func.clone(),
+                    local: *local,
+                })?;
+                assign_projected(
+                    slot,
+                    head,
+                    value,
+                    &func,
+                    &place_desc,
+                    false,
+                    Some(self.program()),
+                    root_ty,
+                )
+            }
+        }
+    }
+
+    /// A write or in-place modification whose projection
+    /// crosses a union field boundary: the projection steps
+    /// into field `idx` of a union whose stored value another
+    /// field's write produced (or whose storage is already in
+    /// byte form). Plain navigation cannot compose such a
+    /// write — the value model holds one field's value per
+    /// union, so a partial write into a different field has
+    /// nowhere to land — so the write is intercepted here, at
+    /// the same level the vector length slot's writes are
+    /// intercepted: the union's current value is read, the
+    /// written field's value is materialised from it (decoded
+    /// through the field's scalar shape), `apply` performs the
+    /// write inside that field value, and the composed union
+    /// value is stored back at the projection's head.
+    ///
+    /// Composition keeps the aggregate form when the held
+    /// field's span fits inside the written field's span (the
+    /// surviving bytes are exactly the written field's new
+    /// value) and switches the union to its byte form
+    /// (`Value::UnionBytes`) when the held field is wider, so
+    /// the bytes past the written field survive for later
+    /// reads of the held field.
+    ///
+    /// Returns `None` when the write does not cross fields —
+    /// no union step, the addressed field is the held one, the
+    /// union holds nothing yet, or the fields involved have no
+    /// scalar shapes to compose through — and the caller takes
+    /// its ordinary path, whose verdicts are unchanged. A
+    /// decline happens only before `apply` runs: once the
+    /// write is applied, composition always stores a value.
+    /// `vec_len_tail_ok` records whether the caller's `apply`
+    /// handles a trailing vector-length step itself (the
+    /// projected assignment does; in-place navigation does
+    /// not, and the length-slot pre-pass owns that case).
+    fn union_crossing_write<R>(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        vec_len_tail_ok: bool,
+        apply: impl FnOnce(&mut Value, &[RefProj], &str, &str) -> InterpResult<R>,
+    ) -> Option<InterpResult<R>> {
+        // The effective projection: an allocation target's
+        // projection is canonicalised exactly as the write
+        // path canonicalises it, so the head and the rest are
+        // the steps the store will navigate.
+        let effective;
+        let projection: &[RefProj] = match target {
+            Resolved::Alloc { id, projection } => {
+                effective = self.elem_block_projection(*id, projection);
+                &effective
+            }
+            Resolved::Place { projection, .. } | Resolved::Static { projection, .. } => projection,
+            Resolved::Value(..) => return None,
+        };
+        let pos = projection
+            .iter()
+            .position(|s| matches!(s, RefProj::UnionField { .. }))?;
+        let RefProj::UnionField { idx, table } = projection[pos] else {
+            unreachable!("the position names a union field step")
+        };
+        let head = &projection[..pos];
+        let rest = &projection[pos + 1..];
+        if !vec_len_tail_ok && matches!(rest.last(), Some(RefProj::VecLen)) {
+            return None;
+        }
+        let (func, place_desc) = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => (
+                frames[*frame_pos].func.clone(),
+                describe_resolved(*local, projection),
+            ),
+            Resolved::Static { name, .. } => ("<static>".to_string(), format!("static {name}")),
+            Resolved::Alloc { id, .. } => {
+                ("<allocation>".to_string(), format!("allocation #{id}"))
+            }
+            Resolved::Value(..) => unreachable!("value targets declined above"),
+        };
+        let head_target = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: head.to_vec(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: head.to_vec(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: head.to_vec(),
+            },
+            Resolved::Value(..) => unreachable!("value targets declined above"),
+        };
+        let current = self.read_resolved(frames, &head_target).ok()?;
+        let plan = self.union_cross_plan(&current, idx, table)?;
+        // The written field's value before the write, decoded
+        // from what the union holds; a whole-field write
+        // replaces it wholesale and needs no decode. A decode
+        // failure declines: the ordinary path produces its own
+        // verdict for the same write.
+        let mut temp = if rest.is_empty() {
+            Value::Uninit
+        } else {
+            match self.union_field_read(current.clone(), idx, table, &func, &place_desc) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        };
+        let result = match apply(&mut temp, rest, &func, &place_desc) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        let new_union = match &plan {
+            UnionCross::Bytes { source } => {
+                let shape = self
+                    .program
+                    .union_tables
+                    .get(table)
+                    .and_then(|shapes| shapes.get(idx))
+                    .and_then(|o| o.as_ref());
+                match shape.and_then(|shape| self.union_field_bytes(&temp, shape)) {
+                    Some(image) => {
+                        let mut bytes = source.clone();
+                        Self::splice_union_bytes(&mut bytes, 0, &image);
+                        Value::UnionBytes { bytes }
+                    }
+                    // The written value has no byte image under
+                    // its shape: the write is honoured in the
+                    // aggregate form holding the written field.
+                    // The held field's tail bytes are lost —
+                    // still strictly more than the model without
+                    // byte storage could do with this write,
+                    // which was to error.
+                    None => Self::union_holding(idx, temp, &current),
+                }
+            }
+            UnionCross::Switch => Self::union_holding(idx, temp, &current),
+        };
+        Some(
+            self.store_union_at_head(frames, target, head, new_union)
+                .map(|()| result),
+        )
     }
 
     /// A scalar `Transmute` reinterpretation: flatten the
@@ -20972,6 +21642,22 @@ impl<'a> Interpreter<'a> {
         shape: &ScalarShape,
     ) -> InterpResult<u128> {
         match (shape, value) {
+            // A union in its byte form flattens from its
+            // storage bytes: a byte a write covered holds the
+            // pattern there, and a byte no write covered reads
+            // as zero, the convention the byte-form field read
+            // keeps. (Shapes wider than a pattern have no
+            // flattening; the structural byte rendering in
+            // `union_field_bytes` is the path for those.)
+            (shape, Value::UnionBytes { bytes }) if shape.bits() <= 128 => {
+                let mut out: u128 = 0;
+                for (i, b) in bytes.iter().enumerate().take(16) {
+                    if let Some(b) = b {
+                        out |= u128::from(*b) << (8 * i);
+                    }
+                }
+                Ok(out & bit_mask(shape.bits()))
+            }
             (ScalarShape::Int { bits, .. }, Value::Int(i)) => {
                 Ok((*i as u128) & bit_mask(*bits))
             }
@@ -28129,6 +28815,7 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
         | Value::Str(_)
         | Value::Bytes(_)
         | Value::ErasedBlock { .. }
+        | Value::UnionBytes { .. }
         | Value::Ref(_)
         | Value::FatRef { .. }
         | Value::FnPtr(_)
