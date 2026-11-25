@@ -1806,28 +1806,32 @@ pub enum TerminatorKind {
         /// Drop glue of the element type when the callee is a
         /// `From` / `Into` conversion into a `Box<[T]>` whose
         /// elements the modelled conversion clones one by one (a
-        /// `&[T]` or borrowed-`Cow<[T]>` source): when a later
-        /// element's clone panics, the conversion drops the
-        /// elements it already cloned — the initialized prefix —
-        /// before the panic propagates, exactly as the real
-        /// construction's guard drops them. `None` for every
+        /// `&[T]` or borrowed-`Cow<[T]>` source), or a
+        /// `slice::to_vec` call, whose modelled builtin likewise
+        /// clones the receiver slice's elements one by one: when
+        /// a later element's clone panics, the conversion drops
+        /// the elements it already cloned — the initialized
+        /// prefix — before the panic propagates, exactly as the
+        /// real construction's guard drops them. `None` for every
         /// other builtin, and when the element glue is trivial
         /// or cannot be accounted for (the prefix is then
         /// discarded as before).
         elem_glue: Option<DropGlue>,
         /// Drop glue of the receiver's `Self` type when the
-        /// callee is `Clone::clone` and `Self` is a closure
-        /// type: the modelled clone clones the environment
-        /// capture by capture, and when a later capture's
-        /// clone panics, the captures cloned so far drop with
-        /// their own glue before the panic propagates, exactly
-        /// as the real field-wise construction's guard drops
-        /// them. Conversion builds the closure type's
-        /// [`DropGlue`] (its captures' glue, see
-        /// `DropGlueBuilder`). `None` for every other builtin,
-        /// when `Self` is not a closure type, and when the
-        /// glue is trivial or cannot be accounted for (the
-        /// cloned captures are then discarded as before).
+        /// callee is `Clone::clone` and `Self` is a type the
+        /// modelled clone builds part by part — a closure
+        /// type (its environment captures), a `Vec` (its
+        /// elements), a tuple or array (its elements), or a
+        /// `Box` (its pointee): when a later part's clone
+        /// panics, the parts cloned so far drop with their
+        /// own glue before the panic propagates, exactly
+        /// as the real construction's guard drops them.
+        /// Conversion builds the receiver type's
+        /// [`DropGlue`] (see `DropGlueBuilder`). `None` for
+        /// every other builtin, when `Self` is none of those
+        /// types, and when the glue is trivial or cannot be
+        /// accounted for (the cloned parts are then
+        /// discarded as before).
         receiver_glue: Option<DropGlue>,
         /// Discriminant values of the comparison's `Self` type,
         /// baked by conversion for the `PartialOrd` / `Ord`

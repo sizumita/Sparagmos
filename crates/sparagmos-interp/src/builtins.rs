@@ -4831,10 +4831,12 @@ impl<'a> Interpreter<'a> {
     /// `Iterator::nth` call (see
     /// `TerminatorKind::CallBuiltin::skipped_glue`), and
     /// `elem_glue` the conversion-baked element glue of a
-    /// boxed-slice `From` / `Into` conversion (see
+    /// boxed-slice `From` / `Into` conversion or a
+    /// `slice::to_vec` call (see
     /// `TerminatorKind::CallBuiltin::elem_glue`), and
-    /// `receiver_glue` the conversion-baked glue of a closure
-    /// receiver of a `Clone::clone` call (see
+    /// `receiver_glue` the conversion-baked glue of the
+    /// receiver of a `Clone::clone` call the modelled clone
+    /// builds part by part (see
     /// `TerminatorKind::CallBuiltin::receiver_glue`).
     pub(crate) fn exec_builtin(
         &mut self,
@@ -10619,11 +10621,22 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
-                let (elems, _) = self.slice_elements(frames, &vals[0])?;
-                let fields = elems
-                    .iter()
-                    .map(|e| self.clone_owned_value(frames, e))
-                    .collect::<InterpResult<Vec<_>>>()?;
+                let (elems, len) = self.slice_elements(frames, &vals[0])?;
+                // `to_vec` is the slice's clone into a vector:
+                // every element clones with its own `Clone`
+                // semantics, the way `Vec::clone` clones its
+                // elements (see `clone_modelled_value`), not
+                // the shape-only copy. The element tag is the
+                // call's first generic argument.
+                let elem_ty = generic_args.first().map(String::as_str);
+                let elements =
+                    self.clone_source_elements(frames, &vals[0], elems, len, elem_ty);
+                let fields = self.clone_boxed_slice_elements(
+                    frames,
+                    &elements,
+                    elem_ty,
+                    elem_glue,
+                )?;
                 Ok(Value::Enum {
                     variant: 0,
                     fields,
@@ -13807,9 +13820,28 @@ fn value_fingerprint(value: &Value) -> u64 {
                     if let Some((id, projection)) = box_alloc_pointer(&value) {
                         let pointee = self.read_resolved(
                             frames,
-                            &Resolved::Alloc { id, projection },
+                            &Resolved::Alloc {
+                                id,
+                                projection: projection.clone(),
+                            },
                         )?;
-                        let cloned = self.clone_owned_value(frames, &pointee)?;
+                        // The pointee clones with its own tag
+                        // known, the way an element of a
+                        // boxed-slice conversion clones: a
+                        // counted pointee moves its count, a
+                        // collected `Clone` body runs, instead
+                        // of the shape-only copy.
+                        let inner_ty = generic_first_arg(self_ty, "std::boxed::Box<");
+                        let pointee_glue =
+                            receiver_glue.and_then(|g| g.pointee_plan());
+                        let pointee_ref = RefTarget::Alloc { id, projection };
+                        let cloned = self.clone_boxed_slice_element(
+                            frames,
+                            &pointee,
+                            Some(&pointee_ref),
+                            inner_ty,
+                            pointee_glue.as_ref(),
+                        )?;
                         let boxed = self.new_box(cloned);
                         if let Some(ty) =
                             generic_first_arg(self_ty, "std::boxed::Box<")
@@ -13863,14 +13895,47 @@ fn value_fingerprint(value: &Value) -> u64 {
                 let value = if self_ty.starts_with("std::vec::Vec<")
                     || self_ty.starts_with("alloc::vec::Vec<")
                 {
+                    // A `Vec` clone clones every element with
+                    // the element type's own `Clone` semantics,
+                    // exactly as the boxed-slice conversion
+                    // clones a slice's elements (see
+                    // `clone_boxed_slice_element`): a collected
+                    // element `Clone` body runs once per element
+                    // in order, counted handles move their
+                    // counts, and a panicking element clone
+                    // drops the elements cloned so far (the
+                    // glue `receiver_glue` carries, baked for a
+                    // `Vec` receiver in conversion) while the
+                    // source vector stays intact. The elements
+                    // pair with their live source references
+                    // (see `clone_source_elements`), so a clone
+                    // body that mutates through `&self` writes
+                    // the source element, as a direct clone of
+                    // that element would.
+                    let elem_ty = generic_first_arg(self_ty, "std::vec::Vec<")
+                        .or_else(|| generic_first_arg(self_ty, "alloc::vec::Vec<"));
+                    let elem_glue = receiver_glue.and_then(|g| g.elem_plan());
                     match value {
-                        Value::Enum { variant, fields } => Value::Enum {
-                            variant,
-                            fields: fields
-                                .iter()
-                                .map(|f| self.clone_owned_value(frames, f))
-                                .collect::<InterpResult<Vec<_>>>()?,
-                        },
+                        Value::Enum { variant, fields } => {
+                            let len = fields.len() as u128;
+                            let elements = self.clone_source_elements(
+                                frames.as_slice(),
+                                arg,
+                                fields,
+                                len,
+                                elem_ty,
+                            );
+                            let cloned = self.clone_boxed_slice_elements(
+                                frames,
+                                &elements,
+                                elem_ty,
+                                elem_glue.as_ref(),
+                            )?;
+                            Value::Enum {
+                                variant,
+                                fields: cloned,
+                            }
+                        }
                         // A sparse vector's stored
                         // elements clone the same way;
                         // its unmaterialised tail has
@@ -13882,12 +13947,19 @@ fn value_fingerprint(value: &Value) -> u64 {
                         // source's spare capacity does
                         // not carry over.
                         Value::SparseVec { elems, len, .. } => {
-                            let cloned = elems
-                                .iter()
-                                .map(|f| {
-                                    self.clone_owned_value(frames, f)
-                                })
-                                .collect::<InterpResult<Vec<_>>>()?;
+                            let elements = self.clone_source_elements(
+                                frames.as_slice(),
+                                arg,
+                                elems,
+                                len,
+                                elem_ty,
+                            );
+                            let cloned = self.clone_boxed_slice_elements(
+                                frames,
+                                &elements,
+                                elem_ty,
+                                elem_glue.as_ref(),
+                            )?;
                             let cap =
                                 len.max(cloned.len() as u128);
                             Value::SparseVec {
@@ -13901,14 +13973,35 @@ fn value_fingerprint(value: &Value) -> u64 {
                 } else if (self_ty.starts_with('(') || self_ty.starts_with('['))
                     && matches!(value, Value::Tuple(_))
                 {
-                    match value {
-                        Value::Tuple(items) => Value::Tuple(
-                            items
-                                .iter()
-                                .map(|f| self.clone_owned_value(frames, f))
-                                .collect::<InterpResult<Vec<_>>>()?,
-                        ),
-                        other => other,
+                    // A tuple / array clone is the field-wise
+                    // clone with each element's own tag, the
+                    // discipline `clone_typed_aggregate`
+                    // applies to the same shapes in the
+                    // boxed-slice conversion: an element's
+                    // collected `Clone` body runs instead of
+                    // the shape-only copy. A shape the typed
+                    // clone does not cover keeps the copy.
+                    let source_ref = match arg {
+                        Value::Ref(target) => Some(target.clone()),
+                        _ => None,
+                    };
+                    match self.clone_typed_aggregate(
+                        frames,
+                        &value,
+                        source_ref.as_ref(),
+                        self_ty,
+                        receiver_glue,
+                    )? {
+                        Some(cloned) => cloned,
+                        None => match value {
+                            Value::Tuple(items) => Value::Tuple(
+                                items
+                                    .iter()
+                                    .map(|f| self.clone_owned_value(frames, f))
+                                    .collect::<InterpResult<Vec<_>>>()?,
+                            ),
+                            other => other,
+                        },
                     }
                 } else {
                     value
