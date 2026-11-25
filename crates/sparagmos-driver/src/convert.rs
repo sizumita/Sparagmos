@@ -734,6 +734,37 @@ pub struct Converter {
     static_inits: std::collections::HashMap<sm::DefId, std::rc::Rc<Allocation>>,
     /// Total bytes held in `alloc_cache` and `static_inits`.
     alloc_cache_bytes: usize,
+    /// Memoised decodes of allocated constants, keyed by the
+    /// constant's type and its allocation's exact contents
+    /// (bytes and provenance targets). `const_from_alloc`
+    /// resets every budget at entry, so a root decode is a
+    /// pure function of those two inputs, and a body that
+    /// mentions the same constant many times -- one reference
+    /// into a large static per element of a table the body's
+    /// initializer builds -- otherwise re-materialises the
+    /// pointee on every mention. Only decodes that finished
+    /// with no recorded error and no budget-failure flag are
+    /// memoised, so a memoised value is exactly what a fresh
+    /// decode of the same constant produces. Allocations
+    /// larger than `MAX_CONST_MEMO_BYTES` are not memoised:
+    /// the key copies the bytes, and a large allocation's own
+    /// decode is dominated by its content, paid once per
+    /// mention as before.
+    const_memo: std::collections::HashMap<
+        (rustc_public::ty::Ty, Vec<Option<u8>>, Vec<(usize, ProvTargetKey)>),
+        std::rc::Rc<sm::ConstValue>,
+    >,
+    /// Memoised span resolutions, keyed by the span and the
+    /// body span bounding its macro-expansion walk. Resolving
+    /// a span crosses into the compiler for every call, and a
+    /// body's statements share spans heavily (every statement
+    /// of one source expression carries that expression's
+    /// span), so a large body otherwise pays the crossing
+    /// once per statement.
+    source_line_cache: std::collections::HashMap<
+        (rustc_public::ty::Span, rustc_public::ty::Span),
+        sm::SourceLine,
+    >,
 }
 
 impl Default for Converter {
@@ -3339,6 +3370,8 @@ impl Converter {
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
             alloc_cache_bytes: 0,
+            const_memo: std::collections::HashMap::new(),
+            source_line_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -3746,13 +3779,21 @@ impl Converter {
                 entry.1 = entry.1.max(pos.line);
             }
         };
-        for bb in &body.blocks {
-            for stmt in &bb.statements {
-                let pos = self.source_line(stmt.source_info.span, body.span);
-                note_scope(&mut scope_lines, stmt.source_info.scope, pos);
+        // The statements' and terminators' lines were already
+        // resolved when the blocks were converted (the
+        // `source_lines` above); resolving every span a second
+        // time here would double the span-resolution cost of
+        // every body, which dominates the conversion of a
+        // large body.
+        for (bb, lines) in body.blocks.iter().zip(&source_lines) {
+            for (stmt, pos) in bb.statements.iter().zip(&lines.statements) {
+                note_scope(&mut scope_lines, stmt.source_info.scope, *pos);
             }
-            let pos = self.source_line(bb.terminator.source_info.span, body.span);
-            note_scope(&mut scope_lines, bb.terminator.source_info.scope, pos);
+            note_scope(
+                &mut scope_lines,
+                bb.terminator.source_info.scope,
+                lines.terminator,
+            );
         }
         let debug_info: Vec<sm::VarDebugInfo> = body
             .var_debug_info
@@ -3980,6 +4021,26 @@ impl Converter {
     /// instead of failing the conversion — line information is an
     /// overlay on the body, never a conversion requirement.
     fn source_line(
+        &mut self,
+        span: rustc_public::ty::Span,
+        body_span: rustc_public::ty::Span,
+    ) -> sm::SourceLine {
+        // The resolution is a pure function of the two spans
+        // (the file interning it performs hands out ids by
+        // file name, so a repeated resolution would return
+        // the same line), and it crosses into the compiler
+        // for every call; a body's statements share spans
+        // heavily, so resolutions are memoised (see the
+        // `source_line_cache` field).
+        if let Some(&line) = self.source_line_cache.get(&(span, body_span)) {
+            return line;
+        }
+        let line = self.source_line_uncached(span, body_span);
+        self.source_line_cache.insert((span, body_span), line);
+        line
+    }
+
+    fn source_line_uncached(
         &mut self,
         span: rustc_public::ty::Span,
         body_span: rustc_public::ty::Span,
@@ -4960,6 +5021,33 @@ impl Converter {
         self.const_work_budget = MAX_CONST_WORK_BYTES;
         self.const_work_failed = false;
         self.clear_alloc_caches();
+        // The memoised decode of this exact constant, if a
+        // previous mention already produced it (see the
+        // `const_memo` field). The resets above have run, so
+        // the converter state a hit leaves behind is the state
+        // a fresh decode's entry would leave behind.
+        let memo_key = if alloc.bytes.len() <= MAX_CONST_MEMO_BYTES {
+            let mut ptrs = Vec::with_capacity(alloc.provenance.ptrs.len());
+            let mut named = true;
+            for (off, prov) in &alloc.provenance.ptrs {
+                match prov_target_key(prov, 0) {
+                    Some(k) => ptrs.push((*off, k)),
+                    None => {
+                        named = false;
+                        break;
+                    }
+                }
+            }
+            named.then(|| (*ty, alloc.bytes.clone(), ptrs))
+        } else {
+            None
+        };
+        if let Some(key) = &memo_key {
+            if let Some(v) = self.const_memo.get(key) {
+                return (**v).clone();
+            }
+        }
+        let errors_before = self.errors.len();
         // A constant whose type passes through a coroutine-
         // closure type cannot be asked its kind (see
         // `guarded_ty_kind`); the value is a zero-sized closure
@@ -4968,7 +5056,7 @@ impl Converter {
         let Some(kind) = guarded_ty_kind(ty) else {
             return sm::ConstValue::ZeroSized;
         };
-        match kind {
+        let value = match kind {
             TyKind::RigidTy(RigidTy::Bool) => match alloc.read_bool() {
                 Ok(b) => sm::ConstValue::Bool(b),
                 Err(_) => {
@@ -5066,15 +5154,36 @@ impl Converter {
                 // Aggregate constants (tuples, arrays, ADTs) are
                 // decoded field by field, guided by the layout.
                 if let Some(v) = self.decode_const(ty, alloc, 0, 0) {
-                    return v;
+                    v
+                } else {
+                    self.err(format!(
+                        "ConstantKind::Allocated (type {})",
+                        short_ty(ty)
+                    ));
+                    sm::ConstValue::ZeroSized
                 }
-                self.err(format!(
-                    "ConstantKind::Allocated (type {})",
-                    short_ty(ty)
-                ));
-                sm::ConstValue::ZeroSized
+            }
+        };
+        // Record the decode for later mentions of the same
+        // constant, but only when it is exactly reproducible:
+        // a decode that recorded an error, or that a budget
+        // failure shaped (a fallback taken because a charge
+        // failed leaves the corresponding flag set), may have
+        // depended on the state it ran in, so it is decoded
+        // fresh on every mention, as before.
+        if let Some(key) = memo_key {
+            if self.errors.len() == errors_before
+                && !self.const_budget_failed
+                && !self.const_scan_failed
+                && !self.const_work_failed
+            {
+                if self.const_memo.len() >= MAX_CONST_MEMO_ENTRIES {
+                    self.const_memo.clear();
+                }
+                self.const_memo.insert(key, std::rc::Rc::new(value.clone()));
             }
         }
+        value
     }
 
     /// Resolve the allocation provenance `prov` names. A
@@ -9012,6 +9121,21 @@ const MAX_CONST_SCAN_BYTES: usize = 1 << 30;
 /// thirty re-materialisations instead of five thousand.
 const MAX_CONST_WORK_BYTES: usize = 1 << 32;
 
+/// Byte-size bound on allocations whose decodes are memoised
+/// across root constants (see `Converter::const_memo`): the
+/// memo key copies the allocation's bytes, so it is only
+/// worth building for the small allocations root constants
+/// usually are -- a pointer slot, a scalar, a small
+/// aggregate. A larger allocation's decode is dominated by
+/// its own content and is paid once per mention, as before.
+const MAX_CONST_MEMO_BYTES: usize = 512;
+
+/// Bound on the number of memoised constant decodes (see
+/// `Converter::const_memo`): past the bound the memo is
+/// cleared rather than grown, so a conversion that touches
+/// very many distinct constants cannot pin them all.
+const MAX_CONST_MEMO_ENTRIES: usize = 8192;
+
 /// Cap on the total bytes held in the converter's per-constant
 /// allocation cache (see `Converter::alloc_cache`).
 const MAX_CACHED_ALLOC_BYTES: usize = 1 << 28;
@@ -9085,6 +9209,62 @@ fn vtable_id(
     h | (1 << 63)
 }
 
+/// What an allocation's provenance entry denotes, named in
+/// terms that are stable across mentions of the same
+/// constant, for the `const_memo` key: the bridge index of an
+/// allocation id is assigned per materialisation, so it
+/// cannot name the target -- two mentions of one reference
+/// into a static carry different indices for the same
+/// static. Statics and functions are named by their
+/// definitions (a function's identity is the key the
+/// const-fn mention table uses), vtables and type ids by the
+/// rendered pair / type the codebase already hashes for
+/// their identities, and a memory allocation by its exact
+/// contents, recursively, within the memo bounds (see
+/// `prov_target_key`).
+#[derive(PartialEq, Eq, Hash)]
+enum ProvTargetKey {
+    Static(rustc_public::DefId),
+    Function(rustc_public::DefId, String),
+    VTable(String),
+    TypeId(String),
+    Memory(Vec<Option<u8>>, Vec<(usize, ProvTargetKey)>),
+}
+
+/// The [`ProvTargetKey`] of the allocation `prov` denotes,
+/// or `None` when the target cannot be named within the
+/// memo bounds: a memory allocation larger than
+/// `MAX_CONST_MEMO_BYTES`, or one whose own provenance
+/// reaches deeper than two levels of memory allocations.
+/// Such constants are simply not memoised; they decode on
+/// every mention, as before.
+fn prov_target_key(prov: &Prov, depth: usize) -> Option<ProvTargetKey> {
+    use mir::alloc::GlobalAlloc;
+    match GlobalAlloc::from(prov.0) {
+        GlobalAlloc::Static(def) => {
+            Some(ProvTargetKey::Static(rustc_public::CrateDef::def_id(&def)))
+        }
+        GlobalAlloc::Function(inst) => Some(ProvTargetKey::Function(
+            inst.def.def_id(),
+            format!("{:?}", inst.args()),
+        )),
+        GlobalAlloc::VTable(ty, trait_ref) => {
+            Some(ProvTargetKey::VTable(format!("{ty:?}|{trait_ref:?}")))
+        }
+        GlobalAlloc::TypeId { ty } => Some(ProvTargetKey::TypeId(format!("{ty:?}"))),
+        GlobalAlloc::Memory(alloc) => {
+            if depth >= 2 || alloc.bytes.len() > MAX_CONST_MEMO_BYTES {
+                return None;
+            }
+            let mut ptrs = Vec::with_capacity(alloc.provenance.ptrs.len());
+            for (off, p) in &alloc.provenance.ptrs {
+                ptrs.push((*off, prov_target_key(p, depth + 1)?));
+            }
+            Some(ProvTargetKey::Memory(alloc.bytes, ptrs))
+        }
+    }
+}
+
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
 /// The provenance recorded for the pointer slot at
 /// `offset` in `alloc`, if any. rustc_public builds
@@ -9117,7 +9297,20 @@ fn prov_at(alloc: &Allocation, offset: usize) -> Option<&Prov> {
 /// array copied terabytes in aggregate while charging only
 /// the one-byte results against the expansion budget).
 fn alloc_bytes_in(alloc: &Allocation, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
-    alloc.bytes.get(range)?.iter().copied().collect()
+    let slice = alloc.bytes.get(range)?;
+    // A pre-sized loop, not `iter().copied().collect()` into
+    // an `Option<Vec>`: the collecting adapter cannot see the
+    // final size, so the copy regrows the vector repeatedly
+    // and costs an order of magnitude more per byte in an
+    // unoptimised build (measured ~55 ns/byte against
+    // ~7 ns/byte for this loop) -- the difference between a
+    // second and a minute when a large backing allocation is
+    // copied once per element of a table that references it.
+    let mut bytes = Vec::with_capacity(slice.len());
+    for byte in slice {
+        bytes.push((*byte)?);
+    }
+    Some(bytes)
 }
 
 fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {

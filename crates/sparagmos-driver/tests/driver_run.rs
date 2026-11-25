@@ -1172,6 +1172,53 @@ fn run_mode_large_reference_table_reads_back() {
 }
 
 #[test]
+fn run_mode_repeated_static_ref_table_converts_and_reads_back() {
+    // A static initializer that builds a 300-element table of
+    // one-byte slices alternating between two 1 MiB statics.
+    // Every element's slice expression mentions its static
+    // through a distinct reference constant, and each such
+    // constant's decode materialises the static's whole
+    // backing, so the initializer body's conversion otherwise
+    // pays the backing size per element (the 5,000-element
+    // shape of Issue #492 took ~500 s to convert before the
+    // root-constant memo and the pre-sized byte copy in
+    // `alloc_bytes_in`). The decoded values must stay exact:
+    // each element reads back the byte of the static it
+    // denotes, so the memo must not conflate the two targets.
+    let mut src = String::new();
+    src.push_str("static A: [u8; 1048576] = [7; 1048576]; ");
+    src.push_str("static B: [u8; 1048576] = [9; 1048576]; ");
+    let mut elems = Vec::new();
+    for i in 0..300 {
+        let name = if i % 2 == 0 { "A" } else { "B" };
+        elems.push(format!(
+            "unsafe {{ std::slice::from_raw_parts({name}.as_ptr(), 1) }}"
+        ));
+    }
+    src.push_str(&format!(
+        "static TABLE: [&[u8]; 300] = [{}]; ",
+        elems.join(", ")
+    ));
+    src.push_str(
+        "fn main() { println!(\"{} {} {} {} {}\", TABLE[0][0], TABLE[1][0], TABLE[150][0], TABLE[299][0], TABLE.len()); }",
+    );
+    let dir = temp_dir("repeated-static-ref-table");
+    let src = fixture(&dir, "repeated_static_ref_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a table of repeated static references must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7 9 7 9 300\n",
+        "each element must read back the byte of the static it denotes"
+    );
+}
+
+#[test]
 fn run_mode_slice_table_into_shared_array_reads_requested_ranges() {
     // Slices at different offsets into one shared backing
     // array decode exactly the requested byte ranges: the
