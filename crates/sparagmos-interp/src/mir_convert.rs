@@ -9782,6 +9782,12 @@ let inner = match (&src, target) {
                 .or_else(|| self_ty.strip_prefix("&"))
                 .unwrap_or(self_ty);
             self_ty == "std::fs::File"
+                || (matches!(
+                    canonical.as_str(),
+                    "std::io::Write::write"
+                        | "std::io::Write::write_all"
+                        | "std::io::Write::flush"
+                ) && crate::builtins::stream_write_receiver(self_ty))
         } else {
             INHERENT_METHODS.contains(&canonical.as_str())
         };

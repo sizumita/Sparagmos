@@ -40048,3 +40048,117 @@ fn run_mode_vec_tuple_elem_push_and_replace() {
         "w2=3 4\nw2b=7 8\nw2c=9 10\n",
     );
 }
+
+const SELF_SPAWN_SRC: &str = r#"
+use std::env;
+use std::process::Command;
+fn main() {
+    let me = env::args_os().next().unwrap();
+    match env::args().nth(1).as_deref() {
+        Some("child-status") => std::process::exit(7),
+        Some("child-output") => {
+            println!("child out");
+            eprintln!("child err");
+        }
+        Some("child-abort") => std::process::abort(),
+        _ => {
+            // A guest argument beyond argv[0] derefs as an
+            // `OsStr`, like any other `OsString` value.
+            let marker = env::args_os().nth(2).unwrap();
+            assert_eq!(&*marker, "marker");
+            let st = Command::new(&me).arg("child-status").status().unwrap();
+            assert_eq!(st.code(), Some(7));
+            let out = Command::new(&me).arg("child-output").output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(out.stdout, b"child out\n");
+            assert_eq!(out.stderr, b"child err\n");
+            // A child that aborts dies on a signal: no exit
+            // code, as `waitpid` reports it natively.
+            let st = Command::new(&me).arg("child-abort").status().unwrap();
+            assert_eq!(st.code(), None);
+            println!("self spawn ok");
+        }
+    }
+}
+"#;
+
+#[test]
+fn run_mode_guest_spawning_itself_via_status_and_output() {
+    // A guest that spawns its own program path (the
+    // `needs-subprocess` shape throughout the rustc suite)
+    // re-runs itself through the driver: `status` observes
+    // the child's real exit code (or its death by abort),
+    // and `output` captures the child's stdout and stderr.
+    let dir = temp_dir("self-spawn");
+    let src = fixture(&dir, "selfspawn.rs", SELF_SPAWN_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--guest-arg", "parent", "--guest-arg", "marker"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "self-spawning guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "self spawn ok\n");
+}
+
+const SPAWN_GATE_SRC: &str = r#"
+use std::process::Command;
+fn main() {
+    let target = std::env::args().nth(1).unwrap();
+    let err = Command::new(&target).status().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    println!("gate ok");
+}
+"#;
+
+#[test]
+fn run_mode_spawn_of_non_executable_is_an_io_error() {
+    // The spawn gate still applies to programs the run has
+    // not claimed: a data file is not executable, and the
+    // guest observes the permission error as a value.
+    let dir = temp_dir("spawn-gate");
+    let data = fixture(&dir, "data.txt", "not a program\n");
+    let src = fixture(&dir, "gate.rs", SPAWN_GATE_SRC);
+    let data_arg = data.to_string_lossy().into_owned();
+    let out = run_driver_extra(&src, &["--guest-arg", &data_arg]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "gate guest must exit 0; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "gate ok\n");
+}
+
+const STDOUT_WRITE_SRC: &str = r#"
+use std::io::Write;
+fn main() {
+    let mut out = std::io::stdout();
+    let n = out.write(b"direct write\n").unwrap();
+    assert_eq!(n, 13);
+    out.write_all(b"write all\n").unwrap();
+    out.flush().unwrap();
+    let mut v: Vec<u8> = Vec::new();
+    v.write_all(b"vec bytes").unwrap();
+    assert_eq!(v, b"vec bytes");
+    println!("write ok");
+}
+"#;
+
+#[test]
+fn run_mode_write_on_stdout_and_vec() {
+    // `Write::write` / `write_all` / `flush` on the standard
+    // streams and on a `Vec<u8>` are served directly (only
+    // `write_fmt` was, before): the bytes land on the
+    // captured stream / in the vector.
+    run_ok(
+        "stdout-write",
+        STDOUT_WRITE_SRC,
+        "direct write\nwrite all\nwrite ok\n",
+    );
+}

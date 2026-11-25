@@ -7429,6 +7429,38 @@ fn tool_run(
 /// program and when the program itself exits 2, but only
 /// the driver failure reports a `sparagmos-driver` line on
 /// its stderr.
+/// The environment a program run for a tool request runs
+/// under, as a complete assignment: this process's
+/// environment (the guest's own, which the interpreter
+/// answers its environment reads from) with the request's
+/// assignments applied -- or, when the request clears the
+/// environment, exactly the request's assignments.
+fn request_guest_env(
+    request: &sparagmos_interp::ToolRunRequest,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut guest_env: Vec<(Vec<u8>, Vec<u8>)> = if request.env_clear {
+        Vec::new()
+    } else {
+        std::env::vars_os()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    };
+    for (key, value) in &request.envs {
+        match value {
+            Some(v) => {
+                if let Some(slot) = guest_env.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = v.clone();
+                } else {
+                    guest_env.push((key.clone(), v.clone()));
+                }
+            }
+            None => guest_env.retain(|(k, _)| k != key),
+        }
+    }
+    guest_env
+}
+
 fn artifact_run(
     request: &sparagmos_interp::ToolRunRequest,
     registry: &ToolRegistry,
@@ -7510,31 +7542,7 @@ fn artifact_run(
             format!("tool interception: cannot allocate the guest stderr channel: {e}")
         })?;
     drop(stderr_file);
-    // The environment the recorded program runs under, as a
-    // complete assignment: this process's environment (the
-    // guest's own, which the interpreter answers its
-    // environment reads from) with the execution request's
-    // assignments applied -- or, when the request clears the
-    // environment, exactly the request's assignments.
-    let mut guest_env: Vec<(Vec<u8>, Vec<u8>)> = if request.env_clear {
-        Vec::new()
-    } else {
-        std::env::vars_os()
-            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-            .collect()
-    };
-    for (key, value) in &request.envs {
-        match value {
-            Some(v) => {
-                if let Some(slot) = guest_env.iter_mut().find(|(k, _)| k == key) {
-                    slot.1 = v.clone();
-                } else {
-                    guest_env.push((key.clone(), v.clone()));
-                }
-            }
-            None => guest_env.retain(|(k, _)| k != key),
-        }
-    }
+    let guest_env = request_guest_env(request);
     let env_path = write_guest_env_file(&guest_env).map_err(|e| {
         format!("tool interception: cannot record the guest environment: {e}")
     })?;
@@ -7646,6 +7654,181 @@ fn artifact_run(
         stdout,
         stderr: guest_stderr,
     })
+}
+
+/// The invocation context of a plain run, replayed when the
+/// guest spawns the program it is itself running (see
+/// [`execute`]): this run's conversion inputs, so the child
+/// run converts the same source the same way.
+#[derive(Clone)]
+struct SelfRunContext {
+    input: String,
+    edition: String,
+    aux: Vec<String>,
+    rustc_args: Vec<String>,
+}
+
+/// Run the guest program itself for a spawn the interpreter
+/// routed here: the guest invoked `Command` on its own
+/// program (the name this run presents as argv[0]), which is
+/// the standard shape of the test suite's `needs-subprocess`
+/// tests -- a parent run checking a child run's exit status
+/// or collected output. The answer is a subprocess of this
+/// driver binary reconstructing this run under the request's
+/// invocation (arguments, environment, working directory),
+/// exactly as `artifact_run` reconstructs a recorded
+/// program's run; the two differ only in what is replayed
+/// (this run's own conversion inputs, not a registry
+/// artifact's).
+fn self_run(
+    request: &sparagmos_interp::ToolRunRequest,
+    ctx: &SelfRunContext,
+    exe: &std::path::Path,
+) -> Result<sparagmos_interp::ToolRunOutcome, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    let cwd: std::path::PathBuf = match &request.cwd {
+        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        None => std::env::current_dir()
+            .map_err(|e| format!("self spawn: no working directory: {e}"))?,
+    };
+    // As in `artifact_run`: a guest-spelled directory is
+    // relative to this process's own working directory (the
+    // parent the child would have inherited it from), and the
+    // execution directory is handed to a subprocess that
+    // starts in this process's directory, so it must stand on
+    // its own.
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("self spawn: no working directory: {e}"))?
+            .join(cwd)
+    };
+    let program = String::from_utf8_lossy(&request.program).into_owned();
+    // The recorded program's stderr gets its own channel, as
+    // in `artifact_run` (see there): the guest's stderr is
+    // the outcome's, and this process's stderr carries only
+    // the driver's own lines.
+    let (stderr_path, stderr_file) =
+        create_private_temp_file("self-stderr").map_err(|e| {
+            format!("self spawn: cannot allocate the guest stderr channel: {e}")
+        })?;
+    drop(stderr_file);
+    let guest_env = request_guest_env(request);
+    let env_path = write_guest_env_file(&guest_env).map_err(|e| {
+        format!("self spawn: cannot record the guest environment: {e}")
+    })?;
+    // The name the child reads as its argv[0]: the explicit
+    // argv0 the invocation carried, else the program name as
+    // the guest spelled it -- the same name this run presents,
+    // so the child's own self-spawns name it again.
+    let program_name = match &request.argv0 {
+        Some(argv0) => String::from_utf8_lossy(argv0).into_owned(),
+        None => program.clone(),
+    };
+    let mut tail = vec!["run".to_string(), ctx.input.clone()];
+    tail.push("--edition".to_string());
+    tail.push(ctx.edition.clone());
+    for spec in &ctx.aux {
+        tail.push("--aux".to_string());
+        tail.push(spec.clone());
+    }
+    for tok in &ctx.rustc_args {
+        tail.push("--rustc-arg".to_string());
+        tail.push(tok.clone());
+    }
+    tail.push("--guest-cwd".to_string());
+    tail.push(cwd.display().to_string());
+    tail.push("--guest-stderr-file".to_string());
+    tail.push(stderr_path.display().to_string());
+    tail.push("--guest-env-file".to_string());
+    tail.push(env_path.display().to_string());
+    tail.push("--guest-program-name".to_string());
+    tail.push(program_name);
+    // The arguments travel as command-line strings, as in
+    // `artifact_run`: an argument that is not valid UTF-8
+    // cannot be carried without changing its bytes, so the
+    // invocation is unsupported rather than silently lossy.
+    for arg in &request.args {
+        if std::str::from_utf8(arg).is_err() {
+            let _ = std::fs::remove_file(&stderr_path);
+            let _ = std::fs::remove_file(&env_path);
+            return Err(
+                "self spawn: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
+                    .to_string(),
+            );
+        }
+        tail.push("--guest-arg".to_string());
+        tail.push(String::from_utf8_lossy(arg).into_owned());
+    }
+    let start_dir = std::env::current_dir()
+        .map_err(|e| format!("self spawn: no working directory: {e}"))?;
+    let outcome = run_convert_subprocess(exe, &tail, &start_dir, false, &[]);
+    let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stderr_path);
+    let _ = std::fs::remove_file(&env_path);
+    let (code, stdout, stderr) = outcome?;
+    if code == 2 {
+        // As in `artifact_run`: exit 2 is both the
+        // subprocess's driver-failure code and a code the
+        // program itself may exit with; the driver's own
+        // stderr channel tells them apart.
+        let text = String::from_utf8_lossy(&stderr);
+        let reason = text.lines().find_map(|line| {
+            line.strip_prefix("sparagmos-driver run: unsupported: ")
+                .or_else(|| line.strip_prefix("sparagmos-driver: compilation failed: "))
+                .map(|rest| rest.to_string())
+        });
+        let driver_failed = reason.is_some()
+            || text.lines().any(|line| line.starts_with("sparagmos-driver"));
+        if driver_failed {
+            let reason =
+                reason.unwrap_or_else(|| "the program could not be run".to_string());
+            return Err(format!("self spawn: running `{program}`: {reason}"));
+        }
+    }
+    // A guest abort (a panic under `panic=abort`, a panic
+    // escaping a cleanup, an explicit abort) ends the child
+    // driver with the abort report on the guest's stderr
+    // channel and the run's abort exit code -- 134 since the
+    // crash-class judging change gave guest crashes their
+    // own code (the guest-panic code 101 is the older
+    // representation of the same end); natively the child
+    // died on SIGABRT, and the outcome's negative-code
+    // convention carries exactly that (see
+    // `exit_status_value` in the interpreter).
+    let exit_code = if (code == 101 || code == 134)
+        && String::from_utf8_lossy(&guest_stderr)
+            .lines()
+            .any(|line| line.starts_with("thread 'main' aborted:"))
+    {
+        -6 // SIGABRT
+    } else {
+        code
+    };
+    Ok(sparagmos_interp::ToolRunOutcome {
+        exit_code,
+        stdout,
+        stderr: guest_stderr,
+    })
+}
+
+/// Render an `--aux` spec back to its command-line spelling
+/// (`<name>=<file.rs>` with its `;crate-type=` / `;edition=`
+/// attributes), for replays of this run's invocation (see
+/// [`SelfRunContext`]).
+fn render_aux_spec(spec: &AuxSpec) -> String {
+    let mut out = format!("{}={}", spec.name, spec.path);
+    if let Some(crate_type) = &spec.crate_type {
+        out.push_str(";crate-type=");
+        out.push_str(crate_type);
+    }
+    if let Some(edition) = &spec.edition {
+        out.push_str(";edition=");
+        out.push_str(edition);
+    }
+    out
 }
 
 /// A converted program ready to run, with its entry point
@@ -8221,6 +8404,7 @@ fn execute(
     guest_stderr_file: Option<&str>,
     program_name: Option<&str>,
     process_host: Option<sparagmos_interp::ProcessHost>,
+    self_ctx: &SelfRunContext,
 ) -> i32 {
     // The name the program reads as its argv[0]: the input
     // path by default (the stand-in for the compiled binary's
@@ -8251,7 +8435,25 @@ fn execute(
     // artifact itself, which `artifact_run` answers by
     // interpreting the recorded source.
     let tool_interception = if tool_programs.is_empty() {
-        None
+        // No tool programs were named: the one program the
+        // host answers for is the guest's own. A guest
+        // spawning itself (the `needs-subprocess` test shape:
+        // a parent run checking a child run of the same
+        // program) is routed to `self_run`, which replays
+        // this run's invocation in a driver subprocess; every
+        // other program keeps the process model's standing
+        // answers, and `spawn` of even the guest's own
+        // program stays unsupported (no `Child` handle can be
+        // fabricated for a subprocess run).
+        let exe = std::env::current_exe().unwrap_or_default();
+        let self_ctx = self_ctx.clone();
+        Some(sparagmos_interp::ToolInterception {
+            programs: vec![program_name.as_bytes().to_vec()],
+            runner: sparagmos_interp::ToolRunner(std::sync::Arc::new(
+                move |request| self_run(request, &self_ctx, &exe),
+            )),
+            fallback: None,
+        })
     } else {
         let registry = std::sync::Arc::new(ToolRegistry::default());
         let exe = std::env::current_exe().unwrap_or_default();
@@ -8279,10 +8481,15 @@ fn execute(
         guest_args: guest_args.to_vec(),
         program_path: program_name.to_string(),
         overflow_checks,
-        // Real child processes only in a run without tool
-        // interception: a recipe's invocations are the tool
-        // runner's to answer, and its runs configure no host.
-        process_host: if tool_interception.is_none() {
+        // Real child processes in any run that named no
+        // tool programs: a recipe's invocations are the
+        // tool runner's to answer, and its runs configure
+        // no host. The self-spawn interception installed
+        // above claims only the guest's own argv[0] name;
+        // every other program is the host's to serve (the
+        // interpreter consults the interception first and
+        // the host for the rest), so the two coexist here.
+        process_host: if tool_programs.is_empty() {
             process_host.clone()
         } else {
             None
@@ -9977,6 +10184,15 @@ fn driver_main() {
     // The `--extern` names among them are captured first: the
     // auxiliary binding below counts them as declarations.
     let locator_names = locator_extern_names(&rustc_args);
+    // The invocation context a guest self-spawn replays (see
+    // `self_run`), captured before the argument vector is
+    // consumed by the conversion's own argument assembly.
+    let self_ctx = SelfRunContext {
+        input: input.clone(),
+        edition: edition.clone(),
+        aux: aux_specs.iter().map(render_aux_spec).collect(),
+        rustc_args: rustc_args.clone(),
+    };
     args.extend(rustc_args);
     if !aux_built.is_empty() {
         args.push("-L".to_string());
@@ -10192,6 +10408,7 @@ fn driver_main() {
                     guest_stderr_file.as_deref(),
                     guest_program_name.as_deref(),
                     process_host,
+                    &self_ctx,
                 ));
             }
             print_convert_report(&c, &input);

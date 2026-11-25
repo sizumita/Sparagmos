@@ -320,8 +320,9 @@ pub enum Builtin {
     /// (argv[0] plus the configured guest arguments).
     EnvArgs,
     /// `std::env::args_os() -> ArgsOs`: the run's argument iterator
-    /// over `OsString` values, which are the string values
-    /// themselves in this model (guest arguments are text).
+    /// over `OsString` values (the stored elements are the
+    /// argument strings; the iterator step presents each in
+    /// the standard `OsString` buffer form).
     EnvArgsOs,
     /// `std::env::current_exe() -> io::Result<PathBuf>`: the
     /// host executable's path (the driver binary's own path —
@@ -470,6 +471,10 @@ pub enum Builtin {
     /// `std::process::exit(code)`: end the run with the given
     /// exit code (see `InterpError::ProcessExit`).
     ProcessExit,
+    /// `core::intrinsics::abort()` / `std::process::abort()`:
+    /// end the run as an abort (see `InterpError::Abort`), the
+    /// guest-side equivalent of dying on `SIGABRT`.
+    IntrinsicsAbort,
     /// `std::io::stdout() -> Stdout`: the standard output handle.
     /// The handle value is a marker in this model: writes through
     /// it are modelled by the `Write` builtins, which dispatch on
@@ -2393,6 +2398,35 @@ fn fmt_result_ok() -> Value {
 /// Look a canonical callee name up in the registry, spelled
 /// exactly as given; `None` when the interpreter has no model
 /// for it.
+/// Whether a `Write` method's `Self` type (reference markers
+/// stripped) is one of the non-file receivers the interpreter
+/// serves through its captured streams or an in-place append:
+/// the public `std::io` stream handles and their locks, the
+/// `std::sys` stdio handles the panic runtime writes through
+/// directly, or a `Vec<u8>`.
+pub(crate) fn stream_write_receiver(self_ty: &str) -> bool {
+    matches!(
+        self_ty,
+        "std::io::Stdout"
+            | "std::io::StdoutLock"
+            | "std::io::Stderr"
+            | "std::io::StderrLock"
+            | "std::sys::stdio::unix::Stdout"
+            | "std::sys::stdio::unix::Stderr"
+    ) || self_ty.starts_with("std::vec::Vec<u8")
+}
+
+/// Whether a standard-stream receiver writes to the captured
+/// error stream (rather than the captured output stream).
+fn stream_is_stderr(self_ty: &str) -> bool {
+    matches!(
+        self_ty,
+        "std::io::Stderr"
+            | "std::io::StderrLock"
+            | "std::sys::stdio::unix::Stderr"
+    )
+}
+
 /// Whether this call is a file-I/O builtin node: a `Read` /
 /// `Write` / `Seek` method whose `Self` is `std::fs::File`,
 /// or one of `File`'s inherent handle methods. Conversion
@@ -2400,7 +2434,10 @@ fn fmt_result_ok() -> Value {
 /// `file_io_terminator` in mir_convert); the inherent names
 /// are File-unique, and the trait names are gated on the
 /// `Self` type so other receivers keep their collected
-/// bodies.
+/// bodies. The `Write` methods additionally serve the
+/// standard-stream and `Vec<u8>` receivers (see
+/// `stream_write_receiver`), whose writes the interpreter
+/// models through its captured streams / an in-place append.
 fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
     match name {
         "std::fs::File::metadata"
@@ -2414,9 +2451,6 @@ fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
         | "std::io::Read::read_to_string"
         | "std::io::Read::read_buf"
         | "std::io::Read::read_buf_exact"
-        | "std::io::Write::write"
-        | "std::io::Write::write_all"
-        | "std::io::Write::flush"
         | "std::io::Seek::seek"
         | "std::io::Seek::rewind"
         | "std::io::Seek::stream_position" => generic_args
@@ -2427,6 +2461,19 @@ fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
                     .trim()
             })
             == Some("std::fs::File"),
+        "std::io::Write::write"
+        | "std::io::Write::write_all"
+        | "std::io::Write::flush" => {
+            let self_ty = generic_args
+                .first()
+                .map(|tag| {
+                    tag.trim_start_matches("&mut ")
+                        .trim_start_matches('&')
+                        .trim()
+                })
+                .unwrap_or("");
+            self_ty == "std::fs::File" || stream_write_receiver(self_ty)
+        }
         _ => false,
     }
 }
@@ -2512,6 +2559,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::sys::fs::set_permissions" => Builtin::FsSys(FsSysOp::SetPermissions),
         "std::sys::fs::symlink" => Builtin::FsSys(FsSysOp::Symlink),
         "std::process::exit" => Builtin::ProcessExit,
+        "std::process::abort" => Builtin::IntrinsicsAbort,
+        "std::intrinsics::abort" | "core::intrinsics::abort" => {
+            Builtin::IntrinsicsAbort
+        }
         "std::io::stdout" => Builtin::Stdout,
         "std::io::Stdout::lock" | "std::io::Stderr::lock" => Builtin::StdStreamLock,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
@@ -5053,19 +5104,21 @@ impl<'a> Interpreter<'a> {
             let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
             return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
         }
-        // `Read` / `Write` / `Seek` on `std::fs::File` and
-        // `File`'s inherent handle methods: conversion emits a
-        // builtin node only for those calls (see
-        // `file_io_terminator` in mir_convert). The names are
-        // deliberately absent from `lookup`, so the driver's
-        // reach pass still collects the other receivers' bodies
-        // (a `&[u8]` reader's `read` among them).
+        // `Read` / `Write` / `Seek` on `std::fs::File`, the
+        // `Write` methods on the standard streams and
+        // `Vec<u8>`, and `File`'s inherent handle methods:
+        // conversion emits a builtin node only for those calls
+        // (see `file_io_terminator` in mir_convert). The names
+        // are deliberately absent from `lookup`, so the
+        // driver's reach pass still collects the other
+        // receivers' bodies (a `&[u8]` reader's `read` among
+        // them).
         if is_file_io_call(name, generic_args) {
             let mut vals = Vec::with_capacity(args.len());
             for arg in args {
                 vals.push(self.eval_operand(frames, body, arg)?);
             }
-            return self.exec_file_io(frames, name, vals);
+            return self.exec_file_io(frames, name, generic_args, vals);
         }
         let kind = lookup(name)
             .or_else(|| foreign_helper_lookup(name))
@@ -5571,6 +5624,12 @@ impl<'a> Interpreter<'a> {
                 let code = as_i128(&vals[0], name)? as i32;
                 Err(InterpError::ProcessExit { code })
             }
+            Builtin::IntrinsicsAbort => {
+                arity(0)?;
+                Err(InterpError::Abort {
+                    message: "explicit abort".to_string(),
+                })
+            }
             Builtin::Stdout => {
                 arity(0)?;
                 Ok(Value::Enum {
@@ -5593,10 +5652,14 @@ impl<'a> Interpreter<'a> {
                 let text =
                     self.format_arguments(frames, &self.coerce_arguments(frames, &vals[1], name)?, 0)?;
                 match self_ty {
-                    "std::io::Stdout" | "std::io::StdoutLock" => {
+                    "std::io::Stdout"
+                    | "std::io::StdoutLock"
+                    | "std::sys::stdio::unix::Stdout" => {
                         self.push_output(&text);
                     }
-                    "std::io::Stderr" | "std::io::StderrLock" => {
+                    "std::io::Stderr"
+                    | "std::io::StderrLock"
+                    | "std::sys::stdio::unix::Stderr" => {
                         self.push_error_output(&text);
                     }
                     "std::fs::File" => {
@@ -6714,7 +6777,7 @@ impl<'a> Interpreter<'a> {
                 let state = self
                     .command_snapshot(id)
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
-                match process_spawn_error(&state) {
+                match spawn_gate_error(self.tool_interception(), &state) {
                     Some(error) => Ok(err_result(error)),
                     None => {
                         // `Command::status` runs the program and
@@ -6871,7 +6934,7 @@ impl<'a> Interpreter<'a> {
                 let state = self
                     .command_snapshot(id)
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
-                match process_spawn_error(&state) {
+                match spawn_gate_error(self.tool_interception(), &state) {
                     Some(error) => Ok(err_result(error)),
                     None => {
                         check_stdio_modelled(&state)?;
@@ -17020,12 +17083,16 @@ fn value_fingerprint(value: &Value) -> u64 {
             // `Args { inner: ArgsOs }` / `ArgsOs { inner:
             // sys::args::common::Args }` / the common `Args {
             // inner: vec::IntoIter }`: step the innermost owned-iterator
-            // state and rebuild the wrappers. The yielded
-            // `OsString` is the string value itself in this model,
-            // so `Args::next`'s OsString-to-String conversion is
-            // the identity (the arguments are always valid text
-            // here, so the native panic on invalid Unicode cannot
-            // arise).
+            // state and rebuild the wrappers. The stored
+            // elements are the argument strings themselves;
+            // `Args::next` yields them as-is, so its
+            // OsString-to-String conversion is the identity
+            // (the arguments are always valid text here, so
+            // the native panic on invalid Unicode cannot
+            // arise), while `ArgsOs::next` yields each element
+            // in the standard `OsString` buffer form the
+            // OsString consumers (deref, lossy conversion,
+            // command construction) read.
             let depth = if self_ty_is(self_ty, "std::env::Args") { 3 } else { 2 };
             let mut inner = &state;
             for _ in 0..depth {
@@ -17048,6 +17115,14 @@ fn value_fingerprint(value: &Value) -> u64 {
                     fields: vec![rebuilt],
                 };
             }
+            let item = if self_ty_is(self_ty, "std::env::ArgsOs") {
+                item.map(|value| match value {
+                    Value::Str(text) => os_string_value(text.as_bytes()),
+                    other => other,
+                })
+            } else {
+                item
+            };
             return Ok((
                 rebuilt,
                 match item {
@@ -19650,18 +19725,27 @@ fn value_fingerprint(value: &Value) -> u64 {
 
     /// Execute one file-I/O builtin node (see
     /// `file_io_terminator` in `mir_convert`): a `Read` /
-    /// `Write` / `Seek` method on `std::fs::File`, or one of
-    /// `File`'s inherent handle methods. Every operation
-    /// delegates to the host file in the interpreter's file
-    /// table; the guest-visible results are std's own shapes
+    /// `Write` / `Seek` method on `std::fs::File`, a `Write`
+    /// method on a standard stream or a `Vec<u8>`, or one of
+    /// `File`'s inherent handle methods. File operations
+    /// delegate to the host file in the interpreter's file
+    /// table; stream writes go to the captured output the
+    /// stream denotes, and a `Vec<u8>` write appends in
+    /// place. The guest-visible results are std's own shapes
     /// (the host errno in the `Os` error form, the bare-kind
     /// form for the errors std raises itself).
     fn exec_file_io(
         &mut self,
         frames: &mut Vec<Frame>,
         name: &str,
+        generic_args: &[String],
         vals: Vec<Value>,
     ) -> InterpResult<Value> {
+        let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+        let self_ty = self_ty
+            .strip_prefix("&mut ")
+            .or_else(|| self_ty.strip_prefix("&"))
+            .unwrap_or(self_ty);
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
                 Ok(())
@@ -19957,8 +20041,21 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             "std::io::Write::write" => {
                 arity(2)?;
-                let id = self.file_id_of(frames, &vals[0])?;
                 let bytes = self.slice_bytes(frames, &vals[1], name)?;
+                if self_ty.starts_with("std::vec::Vec<u8") {
+                    self.append_bytes_to_vec(frames, &vals[0], &bytes)?;
+                    return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
+                }
+                if stream_write_receiver(self_ty) {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if stream_is_stderr(self_ty) {
+                        self.push_error_output(&text);
+                    } else {
+                        self.push_output(&text);
+                    }
+                    return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
+                }
+                let id = self.file_id_of(frames, &vals[0])?;
                 let written = self.with_file(id, |f| {
                     <std::fs::File as std::io::Write>::write(f, &bytes)
                 });
@@ -19966,8 +20063,21 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             "std::io::Write::write_all" => {
                 arity(2)?;
-                let id = self.file_id_of(frames, &vals[0])?;
                 let bytes = self.slice_bytes(frames, &vals[1], name)?;
+                if self_ty.starts_with("std::vec::Vec<u8") {
+                    self.append_bytes_to_vec(frames, &vals[0], &bytes)?;
+                    return Ok(io_result_ok(Value::Unit));
+                }
+                if stream_write_receiver(self_ty) {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if stream_is_stderr(self_ty) {
+                        self.push_error_output(&text);
+                    } else {
+                        self.push_output(&text);
+                    }
+                    return Ok(io_result_ok(Value::Unit));
+                }
+                let id = self.file_id_of(frames, &vals[0])?;
                 let written = self.with_file(id, |f| {
                     <std::fs::File as std::io::Write>::write_all(f, &bytes)
                 });
@@ -19975,6 +20085,11 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             "std::io::Write::flush" => {
                 arity(1)?;
+                if stream_write_receiver(self_ty) {
+                    // The captured streams are unbuffered in
+                    // this model; there is nothing to flush.
+                    return Ok(io_result_ok(Value::Unit));
+                }
                 let id = self.file_id_of(frames, &vals[0])?;
                 let flushed = self.with_file(id, |f| {
                     <std::fs::File as std::io::Write>::flush(f)
@@ -20920,6 +21035,22 @@ fn value_fingerprint(value: &Value) -> u64 {
             (Value::Bytes(x), Value::Tuple(y)) | (Value::Tuple(y), Value::Bytes(x)) => {
                 x.len() == y.len()
                     && x.iter().zip(y.iter()).all(|(byte, elem)| {
+                        matches!(elem, Value::Uint(v) if *v == u128::from(*byte))
+                            || matches!(elem, Value::Int(v) if *v == i128::from(*byte))
+                    })
+            }
+            // A byte string and an element-list aggregate of
+            // byte values: the two shapes of one byte sequence
+            // (a `Vec<u8>` the process model builds from a
+            // child's captured output is the element list; a
+            // byte-string constant is the bytes).
+            (Value::Enum { fields: x, .. }, Value::Bytes(y))
+            | (Value::Bytes(y), Value::Enum { fields: x, .. })
+                if x.iter()
+                    .all(|e| matches!(e, Value::Uint(_) | Value::Int(_))) =>
+            {
+                x.len() == y.len()
+                    && x.iter().zip(y.iter()).all(|(elem, byte)| {
                         matches!(elem, Value::Uint(v) if *v == u128::from(*byte))
                             || matches!(elem, Value::Int(v) if *v == i128::from(*byte))
                     })
@@ -25384,6 +25515,14 @@ fn iterator_next_back_state(
                 fields: vec![rebuilt],
             };
         }
+        let item = if self_ty_is(self_ty, "std::env::ArgsOs") {
+            item.map(|value| match value {
+                Value::Str(text) => os_string_value(text.as_bytes()),
+                other => other,
+            })
+        } else {
+            item
+        };
         return Ok((rebuilt, item));
     }
     let fields = iterator_fields(state, self_ty)?;
@@ -28148,6 +28287,27 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::Pat
 /// unresolvable program fails the `exec`. `None` means the
 /// program would start — which the process model does not do,
 /// so the caller reports it as a named unsupported error.
+/// The spawn gate for a command: the `io::Error` the spawn
+/// fails with, if it fails at all. A program the run's tool
+/// interception claims by name is exempt from the filesystem
+/// resolution `process_spawn_error` performs: the host side
+/// has taken responsibility for that program, so whether it
+/// can start is the host's call. The claimed name in a plain
+/// run is the guest's own program -- a source path, which the
+/// filesystem check would refuse as not executable even
+/// though the host runs it by re-interpreting the source.
+fn spawn_gate_error(
+    interception: Option<&crate::interp::ToolInterception>,
+    state: &crate::interp::CommandState,
+) -> Option<Value> {
+    if let Some(interception) = interception {
+        if interception.programs.iter().any(|p| p == &state.program) {
+            return None;
+        }
+    }
+    process_spawn_error(state)
+}
+
 fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
     use std::os::unix::ffi::OsStrExt;
     if state.saw_nul {
