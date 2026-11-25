@@ -1,4 +1,4 @@
-use super::{fixture, run_driver, run_driver_extra, run_ok, temp_dir};
+use super::{Command, Output, Path, fixture, run_driver, run_driver_extra, run_ok, temp_dir};
 
 
 // ----- RefCell model (Lane CC) -----
@@ -663,4 +663,205 @@ fn run_mode_barrier_releases_both_parties() {
     assert!(stdout.contains("thread leader=true"), "stdout={stdout}");
     assert!(stdout.contains("main leader=false"), "stdout={stdout}");
     assert!(stdout.contains("joined"), "stdout={stdout}");
+}
+
+/// Run the driver in `--test` harness mode: the fixture is a
+/// test crate and the modelled libtest harness runs its tests.
+fn run_driver_test_harness(src: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .arg("--rustc-arg")
+        .arg("--test")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+const SCHED_SPIN_TRY_RECV_SRC: &str = r#"use std::sync::mpsc::channel;
+fn main() {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for i in 0..5 {
+            tx.send(i).unwrap();
+        }
+    });
+    // The entry thread spins on `try_recv`: every call must
+    // honestly report `Empty` until the producer has run, and
+    // the producer only runs if the spinner yields the
+    // scheduler (the shape of tests/ui/threads-sendsync's
+    // issue-9396, which starved before time-slicing).
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        if let Ok(v) = rx.try_recv() {
+            got.push(v);
+        }
+    }
+    assert_eq!(got, vec![0, 1, 2, 3, 4]);
+    println!("try_recv spin ok");
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_spin_try_recv_interleaves() {
+    let dir = temp_dir("sched-spin-try-recv");
+    let src = fixture(&dir, "spin_try_recv.rs", SCHED_SPIN_TRY_RECV_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "try_recv spin ok\n");
+}
+
+const SCHED_PRODUCER_CONSUMER_SRC: &str = r#"use std::sync::mpsc::channel;
+fn main() {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut i = 0;
+        loop {
+            tx.send(i).unwrap();
+            i += 1;
+        }
+    });
+    // An unbounded producer drained by the entry thread's own
+    // `recv`: the producer must yield back to the blocked
+    // consumer instead of filling the channel until the step
+    // budget ends the run (the shape of issue-8827).
+    for expected in 0..20 {
+        assert_eq!(rx.recv().unwrap(), expected);
+    }
+    println!("producer consumer ok");
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_unbounded_producer_yields_to_consumer() {
+    let dir = temp_dir("sched-producer-consumer");
+    let src = fixture(&dir, "producer_consumer.rs", SCHED_PRODUCER_CONSUMER_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "producer consumer ok\n"
+    );
+}
+
+const SCHED_SPIN_BARRIER_SRC: &str = r#"use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+fn main() {
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let a2 = arrived.clone();
+    let h = std::thread::spawn(move || {
+        a2.fetch_add(1, Ordering::SeqCst);
+        while a2.load(Ordering::SeqCst) < 2 {}
+        7
+    });
+    arrived.fetch_add(1, Ordering::SeqCst);
+    while arrived.load(Ordering::SeqCst) < 2 {}
+    assert_eq!(h.join().unwrap(), 7);
+    println!("spin barrier ok");
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_guest_spin_barrier_rendezvous() {
+    let dir = temp_dir("sched-spin-barrier");
+    let src = fixture(&dir, "spin_barrier.rs", SCHED_SPIN_BARRIER_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "spin barrier ok\n");
+}
+
+const SCHED_JOIN_FAIRNESS_SRC: &str = r#"use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+fn main() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f2 = flag.clone();
+    let spinner = std::thread::spawn(move || {
+        while !f2.load(Ordering::SeqCst) {}
+        9
+    });
+    let f3 = flag.clone();
+    let setter = std::thread::spawn(move || {
+        let mut x = 0u64;
+        for i in 0..1000 {
+            x += i;
+        }
+        f3.store(true, Ordering::SeqCst);
+        x
+    });
+    // Joining the spinner first must not starve the setter:
+    // the join's scheduling passes interleave both threads.
+    assert_eq!(spinner.join().unwrap(), 9);
+    assert_eq!(setter.join().unwrap(), 499500);
+    println!("join fairness ok");
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_join_does_not_starve_third_thread() {
+    let dir = temp_dir("sched-join-fairness");
+    let src = fixture(&dir, "join_fairness.rs", SCHED_JOIN_FAIRNESS_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "join fairness ok\n");
+}
+
+const SCHED_HARNESS_SPIN_SRC: &str = r#"use std::sync::mpsc::channel;
+
+fn spin_on_channel() {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for i in 0..5 {
+            tx.send(i).unwrap();
+        }
+    });
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        if let Ok(v) = rx.try_recv() {
+            got.push(v);
+        }
+    }
+    assert_eq!(got, vec![0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn test_body_threads_interleave() {
+    spin_on_channel();
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_harness_test_body_interleaves() {
+    let dir = temp_dir("sched-harness-spin");
+    let src = fixture(&dir, "harness_spin.rs", SCHED_HARNESS_SPIN_SRC);
+    let out = run_driver_test_harness(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "stdout={stdout}"
+    );
 }

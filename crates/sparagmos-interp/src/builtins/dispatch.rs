@@ -1062,12 +1062,17 @@ impl<'a> Interpreter<'a> {
                     variant: 0,
                     fields: Vec::new(),
                 }));
+                // The scope body is an arbitrary guest program
+                // and runs as a scheduled region, so the
+                // threads it spawns interleave with it instead
+                // of waiting for the scope-exit drain below.
                 let result =
-                    self.call_callable_to_completion(frames, &callable, vec![scope_ref])?;
+                    self.call_callable_scheduled(frames, &callable, vec![scope_ref])?;
                 // Every thread spawned inside the scope must
                 // finish before the scope returns; the cooperative
-                // model runs all pending threads here.
-                self.drain_threads(frames)?;
+                // model runs all pending threads here, quantum by
+                // quantum until none are left.
+                self.drain_threads_to_completion(frames)?;
                 Ok(result)
             }
             Builtin::ThreadCurrent => {
@@ -1405,7 +1410,11 @@ impl<'a> Interpreter<'a> {
                     let out_mark = self.output_len();
                     let err_mark = self.error_output_len();
                     self.clear_panic_stamp();
-                    let result = self.call_callable_to_completion(
+                    // A test body is an arbitrary guest
+                    // program: it runs as a scheduled region so
+                    // its own threads interleave with it (see
+                    // `Interpreter::drive_scheduled`).
+                    let result = self.call_callable_scheduled(
                         frames,
                         &test.callable,
                         Vec::new(),

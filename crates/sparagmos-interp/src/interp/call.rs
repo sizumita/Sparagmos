@@ -957,7 +957,29 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let depth = frames.len();
         self.start_detached_call(frames, func, arg_values)?;
-        self.drive(frames, depth)
+        // A detached call is a scheduled region like any other
+        // (see `drive_scheduled`): the try function of a
+        // `catch_unwind`, a destructor body, or another runtime
+        // callback may itself spawn threads and spin, so a yield
+        // raised inside is served by a scheduling pass here and
+        // the region resumes; the caller only ever observes the
+        // region's own outcome.
+        loop {
+            let prev_segment = self.segment.replace(SegmentMark {
+                depth: self.drive_depth + 1,
+                thread: self.current_thread_id(),
+                steps0: self.steps,
+            });
+            let result = self.drive(frames, depth);
+            self.segment = prev_segment;
+            match result {
+                Err(InterpError::Yield) => {
+                    self.drain_threads(frames)?;
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Call `func` synchronously from within the interpreter
