@@ -1533,6 +1533,62 @@ fn run_mode_str_matches_eq_family() {
     );
 }
 
+const STR_SPLIT_WHITESPACE_SRC: &str = r#"
+fn show(label: &str, v: Vec<&str>) {
+    println!("{label}={v:?}");
+}
+
+fn main() {
+    show("basic", " a b  c ".split_whitespace().collect());
+    show("empty", "".split_whitespace().collect());
+    show("ws-only", " \t\n\u{2003} ".split_whitespace().collect());
+    show("single", "hello".split_whitespace().collect());
+    show("unicode", "a\u{2003}b\u{00a0}c".split_whitespace().collect());
+    let mut it = "a b  c d".split_whitespace();
+    println!("f1={:?}", it.next());
+    println!("b1={:?}", it.next_back());
+    println!("f2={:?}", it.next());
+    println!("b2={:?}", it.next_back());
+    println!("b3={:?}", it.next_back());
+    println!("cnt={}", "  one\ttwo\nthree  ".split_whitespace().count());
+    show("rev", "p q r".split_whitespace().rev().collect());
+    let lens: Vec<usize> = "aa b ccc".split_whitespace().map(|s| s.len()).collect();
+    println!("lens={lens:?}");
+}
+"#;
+
+#[test]
+fn run_mode_str_split_whitespace() {
+    // `str::split_whitespace`: core defines the iterator as
+    // a one-field wrapper over
+    // `Filter<Split<IsWhitespace>, IsNotEmpty>`, and both
+    // callables are zero-sized `Fn` types (the
+    // `impl_fn_for_zst!` family), so the step delegates to
+    // the wrapped `Filter` under its tag and both predicates
+    // are applied through the type-directed dispatch -- the
+    // `IsWhitespace` pattern inside the split's predicate
+    // searcher and the `IsNotEmpty` filter predicate.
+    // Expected output was produced by the native 1.100.0
+    // toolchain.
+    run_ok(
+        "str-split-whitespace",
+        STR_SPLIT_WHITESPACE_SRC,
+        "basic=[\"a\", \"b\", \"c\"]\n\
+         empty=[]\n\
+         ws-only=[]\n\
+         single=[\"hello\"]\n\
+         unicode=[\"a\", \"b\", \"c\"]\n\
+         f1=Some(\"a\")\n\
+         b1=Some(\"d\")\n\
+         f2=Some(\"b\")\n\
+         b2=Some(\"c\")\n\
+         b3=None\n\
+         cnt=3\n\
+         rev=[\"r\", \"q\", \"p\"]\n\
+         lens=[2, 1, 3]\n",
+    );
+}
+
 const WRAPPER_DEFAULT_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
