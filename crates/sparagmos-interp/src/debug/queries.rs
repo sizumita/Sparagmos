@@ -592,48 +592,89 @@ fn fn_pattern_search(pattern: &str, text: &str) -> bool {
 }
 
 /// Render gdb's `info functions [-q] [pattern]`: one
-/// declaration line per body of the program whose name the
-/// pattern matches (every body without a pattern), in name
-/// order. The `-q` form carries the `static fn` prefix and
-/// the signature; the plain form is `fn <name>();`.
+/// declaration line per function of the program whose name
+/// the pattern matches (every function without a pattern),
+/// in name order. The `-q` form carries the `static fn`
+/// prefix and the signature; the plain form is
+/// `fn <name>();`.
+///
+/// Entries come from two sources. A converted body renders
+/// from its own key and local types, as the interpreter has
+/// always spelled them. The driver's display-name table
+/// ([`crate::ir::Program::fn_display_names`]) names resolved
+/// instances the way the compiler's debug info does —
+/// generic arguments substituted, trait-impl methods under
+/// their `{impl#N}` scope, closures with their single
+/// environment-pointer parameter — and a table entry whose
+/// name equals a body's rendered name takes the body's
+/// place: the body's own signature derivation is the wrong
+/// one there (a closure body's parameters are its captures,
+/// not the environment pointer the debug info declares).
+/// Table entries with no converted body are listed on their
+/// own: the debug info names every instance the program
+/// resolved, converted or not.
 pub(super) fn render_info_functions(
     interp: &Interpreter,
     pattern: Option<&str>,
     quiet: bool,
 ) -> Vec<String> {
     let program = interp.program();
-    let mut names: Vec<&String> = program.functions.keys().collect();
-    names.sort();
-    let mut lines = Vec::new();
-    for name in names {
-        if let Some(pat) = pattern {
-            if !fn_pattern_search(pat, name) {
-                continue;
-            }
-        }
+    let mut table: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for (display, signature) in &program.fn_display_names {
+        table.insert(display.as_str(), signature.as_str());
+    }
+    // (rendered name, signature line, spellings the pattern
+    // may match: the body key and the rendered name).
+    let mut entries: Vec<(String, String, Vec<String>)> = Vec::new();
+    for name in program.functions.keys() {
+        let rendered = dwarf_type_name(name);
         let Some(body) = program.get(name) else {
             continue;
         };
-        // The declaration gdb's full-debuginfo listing prints:
-        // the signature form, with the return type omitted for
-        // the unit and never types (both print as no return).
-        let signature = {
-            let args: Vec<String> = (1..=body.arg_count)
-                .filter_map(|i| body.local_tys.get(i).map(ir_ty_name))
-                .collect();
-            let ret = match body.local_tys.first() {
-                Some(Ty::Unit) | Some(Ty::Never) | None => String::new(),
-                Some(ty) => format!(" -> {}", ir_ty_name(ty)),
-            };
-            format!(
-                "static fn {}({}){};",
-                dwarf_type_name(name),
-                args.join(", "),
-                ret
-            )
+        let signature = match table.remove(rendered.as_str()) {
+            Some(sig) => format!("static fn {rendered}{sig};"),
+            None => {
+                // The declaration gdb's full-debuginfo listing
+                // prints: the signature form, with the return
+                // type omitted for the unit and never types
+                // (both print as no return).
+                let args: Vec<String> = (1..=body.arg_count)
+                    .filter_map(|i| body.local_tys.get(i).map(ir_ty_name))
+                    .collect();
+                let ret = match body.local_tys.first() {
+                    Some(Ty::Unit) | Some(Ty::Never) | None => String::new(),
+                    Some(ty) => format!(" -> {}", ir_ty_name(ty)),
+                };
+                format!("static fn {rendered}({}){ret};", args.join(", "))
+            }
         };
+        entries.push((
+            rendered.clone(),
+            signature,
+            vec![name.clone(), rendered],
+        ));
+    }
+    // Table entries no converted body claimed.
+    for (display, signature) in &program.fn_display_names {
+        if table.contains_key(display.as_str()) {
+            entries.push((
+                display.clone(),
+                format!("static fn {display}{signature};"),
+                vec![display.clone()],
+            ));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut lines = Vec::new();
+    for (rendered, signature, spellings) in &entries {
+        if let Some(pat) = pattern {
+            if !spellings.iter().any(|s| fn_pattern_search(pat, s)) {
+                continue;
+            }
+        }
         if quiet {
-            lines.push(signature);
+            lines.push(signature.clone());
         } else {
             // The plain listing's declaration form depends on
             // the debug info the binary carries: with full
@@ -641,9 +682,9 @@ pub(super) fn render_info_functions(
             // (`static fn ...`), with line-only info the
             // symbol-table form (`fn ...`). Both are candidate
             // lines, as elsewhere in the renderers.
-            lines.push(format!("fn {}();", dwarf_type_name(name)));
-            lines.push(format!("static fn {}();", dwarf_type_name(name)));
-            lines.push(signature);
+            lines.push(format!("fn {rendered}();"));
+            lines.push(format!("static fn {rendered}();"));
+            lines.push(signature.clone());
         }
     }
     lines

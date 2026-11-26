@@ -30,6 +30,12 @@ pub struct MirProgram {
     /// (std callees, ADT types). Used to name ADT locals and to
     /// resolve calls into runtime support.
     pub fn_names: HashMap<mir::DefId, String>,
+    /// Debugger display names of the program's resolved
+    /// function instances, as recorded by the driver (see
+    /// `ir::Program::fn_display_names`): `(display name,
+    /// declaration signature)` pairs. Empty unless the driver
+    /// collected a debugger session.
+    pub fn_display_names: Vec<(String, String)>,
     /// Declared ABIs of the program's function instances, keyed
     /// by the same `DefId` a converted body carries, as recorded
     /// by the driver when it registered each instance.

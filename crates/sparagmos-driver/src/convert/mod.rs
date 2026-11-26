@@ -38,6 +38,7 @@ use rustc_public::{CrateDef, CrateDefType};
 use sparagmos_mir as sm;
 
 mod guard;
+mod display_names;
 mod statics;
 mod subst;
 mod screen;
@@ -55,6 +56,7 @@ mod helpers;
 // visibility, and some are not referenced through this facade; both
 // are intentional, so the unused-imports lint is allowed here.
 pub(crate) use self::guard::*;
+pub(crate) use self::display_names::*;
 pub(crate) use self::statics::*;
 pub(crate) use self::subst::*;
 pub(crate) use self::screen::*;
@@ -72,6 +74,7 @@ pub use self::guard::{
     resolution_emitted, resolve_closure_guarded, resolve_instance_guarded, set_compiler_tcx,
     with_body_materialization,
 };
+pub use self::display_names::{drain_fn_display_names, set_debug_session};
 pub use self::helpers::{
     args_mention_params, closure_kind, coroutine_closure_args, def_fn_abi, instance_fn_abi,
 };
