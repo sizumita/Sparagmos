@@ -438,6 +438,25 @@ pub(crate) enum Resolved {
     },
 }
 
+/// Where the `dyn` identity of a borrow whose own type is a
+/// trait object comes from, when the borrowed place is not
+/// itself a fat pointer (see
+/// [`Interpreter::dyn_borrow_source`]).
+pub(crate) enum DynBorrowSource {
+    /// The value stored at the place is a fat pointer: the
+    /// borrow is that fat pointer itself (a reborrow of it).
+    Stored(Value),
+    /// The place is the unsized tail of the pointee a fat
+    /// pointer denotes: the borrow is a fat pointer over the
+    /// thin borrow, with the crossed pointer's concrete type
+    /// and drop glue, answering to the borrow's own bounds.
+    Crossed {
+        concrete: String,
+        traits: Vec<String>,
+        drop_glue: Option<Box<crate::ir::DropGlue>>,
+    },
+}
+
 /// The interpreter state for one program.
 pub struct Interpreter<'a> {
     program: &'a Program,

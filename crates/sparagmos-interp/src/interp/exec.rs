@@ -3430,6 +3430,29 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 };
+                // A borrow whose own type is a trait object, of
+                // a place that is not itself a fat pointer (the
+                // unsized tail of a DST struct behind a fat
+                // pointer, or a place holding a fat pointer):
+                // the borrow still denotes a trait object, so
+                // its `dyn` identity is recovered from the fat
+                // pointer attached to the place (see
+                // `dyn_borrow_source`). Without it the borrow
+                // is a thin reference whose method calls never
+                // engage virtual dispatch.
+                let dyn_source = match dest_ty {
+                    Some(Ty::Ref(inner)) => match &**inner {
+                        Ty::Dynamic(dest_traits) => self.dyn_borrow_source(
+                            frames,
+                            body,
+                            place,
+                            &target,
+                            dest_traits,
+                        ),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 // A pointer to an unsized pointee (a slice or
                 // `str`) is a fat pointer: it must carry the
                 // pointee's length as its metadata, or `PtrMetadata`
@@ -3498,6 +3521,22 @@ impl<'a> Interpreter<'a> {
                         Value::Ref(RefTarget::Alloc { id, projection })
                     }
                 };
+                match dyn_source {
+                    Some(DynBorrowSource::Stored(v)) => return Ok(v),
+                    Some(DynBorrowSource::Crossed {
+                        concrete,
+                        traits,
+                        drop_glue,
+                    }) => {
+                        return Ok(Value::DynRef {
+                            base: Box::new(thin),
+                            concrete,
+                            traits,
+                            drop_glue,
+                        });
+                    }
+                    None => {}
+                }
                 match fat_len {
                     Some(len) => Ok(Value::FatRef {
                         base: Box::new(thin),
