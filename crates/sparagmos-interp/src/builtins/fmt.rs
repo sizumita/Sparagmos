@@ -2120,6 +2120,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A std lock value (`Mutex` / `RwLock`): std's `Debug`
+        // impls for the lock types are handwritten -- they
+        // acquire the lock, show the guarded value (or the
+        // `<locked>` placeholder while a guard is outstanding),
+        // then the poison flag, and finish non-exhaustively --
+        // and no guest body serves a std Self type, so the
+        // structural engine composes the form here from the
+        // lock aggregate's fields, as it does for the lock
+        // guards above. A lock-shaped value whose state cannot
+        // be read keeps the existing behaviour.
+        if trait_ == FmtTrait::Debug {
+            if let Some(text) =
+                self.format_sync_lock(frames, value, ty, options, indent)?
+            {
+                return Ok(text);
+            }
+        }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(
@@ -2134,6 +2151,115 @@ impl<'a> Interpreter<'a> {
             FmtTrait::LowerExp => self.format_exp(value, ty, false, options),
             FmtTrait::UpperExp => self.format_exp(value, ty, true, options),
         }
+    }
+
+    /// `Debug` for a std lock value (`Mutex` / `RwLock`):
+    /// std's handwritten form, composed from the lock
+    /// aggregate, whose fields are the sys lock, the poison
+    /// flag and the `UnsafeCell` holding the guarded value.
+    /// Whether the acquisition std performs would succeed
+    /// is read from the sys lock's state word: a `Mutex`
+    /// is held while its futex word is nonzero, and an
+    /// `RwLock` refuses a reader only while its state
+    /// word's counter bits hold the write-locked sentinel
+    /// (`(1 << 30) - 1`). The poison flag is the atomic
+    /// bool the flag wraps; a flag with no storage (the
+    /// `panic = "abort"` form, whose `get` is constantly
+    /// `false`) reads as unset. Returns `None` when the
+    /// value does not read as a lock, so the caller keeps
+    /// the existing behaviour.
+    fn format_sync_lock(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let Some((name, elem_ty, rw_lock)) = sync_lock_tag(ty) else {
+            return Ok(None);
+        };
+        let resolved;
+        let value = match value {
+            Value::Ref(_) => {
+                resolved = self.resolve_value(frames, value)?;
+                &resolved
+            }
+            other => other,
+        };
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        if fields.len() != 3 {
+            return Ok(None);
+        }
+        let Some(state) = lock_state_word(&fields[0]) else {
+            return Ok(None);
+        };
+        let locked = if rw_lock {
+            state & 0x3fff_ffff == 0x3fff_ffff
+        } else {
+            state != 0
+        };
+        let poisoned = match scalar_word(&fields[1]) {
+            Some(word) => word != 0,
+            None => match &fields[1] {
+                Value::Enum { fields: inner, .. } if inner.is_empty() => false,
+                Value::Tuple(inner) if inner.is_empty() => false,
+                _ => return Ok(None),
+            },
+        };
+        // The guarded value is the `UnsafeCell`'s payload.
+        let data = match &fields[2] {
+            Value::Enum { fields: inner, .. } if inner.len() == 1 => inner[0].clone(),
+            Value::Tuple(inner) if inner.len() == 1 => inner[0].clone(),
+            other => other.clone(),
+        };
+        let data = if matches!(data, Value::Ref(_)) {
+            self.resolve_value(frames, &data)?
+        } else {
+            data
+        };
+        let data_text = if locked {
+            // The `Mutex` form shows the `&str` placeholder
+            // (quoted, as a string's `Debug` is); the
+            // `RwLock` form shows the bare formatted text
+            // its `format_args!` placeholder renders as.
+            if rw_lock {
+                "<locked>".to_string()
+            } else {
+                "\"<locked>\"".to_string()
+            }
+        } else if options.alternate() {
+            self.format_value(
+                frames,
+                &data,
+                FmtTrait::Debug,
+                &elem_ty,
+                options,
+                indent + 4,
+            )?
+        } else {
+            self.format_value(
+                frames,
+                &data,
+                FmtTrait::Debug,
+                &elem_ty,
+                &FmtOptions::new(),
+                indent,
+            )?
+        };
+        if options.alternate() {
+            let pad = " ".repeat(indent + 4);
+            return Ok(Some(format!(
+                "{name} {{\n{pad}data: {data_text},\n{pad}poisoned: {poisoned},\n{pad}..\n{}}}",
+                " ".repeat(indent)
+            )));
+        }
+        Ok(Some(pad_width(
+            &format!("{name} {{ data: {data_text}, poisoned: {poisoned}, .. }}"),
+            options,
+        )))
     }
 
     /// `Display` / `Debug` for an `io::Error` in the `Custom`
@@ -4563,6 +4689,63 @@ pub(super) fn sync_guard_elem_tag(ty: &str) -> Option<(String, SyncGuardKind)> {
         .into_iter()
         .find(|arg| !is_lifetime_arg(arg))
         .map(|elem| (elem.to_string(), read_guard))
+}
+
+/// The printed name and element type tag of a std lock type
+/// tag (`std::sync::Mutex<T>` / `std::sync::RwLock<T>`),
+/// paired with whether the lock is a read-write lock: std's
+/// `Debug` for an `RwLock` acquires a read guard, so only a
+/// writer blocks it, and its `<locked>` placeholder is the
+/// bare formatted text where the `Mutex`'s is a quoted
+/// string. The head must be followed directly by the
+/// argument list, as in `guard_elem_tag`, so the guard
+/// types (`MutexGuard`, ...) do not match.
+pub(super) fn sync_lock_tag(ty: &str) -> Option<(&'static str, String, bool)> {
+    let plain = pointee_tag(ty);
+    for (head, name, rw_lock) in [
+        ("std::sync::Mutex", "Mutex", false),
+        ("std::sync::RwLock", "RwLock", true),
+    ] {
+        if plain
+            .strip_prefix(head)
+            .is_some_and(|rest| rest.starts_with('<'))
+        {
+            let open = plain.find('<')?;
+            let inner = tag_group_inner(plain, open)?;
+            return split_tag_list(inner)
+                .into_iter()
+                .find(|arg| !is_lifetime_arg(arg))
+                .map(|elem| (name, elem.to_string(), rw_lock));
+        }
+    }
+    None
+}
+
+/// The scalar a lock field's storage bottoms out in: the
+/// word an atomic wrapper chain (an `AtomicU32` over an
+/// `UnsafeCell`, and the like) holds, read through any
+/// number of one-field wrappers.
+fn scalar_word(value: &Value) -> Option<u128> {
+    match value {
+        Value::Uint(word) => Some(*word),
+        Value::Int(word) => Some(*word as u128),
+        Value::Bool(word) => Some(*word as u128),
+        Value::Enum { fields, .. } if fields.len() == 1 => scalar_word(&fields[0]),
+        Value::Tuple(fields) if fields.len() == 1 => scalar_word(&fields[0]),
+        _ => None,
+    }
+}
+
+/// The state word of a sys lock value: the state futex is
+/// the lock's first field, and the futex itself is an
+/// atomic wrapper over the word.
+fn lock_state_word(sys: &Value) -> Option<u128> {
+    match sys {
+        Value::Enum { fields, .. } | Value::Tuple(fields) if !fields.is_empty() => {
+            scalar_word(&fields[0])
+        }
+        other => scalar_word(other),
+    }
 }
 
 pub(super) fn guard_elem_tag(ty: &str) -> Option<String> {
