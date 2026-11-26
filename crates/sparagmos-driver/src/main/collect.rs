@@ -593,6 +593,34 @@ fn collect() -> ControlFlow<()> {
         &mut seed_bodies,
     );
 
+    // Demand the `Iterator::next` instances of the
+    // guest-stepped iterators the converted bodies hand to a
+    // modelled consumer: the consumer's name is builtin-served,
+    // so the call-graph collection stops there, and a generic
+    // guest impl has no monomorphic instance as an item, while
+    // the builtin drain's fallback step runs the impl body.
+    // The credit and failure accounting folds into the drop
+    // demand's maps, which are applied to the deferred
+    // placeholders below.
+    let (next_credited, next_failures) = demand_iterator_next_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut seed_bodies,
+    );
+    for (def, (count, counts)) in next_credited {
+        let slot = drop_credited.entry(def).or_insert((0, counts));
+        slot.0 += count;
+    }
+    for (def, reasons) in next_failures {
+        let slot = drop_failures.entry(def).or_default();
+        for (k, v) in reasons {
+            *slot.entry(k.clone()).or_default() += v;
+        }
+    }
+
     // Demand the `core`-generated `Clone` bodies for tuple and
     // array types, for the same reason: the trait method's name
     // is builtin-served, so the call-graph collection stops

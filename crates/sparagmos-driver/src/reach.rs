@@ -1520,17 +1520,35 @@ fn consumer_instance_needs_body(
     // through its collected `next` body -- is the only
     // faithful execution, so the instance is collected (the
     // conversion side lifts the pre-emption for the same
-    // shapes; see `body_served_iterator_arg`).
+    // shapes; see `body_served_iterator_arg`). A guest-stepped
+    // source (see `guest_stepped_iterator_ty`) is collected
+    // for a different reason: the entry's own body is not run
+    // for such a source -- the conversion pre-emption stands,
+    // since the body drives the raw allocation machinery --
+    // but collecting it walks its call edges, and the `next`
+    // edge inside it demands the source's own `next` instance
+    // under the foreign-type arm of the `Iterator::next`
+    // judgement above. The builtin's drain then steps the
+    // source through that body at the modelled machine's
+    // unclaimed-tag fallback. Only the last type argument is
+    // judged for the guest shape: it is the iterator, while
+    // the earlier ones are the element type and the collected
+    // `Vec` itself, whose guest-ness says nothing about how
+    // the source steps.
     if matches!(
         canonical,
         "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter"
             | "std::vec::in_place_collect::from_iter_in_place"
             | "alloc::vec::in_place_collect::from_iter_in_place"
     ) {
+        let last_ty = args.0.iter().rev().find_map(|arg| match arg {
+            GenericArgKind::Type(ty) => Some(ty),
+            _ => None,
+        });
         return args.0.iter().any(|arg| {
             matches!(arg, GenericArgKind::Type(ty)
                 if body_served_iterator_ty(ty))
-        });
+        }) || last_ty.is_some_and(|ty| guest_stepped_iterator_ty(ty));
     }
     // `Vec::extend_trusted`: the builtin drains the iterator
     // through the modelled `next` state machine, which cannot
@@ -1545,12 +1563,22 @@ fn consumer_instance_needs_body(
     // judged, as for the nested entry above. The judgement
     // is the recursive body-served predicate, so an adapter
     // over such an iterator -- whose step composes the inner
-    // step -- is judged by its source.
+    // step -- is judged by its source. A guest-stepped
+    // source (see `guest_stepped_iterator_ty`) is demanded
+    // for the edge-walking reason given at the nested entry
+    // above: the source's `next` instance must be in the
+    // program for the builtin drain's fallback step, and
+    // only the last type argument -- the iterator -- is
+    // judged for it.
     if canonical.starts_with("std::vec::Vec") && canonical.ends_with("::extend_trusted") {
+        let last_ty = args.0.iter().rev().find_map(|arg| match arg {
+            GenericArgKind::Type(ty) => Some(ty),
+            _ => None,
+        });
         return args.0.iter().any(|arg| {
             matches!(arg, GenericArgKind::Type(ty)
                 if body_served_iterator_ty(ty))
-        });
+        }) || last_ty.is_some_and(|ty| guest_stepped_iterator_ty(ty));
     }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
@@ -1821,6 +1849,41 @@ fn body_served_iterator_ty(ty: &Ty) -> bool {
         matches!(arg, GenericArgKind::Type(inner)
             if body_served_iterator_ty(inner))
     })
+}
+
+/// Whether this type's `Iterator::next` step bottoms out in
+/// an impl the modelled state machine does not serve: the
+/// head type is a foreign ADT (its definition is in neither
+/// `std` nor `core` nor `alloc` -- a user-defined iterator),
+/// possibly wrapped in adapter types whose steps compose the
+/// inner step, so an adapter over a guest iterator is itself
+/// guest-stepped. A reference names the blanket impl, whose
+/// step is the pointee's, so it is peeled first. Unlike
+/// `body_served_iterator_ty`, whose recursion ranges over
+/// every ADT argument (a hash iterator can sit in any
+/// argument slot of the wrappers it appears under), the
+/// recursion here ranges only over `iter` adapter arguments:
+/// a guest type in any other slot -- the element type of a
+/// `Vec` being collected into, say -- is stepped by the
+/// modelled machine like any other element and must not
+/// mark its container guest-stepped.
+pub fn guest_stepped_iterator_ty(ty: &Ty) -> bool {
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return guest_stepped_iterator_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, args))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    if !name.starts_with("std::") && !name.starts_with("core::") && !name.starts_with("alloc::") {
+        return true;
+    }
+    if name.starts_with("std::iter::") || name.starts_with("core::iter::") {
+        return args.0.iter().any(|arg| {
+            matches!(arg, GenericArgKind::Type(inner) if guest_stepped_iterator_ty(inner))
+        });
+    }
+    false
 }
 
 /// Whether this type is a hash-collection iterator (the
