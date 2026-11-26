@@ -9039,6 +9039,10 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::slice::ChunksExact<")
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::ChunksMut<")
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<")
         {
             // These types are their own iterator: the
             // blanket `IntoIterator for I: Iterator` impl

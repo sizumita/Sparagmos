@@ -217,3 +217,33 @@ fn run_mode_byte_index_write_of_f32_storage() {
         "local 1065353216\nboxed 1065353216\nfull -2.5\n"
     );
 }
+
+const NONZERO_FMT_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    let a = NonZero::new(42u32).unwrap();
+    println!("dbg {:?}", a);
+    println!("disp {}", a);
+    println!("hex {:x}", a);
+    let b = NonZero::new(-3i64).unwrap();
+    println!("neg {:?}", b);
+    let c = NonZero::new(7usize).unwrap();
+    println!("usz {:?} list {:?}", c, vec![a]);
+    println!("pad {:>6}|{:<6}|", a, a);
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_formats_as_inner_scalar() {
+    // `core::num::NonZero<T>`'s fmt impls all delegate to
+    // the primitive's own impl over the stored scalar; the
+    // value arrives as nested one-field wrappers (the
+    // `NonZeroInner` associated type), which the formatter
+    // unwraps to the scalar. The outputs below are native
+    // rustc 1.100.0's.
+    run_ok(
+        "nonzero-fmt",
+        NONZERO_FMT_SRC,
+        "dbg 42\ndisp 42\nhex 2a\nneg -3\nusz 7 list [42]\npad     42|42    |\n",
+    );
+}
