@@ -232,4 +232,143 @@ fn run_mode_step_by_over_ranges() {
         STEP_BY_RANGES_SRC,
         "[0, 2, 4, 6, 8, 10]\n[0, 3, 6, 9]\n[250, 252, 254]\n[-5, -1, 3]\n[0]\nSome(10) Some(15) None\n[0, 2, 4]\n",
     );
+}const RANGE_STEP_AUX_YES_SRC: &str = r#"
+//@ compile-flags: -C overflow-checks=yes
+#![crate_type = "lib"]
+pub fn next_from(iter: &mut std::ops::RangeFrom<u8>) -> u8 {
+    iter.next().unwrap()
+}
+pub fn next_from_iter(iter: &mut std::range::RangeFromIter<u8>) -> u8 {
+    iter.next().unwrap()
+}
+"#;
+
+const RANGE_STEP_AUX_NO_SRC: &str = r#"
+//@ compile-flags: -C overflow-checks=no
+#![crate_type = "lib"]
+pub fn next_from(iter: &mut std::ops::RangeFrom<u8>) -> u8 {
+    iter.next().unwrap()
+}
+pub fn next_from_iter(iter: &mut std::range::RangeFromIter<u8>) -> u8 {
+    iter.next().unwrap()
+}
+"#;
+
+const RANGE_FROM_STEP_PER_CRATE_MAIN_SRC: &str = r#"
+extern crate ocyes;
+extern crate ocno;
+fn main() {
+    // The legacy `RangeFrom` step performed inside an
+    // auxiliary crate follows that crate's own
+    // overflow-checks setting, not the main compilation's:
+    // the no-checks crate wraps at the maximum, the checks
+    // crate panics stepping at the maximum.
+    let mut it = u8::MAX..;
+    assert_eq!(ocno::next_from(&mut it), 255);
+    assert_eq!(ocno::next_from(&mut it), 0);
+    let mut it = u8::MAX..;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ocyes::next_from(&mut it);
+    }));
+    assert!(r.is_err());
+    println!("ok");
+}
+"#;
+
+/// The `Step::forward` behind a legacy `RangeFrom` step is
+/// an `#[rustc_inherit_overflow_checks]` operation: when an
+/// auxiliary crate performs the step, the auxiliary crate's
+/// setting decides -- under both session configurations of
+/// the main compilation.
+#[test]
+fn run_mode_range_from_step_follows_the_stepping_crate() {
+    let dir = temp_dir("range-from-step-per-crate");
+    let yes = fixture(&dir, "ocyes.rs", RANGE_STEP_AUX_YES_SRC);
+    let no = fixture(&dir, "ocno.rs", RANGE_STEP_AUX_NO_SRC);
+    let src = fixture(&dir, "main.rs", RANGE_FROM_STEP_PER_CRATE_MAIN_SRC);
+    let yes_arg = format!("ocyes={}", yes.display());
+    let no_arg = format!("ocno={}", no.display());
+    let out = run_driver_extra(&src, &["--aux", &yes_arg, "--aux", &no_arg]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--aux",
+            &yes_arg,
+            "--aux",
+            &no_arg,
+            "--rustc-arg",
+            "-C",
+            "--rustc-arg",
+            "overflow-checks=no",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const RANGE_FROM_ITER_STEP_PER_CRATE_MAIN_SRC: &str = r#"
+#![feature(new_range_remainder)]
+extern crate ocyes;
+extern crate ocno;
+fn main() {
+    // The new `RangeFromIter` step follows the crate that
+    // performs it (the shape of
+    // tests/ui/iterators/rangefrom-overflow-2crates.rs):
+    // stepped by the no-checks crate the bound wraps;
+    // stepped by the checks crate the maximum is yielded
+    // once and the next step panics -- while the exhausted
+    // iterator still wraps in the no-checks crate's hands.
+    let mut it = std::range::RangeFrom::from(u8::MAX..).into_iter();
+    assert_eq!(ocno::next_from_iter(&mut it), 255);
+    assert_eq!(ocno::next_from_iter(&mut it), 0);
+    let mut it = std::range::RangeFrom::from(u8::MAX..).into_iter();
+    assert_eq!(ocyes::next_from_iter(&mut it), 255);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ocyes::next_from_iter(&mut it);
+    }));
+    assert!(r.is_err());
+    assert_eq!(ocno::next_from_iter(&mut it), 0);
+    println!("ok");
+}
+"#;
+
+/// The same per-crate resolution for `RangeFromIter`: its
+/// step replays core's checked/wrapping forms, and which
+/// form applies is the stepping crate's setting.
+#[test]
+fn run_mode_range_from_iter_step_follows_the_stepping_crate() {
+    let dir = temp_dir("range-from-iter-step-per-crate");
+    let yes = fixture(&dir, "ocyes.rs", RANGE_STEP_AUX_YES_SRC);
+    let no = fixture(&dir, "ocno.rs", RANGE_STEP_AUX_NO_SRC);
+    let src = fixture(
+        &dir,
+        "main.rs",
+        RANGE_FROM_ITER_STEP_PER_CRATE_MAIN_SRC,
+    );
+    let yes_arg = format!("ocyes={}", yes.display());
+    let no_arg = format!("ocno={}", no.display());
+    let out = run_driver_extra(&src, &["--aux", &yes_arg, "--aux", &no_arg]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--aux",
+            &yes_arg,
+            "--aux",
+            &no_arg,
+            "--rustc-arg",
+            "-C",
+            "--rustc-arg",
+            "overflow-checks=no",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
