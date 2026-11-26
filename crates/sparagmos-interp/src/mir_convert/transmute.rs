@@ -397,6 +397,13 @@ impl<'a> Converter<'a> {
     ///   the discriminant of the field's value (`mem::Alignment`
     ///   -> `usize`), and the reverse (integer -> the wrapper:
     ///   the integer is the wrapped enum's discriminant);
+    /// * one-field struct over an array <-> integer of the
+    ///   same total width: the bit-stream reinterpretation
+    ///   over the array's leaves (the `Simd<T, N>` -> `u16`
+    ///   an inlined small-array integer comparison produces,
+    ///   and the reverse construction); a storage length the
+    ///   type representation does not carry takes its element
+    ///   count from the integer's width;
     /// * fieldless enum <-> the one-field transparent struct
     ///   wrapping it (`mem::Alignment` <-> its enum): the enum
     ///   value itself, wrapped into / read out of the struct's
@@ -1091,10 +1098,33 @@ let inner = match (&src, target) {
                             None => unsupported(),
                         }
                     } else {
-                        unsupported()
+                        // A one-field wrapper over a scalar
+                        // stream the arms above do not read —
+                        // an array field, the `Simd<T, N>`
+                        // storage shape core's integer
+                        // comparison of small arrays produces
+                        // after inlining: the bit-stream
+                        // reinterpretation, whose element
+                        // count the wrapper derivation takes
+                        // from the integer's width.
+                        match self.stream_regroup_rvalue(
+                            &mir::Ty::Adt(*def, args.clone()),
+                            target,
+                            v,
+                        ) {
+                            Some(rv) => rv,
+                            None => unsupported(),
+                        }
                     }
                 } else {
-                    unsupported()
+                    match self.stream_regroup_rvalue(
+                        &mir::Ty::Adt(*def, args.clone()),
+                        target,
+                        v,
+                    ) {
+                        Some(rv) => rv,
+                        None => unsupported(),
+                    }
                 }
             }
             // Integer -> fieldless enum: the variant whose
@@ -1102,7 +1132,7 @@ let inner = match (&src, target) {
             // Integer -> enum with a single variant carrying a
             // single integer field: that variant holding the
             // integer as its payload.
-            (_, mir::Ty::Adt(def, args)) if src_is_int => {
+            (Some(s), mir::Ty::Adt(def, args)) if src_is_int => {
                 if let Some(table) = self.fieldless_enum_discriminants(def) {
                     ir::Rvalue::IntToEnum(v.clone(), table)
                 } else if let Some(field_ty) = self.single_field_ty(def, args) {
@@ -1124,7 +1154,21 @@ let inner = match (&src, target) {
                                 None => unsupported(),
                             }
                         }
-                        _ => unsupported(),
+                        // A field the arms above do not read
+                        // — an array field, the reverse of
+                        // the `Simd<T, N>` -> integer shape:
+                        // the bit-stream reinterpretation,
+                        // whose element count the wrapper
+                        // derivation takes from the integer's
+                        // width.
+                        _ => match self.stream_regroup_rvalue(
+                            s,
+                            &mir::Ty::Adt(*def, args.clone()),
+                            v,
+                        ) {
+                            Some(rv) => rv,
+                            None => unsupported(),
+                        },
                     }
                 } else if let Some(payload) =
                     self.single_variant_payload(def, args)
@@ -1138,7 +1182,14 @@ let inner = match (&src, target) {
                             payload_entry: None,
                         }
                     } else {
-                        unsupported()
+                        match self.stream_regroup_rvalue(
+                            s,
+                            &mir::Ty::Adt(*def, args.clone()),
+                            v,
+                        ) {
+                            Some(rv) => rv,
+                            None => unsupported(),
+                        }
                     }
                 } else if let Some(shape) = self.wrapper_shape(def, args) {
                     // A transparent wrapper around a thin pointer
@@ -1176,7 +1227,14 @@ let inner = match (&src, target) {
                             .collect(),
                     }
                 } else {
-                    unsupported()
+                    match self.stream_regroup_rvalue(
+                        s,
+                        &mir::Ty::Adt(*def, args.clone()),
+                        v,
+                    ) {
+                        Some(rv) => rv,
+                        None => unsupported(),
+                    }
                 }
             }
             // Thin pointer -> owning-pointer chain (the
@@ -2110,6 +2168,20 @@ let inner = match (&src, target) {
                 u64::from(total_bits / eb),
             )),
         })
+    }
+
+    /// The bit-stream reinterpretation of a pair as an
+    /// rvalue, or `None` when the pair does not decompose
+    /// into equal-width bit streams (see
+    /// `stream_regroup_shapes`).
+    fn stream_regroup_rvalue(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+        v: &ir::Operand,
+    ) -> Option<ir::Rvalue> {
+        let (from, to) = self.stream_regroup_shapes(src, target)?;
+        Some(ir::Rvalue::Reinterpret(v.clone(), from, to))
     }
 
     /// The bit-stream reinterpretation shapes for a
