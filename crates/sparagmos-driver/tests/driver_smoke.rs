@@ -422,3 +422,73 @@ fn driver_removes_its_out_dir_on_exit() {
     );
     let _ = std::fs::remove_dir_all(&kept);
 }
+
+#[test]
+fn driver_reaps_stale_out_dirs_at_startup() {
+    // A driver start sweeps scratch out dirs whose creator is
+    // gone (#537): the subset runner kills drivers at its
+    // per-record timeout, so the exit-time self-cleanup never
+    // runs for them. A live creator's dir and a young dir are
+    // kept, and the keep-scratch opt-out disables the sweep.
+    let dir = std::env::temp_dir().join(format!(
+        "sparagmos-driver-smoke-reap-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
+    let src = dir.join("reap.rs");
+    std::fs::write(&src, FIXTURE).unwrap();
+
+    // Pids above every kernel's pid cap (Linux: 2^22, macOS:
+    // below 100_000) cannot belong to a live process.
+    const DEAD_PID: u32 = 999_999_999;
+    let stale = dir.join(format!("sparagmos-driver-out-{DEAD_PID}"));
+    let young = dir.join(format!("sparagmos-driver-out-{}", DEAD_PID - 1));
+    let live = dir.join(format!(
+        "sparagmos-driver-out-{}",
+        std::process::id()
+    ));
+    for fake in [&stale, &young, &live] {
+        std::fs::create_dir_all(fake).unwrap();
+        std::fs::write(fake.join("marker"), b"x").unwrap();
+    }
+    // Age the stale and live dirs past the reaper's margin;
+    // the young one keeps its fresh timestamps.
+    let long_ago = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 2 * 60 * 60) as libc::time_t;
+    for aged in [&stale, &live] {
+        let c_path = std::ffi::CString::new(aged.to_str().unwrap()).unwrap();
+        let times = libc::utimbuf {
+            actime: long_ago,
+            modtime: long_ago,
+        };
+        assert_eq!(unsafe { libc::utime(c_path.as_ptr(), &times) }, 0);
+    }
+
+    let run = |keep: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+        cmd.arg(&src).env("TMPDIR", &dir);
+        if keep {
+            cmd.env("SPARAGMOS_DRIVER_KEEP_SCRATCH", "1");
+        }
+        let status = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run sparagmos-driver");
+        assert!(status.success());
+    };
+
+    run(true);
+    assert!(
+        stale.exists(),
+        "the keep-scratch opt-out disables the sweep"
+    );
+    run(false);
+    assert!(!stale.exists(), "dead creator and old: reaped at startup");
+    assert!(young.exists(), "dead creator but young: kept");
+    assert!(live.exists(), "live creator: kept");
+}
