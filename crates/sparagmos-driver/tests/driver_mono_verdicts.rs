@@ -808,6 +808,70 @@ fn comptime_intrinsic_converts() {
 }
 
 #[test]
+fn comptime_type_name_const_argument_converts() {
+    // `type_name` is a `#[rustc_comptime]` intrinsic too,
+    // and the shape of tests/ui/const-generics/
+    // intrinsics-type_name-as-const-argument.rs demands it
+    // differently from `offset_of!`: the call sits in the
+    // anonymous constant of a where clause's const generic
+    // argument, a demand rooted by the trait predicate
+    // rather than by a body the collector walks into. It
+    // is still constant evaluation only -- the constant is
+    // resolved before code generation, which never sees
+    // the call -- so the must-be-overridden verdict must
+    // not fire. (At the verdict's introduction this record
+    // failed with the same rejection as the offset_of
+    // family.)
+    let case = Case::new("type-name-const-arg");
+    let src = case.write(
+        "case.rs",
+        "#![allow(incomplete_features)]\n\
+         #![feature(adt_const_params, unsized_const_params, generic_const_exprs)]\n\
+         #![feature(core_intrinsics)]\n\
+         #![feature(const_type_name)]\n\
+         trait Trait<const S: &'static str> {}\n\
+         struct Bug<T>\n\
+         where\n\
+             T: Trait<{ std::intrinsics::type_name::<T>() }>,\n\
+         {\n\
+             t: T,\n\
+         }\n\
+         fn main() {}\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn comptime_offset_of_promotion_shape_converts() {
+    // The shapes of tests/ui/inline-const/
+    // dont-eval-const-block-during-promotion.rs: since
+    // `offset_of!` desugars to an inline const block, the
+    // comptime call sits in the index and divisor
+    // positions constant promotion examines, including
+    // indexes into a local array promotion can never
+    // lift. The verdict must not fire for any of them,
+    // and conversion must accept the program without
+    // evaluating the blocks.
+    let case = Case::new("offset-of-promotion");
+    let src = case.write(
+        "case.rs",
+        "use std::mem::offset_of;\n\
+         struct Thing(i32);\n\
+         fn main() {\n\
+         let x = &([0][const { 0 }] & 0);\n\
+         let y = &(1 / const { 1 });\n\
+         let temp = [0u8];\n\
+         let _ = &(temp[offset_of!(Thing, 0)] & 0u8);\n\
+         let temp2: &[u8] = &[0u8];\n\
+         let _ = &(temp2[const { 0usize }] & 0u8);\n\
+         (x, y); }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
 fn fallback_body_intrinsic_converts() {
     // `rotate_left` is declared in core with a fallback body,
     // so it need not be overridden: the method's body calls
