@@ -295,9 +295,10 @@ impl<'a> Converter<'a> {
             return None;
         }
         // An `Iterator::next` / `DoubleEndedIterator::
-        // next_back` call on a `str` split-family iterator is
-        // not bound to a body either: the modelled state
-        // machine (`str_split_step`) is the family's faithful
+        // next_back` call on a `str` split-family or
+        // matches-family iterator is not bound to a body
+        // either: the modelled state machine (`str_split_step`
+        // / `str_matches_step`) is the family's faithful
         // execution, while a collected impl body -- the
         // predicate pattern's converts cleanly -- drives the
         // searcher through the `Chars` byte-snapshot machinery
@@ -532,9 +533,9 @@ impl<'a> Converter<'a> {
     /// `Filter`, whose values are genuine structs built by
     /// Whether this call is `Iterator::next` or
     /// `DoubleEndedIterator::next_back` on a `str`
-    /// split-family iterator, whose modelled state machine
-    /// pre-empts a collected impl body (see
-    /// `resolve_body_callee`).
+    /// split-family or matches-family iterator, whose
+    /// modelled state machine pre-empts a collected impl
+    /// body (see `resolve_body_callee`).
     fn split_next_builtin_preempts(&self, func: &mir::Operand) -> bool {
         let Some((name, _, raw_generic_args)) = self.resolve_external_callee(func)
         else {
@@ -560,6 +561,8 @@ impl<'a> Converter<'a> {
             || tag.starts_with("std::str::SplitTerminator<")
             || tag.starts_with("std::str::RSplitTerminator<")
             || tag.starts_with("std::str::SplitInclusive<")
+            || tag.starts_with("std::str::Matches<")
+            || tag.starts_with("std::str::MatchIndices<")
     }
 
     /// collected constructors — the instance body, including
