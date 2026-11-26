@@ -33,6 +33,7 @@ mod strings;
 mod summary_mode;
 mod sync;
 mod tool_interception;
+mod transmute;
 mod vec_slice;
 
 /// Fixture directories this test process created under the

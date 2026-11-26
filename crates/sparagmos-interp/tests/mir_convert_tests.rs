@@ -3789,6 +3789,129 @@ fn transmute_wrapper_with_a_zst_field_round_trips() {
     );
 }
 
+// ----- transmute: one-field ADT over an array <-> integer -------------------
+//
+// The `Simd<T, N>` storage shape: a one-field struct whose
+// only field is an array whose length is a const parameter
+// the type representation does not carry. Core's integer
+// comparison of small arrays, inlined, transmutes the
+// wrapper straight to the integer of the array's total
+// width (and builds the wrapper back from an integer the
+// same way). The specialised ADT <-> integer arms read
+// neither an array field nor a non-integer payload, so the
+// pair goes through the bit-stream reinterpretation, whose
+// wrapper derivation takes the element count from the
+// integer's width.
+
+const SIMD_LIKE_DEF: mir::DefId = mir::DefId::new(0, 130);
+
+fn simd_like_ty() -> mir::Ty {
+    mir::Ty::Adt(SIMD_LIKE_DEF, vec![u8_ty()])
+}
+
+/// A program holding the `SimdLike<T, const N: usize>`
+/// record: one variant whose only field is an array over
+/// the type parameter, its length the const parameter,
+/// carried as a named parameter.
+fn simd_like_prog() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        SIMD_LIKE_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![mir::Ty::Array(
+                Box::new(mir::Ty::Param(0, "T".to_string())),
+                mir::ArrayLen::Param("N".to_string()),
+            )]],
+        },
+    );
+    prog
+}
+
+#[test]
+fn transmute_array_wrapper_to_int_reinterprets_bits() {
+    // fn f() -> u16 { _1 = [1u8, 5]; _2 = SimdLike(_1);
+    //                 _0 = transmute(_2) as u16; return }
+    // The array's little-endian bit stream is the integer:
+    // 1 | 5 << 8 = 1281.
+    let arr_ty = mir::Ty::Array(Box::new(u8_ty()), mir::ArrayLen::Known(2));
+    let body = mir::Body::new(
+        decls(&[u16_ty(), arr_ty, simd_like_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(u8_ty())),
+                        vec![const_u8(1), const_u8(5)],
+                    ),
+                ),
+                assign(
+                    place(2),
+                    adt_aggregate(
+                        SIMD_LIKE_DEF,
+                        0,
+                        vec![u8_ty()],
+                        vec![mir::Operand::Copy(place(1))],
+                    ),
+                ),
+                assign(place(0), transmute(copy(2), u16_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = simd_like_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("array-wrapper-to-int transmute runs"),
+        Value::Uint(1281)
+    );
+}
+
+#[test]
+fn transmute_int_to_array_wrapper_reinterprets_bits() {
+    // fn f() -> u8 { _2 = 1281u16; _1 = transmute(_2) as SimdLike;
+    //                _0 = copy _1.0[1]; return }
+    // The wrapper built from the integer holds the array
+    // [1, 5] (little-endian), so element 1 is 5.
+    let field_inst_ty = mir::Ty::Array(
+        Box::new(u8_ty()),
+        mir::ArrayLen::Param("N".to_string()),
+    );
+    let elem1 = mir::Place {
+        local: mir::Local(1),
+        projection: vec![
+            mir::PlaceElem::Field(0, field_inst_ty),
+            mir::PlaceElem::ConstantIndex {
+                offset: 1,
+                min_length: 2,
+                from_end: false,
+            },
+        ],
+    };
+    let body = mir::Body::new(
+        decls(&[u8_ty(), simd_like_ty(), u16_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(2), mir::Rvalue::Use(const_int(1281, 2))),
+                assign(place(1), transmute(copy(2), simd_like_ty())),
+                assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(elem1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = simd_like_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("int-to-array-wrapper transmute runs"),
+        Value::Uint(5)
+    );
+}
+
 #[test]
 fn transmute_zst_to_zst_yields_the_unique_value() {
     // fn f() -> [i32; 0] { _1 = (); _0 = transmute(_1); return }
