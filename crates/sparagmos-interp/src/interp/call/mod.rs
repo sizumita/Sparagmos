@@ -79,7 +79,9 @@ impl<'a> Interpreter<'a> {
         &self,
         func: &str,
     ) -> Option<(String, crate::builtins::Builtin, Vec<String>)> {
-        if self.program.get(func).is_some() {
+        if self.program.get(func).is_some()
+            || self.program.fn_link_aliases.contains_key(func)
+        {
             return None;
         }
         let canonical = crate::builtins::canonical_name(func);
@@ -492,6 +494,40 @@ impl<'a> Interpreter<'a> {
         self.eval_constant(c).ok()
     }
 
+    /// The body serving a call to `func`: the body registered
+    /// under the name itself, or -- for a name that denotes a
+    /// body-less extern declaration -- the in-program
+    /// definition exporting the declaration's link symbol
+    /// (see `Program::fn_link_aliases`). The declaration's
+    /// own name still keys its definition-location stamp, so
+    /// stamp lookups keep using the name the call arrived
+    /// under; only the body comes through the alias.
+    pub(crate) fn serving_body(&self, func: &str) -> Option<&Body> {
+        self.program.get(func).or_else(|| {
+            self.program
+                .fn_link_aliases
+                .get(func)
+                .and_then(|target| self.program.get(target))
+        })
+    }
+
+    /// The program key of the body serving a call to `func`
+    /// (see `serving_body`): the name itself when a body is
+    /// registered under it, the link alias's target for a
+    /// body-less declaration, and the name unchanged when
+    /// neither serves (the call then fails naming it).
+    fn serving_name<'s>(&'s self, func: &'s str) -> &'s str {
+        if self.program.get(func).is_some() {
+            func
+        } else {
+            self.program
+                .fn_link_aliases
+                .get(func)
+                .map(String::as_str)
+                .unwrap_or(func)
+        }
+    }
+
     /// The `Coroutine::resume` shim's location stamp: the
     /// location a track-caller coroutine body entered through
     /// a `dyn` receiver observes (see
@@ -543,7 +579,7 @@ impl<'a> Interpreter<'a> {
         // turns out unmarked, whose location the model does not
         // track).
         let mut arg_values = arg_values;
-        let mut stamp = match self.program.get(func) {
+        let mut stamp = match self.serving_body(func) {
             Some(callee)
                 if callee.caller_location_local.is_some()
                     && arg_values.len() == callee.arg_count + 1 =>
@@ -566,7 +602,7 @@ impl<'a> Interpreter<'a> {
         // dispatch below re-enters this function with the impl
         // body, where the packed shape is already the declared
         // one and passes through unchanged.
-        if let Some(callee) = self.program.get(func) {
+        if let Some(callee) = self.serving_body(func) {
             arg_values = self.pack_variadic_args(func, callee, arg_values);
         }
         // A call whose receiver is a `dyn` fat pointer is a vtable
@@ -641,7 +677,7 @@ impl<'a> Interpreter<'a> {
                 }
                 Err(e) => return Err(e),
             },
-            None => match self.program.get(func) {
+            None => match self.serving_body(func) {
                 Some(c) => c,
                 None => return Err(self.missing_body_error(func)),
             },
@@ -704,10 +740,11 @@ impl<'a> Interpreter<'a> {
             locals[idx] = stamp;
         }
         let frame_id = self.fresh_frame_id();
-        self.register_frame_base(&frames, frame_id, func);
+        let frame_func = self.serving_name(func);
+        self.register_frame_base(&frames, frame_id, frame_func);
         frames.push(Frame {
             id: frame_id,
-            func: func.to_string(),
+            func: frame_func.to_string(),
             locals,
             block: 0,
             stmt: 0,
@@ -752,7 +789,7 @@ impl<'a> Interpreter<'a> {
                 }
                 Err(e) => return Err(e),
             },
-            None => match self.program.get(func) {
+            None => match self.serving_body(func) {
                 Some(b) => b,
                 None => return Err(self.missing_body_error(func)),
             },
@@ -779,10 +816,11 @@ impl<'a> Interpreter<'a> {
         }
         let incoming_asm = self.pending_asm_incoming.take();
         let id = self.fresh_frame_id();
-        self.register_frame_base(&frames, id, func);
+        let frame_func = self.serving_name(func);
+        self.register_frame_base(&frames, id, frame_func);
         frames.push(Frame {
             id,
-            func: func.to_string(),
+            func: frame_func.to_string(),
             locals,
             block: 0,
             stmt: 0,

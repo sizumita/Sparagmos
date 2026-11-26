@@ -2719,6 +2719,21 @@ pub struct Program {
     /// compiler's shim presents to the callee (see
     /// `Interpreter::start_call`).
     pub track_caller_defs: HashMap<String, Constant>,
+    /// Bodies serving a name that has no body of its own: the
+    /// program key of a body-less extern declaration maps to
+    /// the key of the in-program definition exporting the
+    /// declaration's link symbol (a `#[no_mangle]` /
+    /// `#[export_name]` definition), the binding a native link
+    /// performs. A direct call is rewritten to the definition
+    /// at conversion, but a function-item value names the
+    /// declaration itself -- the item the value was formed
+    /// from -- so a call through such a value resolves its
+    /// body through this table. The declaration's name still
+    /// keys its own definition-location stamp (see
+    /// `track_caller_defs`): the location a track-caller
+    /// callee entered through the value observes is the
+    /// declaration's, not the definition's.
+    pub fn_link_aliases: HashMap<String, String>,
     /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
     /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
     /// `call_once`): the trait method definitions in core,

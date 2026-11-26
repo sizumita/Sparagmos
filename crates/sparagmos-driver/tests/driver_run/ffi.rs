@@ -133,6 +133,109 @@ fn run_mode_extern_decl_binds_local_export_by_link_symbol() {
     );
 }
 
+const LOCAL_EXPORT_PTR_SRC: &str = r#"
+mod defs {
+    #[no_mangle]
+    pub fn ptr_export(x: i32) -> i32 { x + 40 }
+}
+
+unsafe extern "Rust" {
+    safe fn ptr_export(x: i32) -> i32;
+}
+
+fn main() {
+    println!("direct={}", ptr_export(2));
+    println!("indirect={}", (ptr_export as fn(i32) -> i32)(3));
+}
+"#;
+
+#[test]
+fn run_mode_extern_decl_fn_pointer_binds_local_export() {
+    // A function-item value names the extern declaration
+    // itself, not the definition a direct call is rewritten
+    // to: the value's call resolves through the link alias
+    // to the in-program definition exporting the
+    // declaration's symbol, as a native link binds it.
+    let dir = temp_dir("local-export-ptr");
+    let src = fixture(&dir, "localexportptr.rs", LOCAL_EXPORT_PTR_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a call through a function value naming the declaration must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "direct=42\nindirect=43\n",
+        "both the direct and the value call execute the exported definition"
+    );
+}
+
+const TRACK_CALLER_FFI_SRC: &str = r#"
+use std::panic::Location;
+
+unsafe extern "Rust" {
+    #[track_caller]
+    safe fn ffi_tracked() -> &'static Location<'static>;
+    safe fn ffi_untracked() -> &'static Location<'static>;
+}
+
+fn nested_tracked() -> &'static Location<'static> {
+    ffi_tracked()
+}
+
+mod provides {
+    use std::panic::Location;
+    #[track_caller]
+    #[no_mangle]
+    fn ffi_tracked() -> &'static Location<'static> {
+        Location::caller()
+    }
+    #[no_mangle]
+    fn ffi_untracked() -> &'static Location<'static> {
+        Location::caller()
+    }
+}
+
+fn main() {
+    let tracked = ffi_tracked();
+    println!("tracked={}:{}", tracked.line(), tracked.column());
+    let untracked = ffi_untracked();
+    println!("untracked={}:{}", untracked.line(), untracked.column());
+    let contained = nested_tracked();
+    println!("contained={}:{}", contained.line(), contained.column());
+    let indirect = (ffi_tracked as fn() -> &'static Location<'static>)();
+    println!("indirect={}:{}", indirect.line(), indirect.column());
+}
+"#;
+
+#[test]
+fn run_mode_track_caller_extern_decl_locations() {
+    // The rfc-2091 track-caller FFI shape: `#[track_caller]`
+    // extern declarations whose `#[no_mangle]` definitions
+    // live in the same crate. Direct calls present their
+    // call sites, the untracked definition presents its own
+    // `Location::caller()` site, and a call through a
+    // function-item value naming the declaration presents
+    // the declaration's own definition location (line 6),
+    // as the compiler's shim for the declaration does.
+    let dir = temp_dir("track-caller-ffi");
+    let src = fixture(&dir, "trackcallerffi.rs", TRACK_CALLER_FFI_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "track-caller FFI calls must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "tracked=28:19\nuntracked=23:9\ncontained=11:5\nindirect=6:5\n",
+        "each call shape presents the location the compiler's resolution assigns it"
+    );
+}
+
 const LIBC_EXTERN_SRC: &str = r#"
 use std::ffi::{c_int, c_void};
 

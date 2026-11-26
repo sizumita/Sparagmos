@@ -42,6 +42,7 @@ impl Converter {
             static_tys: HashMap::new(),
             static_tys_mir: sm::StaticTys::new(),
             track_caller_defs: HashMap::new(),
+            track_caller_decl_pending: Vec::new(),
             fn_abis: HashMap::new(),
             fn_shim_locations: [None, None, None],
             coroutine_shim_location: None,
@@ -243,6 +244,58 @@ impl Converter {
         self.noting_track_caller = false;
         if let Some(stamp) = stamp {
             self.track_caller_defs.insert(id, stamp);
+        } else {
+            // No body to take a definition span from: an extern
+            // declaration (or an instance whose body the
+            // compiler cannot materialise). Its stamp is
+            // fabricated from its definition span at the next
+            // body conversion (see
+            // `fabricate_track_caller_decl_stamps`).
+            if !self
+                .track_caller_decl_pending
+                .iter()
+                .any(|(pending, _)| *pending == id)
+            {
+                self.track_caller_decl_pending.push((id, *inst));
+            }
+        }
+    }
+
+    /// Fabricate the definition-location stamps of the
+    /// body-less `#[track_caller]` instances noted so far
+    /// (extern declarations): a terminator of `host` re-spanned
+    /// to each declaration's definition span and re-scoped to
+    /// the host's root scope, resolved with the compiler's own
+    /// caller-location resolution -- the fabrication
+    /// `def_location_stamp` performs for definition stamps and
+    /// `note_coroutine_shim_location` for the resume shim's.
+    /// Runs at the end of every body conversion, with the body
+    /// just converted as the host: a declaration is noted while
+    /// some body that names it converts, so that body is at
+    /// hand. A declaration whose span or stamp the compiler
+    /// cannot produce simply gets no stamp, like an instance
+    /// the compiler cannot name gets no link symbol.
+    fn fabricate_track_caller_decl_stamps(&mut self, host: &mir::Body) {
+        while let Some((id, inst)) = self.track_caller_decl_pending.pop() {
+            if self.track_caller_defs.contains_key(&id) {
+                continue;
+            }
+            let Some(span) = track_caller_decl_def_span(&inst) else {
+                continue;
+            };
+            self.noting_track_caller = true;
+            let stamp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut term = host.blocks.first()?.terminator.clone();
+                term.source_info.span = span;
+                term.source_info.scope = 0;
+                self.call_site_stamp(host, &term)
+            }))
+            .ok()
+            .flatten();
+            self.noting_track_caller = false;
+            if let Some(stamp) = stamp {
+                self.track_caller_defs.insert(id, stamp);
+            }
         }
     }
 
@@ -515,7 +568,7 @@ impl Converter {
         &mut self,
         body: &mir::Body,
     ) -> Result<sm::Body, Vec<String>> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.convert_body(body)
         })) {
             Ok(result) => result,
@@ -526,7 +579,12 @@ impl Converter {
                     std::panic::resume_unwind(payload);
                 }
             }
-        }
+        };
+        // The body just converted is the host for any
+        // definition stamps of body-less `#[track_caller]`
+        // declarations its conversion noted.
+        self.fabricate_track_caller_decl_stamps(body);
+        result
     }
 
     /// Convert one Stable MIR body. On any unsupported construct, returns
@@ -1081,6 +1139,23 @@ impl Converter {
         let public: rustc_public::ty::Span = rustc_public::rustc_internal::stable(collapsed);
         Some((public.get_filename(), public.get_lines()))
     }
+}
+
+/// The definition span of a body-less `#[track_caller]`
+/// instance (an extern declaration), read through the
+/// compiler context installed for the conversion: the span
+/// the compiler's own track-caller shim for the declaration
+/// presents as the caller location of a call through a
+/// function-item value naming it. Outside a compilation
+/// callback there is no definition to read.
+fn track_caller_decl_def_span(inst: &Instance) -> Option<rustc_public::ty::Span> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, inst);
+        Some(rustc_public::rustc_internal::stable(
+            tcx.def_span(internal.def.def_id()),
+        ))
+    })
 }
 
 /// The definition span of the `resume` method of the
