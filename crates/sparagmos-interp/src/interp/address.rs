@@ -2395,13 +2395,20 @@ impl<'a> Interpreter<'a> {
         if !self.is_elem_block(id) {
             return None;
         }
-        let content = self.alloc_base(id).ok()?;
-        match &content {
-            Value::Tuple(_) => {}
-            // A zeroed block holds bytes; only byte elements
-            // index it faithfully.
-            Value::Bytes(_) if size == 1 => {}
-            _ => return None,
+        // Only the block's shape is judged here, so the store
+        // is borrowed for the check: cloning the block's whole
+        // contents (a raw table's bucket array, say) to learn
+        // that it is a tuple would price every pointer offset
+        // at the block's full size.
+        {
+            let store = self.allocs.borrow();
+            match store.get(&id) {
+                Some(Value::Tuple(_)) => {}
+                // A zeroed block holds bytes; only byte elements
+                // index it faithfully.
+                Some(Value::Bytes(_)) if size == 1 => {}
+                _ => return None,
+            }
         }
         let disp = disp?;
         let (base, carried) = match projection.last() {
@@ -2637,7 +2644,12 @@ impl<'a> Interpreter<'a> {
                 {
                     return Ok(RefTarget::Alloc { id, projection });
                 }
-                let base = self.alloc_base(id).ok();
+                // The projection computation reads the block
+                // through a reference; the store is borrowed for
+                // the call rather than cloned (see
+                // `alloc_offset_absorb`).
+                let store = self.allocs.borrow();
+                let base = store.get(&id);
                 let projection = self.offset_projection(
                     frames,
                     None,
@@ -2645,7 +2657,7 @@ impl<'a> Interpreter<'a> {
                     projection,
                     disp,
                     elem_size,
-                    base.as_ref(),
+                    base,
                     count,
                 )?;
                 Ok(RefTarget::Alloc { id, projection })
@@ -3466,8 +3478,8 @@ impl<'a> Interpreter<'a> {
         if projection.is_empty() {
             Ok(base.clone())
         } else {
-            self.project_value_t(
-                base.clone(),
+            self.project_value_ref_t(
+                base,
                 projection,
                 "<constant>",
                 "constant aggregate",

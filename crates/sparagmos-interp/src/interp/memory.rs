@@ -1751,7 +1751,10 @@ impl<'a> Interpreter<'a> {
                 Ok(value)
             }
             Resolved::Static { name, projection } => {
-                let base = self.static_base(name)?;
+                let store = self.statics.borrow();
+                let base = store
+                    .get(name)
+                    .ok_or_else(|| self.missing_static(name))?;
                 let func = frames
                     .last()
                     .map(|f| f.func.clone())
@@ -1759,7 +1762,7 @@ impl<'a> Interpreter<'a> {
                 let place_desc = format!("static {name}");
                 let root_ty = self.program().static_tys.get(name).cloned();
                 let value =
-                    self.project_value_t(base, projection, &func, &place_desc, root_ty)?;
+                    self.project_value_ref_t(base, projection, &func, &place_desc, root_ty)?;
                 if value == Value::Uninit {
                     return self.uninit_read_value(ty, func, place_desc);
                 }
@@ -1767,7 +1770,10 @@ impl<'a> Interpreter<'a> {
             }
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
-                let base = self.alloc_base(*id)?;
+                let store = self.allocs.borrow();
+                let base = store
+                    .get(id)
+                    .ok_or_else(|| self.missing_alloc(*id))?;
                 let func = frames
                     .last()
                     .map(|f| f.func.clone())
@@ -1784,15 +1790,15 @@ impl<'a> Interpreter<'a> {
                 // not measure, so the projector's bounds panic
                 // does not apply to it.
                 let past_unwritten = self.is_elem_block(*id)
-                    && match (&base, projection.first()) {
+                    && match (base, projection.first()) {
                         (Value::Tuple(items), Some(RefProj::Index(i))) => {
                             *i >= items.len()
                         }
                         _ => false,
                     };
                 let root_ty = self.alloc_ty(*id);
-                let value = match self.project_value_t(
-                    base.clone(),
+                let value = match self.project_value_ref_t(
+                    base,
                     projection,
                     &func,
                     &place_desc,
@@ -1829,7 +1835,7 @@ impl<'a> Interpreter<'a> {
                 projection,
             } => {
                 let frame = &frames[*frame_pos];
-                let base = frame.locals.get(*local).cloned().ok_or_else(|| {
+                let stored = frame.locals.get(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
                         func: frame.func.clone(),
                         local: *local,
@@ -1839,10 +1845,17 @@ impl<'a> Interpreter<'a> {
                 // by rustc MIR at all (a unit struct constructor's
                 // body is a bare `return`): an unwritten read of
                 // such a local denotes the type's single value.
-                let base = if base == Value::Uninit {
-                    self.zst_local_value(frame, *local).unwrap_or(base)
+                let zst_base;
+                let base: &Value = if *stored == Value::Uninit {
+                    match self.zst_local_value(frame, *local) {
+                        Some(v) => {
+                            zst_base = v;
+                            &zst_base
+                        }
+                        None => stored,
+                    }
                 } else {
-                    base
+                    stored
                 };
                 // The description is only read inside projection
                 // steps and by the error below, so with an empty
@@ -1868,7 +1881,7 @@ impl<'a> Interpreter<'a> {
                     .get(&frame.func)
                     .and_then(|body| body.local_ty(Local(*local)))
                     .cloned();
-                let value = match self.project_value_t(
+                let value = match self.project_value_ref_t(
                     base,
                     projection,
                     &frame.func,
