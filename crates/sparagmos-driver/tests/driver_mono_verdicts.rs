@@ -12,7 +12,12 @@
 //! used to accept all of these, so compile-check records whose
 //! expected outcome is a failure of one of those kinds flipped
 //! to "expected failure but conversion succeeded" (Issue #509).
-//! The driver now replays the verdicts in `mono_check`; each
+//! Two further verdicts are pinned here: a call to an intrinsic
+//! that must be overridden but has no backend shim (the internal
+//! error code generation raises for it), and a
+//! `#[linkage = "common"]` static with a non-zero initializer
+//! (the LLVM verifier's rejection of the module). The driver now
+//! replays the verdicts in `mono_check`; each
 //! test below pins one rejection and the nearby acceptance that
 //! guards it against over-rejection. A rejected compilation
 //! also stops the compiler session before the phases past
@@ -651,4 +656,127 @@ fn oversized_vtable_const_rejected_without_debuginfo() {
             "debuginfo={debuginfo} stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn unshimmed_must_override_intrinsic_rejected() {
+    // A `#[rustc_intrinsic]` declared without a body must be
+    // overridden by the codegen backend; this backend shims no
+    // `const_deallocate`, so a call to it is the internal error
+    // rustc raises (tests/ui/intrinsics/not-overridden.rs).
+    let case = Case::new("not-overridden");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         pub const unsafe fn const_deallocate(_ptr: *mut u8, _size: usize, _align: usize);\n\
+         fn main() { unsafe { const_deallocate(std::ptr::null_mut(), 1, 1); } }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("compilation failed"), "stderr={stderr}");
+    assert!(stderr.contains("must be overridden"), "stderr={stderr}");
+}
+
+#[test]
+fn shimmed_must_override_intrinsic_converts() {
+    // `ctpop` must be overridden too, but the builtin registry
+    // serves it, so the call is shimmed and converts.
+    let case = Case::new("ctpop-served");
+    let src = case.write(
+        "case.rs",
+        "#![feature(core_intrinsics)]\n\
+         fn main() { let _n = unsafe { core::intrinsics::ctpop(7u32) }; }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn codegen_only_float_intrinsic_converts() {
+    // `sqrtf32` must be overridden too, and the interpreter
+    // has no model for the sized float spellings — but code
+    // generation lowers them, so the call is shimmed by the
+    // backend the verdict mirrors and converts. (The verdict
+    // originally replayed only the interpreter's registry
+    // and rejected this valid program.)
+    let case = Case::new("sqrtf32-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(core_intrinsics)]\n\
+         fn main() { let _x = unsafe { core::intrinsics::sqrtf32(2.0f32) }; }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn codegen_only_prefetch_intrinsic_converts() {
+    // A locally declared `prefetch_read_data` (the minicore
+    // shape) is likewise served by code generation's prefetch
+    // lowering while the interpreter leaves it unmodelled:
+    // an ordinary conversion skip, not the must-be-overridden
+    // error.
+    let case = Case::new("prefetch-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn prefetch_read_data<T, const LOCALITY: i32>(data: *const T);\n\
+         fn main() { let v: u32 = 0; unsafe { prefetch_read_data::<u32, 0>(&v as *const u32); } }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn fallback_body_intrinsic_converts() {
+    // `rotate_left` is declared in core with a fallback body,
+    // so it need not be overridden: the method's body calls
+    // the intrinsic, and conversion converts the fallback.
+    let case = Case::new("rotate-fallback");
+    let src = case.write(
+        "case.rs",
+        "fn main() { let _v = 1u32.rotate_left(2); }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn common_linkage_nonzero_initializer_rejected() {
+    // A common global is a tentative definition: its
+    // initializer must be all zero, and the LLVM verifier
+    // rejects the module otherwise
+    // (tests/ui/linkage-attr/common-linkage-non-zero-init.rs).
+    let case = Case::new("common-nonzero");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"lib\"]\n\
+         #![feature(linkage)]\n\
+         #[linkage = \"common\"]\n\
+         #[no_mangle]\n\
+         pub static TEST: bool = true;\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("compilation failed"), "stderr={stderr}");
+    assert!(stderr.contains("zero initializer"), "stderr={stderr}");
+}
+
+#[test]
+fn common_linkage_zero_initializer_converts() {
+    // The same declaration with a zero initializer is the
+    // legal tentative definition and converts.
+    let case = Case::new("common-zero");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"lib\"]\n\
+         #![feature(linkage)]\n\
+         #[linkage = \"common\"]\n\
+         #[no_mangle]\n\
+         pub static TEST: bool = false;\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
 }
