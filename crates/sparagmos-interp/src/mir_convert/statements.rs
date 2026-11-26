@@ -576,6 +576,27 @@ impl<'a> Converter<'a> {
         func: &mir::Operand,
         raw_generic_args: &[mir::Ty],
     ) -> bool {
+        // `Write::write_fmt` on a `dyn Write` receiver is a
+        // vtable dispatch: the builtin's model keys on the
+        // receiver's static type and stops every `dyn` call,
+        // while the concrete instance body the vtable demand
+        // collected is the faithful execution. Yield the
+        // builtin here so the call conversion falls through
+        // to its vtable-dispatch branch below. A static
+        // receiver needs no yield: `resolve_body_callee` has
+        // already preferred a collected impl body for it, and
+        // the builtin serves the receivers it models.
+        if kind == crate::builtins::Builtin::WriteFmt {
+            let Some(self_ty) = raw_generic_args.first() else {
+                return false;
+            };
+            let tag = crate::builtins::ty_tag(self_ty, self.names);
+            let tag = tag
+                .strip_prefix("&mut ")
+                .or_else(|| tag.strip_prefix('&'))
+                .unwrap_or(&tag);
+            return tag.starts_with("dyn ");
+        }
         let iter_ty = match kind {
             crate::builtins::Builtin::IteratorCount
             | crate::builtins::Builtin::IteratorFold
