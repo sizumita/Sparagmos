@@ -12,7 +12,9 @@
 //! cast regrouping of a slice's elements (a `[[u8; 3]; 2]`
 //! storage ranged over as `[[u8; 2]]`), for the element
 //! reads, the comparisons, and the `Debug` formatting of
-//! the regrouped view alike.
+//! the regrouped view alike, and for the reads and writes
+//! an `iter_mut` over the regrouped view performs through
+//! the element references its steps hand out.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -722,5 +724,117 @@ fn main() {
          reslice fmt: 4\n\
          reslice0: [[3, 2], [6, 4]]\n\
          after writes: [[3, 20, 40], [4, 5, 1]]\n"
+    );
+}
+
+/// Mutable iteration over a regrouped slice: the element
+/// references an `IterMut` step hands out denote their
+/// elements by a byte displacement over the position the
+/// cast's denomination recorded (the step's pointer
+/// arithmetic, not an index step), so the reads and the
+/// writes through them price through the recorded view at
+/// the displaced position -- the second element's bytes
+/// are the storage's third and fourth bytes, in both
+/// directions.
+#[test]
+fn cast_slice_regroup_iter_mut() {
+    let stdout = run_ok(
+        "cast-regroup-iter-mut",
+        "cast_regroup_iter_mut.rs",
+        r#"
+fn main() {
+    let mut a: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    {
+        let basem: *mut [[u8; 3]] = &mut a;
+        let pm: &mut [[u8; 2]] = unsafe { &mut *(basem as *mut [[u8; 2]]) };
+        for e in pm.iter_mut() {
+            println!("elem: {:?}", e);
+        }
+        let mut sum = 0u32;
+        for e in pm.iter_mut() {
+            for x in e.iter() {
+                sum += *x as u32;
+            }
+        }
+        println!("sum: {sum}");
+        for e in pm.iter_mut() {
+            e[0] = 40;
+            e[1] = 41;
+        }
+    }
+    println!("after: {:?}", a);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "elem: [3, 2]\n\
+         elem: [6, 4]\n\
+         sum: 15\n\
+         after: [[40, 41, 40], [41, 5, 1]]\n"
+    );
+}
+
+/// The back steps and the whole-element writes of a
+/// mutable iteration over a regrouped view: `rev` displaces
+/// the end pointer backwards over the denominated position,
+/// a whole-element assignment through the yielded reference
+/// splices the element's bytes at the displaced span, and
+/// a scalar-element view (the same storage ranged over as
+/// `u16` elements) mutates through the same pricing. The
+/// non-regrouped control is unchanged.
+#[test]
+fn cast_slice_regroup_iter_mut_rev_and_whole() {
+    let stdout = run_ok(
+        "cast-regroup-iter-mut-rev",
+        "cast_regroup_iter_mut_rev.rs",
+        r#"
+fn main() {
+    let mut a: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    {
+        let basem: *mut [[u8; 3]] = &mut a;
+        let pm: &mut [[u8; 2]] = unsafe { &mut *(basem as *mut [[u8; 2]]) };
+        for e in pm.iter_mut().rev() {
+            println!("rev: {:?}", e);
+            e[1] = 99;
+        }
+    }
+    println!("after rev: {:?}", a);
+    let mut b: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    {
+        let basem: *mut [[u8; 3]] = &mut b;
+        let pm: &mut [[u8; 2]] = unsafe { &mut *(basem as *mut [[u8; 2]]) };
+        for e in pm.iter_mut() {
+            *e = [9, 8];
+        }
+    }
+    println!("after whole: {:?}", b);
+    let mut c: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    {
+        let s: &mut [u16] = unsafe { &mut *(&mut c as *mut [[u8; 3]] as *mut [u16]) };
+        for x in s.iter_mut() {
+            println!("u16: {}", x);
+            *x = 7;
+        }
+    }
+    println!("after u16: {:?}", c);
+    let mut d: [[u8; 2]; 2] = [[1, 2], [3, 4]];
+    for e in d.iter_mut() {
+        e[0] = 50;
+    }
+    println!("control: {:?}", d);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "rev: [6, 4]\n\
+         rev: [3, 2]\n\
+         after rev: [[3, 99, 6], [99, 5, 1]]\n\
+         after whole: [[9, 8, 9], [8, 5, 1]]\n\
+         u16: 515\n\
+         u16: 1030\n\
+         after u16: [[7, 0, 7], [0, 5, 1]]\n\
+         control: [[50, 2], [50, 4]]\n"
     );
 }
