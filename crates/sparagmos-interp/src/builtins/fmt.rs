@@ -1826,28 +1826,38 @@ impl<'a> Interpreter<'a> {
         // A `String` in its real aggregate form (see
         // `string_from_real_aggregate`) formats as the string it
         // denotes, for every trait `String` / `str` formatting
-        // defines.
+        // defines. The same denotation covers a `str` pointee
+        // over such storage, and the bare element form (and the
+        // sparse form a growth of it leaves) that
+        // `String::as_mut_vec` / `str::as_bytes_mut` leave in
+        // the string's storage, which denotes the string
+        // directly, with no wrapper around it.
         if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
             let plain = pointee_tag(ty);
-            if plain == "std::string::String" || plain == "alloc::string::String" {
-                if let Value::Enum {
-                    variant: 0,
-                    fields,
-                } = value
-                {
-                    let text = match self.string_from_real_aggregate(frames, value)? {
+            if plain == "std::string::String"
+                || plain == "alloc::string::String"
+                || plain == "str"
+            {
+                let text = match value {
+                    Value::Enum {
+                        variant: 0,
+                        fields,
+                    } => match self.string_from_real_aggregate(frames, value)? {
                         Some(text) => Some(text),
                         None => match fields.first() {
                             Some(vec) => self.string_from_element_form(vec),
                             None => None,
-                        },
-                    };
-                    if let Some(text) = text {
-                        let decoded = Value::Str(text);
-                        return self.format_value(
-                            frames, &decoded, trait_, ty, options, indent,
-                        );
-                    }
+                        }
+                        .or_else(|| self.string_from_element_form(value)),
+                    },
+                    Value::SparseVec { .. } => self.string_from_element_form(value),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    let decoded = Value::Str(text);
+                    return self.format_value(
+                        frames, &decoded, trait_, ty, options, indent,
+                    );
                 }
             }
         }

@@ -316,6 +316,25 @@ pub(super) fn string_aggregate_bytes(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::Str(s) => Some(s.clone().into_bytes()),
         Value::Bytes(b) => Some(b.clone()),
+        // The sparse element form (the shape a growth of the
+        // bare element form leaves in a string's storage, see
+        // `String::as_mut_vec`): the bytes are the first `len`
+        // elements; any slots past them are spare capacity.
+        Value::SparseVec { elems, len, .. } => {
+            let len = usize::try_from(*len).ok()?;
+            if elems.len() < len {
+                return None;
+            }
+            let mut out = Vec::with_capacity(len);
+            for f in &elems[..len] {
+                match f {
+                    Value::Uint(b) => out.push(*b as u8),
+                    Value::Int(b) if (0..=255).contains(b) => out.push(*b as u8),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
         Value::Enum { fields, .. } => {
             if fields
                 .iter()

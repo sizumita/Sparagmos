@@ -210,3 +210,102 @@ fn run_mode_string_mutator_boundary_panics() {
         "assertion failed: self.is_char_boundary(at)",
     );
 }
+
+// Regression coverage for the byte-view mutators: `String::
+// as_mut_vec`, `String::leak` and `str::as_bytes_mut`. The
+// abstract string has no byte slots, so each of these calls
+// rewrites the denoted storage into the byte element form
+// and the vector / byte operations mutate that form in
+// place; the string readers (text coercions, formatting,
+// equality, ordering) read the form back as the string it
+// denotes. Before the fix, `Vec::push` through the view
+// stopped on the string value, `leak` stopped in conversion
+// on its body's pointer transmute, and a byte write through
+// `as_bytes_mut` stopped on the string storage.
+
+const AS_MUT_VEC_SRC: &str = r#"
+fn main() {
+    let mut s = String::from("hello");
+    {
+        let v = unsafe { s.as_mut_vec() };
+        v.push(b'!');
+        v[0] = b'H';
+        v.extend_from_slice(b"?");
+        let p = v.pop();
+        assert_eq!(p, Some(b'?'));
+        assert_eq!(v.len(), 6);
+    }
+    assert_eq!(s, "Hello!");
+    assert!(s == String::from("Hello!"));
+    assert!(s > String::from("Hello"));
+    println!("{} {:?} {}", s, s, s.len());
+    let mut e = String::new();
+    unsafe { e.as_mut_vec() }.extend_from_slice(b"abc");
+    println!("{}", e);
+    let mut c: String = "hello".chars().collect();
+    { let v = unsafe { c.as_mut_vec() }; v[4] = b'O'; }
+    let mut u = unsafe { String::from_utf8_unchecked(vec![104, 105]) };
+    unsafe { u.as_mut_vec() }.push(b'!');
+    println!("{} {}", c, u);
+    struct Holder { s: String }
+    let mut h = Holder { s: String::from("ab") };
+    unsafe { h.s.as_mut_vec() }.push(b'c');
+    let mut vs = vec![String::from("x")];
+    unsafe { vs[0].as_mut_vec() }.push(b'y');
+    println!("{} {}", h.s, vs[0]);
+    let mut t = String::from("hello");
+    {
+        let v = unsafe { t.as_mut_vec() };
+        v.truncate(2);
+        v.insert(1, b'E');
+        let r = v.remove(0);
+        assert_eq!(r, b'h');
+        let sum: u32 = v.iter().map(|b| *b as u32).sum();
+        assert_eq!(sum, 69 + 101);
+        v.clear();
+        assert!(v.is_empty());
+    }
+    assert_eq!(t, "");
+    s.push_str("?");
+    println!("[{}]", s);
+}
+"#;
+
+#[test]
+fn run_mode_string_as_mut_vec_writes_through() {
+    run_ok(
+        "strmutvec",
+        AS_MUT_VEC_SRC,
+        "Hello! \"Hello!\" 6\nabc\nhellO hi!\nabc xy\n[Hello!?]\n",
+    );
+}
+
+const LEAK_AND_BYTES_MUT_SRC: &str = r#"
+fn leak_it(s: String) -> &'static mut str { s.leak() }
+fn main() {
+    let m = leak_it(String::from("rust"));
+    assert_eq!(m, "rust");
+    m.make_ascii_uppercase();
+    { let b = unsafe { m.as_bytes_mut() }; b[0] = b'R'; }
+    assert_eq!(&*m, "RUST");
+    println!("{:?} {}", m, m.len());
+    let m2 = leak_it("ab".chars().collect());
+    println!("{}", m2);
+    let mut s2 = String::from("cat");
+    let r: &mut str = &mut s2;
+    { let b = unsafe { r.as_bytes_mut() }; b[0] = b'b'; }
+    println!("{}", s2);
+    let mut s3 = String::from("hello");
+    { let b = unsafe { s3.as_bytes_mut() }; b[0] = b'H'; }
+    println!("{}", s3);
+}
+"#;
+
+#[test]
+fn run_mode_string_leak_and_as_bytes_mut() {
+    run_ok(
+        "strleak",
+        LEAK_AND_BYTES_MUT_SRC,
+        "\"RUST\" 4\nab\nbat\nHello\n",
+    );
+}

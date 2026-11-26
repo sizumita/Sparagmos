@@ -4995,6 +4995,33 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 self.string_bytes_ref(frames, &vals[0])
             }
+            Builtin::StrAsBytesMut => {
+                arity(1)?;
+                let view = vals[0].clone();
+                let target = self.deref_value(frames, &view)?;
+                let text = self.string_text_at(frames, &target, "str::as_bytes_mut")?;
+                let len = text.len() as u128;
+                let bytes = Value::Enum {
+                    variant: 0,
+                    fields: text
+                        .into_bytes()
+                        .into_iter()
+                        .map(|b| Value::Uint(b as u128))
+                        .collect(),
+                };
+                self.write_resolved(frames, &target, bytes)?;
+                // The byte slice denotes the same storage the
+                // `&mut str` denoted, at the string's byte
+                // length.
+                let base = match view {
+                    Value::FatRef { base, .. } => *base,
+                    other => other,
+                };
+                Ok(Value::FatRef {
+                    base: Box::new(base),
+                    len,
+                })
+            }
             Builtin::StringIntoBytes => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
@@ -5005,6 +5032,43 @@ impl<'a> Interpreter<'a> {
                         .into_iter()
                         .map(|b| Value::Uint(b as u128))
                         .collect(),
+                })
+            }
+            Builtin::StringAsMutVec => {
+                arity(1)?;
+                let view = vals[0].clone();
+                let target = self.deref_value(frames, &view)?;
+                let text = self.string_text_at(frames, &target, "String::as_mut_vec")?;
+                // The string value in the byte vector's own
+                // element form: the returned reference denotes
+                // the receiver's storage itself (the vector
+                // operations resolve it with no projection), so
+                // the element form is what they mutate in
+                // place, and the string readers coerce that
+                // form back to text (see `resolve_string`).
+                let bytes = Value::Enum {
+                    variant: 0,
+                    fields: text
+                        .into_bytes()
+                        .into_iter()
+                        .map(|b| Value::Uint(b as u128))
+                        .collect(),
+                };
+                self.write_resolved(frames, &target, bytes)?;
+                Ok(view)
+            }
+            Builtin::StringLeak => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                let len = s.len() as u128;
+                let id = self.alloc_insert(Value::Str(s));
+                self.record_alloc_ty(id, Ty::Str);
+                Ok(Value::FatRef {
+                    base: Box::new(Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: Vec::new(),
+                    })),
+                    len,
                 })
             }
             Builtin::StringIntoBoxedStr => {

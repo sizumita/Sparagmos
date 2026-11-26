@@ -578,6 +578,16 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                // The vector may equally *be* the stored value,
+                // with no `String` wrapper around it: the shape
+                // `String::as_mut_vec` leaves in the receiver's
+                // storage, whose returned reference denotes the
+                // storage itself, so the vector operations
+                // mutate the element form directly (the sparse
+                // form a growth leaves included).
+                if let Some(text) = self.string_from_element_form(other) {
+                    return Ok(text);
+                }
                 Err(InterpError::type_mismatch(
                     "string argument",
                     "string data",
