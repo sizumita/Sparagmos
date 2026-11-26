@@ -1715,3 +1715,171 @@ fn debug_mode_field_steps_deref_nested_boxes() {
         );
     }
 }
+const DEBUG_STRING_FORMS_SRC: &str = r#"use std::rc::Rc;
+
+struct Foo {
+    inner: &'static str,
+}
+
+fn main() {
+    let plain_string = String::from("Hello");
+    let plain_str = "Hello";
+    let str_in_struct = Foo { inner: "Hello" };
+    let str_in_tuple = ("Hello", "World");
+    let str_in_rc = Rc::new("Hello");
+    let box_str: Box<str> = Box::from("World");
+    let rc_str: Rc<str> = Rc::from("Hello");
+    zzz(); // #break
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_string_forms_render_in_gdb() {
+    // The gdb forms of the string values: a `String` whose
+    // value the model holds as text renders in the DWARF
+    // structural aggregate form (with the `non_null`
+    // definition path and the niche capacity), a boxed `str`
+    // renders as its byte list, and an `Rc<str>` expands its
+    // `RcInner` inline with the unsized tail as the data
+    // address.
+    let dir = temp_dir("debug-string-forms-gdb");
+    let src = fixture(&dir, "string_forms.rs", DEBUG_STRING_FORMS_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "break 15\nrun\nprint plain_string\nprint str_in_struct\nprint str_in_rc\nprint box_str\nprint rc_str\n",
+        "gdb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "alloc::string::String {vec: alloc::vec::Vec<u8, \
+         alloc::alloc::Global> {buf: alloc::raw_vec::RawVec<u8, \
+         alloc::alloc::Global> {inner: \
+         alloc::raw_vec::RawVecInner<alloc::alloc::Global> {ptr: \
+         core::ptr::non_null::NonNull<u8> {pointer: 0x",
+        "cap: core::num::niche_types::UsizeNoHighBit (5)",
+        "string_forms::Foo {inner: \"Hello\"}",
+        "alloc::boxed::Box<str, alloc::alloc::Global> \
+         [87, 111, 114, 108, 100]",
+        "core::ptr::non_null::NonNull<alloc::rc::RcInner<str>> \
+         {pointer: alloc::rc::RcInner<str> {strong:",
+        "value: 0x",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn debug_mode_string_forms_render_in_lldb() {
+    // The lldb forms of the same values: a `String` and an
+    // `Rc`'s `str` pointee render through their provider
+    // lines with the character children appended.
+    let dir = temp_dir("debug-string-forms-lldb");
+    let src = fixture(&dir, "string_forms.rs", DEBUG_STRING_FORMS_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "break 15\nrun\nv plain_string\nv str_in_rc\nv box_str\n",
+        "lldb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "(alloc::string::String) plain_string = \"Hello\" \
+         { [0] = 'H' [1] = 'e' [2] = 'l' [3] = 'l' [4] = 'o' }",
+        "str_in_rc = strong=1, weak=0 \
+         { value = \"Hello\" { [0] = 'H'",
+        "box_str = \"World\" { [0] = 'W'",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_BOX_DST_SRC: &str = r#"use std::rc::Rc;
+
+struct Foo<T: ?Sized> {
+    vals: T,
+}
+
+struct Holder {
+    p: *const Foo<[u8]>,
+}
+
+fn main() {
+    let box_str: Box<str> = Box::from("World");
+    let box_slice: Box<[u8]> = Box::new([9, 8, 7]);
+    let box_dst: Box<Foo<[u8]>> = Box::new(Foo { vals: [5, 6] });
+    let raw_slice: *const [u8] = &[9, 8, 7];
+    let holder = Holder { p: &Foo { vals: [5, 6] } };
+    let rc_str: Rc<str> = Rc::from("Hello");
+    zzz(); // #break
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_box_unsized_pointees_print_the_pointee() {
+    // A box over an unsized pointee prints the pointee: a
+    // `str` as its byte list, a slice as its elements, a
+    // DST struct as the struct itself with the slice tail's
+    // elements. A raw slice pointer prints the same element
+    // list, and a raw pointer to a DST struct held in a
+    // field expands the pointee struct inline.
+    let dir = temp_dir("debug-box-dst");
+    let src = fixture(&dir, "box_dst.rs", DEBUG_BOX_DST_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "break 18\nrun\nprint box_str\nprint box_slice\nprint box_dst\nprint raw_slice\nprint holder\nprint rc_str\n",
+        "gdb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "alloc::boxed::Box<str, alloc::alloc::Global> \
+         [87, 111, 114, 108, 100]",
+        "alloc::boxed::Box<[u8], alloc::alloc::Global> [9, 8, 7]",
+        "alloc::boxed::Box<box_dst::Foo<[u8]>, \
+         alloc::alloc::Global> box_dst::Foo<[u8]> {vals: [5, 6]}",
+        "*const [u8] [9, 8, 7]",
+        "box_dst::Holder {p: box_dst::Foo<[u8]> {vals: [5, 6]}}",
+        "value: 0x",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn debug_mode_box_str_lldb_provider_line() {
+    // A boxed `str` takes the pointee's own lldb provider
+    // form: the string summary with its character children.
+    let dir = temp_dir("debug-box-str-lldb");
+    let src = fixture(&dir, "string_forms.rs", DEBUG_STRING_FORMS_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "break 15\nrun\nv box_str\n",
+        "lldb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains(
+            "(alloc::boxed::Box<str, alloc::alloc::Global>) \
+             box_str = \"World\" \
+             { [0] = 'W' [1] = 'o' [2] = 'r' [3] = 'l' [4] = 'd' }"
+        ),
+        "missing the box provider line in debug transcript: {stdout}"
+    );
+}
