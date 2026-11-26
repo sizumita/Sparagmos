@@ -5230,3 +5230,41 @@ fn run_mode_as_ref_slice_of_arrays() {
         "asref 2 [[1, 2], [3, 4]]\nborrow 2 [[1, 2], [3, 4]]\n",
     );
 }
+
+const SORT_INTERLEAVED_SCRATCH_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..8usize {
+        for p in 0..4usize {
+            v.push(p * 1000 + i);
+        }
+    }
+    v.sort();
+    println!("sorted: {v:?}");
+}
+"#;
+
+#[test]
+fn run_mode_sort_interleaved_scratch_partition() {
+    // Driftsort on interleaved runs takes the stable-quicksort
+    // path: `stable_partition` copies elements one at a time
+    // between the vector buffer and the stack scratch array
+    // (`AlignedStorage`, a byte array field reinterpreted as
+    // elements). The scratch base pointer is a bare field
+    // projection, and `partition_one` offsets it by an element
+    // count (`scratch_base.add(num_left)`). That offset used to
+    // fall out of the declared-type array judgment (which
+    // required a trailing index step) into the value-shape
+    // absorption, which denominated the position in the
+    // offset's element size over a byte container: element 1
+    // landed at byte 1, the address was misaligned, and the
+    // guest died in the `copy_nonoverlapping` precondition
+    // check (exit 134). The bare field base now judges as
+    // element 0 of the field's sequence, so the partition
+    // copies land on element boundaries and the sort runs.
+    run_ok(
+        "sort-interleaved-scratch",
+        SORT_INTERLEAVED_SCRATCH_SRC,
+        "sorted: [0, 1, 2, 3, 4, 5, 6, 7, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007]\n",
+    );
+}
