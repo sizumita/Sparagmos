@@ -64,6 +64,133 @@ pub(crate) fn treat_err_abort_reason(reason: &str) -> Option<String> {
     }
 }
 
+/// Report a panic that ended the compiler run, and exit with
+/// the code the run contract assigns it. A run-ending panic
+/// reaches this report by two roads: it escaped the run and
+/// the caller's `catch_unwind` caught it, or the run ended in
+/// `CompilerError::Failed` and the panic hook's record of a
+/// panic during the run is reported in the bare error's place
+/// (see `report_failed_run`). Either way the classification
+/// is the panic's own shape: a compilation failure the
+/// compiler already explained, or an internal failure of the
+/// conversion.
+pub(crate) fn report_escaped_panic(reason: &str, exec_mode: bool, mode: Mode) -> ! {
+    let (line, code) = panic_report(reason, exec_mode, mode);
+    eprintln!("{line}");
+    exit_process(code);
+}
+
+/// The report line and exit code for a panic that ended the
+/// compiler run (see `report_escaped_panic`).
+fn panic_report(reason: &str, exec_mode: bool, mode: Mode) -> (String, i32) {
+    if is_delayed_bug_flush(reason) {
+        // The compiler died on an internal error of its own
+        // (see `is_delayed_bug_flush`): a compiler crash
+        // (Issue #66). Convert mode reports it with the
+        // crash exit code, the code the native compiler
+        // dies with on the same flush; run mode keeps its
+        // single unsupported code, and the
+        // compilation-failure report, for every
+        // conversion-side failure.
+        if exec_mode {
+            return (
+                format!("sparagmos-driver: compilation failed: {DELAYED_BUG_ABORT}"),
+                2,
+            );
+        }
+        return (
+            format!("sparagmos-driver: compiler crashed: {DELAYED_BUG_ABORT}"),
+            101,
+        );
+    }
+    if let Some(abort) = treat_err_abort_reason(reason) {
+        // The compiler itself aborted the compilation on a
+        // diagnostic it had already reported, under a flag
+        // ordering exactly that: a compilation failure, not
+        // a conversion gap, so it takes the
+        // compilation-failure report (and its exit codes),
+        // exactly like a front-end rejection recorded by
+        // the callbacks.
+        return (
+            format!("sparagmos-driver: compilation failed: {abort}"),
+            if exec_mode { 2 } else { 1 },
+        );
+    }
+    if mode == Mode::RunJit {
+        return (
+            format!(
+                "sparagmos-driver run-jit: unsupported: Stable MIR conversion panicked: {reason}"
+            ),
+            2,
+        );
+    }
+    if exec_mode {
+        return (
+            format!(
+                "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
+            ),
+            2,
+        );
+    }
+    // Any other panic that ends the compiler run is an
+    // internal failure of the compiler itself (Issue #66):
+    // convert mode reports it as a crash, not as a clean
+    // compilation failure. Panics the conversion contains
+    // per body or per query never reach this point; they
+    // keep their named reasons in the report.
+    (
+        format!("sparagmos-driver: Stable MIR conversion panicked: {reason}"),
+        101,
+    )
+}
+
+/// Report a compiler run that ended in
+/// `CompilerError::Failed`, and exit. A panic raised inside
+/// the run can be folded into that bare error by the
+/// compiler's fatal-error machinery before it reaches the
+/// caller's `catch_unwind`; when the panic hook's record of
+/// a panic during the run still stands — no containment
+/// consumed it — the record is the run's concrete failure
+/// reason and is reported as an escaped panic (see
+/// `report_escaped_panic`). A front-end failure that
+/// panicked nowhere leaves the slot empty and keeps the
+/// bare compilation-failure report; in run mode a failed
+/// compilation is a conversion failure, which the run
+/// contract reports as exit 2.
+pub(crate) fn report_failed_run(
+    error: &rustc_public::CompilerError<()>,
+    exec_mode: bool,
+    mode: Mode,
+) -> ! {
+    let (line, code) = failed_run_report(
+        take_captured_panic(),
+        &format!("{error:?}"),
+        exec_mode,
+        mode,
+    );
+    eprintln!("{line}");
+    exit_process(code);
+}
+
+/// The report line and exit code for a failed compiler run
+/// (see `report_failed_run`): the panic report when a panic
+/// was captured during the run, else the bare
+/// compilation-failure line with the front-end exit code.
+fn failed_run_report(
+    captured: Option<String>,
+    error_debug: &str,
+    exec_mode: bool,
+    mode: Mode,
+) -> (String, i32) {
+    if let Some(reason) = captured {
+        return panic_report(&reason, exec_mode, mode);
+    }
+    (
+        format!("sparagmos-driver: compilation failed: {error_debug}"),
+        if exec_mode { 2 } else { 1 },
+    )
+}
+
 /// Reason text from a caught panic payload, when it is a string.
 pub(crate) fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -407,4 +534,71 @@ impl StdoutToStderr {
     }
 
     pub(crate) fn restore(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed run whose panic the hook captured reports the
+    /// panic's reason — message and location — under the run
+    /// contract's line, not the bare `Failed` text: the
+    /// fatal-error machinery folds such a panic into
+    /// `CompilerError::Failed`, and the capture is the only
+    /// place the reason survives.
+    #[test]
+    fn failed_run_surfaces_captured_panic() {
+        let captured = Some(
+            "something gave up (panicked at convert.rs:10:5)".to_string(),
+        );
+        let (line, code) = failed_run_report(
+            captured,
+            "Failed",
+            true,
+            Mode::Run,
+        );
+        assert_eq!(code, 2);
+        assert!(
+            line.contains("something gave up (panicked at convert.rs:10:5)"),
+            "line={line}"
+        );
+        assert!(
+            line.starts_with("sparagmos-driver run: unsupported:"),
+            "line={line}"
+        );
+    }
+
+    /// A failed run that panicked nowhere keeps the bare
+    /// compilation-failure report and its exit codes.
+    #[test]
+    fn failed_run_without_panic_keeps_bare_report() {
+        let (line, code) = failed_run_report(None, "Failed", true, Mode::Run);
+        assert_eq!(line, "sparagmos-driver: compilation failed: Failed");
+        assert_eq!(code, 2);
+        let (line, code) =
+            failed_run_report(None, "Failed", false, Mode::Convert);
+        assert_eq!(line, "sparagmos-driver: compilation failed: Failed");
+        assert_eq!(code, 1);
+    }
+
+    /// The panic classification itself is unchanged by the
+    /// failed-run route: a plain conversion panic is a crash
+    /// in convert mode, and a delayed-bug flush keeps its
+    /// crash report in both modes.
+    #[test]
+    fn panic_report_classification() {
+        let (line, code) = panic_report("boom", false, Mode::Convert);
+        assert_eq!(code, 101);
+        assert!(
+            line.contains("Stable MIR conversion panicked: boom"),
+            "line={line}"
+        );
+        let flush = "panicked at compiler/rustc_errors/src/lib.rs:1499:9";
+        let (line, code) = panic_report(flush, false, Mode::Convert);
+        assert_eq!(code, 101);
+        assert!(line.contains("compiler crashed:"), "line={line}");
+        let (line, code) = panic_report(flush, true, Mode::Run);
+        assert_eq!(code, 2);
+        assert!(line.contains("compilation failed:"), "line={line}");
+    }
 }
