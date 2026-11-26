@@ -1787,6 +1787,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "libc::unix::free" => Builtin::LibcFree,
         "libc::unix::realloc" => Builtin::LibcRealloc,
         "libc::unix::posix_memalign" => Builtin::LibcPosixMemalign,
+        "libc::sigaction" | "libc::unix::sigaction" => Builtin::LibcSigaction,
+        "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
+        "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }

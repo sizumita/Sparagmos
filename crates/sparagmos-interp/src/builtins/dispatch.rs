@@ -96,7 +96,13 @@ impl<'a> Interpreter<'a> {
             }
             return self.exec_stream_io(frames, name, vals);
         }
-        let kind = lookup(name)
+        // The baked name may carry the calling crate's
+        // `extern crate` prefix (`krate::libc::sigaction`
+        // for a callee the registry names `libc::sigaction`):
+        // the qualified lookup resolves the same item under
+        // either spelling, as it does for every other
+        // builtin-name consumer.
+        let kind = lookup_qualified(name)
             .or_else(|| foreign_helper_lookup(name))
             .or_else(|| intrinsic_lookup(name))
             .or_else(|| fmt_trait_method(name))
@@ -8609,6 +8615,18 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 self.write_resolved(frames, &target, block)?;
                 Ok(Value::Int(0))
+            }
+            Builtin::LibcSigaction => {
+                arity(3)?;
+                self.exec_libc_sigaction(frames, name, &vals)
+            }
+            Builtin::LibcRaise => {
+                arity(1)?;
+                self.exec_libc_raise(frames, name, &vals)
+            }
+            Builtin::LibcAtexit => {
+                arity(1)?;
+                self.exec_libc_atexit(frames, name, &vals)
             }
             Builtin::AtomicCxchg => {
                 arity(3)?;

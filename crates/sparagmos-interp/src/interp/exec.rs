@@ -104,6 +104,15 @@ impl<'a> Interpreter<'a> {
             },
             Err(e) => Err(e),
         };
+        // Program exit first runs the guest's registered
+        // `atexit` handlers (see `run_exit_handlers`): the
+        // platform runs them as `main` returns, ahead of the
+        // thread's TLS teardown. A handler's failure replaces
+        // the entry's outcome, as a destructor's does below.
+        let result = match self.run_exit_handlers(&mut frames) {
+            Ok(()) => result,
+            Err(e) => Err(e),
+        };
         // Program exit runs the entry thread's registered TLS
         // destructors (the registrations wrap
         // `__cxa_thread_atexit`, whose entries run at exit),

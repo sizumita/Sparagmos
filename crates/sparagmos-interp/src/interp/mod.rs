@@ -49,6 +49,7 @@ mod memory;
 mod panics;
 mod places;
 mod project;
+mod signals;
 mod state;
 mod threads;
 mod values;
@@ -59,6 +60,7 @@ pub use host::{
     ToolRunner,
 };
 pub use state::FmtBuilderKind;
+pub(crate) use signals::SignalAction;
 
 pub(crate) use address::*;
 pub(crate) use arith::*;
@@ -580,6 +582,15 @@ pub struct Interpreter<'a> {
     /// the registration carried. They run when the thread's code
     /// finishes (see [`Interpreter::run_thread`]).
     tls_dtors: std::cell::RefCell<HashMap<u64, Vec<(Value, Value)>>>,
+    /// Signal dispositions installed through the `sigaction`
+    /// model (see the `LibcSigaction` builtin), keyed by
+    /// signal number.
+    signal_actions: std::cell::RefCell<HashMap<i64, SignalAction>>,
+    /// Exit handlers registered through the `atexit` model
+    /// (see the `LibcAtexit` builtin), in registration
+    /// order. They run when the entry's exit runs them (see
+    /// `run_exit_handlers`).
+    exit_handlers: std::cell::RefCell<Vec<Value>>,
     /// The thread whose code is currently executing (the entry
     /// thread outside any spawned thread's run).
     current_thread: std::cell::Cell<u64>,
@@ -920,6 +931,8 @@ impl<'a> Interpreter<'a> {
             threads: std::cell::RefCell::new(HashMap::new()),
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
+            signal_actions: std::cell::RefCell::new(HashMap::new()),
+            exit_handlers: std::cell::RefCell::new(Vec::new()),
             current_thread: std::cell::Cell::new(1),
             sync_nesting: std::cell::Cell::new(0),
             channel_epoch: std::cell::Cell::new(0),
