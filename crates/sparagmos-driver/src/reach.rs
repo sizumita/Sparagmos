@@ -123,6 +123,33 @@ pub const MAX_COLLECTED_BODIES: usize = 8192;
 /// conversion before foreign bodies are converted.
 pub const MAX_INSTANTIATION_EXPANDED_SIZE: usize = 1 << 15;
 
+/// The largest expanded type tree the converter materializes
+/// (see [`MAX_INSTANTIATION_EXPANDED_SIZE`] for how an expanded
+/// size is counted).
+///
+/// The collection cap guards which instances get demanded, but
+/// conversion itself walks whatever types the collected bodies
+/// carry: a body whose locals spell a type tree past every
+/// collection bound still materializes it node by node into the
+/// owned `sparagmos_mir::Ty` tree. Nested closures are the
+/// sharp case: a closure type spells its captured type twice,
+/// so each nesting level doubles the tree the converter builds,
+/// and a chain of independent calls (thirty `dup` calls in one
+/// `main`, tests/ui/closures/issue-72408-nested-closures-
+/// exponential.rs) reaches the doubling without any single
+/// demand tripping the collection cap first. The converter
+/// therefore refuses a type whose expanded tree exceeds this
+/// bound, reporting it like any other unsupported construct in
+/// the body that carries it.
+///
+/// The value is set by what legitimate conversion reaches, not
+/// by the collection cap: bodies converted for the iterator
+/// adapter towers spell types of several hundred thousand
+/// nodes, so the bound sits well above those, while the
+/// exponential chains cross it at a nesting depth whose total
+/// materialization is still small.
+pub const MAX_TY_EXPANDED_SIZE: usize = 1 << 21;
+
 /// Whether the expanded size of `args` (see
 /// [`MAX_INSTANTIATION_EXPANDED_SIZE`]) stays within `limit`.
 /// The walk counts nodes against a budget and stops as soon as
@@ -222,6 +249,19 @@ pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bo
         }
     }
     Walk { budget: limit }.args(args)
+}
+
+/// Whether the expanded size of `ty` (see
+/// [`MAX_TY_EXPANDED_SIZE`]) stays within `limit`. Shares the
+/// memoized walk with [`generic_args_within_expanded_size`],
+/// so deciding the question costs O(min(expanded size, limit))
+/// plus cache hits: the walk itself can never be the runaway
+/// allocation it guards against.
+pub fn ty_within_expanded_size(ty: &Ty, limit: usize) -> bool {
+    generic_args_within_expanded_size(
+        &GenericArgs(vec![GenericArgKind::Type(*ty)]),
+        limit,
+    )
 }
 
 thread_local! {
