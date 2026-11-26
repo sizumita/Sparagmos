@@ -218,6 +218,143 @@ fn run_mode_byte_index_write_of_f32_storage() {
     );
 }
 
+const PUNNED_SCALAR_VIEW_FMT_SRC: &str = r#"
+fn main() {
+    let x: f32 = 1.0;
+    let view = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u32, 1) };
+    println!("r={:?}", &view[0]);
+    let y: u32 = 0x3F80_0000;
+    let view2 = unsafe { std::slice::from_raw_parts(&y as *const u32 as *const f32, 1) };
+    println!("r2={:?}", &view2[0]);
+    let v: u32 = view[0];
+    println!("v={}", v);
+    let v2: f32 = view2[0];
+    println!("v2={}", v2);
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_fmt_reads_the_element_kind() {
+    // A scalar-backed slice whose element type is the
+    // storage's width but a different kind (Issue #479):
+    // a consumer that resolves the element reference
+    // directly (formatting) sees the element under its own
+    // kind -- the storage's bits reinterpreted -- not the
+    // backing scalar. The typed reads below agree with the
+    // formatted ones. Native rustc 1.100.0's output.
+    run_ok(
+        "punned-scalar-view-fmt",
+        PUNNED_SCALAR_VIEW_FMT_SRC,
+        "r=1065353216\nr2=1.0\nv=1065353216\nv2=1\n",
+    );
+}
+
+const PUNNED_SCALAR_VIEW_ITER_SRC: &str = r#"
+fn main() {
+    let y: u32 = 0x3F80_0000;
+    let view = unsafe { std::slice::from_raw_parts(&y as *const u32 as *const f32, 1) };
+    for v in view.iter() {
+        println!("v={:?}", v);
+    }
+    let x: f32 = 1.0;
+    let view2 = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u32, 1) };
+    for v in view2.iter() {
+        println!("w={:?}", v);
+    }
+    let s: Vec<f32> = view.iter().copied().collect();
+    println!("s={:?}", s);
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_iter_yields_the_element_kind() {
+    // The iterator snapshot of a punned scalar view
+    // (Issue #479): the yielded element is the storage's
+    // bytes under the element's kind, both for a consumer
+    // that resolves the yielded reference directly and for
+    // a typed consumer (`copied`). Native rustc 1.100.0's
+    // output.
+    run_ok(
+        "punned-scalar-view-iter",
+        PUNNED_SCALAR_VIEW_ITER_SRC,
+        "v=1.0\nw=1065353216\ns=[1.0]\n",
+    );
+}
+
+const PUNNED_SCALAR_VIEW_KINDS_SRC: &str = r#"
+static SX: f32 = -2.5;
+fn main() {
+    let a: f32 = -2.5;
+    let va = unsafe { std::slice::from_raw_parts(&a as *const f32 as *const i32, 1) };
+    println!("a={:?} ai={}", &va[0], va.iter().next().unwrap());
+    let b: f64 = 0.5;
+    let vb = unsafe { std::slice::from_raw_parts(&b as *const f64 as *const u64, 1) };
+    println!("b={:?}", &vb[0]);
+    let d: u16 = 0xFFFF;
+    let vd = unsafe { std::slice::from_raw_parts(&d as *const u16 as *const i16, 1) };
+    println!("d={:?} di={}", &vd[0], vd.iter().next().unwrap());
+    let e: u32 = 0x41;
+    let ve = unsafe { std::slice::from_raw_parts(&e as *const u32 as *const char, 1) };
+    println!("e={:?} ei={:?}", &ve[0], ve.iter().next().unwrap());
+    let f: char = '\u{1F600}';
+    let vf = unsafe { std::slice::from_raw_parts(&f as *const char as *const u32, 1) };
+    println!("f={:?}", &vf[0]);
+    let i: u8 = 1;
+    let vi = unsafe { std::slice::from_raw_parts(&i as *const u8 as *const bool, 1) };
+    println!("i={:?} ii={}", &vi[0], vi.iter().next().unwrap());
+    let vs = unsafe { std::slice::from_raw_parts(&SX as *const f32 as *const u32, 1) };
+    println!("s={:?} si={}", &vs[0], vs.iter().next().unwrap());
+    let bx = Box::new(1.0f32);
+    let vb2 = unsafe { std::slice::from_raw_parts(&*bx as *const f32 as *const u32, 1) };
+    println!("bx={:?} bi={}", &vb2[0], vb2.iter().next().unwrap());
+    let j: f32 = 3.25;
+    let vj = std::slice::from_ref(&j);
+    println!("j={:?} ji={}", &vj[0], vj.iter().next().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_other_kinds_and_storages() {
+    // The punned reading across scalar kind pairs
+    // (signedness, float/integer, char, bool) and storage
+    // positions (local, static, boxed), with a same-kind
+    // `from_ref` view as the no-reinterpretation guard.
+    // Native rustc 1.100.0's output.
+    run_ok(
+        "punned-scalar-view-kinds",
+        PUNNED_SCALAR_VIEW_KINDS_SRC,
+        "a=-1071644672 ai=-1071644672\nb=4602678819172646912\nd=-1 di=-1\ne='A' ei='A'\nf=128512\ni=true ii=true\ns=3223322624 si=3223322624\nbx=1065353216 bi=1065353216\nj=3.25 ji=3.25\n",
+    );
+}
+
+const CHAR_REFERENCE_FMT_SRC: &str = r#"
+fn main() {
+    let c: char = 'A';
+    println!("c={:?}", &c);
+    let arr: [char; 1] = ['A'];
+    println!("ac={:?}", &arr[0]);
+    for v in arr.iter() {
+        println!("ai={:?}", v);
+    }
+    println!("d={}", &c);
+}
+"#;
+
+#[test]
+fn run_mode_char_reference_formats_as_char() {
+    // A `char` reached through a reference (an explicit
+    // `&c`, an element reference, a yielded reference)
+    // formats as the character, not its code point: the
+    // argument's tag names the reference, and the char
+    // reading judges the pointee tag. Native rustc
+    // 1.100.0's output.
+    run_ok(
+        "char-reference-fmt",
+        CHAR_REFERENCE_FMT_SRC,
+        "c='A'\nac='A'\nai='A'\nd=A\n",
+    );
+}
+
 const NONZERO_FMT_SRC: &str = r#"
 use std::num::NonZero;
 fn main() {

@@ -825,8 +825,14 @@ impl<'a> Interpreter<'a> {
                 // tag is the load's width, and the byte view of
                 // the base value's storage composes it (the
                 // resolved read has no byte-level view of that
-                // storage).
-                let pointee = match self.byte_view_fmt_arg(frames, target, ty) {
+                // storage). The `Pointer` trait is excepted:
+                // it asks for the argument's address, not its
+                // pointee, so it keeps the plain path.
+                let pointee = match if *trait_ == FmtTrait::Pointer {
+                    None
+                } else {
+                    self.byte_view_fmt_arg(frames, target, ty)
+                } {
                     Some(view) => view?,
                     None => match self.regrouped_fmt_arg(frames, target, ty) {
                         Some(view) => view?,
@@ -3087,7 +3093,7 @@ impl<'a> Interpreter<'a> {
         match value {
             Value::Int(v) => Ok(format_int_radix(*v, None, 10, "", options)),
             Value::Uint(v) => {
-                if ty == "char" {
+                if pointee_tag(ty) == "char" {
                     let c = as_char(*v)?;
                     Ok(pad_str(&c.to_string(), options))
                 } else {
@@ -3163,7 +3169,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Value::Uint(v) => {
-                if ty == "char" {
+                if pointee_tag(ty) == "char" {
                     let c = as_char(*v)?;
                     return Ok(pad_str(&format!("{c:?}"), options));
                 }
