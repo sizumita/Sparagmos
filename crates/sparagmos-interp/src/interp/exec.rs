@@ -1766,12 +1766,14 @@ impl<'a> Interpreter<'a> {
                     operands,
                     overflow,
                 } => {
-                    // An overflow assertion in a session compiled
-                    // without overflow checks is dropped, as native
-                    // codegen drops it: the checked operation's
-                    // wrapped result is simply used, and the
-                    // condition is not evaluated at all.
-                    if *overflow && !self.config.overflow_checks {
+                    // An overflow assertion whose instantiating
+                    // crate was compiled without overflow checks is
+                    // dropped, as native codegen drops it for that
+                    // crate: the checked operation's wrapped result
+                    // is simply used, and the condition is not
+                    // evaluated at all. The setting is the call
+                    // stack's (see `overflow_checks_at`).
+                    if *overflow && !self.overflow_checks_at(frames) {
                         Self::jump(frames, body, *target)?;
                     } else {
                         let value = self.eval_operand(frames, body, cond)?;

@@ -200,12 +200,15 @@ pub struct InterpConfig {
     /// Empty when no invocation path is known; `env::args` then
     /// yields just the guest arguments.
     pub program_path: String,
-    /// The session's overflow-checks setting, as the driver
-    /// resolved it from the compilation's flags. Overflow
+    /// The main compilation's overflow-checks setting, as the
+    /// driver resolved it from the compilation's flags. Overflow
     /// assertions (see `TerminatorKind::Assert::overflow`) fire
-    /// only when this is set; the arithmetic operations themselves
-    /// wrap either way, exactly as in MIR. Defaults to `true`
-    /// (the debug-profile default).
+    /// per the *instantiating* crate's setting, resolved at run
+    /// time by `overflow_checks_at`; this value is the setting
+    /// of the main crate and the fallback for frames whose
+    /// crate has no recorded setting. The arithmetic operations
+    /// themselves wrap either way, exactly as in MIR. Defaults
+    /// to `true` (the debug-profile default).
     pub overflow_checks: bool,
     /// The session's panic strategy, as the driver resolved it
     /// from the compilation's flags: `true` when the guest was
@@ -941,6 +944,45 @@ impl<'a> Interpreter<'a> {
     /// Whether the guest was compiled with overflow checks
     /// (see the `overflow_checks` field of `InterpConfig`).
     pub fn overflow_checks(&self) -> bool {
+        self.config.overflow_checks
+    }
+
+    /// The overflow-checks setting in force for an operation
+    /// evaluated on behalf of the call stack `frames`.
+    ///
+    /// Overflow checks are a per-crate codegen setting: a
+    /// generic body marked `#[rustc_inherit_overflow_checks]`
+    /// (a core trait implementation, an iterator step) is
+    /// compiled into the crate that instantiates it, under
+    /// *that* crate's setting. The interpreter holds one body
+    /// per instance, shared by every instantiating crate, so
+    /// the setting is resolved from the stack instead: walking
+    /// from the innermost frame out, the first frame whose
+    /// body name carries a recorded crate as a `::` segment
+    /// decides (body names are rooted at the main crate, so an
+    /// auxiliary crate's bodies appear as
+    /// `main::<aux>::<fn>`). Frames of the shared libraries
+    /// (std / core / alloc) name no recorded crate and are
+    /// stepped over, so a library operation stepped from two
+    /// guest crates with different settings follows each
+    /// caller in turn. When no frame names a recorded crate,
+    /// the session's setting (the main compilation's) applies.
+    pub fn overflow_checks_at(&self, frames: &[Frame]) -> bool {
+        if self.program.crate_overflow_checks.is_empty() {
+            return self.config.overflow_checks;
+        }
+        for frame in frames.iter().rev() {
+            for segment in frame.func.split("::") {
+                if let Some((_, on)) = self
+                    .program
+                    .crate_overflow_checks
+                    .iter()
+                    .find(|(name, _)| name == segment)
+                {
+                    return *on;
+                }
+            }
+        }
         self.config.overflow_checks
     }
 

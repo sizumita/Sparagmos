@@ -4,7 +4,7 @@
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    eval_binary, eval_unary, synthetic_address, Interpreter,
+    eval_binary, eval_unary, synthetic_address, Frame, Interpreter,
 };
 use crate::ir::{BinOp, Ty, UnOp};
 use crate::value::Value;
@@ -21,9 +21,12 @@ impl<'a> Interpreter<'a> {
     /// the core impls panic on overflow — the same panic the
     /// `Assert` after a checked MIR operation raises — so the
     /// checked form's flag is consulted here; otherwise the
-    /// wrapped result stands.
+    /// wrapped result stands. The flag is the instantiating
+    /// crate's, resolved from the caller stack (see
+    /// `Interpreter::overflow_checks_at`).
     pub(super) fn exec_primitive_binop(
         &self,
+        frames: &[Frame],
         name: &str,
         op: BinOp,
         lhs: &Value,
@@ -32,7 +35,7 @@ impl<'a> Interpreter<'a> {
         let ty = primitive_self_ty(name)?;
         let (result, overflowed) =
             eval_binary(op, lhs, rhs, Some(&ty), true, &synthetic_address)?;
-        if overflowed && self.overflow_checks() {
+        if overflowed && self.overflow_checks_at(frames) {
             return Err(InterpError::panic_str_payload(
                 primitive_overflow_message(op),
             ));
@@ -47,12 +50,13 @@ impl<'a> Interpreter<'a> {
     /// operation, so the panic is raised directly).
     pub(super) fn exec_primitive_unop(
         &self,
+        frames: &[Frame],
         name: &str,
         op: UnOp,
         value: &Value,
     ) -> InterpResult<Value> {
         let ty = primitive_self_ty(name)?;
-        if op == UnOp::Neg && self.overflow_checks() {
+        if op == UnOp::Neg && self.overflow_checks_at(frames) {
             if let (Value::Int(a), Ty::Int(it)) = (value, &ty) {
                 let bits = it.bits();
                 let min = if bits >= 128 {

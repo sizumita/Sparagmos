@@ -140,6 +140,11 @@ pub(crate) struct Collected {
     /// `sparagmos_driver::convert::drain_fn_display_names`),
     /// for the interpreter's program. Empty outside debug mode.
     pub(crate) fn_display_names: Vec<(String, String)>,
+    /// Resolved overflow-checks settings of the separately
+    /// compiled auxiliary crates, keyed by crate name, as
+    /// recorded by `main` from each crate's own build (see
+    /// `AUX_OVERFLOW_CHECKS`), for the interpreter's program.
+    pub(crate) crate_overflow_checks: Vec<(String, bool)>,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -151,6 +156,25 @@ pub(crate) static AUX_CRATES: OnceLock<Vec<String>> = OnceLock::new();
 
 pub(crate) fn aux_crates() -> &'static [String] {
     AUX_CRATES.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// Resolved overflow-checks settings of the collected
+/// auxiliary crates (--aux), keyed by crate name: the value
+/// each crate's own build flags resolve to, the way
+/// `session_overflow_checks` resolves the main compilation's.
+/// Set by `main` before the compiler run, alongside
+/// `AUX_CRATES`; empty for single-file inputs. The interpreter
+/// resolves a shared library body's effective setting from
+/// the call stack against this table (see
+/// `ir::Program::crate_overflow_checks`).
+pub(crate) static AUX_OVERFLOW_CHECKS: OnceLock<Vec<(String, bool)>> =
+    OnceLock::new();
+
+pub(crate) fn aux_overflow_checks() -> &'static [(String, bool)] {
+    AUX_OVERFLOW_CHECKS
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
 }
 
 pub(crate) fn stash(c: Collected) {

@@ -36,6 +36,13 @@ pub struct MirProgram {
     /// declaration signature)` pairs. Empty unless the driver
     /// collected a debugger session.
     pub fn_display_names: Vec<(String, String)>,
+    /// Resolved overflow-checks settings of the crates the
+    /// driver compiled separately (its `--aux` crates), keyed
+    /// by crate name, as recorded by the driver from each
+    /// crate's own build flags (see
+    /// `ir::Program::crate_overflow_checks`). Empty unless the
+    /// program was collected from a multi-crate compilation.
+    pub crate_overflow_checks: Vec<(String, bool)>,
     /// Declared ABIs of the program's function instances, keyed
     /// by the same `DefId` a converted body carries, as recorded
     /// by the driver when it registered each instance.

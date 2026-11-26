@@ -249,7 +249,12 @@ pub(crate) use self::jit::*;
 /// `#[rustc_inherit_overflow_checks]` body is present in the MIR
 /// either way — dropping it when the session has checks off is a
 /// codegen-time decision the driver must reproduce (see
-/// `InterpConfig::overflow_checks`).
+/// `InterpConfig::overflow_checks`). This resolves one
+/// compilation's setting from its own argument list: the main
+/// compilation's here, and each auxiliary crate's from its own
+/// build command (see `AuxBuilt::overflow_checks`); the
+/// interpreter picks the instantiating crate's setting at run
+/// time (see `Interpreter::overflow_checks_at`).
 fn session_overflow_checks(args: &[String]) -> bool {
     // One pass over the arguments, tracking the last value of each
     // relevant option. A codegen option appears as `-C opt[=v]`,
@@ -1048,6 +1053,10 @@ fn driver_main_inner() {
             extern_name: name.clone(),
             artifact: Some(path.clone()),
             collect: *collect,
+            // No build flags to resolve from: `main` records the
+            // main compilation's own setting for prebuilt
+            // libraries when it publishes the table (below).
+            overflow_checks: true,
         })
         .collect();
     let mut visible: Vec<AuxBuilt> = prebuilt.clone();
@@ -1223,6 +1232,24 @@ fn driver_main_inner() {
     //   process's stdout is reserved for the driver's own report —
     //   in run mode, for the guest program's output alone.
     let overflow_checks = session_overflow_checks(&args);
+    // Publish the auxiliary crates' own overflow-checks
+    // settings for the collection about to run: a prebuilt
+    // library (--aux-lib) has no build of its own to resolve
+    // from, so it takes the main compilation's setting; a
+    // compiled auxiliary keeps the setting its own build flags
+    // resolved to (see `AuxBuilt::overflow_checks`).
+    for built in &mut aux_built {
+        if aux_lib_specs.iter().any(|(name, _, _)| name == &built.name) {
+            built.overflow_checks = overflow_checks;
+        }
+    }
+    let _ = AUX_OVERFLOW_CHECKS.set(
+        aux_built
+            .iter()
+            .filter(|b| b.collect)
+            .map(|b| (b.name.clone(), b.overflow_checks))
+            .collect::<Vec<_>>(),
+    );
     let panic_abort = session_panic_abort(&args);
     let sigpipe = session_sigpipe(&args);
     let previous_hook = begin_panic_capture();

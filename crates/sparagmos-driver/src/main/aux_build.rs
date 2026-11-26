@@ -587,6 +587,16 @@ pub(crate) struct AuxBuilt {
     /// Whether the crate's functions are guest code to convert
     /// (false for proc-macro and cdylib crates).
     pub(crate) collect: bool,
+    /// The crate's resolved overflow-checks setting: what its
+    /// own build flags resolve to under the session rule (see
+    /// `session_overflow_checks`), the setting native codegen
+    /// compiled this crate's instantiations of
+    /// `#[rustc_inherit_overflow_checks]` bodies with. For a
+    /// prebuilt library (--aux-lib) there is no build to read;
+    /// `main` records the main compilation's setting, which is
+    /// also what the interpreter fell back to for every crate
+    /// before this table existed.
+    pub(crate) overflow_checks: bool,
 }
 
 /// The names under which a consumer may declare a built
@@ -828,6 +838,16 @@ pub(crate) fn compile_aux(
     for flag in declared_compile_flags(&src_text) {
         cmd.arg(expand_aux_flag_variables(&flag, src_path));
     }
+    // The crate's own overflow-checks setting, resolved from
+    // the very command line it is about to be built with (its
+    // own `//@ compile-flags:` included above): the setting its
+    // instantiations of checked library bodies were compiled
+    // under, recorded for the interpreter's program.
+    let cmd_args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let overflow_checks = super::session_overflow_checks(&cmd_args);
     let out = cmd
         .output()
         .map_err(|e| format!("failed to run rustc for auxiliary crate `{name}`: {e}"))?;
@@ -888,5 +908,6 @@ pub(crate) fn compile_aux(
         extern_name: name.to_string(),
         artifact: if link { artifact } else { None },
         collect,
+        overflow_checks,
     })
 }
