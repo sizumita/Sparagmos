@@ -795,6 +795,186 @@ fn registry_resolves_f16_methods() {
 }
 
 #[test]
+fn registry_resolves_f16_classify_and_byte_methods_for_f16_only() {
+    use FloatOp as O;
+    for (method, op) in [
+        ("is_normal", O::IsNormal),
+        ("classify", O::Classify),
+        ("to_be_bytes", O::ToBeBytes),
+        ("to_le_bytes", O::ToLeBytes),
+        ("to_ne_bytes", O::ToNeBytes),
+        ("from_be_bytes", O::FromBeBytes),
+        ("from_le_bytes", O::FromLeBytes),
+        ("from_ne_bytes", O::FromNeBytes),
+    ] {
+        for prefix in ["core", "std"] {
+            let name = format!("{prefix}::f16::<impl f16>::{method}");
+            assert_eq!(
+                lookup(&name),
+                Some(Builtin::Float16Method { op }),
+                "{name}"
+            );
+        }
+        // The `f32` / `f64` namesakes keep their collected
+        // bodies: the registry must not resolve them to builtins.
+        for ty in ["f32", "f64"] {
+            let name = format!("core::{ty}::<impl {ty}>::{method}");
+            assert_eq!(lookup(&name), None, "{name}");
+        }
+    }
+}
+
+#[test]
+fn f16_is_normal_judges_the_f16_exponent_field() {
+    // Judged from the `f16` bit pattern: the subnormals below
+    // widen to normal `f64` values, so the widened value's own
+    // `is_normal` would give the wrong answer for them.
+    for (bits, expected) in [
+        (0x0000u16, false), // zero
+        (0x8000, false),    // -0.0
+        (0x0001, false),    // smallest subnormal
+        (0x03ff, false),    // largest subnormal
+        (0x0400, true),     // smallest normal
+        (0x8400, true),     // smallest negative normal
+        (0x3c00, true),     // 1.0
+        (0x7bff, true),     // MAX
+        (0x7c00, false),    // infinity
+        (0x7e00, false),    // NaN
+    ] {
+        assert_eq!(
+            run_method(
+                "core::f16::<impl f16>::is_normal",
+                bool_ty(),
+                vec![const_f16(bits)]
+            ),
+            Value::Bool(expected),
+            "is_normal({bits:#06x})"
+        );
+    }
+}
+
+#[test]
+fn f16_classify_judges_the_f16_bit_pattern() {
+    // The expected variants are `core::num::FpCategory` in
+    // declaration order (Nan, Infinite, Zero, Subnormal,
+    // Normal) -- the order the driver's discriminant table
+    // records for the type.
+    let fp_category_ty = mir::Ty::Adt(mir::DefId::new(0, 901), vec![]);
+    for (bits, variant) in [
+        (0x7e00u16, 0), // NaN
+        (0xfe00, 0),    // NaN (negative)
+        (0x7c00, 1),    // Infinite
+        (0xfc00, 1),    // Infinite (negative)
+        (0x0000, 2),    // Zero
+        (0x8000, 2),    // Zero (negative)
+        (0x0001, 3),    // Subnormal (smallest)
+        (0x03ff, 3),    // Subnormal (largest)
+        (0x0400, 4),    // Normal (smallest)
+        (0x3c00, 4),    // Normal (1.0)
+        (0x7bff, 4),    // Normal (MAX)
+    ] {
+        assert_eq!(
+            run_method(
+                "core::f16::<impl f16>::classify",
+                fp_category_ty.clone(),
+                vec![const_f16(bits)]
+            ),
+            Value::Enum {
+                variant,
+                fields: vec![]
+            },
+            "classify({bits:#06x})"
+        );
+    }
+}
+
+fn const_bytes2(bytes: [u8; 2]) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Tuple(vec![
+        mir::ConstValue::Scalar(mir::Scalar::Int {
+            data: u128::from(bytes[0]),
+            size: 1,
+        }),
+        mir::ConstValue::Scalar(mir::Scalar::Int {
+            data: u128::from(bytes[1]),
+            size: 1,
+        }),
+    ])))
+}
+
+#[test]
+fn f16_byte_conversions_round_trip_the_bit_pattern() {
+    let bytes_ty = mir::Ty::Tuple(vec![
+        mir::Ty::Uint(mir::UintTy::U8),
+        mir::Ty::Uint(mir::UintTy::U8),
+    ]);
+    for bits in [0x0000u16, 0x8000, 0x3c00, 0x7e00, 0x0001, 0xfe01, 0xc120] {
+        let be = bits.to_be_bytes();
+        let le = bits.to_le_bytes();
+        assert_eq!(
+            run_method(
+                "core::f16::<impl f16>::to_be_bytes",
+                bytes_ty.clone(),
+                vec![const_f16(bits)]
+            ),
+            Value::Tuple(vec![
+                Value::Uint(u128::from(be[0])),
+                Value::Uint(u128::from(be[1]))
+            ]),
+            "to_be_bytes({bits:#06x})"
+        );
+        assert_eq!(
+            run_method(
+                "std::f16::<impl f16>::to_le_bytes",
+                bytes_ty.clone(),
+                vec![const_f16(bits)]
+            ),
+            Value::Tuple(vec![
+                Value::Uint(u128::from(le[0])),
+                Value::Uint(u128::from(le[1]))
+            ]),
+            "to_le_bytes({bits:#06x})"
+        );
+        assert_eq!(
+            run_f16(
+                "core::f16::<impl f16>::from_be_bytes",
+                vec![const_bytes2(be)]
+            ),
+            bits,
+            "from_be_bytes({bits:#06x})"
+        );
+        assert_eq!(
+            run_f16(
+                "std::f16::<impl f16>::from_le_bytes",
+                vec![const_bytes2(le)]
+            ),
+            bits,
+            "from_le_bytes({bits:#06x})"
+        );
+        // Native byte order on this platform is little-endian.
+        assert_eq!(
+            run_method(
+                "core::f16::<impl f16>::to_ne_bytes",
+                bytes_ty.clone(),
+                vec![const_f16(bits)]
+            ),
+            Value::Tuple(vec![
+                Value::Uint(u128::from(le[0])),
+                Value::Uint(u128::from(le[1]))
+            ]),
+            "to_ne_bytes({bits:#06x})"
+        );
+        assert_eq!(
+            run_f16(
+                "core::f16::<impl f16>::from_ne_bytes",
+                vec![const_bytes2(le)]
+            ),
+            bits,
+            "from_ne_bytes({bits:#06x})"
+        );
+    }
+}
+
+#[test]
 fn f16_div_euclid_rounds_the_quotient_before_truncating() {
     // 1.0 / 0.2000732421875 is about 4.99817: the `f16` division
     // rounds it to 5.0 before the truncation in core's definition,

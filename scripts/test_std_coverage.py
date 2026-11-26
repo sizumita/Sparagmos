@@ -214,12 +214,20 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(reg.lookup("core::f128::<impl f128>::from_bits"))
         self.assertTrue(reg.lookup(
             "core::unicode::unicode_data::grapheme_extend::lookup_slow"))
+        # The f16 classify / byte-conversion family is served by
+        # exact arms in `lookup`, registered for f16 only: they are
+        # kept out of the shared float method table so the f32/f64
+        # namesakes keep executing their collected bodies.
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::classify"))
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::is_normal"))
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::to_be_bytes"))
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::from_ne_bytes"))
         # The unmodelled remainder of the same families stays out:
-        # f16 classify / byte conversions are not in the method
-        # table, f128 has no powf, and white_space is not one of the
-        # modelled unicode_data modules.
-        self.assertFalse(reg.lookup("core::f16::<impl f16>::classify"))
-        self.assertFalse(reg.lookup("core::f16::<impl f16>::to_be_bytes"))
+        # the f32/f64 namesakes of the f16-only arms, f128 has no
+        # powf, and white_space is not one of the modelled
+        # unicode_data modules.
+        self.assertFalse(reg.lookup("core::f32::<impl f32>::classify"))
+        self.assertFalse(reg.lookup("core::f64::<impl f64>::to_be_bytes"))
         self.assertFalse(reg.lookup("core::f128::<impl f128>::powf"))
         self.assertFalse(reg.lookup(
             "core::unicode::unicode_data::white_space::lookup_slow"))

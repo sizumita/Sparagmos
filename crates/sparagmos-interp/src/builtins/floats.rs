@@ -120,7 +120,15 @@ pub(super) fn exec_float128_method(
         | O::CopySign
         | O::Powf
         | O::ToDegrees
-        | O::ToRadians => {
+        | O::ToRadians
+        | O::IsNormal
+        | O::Classify
+        | O::ToBeBytes
+        | O::ToLeBytes
+        | O::ToNeBytes
+        | O::FromBeBytes
+        | O::FromLeBytes
+        | O::FromNeBytes => {
             return Err(unsupported(format!(
                 "f128 method {name} is not runtime-supported"
             )));
@@ -197,6 +205,18 @@ pub(super) fn exec_float16_method(
             }
         };
         return Ok(Value::Float(f16_bits_to_f64(bits as u16)));
+    }
+    if matches!(op, O::FromBeBytes | O::FromLeBytes | O::FromNeBytes) {
+        // An associated function like `from_bits`: no receiver,
+        // the single argument is the `[u8; 2]` byte array.
+        arity(1)?;
+        let bytes = as_byte_array(name, &vals[0])?;
+        let bits = match op {
+            O::FromBeBytes => u16::from_be_bytes(bytes),
+            O::FromLeBytes => u16::from_le_bytes(bytes),
+            _ => u16::from_ne_bytes(bytes),
+        };
+        return Ok(Value::Float(f16_bits_to_f64(bits)));
     }
     arity(match op {
         O::MulAdd => 3,
@@ -333,6 +353,21 @@ pub(super) fn exec_float16_method(
         O::ToDegrees => round(x * f16_bits_to_f64(0x5329)),
         O::ToRadians => round(x * f16_bits_to_f64(0x2478)),
         O::ToBits => Value::Uint(f64_to_f16_bits(x) as u128),
+        // `is_normal` and `classify` are judged from the `u16`
+        // bit pattern, not from the widened `f64`: an `f16`
+        // subnormal widens to a normal `f64`, so the widened
+        // value's own classification would differ.
+        O::IsNormal => {
+            let exp = (f64_to_f16_bits(x) >> 10) & 0x1f;
+            Value::Bool(exp != 0 && exp != 0x1f)
+        }
+        O::Classify => fp_category_value(f64_to_f16_bits(x)),
+        O::ToBeBytes => byte_array_value(f64_to_f16_bits(x).to_be_bytes()),
+        O::ToLeBytes => byte_array_value(f64_to_f16_bits(x).to_le_bytes()),
+        O::ToNeBytes => byte_array_value(f64_to_f16_bits(x).to_ne_bytes()),
+        O::FromBeBytes | O::FromLeBytes | O::FromNeBytes => {
+            unreachable!("handled above")
+        }
         O::Powi => {
             let n = match vals[1] {
                 Value::Int(v) => v as i32,
@@ -638,6 +673,71 @@ pub(super) fn exec_float_method(
                 )
             })
         }
+        O::IsNormal
+        | O::Classify
+        | O::ToBeBytes
+        | O::ToLeBytes
+        | O::ToNeBytes
+        | O::FromBeBytes
+        | O::FromLeBytes
+        | O::FromNeBytes => {
+            return Err(unsupported(format!(
+                "float method {name} is not runtime-supported"
+            )));
+        }
         O::FromBits => unreachable!("handled above"),
     })
+}
+
+/// The two bytes of a `[u8; 2]` argument (the byte-array
+/// argument of the `f16::from_*_bytes` associated functions):
+/// arrays ride as tuples of their elements; a byte-array
+/// constant arrives as raw bytes.
+fn as_byte_array(name: &str, v: &Value) -> InterpResult<[u8; 2]> {
+    let byte = |e: &Value| -> InterpResult<u8> {
+        match e {
+            Value::Uint(v) => Ok(*v as u8),
+            Value::Int(v) => Ok(*v as u8),
+            other => Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "u8",
+                other.kind_name(),
+            )),
+        }
+    };
+    match v {
+        Value::Tuple(elems) if elems.len() == 2 => Ok([byte(&elems[0])?, byte(&elems[1])?]),
+        Value::Bytes(b) if b.len() == 2 => Ok([b[0], b[1]]),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "[u8; 2]",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// A `[u8; 2]` value: arrays ride as tuples of their elements.
+fn byte_array_value(bytes: [u8; 2]) -> Value {
+    Value::Tuple(bytes.iter().map(|b| Value::Uint(u128::from(*b))).collect())
+}
+
+/// A `core::num::FpCategory` value for an `f16` bit pattern:
+/// the variants in declaration order (Nan, Infinite, Zero,
+/// Subnormal, Normal), judged from the bits themselves (an
+/// `f16` subnormal widens to a normal `f64`, so the widened
+/// value cannot be classified in its place).
+fn fp_category_value(bits: u16) -> Value {
+    let exp = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x3ff;
+    let variant = if exp == 0x1f {
+        if mantissa != 0 { 0 } else { 1 }
+    } else if exp == 0 {
+        if mantissa != 0 { 3 } else { 2 }
+    } else {
+        4
+    };
+    Value::Enum {
+        variant,
+        fields: Vec::new(),
+    }
 }
