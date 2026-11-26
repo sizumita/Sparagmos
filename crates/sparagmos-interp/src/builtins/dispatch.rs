@@ -5438,9 +5438,39 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                // The operands are `&T` / `&U` with `T, U: Debug`:
+                // core renders them with `{:?}`, so the rendering
+                // is the fmt engine's `Debug` under each operand's
+                // own generic-argument tag -- the same rendering
+                // `ResultUnwrapFailed` uses for its error. The
+                // value model's own `Display` is only the fallback
+                // for a shape the engine cannot render, as the
+                // custom message above is best-effort too.
                 let left = self.resolve_value(frames, &vals[1])?;
                 let right = self.resolve_value(frames, &vals[2])?;
-                message = format!("{message}\n  left: {left}\n right: {right}");
+                let left_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let right_tag = generic_args.get(1).map(String::as_str).unwrap_or("");
+                let left_text = self
+                    .format_value(
+                        frames,
+                        &left,
+                        FmtTrait::Debug,
+                        left_tag,
+                        &FmtOptions::new(),
+                        0,
+                    )
+                    .unwrap_or_else(|_| left.to_string());
+                let right_text = self
+                    .format_value(
+                        frames,
+                        &right,
+                        FmtTrait::Debug,
+                        right_tag,
+                        &FmtOptions::new(),
+                        0,
+                    )
+                    .unwrap_or_else(|_| right.to_string());
+                message = format!("{message}\n  left: {left_text}\n right: {right_text}");
                 Err(InterpError::panic_string_payload(message))
             }
             Builtin::PanicNounwindFmt => {
