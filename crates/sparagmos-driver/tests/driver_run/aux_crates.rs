@@ -328,6 +328,83 @@ fn run_mode_aux_crate_eii_fn_explicit_impl_overrides_default() {
 }
 
 
+const EII_FN_SCOPED_DECL_SRC: &str = r#"
+//@ no-prefer-dynamic
+//@[dylib] compile-flags: --crate-type=dylib -Cprefer-dynamic
+#![crate_type = "rlib"]
+#![feature(extern_item_impls)]
+
+#[eii(eii1)]
+pub fn decl1(x: u64) {
+    println!("default {x}");
+}
+"#;
+
+const EII_FN_SCOPED_IMPL_SRC: &str = r#"
+//@ no-prefer-dynamic
+//@[dylib-impl] compile-flags: --crate-type=dylib -Cprefer-dynamic
+//@ aux-build: decl_with_default.rs
+#![crate_type = "rlib"]
+#![feature(extern_item_impls)]
+
+extern crate decl_with_default as decl;
+
+#[decl::eii1]
+fn other(x: u64) {
+    println!("1{x}");
+}
+"#;
+
+const EII_FN_SCOPED_MAIN_SRC: &str = r#"
+extern crate decl_with_default;
+extern crate impl1;
+
+fn main() {
+    decl_with_default::decl1(10);
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_eii_fn_scoped_crate_type_flags() {
+    // The declaration crate and the implementation crate of
+    // tests/ui/eii/default/call_impl.rs, whose own
+    // `//@[rev] compile-flags:` each scope a dylib build to one
+    // revision (the declaration's to a revision this test does
+    // not even have). The auxiliary builds applied scoped flags
+    // in every revision, so both crates came out as dylibs in
+    // both revisions, and rustc's EII final-artifact check
+    // counted the default implementation inside the dylib
+    // dependency as a second implementation beside the explicit
+    // one: the impl1 build failed with "multiple implementations
+    // of `#[eii1]`" and the record stopped unsupported. Scoped
+    // flags now apply only to their own revision, and the
+    // explicit implementation runs in both revisions (the
+    // subset runner stamps the active revision as the spec's
+    // `;cfg=`, normalized: dashes as underscores).
+    for (tag, cfg) in [("rlib", "rlib"), ("dylib", "dylib_impl")] {
+        let dir = temp_dir(&format!("eii-fn-scoped-{tag}"));
+        let decl = fixture(&dir, "decl_with_default.rs", EII_FN_SCOPED_DECL_SRC);
+        let imp = fixture(&dir, "impl1.rs", EII_FN_SCOPED_IMPL_SRC);
+        let src = fixture(&dir, "eiifnscopedmain.rs", EII_FN_SCOPED_MAIN_SRC);
+        let out = run_driver_with_aux_specs(
+            &src,
+            None,
+            &[
+                aux_spec("decl_with_default", &decl, &format!(";cfg={cfg}")),
+                aux_spec("impl1", &imp, &format!(";cfg={cfg}")),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "revision {tag}: the explicit EII implementation must run; stderr={stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "110\n");
+    }
+}
+
+
 const AUX_PM_SRC: &str = r#"
 extern crate proc_macro;
 use proc_macro::TokenStream;
