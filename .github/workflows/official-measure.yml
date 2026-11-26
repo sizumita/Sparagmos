@@ -508,7 +508,14 @@ jobs:
             --stages all \
             --jobs 2
 
+      # Runs on failure too: when a shard step fails or is killed,
+      # the runner's last incremental snapshot (marked
+      # "complete": false) is still uploaded so the partial results
+      # can be recovered by hand. The aggregate merge refuses
+      # partial inputs, so a recovered snapshot is never merged as
+      # a complete result.
       - name: Upload shard result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: subset-shard-${{ matrix.shard }}
@@ -714,7 +721,14 @@ jobs:
             --out "$RUNNER_TEMP/subset-jit-shard-${{ matrix.shard }}.json" \
             --jobs 2
 
+      # Runs on failure too: when a shard step fails or is killed,
+      # the runner's last incremental snapshot (marked
+      # "complete": false) is still uploaded so the partial results
+      # can be recovered by hand. The aggregate merge refuses
+      # partial inputs, so a recovered snapshot is never merged as
+      # a complete result.
       - name: Upload shard result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: subset-jit-shard-${{ matrix.shard }}
@@ -892,7 +906,14 @@ jobs:
             --stages all \
             --jobs 2
 
+      # Runs on failure too: when a shard step fails or is killed,
+      # the runner's last incremental snapshot (marked
+      # "complete": false) is still uploaded so the partial results
+      # can be recovered by hand. The aggregate merge refuses
+      # partial inputs, so a recovered snapshot is never merged as
+      # a complete result.
       - name: Upload shard result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: subset-shard-${{ matrix.class }}-${{ matrix.shard }}
