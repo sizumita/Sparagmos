@@ -390,17 +390,47 @@ impl<'a> Converter<'a> {
     }
 
     fn compute_union_tables(&mut self, program: &MirProgram) {
+        // Each worklist entry carries the chain of (ADT
+        // definition, instance size) pairs whose field
+        // expansion produced it, where the size is the
+        // instance type's node count (see `ty_node_count`).
+        // An ADT instance is not expanded when its
+        // definition already appears in the chain with an
+        // instance no larger than it: a generative
+        // definition -- `Expanding<T> { b: *const
+        // Expanding<(T, T)> }` in tests/debuginfo/
+        // recursive-struct.rs (Issue #480) -- re-enters
+        // with strictly larger arguments at every step,
+        // minting a new, twice-as-large type forever, and
+        // before this guard the walk followed it without
+        // bound (the driver grew at ~190 MB/s past 22 GB
+        // and was OOM-killed). Re-entries that *shrink* --
+        // the `Box<Box<...>>` peel, a recursive type
+        // re-entered with the same arguments (whose field
+        // types the ancestor's expansion already produced)
+        // -- still expand, so ordinary recursive types
+        // (`Node { next: Option<Box<Node>> }`, the
+        // `LongCycle1 -> ... -> LongCycle4 -> LongCycle1`
+        // family) are walked exactly as before. Not
+        // expanding a non-shrinking re-entry loses nothing
+        // the walk could ever finish: any union instance
+        // inside it whose exact instance a body actually
+        // uses is still seeded directly (every local type
+        // and every recorded instance field type is a
+        // seed), and a union that only exists at a deeper
+        // generative level has infinitely many sibling
+        // instances besides.
         let mut visited: Vec<mir::Ty> = Vec::new();
-        let mut worklist: Vec<mir::Ty> = Vec::new();
+        let mut worklist: Vec<(mir::Ty, Vec<(mir::AdtDefId, u32)>)> = Vec::new();
         for f in &program.functions {
             for decl in &f.body.local_decls {
-                worklist.push(decl.ty.clone());
+                worklist.push((decl.ty.clone(), Vec::new()));
             }
         }
         for (_, ty) in &self.adt_fields.entries {
-            worklist.push(ty.clone());
+            worklist.push((ty.clone(), Vec::new()));
         }
-        while let Some(ty) = worklist.pop() {
+        while let Some((ty, chain)) = worklist.pop() {
             let mut ty = ty;
             while let mir::Ty::Pat(inner, _) = ty {
                 ty = *inner;
@@ -414,6 +444,12 @@ impl<'a> Converter<'a> {
                     if self.is_union(def) {
                         self.intern_union_table(def, args);
                     }
+                    let size = ty_node_count(&ty);
+                    if chain.iter().any(|(d, n)| d == def && *n <= size) {
+                        continue;
+                    }
+                    let mut chain = chain.clone();
+                    chain.push((*def, size));
                     let variant_count = self
                         .adt_shapes
                         .get(def)
@@ -423,17 +459,21 @@ impl<'a> Converter<'a> {
                         if let Some(ftys) =
                             self.instantiated_field_tys(def, args, variant as u32)
                         {
-                            worklist.extend(ftys);
+                            worklist.extend(
+                                ftys.into_iter().map(|fty| (fty, chain.clone())),
+                            );
                         }
                     }
                 }
                 mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
-                    worklist.push((**inner).clone());
+                    worklist.push(((**inner).clone(), chain));
                 }
                 mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
-                    worklist.push((**elem).clone());
+                    worklist.push(((**elem).clone(), chain));
                 }
-                mir::Ty::Tuple(ts) => worklist.extend(ts.iter().cloned()),
+                mir::Ty::Tuple(ts) => worklist.extend(
+                    ts.iter().cloned().map(|t| (t, chain.clone())),
+                ),
                 _ => {}
             }
         }
@@ -1280,4 +1320,49 @@ fn ty_proven_zero_sized(
         }
         _ => false,
     }
+}
+
+/// The number of nodes in a converted type, counted with a
+/// saturating cap: the count only steers the
+/// generative-recursion guard in
+/// `Converter::compute_union_tables`, which compares
+/// instances of one definition along an expansion chain, so
+/// exact counts past the cap (where every comparison
+/// already reads as "at least as large") would change
+/// nothing.
+fn ty_node_count(ty: &mir::Ty) -> u32 {
+    const CAP: u32 = 512;
+    fn count(ty: &mir::Ty, budget: &mut u32) -> u32 {
+        if *budget == 0 {
+            return 0;
+        }
+        *budget -= 1;
+        let children: u32 = match ty {
+            mir::Ty::Adt(_, args)
+            | mir::Ty::FnDef(_, args)
+            | mir::Ty::Closure(_, args)
+            | mir::Ty::Coroutine(_, args)
+            | mir::Ty::CoroutineWitness(_, args)
+            | mir::Ty::Alias(_, _, args)
+            | mir::Ty::Tuple(args) => {
+                args.iter().map(|t| count(t, budget)).sum()
+            }
+            mir::Ty::Array(inner, _)
+            | mir::Ty::Pat(inner, _)
+            | mir::Ty::Slice(inner)
+            | mir::Ty::RawPtr(inner, _)
+            | mir::Ty::Ref(_, inner, _)
+            | mir::Ty::Dynamic(_, inner, _) => count(inner, budget),
+            mir::Ty::FnPtr(sig) => sig
+                .inputs
+                .iter()
+                .map(|t| count(t, budget))
+                .sum::<u32>()
+                + count(&sig.output, budget),
+            _ => 0,
+        };
+        1 + children
+    }
+    let mut budget = CAP;
+    count(ty, &mut budget)
 }
