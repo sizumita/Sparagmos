@@ -1380,6 +1380,36 @@ impl Converter {
         })
     }
 
+    /// Record the debuginfo spelling of a foreign (extern-block)
+    /// type's name in place of the Stable MIR spelling. The name
+    /// `DefId::name` records omits the extern block's scope
+    /// segment, but the compiler's debuginfo names the type
+    /// through its scope chain (`type_names::{extern#0}::ForeignType1`),
+    /// and a debugger's type query reports that spelling (the
+    /// debuginfo suite's type-names record pins it). The recorded
+    /// name is the only identity a foreign type carries into the
+    /// program, so it is rewritten here, at the one conversion
+    /// point every mention of the type passes through. When the
+    /// compiler context is unavailable or the name cannot be
+    /// computed under the resolution containment, the Stable MIR
+    /// spelling stands.
+    fn record_foreign_name(&mut self, def: &rustc_public::ty::ForeignDef, id: sm::DefId) {
+        let Some(tcx) = compiler_tcx() else {
+            return;
+        };
+        let (result, _emitted) = with_instance_resolution_contained(|| {
+            use rustc_codegen_ssa::debuginfo::type_names;
+            let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+            let ty = tcx.type_of(internal).skip_binder();
+            type_names::compute_debuginfo_type_name(tcx, ty, true)
+        });
+        if let Ok(name) = result {
+            if let Some(slot) = self.def_names.get_mut(id.index as usize) {
+                *slot = name;
+            }
+        }
+    }
+
     fn rigid_ty(&mut self, ty: &rustc_public::ty::Ty, r: &RigidTy) -> sm::Ty {
         match r {
             RigidTy::Bool => sm::Ty::Bool,
@@ -1397,6 +1427,7 @@ impl Converter {
             }
             RigidTy::Foreign(def) => {
                 let d = self.crate_def_id(def);
+                self.record_foreign_name(def, d);
                 sm::Ty::Foreign(d)
             }
             RigidTy::Array(elem, len) => {
