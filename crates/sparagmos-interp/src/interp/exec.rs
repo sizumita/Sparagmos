@@ -3033,7 +3033,24 @@ impl<'a> Interpreter<'a> {
                     };
                     return Ok(value);
                 }
-                let target = self.resolve_place(frames, body, place)?;
+                let target = match self.resolve_place(frames, body, place) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        // A place that crosses a dereference of a
+                        // storage-less pointer (a null pointer, a
+                        // dangling address) denotes no storage, so
+                        // no resolved place names it -- but the
+                        // pointer being formed is still
+                        // meaningful: it is the address the
+                        // projection denotes.
+                        match self.resolve_place_as_address(
+                            frames, body, place, dest_ty,
+                        ) {
+                            Some(value) => return Ok(value),
+                            None => return Err(err),
+                        }
+                    }
+                };
                 // A pointer to an unsized pointee (a slice or
                 // `str`) is a fat pointer: it must carry the
                 // pointee's length as its metadata, or `PtrMetadata`

@@ -1760,6 +1760,189 @@ impl<'a> Interpreter<'a> {
         Some(offset)
     }
 
+    /// The value of a reference (or raw pointer) formed over a
+    /// place whose resolution crosses a dereference of a
+    /// storage-less pointer -- a null pointer, or an address no
+    /// allocation owns (the dangling address of a zero-sized
+    /// allocation, an integer cast to a pointer). The pointee
+    /// has no storage in the model, so no resolved place denotes
+    /// it; but forming the pointer is still meaningful, and its
+    /// value is the address the projection denotes: the
+    /// pointer's own address displaced by the structural offset
+    /// of the steps past the dereference, carrying the fat
+    /// metadata the source pointer (or the destination type)
+    /// gives it. The shapes are `&*p` for a `p` built from an
+    /// integer, and `&raw const (*p).field` in address-of code
+    /// that never reads through the result. `None` when the
+    /// place does not have this shape -- no dereference, a
+    /// pointer that denotes storage, a step the offset walk
+    /// cannot price -- leaving the caller's original resolution
+    /// error in place.
+    pub(crate) fn resolve_place_as_address(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+        dest_ty: Option<&Ty>,
+    ) -> Option<Value> {
+        let deref_pos = place
+            .projection
+            .iter()
+            .position(|s| matches!(s, ProjectionElem::Deref))?;
+        let prefix = Place {
+            local: place.local,
+            projection: place.projection[..deref_pos].to_vec(),
+        };
+        let pointer = self.read_place(frames, body, &prefix).ok()?;
+        let (base, mut fat_len) = match &pointer {
+            Value::Ref(RefTarget::Null) => (0i128, None),
+            Value::Ref(RefTarget::Address(addr))
+                if self.address_owner(*addr).is_none() =>
+            {
+                (i128::from(*addr), None)
+            }
+            Value::FatRef { base, len } => {
+                let base = match &**base {
+                    Value::Ref(RefTarget::Null) => 0i128,
+                    Value::Ref(RefTarget::Address(addr))
+                        if self.address_owner(*addr).is_none() =>
+                    {
+                        i128::from(*addr)
+                    }
+                    _ => return None,
+                };
+                (base, Some(*len))
+            }
+            _ => return None,
+        };
+        let pointee_ty = self.place_pointee_ty(body, &prefix)?;
+        // The length of the sequence the dereference denotes,
+        // where a step counts back from its end: the fat
+        // pointer's own metadata, or the array pointee's length.
+        let seq_len = fat_len.or(match &pointee_ty {
+            Ty::Array(_, n) => Some(u128::from(*n)),
+            _ => None,
+        });
+        let mut steps: Vec<RefProj> = Vec::new();
+        for step in &place.projection[deref_pos + 1..] {
+            match step {
+                ProjectionElem::Field(idx) => {
+                    steps.push(RefProj::Field(*idx))
+                }
+                ProjectionElem::UnionField { idx, table } => {
+                    steps.push(RefProj::UnionField {
+                        idx: *idx,
+                        table: *table,
+                    })
+                }
+                ProjectionElem::Downcast(v) => {
+                    steps.push(RefProj::Downcast(*v))
+                }
+                ProjectionElem::Index(local) => {
+                    let idx = self
+                        .read_index_local(frames, body, *local, place)
+                        .ok()?;
+                    steps.push(RefProj::Index(idx));
+                }
+                ProjectionElem::ConstantIndex { offset, from_end } => {
+                    if *from_end {
+                        let len = seq_len?;
+                        let idx = len.checked_sub(1 + u128::from(*offset))?;
+                        steps.push(RefProj::Index(usize::try_from(idx).ok()?));
+                    } else {
+                        steps.push(RefProj::Index(
+                            usize::try_from(*offset).ok()?,
+                        ));
+                    }
+                }
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    let (off, len) = if *from_end {
+                        let total = seq_len?;
+                        let end = total.checked_sub(u128::from(*to))?;
+                        let start = u128::from(*from);
+                        (start, end.checked_sub(start)?)
+                    } else {
+                        (
+                            u128::from(*from),
+                            u128::from(*to).checked_sub(u128::from(*from))?,
+                        )
+                    };
+                    steps.push(RefProj::Subslice {
+                        offset: usize::try_from(off).ok()?,
+                        len: usize::try_from(len).ok()?,
+                    });
+                    fat_len = Some(len);
+                }
+                ProjectionElem::Deref => return None,
+            }
+        }
+        let offset = self.projection_offset_forward(&pointee_ty, &steps)?;
+        let addr = base.checked_add(offset)?;
+        let thin = Value::Ref(RefTarget::Address(u64::try_from(addr).ok()?));
+        // A pointer to an unsized pointee is fat: it carries the
+        // length the source pointer (or the array pointee, or a
+        // sub-slice step) determines.
+        let dest_inner = match dest_ty {
+            Some(Ty::Ref(inner)) => Some(&**inner),
+            _ => None,
+        };
+        match dest_inner {
+            Some(Ty::Slice(_)) | Some(Ty::Str) => {
+                let len = fat_len.or(seq_len)?;
+                Some(Value::FatRef {
+                    base: Box::new(thin),
+                    len,
+                })
+            }
+            _ => Some(thin),
+        }
+    }
+
+    /// The pointee type of the pointer a place holds: the
+    /// place's declared type walked across its projection at
+    /// the type level, then one reference step in. `None` when
+    /// any step's type is not recorded, or the place does not
+    /// hold a pointer.
+    fn place_pointee_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
+        let mut ty = body.local_ty(place.local)?.clone();
+        let mut variant = 0usize;
+        for step in &place.projection {
+            ty = match step {
+                ProjectionElem::Field(idx) => {
+                    let next = self.adt_field_ty(&ty, variant, *idx)?;
+                    variant = 0;
+                    next
+                }
+                ProjectionElem::UnionField { idx, .. } => {
+                    let next = self.adt_field_ty(&ty, 0, *idx)?;
+                    variant = 0;
+                    next
+                }
+                ProjectionElem::Downcast(v) => {
+                    variant = *v as usize;
+                    ty
+                }
+                ProjectionElem::Deref => {
+                    variant = 0;
+                    match ty {
+                        Ty::Ref(inner) => (*inner).clone(),
+                        _ => return None,
+                    }
+                }
+                ProjectionElem::Index(_)
+                | ProjectionElem::ConstantIndex { .. } => match ty {
+                    Ty::Array(elem, _) | Ty::Slice(elem) => (*elem).clone(),
+                    _ => return None,
+                },
+                ProjectionElem::Subslice { .. } => ty,
+            };
+        }
+        match ty {
+            Ty::Ref(inner) => Some((*inner).clone()),
+            _ => None,
+        }
+    }
+
     /// [`Self::projection_offset`] without a root type: only
     /// a single sequence step (denominated by the leaf type)
     /// among byte displacements is derivable.

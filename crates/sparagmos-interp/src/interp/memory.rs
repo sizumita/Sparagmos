@@ -233,6 +233,19 @@ impl<'a> Interpreter<'a> {
                     // null or dangling pointer is a legal operand.
                     return Ok(());
                 }
+                if let Some(elem) = elem {
+                    if self.ty_size_full(elem) == Some(0) {
+                        // A copy of zero-sized elements moves no
+                        // bytes whatever the count: neither pointer
+                        // is dereferenced, exactly as the native
+                        // intrinsic leaves both untouched. The
+                        // null pointers a zero-sized
+                        // copy_nonoverlapping passes -- and the
+                        // copies inside ptr::swap of a zero-sized
+                        // type -- are the canonical shapes.
+                        return Ok(());
+                    }
+                }
                 let src_target = self.deref_value(frames, &src_value)?;
                 let dst_target = self.deref_value(frames, &dst_value)?;
                 // Snapshot the source elements before writing: the
@@ -718,12 +731,12 @@ impl<'a> Interpreter<'a> {
     /// The resolution of a dereference of a storage-less
     /// pointer -- a null pointer, or an address no allocation
     /// owns (the dangling pointer std serves every zero-sized
-    /// allocation with) -- whose pointee type is zero-sized:
-    /// the pointee's single value, which needs no storage to
-    /// denote. `None` when the pointer denotes storage, the
-    /// pointee type is unknown or not zero-sized, or its
-    /// single value cannot be fabricated.
-    pub(super) fn storage_less_zst_deref(
+    /// allocation with) -- whose pointee needs no storage to
+    /// denote: a zero-sized pointee's single value, or a union
+    /// pointee's uninit form. `None` when the pointer denotes
+    /// storage, the pointee type is unknown or not zero-sized,
+    /// or its single value cannot be fabricated.
+    pub(crate) fn storage_less_zst_deref(
         &self,
         value: &Value,
         pointee_ty: Option<&Ty>,
@@ -738,7 +751,35 @@ impl<'a> Interpreter<'a> {
         if !storage_less {
             return None;
         }
-        let single = self.zst_single_value(pointee_ty?)?;
+        let ty = pointee_ty?;
+        let single = self.zst_single_value(ty).or_else(|| {
+            // A union pointee (a MaybeUninit above all) has a
+            // value form that needs no storage either: the
+            // union's uninit form, one field holding the uninit
+            // value -- the shape MaybeUninit::uninit()
+            // materialises. The strict fabrication above
+            // refuses it when this instantiation's size is not
+            // recorded (the name-keyed tables hold no layout
+            // for the ADT in this program), but the form is
+            // the same whatever the payload's size: a payload
+            // read through it reports the uninit value it
+            // finds rather than invented data.
+            match ty {
+                Ty::Adt(name)
+                    if matches!(
+                        self.debug_shape_for_def(name)
+                            .map(|shape| &shape.kind),
+                        Some(sparagmos_mir::AdtShapeKind::Union)
+                    ) =>
+                {
+                    Some(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Uninit],
+                    })
+                }
+                _ => None,
+            }
+        })?;
         Some(Resolved::Value(single, Vec::new()))
     }
 
@@ -844,32 +885,61 @@ impl<'a> Interpreter<'a> {
     /// [`zst_value_of_ty`] covers, and a single-variant ADT
     /// whose fields are all single-valued (their declared
     /// types are the program's recorded field skeletons).
-    /// `None` for a type of unknown or nonzero size, a
+    /// `None` for a type of unknown or nonzero size, or a
     /// multi-variant ADT (its zero-sized values are not
-    /// unique), or a field whose skeleton names no type.
+    /// unique).
     pub(crate) fn zst_single_value(&self, ty: &Ty) -> Option<Value> {
-        if self.ty_size_full(ty) != Some(0) {
-            return None;
-        }
-        if let Some(value) = zst_value_of_ty(ty) {
-            return Some(value);
-        }
+        self.zst_single_value_proven(ty, false)
+    }
+
+    /// [`Self::zst_single_value`] with the caller's evidence
+    /// that the value being fabricated is zero-sized: an
+    /// enclosing ADT whose recorded layout is zero-sized
+    /// proves every field of the value zero-sized too, so the
+    /// evidence propagates into the fields. The layout table
+    /// holds one entry per ADT name, and for a generic ADT
+    /// (MaybeUninit, ManuallyDrop, ...) the entry a field's
+    /// own name resolves to may belong to a different
+    /// instantiation than the one at hand -- a ManuallyDrop
+    /// wrapping a future outweighs the one wrapping a
+    /// zero-sized payload in the same program -- while the
+    /// enclosing value's proof is about this instantiation.
+    /// A field whose skeleton names no type (a generic
+    /// parameter of the ADT) fabricates as the uninit value
+    /// under that proof, and refuses without it.
+    fn zst_single_value_proven(&self, ty: &Ty, proven: bool) -> Option<Value> {
         match ty {
             Ty::Adt(name) => {
+                let proven = proven || self.ty_size_full(ty) == Some(0);
                 let variants = self.program().adt_field_tys.get(name)?;
                 if variants.len() != 1 {
                     return None;
                 }
                 let mut fields = Vec::with_capacity(variants[0].len());
                 for field in &variants[0] {
-                    fields.push(self.zst_single_value(field.as_ref()?)?);
+                    match field {
+                        Some(field_ty) => fields.push(
+                            self.zst_single_value_proven(field_ty, proven)?,
+                        ),
+                        None => {
+                            if !proven {
+                                return None;
+                            }
+                            fields.push(Value::Uninit);
+                        }
+                    }
                 }
                 Some(Value::Enum {
                     variant: 0,
                     fields,
                 })
             }
-            _ => None,
+            _ => {
+                if !proven && self.ty_size_full(ty) != Some(0) {
+                    return None;
+                }
+                zst_value_of_ty(ty)
+            }
         }
     }
 
@@ -900,11 +970,13 @@ impl<'a> Interpreter<'a> {
                 id: *id,
                 projection: projection.clone(),
             }),
-            Value::Ref(RefTarget::Null) => Err(InterpError::type_mismatch(
-                "dereference",
-                "reference",
-                "null pointer",
-            )),
+            Value::Ref(RefTarget::Null) => {
+                Err(InterpError::type_mismatch(
+                    "dereference",
+                    "reference",
+                    "null pointer",
+                ))
+            }
             Value::Ref(RefTarget::Address(addr)) => {
                 // A registered synthetic address denotes its
                 // allocation in the store (see `address_owners`):
@@ -917,11 +989,13 @@ impl<'a> Interpreter<'a> {
                         id,
                         projection: Vec::new(),
                     }),
-                    None => Err(InterpError::type_mismatch(
-                        "dereference",
-                        "reference",
-                        "address-only pointer (no pointee in this model)",
-                    )),
+                    None => {
+                        Err(InterpError::type_mismatch(
+                            "dereference",
+                            "reference",
+                            "address-only pointer (no pointee in this model)",
+                        ))
+                    }
                 }
             }
             // A byte-array reference local holds the byte data
@@ -1411,6 +1485,23 @@ impl<'a> Interpreter<'a> {
             Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
             Value::FatRef { base, len } => match *base {
                 Value::Ref(_) => {
+                    // A fat pointer whose base denotes no
+                    // storage (a null pointer, an address no
+                    // allocation owns): its first element is at
+                    // the base address itself, so the
+                    // first-element pointer is the base as it
+                    // stands -- the same answer the thin
+                    // address-only arm above gives.
+                    let storage_less = match &*base {
+                        Value::Ref(RefTarget::Null) => true,
+                        Value::Ref(RefTarget::Address(addr)) => {
+                            self.address_owner(*addr).is_none()
+                        }
+                        _ => false,
+                    };
+                    if storage_less {
+                        return Ok(*base);
+                    }
                     let resolved = self.deref_value(frames, &base)?;
                     let ends_at_element = match &resolved {
                         Resolved::Place { projection, .. }

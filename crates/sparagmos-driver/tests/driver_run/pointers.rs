@@ -3697,3 +3697,91 @@ fn run_mode_fn_pointer_code_bytes() {
     // different bytes.
     run_ok("fn-code", FN_CODE_SRC, "fn-code-ok\n");
 }
+
+
+const INT_PTR_FORM_SRC: &str = r#"
+fn main() {
+    let lsz: usize = 0x8090a0b0c0d0e0f0;
+    let p: *const [u8; 1] = lsz as *const [u8; 1];
+    // Forming a reference through a dereference of an
+    // integer-derived pointer: the pointee has no storage in
+    // the model, but the formed pointers are pure addresses --
+    // they unsized-cast, thin-cast and compare as addresses
+    // (the shape tests/ui/cast/cast-rfc0401.rs exercises).
+    let u: *const [u8] = unsafe { &*p };
+    assert_eq!(u as *const u8, p as *const u8);
+    assert_eq!(u.len(), 1);
+    assert_eq!(p as usize, lsz);
+    println!("int-ptr-form-ok");
+}
+"#;
+
+#[test]
+fn run_mode_reference_formation_through_integer_pointer() {
+    run_ok("int-ptr-form", INT_PTR_FORM_SRC, "int-ptr-form-ok\n");
+}
+
+const ADDROF_NULL_SRC: &str = r#"
+struct FooBar { x: u32, y: u32 }
+fn main() {
+    // The address of a field of a null pointer's pointee: the
+    // result is never read, it is the field's displaced null
+    // address (the shape tests/ui/mir/null/addrof_null.rs
+    // exercises).
+    let p: *const FooBar = std::ptr::null();
+    let q = unsafe { &raw const (*p).x };
+    assert_eq!(q as usize, 0);
+    let r = unsafe { &raw const (*p).y };
+    assert_eq!(r as usize, 4);
+    println!("addrof-null-ok");
+}
+"#;
+
+#[test]
+fn run_mode_address_of_field_through_null_pointer() {
+    run_ok("addrof-null", ADDROF_NULL_SRC, "addrof-null-ok\n");
+}
+
+const ZST_NULL_OPS_SRC: &str = r#"
+fn main() {
+    // Zero-sized element operations through null pointers
+    // move no bytes: the copies inside ptr::swap of a
+    // zero-sized type, a zero-sized copy_nonoverlapping with
+    // a nonzero count, and a volatile read of a zero-sized
+    // pointee (the shapes tests/ui/precondition-checks/
+    // zero-size-null.rs exercises under debug assertions).
+    unsafe {
+        let null: *mut () = std::ptr::null_mut();
+        std::ptr::copy_nonoverlapping(null as *const (), null, 123);
+        std::ptr::swap::<()>(null, null);
+        let v = std::ptr::read_volatile::<()>(null as *const ());
+        assert_eq!(v, ());
+        std::ptr::write_volatile::<()>(null, ());
+    }
+    println!("zst-null-ops-ok");
+}
+"#;
+
+#[test]
+fn run_mode_zero_sized_pointer_ops_through_null() {
+    let dir = temp_dir("zst-null-ops");
+    let src = fixture(&dir, "zst_null_ops.rs", ZST_NULL_OPS_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "-Zmir-opt-level=0",
+            "--rustc-arg",
+            "-Copt-level=0",
+            "--rustc-arg",
+            "-Cdebug-assertions=yes",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "zero-sized pointer ops through null must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "zst-null-ops-ok\n");
+}
