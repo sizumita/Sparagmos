@@ -2648,7 +2648,7 @@ fn adt_field_tys_of<'p>(program: &'p Program, name: &str) -> Option<&'p Vec<Vec<
     None
 }
 
-fn adt_field_ty_in(program: &Program, ty: &Ty, variant: usize, idx: usize) -> Option<Ty> {
+pub(crate) fn adt_field_ty_in(program: &Program, ty: &Ty, variant: usize, idx: usize) -> Option<Ty> {
     match ty {
         Ty::Adt(name) => adt_field_tys_of(program, name)?
             .get(variant)?
