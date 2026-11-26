@@ -112,6 +112,21 @@ impl<'a> Interpreter<'a> {
             }
             return self.exec_stream_io(frames, name, vals);
         }
+        // The `core::ub_checks` runtime predicates (and the
+        // raw-pointer alignment predicate they bottom out in):
+        // conversion emits a builtin node only for those calls
+        // (see `ub_check_terminator` in `mir_convert`), and the
+        // node is served here, before the registry lookup, for
+        // the same reason as the time arms above — the collected
+        // bodies of the other instances stay reachable through
+        // the driver's reach pass.
+        if let Some(helper) = ub_check_helper(name) {
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                vals.push(self.eval_operand(frames, body, arg)?);
+            }
+            return self.exec_ub_check_helper(frames, body, name, helper, args, vals);
+        }
         // The baked name may carry the calling crate's
         // `extern crate` prefix (`krate::libc::sigaction`
         // for a callee the registry names `libc::sigaction`):
