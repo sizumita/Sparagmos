@@ -704,10 +704,9 @@ impl<'a> Interpreter<'a> {
     /// (closure or function pointer) or a set of chars (a
     /// `[char; N]` pattern's chars by value, or a `&[char]`
     /// pattern's slice) -- whose scan tests each char of the
-    /// remaining window. Any other searcher shape is the
-    /// generic unsupported error, as before (a `&str` pattern's
-    /// `StrSearcher` is one: its constructor has no converted
-    /// body, so such an iterator is never even built).
+    /// remaining window, and the `&str` pattern's `StrSearcher`
+    /// (see `StrSearcherParts`). Any other searcher shape is
+    /// the generic unsupported error, as before.
     fn str_matches_step(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -739,6 +738,16 @@ impl<'a> Interpreter<'a> {
             };
             let new_state = parts.encode(state);
             let item = matches_item(&parts.haystack, indices, found);
+            return Ok((new_state, item));
+        }
+        if let Some(mut parts) = StrMatchesStrParts::decode(state) {
+            let found = if back {
+                parts.next_match_back()
+            } else {
+                parts.next_match()
+            };
+            let new_state = parts.encode(state);
+            let item = matches_item(&parts.searcher.haystack, indices, found);
             return Ok((new_state, item));
         }
         Err(unsupported(format!(
@@ -775,6 +784,19 @@ impl<'a> Interpreter<'a> {
                 (true, true) => parts.next_inclusive(self, frames)?,
                 (false, false) => parts.next_back(self, frames)?,
                 (false, true) => parts.next_back_inclusive(self, frames)?,
+            };
+            let new_state = parts.encode(state);
+            return Ok(match item {
+                Some(piece) => (new_state, some_value(Value::Str(piece))),
+                None => (new_state, none_value()),
+            });
+        }
+        if let Some(mut parts) = StrSplitStrParts::decode(state) {
+            let item = match (back == reversed, inclusive) {
+                (true, false) => parts.next(),
+                (true, true) => parts.next_inclusive(),
+                (false, false) => parts.next_back(),
+                (false, true) => parts.next_back_inclusive(),
             };
             let new_state = parts.encode(state);
             return Ok(match item {
@@ -8307,6 +8329,491 @@ impl StrSplitPredParts {
             }
         }
         self.back_match(interp, frames, true)
+    }
+}
+
+/// The decoded state of an `&str` pattern's searcher
+/// (`std::str::pattern::StrSearcher`, built by the
+/// `StrSearcherNew` builtin): the haystack and the needle
+/// the searcher stores, and the front / back cursors of its
+/// `StrSearcherImpl` payload -- the `Empty` payload's
+/// `position` / `end`, the `Byte` payload's, or the `TwoWay`
+/// payload's. A step replays core's searcher semantics over
+/// the stored strings: a substring scan of the remaining
+/// window for the non-empty payloads (the two-way algorithm
+/// computes the same match positions), and for the `Empty`
+/// payload a transcription of core's steppers, whose match
+/// flags and finished flag are carried and toggled exactly
+/// as core's are. The payload fields the machine does not
+/// read (the byte, the two-way constants and memory) are
+/// carried as their original values so the rebuilt state is
+/// field-exact, as in `StrMatchesParts`.
+struct StrSearcherParts {
+    haystack: String,
+    needle: String,
+    variant: u32,
+    payload: Vec<Value>,
+    finger: usize,
+    finger_back: usize,
+    // The `Empty` payload's flags, in its field order.
+    match_fw: bool,
+    match_bw: bool,
+    finished: bool,
+}
+
+impl StrSearcherParts {
+    /// The payload's `(position, end)` field indices, by
+    /// `StrSearcherImpl` variant.
+    fn cursor_indices(variant: u32) -> Option<(usize, usize, usize)> {
+        match variant {
+            // Empty { position, end, .. }
+            0 => Some((0, 1, 5)),
+            // Byte { b, position, end }
+            1 => Some((1, 2, 3)),
+            // TwoWay { .., position, end, .. }
+            2 => Some((4, 5, 8)),
+            _ => None,
+        }
+    }
+
+    fn decode(searcher: &Value) -> Option<Self> {
+        let fields = iterator_fields(searcher, "").ok()?;
+        if fields.len() != 3 {
+            return None;
+        }
+        let Value::Str(haystack) = &fields[0] else {
+            return None;
+        };
+        let Value::Str(needle) = &fields[1] else {
+            return None;
+        };
+        let Value::Enum {
+            variant,
+            fields: impl_fields,
+        } = &fields[2]
+        else {
+            return None;
+        };
+        if impl_fields.len() != 1 {
+            return None;
+        }
+        let (finger_idx, back_idx, payload_len) = Self::cursor_indices(*variant)?;
+        let payload = iterator_fields(&impl_fields[0], "").ok()?;
+        if payload.len() != payload_len {
+            return None;
+        }
+        // The variant is a function of the needle's shape;
+        // decline a state that disagrees with it rather than
+        // step a shape the constructor never builds.
+        let shape_ok = match variant {
+            0 => needle.is_empty(),
+            1 => needle.len() == 1,
+            _ => needle.len() > 1,
+        };
+        if !shape_ok {
+            return None;
+        }
+        let as_usize = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Uint(n) => Some(*n as usize),
+                Value::Int(n) => Some(*n as usize),
+                _ => None,
+            }
+        };
+        let as_bool = |v: &Value| -> Option<bool> {
+            match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            }
+        };
+        let finger = as_usize(&payload[finger_idx])?;
+        let finger_back = as_usize(&payload[back_idx])?;
+        let (match_fw, match_bw, finished) = if *variant == 0 {
+            (
+                as_bool(&payload[2])?,
+                as_bool(&payload[3])?,
+                as_bool(&payload[4])?,
+            )
+        } else {
+            (false, false, false)
+        };
+        Some(Self {
+            haystack: haystack.clone(),
+            needle: needle.clone(),
+            variant: *variant,
+            payload,
+            finger,
+            finger_back,
+            match_fw,
+            match_bw,
+            finished,
+        })
+    }
+
+    fn encode(&self, searcher: &Value) -> Value {
+        let fields = iterator_fields(searcher, "").expect("state decoded above");
+        let Value::Enum {
+            fields: impl_fields,
+            ..
+        } = &fields[2]
+        else {
+            unreachable!("state decoded above")
+        };
+        let (finger_idx, back_idx, _) =
+            Self::cursor_indices(self.variant).expect("state decoded above");
+        let mut payload = self.payload.clone();
+        payload[finger_idx] = Value::Uint(self.finger as u128);
+        payload[back_idx] = Value::Uint(self.finger_back as u128);
+        if self.variant == 0 {
+            payload[2] = Value::Bool(self.match_fw);
+            payload[3] = Value::Bool(self.match_bw);
+            payload[4] = Value::Bool(self.finished);
+        }
+        let payload_value = rebuild_state(&impl_fields[0], payload);
+        let impl_value = rebuild_state(&fields[2], vec![payload_value]);
+        rebuild_state(
+            searcher,
+            vec![
+                Value::Str(self.haystack.clone()),
+                Value::Str(self.needle.clone()),
+                impl_value,
+            ],
+        )
+    }
+
+    /// One step of core's `Empty` searcher in the front
+    /// direction: `Some(Some(range))` for a match step,
+    /// `Some(None)` once finished, `None` for a reject step
+    /// (the caller loops), transcribed from core's
+    /// `Searcher::next`.
+    fn empty_next(&mut self) -> Option<Option<(usize, usize)>> {
+        if self.finished {
+            return Some(None);
+        }
+        let is_match = self.match_fw;
+        self.match_fw = !self.match_fw;
+        let pos = self.finger;
+        if is_match {
+            return Some(Some((pos, pos)));
+        }
+        match self.haystack[pos..].chars().next() {
+            None => {
+                self.finished = true;
+                Some(None)
+            }
+            Some(ch) => {
+                self.finger = pos + ch.len_utf8();
+                None
+            }
+        }
+    }
+
+    /// One step of core's `Empty` searcher in the back
+    /// direction; see `empty_next`.
+    fn empty_next_back(&mut self) -> Option<Option<(usize, usize)>> {
+        if self.finished {
+            return Some(None);
+        }
+        let is_match = self.match_bw;
+        self.match_bw = !self.match_bw;
+        let end = self.finger_back;
+        if is_match {
+            return Some(Some((end, end)));
+        }
+        match self.haystack[..end].chars().next_back() {
+            None => {
+                self.finished = true;
+                Some(None)
+            }
+            Some(ch) => {
+                self.finger_back = end - ch.len_utf8();
+                None
+            }
+        }
+    }
+
+    /// Core `Searcher::next_match`: the next match's byte
+    /// range, front first.
+    fn next_match(&mut self) -> Option<(usize, usize)> {
+        if self.variant == 0 {
+            if self.finger > self.finger_back {
+                return None;
+            }
+            loop {
+                match self.empty_next() {
+                    Some(found) => return found,
+                    None => {}
+                }
+            }
+        }
+        let n = self.needle.len();
+        let bytes = self.haystack.as_bytes();
+        let Some(range) = bytes.get(self.finger..self.finger_back) else {
+            self.finger = self.finger_back;
+            return None;
+        };
+        let at = range
+            .windows(n)
+            .position(|w| w == self.needle.as_bytes());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger = found + n;
+                Some((found, found + n))
+            }
+            None => {
+                self.finger = self.finger_back;
+                None
+            }
+        }
+    }
+
+    /// Core `Searcher::next_match_back`: the next match's
+    /// byte range, back first.
+    fn next_match_back(&mut self) -> Option<(usize, usize)> {
+        if self.variant == 0 {
+            if self.finger > self.finger_back {
+                return None;
+            }
+            loop {
+                match self.empty_next_back() {
+                    Some(found) => return found,
+                    None => {}
+                }
+            }
+        }
+        let n = self.needle.len();
+        let bytes = self.haystack.as_bytes();
+        let Some(range) = bytes.get(self.finger..self.finger_back) else {
+            self.finger_back = self.finger;
+            return None;
+        };
+        let at = range
+            .windows(n)
+            .rposition(|w| w == self.needle.as_bytes());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger_back = found;
+                Some((found, found + n))
+            }
+            None => {
+                self.finger_back = self.finger;
+                None
+            }
+        }
+    }
+}
+
+/// The decoded state of a `str` matches iterator over an
+/// `&str` pattern: the two one-field wrappers over the
+/// pattern's `StrSearcher` (see `StrSearcherParts`).
+struct StrMatchesStrParts {
+    searcher: StrSearcherParts,
+}
+
+impl StrMatchesStrParts {
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 1 {
+            return None;
+        }
+        Some(Self {
+            searcher: StrSearcherParts::decode(&internal[0])?,
+        })
+    }
+
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded above");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded above");
+        let searcher = self.searcher.encode(&internal[0]);
+        let internal = rebuild_state(&outer[0], vec![searcher]);
+        rebuild_state(state, vec![internal])
+    }
+
+    fn next_match(&mut self) -> Option<(usize, usize)> {
+        self.searcher.next_match()
+    }
+
+    fn next_match_back(&mut self) -> Option<(usize, usize)> {
+        self.searcher.next_match_back()
+    }
+}
+
+/// The decoded state of a `str` split iterator over an
+/// `&str` pattern: the `SplitInternal` fields with the
+/// matcher decoded as a `StrSearcher` (see
+/// `StrSearcherParts`). The step replay is `StrSplitParts`'
+/// with the matcher's `next_match` in place of the char
+/// search.
+struct StrSplitStrParts {
+    start: usize,
+    end: usize,
+    searcher: StrSearcherParts,
+    allow_trailing_empty: bool,
+    finished: bool,
+}
+
+impl StrSplitStrParts {
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 5 {
+            return None;
+        }
+        let as_usize = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Uint(n) => Some(*n as usize),
+                Value::Int(n) => Some(*n as usize),
+                _ => None,
+            }
+        };
+        let as_bool = |v: &Value| -> Option<bool> {
+            match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            }
+        };
+        Some(Self {
+            start: as_usize(&internal[0])?,
+            end: as_usize(&internal[1])?,
+            searcher: StrSearcherParts::decode(&internal[2])?,
+            allow_trailing_empty: as_bool(&internal[3])?,
+            finished: as_bool(&internal[4])?,
+        })
+    }
+
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded above");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded above");
+        let searcher = self.searcher.encode(&internal[2]);
+        let internal = rebuild_state(
+            &outer[0],
+            vec![
+                Value::Uint(self.start as u128),
+                Value::Uint(self.end as u128),
+                searcher,
+                Value::Bool(self.allow_trailing_empty),
+                Value::Bool(self.finished),
+            ],
+        );
+        rebuild_state(state, vec![internal])
+    }
+
+    fn haystack(&self) -> &str {
+        &self.searcher.haystack
+    }
+
+    fn needle_len(&self) -> usize {
+        self.searcher.needle.len()
+    }
+
+    // The `SplitInternal` replay, as in `StrSplitParts`.
+
+    /// `SplitInternal::get_end`.
+    fn get_end(&mut self) -> Option<String> {
+        if !self.finished {
+            self.finished = true;
+            if self.allow_trailing_empty || self.end > self.start {
+                return Some(self.haystack()[self.start..self.end].to_string());
+            }
+        }
+        None
+    }
+
+    /// `SplitInternal::next`.
+    fn next(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        match self.searcher.next_match() {
+            Some((a, _)) => {
+                let elt = self.haystack()[self.start..a].to_string();
+                self.start = a + self.needle_len();
+                Some(elt)
+            }
+            None => self.get_end(),
+        }
+    }
+
+    /// `SplitInternal::next_inclusive`.
+    fn next_inclusive(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        match self.searcher.next_match() {
+            Some((_, b)) => {
+                let elt = self.haystack()[self.start..b].to_string();
+                self.start = b;
+                Some(elt)
+            }
+            None => self.get_end(),
+        }
+    }
+
+    /// The post-dance half of `SplitInternal::next_back` /
+    /// `next_back_inclusive`: one back match, or the final
+    /// piece (which the back steps yield unconditionally).
+    fn back_match(&mut self, inclusive: bool) -> Option<String> {
+        match self.searcher.next_match_back() {
+            Some((a, b)) => {
+                let elt = self.haystack()[b..self.end].to_string();
+                self.end = if inclusive { b } else { a };
+                Some(elt)
+            }
+            None => {
+                self.finished = true;
+                Some(self.haystack()[self.start..self.end].to_string())
+            }
+        }
+    }
+
+    /// `SplitInternal::next_back`, including its
+    /// `allow_trailing_empty` dance (the recursive call in
+    /// core is the one `back_match` call here).
+    fn next_back(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(false) {
+                Some(elt) if !elt.is_empty() => return Some(elt),
+                _ => {
+                    if self.finished {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.back_match(false)
+    }
+
+    /// `SplitInternal::next_back_inclusive`: the mirror of
+    /// `next_back` over `back_match`'s inclusive form.
+    fn next_back_inclusive(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(true) {
+                Some(elt) if !elt.is_empty() => return Some(elt),
+                _ => {
+                    if self.finished {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.back_match(true)
     }
 }
 

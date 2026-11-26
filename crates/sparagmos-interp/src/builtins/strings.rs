@@ -712,3 +712,186 @@ impl<'a> Interpreter<'a> {
         }
     }
 }
+
+/// The value `std::str::pattern::StrSearcher::new` builds:
+/// core's `StrSearcher { haystack, needle, searcher }` in its
+/// real field shape. The constructor's MIR is not encoded in
+/// core's rlib (it carries no `#[inline]`), so the model
+/// fills the three `StrSearcherImpl` payloads exactly as
+/// core does: an empty needle gets the `Empty` payload with
+/// both match flags set, a one-byte needle the `Byte`
+/// payload, and any longer needle the `TwoWay` payload whose
+/// constant fields are the critical factorization core's own
+/// constructor computes (see `two_way_searcher_fields`).
+pub(super) fn str_searcher_value(haystack: &str, needle: &str) -> Value {
+    let end = Value::Uint(haystack.len() as u128);
+    let searcher = if needle.is_empty() {
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Uint(0),
+                    end,
+                    Value::Bool(true),
+                    Value::Bool(true),
+                    Value::Bool(false),
+                ],
+            }],
+        }
+    } else if let &[b] = needle.as_bytes() {
+        Value::Enum {
+            variant: 1,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(u128::from(b)), Value::Uint(0), end],
+            }],
+        }
+    } else {
+        Value::Enum {
+            variant: 2,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: two_way_searcher_fields(needle.as_bytes(), haystack.len()),
+            }],
+        }
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Str(haystack.to_string()),
+            Value::Str(needle.to_string()),
+            searcher,
+        ],
+    }
+}
+
+/// The fields of a `TwoWaySearcher` for `needle` over a
+/// haystack of length `end`, in core's field order, computed
+/// by the critical-factorization preprocessing of core's
+/// `TwoWaySearcher::new`: the maximal-suffix factorization,
+/// the short-period case's separate reverse factorization,
+/// and the byte set of the period -- or of the whole needle
+/// in the long-period case, whose period is the lower bound
+/// and whose memory fields carry the `usize::MAX` dummy
+/// that marks it.
+fn two_way_searcher_fields(needle: &[u8], end: usize) -> Vec<Value> {
+    let (crit_pos_false, period_false) = maximal_suffix(needle, false);
+    let (crit_pos_true, period_true) = maximal_suffix(needle, true);
+    let (crit_pos, period) = if crit_pos_false > crit_pos_true {
+        (crit_pos_false, period_false)
+    } else {
+        (crit_pos_true, period_true)
+    };
+    let (crit_pos_back, period, byteset, memory, memory_back) =
+        if needle[..crit_pos] == needle[period..period + crit_pos] {
+            // Short period case -- the period is exact.
+            let crit_pos_back = needle.len()
+                - Ord::max(
+                    reverse_maximal_suffix(needle, period, false),
+                    reverse_maximal_suffix(needle, period, true),
+                );
+            (
+                crit_pos_back,
+                period,
+                byteset_create(&needle[..period]),
+                0,
+                needle.len(),
+            )
+        } else {
+            // Long period case -- the period is approximated
+            // and no memorization is used.
+            (
+                crit_pos,
+                Ord::max(crit_pos, needle.len() - crit_pos) + 1,
+                byteset_create(needle),
+                usize::MAX,
+                usize::MAX,
+            )
+        };
+    vec![
+        Value::Uint(crit_pos as u128),
+        Value::Uint(crit_pos_back as u128),
+        Value::Uint(period as u128),
+        Value::Uint(u128::from(byteset)),
+        Value::Uint(0),
+        Value::Uint(end as u128),
+        Value::Uint(memory as u128),
+        Value::Uint(memory_back as u128),
+    ]
+}
+
+/// Core `TwoWaySearcher::byteset_create`: bit `b & 63` for
+/// each byte `b` of the slice.
+fn byteset_create(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |a, &b| (1u64 << (b & 0x3f)) | a)
+}
+
+/// Core `TwoWaySearcher::maximal_suffix`: the starting
+/// index and period of the maximal suffix of `arr` under
+/// the byte order `order_greater` selects.
+fn maximal_suffix(arr: &[u8], order_greater: bool) -> (usize, usize) {
+    let mut left = 0;
+    let mut right = 1;
+    let mut offset = 0;
+    let mut period = 1;
+    while let Some(&a) = arr.get(right + offset) {
+        let b = arr[left + offset];
+        if (a < b && !order_greater) || (a > b && order_greater) {
+            right += offset + 1;
+            offset = 0;
+            period = right - left;
+        } else if a == b {
+            if offset + 1 == period {
+                right += offset + 1;
+                offset = 0;
+            } else {
+                offset += 1;
+            }
+        } else {
+            left = right;
+            right += 1;
+            offset = 0;
+            period = 1;
+        }
+    }
+    (left, period)
+}
+
+/// Core `TwoWaySearcher::reverse_maximal_suffix`: the
+/// maximal suffix computation over the reverse of `arr`,
+/// stopping early once a period of `known_period` is
+/// reached; returns the factorization index counted from
+/// the back.
+fn reverse_maximal_suffix(arr: &[u8], known_period: usize, order_greater: bool) -> usize {
+    let mut left = 0;
+    let mut right = 1;
+    let mut offset = 0;
+    let mut period = 1;
+    let n = arr.len();
+    while right + offset < n {
+        let a = arr[n - (1 + right + offset)];
+        let b = arr[n - (1 + left + offset)];
+        if (a < b && !order_greater) || (a > b && order_greater) {
+            right += offset + 1;
+            offset = 0;
+            period = right - left;
+        } else if a == b {
+            if offset + 1 == period {
+                right += offset + 1;
+                offset = 0;
+            } else {
+                offset += 1;
+            }
+        } else {
+            left = right;
+            right += 1;
+            offset = 0;
+            period = 1;
+        }
+        if period == known_period {
+            break;
+        }
+    }
+    left
+}

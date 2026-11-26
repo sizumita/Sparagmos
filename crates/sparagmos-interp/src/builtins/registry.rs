@@ -578,6 +578,19 @@ pub enum Builtin {
     /// express for value-held slices; the scan computes the
     /// same result.
     Memchr { reverse: bool },
+    /// `std::str::pattern::StrSearcher::new(haystack, needle)`:
+    /// the `&str` pattern's searcher constructor. Core defines
+    /// it without `#[inline]`, so its MIR is not encoded in
+    /// core's rlib and no converted body can be collected for
+    /// it (the `TwoWaySearcher::new` it calls is in the same
+    /// position); the model builds the searcher value in core's
+    /// real field shape -- the `Empty` and `Byte` payloads
+    /// exactly as core fills them, and the `TwoWay` payload
+    /// with the critical-factorization preprocessing core's
+    /// own constructor computes (see `str_searcher_value`) --
+    /// so the converted `Searcher` bodies and the modelled
+    /// matches / split steps both read a genuine state.
+    StrSearcherNew,
     /// `core::slice::index::RangeError::report(self, len)`: core
     /// forwards to `slice_index_fail`; the same builtin shape.
     RangeErrorReport,

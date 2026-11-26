@@ -5512,6 +5512,12 @@ impl<'a> Interpreter<'a> {
                     "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found {radix}"
                 )))
             }
+            Builtin::StrSearcherNew => {
+                arity(2)?;
+                let haystack = self.resolve_string(frames, &vals[0])?;
+                let needle = self.resolve_string(frames, &vals[1])?;
+                Ok(str_searcher_value(&haystack, &needle))
+            }
             Builtin::Memchr { reverse } => {
                 arity(2)?;
                 let needle = match self.resolve_value(frames, &vals[0])? {
