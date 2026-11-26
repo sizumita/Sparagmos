@@ -94,6 +94,84 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(reg.range_inclusive_new)
         self.assertTrue(reg.to_uppercase)
 
+    def test_guard_forms_used_by_the_real_registry(self):
+        # The real registry writes guards across several lines and
+        # groups alternatives with parentheses and `||`; the parser
+        # must interpret those forms, not skip them.
+        src = '''
+pub fn lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::io::_print" => Builtin::Print,
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::reserve")
+                || canonical.ends_with(">::reserve_exact")) =>
+        {
+            Builtin::VecReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::extend_trusted") =>
+        {
+            Builtin::VecExtendTrusted
+        }
+        _ if canonical == "test::test_main_env_args"
+            || canonical.ends_with("::test::test_main_env_args") =>
+        {
+            Builtin::TestMain
+        }
+        _ => return None,
+    })
+}
+'''
+        reg = cov.BuiltinRegistry(src)
+        self.assertTrue(reg.lookup("std::vec::Vec::<T, A>::reserve"))
+        self.assertTrue(reg.lookup("std::vec::Vec::<T, A>::reserve_exact"))
+        self.assertTrue(reg.lookup("std::vec::Vec::<T, A>::extend_trusted"))
+        self.assertFalse(reg.lookup("std::vec::Vec::<T, A>::reserve_other"))
+        self.assertFalse(reg.lookup("alloc::vec::Vec::<T, A>::reserve"))
+        self.assertFalse(reg.lookup("std::string::String::reserve"))
+        self.assertTrue(reg.lookup("test::test_main_env_args"))
+        self.assertTrue(reg.lookup("std::test::test_main_env_args"))
+        self.assertFalse(reg.lookup("std::vec::Vec::new"))
+
+    def test_unsupported_multiline_guard_is_an_error(self):
+        # A guard shape outside the interpreted grammar must stay a
+        # hard error even when it spans several lines (such guards
+        # used to be skipped silently, which under-counted the
+        # interpreter's builtin support).
+        bad = '''
+pub fn lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::io::_print" => Builtin::Print,
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.len() > 0 =>
+        {
+            Builtin::Bogus
+        }
+        _ => return None,
+    })
+}
+'''
+        with self.assertRaises(ValueError):
+            cov.BuiltinRegistry(bad)
+
+    def test_real_builtins_vec_family(self):
+        # The Vec growth / pointer / extend family is served by
+        # guard arms of the real registry (multi-line, partly with
+        # `||` alternatives); the census names must resolve, under
+        # the `std::` prefix the guards require.
+        src = cov.read_builtins_source(
+            REPO_ROOT / "crates/sparagmos-interp/src/builtins")
+        reg = cov.BuiltinRegistry(src)
+        for name in (
+                "std::vec::Vec::<T, A>::reserve",
+                "std::vec::Vec::<T, A>::reserve_exact",
+                "std::vec::Vec::<T, A>::as_ptr",
+                "std::vec::Vec::<T, A>::extend_from_slice",
+                "std::vec::Vec::<T, A>::extend_trusted",
+                "std::vec::Vec::<T, A>::into_boxed_slice"):
+            self.assertTrue(reg.lookup(name), name)
+        self.assertFalse(reg.lookup("alloc::vec::Vec::<T, A>::reserve"))
+
 
 FIXTURE_DUMP = """sparagmos-mir-dump v0
 source: fixture.rs
