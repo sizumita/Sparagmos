@@ -1312,3 +1312,114 @@ fn debug_mode_str_values_render_as_text() {
         );
     }
 }
+
+fn debug_driver_g(dir: &Path, src: &Path, script: &str, dialect: &str) -> Output {
+    let script_path = dir.join("session.script");
+    std::fs::write(&script_path, script).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("debug")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--rustc-arg")
+        .arg("-g")
+        .arg("--rustc-arg")
+        .arg("-Zmir-opt-level=0")
+        .arg("--debug-script")
+        .arg(&script_path)
+        .arg("--debug-dialect")
+        .arg(dialect)
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+const DEBUG_BOX_DST_SRC: &str = r#"struct Foo<T: ?Sized> {
+    a: u32,
+    value: T,
+}
+struct Holder {
+    p: *const Foo<[u8]>,
+}
+fn main() {
+    let box_str: Box<str> = "World".into();
+    let box_slice: Box<[u8]> = Box::new([10u8, 20, 30]);
+    let box_dst: Box<Foo<[u8]>> = Box::new(Foo { a: 7, value: [1u8, 2] });
+    let rc_str: std::rc::Rc<str> = "World".into();
+    let str_in_rc: std::rc::Rc<&str> = std::rc::Rc::new("Hello");
+    let raw_slice: *const [u8] = &[9u8, 8, 7];
+    let raw_dst: *const Foo<[u8]> = &Foo { a: 3, value: [5u8, 6, 7, 8] };
+    let holder = Holder { p: raw_dst };
+    zzz();
+    let _ = (box_str, box_slice, box_dst, rc_str, str_in_rc, raw_slice, raw_dst, holder);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_box_unsized_pointees_print_the_pointee() {
+    // gdb prints a fat pointer's pointee, not its metadata:
+    // a `Box<str>` as the box's name over the text's bytes,
+    // a `Box<[T]>` over the elements, a `Box` of a
+    // dynamically sized struct and a raw pointer to one as
+    // the struct itself (sized fields by value, the unsized
+    // tail as an address), and a raw slice pointer as its
+    // name over the elements. An `Rc<str>`'s inner pointer
+    // prints the `RcInner<str>` struct the same way, while
+    // a sized pointee (`RcInner<&str>`) stays an address;
+    // both print `NonNull` by its definition path.
+    let dir = temp_dir("debug-box-dst");
+    let src = fixture(&dir, "box_str_dst.rs", DEBUG_BOX_DST_SRC);
+    let out = debug_driver_g(
+        &dir,
+        &src,
+        "break 17\nrun\nprint box_str\nprint box_slice\nprint box_dst\nprint rc_str\nprint str_in_rc\nprint raw_slice\nprint holder\n",
+        "gdb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "alloc::boxed::Box<str, alloc::alloc::Global> [87, 111, 114, 108, 100]",
+        "alloc::boxed::Box<[u8], alloc::alloc::Global> [10, 20, 30]",
+        "box_str_dst::Foo<[u8]> {a: 7, value: 0x",
+        "core::ptr::non_null::NonNull<alloc::rc::RcInner<str>> {pointer: alloc::rc::RcInner<str> {strong: core::cell::Cell<usize> {value: core::cell::UnsafeCell<usize> {value: 1}}",
+        "core::ptr::non_null::NonNull<alloc::rc::RcInner<&str>> {pointer: 0x",
+        "*const [u8] [9, 8, 7]",
+        "p: box_str_dst::Foo<[u8]> {a: 3, value: 0x",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("RcInner<&str> {strong"),
+        "a sized pointee must stay an address, not the struct: {stdout}"
+    );
+}
+
+#[test]
+fn debug_mode_box_str_lldb_provider_line() {
+    // The lldb provider line for a `Box` over an unsized
+    // pointee shows the pointee's own summary under the
+    // box's type name: the text and its character children
+    // for `str`, the size and element children for a slice.
+    let dir = temp_dir("debug-box-lldb");
+    let src = fixture(&dir, "box_str_dst.rs", DEBUG_BOX_DST_SRC);
+    let out = debug_driver_g(
+        &dir,
+        &src,
+        "break 17\nrun\nprint box_str\nprint box_slice\n",
+        "lldb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "(alloc::boxed::Box<str, alloc::alloc::Global>) box_str = \"World\" { [0] = 'W' [1] = 'o' [2] = 'r' [3] = 'l' [4] = 'd' }",
+        "box_slice = size=3 { [0] = 10 [1] = 20 [2] = 30 }",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}

@@ -2,8 +2,13 @@
 
 use crate::interp::{Frame, Interpreter};
 use crate::value::{RefProj, RefTarget, Value};
-use super::desc::{Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level};
-use super::render_gdb::{MAX_RENDER_DEPTH, compress_repeats, render_gdb};
+use super::desc::{
+    Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level,
+    tag_base_name,
+};
+use super::render_gdb::{
+    MAX_RENDER_DEPTH, compress_repeats, fat_base_text, render_gdb,
+};
 use super::render_lldb::{escape_char, escape_str, lldb_type_name, render_lldb_compact};
 
 // ---------------------------------------------------------------------------
@@ -82,7 +87,7 @@ fn printer_kind(dwarf_name: &str) -> Option<PrinterKind> {
 /// tuple (an array value or a materialised slice), an ADT
 /// element aggregate (a vector's storage form), or a byte block
 /// (each byte an element).
-fn sequence_values(value: &Value) -> Option<Vec<Value>> {
+pub(super) fn sequence_values(value: &Value) -> Option<Vec<Value>> {
     match value {
         Value::Tuple(items) => Some(items.clone()),
         Value::Enum { fields, .. } => Some(fields.clone()),
@@ -947,6 +952,120 @@ fn rc_count(inner: &Value, field: usize) -> Option<u128> {
 /// this renderer implements (a slice, a string slice, a counted
 /// handle): the `(Type) name = <summary> { <children> }` line
 /// lldb prints for it.
+/// The text of a box's `str` pointee, followed through
+/// the box's pointer with the session's frames: the pointer
+/// dereferences to the fat pointer, whose base carries the
+/// text as a snapshot or reaches it through one more
+/// dereference.
+fn provider_pointee_text(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+) -> Option<String> {
+    fn go(
+        interp: &Interpreter,
+        frames: &[Frame],
+        value: &Value,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 6 {
+            return None;
+        }
+        match value {
+            Value::Str(text) => Some(text.clone()),
+            Value::Bytes(bytes) => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Value::FatRef { base, .. } => {
+                if let Some(text) = fat_base_text(base) {
+                    return Some(text);
+                }
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let next = interp.read_resolved(frames, &resolved).ok()?;
+                go(interp, frames, &next, depth + 1)
+            }
+            Value::Ref(_) => {
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let next = interp.read_resolved(frames, &resolved).ok()?;
+                go(interp, frames, &next, depth + 1)
+            }
+            Value::Enum { fields, .. } => {
+                go(interp, frames, fields.first()?, depth + 1)
+            }
+            _ => None,
+        }
+    }
+    go(interp, frames, value, 0)
+}
+
+/// The lldb provider line for a `Box` over an unsized
+/// pointee: lldb shows the pointee's own summary under the
+/// box's type name -- the text and its character children
+/// for a `str` pointee, the size and element children for
+/// a slice pointee.
+fn render_lldb_box_line(
+    interp: &Interpreter,
+    frames: &[Frame],
+    tag: &str,
+    value: &Value,
+    expr: &str,
+) -> Option<String> {
+    let pointee_ty = first_generic_arg(tag)?;
+    let ty = lldb_type_name(&dwarf_type_name(tag));
+    let pointer = match value {
+        Value::Enum { fields, .. } => fields.first()?,
+        other => other,
+    };
+    match Desc::from_tag(&pointee_ty) {
+        Desc::Str => {
+            let text = provider_pointee_text(interp, frames, pointer)?;
+            let mut parts = Vec::with_capacity(text.len());
+            for (i, c) in text.chars().enumerate() {
+                parts.push(format!("[{i}] = '{}'", escape_char(c)));
+            }
+            let children = if parts.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{ {} }}", parts.join(" "))
+            };
+            Some(format!(
+                "({ty}) {expr} = \"{}\" {children}",
+                escape_str(&text)
+            ))
+        }
+        Desc::Slice(elem) => {
+            let pointee = slice_pointee(interp, frames, pointer)?;
+            let elems = sequence_values(&pointee)?;
+            // A sparse pointee's size is its declared
+            // length, past the stored elements the children
+            // render from (see `Value::SparseVec`).
+            let size = match &pointee {
+                Value::SparseVec { len, .. } => *len,
+                _ => elems.len() as u128,
+            };
+            let mut parts = Vec::with_capacity(elems.len());
+            for (i, e) in elems.iter().enumerate() {
+                let v = render_lldb_compact(
+                    interp,
+                    e,
+                    Some(&elem),
+                    false,
+                    true,
+                    1,
+                )?;
+                parts.push(format!("[{i}] = {v}"));
+            }
+            if parts.is_empty() {
+                Some(format!("({ty}) {expr} = size={size}"))
+            } else {
+                let children = format!("{{ {} }}", parts.join(" "));
+                Some(format!("({ty}) {expr} = size={size} {children}"))
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn render_lldb_provider_line(
     interp: &Interpreter,
     frames: &[Frame],
@@ -1021,6 +1140,9 @@ pub(super) fn render_lldb_provider_line(
             _ => None,
         },
         Some(Desc::Adt(tag)) => {
+            if tag_base_name(tag) == "Box" {
+                return render_lldb_box_line(interp, frames, tag, value, expr);
+            }
             let kind = printer_kind(&dwarf_type_name(tag))?;
             match kind {
                 PrinterKind::Rc | PrinterKind::Arc => {

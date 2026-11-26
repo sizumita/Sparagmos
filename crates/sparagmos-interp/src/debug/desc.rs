@@ -373,6 +373,43 @@ pub(super) fn dwarf_type_name(tag: &str) -> String {
         out.push(bytes[i] as char);
         i += 1;
     }
+    ptr_item_definition_paths(&out)
+}
+
+/// Two `core::ptr` items are defined one module deeper than
+/// the path the conversion records for them: `NonNull` in
+/// `core::ptr::non_null`, `Unique` in `core::ptr::unique`
+/// (the `core::ptr` module re-exports both). A definition
+/// path spells the defining module, so a `ptr::NonNull` /
+/// `ptr::Unique` item segment takes its submodule. The
+/// rewrite is segment-exact: the item must be the segment
+/// directly under a `ptr` module segment.
+fn ptr_item_definition_paths(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(pos) = rest.find("::ptr::") {
+        let head_end = pos + "::ptr::".len();
+        let tail = &rest[head_end..];
+        let item_end = tail
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(tail.len());
+        let (item, after) = tail.split_at(item_end);
+        let module = match item {
+            "NonNull" => "non_null",
+            "Unique" => "unique",
+            _ => {
+                out.push_str(&rest[..head_end]);
+                rest = tail;
+                continue;
+            }
+        };
+        out.push_str(&rest[..head_end]);
+        out.push_str(module);
+        out.push_str("::");
+        out.push_str(item);
+        rest = after;
+    }
+    out.push_str(rest);
     out
 }
 
