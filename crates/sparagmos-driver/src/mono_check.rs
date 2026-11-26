@@ -134,7 +134,12 @@
 //!   `codegen_served_unmodelled` — and reports the call
 //!   only when neither serves it. An intrinsic with a
 //!   fallback body is never reported: the body is the
-//!   fallback, and leaving it unshimmed is legal.
+//!   fallback, and leaving it unshimmed is legal. A
+//!   `#[rustc_comptime]` intrinsic is never reported
+//!   either: the compiler confines its calls to constant
+//!   contexts, which are evaluated before code generation,
+//!   so no call to one ever reaches the backend (see
+//!   `comptime_intrinsic`).
 //!
 //! - `#[linkage = "common"]` statics with a non-zero
 //!   initializer (the LLVM verifier's "'common' global must
@@ -217,6 +222,15 @@ fn check_override_call(func: &Operand) -> Option<String> {
     if !intrinsic.must_be_overridden() {
         return None;
     }
+    let canonical = sparagmos_interp::builtins::canonical_name(&def.name());
+    let bare = canonical.rsplit("::").next().unwrap_or(&canonical);
+    // A compile-time intrinsic's calls are confined to
+    // constant contexts and evaluated there; the call
+    // never reaches code generation, so the override
+    // error is unreachable for it.
+    if comptime_intrinsic(bare) {
+        return None;
+    }
     let inst = Instance::resolve(def, &args).ok()?;
     if !matches!(inst.kind, InstanceKind::Intrinsic) {
         return None;
@@ -234,8 +248,6 @@ fn check_override_call(func: &Operand) -> Option<String> {
     // internal error. (The remaining conversion dispatches
     // key on trait methods and format machinery, which an
     // intrinsic definition never names.)
-    let canonical = sparagmos_interp::builtins::canonical_name(&def.name());
-    let bare = canonical.rsplit("::").next().unwrap_or(&canonical);
     let served = sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
         || sparagmos_interp::builtins::foreign_helper_lookup(&canonical).is_some()
         || sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some()
@@ -248,6 +260,65 @@ fn check_override_call(func: &Operand) -> Option<String> {
          but isn't (no backend shim serves this call)",
         intrinsic.fn_name()
     ))
+}
+
+/// Whether the named intrinsic is a compile-time
+/// intrinsic: in the pinned core it is declared with
+/// `#[rustc_comptime]`, and the compiler rejects any call
+/// to it outside a constant context ("comptime fns can
+/// only be called at compile time" — verified against
+/// the pinned compiler with a runtime-context call to
+/// `offset_of`). Every call that survives into a
+/// converted body therefore sits inside a constant —
+/// an inline const block, a promoted constant, a const
+/// item — and is resolved by constant evaluation; it
+/// never reaches code generation, so the
+/// must-be-overridden error cannot fire for it. The
+/// verdict exempts these names outright instead of
+/// routing them through the served sets: code
+/// generation does not shim them (they are not
+/// `codegen_served_unmodelled` material), it simply
+/// never sees them.
+///
+/// The set is the pinned core's `#[rustc_comptime]`
+/// declarations, extracted from the Rust 1.100.0 core
+/// sources; every one of them is a body-less
+/// `#[rustc_intrinsic]` declaration, so each is a
+/// must-be-overridden candidate the exemption has to
+/// cover. As with the codegen list, the judgement is
+/// by bare name: the test suite's own minicore-style
+/// declarations name the same intrinsics.
+fn comptime_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "align_of"
+            | "field_offset"
+            | "field_representing_type_actual_type_id"
+            | "field_representing_type_name"
+            | "field_representing_type_offset"
+            | "needs_drop"
+            | "non_exhaustive"
+            | "offset_of"
+            | "size_of"
+            | "size_of_type_id"
+            | "type_id"
+            | "type_id_array_len"
+            | "type_id_element_ty"
+            | "type_id_fields"
+            | "type_id_field_representing_type"
+            | "type_id_function_ptr"
+            | "type_id_generics"
+            | "type_id_is_signed"
+            | "type_id_points_mutably"
+            | "type_id_points_to"
+            | "type_id_variants"
+            | "type_id_vtable"
+            | "type_name"
+            | "type_of"
+            | "variant_count"
+            | "variant_name"
+            | "variant_non_exhaustive"
+    )
 }
 
 /// Whether rustc's code generation shims the named intrinsic
