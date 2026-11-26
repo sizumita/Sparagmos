@@ -3522,6 +3522,44 @@ impl<'a> Interpreter<'a> {
                 let arg = first_generic_arg(tag).unwrap_or("");
                 return Ok(pad_width(&format!("PhantomData<{arg}>"), options));
             }
+            "core::asserting::Capture" => {
+                // The handwritten `Debug` of the `assert!`
+                // capture wrapper is a fixed function of the
+                // marker type argument: the `TryCaptureWithoutDebug`
+                // marker always prints `N/A`; the
+                // `TryCaptureWithDebug` marker prints the
+                // captured element's own `Debug` (the `elem`
+                // field's `Some` payload), or `N/A` when no
+                // element was captured.
+                let marker = second_generic_arg(tag).unwrap_or("");
+                let marker_head = marker.split('<').next().unwrap_or("").trim();
+                if marker_head == "core::asserting::TryCaptureWithoutDebug" {
+                    return Ok(pad_width("N/A", options));
+                }
+                if marker_head == "core::asserting::TryCaptureWithDebug" {
+                    match fields.first() {
+                        Some(Value::Enum {
+                            variant: 1,
+                            fields: payload,
+                        }) if payload.len() == 1 => {
+                            let elem = first_generic_arg(tag).unwrap_or("");
+                            let text = self.format_value(
+                                frames,
+                                &payload[0],
+                                FmtTrait::Debug,
+                                elem,
+                                options,
+                                indent,
+                            )?;
+                            return Ok(text);
+                        }
+                        Some(Value::Enum { variant: 0, .. }) => {
+                            return Ok(pad_width("N/A", options));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             "core::cell::RefCell" | "std::cell::RefCell" => {
                 // The impl shows only the `value` field, as the
                 // inner value behind its `UnsafeCell`, or as

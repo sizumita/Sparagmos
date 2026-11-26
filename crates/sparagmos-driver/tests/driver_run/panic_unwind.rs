@@ -3186,3 +3186,68 @@ fn run_mode_assert_eq_custom_message_keeps_debug_operands() {
         "custom message with Debug operands: {stderr}"
     );
 }
+
+const GENERIC_ASSERT_SRC: &str = r##"
+#![feature(generic_assert)]
+use std::panic;
+
+#[derive(Clone, Copy, PartialEq)]
+struct NoDebug(i32);
+
+#[derive(Clone, Copy, PartialEq)]
+struct WithDebug(i32);
+impl std::fmt::Debug for WithDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WD({})", self.0)
+    }
+}
+
+fn grab<F: FnOnce() + panic::UnwindSafe>(f: F) -> String {
+    let err = panic::catch_unwind(f).unwrap_err();
+    if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        panic!("payload not a string");
+    }
+}
+
+fn main() {
+    let elem = 1;
+    let m1 = grab(|| { assert!(&elem == &3); });
+    println!("M1|{m1}|");
+    let nd = NoDebug(1);
+    let m2 = grab(|| { assert!(nd == NoDebug(3)); });
+    println!("M2|{m2}|");
+    let wd = WithDebug(7);
+    let m3 = grab(|| { assert!(wd == WithDebug(3)); });
+    println!("M3|{m3}|");
+}
+"##;
+
+#[test]
+fn run_mode_generic_assert_captures_render_like_core() {
+    // core's handwritten `Debug` for `asserting::Capture` is a
+    // fixed function of the marker type argument: with
+    // `TryCaptureWithDebug` it prints the captured element's own
+    // `Debug`; with `TryCaptureWithoutDebug` it prints `N/A`.
+    // The structural fmt engine must not render the wrapper's
+    // recorded struct shape instead.
+    let dir = temp_dir("genericassert");
+    let src = fixture(&dir, "genericassert.rs", GENERIC_ASSERT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "caught assert panics terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "M1|Assertion failed: &elem == &3\nWith captures:\n  elem = 1\n|\n\
+         M2|Assertion failed: nd == NoDebug(3)\nWith captures:\n  nd = N/A\n|\n\
+         M3|Assertion failed: wd == WithDebug(3)\nWith captures:\n  wd = WD(7)\n|\n",
+        "capture renderings match core's"
+    );
+}
