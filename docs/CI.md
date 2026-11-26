@@ -697,8 +697,8 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   1800 s for the one-time run-make-support build per job); they are
   not raised through the `SPARAGMOS_*_TIMEOUT` variables;
 - stage-4 records likewise use built-in timeouts (240 s for a
-  native rustdoc run, 1800 s for a guest run and for the one-time
-  per-job startup probe, 1200 s for a checker-tool build);
+  native rustdoc run and for the one-time per-job startup probe,
+  1800 s for a guest run, 1200 s for a checker-tool build);
   `SPARAGMOS_RUSTDOC_TIMEOUT` and its siblings can raise them,
   but the workflows do not;
 - bound every driver subprocess's resident memory: the runner

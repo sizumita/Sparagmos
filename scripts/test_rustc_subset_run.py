@@ -5320,6 +5320,35 @@ class Stage4RustdocTests(unittest.TestCase):
         self.assertEqual(res["status"], "unsupported")
         self.assertIn("unsupported: frobnicate", res["reason"])
 
+    def test_probe_timeout_default_matches_native_timeout(self):
+        # The startup probe only asks the guest driver for its
+        # version; its built-in default is the native timeout
+        # (240 s), not the guest run's 1800 s (Issue #482). The
+        # constants are read from the environment at import time,
+        # so re-load the module under a controlled one.
+        def fresh(probe_timeout):
+            spec = importlib.util.spec_from_file_location(
+                "rustc_subset_run_fresh",
+                Path(__file__).parent / "rustc-subset-run.py")
+            mod = importlib.util.module_from_spec(spec)
+            with unittest.mock.patch.dict(os.environ):
+                if probe_timeout is None:
+                    os.environ.pop(
+                        "SPARAGMOS_RUSTDOC_PROBE_TIMEOUT", None)
+                else:
+                    os.environ["SPARAGMOS_RUSTDOC_PROBE_TIMEOUT"] = \
+                        probe_timeout
+                spec.loader.exec_module(mod)
+            return mod
+
+        mod = fresh(None)
+        self.assertEqual(mod.STAGE4_PROBE_TIMEOUT, 240)
+        self.assertEqual(mod.STAGE4_PROBE_TIMEOUT,
+                         mod.STAGE4_NATIVE_TIMEOUT)
+        # The environment override still applies.
+        mod = fresh("1800")
+        self.assertEqual(mod.STAGE4_PROBE_TIMEOUT, 1800)
+
 
 class CoverageNormalizeTests(unittest.TestCase):
     """compiletest's coverage-output normalisation, ported for

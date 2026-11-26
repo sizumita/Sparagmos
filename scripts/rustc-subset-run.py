@@ -7307,8 +7307,12 @@ RUSTDOC_SUITES_BROWSER = ("rustdoc-gui", "rustdoc-js", "rustdoc-js-std")
 STAGE4_NATIVE_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_TIMEOUT", 240)
 STAGE4_GUEST_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_GUEST_TIMEOUT",
                                     1800)
+# The probe only asks the guest driver for its version: a
+# startup that has not answered within the native timeout is
+# the stall itself (Issue #482), so it does not get the guest
+# run's 1800 s.
 STAGE4_PROBE_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_PROBE_TIMEOUT",
-                                    1800)
+                                    240)
 STAGE4_TOOL_TIMEOUT = _env_timeout("SPARAGMOS_RUSTDOC_TOOL_TIMEOUT", 1200)
 
 # Set by main() from --rustdoc-artifacts / --rustdoc-main; the
