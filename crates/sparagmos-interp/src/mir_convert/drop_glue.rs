@@ -314,11 +314,12 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::sync::mpmc::SendError" => {
                 return Some(self.variant_fields_plan(def, args)?);
             }
-            // `FlatMap` has no modelled iterator state in the
-            // interpreter (its `next` is the converted body), so
-            // its value keeps the real layout and the glue is the
-            // fields': the source iterator, the closure and the
-            // two in-flight inner iterators.
+            // A flatten composition's value keeps the real
+            // layout (the modelled step runs on it in place), so
+            // the glue is the fields': the wrapped compat state
+            // for `FlatMap` / `Flatten`, and for `FlattenCompat`
+            // itself the fused source iterator and the two
+            // in-flight inner iterators.
             "std::iter::FlatMap" | "std::iter::adapters::flatten::FlattenCompat"
             | "std::iter::Fuse" => {
                 return Some(self.variant_fields_plan(def, args)?);

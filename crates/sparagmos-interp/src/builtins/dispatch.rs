@@ -2866,334 +2866,7 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 let value = vals.into_iter().next().expect("arity checked");
-                // A trait-object iterator value (a `Box<dyn
-                // Iterator>` or `&dyn Iterator`) is already an
-                // iterator, so the blanket identity below covers
-                // it whatever its rendered Self type.
-                if matches!(value, Value::DynRef { .. })
-                    || self_ty.starts_with("std::ops::Range<")
-                    || self_ty.starts_with("std::ops::RangeInclusive<")
-                    || self_ty.starts_with("std::iter::Rev<")
-                    || self_ty.starts_with("std::slice::Iter<")
-                    || self_ty.starts_with("std::collections::btree_set::Iter<")
-                    || self_ty.starts_with("std::collections::btree_map::Iter<")
-                    || self_ty.starts_with("std::collections::btree_map::Keys<")
-                    || self_ty.starts_with("std::collections::btree_map::Values<")
-                    || self_ty.starts_with("std::collections::btree_set::IntoIter<")
-                    || self_ty.starts_with("std::collections::btree_map::IntoIter<")
-                    || self_ty.starts_with("std::slice::IterMut<")
-                    || self_ty.starts_with("std::array::IntoIter<")
-                    || self_ty.starts_with("std::vec::IntoIter<")
-                    || self_ty.starts_with("alloc::vec::IntoIter<")
-                    || self_ty.starts_with("std::vec::Drain<")
-                    || self_ty.starts_with("alloc::vec::Drain<")
-                    || self_ty.starts_with("std::option::IntoIter<")
-                    || self_ty.starts_with("std::option::Iter<")
-                    || self_ty.starts_with("std::option::IterMut<")
-                    || self_ty.starts_with("std::iter::Map<")
-                    || self_ty.starts_with("std::iter::Enumerate<")
-                    || self_ty.starts_with("std::iter::Copied<")
-                    || self_ty.starts_with("std::iter::Cloned<")
-                    || self_ty.starts_with("std::iter::Take<")
-                    || self_ty.starts_with("std::iter::Skip<")
-                    || self_ty.starts_with("std::iter::Chain<")
-                    || self_ty.starts_with("std::iter::Zip<")
-                    || self_ty.starts_with("std::iter::SkipWhile<")
-                    || self_ty.starts_with("std::iter::Filter<")
-                    || self_ty.starts_with("std::iter::FilterMap<")
-                    || self_ty.starts_with("std::io::Lines<")
-                    || self_ty.starts_with("std::io::Bytes<")
-                    || self_ty_is(self_ty, "std::str::Lines")
-                    || self_ty_is(self_ty, "std::str::LinesInclusive")
-                    || self_ty.starts_with("std::str::Split<")
-                    || self_ty.starts_with("std::str::RSplit<")
-                    || self_ty.starts_with("std::str::SplitTerminator<")
-                    || self_ty.starts_with("std::str::RSplitTerminator<")
-                    || self_ty.starts_with("std::str::SplitInclusive<")
-                    || self_ty.starts_with("std::iter::Once<")
-                    || self_ty.starts_with("std::path::Components")
-                    || self_ty.starts_with("std::path::Ancestors")
-                    || self_ty_is(self_ty, "std::fs::ReadDir")
-                    || self_ty.starts_with("std::iter::Empty<")
-                    || self_ty.starts_with("std::iter::Repeat<")
-                    || self_ty_is(self_ty, "std::str::Chars")
-                    || self_ty_is(self_ty, "core::str::Chars")
-                    || self_ty_is(self_ty, "std::str::Bytes")
-                    || self_ty_is(self_ty, "core::str::Bytes")
-                    || self_ty_is(self_ty, "std::str::EscapeDebug")
-                    || self_ty_is(self_ty, "core::str::EscapeDebug")
-                    || self_ty_is(self_ty, "std::str::EscapeDefault")
-                    || self_ty_is(self_ty, "core::str::EscapeDefault")
-                    || self_ty_is(self_ty, "std::str::EscapeUnicode")
-                    || self_ty_is(self_ty, "core::str::EscapeUnicode")
-                    || self_ty.starts_with("std::collections::linked_list::Iter<")
-                    || self_ty.starts_with("std::collections::linked_list::IterMut<")
-                    || self_ty.starts_with("std::collections::linked_list::IntoIter<")
-                    || self_ty.starts_with("alloc::collections::linked_list::Iter<")
-                    || self_ty.starts_with("alloc::collections::linked_list::IterMut<")
-                    || self_ty.starts_with("alloc::collections::linked_list::IntoIter<")
-                    || self_ty.starts_with("std::collections::vec_deque::Iter<")
-                    || self_ty.starts_with("std::collections::vec_deque::IterMut<")
-                    || self_ty.starts_with("std::collections::vec_deque::IntoIter<")
-                    || self_ty.starts_with("alloc::collections::vec_deque::Iter<")
-                    || self_ty.starts_with("alloc::collections::vec_deque::IterMut<")
-                    || self_ty.starts_with("alloc::collections::vec_deque::IntoIter<")
-                    || self_ty.starts_with("std::collections::binary_heap::Iter<")
-                    || self_ty.starts_with("std::collections::binary_heap::IntoIter<")
-                    || self_ty.starts_with("std::slice::Chunks<")
-                    || self_ty.starts_with("std::slice::ChunksExact<")
-                    || self_ty.starts_with("std::slice::RChunks<")
-                    || self_ty.starts_with("std::slice::RChunksExact<")
-                {
-                    // These types are their own iterator: the
-                    // blanket `IntoIterator for I: Iterator` impl
-                    // is the identity, and the value is already in
-                    // the shape `Iterator::next` consumes for the
-                    // type — a range is its own state, a slice /
-                    // char / byte iterator was built by the
-                    // corresponding runtime support, an adapter or
-                    // source iterator by its constructor's
-                    // converted body, and the owning iterators by
-                    // the arms below.
-                    Ok(value)
-                } else if self_ty.starts_with('[') {
-                    // Array by value: iteration state is the element
-                    // tuple plus the next index (our layout for
-                    // `std::array::IntoIter`, whose `next` below is
-                    // the only consumer).
-                    match value {
-                        Value::Tuple(items) => Ok(Value::Enum {
-                            variant: 0,
-                            fields: vec![Value::Tuple(items), Value::Uint(0)],
-                        }),
-                        ref other => Err(InterpError::type_mismatch(
-                            "IntoIterator::into_iter for an array",
-                            "array value",
-                            other.kind_name(),
-                        )),
-                    }
-                } else if self_ty.starts_with("&std::vec::Vec<")
-                    || self_ty.starts_with("&alloc::vec::Vec<")
-                    || self_ty.starts_with("&[")
-                {
-                    // `&Vec<T>` and `&[T]` iterate as `slice::Iter`,
-                    // in the real field layout `slice_iter_value`
-                    // builds and `Iterator::next` consumes. A
-                    // scalar-backed slice (the `slice::from_ref`
-                    // shape) reads its elements from the scalar's
-                    // own storage.
-                    let (elems, _) = match self.slice_elements(frames, &value) {
-                        Ok(elems) => elems,
-                        Err(err) => {
-                            let elem_tag = slice_container_element_tag(self_ty)
-                                .or_else(|| {
-                                    slice_container_element_tag(
-                                        self_ty.strip_prefix('&').unwrap_or(self_ty),
-                                    )
-                                })
-                                .unwrap_or("");
-                            match self.scalar_backed_slice_elements(
-                                frames,
-                                &value,
-                                elem_tag,
-                            ) {
-                                Some(elems) => {
-                                    let len = elems.len() as u128;
-                                    (elems, len)
-                                }
-                                None => return Err(err),
-                            }
-                        }
-                    };
-                    Ok(slice_iter_value(elems))
-                } else if self_ty.starts_with("&std::collections::BTreeSet<") {
-                    let elems = self.btree_set_elements_of_ref(frames, &value)?;
-                    Ok(slice_iter_value(elems))
-                } else if self_ty.starts_with("&std::collections::BTreeMap<") {
-                    let elems = self.btree_map_pair_elements_of_ref(frames, &value)?;
-                    Ok(slice_iter_value(elems))
-                } else if self_ty_is(self_ty, "std::env::Args")
-                    || self_ty_is(self_ty, "std::env::ArgsOs")
-                    || self_ty_is(self_ty, "std::env::SplitPaths")
-                    || self_ty.starts_with("std::slice::Windows<")
-                {
-                    // The env argument iterators are their own
-                    // `IntoIterator` (the state `env::args` built).
-                    Ok(value)
-                } else if self_ty.starts_with("std::vec::Vec<")
-                    || self_ty.starts_with("alloc::vec::Vec<")
-                {
-                    // A by-value `Vec` iterates as `vec::IntoIter`:
-                    // the element snapshot plus the next index (the
-                    // vector value's fields are its elements; the
-                    // sparse form a growth or a shrink leaves
-                    // behind contributes its declared elements).
-                    match value {
-                        Value::Enum { fields, .. } => Ok(owned_iter_state(fields)),
-                        v @ Value::SparseVec { .. } => {
-                            Ok(owned_iter_state(value_elements(&v)?))
-                        }
-                        ref other => Err(InterpError::type_mismatch(
-                            "IntoIterator::into_iter for a Vec",
-                            "vector value",
-                            other.kind_name(),
-                        )),
-                    }
-                } else if self_ty.starts_with("std::collections::BTreeSet<") {
-                    let elems = self.btree_set_elements(frames, &value)?;
-                    Ok(owned_iter_state(elems))
-                } else if self_ty.starts_with("std::collections::BTreeMap<") {
-                    let elems = self.btree_map_pair_elements(frames, &value)?;
-                    Ok(owned_iter_state(elems))
-                } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
-                    // `mpsc::Iter` is its own `IntoIterator`.
-                    Ok(value)
-                } else if self_ty.starts_with("std::sync::mpsc::TryIter<") {
-                    // `mpsc::TryIter` is its own `IntoIterator`.
-                    Ok(value)
-                } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
-                    // The channel iterator holds the receiver
-                    // handle as its one field (see `iterator_next`).
-                    Ok(Value::Enum {
-                        variant: 0,
-                        fields: vec![value],
-                    })
-                } else if self_ty.starts_with("std::option::Option<")
-                    || self_ty.starts_with("core::option::Option<")
-                {
-                    // An `Option<T>` by value iterates as
-                    // `option::IntoIter` over zero or one element,
-                    // in the same owning-iterator state shape.
-                    let elems = match &value {
-                        Value::Enum {
-                            variant: 1,
-                            fields,
-                        } => fields.clone(),
-                        Value::Enum { variant: 0, .. } => Vec::new(),
-                        other => {
-                            return Err(InterpError::type_mismatch(
-                                "IntoIterator::into_iter for an Option",
-                                "option value",
-                                other.kind_name(),
-                            ))
-                        }
-                    };
-                    Ok(owned_iter_state(elems))
-                } else if let Some(inner) = self_ty.strip_prefix("&mut ") {
-                    if inner.starts_with("std::vec::Vec<")
-                        || inner.starts_with("alloc::vec::Vec<")
-                        || inner.starts_with('[')
-                    {
-                        // `&mut Vec<T>`, `&mut [T; N]` and `&mut [T]`
-                        // iterate as `slice::IterMut`, in the
-                        // iterator's real field layout (see
-                        // `slice_iter_value`): the `NonNull` first
-                        // element pointer, the past-the-end element
-                        // pointer and the `PhantomData` marker, all
-                        // denoting places in the container's own
-                        // storage — the same state the real
-                        // `iter_mut` body builds, which the
-                        // `slice::IterMut` steps consume.
-                        let len = match &value {
-                            Value::FatRef { len, .. } => *len,
-                            _ => {
-                                let target = self.deref_value(frames, &value)?;
-                                let pointee = self.read_resolved(frames, &target)?;
-                                value_elements(&pointee)?.len() as u128
-                            }
-                        };
-                        // A zero-sized element type stores the
-                        // iterator's length in the end field
-                        // instead of a past-the-end pointer: core
-                        // builds that state with
-                        // `without_provenance_mut(len)` there, the
-                        // converted `len` body reads the address
-                        // back directly, and the `slice::IterMut`
-                        // steps decode the same form (see
-                        // `iter_zst_remaining`).
-                        let zero_sized = slice_container_element_tag(inner)
-                            .and_then(|tag| self.layout_of(tag))
-                            .is_some_and(|(size, _)| size == 0);
-                        let (first, end) = if zero_sized {
-                            // The front pointer still denotes the
-                            // first element when there is one. An
-                            // empty zero-sized container has no
-                            // element to denote and its steps never
-                            // read the pointer (the stored length
-                            // is zero), so the container reference
-                            // itself stands in.
-                            let first = if len == 0 {
-                                match &value {
-                                    Value::FatRef { base, .. } => (**base).clone(),
-                                    _ => value.clone(),
-                                }
-                            } else {
-                                self.iter_mut_element_ref(frames, &value, 0)?
-                            };
-                            (first, Value::Ref(RefTarget::Address(len as u64)))
-                        } else {
-                            (
-                                self.iter_mut_element_ref(frames, &value, 0)?,
-                                self.iter_mut_element_ref(frames, &value, len as usize)?,
-                            )
-                        };
-                        Ok(Value::Enum {
-                            variant: 0,
-                            fields: vec![
-                                // `ptr: NonNull<T>` — the one-field
-                                // wrapper around the raw element
-                                // pointer.
-                                Value::Enum {
-                                    variant: 0,
-                                    fields: vec![first],
-                                },
-                                end,
-                                // `_marker: PhantomData<&mut T>` —
-                                // a zero-sized ADT value.
-                                Value::Enum {
-                                    variant: 0,
-                                    fields: Vec::new(),
-                                },
-                            ],
-                        })
-                    } else if inner.starts_with("std::option::Option<")
-                        || inner.starts_with("core::option::Option<")
-                    {
-                        self.option_ref_into_iter(frames, &value, true)
-                    } else if ref_pointee_is_container(inner) {
-                        Err(unsupported(format!(
-                            "IntoIterator::into_iter for {self_ty} is not runtime-supported"
-                        )))
-                    } else {
-                        // The blanket `IntoIterator for &mut I`
-                        // (I: Iterator): the reference itself is
-                        // the iterator and is returned unchanged,
-                        // the identity the blanket body performs.
-                        // A container pointee, whose own `&mut`
-                        // impl yields a distinct IterMut type,
-                        // keeps the unsupported error above.
-                        Ok(value)
-                    }
-                } else if self_ty.starts_with("&std::option::Option<")
-                    || self_ty.starts_with("&core::option::Option<")
-                {
-                    self.option_ref_into_iter(frames, &value, false)
-                } else if let Some(inner) = self_ty.strip_prefix('&') {
-                    if ref_pointee_is_container(inner) {
-                        Err(unsupported(format!(
-                            "IntoIterator::into_iter for {self_ty} is not runtime-supported"
-                        )))
-                    } else {
-                        // The blanket `IntoIterator for &I`
-                        // (I: Iterator): the reference itself is
-                        // the iterator, returned unchanged.
-                        Ok(value)
-                    }
-                } else {
-                    Err(unsupported(format!(
-                        "IntoIterator::into_iter for {self_ty} is not runtime-supported"
-                    )))
-                }
+                self.into_iter_value(frames, self_ty, value)
             }
             Builtin::IteratorNext => {
                 arity(1)?;
@@ -8882,6 +8555,358 @@ impl<'a> Interpreter<'a> {
     ///   wrapper produces (`Tag` over its `u8`).
     ///
     /// Anything else stays unsupported at the call site.
+    /// The `IntoIterator::into_iter` value transformation: the
+    /// iterator state the value iterates as, in the shape the
+    /// modelled `Iterator::next` steps consume. Split out of
+    /// the `Builtin::IntoIter` arm so the modelled iterator
+    /// steps that pull an inner iterator out of an outer item
+    /// (the flatten composition) perform the same conversion
+    /// the guest's own `into_iter` call performs.
+    pub(super) fn into_iter_value(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        value: Value,
+    ) -> InterpResult<Value> {
+        // A trait-object iterator value (a `Box<dyn
+        // Iterator>` or `&dyn Iterator`) is already an
+        // iterator, so the blanket identity below covers
+        // it whatever its rendered Self type.
+        if matches!(value, Value::DynRef { .. })
+            || self_ty.starts_with("std::ops::Range<")
+            || self_ty.starts_with("std::ops::RangeInclusive<")
+            || self_ty.starts_with("std::iter::Rev<")
+            || self_ty.starts_with("std::slice::Iter<")
+            || self_ty.starts_with("std::collections::btree_set::Iter<")
+            || self_ty.starts_with("std::collections::btree_map::Iter<")
+            || self_ty.starts_with("std::collections::btree_map::Keys<")
+            || self_ty.starts_with("std::collections::btree_map::Values<")
+            || self_ty.starts_with("std::collections::btree_set::IntoIter<")
+            || self_ty.starts_with("std::collections::btree_map::IntoIter<")
+            || self_ty.starts_with("std::slice::IterMut<")
+            || self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::vec::IntoIter<")
+            || self_ty.starts_with("alloc::vec::IntoIter<")
+            || self_ty.starts_with("std::vec::Drain<")
+            || self_ty.starts_with("alloc::vec::Drain<")
+            || self_ty.starts_with("std::option::IntoIter<")
+            || self_ty.starts_with("std::option::Iter<")
+            || self_ty.starts_with("std::option::IterMut<")
+            || self_ty.starts_with("std::iter::Map<")
+            || self_ty.starts_with("std::iter::Enumerate<")
+            || self_ty.starts_with("std::iter::Copied<")
+            || self_ty.starts_with("std::iter::Cloned<")
+            || self_ty.starts_with("std::iter::Take<")
+            || self_ty.starts_with("std::iter::Skip<")
+            || self_ty.starts_with("std::iter::Chain<")
+            || self_ty.starts_with("std::iter::Zip<")
+            || self_ty.starts_with("std::iter::SkipWhile<")
+            || self_ty.starts_with("std::iter::Filter<")
+            || self_ty.starts_with("std::iter::FilterMap<")
+            || self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+            || self_ty.starts_with("std::io::Lines<")
+            || self_ty.starts_with("std::io::Bytes<")
+            || self_ty_is(self_ty, "std::str::Lines")
+            || self_ty_is(self_ty, "std::str::LinesInclusive")
+            || self_ty.starts_with("std::str::Split<")
+            || self_ty.starts_with("std::str::RSplit<")
+            || self_ty.starts_with("std::str::SplitTerminator<")
+            || self_ty.starts_with("std::str::RSplitTerminator<")
+            || self_ty.starts_with("std::str::SplitInclusive<")
+            || self_ty.starts_with("std::iter::Once<")
+            || self_ty.starts_with("std::path::Components")
+            || self_ty.starts_with("std::path::Ancestors")
+            || self_ty_is(self_ty, "std::fs::ReadDir")
+            || self_ty.starts_with("std::iter::Empty<")
+            || self_ty.starts_with("std::iter::Repeat<")
+            || self_ty_is(self_ty, "std::str::Chars")
+            || self_ty_is(self_ty, "core::str::Chars")
+            || self_ty_is(self_ty, "std::str::Bytes")
+            || self_ty_is(self_ty, "core::str::Bytes")
+            || self_ty_is(self_ty, "std::str::EscapeDebug")
+            || self_ty_is(self_ty, "core::str::EscapeDebug")
+            || self_ty_is(self_ty, "std::str::EscapeDefault")
+            || self_ty_is(self_ty, "core::str::EscapeDefault")
+            || self_ty_is(self_ty, "std::str::EscapeUnicode")
+            || self_ty_is(self_ty, "core::str::EscapeUnicode")
+                    || self_ty_is(self_ty, "std::char::EscapeDebug")
+            || self_ty_is(self_ty, "core::char::EscapeDebug")
+            || self_ty_is(self_ty, "std::char::EscapeDefault")
+            || self_ty_is(self_ty, "core::char::EscapeDefault")
+            || self_ty_is(self_ty, "std::char::EscapeUnicode")
+            || self_ty_is(self_ty, "core::char::EscapeUnicode")
+            || self_ty.starts_with("std::collections::linked_list::Iter<")
+            || self_ty.starts_with("std::collections::linked_list::IterMut<")
+            || self_ty.starts_with("std::collections::linked_list::IntoIter<")
+            || self_ty.starts_with("alloc::collections::linked_list::Iter<")
+            || self_ty.starts_with("alloc::collections::linked_list::IterMut<")
+            || self_ty.starts_with("alloc::collections::linked_list::IntoIter<")
+            || self_ty.starts_with("std::collections::vec_deque::Iter<")
+            || self_ty.starts_with("std::collections::vec_deque::IterMut<")
+            || self_ty.starts_with("std::collections::vec_deque::IntoIter<")
+            || self_ty.starts_with("alloc::collections::vec_deque::Iter<")
+            || self_ty.starts_with("alloc::collections::vec_deque::IterMut<")
+            || self_ty.starts_with("alloc::collections::vec_deque::IntoIter<")
+            || self_ty.starts_with("std::collections::binary_heap::Iter<")
+            || self_ty.starts_with("std::collections::binary_heap::IntoIter<")
+            || self_ty.starts_with("std::slice::Chunks<")
+            || self_ty.starts_with("std::slice::ChunksExact<")
+            || self_ty.starts_with("std::slice::RChunks<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+        {
+            // These types are their own iterator: the
+            // blanket `IntoIterator for I: Iterator` impl
+            // is the identity, and the value is already in
+            // the shape `Iterator::next` consumes for the
+            // type — a range is its own state, a slice /
+            // char / byte iterator was built by the
+            // corresponding runtime support, an adapter or
+            // source iterator by its constructor's
+            // converted body, and the owning iterators by
+            // the arms below.
+            Ok(value)
+        } else if self_ty.starts_with('[') {
+            // Array by value: iteration state is the element
+            // tuple plus the next index (our layout for
+            // `std::array::IntoIter`, whose `next` below is
+            // the only consumer).
+            match value {
+                Value::Tuple(items) => Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(items), Value::Uint(0)],
+                }),
+                ref other => Err(InterpError::type_mismatch(
+                    "IntoIterator::into_iter for an array",
+                    "array value",
+                    other.kind_name(),
+                )),
+            }
+        } else if self_ty.starts_with("&std::vec::Vec<")
+            || self_ty.starts_with("&alloc::vec::Vec<")
+            || self_ty.starts_with("&[")
+        {
+            // `&Vec<T>` and `&[T]` iterate as `slice::Iter`,
+            // in the real field layout `slice_iter_value`
+            // builds and `Iterator::next` consumes. A
+            // scalar-backed slice (the `slice::from_ref`
+            // shape) reads its elements from the scalar's
+            // own storage.
+            let (elems, _) = match self.slice_elements(frames, &value) {
+                Ok(elems) => elems,
+                Err(err) => {
+                    let elem_tag = slice_container_element_tag(self_ty)
+                        .or_else(|| {
+                            slice_container_element_tag(
+                                self_ty.strip_prefix('&').unwrap_or(self_ty),
+                            )
+                        })
+                        .unwrap_or("");
+                    match self.scalar_backed_slice_elements(
+                        frames,
+                        &value,
+                        elem_tag,
+                    ) {
+                        Some(elems) => {
+                            let len = elems.len() as u128;
+                            (elems, len)
+                        }
+                        None => return Err(err),
+                    }
+                }
+            };
+            Ok(slice_iter_value(elems))
+        } else if self_ty.starts_with("&std::collections::BTreeSet<") {
+            let elems = self.btree_set_elements_of_ref(frames, &value)?;
+            Ok(slice_iter_value(elems))
+        } else if self_ty.starts_with("&std::collections::BTreeMap<") {
+            let elems = self.btree_map_pair_elements_of_ref(frames, &value)?;
+            Ok(slice_iter_value(elems))
+        } else if self_ty_is(self_ty, "std::env::Args")
+            || self_ty_is(self_ty, "std::env::ArgsOs")
+            || self_ty_is(self_ty, "std::env::SplitPaths")
+            || self_ty.starts_with("std::slice::Windows<")
+        {
+            // The env argument iterators are their own
+            // `IntoIterator` (the state `env::args` built).
+            Ok(value)
+        } else if self_ty.starts_with("std::vec::Vec<")
+            || self_ty.starts_with("alloc::vec::Vec<")
+        {
+            // A by-value `Vec` iterates as `vec::IntoIter`:
+            // the element snapshot plus the next index (the
+            // vector value's fields are its elements; the
+            // sparse form a growth or a shrink leaves
+            // behind contributes its declared elements).
+            match value {
+                Value::Enum { fields, .. } => Ok(owned_iter_state(fields)),
+                v @ Value::SparseVec { .. } => {
+                    Ok(owned_iter_state(value_elements(&v)?))
+                }
+                ref other => Err(InterpError::type_mismatch(
+                    "IntoIterator::into_iter for a Vec",
+                    "vector value",
+                    other.kind_name(),
+                )),
+            }
+        } else if self_ty.starts_with("std::collections::BTreeSet<") {
+            let elems = self.btree_set_elements(frames, &value)?;
+            Ok(owned_iter_state(elems))
+        } else if self_ty.starts_with("std::collections::BTreeMap<") {
+            let elems = self.btree_map_pair_elements(frames, &value)?;
+            Ok(owned_iter_state(elems))
+        } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
+            // `mpsc::Iter` is its own `IntoIterator`.
+            Ok(value)
+        } else if self_ty.starts_with("std::sync::mpsc::TryIter<") {
+            // `mpsc::TryIter` is its own `IntoIterator`.
+            Ok(value)
+        } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
+            // The channel iterator holds the receiver
+            // handle as its one field (see `iterator_next`).
+            Ok(Value::Enum {
+                variant: 0,
+                fields: vec![value],
+            })
+        } else if self_ty.starts_with("std::option::Option<")
+            || self_ty.starts_with("core::option::Option<")
+        {
+            // An `Option<T>` by value iterates as
+            // `option::IntoIter` over zero or one element,
+            // in the same owning-iterator state shape.
+            let elems = match &value {
+                Value::Enum {
+                    variant: 1,
+                    fields,
+                } => fields.clone(),
+                Value::Enum { variant: 0, .. } => Vec::new(),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "IntoIterator::into_iter for an Option",
+                        "option value",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            Ok(owned_iter_state(elems))
+        } else if let Some(inner) = self_ty.strip_prefix("&mut ") {
+            if inner.starts_with("std::vec::Vec<")
+                || inner.starts_with("alloc::vec::Vec<")
+                || inner.starts_with('[')
+            {
+                // `&mut Vec<T>`, `&mut [T; N]` and `&mut [T]`
+                // iterate as `slice::IterMut`, in the
+                // iterator's real field layout (see
+                // `slice_iter_value`): the `NonNull` first
+                // element pointer, the past-the-end element
+                // pointer and the `PhantomData` marker, all
+                // denoting places in the container's own
+                // storage — the same state the real
+                // `iter_mut` body builds, which the
+                // `slice::IterMut` steps consume.
+                let len = match &value {
+                    Value::FatRef { len, .. } => *len,
+                    _ => {
+                        let target = self.deref_value(frames, &value)?;
+                        let pointee = self.read_resolved(frames, &target)?;
+                        value_elements(&pointee)?.len() as u128
+                    }
+                };
+                // A zero-sized element type stores the
+                // iterator's length in the end field
+                // instead of a past-the-end pointer: core
+                // builds that state with
+                // `without_provenance_mut(len)` there, the
+                // converted `len` body reads the address
+                // back directly, and the `slice::IterMut`
+                // steps decode the same form (see
+                // `iter_zst_remaining`).
+                let zero_sized = slice_container_element_tag(inner)
+                    .and_then(|tag| self.layout_of(tag))
+                    .is_some_and(|(size, _)| size == 0);
+                let (first, end) = if zero_sized {
+                    // The front pointer still denotes the
+                    // first element when there is one. An
+                    // empty zero-sized container has no
+                    // element to denote and its steps never
+                    // read the pointer (the stored length
+                    // is zero), so the container reference
+                    // itself stands in.
+                    let first = if len == 0 {
+                        match &value {
+                            Value::FatRef { base, .. } => (**base).clone(),
+                            _ => value.clone(),
+                        }
+                    } else {
+                        self.iter_mut_element_ref(frames, &value, 0)?
+                    };
+                    (first, Value::Ref(RefTarget::Address(len as u64)))
+                } else {
+                    (
+                        self.iter_mut_element_ref(frames, &value, 0)?,
+                        self.iter_mut_element_ref(frames, &value, len as usize)?,
+                    )
+                };
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        // `ptr: NonNull<T>` — the one-field
+                        // wrapper around the raw element
+                        // pointer.
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![first],
+                        },
+                        end,
+                        // `_marker: PhantomData<&mut T>` —
+                        // a zero-sized ADT value.
+                        Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        },
+                    ],
+                })
+            } else if inner.starts_with("std::option::Option<")
+                || inner.starts_with("core::option::Option<")
+            {
+                self.option_ref_into_iter(frames, &value, true)
+            } else if ref_pointee_is_container(inner) {
+                Err(unsupported(format!(
+                    "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                )))
+            } else {
+                // The blanket `IntoIterator for &mut I`
+                // (I: Iterator): the reference itself is
+                // the iterator and is returned unchanged,
+                // the identity the blanket body performs.
+                // A container pointee, whose own `&mut`
+                // impl yields a distinct IterMut type,
+                // keeps the unsupported error above.
+                Ok(value)
+            }
+        } else if self_ty.starts_with("&std::option::Option<")
+            || self_ty.starts_with("&core::option::Option<")
+        {
+            self.option_ref_into_iter(frames, &value, false)
+        } else if let Some(inner) = self_ty.strip_prefix('&') {
+            if ref_pointee_is_container(inner) {
+                Err(unsupported(format!(
+                    "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                )))
+            } else {
+                // The blanket `IntoIterator for &I`
+                // (I: Iterator): the reference itself is
+                // the iterator, returned unchanged.
+                Ok(value)
+            }
+        } else {
+            Err(unsupported(format!(
+                "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+            )))
+        }
+    }
+
     fn wrapped_byte_fill(&self, tag: &str, byte: u8, depth: u32) -> Option<Value> {
         if depth > 4 {
             return None;

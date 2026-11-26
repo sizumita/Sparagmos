@@ -2041,3 +2041,106 @@ fn run_mode_hash_set_collect_into_vec() {
         "[1, 2, 3]\ncount 2\n"
     );
 }
+
+const FLAT_MAP_SRC: &str = r#"
+fn twice(x: i32) -> Vec<i32> {
+    vec![x, x]
+}
+fn main() {
+    let v: Vec<i32> = (0..3).flat_map(|i| vec![i, i * 10]).collect();
+    println!("{v:?}");
+    let factor = 3;
+    let c: Vec<i32> = (1..4).flat_map(|i| vec![i * factor]).collect();
+    println!("{c:?}");
+    let f: Vec<i32> = (0..3).flat_map(twice as fn(i32) -> Vec<i32>).collect();
+    println!("{f:?}");
+    let o: Vec<i32> = (0..4)
+        .flat_map(|i| if i % 2 == 0 { Some(i) } else { None })
+        .collect();
+    println!("{o:?}");
+    let a: Vec<i32> = (0..3).flat_map(|i| [i, -i]).collect();
+    println!("{a:?}");
+    let n: Vec<i32> = (0..3)
+        .flat_map(|i| (0..i).flat_map(move |j| vec![j]))
+        .collect();
+    println!("{n:?}");
+    let e: Vec<i32> = (0..3).flat_map(|_| Vec::<i32>::new()).collect();
+    println!("{e:?}");
+    let cnt = (0..3).flat_map(|i| vec![i, 1]).count();
+    println!("cnt={cnt}");
+}
+"#;
+
+#[test]
+fn run_mode_flat_map_iteration() {
+    // The composition's step is core's FlattenCompat machine:
+    // the in-flight inner iterator is drained, then the outer
+    // iterator is pulled and its item converted with the same
+    // into_iter transformation the guest's own call performs.
+    // The shapes pin the conversions (Vec, capturing closure,
+    // fn pointer, Option, array, a nested FlatMap) and the
+    // empty-inner accounting.
+    let dir = temp_dir("flat-map-iteration");
+    let src = fixture(&dir, "flat_map_iteration.rs", FLAT_MAP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "FlatMap over Range with Vec/Option/array/nested inners must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[0, 0, 1, 10, 2, 20]\n[3, 6, 9]\n[0, 0, 1, 1, 2, 2]\n[0, 2]\n[0, 0, 1, -1, 2, -2]\n[0, 0, 1]\n[]\ncnt=6\n",
+        "each inner iterator is drained in order before the outer advances"
+    );
+}
+
+const FLATTEN_SRC: &str = r#"
+fn main() {
+    let w: Vec<i32> = vec![vec![1, 2], vec![3], vec![]]
+        .into_iter()
+        .flatten()
+        .collect();
+    println!("{w:?}");
+    let vv = vec![vec![1, 2], vec![3]];
+    let flat: Vec<&i32> = vv.iter().flatten().collect();
+    println!("{flat:?}");
+    let fr: Vec<i32> = vec![0..2, 5..7].into_iter().flatten().collect();
+    println!("{fr:?}");
+    let mut it = (0..3).flat_map(|i| vec![i, i * 10]);
+    let mut out = Vec::new();
+    while let Some(x) = it.next() {
+        out.push(x);
+        if let Some(y) = it.next_back() {
+            out.push(y);
+        }
+    }
+    println!("{out:?}");
+    let r: Vec<i32> = (0..3).flat_map(|i| vec![i, i * 10]).rev().collect();
+    println!("{r:?}");
+}
+"#;
+
+#[test]
+fn run_mode_flatten_and_flat_map_next_back() {
+    // Flatten over owned, borrowed and range inners, and the
+    // back step of the composition: the interleaved pulls pin
+    // that front and back meet in the middle (the back inner
+    // iterator is drained from the back, and an outer pull for
+    // the back side takes the outer iterator's own back step).
+    let dir = temp_dir("flatten-next-back");
+    let src = fixture(&dir, "flatten_next_back.rs", FLATTEN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Flatten over Vec/&Vec/Range inners and FlatMap next_back must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2, 3]\n[1, 2, 3]\n[0, 1, 5, 6]\n[0, 20, 0, 2, 1, 10]\n[20, 2, 10, 1, 0, 0]\n",
+        "front and back steps drain the composition symmetrically"
+    );
+}

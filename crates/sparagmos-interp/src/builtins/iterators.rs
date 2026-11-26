@@ -157,6 +157,14 @@ impl<'a> Interpreter<'a> {
                 return Ok(result);
             }
         }
+        if self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            if let Some(result) = self.flatten_next_at(frames, self_ty, target, false)? {
+                return Ok(result);
+            }
+        }
         let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
@@ -412,6 +420,14 @@ impl<'a> Interpreter<'a> {
         }
         if self_ty.starts_with("std::iter::FilterMap<") {
             if let Some(result) = self.filter_map_next_back(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
+        if self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            if let Some(result) = self.flatten_next_at(frames, self_ty, target, true)? {
                 return Ok(result);
             }
         }
@@ -750,6 +766,14 @@ impl<'a> Interpreter<'a> {
             let (new_map, result) =
                 self.next_back_on_state(frames, map_ty, fields[0].clone())?;
             return Ok((rebuild_state(&state, vec![new_map]), result));
+        }
+        if self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            if let Some(step) = self.flatten_step_state(frames, self_ty, &state, true)? {
+                return Ok(step);
+            }
         }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
@@ -2057,6 +2081,317 @@ impl<'a> Interpreter<'a> {
         Ok(Some(some_value(mapped)))
     }
 
+    /// One front (`from_back == false`) or back step of a
+    /// flatten composition on the iterator stored at `target`:
+    /// `FlatMap` and `Flatten` are one-field wrappers over the
+    /// `FlattenCompat` state core's step machine runs on, so
+    /// the step is `flatten_compat_next_at` over that field (or
+    /// over the target itself for a bare `FlattenCompat`).
+    /// Declines (returns `Ok(None)`) when the composition's
+    /// type triple cannot be derived from the rendered tag (see
+    /// `flatten_step_types`), leaving the caller's state-level
+    /// step — and its unsupported verdict — in place.
+    fn flatten_next_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+        from_back: bool,
+    ) -> InterpResult<Option<Value>> {
+        let Some((outer_ty, item_ty, inner_ty)) = flatten_step_types(self_ty) else {
+            return Ok(None);
+        };
+        if self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<") {
+            return self.flatten_compat_next_at(
+                frames,
+                &outer_ty,
+                &item_ty,
+                &inner_ty,
+                target,
+                from_back,
+            );
+        }
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        self.flatten_compat_next_at(
+            frames,
+            &outer_ty,
+            &item_ty,
+            &inner_ty,
+            &inner_target,
+            from_back,
+        )
+    }
+
+    /// The `FlattenCompat` step machine in place, replaying
+    /// core's `next` / `next_back` on the three fields at
+    /// `target`: (outer iterator in its `Fuse`, front inner
+    /// iterator, back inner iterator). The leading inner
+    /// iterator is drained first; when it runs out it is
+    /// cleared and the outer iterator is pulled for the next
+    /// inner iterator — the pulled item is converted with the
+    /// same `IntoIterator::into_iter` transformation the
+    /// guest's own call performs — and when the outer iterator
+    /// is exhausted (its `Fuse` blown) the trailing inner
+    /// iterator serves the rest. Every sub-step is taken in
+    /// place, so an iterator whose state lives in the
+    /// composition's own storage (a `Map`'s closure environment
+    /// above all) steps exactly as it does at its own address.
+    fn flatten_compat_next_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        outer_ty: &str,
+        item_ty: &str,
+        inner_ty: &str,
+        target: &Resolved,
+        from_back: bool,
+    ) -> InterpResult<Option<Value>> {
+        let Some(fuse_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(fuse_iter_target) = extend_target(&fuse_target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let (lead_idx, trail_idx) = if from_back { (2, 1) } else { (1, 2) };
+        let Some(lead_target) = extend_target(target, RefProj::Field(lead_idx)) else {
+            return Ok(None);
+        };
+        let Some(trail_target) = extend_target(target, RefProj::Field(trail_idx)) else {
+            return Ok(None);
+        };
+        loop {
+            match self.option_iter_step_at(frames, inner_ty, &lead_target, from_back)? {
+                Some(SlotStep::Yielded(item)) => {
+                    return Ok(Some(some_value(item)));
+                }
+                Some(SlotStep::Exhausted) | Some(SlotStep::Empty) => {}
+                None => return Ok(None),
+            }
+            match self.option_iter_step_at(frames, outer_ty, &fuse_iter_target, from_back)? {
+                Some(SlotStep::Yielded(iterable)) => {
+                    let inner_state = self.into_iter_value(frames, item_ty, iterable)?;
+                    self.write_resolved(frames, &lead_target, some_value(inner_state))?;
+                }
+                Some(SlotStep::Exhausted) | Some(SlotStep::Empty) => {
+                    // The outer iterator is spent: the trailing
+                    // inner iterator serves whatever remains,
+                    // and its step's result is the step's result.
+                    match self.option_iter_step_at(
+                        frames,
+                        inner_ty,
+                        &trail_target,
+                        from_back,
+                    )? {
+                        Some(SlotStep::Yielded(item)) => {
+                            return Ok(Some(some_value(item)));
+                        }
+                        Some(SlotStep::Exhausted) | Some(SlotStep::Empty) => {
+                            return Ok(Some(none_value()));
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// One step of an `Option<I>` iterator slot in place (a
+    /// `FlattenCompat` inner-iterator field, or the payload
+    /// slot of its `Fuse` field, which has the same shape):
+    /// core's `and_then_or_clear` — a step that yields keeps
+    /// the new state in the slot, a step that returns `None`
+    /// clears the slot to `None`. Declines when the slot does
+    /// not live in a place or does not hold an `Option` value.
+    fn option_iter_step_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        iter_ty: &str,
+        slot_target: &Resolved,
+        from_back: bool,
+    ) -> InterpResult<Option<SlotStep>> {
+        let slot = self.read_resolved(frames, slot_target)?;
+        match &slot {
+            Value::Enum { variant: 0, .. } => return Ok(Some(SlotStep::Empty)),
+            Value::Enum {
+                variant: 1,
+                fields,
+            } if fields.len() == 1 => {}
+            _ => return Ok(None),
+        }
+        let Some(payload_target) = extend_target(slot_target, RefProj::Downcast(1))
+            .and_then(|t| extend_target(&t, RefProj::Field(0)))
+        else {
+            return Ok(None);
+        };
+        let item = if from_back {
+            self.iterator_next_back_at(frames, iter_ty, &payload_target)?
+        } else {
+            self.iterator_next_at(frames, iter_ty, &payload_target)?
+        };
+        match option_payload_opt(item) {
+            Some(item) => Ok(Some(SlotStep::Yielded(item))),
+            None => {
+                self.write_resolved(frames, slot_target, none_value())?;
+                Ok(Some(SlotStep::Exhausted))
+            }
+        }
+    }
+
+    /// One front or back step of a flatten composition over a
+    /// state value (the value-level counterpart of
+    /// `flatten_next_at`, for a composition that does not live
+    /// in a place): the same `FlattenCompat` machine, with the
+    /// sub-steps taken functionally through `next_on_state` /
+    /// `next_back_on_state`. Declines under the same condition
+    /// as `flatten_next_at`.
+    fn flatten_step_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: &Value,
+        from_back: bool,
+    ) -> InterpResult<Option<(Value, Value)>> {
+        let Some((outer_ty, item_ty, inner_ty)) = flatten_step_types(self_ty) else {
+            return Ok(None);
+        };
+        if self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<") {
+            let step = self.flatten_compat_step_state(
+                frames,
+                &outer_ty,
+                &item_ty,
+                &inner_ty,
+                state,
+                from_back,
+            )?;
+            return Ok(Some(step));
+        }
+        let fields = iterator_fields(state, self_ty)?;
+        if fields.len() != 1 {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} state"),
+                "a one-field wrapper around a FlattenCompat",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let (new_inner, item) = self.flatten_compat_step_state(
+            frames,
+            &outer_ty,
+            &item_ty,
+            &inner_ty,
+            &fields[0],
+            from_back,
+        )?;
+        Ok(Some((rebuild_state(state, vec![new_inner]), item)))
+    }
+
+    /// The value-level `FlattenCompat` step machine: the
+    /// functional form of `flatten_compat_next_at`, over the
+    /// state value's three fields.
+    fn flatten_compat_step_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        outer_ty: &str,
+        item_ty: &str,
+        inner_ty: &str,
+        state: &Value,
+        from_back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = iterator_fields(state, "FlattenCompat state")?;
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "FlattenCompat state",
+                "[fuse, front inner iterator, back inner iterator]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let fuse_wrapper = fields[0].clone();
+        let fuse_fields = iterator_fields(&fuse_wrapper, "Fuse state")?;
+        if fuse_fields.len() != 1 {
+            return Err(InterpError::type_mismatch(
+                "Fuse state",
+                "a one-field wrapper around an Option",
+                format!("{} field(s)", fuse_fields.len()),
+            ));
+        }
+        let mut fuse = fuse_fields.into_iter().next().expect("one field checked");
+        let (mut lead, mut trail) = if from_back {
+            (fields[2].clone(), fields[1].clone())
+        } else {
+            (fields[1].clone(), fields[2].clone())
+        };
+        // The state with the step's field values, in field
+        // order, under `state`'s own wrapper shapes.
+        let rebuild = |fuse: &Value, lead: &Value, trail: &Value| {
+            let fuse_now = iterator_state_like(&fuse_wrapper, vec![fuse.clone()]);
+            let (front, back) = if from_back {
+                (trail.clone(), lead.clone())
+            } else {
+                (lead.clone(), trail.clone())
+            };
+            rebuild_state(state, vec![fuse_now, front, back])
+        };
+        loop {
+            if let Some(inner_state) = option_payload_opt(lead.clone()) {
+                let (new_inner, item) = if from_back {
+                    self.next_back_on_state(frames, inner_ty, inner_state)?
+                } else {
+                    self.next_on_state(frames, inner_ty, &inner_state)?
+                };
+                match option_payload_opt(item) {
+                    Some(item) => {
+                        lead = some_value(new_inner);
+                        return Ok((rebuild(&fuse, &lead, &trail), some_value(item)));
+                    }
+                    None => {
+                        lead = none_value();
+                        continue;
+                    }
+                }
+            }
+            match option_payload_opt(fuse.clone()) {
+                None => {
+                    // The outer iterator is spent: the trailing
+                    // inner iterator serves whatever remains.
+                    if let Some(trail_state) = option_payload_opt(trail.clone()) {
+                        let (new_trail, item) = if from_back {
+                            self.next_back_on_state(frames, inner_ty, trail_state)?
+                        } else {
+                            self.next_on_state(frames, inner_ty, &trail_state)?
+                        };
+                        if let Some(item) = option_payload_opt(item) {
+                            trail = some_value(new_trail);
+                            return Ok((rebuild(&fuse, &lead, &trail), some_value(item)));
+                        }
+                        trail = none_value();
+                    }
+                    return Ok((rebuild(&fuse, &lead, &trail), none_value()));
+                }
+                Some(outer_state) => {
+                    let (new_outer, item) = if from_back {
+                        self.next_back_on_state(frames, outer_ty, outer_state)?
+                    } else {
+                        self.next_on_state(frames, outer_ty, &outer_state)?
+                    };
+                    match option_payload_opt(item) {
+                        Some(iterable) => {
+                            fuse = some_value(new_outer);
+                            let inner_state =
+                                self.into_iter_value(frames, item_ty, iterable)?;
+                            lead = some_value(inner_state);
+                            continue;
+                        }
+                        None => {
+                            fuse = none_value();
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn target_ref_value(&self, frames: &[Frame], target: &Resolved) -> InterpResult<Value> {
         match target {
             Resolved::Place {
@@ -2402,6 +2737,14 @@ impl<'a> Interpreter<'a> {
             // itself and never falls through to here for
             // them.
             return self.iterator_next_state(frames, self_ty, state.clone());
+        }
+        if self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            if let Some(step) = self.flatten_step_state(frames, self_ty, state, false)? {
+                return Ok(step);
+            }
         }
         let fields = iterator_fields(state, self_ty)?;
         // A `vec::IntoIter` in its real field layout (the
@@ -4687,6 +5030,362 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Bytes")
 }
 
+/// The outcome of one in-place step of an `Option<I>`
+/// iterator slot (see `Interpreter::option_iter_step_at`).
+enum SlotStep {
+    /// The slot held an iterator and the step yielded an item.
+    Yielded(Value),
+    /// The slot held an iterator, the step exhausted it, and
+    /// the slot now stores `None`.
+    Exhausted,
+    /// The slot already stored `None`.
+    Empty,
+}
+
+/// The type triple a flatten composition's step machine runs
+/// on, derived from the composition's rendered tag: the outer
+/// iterator's type, the outer item's type (the into-iterable
+/// the step converts as the outer yields it), and the inner
+/// iterator's type (the item's own `IntoIterator::IntoIter`).
+/// `None` when any leg is not derivable from the tag — the
+/// step then declines and the composition keeps the verdict
+/// it had. The derivations are type-level only:
+///
+/// - `FlatMap<I, U, F>` wraps `FlattenCompat<Map<I, F>,
+///   U::IntoIter>`: the outer and item legs are the tag's own
+///   arguments, and the inner leg is `U`'s into-iterator tag.
+/// - `Flatten<I>` wraps `FlattenCompat<I, I::Item::IntoIter>`:
+///   the item leg is `I`'s item type (see `iterator_item_ty`).
+/// - `FlattenCompat<I, U::IntoIter>` carries the outer and
+///   inner legs as its arguments; the item leg is `I`'s item
+///   type.
+fn flatten_step_types(self_ty: &str) -> Option<(String, String, String)> {
+    if self_ty.starts_with("std::iter::FlatMap<") {
+        let args = generic_args_of(self_ty);
+        if args.len() < 3 {
+            return None;
+        }
+        let inner = into_iter_tag(&args[1])?;
+        return Some((
+            format!("std::iter::Map<{}, {}>", args[0], args[2]),
+            args[1].clone(),
+            inner,
+        ));
+    }
+    if self_ty.starts_with("std::iter::Flatten<") {
+        let outer = first_generic_arg(self_ty)?.to_string();
+        let item = iterator_item_ty(&outer)?;
+        let inner = into_iter_tag(&item)?;
+        return Some((outer, item, inner));
+    }
+    if self_ty.starts_with("std::iter::adapters::flatten::FlattenCompat<") {
+        let args = generic_args_of(self_ty);
+        if args.len() < 2 {
+            return None;
+        }
+        let item = iterator_item_ty(&args[0])?;
+        return Some((args[0].clone(), item, args[1].clone()));
+    }
+    None
+}
+
+/// The `IntoIterator::IntoIter` type tag for a type tag, where
+/// the mapping is a type-level identity or renaming — the tag
+/// counterpart of the value transformation `into_iter_value`
+/// performs (see dispatch.rs), covering the same arms: a type
+/// that is its own iterator iterates under its own tag, the
+/// by-value containers rename to their module's `IntoIter`,
+/// and the reference forms name the reference iterator the
+/// conversion builds. `None` for a type whose conversion the
+/// value transformation does not serve.
+fn into_iter_tag(ty: &str) -> Option<String> {
+    if let Some(inner) = ty.strip_prefix("&mut ") {
+        if inner.starts_with("std::option::Option<")
+            || inner.starts_with("core::option::Option<")
+        {
+            let elem = first_generic_arg(inner)?;
+            return Some(format!("std::option::IterMut<{elem}>"));
+        }
+        if ref_pointee_is_container(inner) {
+            if inner.starts_with("std::vec::Vec<")
+                || inner.starts_with("alloc::vec::Vec<")
+                || inner.starts_with('[')
+            {
+                let elem = if inner.starts_with('[') {
+                    slice_container_element_tag(inner)?
+                } else {
+                    first_generic_arg(inner)?
+                };
+                return Some(format!("std::slice::IterMut<{elem}>"));
+            }
+            return None;
+        }
+        // The blanket `IntoIterator for &mut I`: the reference
+        // itself is the iterator.
+        return Some(ty.to_string());
+    }
+    if let Some(inner) = ty.strip_prefix('&') {
+        if inner.starts_with("std::option::Option<")
+            || inner.starts_with("core::option::Option<")
+        {
+            let elem = first_generic_arg(inner)?;
+            return Some(format!("std::option::Iter<{elem}>"));
+        }
+        if inner.starts_with("std::vec::Vec<")
+            || inner.starts_with("alloc::vec::Vec<")
+            || inner.starts_with('[')
+        {
+            let elem = if inner.starts_with('[') {
+                slice_container_element_tag(inner)?
+            } else {
+                first_generic_arg(inner)?
+            };
+            return Some(format!("std::slice::Iter<{elem}>"));
+        }
+        if inner.starts_with("std::collections::BTreeSet<") {
+            let elem = first_generic_arg(inner)?;
+            return Some(format!("std::slice::Iter<{elem}>"));
+        }
+        if inner.starts_with("std::collections::BTreeMap<") {
+            let args = generic_args_of(inner);
+            if args.len() < 2 {
+                return None;
+            }
+            return Some(format!("std::slice::Iter<({}, {})>", args[0], args[1]));
+        }
+        if ref_pointee_is_container(inner) {
+            return None;
+        }
+        // The blanket `IntoIterator for &I`.
+        return Some(ty.to_string());
+    }
+    if into_iter_identity(ty) {
+        return Some(ty.to_string());
+    }
+    if ty.starts_with("std::vec::Vec<") || ty.starts_with("alloc::vec::Vec<") {
+        return Some(ty.replacen("Vec<", "IntoIter<", 1));
+    }
+    if ty.starts_with("std::collections::BTreeSet<") {
+        return Some(ty.replacen("BTreeSet<", "IntoIter<", 1));
+    }
+    if ty.starts_with("std::collections::BTreeMap<") {
+        return Some(ty.replacen("BTreeMap<", "IntoIter<", 1));
+    }
+    if ty.starts_with("std::option::Option<") || ty.starts_with("core::option::Option<") {
+        let elem = first_generic_arg(ty)?;
+        return Some(format!("std::option::IntoIter<{elem}>"));
+    }
+    if ty.starts_with("std::sync::mpsc::Receiver<") {
+        let elem = first_generic_arg(ty)?;
+        return Some(format!("std::sync::mpsc::IntoIter<{elem}>"));
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        let (elem, len) = inner.rsplit_once(';')?;
+        return Some(format!(
+            "std::array::IntoIter<{}, {}>",
+            elem.trim(),
+            len.trim()
+        ));
+    }
+    None
+}
+
+/// Whether `IntoIterator::into_iter` is the identity for this
+/// type tag: the type is its own iterator (the blanket
+/// `IntoIterator for I: Iterator` impl), so the value already
+/// is the iterator state. The type-level mirror of the
+/// identity condition in `into_iter_value` (dispatch.rs).
+fn into_iter_identity(ty: &str) -> bool {
+    ty.starts_with("std::ops::Range<")
+        || ty.starts_with("std::ops::RangeInclusive<")
+        || ty.starts_with("std::iter::Rev<")
+        || ty.starts_with("std::slice::Iter<")
+        || ty.starts_with("std::collections::btree_set::Iter<")
+        || ty.starts_with("std::collections::btree_map::Iter<")
+        || ty.starts_with("std::collections::btree_map::Keys<")
+        || ty.starts_with("std::collections::btree_map::Values<")
+        || ty.starts_with("std::collections::btree_set::IntoIter<")
+        || ty.starts_with("std::collections::btree_map::IntoIter<")
+        || ty.starts_with("std::slice::IterMut<")
+        || ty.starts_with("std::array::IntoIter<")
+        || ty.starts_with("std::vec::IntoIter<")
+        || ty.starts_with("alloc::vec::IntoIter<")
+        || ty.starts_with("std::vec::Drain<")
+        || ty.starts_with("alloc::vec::Drain<")
+        || ty.starts_with("std::option::IntoIter<")
+        || ty.starts_with("std::option::Iter<")
+        || ty.starts_with("std::option::IterMut<")
+        || ty.starts_with("std::iter::Map<")
+        || ty.starts_with("std::iter::Enumerate<")
+        || ty.starts_with("std::iter::Copied<")
+        || ty.starts_with("std::iter::Cloned<")
+        || ty.starts_with("std::iter::Take<")
+        || ty.starts_with("std::iter::Skip<")
+        || ty.starts_with("std::iter::Chain<")
+        || ty.starts_with("std::iter::Zip<")
+        || ty.starts_with("std::iter::SkipWhile<")
+        || ty.starts_with("std::iter::Filter<")
+        || ty.starts_with("std::iter::FilterMap<")
+        || ty.starts_with("std::iter::FlatMap<")
+        || ty.starts_with("std::iter::Flatten<")
+        || ty.starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        || ty.starts_with("std::io::Lines<")
+        || ty.starts_with("std::io::Bytes<")
+        || self_ty_is(ty, "std::str::Lines")
+        || self_ty_is(ty, "std::str::LinesInclusive")
+        || ty.starts_with("std::str::Split<")
+        || ty.starts_with("std::str::RSplit<")
+        || ty.starts_with("std::str::SplitTerminator<")
+        || ty.starts_with("std::str::RSplitTerminator<")
+        || ty.starts_with("std::str::SplitInclusive<")
+        || ty.starts_with("std::iter::Once<")
+        || ty.starts_with("std::path::Components")
+        || ty.starts_with("std::path::Ancestors")
+        || self_ty_is(ty, "std::fs::ReadDir")
+        || ty.starts_with("std::iter::Empty<")
+        || ty.starts_with("std::iter::Repeat<")
+        || self_ty_is(ty, "std::str::Chars")
+        || self_ty_is(ty, "core::str::Chars")
+        || self_ty_is(ty, "std::str::Bytes")
+        || self_ty_is(ty, "core::str::Bytes")
+        || self_ty_is(ty, "std::char::EscapeDebug")
+        || self_ty_is(ty, "core::char::EscapeDebug")
+        || self_ty_is(ty, "std::char::EscapeDefault")
+        || self_ty_is(ty, "core::char::EscapeDefault")
+        || self_ty_is(ty, "std::char::EscapeUnicode")
+        || self_ty_is(ty, "core::char::EscapeUnicode")
+        || ty.starts_with("std::collections::linked_list::Iter<")
+        || ty.starts_with("std::collections::linked_list::IterMut<")
+        || ty.starts_with("std::collections::linked_list::IntoIter<")
+        || ty.starts_with("alloc::collections::linked_list::Iter<")
+        || ty.starts_with("alloc::collections::linked_list::IterMut<")
+        || ty.starts_with("alloc::collections::linked_list::IntoIter<")
+        || ty.starts_with("std::collections::vec_deque::Iter<")
+        || ty.starts_with("std::collections::vec_deque::IterMut<")
+        || ty.starts_with("std::collections::vec_deque::IntoIter<")
+        || ty.starts_with("alloc::collections::vec_deque::Iter<")
+        || ty.starts_with("alloc::collections::vec_deque::IterMut<")
+        || ty.starts_with("alloc::collections::vec_deque::IntoIter<")
+        || ty.starts_with("std::collections::binary_heap::Iter<")
+        || ty.starts_with("std::collections::binary_heap::IntoIter<")
+        || ty.starts_with("std::slice::Chunks<")
+        || ty.starts_with("std::slice::ChunksExact<")
+        || ty.starts_with("std::slice::RChunks<")
+        || ty.starts_with("std::slice::RChunksExact<")
+        || self_ty_is(ty, "std::env::Args")
+        || self_ty_is(ty, "std::env::ArgsOs")
+        || self_ty_is(ty, "std::env::SplitPaths")
+        || ty.starts_with("std::slice::Windows<")
+        || ty.starts_with("std::sync::mpsc::Iter<")
+        || ty.starts_with("std::sync::mpsc::IntoIter<")
+        || ty.starts_with("std::sync::mpsc::TryIter<")
+}
+
+/// The `Iterator::Item` type tag of an iterator type tag,
+/// where it is a type-level function of the tag: the first
+/// type argument of the source iterators that carry their
+/// item there, a reference to it for the reference-yielding
+/// sources, and the inner iterator's item through the
+/// transparent one-iterator adapters. `None` where the item
+/// is not a function of the tag (a `Map`'s item is its
+/// closure's return type, which the tag does not carry).
+fn iterator_item_ty(ty: &str) -> Option<String> {
+    // Transparent one-iterator adapters: the item is the
+    // inner iterator's item. (`Chain`'s two sides share one
+    // item type, so the first side names it.)
+    for prefix in [
+        "std::iter::Rev<",
+        "std::iter::Fuse<",
+        "std::iter::Take<",
+        "std::iter::Skip<",
+        "std::iter::StepBy<",
+        "std::iter::Filter<",
+        "std::iter::SkipWhile<",
+        "std::iter::TakeWhile<",
+        "std::iter::Inspect<",
+        "std::iter::Cycle<",
+        "std::iter::Peekable<",
+        "std::iter::Chain<",
+    ] {
+        if ty.starts_with(prefix) {
+            return iterator_item_ty(first_generic_arg(ty)?);
+        }
+    }
+    // `Copied` / `Cloned` over a reference iterator: the item
+    // is the pointee type.
+    if ty.starts_with("std::iter::Copied<") || ty.starts_with("std::iter::Cloned<") {
+        let item = iterator_item_ty(first_generic_arg(ty)?)?;
+        if let Some(rest) = item.strip_prefix("&mut ") {
+            return Some(rest.to_string());
+        }
+        if let Some(rest) = item.strip_prefix('&') {
+            return Some(rest.to_string());
+        }
+        return None;
+    }
+    // Source iterators whose item is the first type argument.
+    for prefix in [
+        "std::vec::IntoIter<",
+        "alloc::vec::IntoIter<",
+        "std::array::IntoIter<",
+        "std::collections::vec_deque::IntoIter<",
+        "alloc::collections::vec_deque::IntoIter<",
+        "std::collections::linked_list::IntoIter<",
+        "alloc::collections::linked_list::IntoIter<",
+        "std::collections::binary_heap::IntoIter<",
+        "std::collections::btree_set::IntoIter<",
+        "std::collections::hash_set::IntoIter<",
+        "std::option::IntoIter<",
+        "std::sync::mpsc::IntoIter<",
+        "std::iter::Once<",
+        "std::iter::Empty<",
+        "std::iter::Repeat<",
+        "std::ops::Range<",
+        "std::ops::RangeInclusive<",
+        "std::ops::RangeFrom<",
+    ] {
+        if ty.starts_with(prefix) {
+            return Some(first_generic_arg(ty)?.to_string());
+        }
+    }
+    // Reference-yielding sources: the item is a reference to
+    // the first type argument.
+    for prefix in [
+        "std::slice::Iter<",
+        "std::collections::btree_set::Iter<",
+        "std::option::Iter<",
+    ] {
+        if ty.starts_with(prefix) {
+            return Some(format!("&{}", first_generic_arg(ty)?));
+        }
+    }
+    for prefix in ["std::slice::IterMut<", "std::option::IterMut<"] {
+        if ty.starts_with(prefix) {
+            return Some(format!("&mut {}", first_generic_arg(ty)?));
+        }
+    }
+    // Slice-yielding sources: the item is a slice reference.
+    for prefix in [
+        "std::slice::Chunks<",
+        "std::slice::RChunks<",
+        "std::slice::ChunksExact<",
+        "std::slice::RChunksExact<",
+        "std::slice::Windows<",
+    ] {
+        if ty.starts_with(prefix) {
+            return Some(format!("&[{}]", first_generic_arg(ty)?));
+        }
+    }
+    if self_ty_is(ty, "std::str::Chars") || self_ty_is(ty, "core::str::Chars") {
+        return Some("char".to_string());
+    }
+    if self_ty_is(ty, "std::str::Bytes") || self_ty_is(ty, "core::str::Bytes") {
+        return Some("u8".to_string());
+    }
+    None
+}
+
 /// Whether the modelled iterator consumers (`nth`, `count`,
 /// `fold`, `for_each`, `collect`) serve this type: exactly
 /// the types the modelled `next` state machine serves. The
@@ -5882,6 +6581,19 @@ fn slice_iter_snapshot_bytes(state: &Value, self_ty: &str) -> InterpResult<Vec<u
     let items = match &ptr {
         Value::Ref(RefTarget::Value(snapshot, _)) => match &**snapshot {
             Value::Tuple(items) => items.clone(),
+            // The string the iterator was built over, held as
+            // the value itself: the form the converted
+            // `str::chars` / `str::bytes` construction leaves
+            // (the byte-slice iterator over the string's own
+            // storage), where the builtin construction stores
+            // a snapshot of the bytes instead. The bytes are
+            // the same bytes either way; the step's pointers
+            // index into them identically.
+            Value::Str(text) => text
+                .as_bytes()
+                .iter()
+                .map(|b| Value::Uint(*b as u128))
+                .collect(),
             other => {
                 return Err(InterpError::type_mismatch(
                     format!("{self_ty} state"),
