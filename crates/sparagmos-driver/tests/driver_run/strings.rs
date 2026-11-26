@@ -3120,3 +3120,84 @@ fn run_mode_str_searcher_pattern_family() {
          c1=true f1=Some(4)\n"
     );
 }
+
+const STR_SPLITN_SRC: &str = r#"fn main() {
+    // char pattern: truncation, remainder-as-last-piece.
+    println!("a={:?}", "a:b:c:d".splitn(2, ':').collect::<Vec<_>>());
+    println!("b={:?}", "a:b:c:d".rsplitn(2, ':').collect::<Vec<_>>());
+    println!("c={:?}", "a:b:c:d".splitn(0, ':').collect::<Vec<_>>());
+    println!("d={:?}", "a:b:c".splitn(1, ':').collect::<Vec<_>>());
+    println!("e={:?}", "a:b:c".rsplitn(1, ':').collect::<Vec<_>>());
+    println!("f={:?}", "a:b:c".splitn(5, ':').collect::<Vec<_>>());
+    // Empty haystack, no delimiter, trailing delimiter.
+    println!("g={:?}", "".splitn(2, ':').collect::<Vec<_>>());
+    println!("h={:?}", "".rsplitn(3, ':').collect::<Vec<_>>());
+    println!("i={:?}", "abc".splitn(2, ':').collect::<Vec<_>>());
+    println!("j={:?}", "a:b:".splitn(3, ':').collect::<Vec<_>>());
+    println!("k={:?}", "a:b:".rsplitn(3, ':').collect::<Vec<_>>());
+    println!("l={:?}", "::".splitn(2, ':').collect::<Vec<_>>());
+    println!("m={:?}", "::".rsplitn(2, ':').collect::<Vec<_>>());
+    // Manual next: the count spends down to the get_end piece.
+    let mut it = "x:y:z".splitn(2, ':');
+    println!("n={:?} {:?} {:?}", it.next(), it.next(), it.next());
+    let mut it2 = "x:y:z".rsplitn(2, ':');
+    println!("o={:?} {:?} {:?}", it2.next(), it2.next(), it2.next());
+    // &str pattern: multi-byte, one-byte, and empty needles.
+    println!("p={:?}", "a::b::c".splitn(2, "::").collect::<Vec<_>>());
+    println!("q={:?}", "a::b::c".rsplitn(2, "::").collect::<Vec<_>>());
+    println!("r={:?}", "aXbXc".splitn(2, "X").collect::<Vec<_>>());
+    println!("s={:?}", "abc".splitn(2, "").collect::<Vec<_>>());
+    println!("t={:?}", "abc".rsplitn(2, "").collect::<Vec<_>>());
+    // Predicate pattern.
+    println!("u={:?}", "a1b2c".splitn(2, |c: char| c.is_ascii_digit()).collect::<Vec<_>>());
+    println!("v={:?}", "a1b2c".rsplitn(2, |c: char| c.is_ascii_digit()).collect::<Vec<_>>());
+    // Consumers and a mid-iteration clone.
+    println!("w={:?} {:?}", "a:b:c:d".splitn(4, ':').count(), "a:b:c:d".rsplitn(4, ':').nth(1));
+    let mut it3 = "p:q:r".splitn(3, ':');
+    let _ = it3.next();
+    let cl = it3.clone();
+    println!("x={:?} {:?}", it3.collect::<Vec<_>>(), cl.collect::<Vec<_>>());
+}
+"#;
+
+#[test]
+fn run_mode_str_splitn_family() {
+    // The `SplitN` / `RSplitN` step: core's `SplitNInternal`
+    // count logic over the wrapped split state -- a count of
+    // zero yields nothing, a count of one yields the wrapped
+    // iterator's `get_end` (the whole remainder), and larger
+    // counts spend one wrapped step each, front for `SplitN`
+    // and back for `RSplitN`, whose `Iterator::next` is the
+    // internal `next_back`. The wrapped state is the split
+    // family's own, so the char, `&str` (all three searcher
+    // payloads), and predicate patterns all step. Expected
+    // output was produced by the native 1.100.0 toolchain.
+    run_ok(
+        "str-splitn-family",
+        STR_SPLITN_SRC,
+        "a=[\"a\", \"b:c:d\"]\n\
+         b=[\"d\", \"a:b:c\"]\n\
+         c=[]\n\
+         d=[\"a:b:c\"]\n\
+         e=[\"a:b:c\"]\n\
+         f=[\"a\", \"b\", \"c\"]\n\
+         g=[\"\"]\n\
+         h=[\"\"]\n\
+         i=[\"abc\"]\n\
+         j=[\"a\", \"b\", \"\"]\n\
+         k=[\"\", \"b\", \"a\"]\n\
+         l=[\"\", \":\"]\n\
+         m=[\"\", \":\"]\n\
+         n=Some(\"x\") Some(\"y:z\") None\n\
+         o=Some(\"z\") Some(\"x:y\") None\n\
+         p=[\"a\", \"b::c\"]\n\
+         q=[\"c\", \"a::b\"]\n\
+         r=[\"a\", \"bXc\"]\n\
+         s=[\"\", \"abc\"]\n\
+         t=[\"\", \"abc\"]\n\
+         u=[\"a\", \"b2c\"]\n\
+         v=[\"c\", \"a1b\"]\n\
+         w=4 Some(\"c\")\n\
+         x=[\"q\", \"r\"] [\"q\", \"r\"]\n",
+    );
+}

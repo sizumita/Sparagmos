@@ -809,6 +809,41 @@ impl<'a> Interpreter<'a> {
         )))
     }
 
+    /// One front step of a `str` splitn iterator (`SplitN` /
+    /// `RSplitN`), replaying core's `SplitNInternal` step on
+    /// the state the constructor's converted body built: the
+    /// type is a one-field wrapper over `SplitNInternal`,
+    /// whose fields are the wrapped split state -- the very
+    /// `SplitInternal` state `str_split_step`'s machines
+    /// decode -- and the count of splits remaining. The step
+    /// is core's own count logic, shared by both types: a
+    /// count of zero is exhausted, a count of one yields the
+    /// wrapped iterator's `get_end` (the whole remainder),
+    /// and any larger count is spent on one wrapped step --
+    /// the front step for `SplitN`, the back step for
+    /// `RSplitN`, whose `Iterator::next` is the internal
+    /// `next_back`. Neither type implements
+    /// `DoubleEndedIterator`, so no back step is modelled.
+    fn str_splitn_step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: &Value,
+        self_ty: &str,
+    ) -> InterpResult<(Value, Value)> {
+        let reversed = self_ty.starts_with("std::str::RSplitN<");
+        if let Some(mut parts) = StrSplitNParts::decode(state, self_ty) {
+            let item = parts.next(self, frames, reversed)?;
+            let new_state = parts.encode(state);
+            return Ok(match item {
+                Some(piece) => (new_state, some_value(Value::Str(piece))),
+                None => (new_state, none_value()),
+            });
+        }
+        Err(unsupported(format!(
+            "Iterator::next for {self_ty} is not runtime-supported"
+        )))
+    }
+
     /// The place-based back step of a `Map` (see `map_next`):
     /// step the inner iterator in place from the back, then apply
     /// the closure to the yielded item. Declines a state that
@@ -3025,6 +3060,9 @@ impl<'a> Interpreter<'a> {
         }
         if is_str_split_ty(self_ty) {
             return self.str_split_step(frames, state, self_ty, false);
+        }
+        if is_str_splitn_ty(self_ty) {
+            return self.str_splitn_step(frames, state, self_ty);
         }
         if is_str_matches_ty(self_ty) {
             return self.str_matches_step(frames, state, self_ty, false);
@@ -5399,6 +5437,8 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitTerminator<")
         || self_ty.starts_with("std::str::RSplitTerminator<")
         || self_ty.starts_with("std::str::SplitInclusive<")
+        || self_ty.starts_with("std::str::SplitN<")
+        || self_ty.starts_with("std::str::RSplitN<")
         || self_ty.starts_with("std::str::Matches<")
         || self_ty.starts_with("std::str::MatchIndices<")
         || self_ty_is(self_ty, "std::str::Chars")
@@ -7338,6 +7378,15 @@ fn is_str_split_ty(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitInclusive<")
 }
 
+/// Whether a rendered tag names one of the `str` splitn
+/// iterators whose state machine `str_splitn_step` replays
+/// (`SplitN`, `RSplitN` -- the `<` keeps `SplitN` from also
+/// matching the plain split family `is_str_split_ty` names).
+fn is_str_splitn_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("std::str::SplitN<")
+        || self_ty.starts_with("std::str::RSplitN<")
+}
+
 /// How a `CharEqSearcher`'s char test is served: a guest
 /// predicate applied through the modelled call path, a set
 /// of chars tested by membership (resolved from the state),
@@ -8814,6 +8863,141 @@ impl StrSplitStrParts {
             }
         }
         self.back_match(true)
+    }
+}
+
+/// The wrapped split state of a `SplitNInternal`, decoded
+/// by the same machines `str_split_step` runs: the `char`
+/// pattern's, the predicate pattern's, and the `&str`
+/// pattern's. The step surface `SplitNInternal` needs is
+/// the front step, the back step, and `get_end`.
+enum StrSplitNInner {
+    Char(StrSplitParts),
+    Pred(StrSplitPredParts),
+    Str(StrSplitStrParts),
+}
+
+impl StrSplitNInner {
+    fn get_end(&mut self) -> Option<String> {
+        match self {
+            StrSplitNInner::Char(parts) => parts.get_end(),
+            StrSplitNInner::Pred(parts) => parts.get_end(),
+            StrSplitNInner::Str(parts) => parts.get_end(),
+        }
+    }
+
+    fn next(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        match self {
+            StrSplitNInner::Char(parts) => Ok(parts.next()),
+            StrSplitNInner::Pred(parts) => parts.next(interp, frames),
+            StrSplitNInner::Str(parts) => Ok(parts.next()),
+        }
+    }
+
+    fn next_back(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        match self {
+            StrSplitNInner::Char(parts) => Ok(parts.next_back()),
+            StrSplitNInner::Pred(parts) => parts.next_back(interp, frames),
+            StrSplitNInner::Str(parts) => Ok(parts.next_back()),
+        }
+    }
+
+    fn encode(&self, wrapped: &Value) -> Value {
+        match self {
+            StrSplitNInner::Char(parts) => parts.encode(wrapped),
+            StrSplitNInner::Pred(parts) => parts.encode(wrapped),
+            StrSplitNInner::Str(parts) => parts.encode(wrapped),
+        }
+    }
+}
+
+/// The decoded state of a `str` splitn iterator: core's
+/// `SplitNInternal` fields -- the wrapped `SplitInternal`
+/// state (see `StrSplitNInner`) and the count of splits
+/// remaining. The split machines decode a one-field wrapper
+/// over the `SplitInternal` state, so decode and encode run
+/// them over the wrapped field under that shape.
+struct StrSplitNParts {
+    inner: StrSplitNInner,
+    count: usize,
+}
+
+impl StrSplitNParts {
+    fn decode(state: &Value, self_ty: &str) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 2 {
+            return None;
+        }
+        let count = match internal[1] {
+            Value::Uint(n) => usize::try_from(n).ok()?,
+            _ => return None,
+        };
+        let wrapped = Value::Tuple(vec![internal[0].clone()]);
+        let inner = if let Some(parts) = StrSplitParts::decode(&wrapped) {
+            StrSplitNInner::Char(parts)
+        } else if let Some(parts) = StrSplitPredParts::decode(&wrapped, self_ty) {
+            StrSplitNInner::Pred(parts)
+        } else if let Some(parts) = StrSplitStrParts::decode(&wrapped) {
+            StrSplitNInner::Str(parts)
+        } else {
+            return None;
+        };
+        Some(Self { inner, count })
+    }
+
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded above");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded above");
+        let wrapped = Value::Tuple(vec![internal[0].clone()]);
+        let stepped = self.inner.encode(&wrapped);
+        let new_iter = iterator_fields(&stepped, "")
+            .expect("state decoded above")
+            .into_iter()
+            .next()
+            .expect("state decoded above");
+        let new_internal = rebuild_state(
+            &outer[0],
+            vec![new_iter, Value::Uint(self.count as u128)],
+        );
+        rebuild_state(state, vec![new_internal])
+    }
+
+    /// `SplitNInternal::next` / `next_back`: `back` selects
+    /// the wrapped step's direction, as core's two entry
+    /// points do; the count logic is shared.
+    fn next(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+        back: bool,
+    ) -> InterpResult<Option<String>> {
+        match self.count {
+            0 => Ok(None),
+            1 => {
+                self.count = 0;
+                Ok(self.inner.get_end())
+            }
+            _ => {
+                self.count -= 1;
+                if back {
+                    self.inner.next_back(interp, frames)
+                } else {
+                    self.inner.next(interp, frames)
+                }
+            }
+        }
     }
 }
 
