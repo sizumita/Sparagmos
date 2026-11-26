@@ -3164,3 +3164,93 @@ fn run_mode_sparse_vec_huge_slice_windows() {
         "len 1000000000\ntail 5\nhead 7\nwin 2 3\npast 999999997\npast2 999999998 3\n"
     );
 }
+
+const HASH_MAP_DEBUG_SRC: &str = r#"
+use std::collections::{HashMap, HashSet};
+fn main() {
+    let empty: HashMap<i32, i32> = HashMap::new();
+    println!("empty {:?}", empty);
+    let mut one: HashMap<i32, i32> = HashMap::new();
+    one.insert(1, 10);
+    println!("one {:?}", one);
+    let mut m: HashMap<String, i32> = HashMap::new();
+    m.insert("a".to_string(), 1);
+    println!("strkey {:?}", m);
+    let mut s: HashSet<i32> = HashSet::new();
+    s.insert(7);
+    println!("set {:?}", s);
+    let mut v: HashMap<i32, Vec<i32>> = HashMap::new();
+    v.insert(1, vec![1, 2]);
+    println!("vecval {:?}", v);
+    println!("pretty {:#?}", one);
+    let d: HashMap<String, Vec<i32>> = HashMap::default();
+    println!("default {:?}", d);
+}
+"#;
+
+#[test]
+fn run_mode_hash_map_debug_format() {
+    // `{:?}` of a `HashMap` / `HashSet` is std's handwritten
+    // `debug_map` / `debug_set` form (`{k: v, ...}` / `{a, ...}`),
+    // not the derived form of the storage aggregate (`HashMap
+    // { base: HashMap { hash_builder: ..., table: RawTable
+    // { ... } } }`): the fmt engine composes it from the entries
+    // the raw-table walk reads back. Single-element maps keep
+    // the expected text exact (a multi-element hash map's entry
+    // order is the table's bucket order, which std leaves to
+    // the hasher). The empty map is the `{}` form, not an error
+    // over the empty table's control-byte block.
+    let dir = temp_dir("hashmapdebug");
+    let src = fixture(&dir, "hashmapdebug.rs", HASH_MAP_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "formatting a HashMap with {{:?}} must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "empty {}\none {1: 10}\nstrkey {\"a\": 1}\nset {7}\nvecval {1: [1, 2]}\npretty {\n    1: 10,\n}\ndefault {}\n"
+    );
+}
+
+const BTREE_MAP_DEBUG_SRC: &str = r#"
+use std::collections::{BTreeMap, BTreeSet};
+fn main() {
+    let empty: BTreeMap<i32, i32> = BTreeMap::new();
+    println!("empty {:?}", empty);
+    let mut m: BTreeMap<i32, i32> = BTreeMap::new();
+    m.insert(2, 20);
+    m.insert(1, 10);
+    println!("map {:?}", m);
+    let mut s: BTreeSet<i32> = BTreeSet::new();
+    s.insert(3);
+    s.insert(1);
+    println!("set {:?}", s);
+    println!("pretty {:#?}", m);
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_debug_format() {
+    // `{:?}` of a `BTreeMap` / `BTreeSet` is the same
+    // `debug_map` / `debug_set` form as the hash collections',
+    // composed from the pairs the B-tree node walk reads back
+    // (in tree order, so the expected text is exact); the
+    // storage form's uninitialised node slots are not part of
+    // the rendering.
+    let dir = temp_dir("btreemapdebug");
+    let src = fixture(&dir, "btreemapdebug.rs", BTREE_MAP_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "formatting a BTreeMap with {{:?}} must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "empty {}\nmap {1: 10, 2: 20}\nset {1, 3}\npretty {\n    1: 10,\n    2: 20,\n}\n"
+    );
+}
