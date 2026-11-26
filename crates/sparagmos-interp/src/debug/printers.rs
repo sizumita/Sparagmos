@@ -3,7 +3,9 @@
 use crate::interp::{Frame, Interpreter};
 use crate::value::{RefProj, RefTarget, Value};
 use super::desc::{Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level};
-use super::render_gdb::{MAX_RENDER_DEPTH, compress_repeats, render_gdb};
+use super::render_gdb::{
+    MAX_RENDER_DEPTH, compress_repeats, render_gdb_with_printers,
+};
 use super::render_lldb::{escape_char, escape_str, lldb_type_name, render_lldb_compact};
 
 // ---------------------------------------------------------------------------
@@ -55,7 +57,14 @@ fn printer_kind(dwarf_name: &str) -> Option<PrinterKind> {
     let parent = segs.next().unwrap_or("");
     Some(match (name, parent) {
         ("String", "string") => PrinterKind::String,
-        ("OsString", "os_str") => PrinterKind::OsString,
+        // The definition path is `ffi::os_str::OsString`; a
+        // tag naming the re-export path `ffi::OsString` (the
+        // parent segment is then `ffi` itself) is the same
+        // type, the way the collection kinds below accept
+        // their two parent spellings.
+        ("OsString", "os_str") | ("OsString", "ffi") => {
+            PrinterKind::OsString
+        }
         ("Vec", "vec") => PrinterKind::Vec,
         ("VecDeque", "vec_deque") | ("VecDeque", "collections") => {
             PrinterKind::VecDeque
@@ -104,20 +113,51 @@ fn sequence_values(value: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// gdb's `print elements` limit for a printer's children.
+/// gdb's `print elements` limit for a printer's children:
+/// the setting's default, and the cap this renderer applies
+/// when the setting is "unlimited" (0), whose unbounded form
+/// the bounded value model does not reproduce.
 const GDB_PRINT_ELEMENTS: usize = 200;
+
+/// The child-count cap a `print elements` setting imposes:
+/// the setting itself, or the default when it is unlimited.
+fn elements_cap(elements: usize) -> usize {
+    if elements == 0 {
+        GDB_PRINT_ELEMENTS
+    } else {
+        elements
+    }
+}
+
+/// Truncate a printed string the way gdb's `print elements`
+/// setting truncates one: past the limit, the first `elements`
+/// characters and an ellipsis (which the caller then quotes).
+/// A setting of 0 is "unlimited" and never truncates.
+fn truncate_print_string(text: &str, elements: usize) -> String {
+    if elements == 0 || text.chars().count() <= elements {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(elements).collect();
+    out.push_str("...");
+    out
+}
 
 /// Render a value in gdb form with the pretty printers applied
 /// where a provider exists (the raw form otherwise).
-fn render_gdb_any(
+pub(super) fn render_gdb_any(
     interp: &Interpreter,
     frames: &[Frame],
     value: &Value,
     desc: Option<&Desc>,
     depth: usize,
+    elements: usize,
 ) -> Option<String> {
-    render_pretty_gdb(interp, frames, value, desc, None, depth)
-        .or_else(|| render_gdb(interp, value, desc, false, None, depth))
+    render_pretty_gdb(interp, frames, value, desc, None, depth, elements)
+        .or_else(|| {
+            render_gdb_with_printers(
+                interp, frames, value, desc, false, None, depth, elements,
+            )
+        })
 }
 
 /// Resolve a printed slice value to the value holding its
@@ -169,11 +209,15 @@ fn slice_pointee(
 /// `Value::SparseVec`) — bounded just past the print-elements
 /// limit, since the renderer truncates there anyway. A fully
 /// stored sequence passes through unchanged.
-fn render_sequence_elems(stored: &[Value], declared: u128) -> Vec<Value> {
+fn render_sequence_elems(
+    stored: &[Value],
+    declared: u128,
+    elements: usize,
+) -> Vec<Value> {
     let mut elems = stored.to_vec();
     let want = usize::try_from(declared)
         .unwrap_or(usize::MAX)
-        .min(GDB_PRINT_ELEMENTS + 1);
+        .min(elements_cap(elements) + 1);
     if elems.len() < want {
         elems.resize(want, Value::Uninit);
     }
@@ -189,11 +233,19 @@ fn render_printer_children(
     elems: &[Value],
     elem_desc: Option<&Desc>,
     depth: usize,
+    elements: usize,
 ) -> Option<String> {
-    let shown = elems.len().min(GDB_PRINT_ELEMENTS);
+    let shown = elems.len().min(elements_cap(elements));
     let mut rendered = Vec::with_capacity(shown);
     for elem in &elems[..shown] {
-        rendered.push(render_gdb_any(interp, frames, elem, elem_desc, depth + 1)?);
+        rendered.push(render_gdb_any(
+            interp,
+            frames,
+            elem,
+            elem_desc,
+            depth + 1,
+            elements,
+        )?);
     }
     let mut body = compress_repeats(&rendered);
     if elems.len() > shown {
@@ -217,6 +269,7 @@ pub(super) fn render_pretty_gdb(
     desc: Option<&Desc>,
     tag_hint: Option<&str>,
     depth: usize,
+    elements: usize,
 ) -> Option<String> {
     if depth > MAX_RENDER_DEPTH {
         return None;
@@ -250,13 +303,15 @@ pub(super) fn render_pretty_gdb(
                 if declared == 0 {
                     Some(head)
                 } else {
-                    let elems = render_sequence_elems(&elems, declared);
+                    let elems =
+                        render_sequence_elems(&elems, declared, elements);
                     let block = render_printer_children(
                         interp,
                         frames,
                         &elems,
                         Some(elem),
                         depth,
+                        elements,
                     )?;
                     Some(format!("{head} = {block}"))
                 }
@@ -271,13 +326,16 @@ pub(super) fn render_pretty_gdb(
                     }
                     _ => return None,
                 };
-                Some(format!("\"{}\"", escape_str(&text)))
+                Some(format!(
+                    "\"{}\"",
+                    escape_str(&truncate_print_string(&text, elements))
+                ))
             }
             _ => None,
         },
         Some(Desc::Adt(tag)) => {
             let kind = printer_kind(&dwarf_type_name(tag))?;
-            render_printer_adt(interp, frames, kind, tag, value, depth)
+            render_printer_adt(interp, frames, kind, tag, value, depth, elements)
         }
         _ => None,
     }
@@ -291,6 +349,7 @@ fn render_printer_adt(
     tag: &str,
     value: &Value,
     depth: usize,
+    elements: usize,
 ) -> Option<String> {
     match kind {
         PrinterKind::String | PrinterKind::OsString => {
@@ -298,7 +357,10 @@ fn render_printer_adt(
                 Value::Str(s) => Some(s.clone()),
                 _ => path_text(value),
             }?;
-            Some(format!("\"{}\"", escape_str(&text)))
+            Some(format!(
+                "\"{}\"",
+                escape_str(&truncate_print_string(&text, elements))
+            ))
         }
         PrinterKind::Vec => {
             let elem =
@@ -314,13 +376,15 @@ fn render_printer_adt(
                     if *len == 0 {
                         Some(head)
                     } else {
-                        let elems = render_sequence_elems(elems, *len);
+                        let elems =
+                            render_sequence_elems(elems, *len, elements);
                         let block = render_printer_children(
                             interp,
                             frames,
                             &elems,
                             elem.as_ref(),
                             depth,
+                            elements,
                         )?;
                         Some(format!("{head} = {block}"))
                     }
@@ -336,6 +400,7 @@ fn render_printer_adt(
                             fields,
                             elem.as_ref(),
                             depth,
+                            elements,
                         )?;
                         Some(format!("{head} = {block}"))
                     }
@@ -359,6 +424,7 @@ fn render_printer_adt(
                 &pointee,
                 elem.as_ref(),
                 depth + 1,
+                elements,
             )?;
             let name = if kind == PrinterKind::Rc {
                 "Rc"
@@ -381,6 +447,7 @@ fn render_printer_adt(
                     &elems,
                     elem.as_ref(),
                     depth,
+                    elements,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -401,6 +468,7 @@ fn render_printer_adt(
                     &keys,
                     elem.as_ref(),
                     depth,
+                    elements,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -425,6 +493,7 @@ fn render_printer_adt(
                     key_desc.as_ref(),
                     val_desc.as_ref(),
                     depth,
+                    elements,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -449,6 +518,7 @@ fn render_printer_adt(
                     key_desc.as_ref(),
                     val_desc.as_ref(),
                     depth,
+                    elements,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -469,6 +539,7 @@ fn render_printer_adt(
                     &keys,
                     elem.as_ref(),
                     depth,
+                    elements,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -549,12 +620,15 @@ fn render_printer_map_children(
     key_desc: Option<&Desc>,
     val_desc: Option<&Desc>,
     depth: usize,
+    elements: usize,
 ) -> Option<String> {
-    let shown = entries.len().min(GDB_PRINT_ELEMENTS);
+    let shown = entries.len().min(elements_cap(elements));
     let mut rendered = Vec::with_capacity(shown);
     for (k, v) in &entries[..shown] {
-        let ks = render_gdb_any(interp, frames, k, key_desc, depth + 1)?;
-        let vs = render_gdb_any(interp, frames, v, val_desc, depth + 1)?;
+        let ks =
+            render_gdb_any(interp, frames, k, key_desc, depth + 1, elements)?;
+        let vs =
+            render_gdb_any(interp, frames, v, val_desc, depth + 1, elements)?;
         rendered.push(format!("[{ks}] = {vs}"));
     }
     let mut body = compress_repeats(&rendered);

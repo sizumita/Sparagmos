@@ -67,6 +67,9 @@ pub(super) fn render_lldb_compact(
                 shared,
                 DebugDialect::Lldb,
                 depth,
+                &[],
+                false,
+                200,
             )?;
             Some(format!("({})", parts.join(", ")))
         }
@@ -197,6 +200,9 @@ fn render_adt_lldb_compact(
                     None,
                     DebugDialect::Lldb,
                     depth,
+                    &[],
+                    false,
+                    200,
                 )?;
                 if nested {
                     Some(format!("({})", parts.join(", ")))

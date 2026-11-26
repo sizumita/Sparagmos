@@ -6,7 +6,9 @@ use super::desc::{Desc, field_desc, path_text, smart_pointer_pointee, tag_base_n
 use super::parse::{ExprStep, ParsedExpr, parse_expr, split_comparison};
 use super::printers::{render_lldb_provider_line, render_pretty_gdb};
 use super::queries::{desc_type_name, expr_type_name, lldb_command_format_scalar, lldb_format_scalar, pointer_pointee};
-use super::render_gdb::{render_gdb, union_projected_field};
+use super::render_gdb::{
+    render_gdb, render_gdb_with_printers, union_projected_field,
+};
 use super::render_lldb::{lldb_type_name, render_env_lldb_lines, render_lldb_lines};
 use super::session::{DebugControl, DebugDialect, DebugPrint};
 
@@ -1476,8 +1478,20 @@ pub(super) fn evaluate_print(
                 desc.as_ref(),
                 ev.tag.as_deref(),
                 0,
+                ctl.print_elements,
             )
-            .or_else(|| render_gdb(interp, &value, desc.as_ref(), char, print.format, 0))
+            .or_else(|| {
+                render_gdb_with_printers(
+                    interp,
+                    frames,
+                    &value,
+                    desc.as_ref(),
+                    char,
+                    print.format,
+                    0,
+                    ctl.print_elements,
+                )
+            })
         } else {
             render_gdb(interp, &value, desc.as_ref(), char, print.format, 0)
         },

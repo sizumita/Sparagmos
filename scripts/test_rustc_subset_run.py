@@ -4233,6 +4233,15 @@ class DebuggerHarnessTests(unittest.TestCase):
         self.assertEqual(
             run.translate_debugger_command("gdb", "set print pretty"),
             "# inert: set print pretty")
+        # The elements limit shapes printed output, so it is
+        # forwarded to the session instead of going inert.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "set print elements 5"),
+            "print-elements 5")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "set print elements unlimited"),
+            "print-elements unlimited")
         self.assertIsNone(run.translate_debugger_command("gdb", "quit"))
         self.assertEqual(
             run.translate_debugger_command("gdb", "ptype x"), "ptype x")

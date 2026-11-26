@@ -3592,6 +3592,13 @@ def _translate_gdb_command(cmd):
         return "up"
     if cmd == "down":
         return "down"
+    m = re.match(r"^set print elements (\d+|unlimited)$", cmd)
+    if m:
+        # The elements limit shapes printed output (string
+        # and child truncation), so it reaches the session as
+        # a real script line, unlike the other `set print`
+        # commands below.
+        return f"print-elements {m.group(1)}"
     if cmd.startswith(("set print ", "set language ", "set pagination ",
                        "set confirm ", "set charset ")):
         return f"# inert: {cmd}"

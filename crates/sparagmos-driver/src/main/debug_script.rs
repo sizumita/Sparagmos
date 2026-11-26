@@ -41,6 +41,19 @@ pub(crate) fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String
                 }
                 pretty_printers = true;
             }
+            "print-elements" => {
+                // gdb `set print elements N` (the runner
+                // forwards it under this name): the session's
+                // string and child truncation limit from this
+                // point on. `unlimited` is gdb's 0.
+                let n: usize = if rest == "unlimited" {
+                    0
+                } else {
+                    rest.parse()
+                        .map_err(|_| bad(&format!("bad print elements `{rest}`")))?
+                };
+                commands.push(DebugCommand::SetPrintElements(n));
+            }
             "type-format" => {
                 let (fmt, ty) = rest
                     .split_once(char::is_whitespace)

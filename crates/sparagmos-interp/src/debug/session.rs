@@ -70,6 +70,12 @@ pub enum DebugCommand {
     /// registration and a print after it under the new one --
     /// the order the real debugger applies its commands in.
     SetLldbFormat { ty: String, format: LldbNumFormat },
+    /// Set gdb's `print elements` limit from this point in
+    /// the session (gdb `set print elements N`): the count
+    /// past which a printed string is truncated and a
+    /// printer's children are cut off. 0 is gdb's
+    /// "unlimited"; the session starts at gdb's default, 200.
+    SetPrintElements(usize),
 }
 
 /// A print command: the expression text plus the number format
@@ -236,6 +242,10 @@ pub(crate) struct DebugControl {
     /// with `disable-gdb-pretty-printers`). Only the gdb form
     /// consults it.
     pub(super) pretty_printers: bool,
+    /// The session's `print elements` setting (see
+    /// `DebugCommand::SetPrintElements`); starts at gdb's
+    /// default, 200.
+    pub(super) print_elements: usize,
     /// Function breakpoints (gdb `break <fn-path>` in a command
     /// section): body names to stop at on first entry.
     fn_breakpoints: Vec<String>,
@@ -424,6 +434,7 @@ impl DebugSession {
             source_text: std::mem::take(&mut self.source_text),
             dialect,
             pretty_printers: self.pretty_printers,
+            print_elements: 200,
             lldb_formats: self.lldb_formats,
             hide_locals: self.hide_locals,
         };
@@ -446,7 +457,8 @@ impl DebugSession {
                     | DebugCommand::Ptype(_)
                     | DebugCommand::Repr(_)
                     | DebugCommand::InfoFunctions { .. }
-                    | DebugCommand::SetLldbFormat { .. },
+                    | DebugCommand::SetLldbFormat { .. }
+                    | DebugCommand::SetPrintElements(_),
                 ) => {
                     let cmd = ctl.script.pop_front().expect("front checked");
                     exec_session_command(&mut ctl, &interp, &[], &cmd);
@@ -521,6 +533,9 @@ fn exec_session_command(
         }
         DebugCommand::SetLldbFormat { ty, format } => {
             ctl.lldb_formats.register(ty, *format);
+        }
+        DebugCommand::SetPrintElements(n) => {
+            ctl.print_elements = *n;
         }
         _ => {}
     }
@@ -696,7 +711,8 @@ pub(crate) fn drive_hook(
                     | DebugCommand::Repr(_)
                     | DebugCommand::InfoFunctions { .. }
                     | DebugCommand::InfoLocals
-                    | DebugCommand::SetLldbFormat { .. }),
+                    | DebugCommand::SetLldbFormat { .. }
+                    | DebugCommand::SetPrintElements(_)),
                 ) => {
                     exec_session_command(&mut ctl, interp, frames, &cmd);
                 }
