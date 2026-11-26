@@ -913,6 +913,20 @@ pub enum Rvalue {
         /// source pointee size (the first element) as the
         /// aggregate is built. `None` for every other aggregate.
         units_from: Option<(u64, usize)>,
+        /// A pointer-payload field-0 retarget (see
+        /// [`Rvalue::PtrField`] and [`Rvalue::PtrFieldBase`]):
+        /// when a wrapper-to-wrapper transmute retargets the
+        /// payload pointer at a pointee that stands in a prefix
+        /// relation to the source pointee (the target pointee is
+        /// the source pointee's first field, or the reverse), the
+        /// payload field (the operand index in the third element)
+        /// has the second element's field-0 entries appended to
+        /// its projection (the first element true: an entry) or
+        /// removed from it (false: an exit) as the aggregate is
+        /// built -- the same retarget the cast conversion applies
+        /// to a bare pointer of the payload's type. `None` for
+        /// every other aggregate.
+        payload_entry: Option<(bool, u32, usize)>,
     },
     /// Build a closure value: the closure body's name plus the
     /// captured environment values (the aggregate's operands, in
@@ -1035,6 +1049,18 @@ pub enum Rvalue {
     /// passes through unchanged and reads through it keep failing
     /// with a type mismatch, as they did before.
     PtrArrayBase(Operand),
+    /// The reverse of a field-0 entry cast (see
+    /// [`Rvalue::PtrField`]): a pointer to a struct's first field
+    /// cast back to a pointer to the struct itself -- a prefix
+    /// field read back as the whole aggregate, as in std's
+    /// B-tree node code casting a leaf node pointer back to the
+    /// internal node it is the head of. The result denotes the
+    /// enclosing aggregate, so the trailing field-0 projections
+    /// the entry left on the pointer (the second field counts
+    /// them) are removed at run time. A pointer whose projection
+    /// does not end in that many field-0 steps does not carry
+    /// the entry and passes through unchanged.
+    PtrFieldBase(Operand, u32),
     /// An array -> array `Transmute` cast entering an element
     /// wrapper (`[T; N]` -> `[MaybeUninit<T>; N]`, or the
     /// `UnsafeCell` twin): each element takes the wrapper's

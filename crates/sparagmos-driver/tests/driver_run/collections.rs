@@ -416,6 +416,140 @@ fn run_mode_btree_map_collect_and_from_iter() {
     );
 }
 
+const BTREE_SET_MULTILEVEL_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let mut s = BTreeSet::new();
+    for i in 0..30 {
+        s.insert(i);
+    }
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_multilevel_iterate() {
+    // A set grown past one leaf by insertion alone: the
+    // root is an internal node (height 1) whose leaf data
+    // the node pointers name through the cast into the leaf
+    // type, and iteration walks the internal node and its
+    // leaf children in order.
+    let dir = temp_dir("btreesetmultilevel");
+    let src = fixture(&dir, "btreesetmultilevel.rs", BTREE_SET_MULTILEVEL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a multi-level BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=30 sum=435\n");
+}
+
+const BTREE_SET_MULTILEVEL_FROM_ITER_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let s: BTreeSet<i32> = (0..80).collect();
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_multilevel_from_iter() {
+    // The same multi-level shape built by the bulk
+    // bottom-up build instead of insertion: iteration
+    // reads back every element in order.
+    let dir = temp_dir("btreesetmultilevelfi");
+    let src = fixture(
+        &dir,
+        "btreesetmultilevelfi.rs",
+        BTREE_SET_MULTILEVEL_FROM_ITER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a from_iter-built multi-level BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=80 sum=3160\n");
+}
+
+const BTREE_MAP_MULTILEVEL_SRC: &str = r#"
+use std::collections::BTreeMap;
+fn main() {
+    let mut m = BTreeMap::new();
+    for i in 0..60 {
+        m.insert(i, i * i);
+    }
+    println!("count={} sum={}", m.iter().count(), m.iter().map(|(k, v)| k + v).sum::<i32>());
+    let mut i = 0;
+    while i < 60 {
+        m.remove(&i);
+        i += 2;
+    }
+    println!("count={}", m.iter().count());
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_multilevel_iterate_remove() {
+    // A multi-level map: iteration interleaves the
+    // internal nodes' own pairs with their subtrees, and
+    // removals that rebalance the leaves leave the walk
+    // exact.
+    let dir = temp_dir("btreemapmultilevel");
+    let src = fixture(&dir, "btreemapmultilevel.rs", BTREE_MAP_MULTILEVEL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a multi-level BTreeMap must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "count=60 sum=71980\ncount=30\n"
+    );
+}
+
+const BTREE_SET_MULTILEVEL_REMOVE_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let mut s = BTreeSet::new();
+    for i in 0..88 {
+        s.insert(i);
+    }
+    let mut j = 0;
+    while j < 88 {
+        s.remove(&j);
+        j += 3;
+    }
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_multilevel_remove() {
+    // Removals across every leaf of a multi-level set,
+    // with the merges and steals rebalancing performs:
+    // the remaining elements still walk in order.
+    let dir = temp_dir("btreesetmultilevelrm");
+    let src = fixture(
+        &dir,
+        "btreesetmultilevelrm.rs",
+        BTREE_SET_MULTILEVEL_REMOVE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a rebalanced multi-level BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=58 sum=2523\n");
+}
+
 const OPTION_BY_VALUE_SRC: &str = r#"
 fn main() {
     let mut n = 0;

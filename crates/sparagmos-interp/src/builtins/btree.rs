@@ -160,6 +160,7 @@ impl<'a> Interpreter<'a> {
             ));
         }
         let (height, ptr) = btree_noderef_parts(noderef)?;
+        let ptr = btree_internal_target(ptr, height > 0);
         let node = self.btree_node_value(frames, ptr, "BTree node reference")?;
         self.btree_walk_node(frames, &node, height, out, depth)
     }
@@ -264,6 +265,7 @@ impl<'a> Interpreter<'a> {
         for i in 0..=len {
             let edge = btree_maybe_uninit(&edges[i])?;
             let ptr = btree_ptr_of(&edge)?;
+            let ptr = btree_internal_target(ptr, height > 1);
             let child = self.btree_node_value(frames, ptr, "BTree internal edge")?;
             self.btree_walk_node(frames, &child, height - 1, out, depth + 1)?;
             if i < len {
@@ -300,6 +302,33 @@ fn btree_count(value: &Value, what: &str) -> InterpResult<usize> {
             "an unsigned integer",
             other.kind_name(),
         )),
+    }
+}
+
+/// The node value target for a node known to be internal
+/// (`height > 0` at the reference that names it). A pointer to
+/// an internal node denotes the node's leaf data -- the first
+/// field of the internal node value, which is what the
+/// pointer's cast into the leaf type names -- while the walk
+/// needs the internal node value itself, edges included: step
+/// one field-0 step up to the enclosing value. A pointer that
+/// does not end in that step, and every leaf node's pointer,
+/// names the node value directly.
+fn btree_internal_target(
+    ptr: Option<RefTarget>,
+    internal: bool,
+) -> Option<RefTarget> {
+    if !internal {
+        return ptr;
+    }
+    match ptr {
+        Some(RefTarget::Alloc { id, mut projection })
+            if matches!(projection.last(), Some(RefProj::Field(0))) =>
+        {
+            projection.pop();
+            Some(RefTarget::Alloc { id, projection })
+        }
+        other => other,
     }
 }
 
