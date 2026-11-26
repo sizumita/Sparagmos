@@ -134,13 +134,13 @@ impl<'a> Converter<'a> {
                 } else {
                     let parts: Vec<String> = args
                         .iter()
-                        .map(|t| crate::builtins::ty_tag(t, self.names))
+                        .map(|t| crate::builtins::ty_tag_full(t, self.names))
                         .collect();
                     format!("{base}<{}>", parts.join(", "))
                 }
             }
             mir::Ty::FnDef(def, _) => self.def_display_name(def),
-            other => crate::builtins::ty_tag(other, self.names),
+            other => crate::builtins::ty_tag_full(other, self.names),
         }
     }
 

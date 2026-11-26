@@ -31,7 +31,12 @@
 //!   modelled implementation owns those definition names, and the
 //!   interpreter prefers converted bodies over builtins, so a
 //!   collected body would shadow the model. The exclusion is per
-//!   definition, matching the builtin registry's granularity.
+//!   definition, matching the builtin registry's granularity. The
+//!   one exception is a definition demanded *as a value* of a
+//!   kind the value-demand exception covers (see
+//!   `value_demand_needs_body`): a call through the value names
+//!   the plain definition with no call site for conversion to
+//!   bake a builtin into, so the real body is collected for it.
 //! - Targets whose resolved instance belongs to the local crate are
 //!   the local item loop's business and are skipped here.
 //! - One function's conversion failure never stops the others: each
@@ -627,6 +632,7 @@ pub fn collect_reachable(
             if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
                 && !consumer_instance_needs_body(&def, &canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
+                && !value_demand_needs_body(&canonical, demand)
             {
                 if builtin_seen.insert(def_id) {
                     records.push(Record {
@@ -1072,7 +1078,7 @@ pub fn collect_reachable(
 /// count must equal that variant's field count. Anything else
 /// returns `None` and the target keeps its "no MIR body available"
 /// record.
-fn synthetic_ctor_body(
+pub fn synthetic_ctor_body(
     conv: &mut Converter,
     def: &rustc_public::ty::FnDef,
     inst: &Instance,
@@ -1389,6 +1395,55 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
         }
         TyKind::Alias(_, alias) => walk_closure_args(&alias.args, out),
         _ => {}
+    }
+}
+
+/// Whether a builtin-owned definition demanded *as a value*
+/// still needs its body collected. A direct call to such a
+/// definition is converted to the builtin, but a call *through*
+/// the value (`.map(std::mem::drop)`, `.map(Deref::deref)`, a
+/// function pointer formed from the item) reaches the runtime
+/// as a bare name with no instance attached: conversion had no
+/// call site at which to bake a `CallBuiltin`, so the only
+/// faithful execution is the definition's own body, collected
+/// under the plain definition name the value carries.
+///
+/// The exception is deliberately limited to the kinds whose
+/// value call the runtime cannot serve by name *and* whose
+/// bodies do not shadow a model that owns a representation:
+/// `mem::drop` (the body runs the argument's drop glue, which
+/// no name-served model computes) and `Deref::deref` (a plain
+/// projection). Collecting the body of a representation-owning
+/// model instead — the `fmt` argument construction, `Box`
+/// allocation, `_print`, the panic formatting path — makes the
+/// interpreter prefer the real body over the model and breaks
+/// the representation agreement between them (the async-closure
+/// corpus tests are the regression that pins this). The bodies
+/// this exception collects are bound only to calls through the
+/// value: at conversion, a direct call is pre-empted back to
+/// the builtin model whenever the model owns the call's shape
+/// (for `mem::drop`, every direct call; for `Deref::deref`,
+/// the calls whose `Self` the model serves -- see
+/// `value_demand_builtin_preempts` in the converter), because
+/// a concrete impl body collected here -- a lock guard's or
+/// an `Rc`'s `deref`, say -- projects the real value layout
+/// the model does not reproduce, and binding direct calls to
+/// it breaks every modelled deref in the program (the
+/// dyn-dispatch, lock-guard and SmallVec corpus tests pin
+/// this). Extend the kind list only with a value-call
+/// regression test per kind, and extend the conversion
+/// pre-emption's list with it.
+fn value_demand_needs_body(canonical: &str, demand: Demand) -> bool {
+    if demand != Demand::Value {
+        return false;
+    }
+    match sparagmos_interp::builtins::lookup_qualified(canonical) {
+        Some(kind) => matches!(
+            kind,
+            sparagmos_interp::builtins::Builtin::MemDrop
+                | sparagmos_interp::builtins::Builtin::Deref
+        ),
+        None => false,
     }
 }
 

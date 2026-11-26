@@ -1029,11 +1029,51 @@ pub(crate) fn collect_const_closure_instances(
                     return;
                 }
                 if !inst.has_body() {
-                    fail_all(
-                        &mut *target_demands,
-                        &owners,
-                        "no MIR body available".to_string(),
-                    );
+                    // A foreign data constructor mentioned by a
+                    // constant (a tuple-struct constructor coerced
+                    // to a `dyn Fn` value in a promoted constant
+                    // is the canonical case) has no MIR body in
+                    // the crate metadata, exactly as in the reach
+                    // walk; synthesize the equivalent body the
+                    // same way before recording the demand unmet.
+                    let fn_def = rustc_public::ty::FnDef(referenced);
+                    match sparagmos_driver::reach::synthetic_ctor_body(
+                        &mut *conv,
+                        &fn_def,
+                        &inst,
+                    ) {
+                        Some(sbody)
+                            if sparagmos_driver::reach::unrepresentable_local(&sbody)
+                                .is_none() =>
+                        {
+                            *taken += 1;
+                            let counts = (
+                                sbody.basic_blocks.len(),
+                                sbody.local_decls.len(),
+                                sbody.arg_count,
+                            );
+                            let display = if plain_taken.insert(referenced) {
+                                base_name.clone()
+                            } else {
+                                format!("{} [{}]", base_name, inst.name())
+                            };
+                            bodies.push((display, sbody));
+                            body_def_ids.push(collected_id);
+                            body_def_names.push(base_name.clone());
+                            let demand = target_demands.entry(referenced).or_default();
+                            demand.converted += 1;
+                            if demand.first_counts.is_none() {
+                                demand.first_counts = Some(counts);
+                            }
+                        }
+                        _ => {
+                            fail_all(
+                                &mut *target_demands,
+                                &owners,
+                                "no MIR body available".to_string(),
+                            );
+                        }
+                    }
                     return;
                 }
                 let Some(ibody) = sparagmos_driver::convert::with_body_materialization(
@@ -1231,11 +1271,51 @@ pub(crate) fn collect_const_fn_instances(
                     return;
                 }
                 if !inst.has_body() {
-                    fail_all(
-                        &mut *target_demands,
-                        &owners,
-                        "no MIR body available".to_string(),
-                    );
+                    // A foreign data constructor mentioned by a
+                    // constant (a tuple-struct constructor coerced
+                    // to a `dyn Fn` value in a promoted constant
+                    // is the canonical case) has no MIR body in
+                    // the crate metadata, exactly as in the reach
+                    // walk; synthesize the equivalent body the
+                    // same way before recording the demand unmet.
+                    let fn_def = rustc_public::ty::FnDef(referenced);
+                    match sparagmos_driver::reach::synthetic_ctor_body(
+                        &mut *conv,
+                        &fn_def,
+                        &inst,
+                    ) {
+                        Some(sbody)
+                            if sparagmos_driver::reach::unrepresentable_local(&sbody)
+                                .is_none() =>
+                        {
+                            *taken += 1;
+                            let counts = (
+                                sbody.basic_blocks.len(),
+                                sbody.local_decls.len(),
+                                sbody.arg_count,
+                            );
+                            let display = if plain_taken.insert(referenced) {
+                                base_name.clone()
+                            } else {
+                                format!("{} [{}]", base_name, inst.name())
+                            };
+                            bodies.push((display, sbody));
+                            body_def_ids.push(collected_id);
+                            body_def_names.push(base_name.clone());
+                            let demand = target_demands.entry(referenced).or_default();
+                            demand.converted += 1;
+                            if demand.first_counts.is_none() {
+                                demand.first_counts = Some(counts);
+                            }
+                        }
+                        _ => {
+                            fail_all(
+                                &mut *target_demands,
+                                &owners,
+                                "no MIR body available".to_string(),
+                            );
+                        }
+                    }
                     return;
                 }
                 let Some(ibody) = sparagmos_driver::convert::with_body_materialization(

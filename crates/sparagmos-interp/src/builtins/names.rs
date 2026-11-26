@@ -139,6 +139,25 @@ fn is_lifetime_list(inner: &str) -> bool {
 /// dispatch keys on, e.g. `i32`, `&str`, `std::ops::Range<usize>`,
 /// `[i32; 4]`. ADT names come from the driver's name table.
 pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
+    ty_tag_impl(ty, names, false)
+}
+
+/// Render a `sparagmos-mir` type the way the driver spells it in
+/// instance names (`<Foo<fn(&'static u8)> as Trait>::method`): the
+/// same rendering as [`ty_tag`] except that a reference renders
+/// its region (`'static` or a named lifetime). This is the
+/// spelling vtable identities are keyed by, so it is the rendering
+/// a `dyn` value's recorded concrete type must use for the
+/// dispatch lookup to find the impl body the driver registered
+/// under the instance name. (A higher-ranked function pointer
+/// still renders without its binder: conversion drops the binder,
+/// so the two spellings of a bound region are erased alike — a
+/// documented limit of the type model.)
+pub fn ty_tag_full(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
+    ty_tag_impl(ty, names, true)
+}
+
+fn ty_tag_impl(ty: &mir::Ty, names: &HashMap<mir::DefId, String>, full: bool) -> String {
     use mir::Ty as T;
     // A type in a nested position (a pointer's pointee, a
     // generic argument, a tuple element, a signature part):
@@ -146,12 +165,12 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
     // the debuginfo spelling (`Box<(dyn Send + Sync)>`,
     // `&(dyn Trait + Send)`), where a bare `dyn` at the top
     // level is not.
-    fn nested(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
+    fn nested(ty: &mir::Ty, names: &HashMap<mir::DefId, String>, full: bool) -> String {
         match ty {
             T::Dynamic(bounds, ..) if bounds.len() > 1 => {
-                format!("({})", ty_tag(ty, names))
+                format!("({})", ty_tag_impl(ty, names, full))
             }
-            _ => ty_tag(ty, names),
+            _ => ty_tag_impl(ty, names, full),
         }
     }
     match ty {
@@ -166,7 +185,7 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             if ts.is_empty() {
                 "()".to_string()
             } else {
-                let parts: Vec<String> = ts.iter().map(|t| nested(t, names)).collect();
+                let parts: Vec<String> = ts.iter().map(|t| nested(t, names, full)).collect();
                 if parts.len() == 1 {
                     format!("({},)", parts[0])
                 } else {
@@ -179,16 +198,25 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
                 mir::ArrayLen::Known(n) => n.to_string(),
                 _ => "_".to_string(),
             };
-            format!("[{}; {n}]", nested(elem, names))
+            format!("[{}; {n}]", nested(elem, names, full))
         }
-        T::Slice(elem) => format!("[{}]", nested(elem, names)),
-        T::Ref(_, inner, mutability) => {
+        T::Slice(elem) => format!("[{}]", nested(elem, names, full)),
+        T::Ref(region, inner, mutability) => {
             let m = if matches!(mutability, mir::Mutability::Mut) {
                 "mut "
             } else {
                 ""
             };
-            format!("&{m}{}", nested(inner, names))
+            let r = if full {
+                match region {
+                    mir::Region::Static => "'static ".to_string(),
+                    mir::Region::Named(name) => format!("'{name} "),
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            format!("&{r}{m}{}", nested(inner, names, full))
         }
         T::RawPtr(inner, mutability) => {
             let m = if matches!(mutability, mir::Mutability::Mut) {
@@ -196,7 +224,7 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             } else {
                 "const"
             };
-            format!("*{m} {}", nested(inner, names))
+            format!("*{m} {}", nested(inner, names, full))
         }
         T::Adt(def, args) | T::Closure(def, args) => {
             // A closure type is identified by its definition's
@@ -212,7 +240,7 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             if args.is_empty() {
                 base
             } else {
-                let parts: Vec<String> = args.iter().map(|t| nested(t, names)).collect();
+                let parts: Vec<String> = args.iter().map(|t| nested(t, names, full)).collect();
                 format!("{base}<{}>", parts.join(", "))
             }
         }
@@ -243,54 +271,85 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             if args.is_empty() {
                 base
             } else {
-                let parts: Vec<String> = args.iter().map(|t| nested(t, names)).collect();
+                let parts: Vec<String> = args.iter().map(|t| nested(t, names, full)).collect();
                 format!("{base}<{}>", parts.join(", "))
             }
         }
         T::FnPtr(sig) => {
-            // A function pointer's tag is its full signature,
-            // in the spelling the compiler's debuginfo gives
-            // it (`extern "system" fn(isize) -> usize`): the
-            // signature is the type's identity for a debugger
-            // type query, and it is fully present at this
-            // level even though the IR type drops it.
-            let mut out = String::new();
-            if matches!(sig.safety, mir::Safety::Unsafe) {
-                out.push_str("unsafe ");
-            }
-            match &sig.abi {
-                mir::Abi::Rust => {}
-                mir::Abi::C => out.push_str("extern \"C\" "),
-                mir::Abi::System => out.push_str("extern \"system\" "),
-                mir::Abi::Stdcall => out.push_str("extern \"stdcall\" "),
-                mir::Abi::Fastcall => out.push_str("extern \"fastcall\" "),
-                mir::Abi::RustCall => out.push_str("extern \"RustCall\" "),
-                mir::Abi::RustIntrinsic => {
-                    out.push_str("extern \"rust-intrinsic\" ")
+            if full {
+                // The instance-name spelling: the abi is folded
+                // the way the driver's names fold it, and an abi
+                // outside that set keeps the kind name.
+                let abi = match &sig.abi {
+                    mir::Abi::Rust | mir::Abi::RustCall | mir::Abi::RustIntrinsic => "",
+                    mir::Abi::C => "extern \"C\" ",
+                    mir::Abi::System => "extern \"system\" ",
+                    _ => return "FnPtr".to_string(),
+                };
+                let safety = if matches!(sig.safety, mir::Safety::Unsafe) {
+                    "unsafe "
+                } else {
+                    ""
+                };
+                let mut parts: Vec<String> = sig
+                    .inputs
+                    .iter()
+                    .map(|t| ty_tag_impl(t, names, full))
+                    .collect();
+                if sig.c_variadic {
+                    parts.push("...".to_string());
                 }
-                mir::Abi::Unadjusted => {
-                    out.push_str("extern \"unadjusted\" ")
+                let out = if matches!(&*sig.output, T::Tuple(ts) if ts.is_empty()) {
+                    String::new()
+                } else {
+                    format!(" -> {}", ty_tag_impl(&sig.output, names, full))
+                };
+                format!("{abi}{safety}fn({}){out}", parts.join(", "))
+            } else {
+                // A function pointer's tag is its full signature,
+                // in the spelling the compiler's debuginfo gives
+                // it (`extern "system" fn(isize) -> usize`): the
+                // signature is the type's identity for a debugger
+                // type query, and it is fully present at this
+                // level even though the IR type drops it.
+                let mut out = String::new();
+                if matches!(sig.safety, mir::Safety::Unsafe) {
+                    out.push_str("unsafe ");
                 }
-                mir::Abi::Other(name) => {
-                    out.push_str(&format!("extern \"{name}\" "))
+                match &sig.abi {
+                    mir::Abi::Rust => {}
+                    mir::Abi::C => out.push_str("extern \"C\" "),
+                    mir::Abi::System => out.push_str("extern \"system\" "),
+                    mir::Abi::Stdcall => out.push_str("extern \"stdcall\" "),
+                    mir::Abi::Fastcall => out.push_str("extern \"fastcall\" "),
+                    mir::Abi::RustCall => out.push_str("extern \"RustCall\" "),
+                    mir::Abi::RustIntrinsic => {
+                        out.push_str("extern \"rust-intrinsic\" ")
+                    }
+                    mir::Abi::Unadjusted => {
+                        out.push_str("extern \"unadjusted\" ")
+                    }
+                    mir::Abi::Other(name) => {
+                        out.push_str(&format!("extern \"{name}\" "))
+                    }
                 }
-            }
-            out.push_str("fn(");
-            let parts: Vec<String> =
-                sig.inputs.iter().map(|t| nested(t, names)).collect();
-            out.push_str(&parts.join(", "));
-            if sig.c_variadic {
-                if !parts.is_empty() {
-                    out.push_str(", ");
+                out.push_str("fn(");
+                let parts: Vec<String> =
+                    sig.inputs.iter().map(|t| nested(t, names, full)).collect();
+                out.push_str(&parts.join(", "));
+                if sig.c_variadic {
+                    if !parts.is_empty() {
+                        out.push_str(", ");
+                    }
+                    out.push_str("...");
                 }
-                out.push_str("...");
+                out.push(')');
+                if !sig.output.is_unit() {
+                    out.push_str(" -> ");
+                    out.push_str(&nested(&sig.output, names, full));
+                }
+                out
             }
-            out.push(')');
-            if !sig.output.is_unit() {
-                out.push_str(" -> ");
-                out.push_str(&nested(&sig.output, names));
-            }
-            out
         }
         T::Param(_, name) => name.clone(),
         T::Dynamic(bounds, ..) => {
