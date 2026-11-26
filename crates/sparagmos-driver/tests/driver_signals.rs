@@ -31,6 +31,10 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn run_driver(src: &Path, aux: &Path) -> Output {
+    run_driver_args(src, aux, &[])
+}
+
+fn run_driver_args(src: &Path, aux: &Path, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
         .arg("run")
         .arg(src)
@@ -38,9 +42,34 @@ fn run_driver(src: &Path, aux: &Path) -> Output {
         .arg("2021")
         .arg("--aux")
         .arg(format!("sigaux={}", aux.display()))
+        .args(extra)
         .env("RUSTC_BOOTSTRAP", "1")
         .output()
         .expect("failed to run sparagmos-driver")
+}
+
+fn run_ok_args(
+    tag: &str,
+    aux_src: &str,
+    main_src: &str,
+    extra: &[&str],
+    expected_stdout: &str,
+) {
+    let dir = temp_dir(tag);
+    let aux = fixture(&dir, "sigaux.rs", aux_src);
+    let src = fixture(&dir, "case.rs", main_src);
+    let out = run_driver_args(&src, &aux, extra);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "case {tag} must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected_stdout,
+        "case {tag} stdout mismatch; stderr={stderr}"
+    );
 }
 
 fn run_ok(tag: &str, aux_src: &str, main_src: &str, expected_stdout: &str) {
@@ -239,13 +268,16 @@ fn run_mode_sigaction_sig_ign_and_refusals() {
     run_ok("ign", IGN_AUX, IGN_MAIN, "survived\nrefusals ok\n");
 }
 
-/// A query (null `act`) of a signal no earlier call
-/// installed an action for — the shape of the
+/// A query (null `act`) before the guest itself has
+/// installed anything — the shape of the
 /// `tests/ui/runtime/on-broken-pipe` records, whose helper
-/// reads the SIGPIPE disposition back before anything in
-/// the guest has installed one. The answer is the default
-/// disposition: an all-zero structure, written over
-/// whatever the answer buffer already held.
+/// reads the SIGPIPE disposition back at startup. For
+/// SIGPIPE the answer is the disposition the runtime
+/// initialisation installed (`SIG_IGN` under the default
+/// setup): an all-zero structure apart from the handler,
+/// written over whatever the answer buffer already held.
+/// A signal the runtime does not set up (SIGTERM here)
+/// answers with the default disposition instead.
 const QUERY_AUX: &str = r#"
 #![feature(rustc_private)]
 extern crate libc;
@@ -256,11 +288,13 @@ pub fn run() {
     unsafe {
         // The on-broken-pipe helper's shape: a zeroed
         // buffer, a null action, the handler read back.
+        // The runtime initialisation has installed
+        // SIG_IGN for SIGPIPE before main.
         let mut actual: sigaction = std::mem::zeroed();
         assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut actual), 0);
-        assert_eq!(actual.sa_sigaction, SIG_DFL);
+        assert_eq!(actual.sa_sigaction, SIG_IGN);
         assert_eq!(actual.sa_flags, 0);
-        println!("default query ok");
+        println!("init query ok");
 
         // Non-zero field values in the answer buffer are
         // overwritten, not left behind.
@@ -268,26 +302,27 @@ pub fn run() {
         seeded.sa_sigaction = 0xABAB as sighandler_t;
         seeded.sa_flags = 0x1234;
         assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut seeded), 0);
-        assert_eq!(seeded.sa_sigaction, SIG_DFL);
+        assert_eq!(seeded.sa_sigaction, SIG_IGN);
         assert_eq!(seeded.sa_flags, 0);
         println!("seeded query ok");
 
-        // Another never-installed signal answers the same.
+        // A signal the runtime does not set up answers
+        // with the default disposition.
         let mut other: sigaction = std::mem::zeroed();
         assert_eq!(sigaction(SIGTERM, std::ptr::null(), &mut other), 0);
         assert_eq!(other.sa_sigaction, SIG_DFL);
 
-        // Installing afterwards reports the default as the
-        // previous disposition, and a query then reports
-        // the installed disposition.
+        // Installing afterwards reports the runtime's
+        // disposition as the previous one, and a query
+        // then reports the installed disposition.
         let mut action: sigaction = std::mem::zeroed();
-        action.sa_sigaction = SIG_IGN as sighandler_t;
+        action.sa_sigaction = SIG_DFL as sighandler_t;
         let mut prev: sigaction = std::mem::zeroed();
         assert_eq!(sigaction(SIGPIPE, &action, &mut prev), 0);
-        assert_eq!(prev.sa_sigaction, SIG_DFL);
+        assert_eq!(prev.sa_sigaction, SIG_IGN);
         let mut now: sigaction = std::mem::zeroed();
         assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut now), 0);
-        assert_eq!(now.sa_sigaction, SIG_IGN);
+        assert_eq!(now.sa_sigaction, SIG_DFL);
         println!("round trip ok");
     }
 }
@@ -302,12 +337,132 @@ fn main() {
 "#;
 
 #[test]
-fn run_mode_sigaction_query_of_never_installed_signal() {
+fn run_mode_sigaction_query_of_runtime_init_and_never_installed() {
     run_ok(
         "query",
         QUERY_AUX,
         QUERY_MAIN,
-        "default query ok\nseeded query ok\nround trip ok\n",
+        "init query ok\nseeded query ok\nround trip ok\n",
+    );
+}
+
+/// The startup SIGPIPE disposition under each
+/// `-Zon-broken-pipe` mode the driver resolves: `kill`
+/// and `inherit` leave the default handler in place,
+/// `error` installs `SIG_IGN` (as the default setup
+/// does, which the query test above covers).
+const MODE_AUX: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+use libc::*;
+
+pub fn run() {
+    unsafe {
+        let mut actual: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut actual), 0);
+        println!("handler {}", actual.sa_sigaction);
+    }
+}
+"#;
+
+const MODE_MAIN: &str = r#"
+extern crate sigaux;
+
+fn main() {
+    sigaux::run();
+}
+"#;
+
+#[test]
+fn run_mode_sigpipe_kill_mode_query() {
+    run_ok_args(
+        "killmode",
+        MODE_AUX,
+        MODE_MAIN,
+        &["--rustc-arg", "-Zon-broken-pipe=kill"],
+        "handler 0\n",
+    );
+}
+
+#[test]
+fn run_mode_sigpipe_inherit_mode_query() {
+    run_ok_args(
+        "inheritmode",
+        MODE_AUX,
+        MODE_MAIN,
+        &["--rustc-arg", "-Zon-broken-pipe=inherit"],
+        "handler 0\n",
+    );
+}
+
+#[test]
+fn run_mode_sigpipe_error_mode_query() {
+    run_ok_args(
+        "errormode",
+        MODE_AUX,
+        MODE_MAIN,
+        &["--rustc-arg", "-Zon-broken-pipe=error"],
+        "handler 1\n",
+    );
+}
+
+/// The disposition a spawned child starts with (std's
+/// spawn-time rule, exercised end to end through the
+/// process host): under the default setup the child is
+/// reset to `SIG_DFL`, so a shell that raises SIGPIPE
+/// on itself dies of it; under `-Zon-broken-pipe=error`
+/// the child inherits the guest's `SIG_IGN` and
+/// survives.
+const CHILD_MAIN: &str = r#"
+fn main() {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("kill -PIPE $$; echo survived")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    println!("child stdout: {}", text.trim());
+    println!("child success: {}", out.status.success());
+}
+"#;
+
+#[test]
+fn run_mode_sigpipe_child_disposition() {
+    let dir = temp_dir("child");
+    let aux = fixture(&dir, "sigaux.rs", MODE_AUX);
+    let src = fixture(&dir, "case.rs", CHILD_MAIN);
+    let out = run_driver_args(&src, &aux, &["--guest-process-host"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "default-mode case must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "child stdout: \nchild success: false\n",
+        "default-mode child must be reset to SIG_DFL; stderr={stderr}"
+    );
+    let out = run_driver_args(
+        &src,
+        &aux,
+        &[
+            "--guest-process-host",
+            "--rustc-arg",
+            "-Zon-broken-pipe=error",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "error-mode case must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "child stdout: survived\nchild success: true\n",
+        "error-mode child must inherit SIG_IGN; stderr={stderr}"
     );
 }
 

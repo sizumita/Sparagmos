@@ -142,6 +142,14 @@ pub struct ProcessSpawnRequest {
     pub stdin: ProcessStdio,
     pub stdout: ProcessStdio,
     pub stderr: ProcessStdio,
+    /// The `SIGPIPE` disposition the child must start
+    /// with (0 for `SIG_DFL`, 1 for `SIG_IGN`), as the
+    /// guest's spawn semantics resolve it (see
+    /// `Interpreter::child_sigpipe` in the signal
+    /// model): the host arranges it in the child before
+    /// exec, since the host process's own runtime setup
+    /// follows its own rule, not the guest's.
+    pub child_sigpipe: u64,
 }
 
 /// The outcome of one finished child process: its exit code

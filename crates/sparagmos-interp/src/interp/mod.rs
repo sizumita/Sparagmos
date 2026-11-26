@@ -60,7 +60,7 @@ pub use host::{
     ToolRunner,
 };
 pub use state::FmtBuilderKind;
-pub(crate) use signals::SignalAction;
+pub(crate) use signals::{SignalAction, SIGPIPE};
 
 pub(crate) use address::*;
 pub(crate) use arith::*;
@@ -92,6 +92,63 @@ pub(crate) use values::*;
 /// operation's step cost, so lock-step protocols are not
 /// chopped mid-operation.
 pub const DEFAULT_THREAD_QUANTUM: usize = 256;
+
+/// How the guest program's runtime initialisation sets
+/// up `SIGPIPE` before `main` runs: the `sigpipe` value
+/// the code the compiler generates hands to `lang_start`
+/// (see `compiler/rustc_session/src/config/sigpipe.rs`,
+/// whose constants std's `reset_sigpipe` duplicates).
+/// The driver resolves it from the compilation the way
+/// the compiler does (see `InterpConfig::sigpipe`); the
+/// interpreter seeds the disposition it names into the
+/// signal model at construction, since the entry the
+/// interpreter runs is `main` itself and the runtime
+/// initialisation is not guest code it executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigpipeInit {
+    /// Neither `-Zon-broken-pipe` nor `#[unix_sigpipe]`:
+    /// the runtime installs `SIG_IGN`. A child the guest
+    /// spawns has `SIGPIPE` reset to `SIG_DFL` before
+    /// exec (std's spawn-time rule for the default
+    /// setup).
+    Default,
+    /// `-Zon-broken-pipe=inherit` or
+    /// `#[unix_sigpipe = "inherit"]`: the runtime
+    /// installs nothing; the guest keeps the disposition
+    /// it started with, and children inherit the guest's.
+    Inherit,
+    /// `-Zon-broken-pipe=error` or
+    /// `#[unix_sigpipe = "sig_ign"]`: the runtime
+    /// installs `SIG_IGN`, and children inherit the
+    /// guest's disposition.
+    Ignore,
+    /// `-Zon-broken-pipe=kill` or
+    /// `#[unix_sigpipe = "sig_dfl"]`: the runtime
+    /// installs `SIG_DFL`, and children inherit the
+    /// guest's disposition.
+    SigDfl,
+}
+
+impl SigpipeInit {
+    /// The handler the runtime initialisation installs
+    /// for `SIGPIPE` (`SIG_IGN` = 1, `SIG_DFL` = 0), or
+    /// `None` when it installs nothing.
+    pub(crate) fn rt_init_handler(self) -> Option<u64> {
+        match self {
+            SigpipeInit::Default | SigpipeInit::Ignore => Some(1),
+            SigpipeInit::SigDfl => Some(0),
+            SigpipeInit::Inherit => None,
+        }
+    }
+
+    /// Whether the compilation named a `SIGPIPE` mode
+    /// explicitly (std's `on_broken_pipe_used`): a
+    /// spawned child then inherits the guest's
+    /// disposition instead of being reset to `SIG_DFL`.
+    pub(crate) fn on_broken_pipe_used(self) -> bool {
+        self != SigpipeInit::Default
+    }
+}
 
 /// Interpreter limits / configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +216,14 @@ pub struct InterpConfig {
     /// non-unwinding line) never appears. Defaults to `false`
     /// (the unwind strategy).
     pub panic_abort: bool,
+    /// The guest's `SIGPIPE` setup, as the driver
+    /// resolved it from the compilation's flags (see
+    /// [`SigpipeInit`]). The disposition it names is
+    /// seeded into the signal model before the entry
+    /// runs, and the child-process rule reads the mode
+    /// at spawn time. Defaults to
+    /// [`SigpipeInit::Default`].
+    pub sigpipe: SigpipeInit,
     /// Tool interception for this run (see [`ToolInterception`]);
     /// `None` keeps the process model's standing behaviour, under
     /// which no child process ever starts.
@@ -191,6 +256,7 @@ impl Default for InterpConfig {
             program_path: String::new(),
             overflow_checks: true,
             panic_abort: false,
+            sigpipe: SigpipeInit::Default,
             tool_interception: None,
             process_host: None,
             stdout_sink: None,
@@ -891,6 +957,16 @@ impl<'a> Interpreter<'a> {
     }
 
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {
+        // The runtime initialisation's `SIGPIPE`
+        // disposition is part of the process state the
+        // entry starts with (see `SigpipeInit`).
+        let sigpipe_actions = match config.sigpipe.rt_init_handler() {
+            Some(handler) => HashMap::from([(
+                SIGPIPE,
+                SignalAction::runtime_init(handler),
+            )]),
+            None => HashMap::new(),
+        };
         Interpreter {
             program,
             config,
@@ -956,7 +1032,7 @@ impl<'a> Interpreter<'a> {
             ),
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
-            signal_actions: std::cell::RefCell::new(HashMap::new()),
+            signal_actions: std::cell::RefCell::new(sigpipe_actions),
             exit_handlers: std::cell::RefCell::new(Vec::new()),
             current_thread: std::cell::Cell::new(1),
             sync_nesting: std::cell::Cell::new(0),
