@@ -573,6 +573,21 @@ pub struct Interpreter<'a> {
     /// [`ThreadSlot`]), keyed by thread id. The entry thread is
     /// id 1, matching `std`'s numbering of the main thread.
     threads: std::cell::RefCell<HashMap<u64, ThreadSlot>>,
+    /// The ids of the threads that can still be activated:
+    /// a spawned thread whose callable has not been taken yet,
+    /// or a started thread currently parked (see
+    /// [`ThreadSlot`]). Maintained incrementally where a
+    /// slot's `callable` / `parked` is taken, restored or
+    /// installed (all in the thread model), so scheduling
+    /// rounds, drains and the per-statement yield decision
+    /// iterate this set — whose size is the number of *live*
+    /// threads — instead of scanning the whole thread table,
+    /// whose size is the number of threads *ever spawned* (the
+    /// table keeps finished threads' outcomes for `join`). A
+    /// stress program that spawns tens of thousands of threads
+    /// otherwise pays a full-table scan for every scheduling
+    /// decision (issue #399).
+    pending_threads: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// The id the next spawned thread gets.
     next_thread: std::cell::RefCell<u64>,
     /// Thread-local destructors registered through std's
@@ -936,6 +951,9 @@ impl<'a> Interpreter<'a> {
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
+            pending_threads: std::cell::RefCell::new(
+                std::collections::BTreeSet::new(),
+            ),
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
             signal_actions: std::cell::RefCell::new(HashMap::new()),
@@ -1211,15 +1229,28 @@ impl<'a> Interpreter<'a> {
     /// frame it was suspended above is still on the stack (see
     /// [`ParkedThread`]).
     fn other_thread_runnable(&self, frames: &[Frame], except: u64) -> bool {
-        self.threads.borrow().iter().any(|(id, slot)| {
-            *id != except
-                && (slot.callable.is_some()
-                    || slot.parked.as_ref().is_some_and(|parked| {
-                        parked
-                            .below
-                            .iter()
-                            .all(|fid| frames.iter().any(|f| f.id == *fid))
-                    }))
+        // Only live threads can be runnable, so walk the
+        // pending set (see the `pending_threads` field) rather
+        // than the whole thread table.
+        let candidates: Vec<u64> = self
+            .pending_threads
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|id| *id != except)
+            .collect();
+        let threads = self.threads.borrow();
+        candidates.iter().any(|id| {
+            let Some(slot) = threads.get(id) else {
+                return false;
+            };
+            slot.callable.is_some()
+                || slot.parked.as_ref().is_some_and(|parked| {
+                    parked
+                        .below
+                        .iter()
+                        .all(|fid| frames.iter().any(|f| f.id == *fid))
+                })
         })
     }
 
