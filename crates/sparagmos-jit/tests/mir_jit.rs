@@ -169,6 +169,7 @@ fn build_with_table(
             })
             .collect(),
         fn_names: names,
+        fn_display_names: Default::default(),
         fn_abis: Default::default(),
         coverage: Default::default(),
         adt_discriminants: table,

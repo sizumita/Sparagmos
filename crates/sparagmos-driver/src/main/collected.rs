@@ -128,6 +128,11 @@ pub(crate) struct Collected {
     /// compilation was instrumented for coverage (see
     /// `sparagmos_driver::coverage`); empty otherwise.
     pub(crate) coverage: sparagmos_mir::CoverageMapping,
+    /// Debugger display names of the resolved function
+    /// instances (see
+    /// `sparagmos_driver::convert::drain_fn_display_names`),
+    /// for the interpreter's program. Empty outside debug mode.
+    pub(crate) fn_display_names: Vec<(String, String)>,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();

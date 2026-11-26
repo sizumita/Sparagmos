@@ -582,6 +582,7 @@ fn driver_main_inner() {
         std::sync::atomic::Ordering::Relaxed,
     );
     let debug_mode = mode == Mode::Debug;
+    sparagmos_driver::convert::set_debug_session(debug_mode);
     // The debug entry point compiles and collects exactly like
     // run mode (it executes the same program, under a debugger
     // session), so every compilation-shaping and error-contract

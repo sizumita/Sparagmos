@@ -2401,6 +2401,19 @@ pub struct Program {
     /// Carried from the driver's table; empty for hand-built
     /// programs.
     pub source_files: Vec<String>,
+    /// Debugger display names of the program's function
+    /// instances: `(display name, declaration signature)`
+    /// pairs the driver recorded at conversion, naming each
+    /// resolved instance the way the compiler's debug info
+    /// does (generic arguments substituted, `{impl#N}` /
+    /// `{closure#N}` path segments, a closure's single
+    /// environment-pointer parameter). The debugger's
+    /// function listing renders these entries and lets an
+    /// entry take precedence over the body-derived
+    /// declaration of the same name. Empty for hand-built
+    /// programs and for programs collected outside a debug
+    /// session.
+    pub fn_display_names: Vec<(String, String)>,
     /// Per-field scalar shapes of the program's union instances,
     /// indexed by the `table` of [`ProjectionElem::UnionField`]:
     /// entry `t` is one union instance's field list, in field

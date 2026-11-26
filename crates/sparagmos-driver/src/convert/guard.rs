@@ -264,6 +264,7 @@ pub fn resolve_instance_guarded(
         note_resolution_emission(&inst.name());
         return None;
     }
+    record_fn_instance(&inst);
     Some(inst)
 }
 
@@ -289,6 +290,7 @@ pub fn resolve_closure_guarded(
         note_resolution_emission(&inst.name());
         return None;
     }
+    record_fn_instance(&inst);
     Some(inst)
 }
 

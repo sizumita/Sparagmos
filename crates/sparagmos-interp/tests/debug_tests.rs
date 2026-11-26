@@ -765,6 +765,59 @@ fn info_functions_lists_bodies_in_both_declaration_forms() {
 }
 
 #[test]
+fn info_functions_prefers_the_display_name_table() {
+    let mut p = program_with_vars(vec![]);
+    // A body whose key already spells the instance the DWARF
+    // way but whose own local types would render a bare
+    // signature: the table's signature must take its place.
+    p.add_function(Body::new(
+        "x::generic_func<i32>",
+        0,
+        vec![Ty::Unit],
+        vec![BasicBlockData::new(vec![], TerminatorKind::Return)],
+    ));
+    p.fn_display_names = vec![
+        (
+            "x::generic_func<i32>".to_string(),
+            "(i32) -> i32".to_string(),
+        ),
+        // An instance with no converted body is listed from
+        // the table alone.
+        ("x::helper<u8>".to_string(), "()".to_string()),
+    ];
+    let mut s = session(p);
+    let run = s.run_script(
+        vec![
+            DebugCommand::InfoFunctions { pattern: None, quiet: true },
+            DebugCommand::InfoFunctions {
+                pattern: Some("helper".to_string()),
+                quiet: true,
+            },
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "static fn x::generic_func<i32>(i32) -> i32;",
+        "static fn x::helper<u8>();",
+        "static fn main() -> i64;",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+    assert!(
+        !run.transcript
+            .iter()
+            .any(|l| l == "static fn x::generic_func<i32>();"),
+        "body-derived signature leaked: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
 fn info_locals_lists_live_locals_and_honours_limited_debuginfo() {
     let mut s = session(typed_scalar_program());
     s.set_breakpoint("test.rs", 3);

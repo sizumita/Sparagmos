@@ -1502,6 +1502,7 @@ fn collect() -> ControlFlow<()> {
         link_symbols: conv.link_symbols.clone(),
         source_files: conv.source_files.clone(),
         coverage,
+        fn_display_names: sparagmos_driver::convert::drain_fn_display_names(),
     });
     ControlFlow::Continue(())
 }
