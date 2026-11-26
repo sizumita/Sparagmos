@@ -550,6 +550,94 @@ fn run_mode_btree_set_multilevel_remove() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "count=58 sum=2523\n");
 }
 
+const BTREE_SET_HEIGHT2_INSERT_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let mut s = BTreeSet::new();
+    for i in 0..200 {
+        s.insert(i);
+    }
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_height2_insert() {
+    // A set grown by insertion until the root itself
+    // splits (height 2): the split moves the right half of
+    // the full internal root's keys and edges into a new
+    // internal node, and iteration afterwards reads every
+    // element back in order.
+    let dir = temp_dir("btreesetheight2");
+    let src = fixture(&dir, "btreesetheight2.rs", BTREE_SET_HEIGHT2_INSERT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a height-2 BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=200 sum=19900\n");
+}
+
+const BTREE_SET_HEIGHT2_FROM_ITER_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let s: BTreeSet<i32> = (0..150).collect();
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_height2_from_iter() {
+    // The same height-2 shape produced by the bulk build:
+    // pushing past a full root creates the second level,
+    // and iteration reads every element back in order.
+    let dir = temp_dir("btreesetheight2fi");
+    let src = fixture(
+        &dir,
+        "btreesetheight2fi.rs",
+        BTREE_SET_HEIGHT2_FROM_ITER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a from_iter-built height-2 BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=150 sum=11175\n");
+}
+
+const BTREE_MAP_HEIGHT2_FROM_ITER_SRC: &str = r#"
+use std::collections::BTreeMap;
+fn main() {
+    let m: BTreeMap<i32, i32> = (0..150).map(|i| (i, i * 3)).collect();
+    println!("count={} sum={}", m.iter().count(), m.iter().map(|(k, v)| k + v).sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_height2_from_iter() {
+    // The bulk-built height-2 shape for a map: the second
+    // level's internal nodes carry their separator pairs,
+    // and iteration interleaves them with the leaves.
+    let dir = temp_dir("btreemapheight2fi");
+    let src = fixture(
+        &dir,
+        "btreemapheight2fi.rs",
+        BTREE_MAP_HEIGHT2_FROM_ITER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a from_iter-built height-2 BTreeMap must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=150 sum=44700\n");
+}
+
 const OPTION_BY_VALUE_SRC: &str = r#"
 fn main() {
     let mut n = 0;

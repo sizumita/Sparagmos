@@ -1776,6 +1776,7 @@ pub(crate) fn project_value_ev(
                                 program,
                                 cur_ty.as_ref(),
                                 &value,
+                                *idx,
                             )
                     }
                     _ => false,
@@ -2469,7 +2470,15 @@ pub(crate) fn grow_tuples_along(
     };
     // The wrapper-descent judgment for this node, taken
     // before the walk borrows the value mutably.
-    let sanctioned = wrapper_descent_sanctioned(program, ty.as_ref(), value);
+    let sanctioned = wrapper_descent_sanctioned(
+        program,
+        ty.as_ref(),
+        value,
+        match step {
+            RefProj::Field(idx) => *idx,
+            _ => 0,
+        },
+    );
     let payload_ty = descent_payload_ty(program, ty.as_ref(), value);
     match (value, step) {
         (Value::Tuple(items), RefProj::Index(idx)) => {
@@ -2762,16 +2771,30 @@ fn wrapper_descent_sanctioned(
     program: Option<&Program>,
     ty: Option<&Ty>,
     slot: &Value,
+    idx: usize,
 ) -> bool {
-    let (
-        Some(program),
-        Some(ty),
-        Value::Enum {
-            variant, fields, ..
-        },
-    ) = (program, ty, slot)
-    else {
+    let Value::Enum { variant, fields, .. } = slot else {
         return true;
+    };
+    // The judgment the stored shape alone makes, consulted
+    // whenever the type evidence does not affirmatively
+    // declare a one-field wrapper: a field step the payload
+    // already holds a slot for can be the slot's own field
+    // (a multi-field aggregate materialised field by field,
+    // whose first stored field is an aggregate), and
+    // descending there would write the step into a sibling;
+    // a step the payload holds no slot for can only be
+    // addressed by growing the payload's own fields, which
+    // is what the descent's retry does. (With no program the
+    // field table cannot be consulted either, and the shape
+    // judgment is all there is.)
+    let shape_sanctions = match fields.first() {
+        Some(Value::Enum { fields, .. }) => fields.len() <= idx,
+        Some(Value::Tuple(items)) => items.len() <= idx,
+        _ => false,
+    };
+    let (Some(program), Some(ty)) = (program, ty) else {
+        return shape_sanctions;
     };
     // The declared shape that decides is the *selected*
     // variant's field count (a tuple's element count, for a
@@ -2809,20 +2832,22 @@ fn wrapper_descent_sanctioned(
             (selected.len(), Ty::Adt(name.clone()))
         }
         Ty::Tuple(ts) => (ts.len(), Ty::Tuple(ts.clone())),
-        _ => return true,
+        _ => return shape_sanctions,
     };
     if declared_len == 0 {
         // A type declaring no fields has no sole field whose
         // interior the step could address, and its own value is
         // a unit, never a one-field aggregate: the evidence
-        // cannot describe this slot. That is the shape a type
+        // cannot describe this slot, so it can neither sanction
+        // nor refute — the stored shape decides, as it does
+        // with no evidence at all. That is the shape a type
         // walk produces when it steps through a union's
         // unit-typed field (a `MaybeUninit`'s `uninit` field)
-        // while the value walk selects the union's payload --
-        // the two walks have parted, and the step belongs to
-        // the slot's own stored fields, which the ordinary
-        // field arm grows into place.
-        return false;
+        // while the value walk selects the union's payload:
+        // the two walks have parted, and which side the step
+        // belongs to is a property of the stored form (see
+        // `shape_sanctions` above).
+        return shape_sanctions;
     }
     if declared_len == 1 {
         return true;
@@ -3126,7 +3151,7 @@ pub(crate) fn project_value_ref_ev<'a>(
                     if fields.len() == 1
                         && fields.get(*idx).is_none()
                         && wrapper_payload(&fields[0])
-                        && wrapper_descent_sanctioned(program, cur_ty.as_ref(), cur)
+                        && wrapper_descent_sanctioned(program, cur_ty.as_ref(), cur, *idx)
                     {
                         cur_ty = descent_payload_ty(program, cur_ty.as_ref(), cur);
                         cur = &fields[0];
@@ -3900,7 +3925,7 @@ pub(crate) fn navigate_mut_grow<'x>(
                 // refutes the wrapper, execution falls through
                 // to the field arm below, which grows the value's
                 // own field vector into place.
-                if wrapper_descent_sanctioned(program, ty.as_ref(), slot) {
+                if wrapper_descent_sanctioned(program, ty.as_ref(), slot, *idx) {
                     let slot_variant = match slot {
                         Value::Enum { variant, .. } => *variant as usize,
                         _ => unreachable!("descent checked the shape"),
