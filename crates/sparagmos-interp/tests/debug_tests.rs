@@ -1286,3 +1286,270 @@ fn union_field_print_reinterprets_the_stored_field() {
         );
     }
 }
+
+/// A program whose first statement stores a zero-sized value:
+/// block 0 (line 2) `_1 = const ()` (no code emitted), then
+/// (line 3) `_2 = 40 + 2`; block 1 (line 4) returns `_2`.
+fn zst_first_program() -> Program {
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::i64(), Ty::Unit, Ty::i64()],
+        vec![
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(1),
+                        Rvalue::Use(Operand::const_unit()),
+                    ),
+                    Statement::assign(
+                        Place::from_index(2),
+                        Rvalue::binary(
+                            BinOp::Add,
+                            Operand::const_int(40),
+                            Operand::const_int(2),
+                        ),
+                    ),
+                ],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::copy_local(2)),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines {
+            statements: vec![line(2), line(3)],
+            terminator: line(3),
+        },
+        BlockSourceLines { statements: vec![line(4)], terminator: line(4) },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "x".to_string(),
+        source: DebugVar::Place(2, vec![]),
+        is_char: false,
+        ty: None,
+        lines: (3, 3),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p
+}
+
+const ZST_SOURCE: &str =
+    "fn main() {\n    let a = ();\n    let x = 40 + 2;\n}\n";
+
+#[test]
+fn breakpoint_on_a_zero_sized_line_slides_to_the_next_code_line() {
+    // A native debugger binds a breakpoint on a line whose only
+    // statement emits no code (a zero-sized store) at the next
+    // line that carries code.
+    let mut s = DebugSession::new(
+        zst_first_program(),
+        "main".to_string(),
+        vec![],
+        InterpConfig::default(),
+    );
+    s.set_source_text("test.rs", ZST_SOURCE);
+    s.set_breakpoint("test.rs", 2);
+    let run = s.run_script(vec![DebugCommand::Run], DebugDialect::Gdb);
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "3\t    let x = 40 + 2;"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().all(|l| !l.starts_with("2\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn stepping_never_stops_on_a_zero_sized_line() {
+    let mut s = DebugSession::new(
+        zst_first_program(),
+        "main".to_string(),
+        vec![],
+        InterpConfig::default(),
+    );
+    s.set_source_text("test.rs", ZST_SOURCE);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::Next],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().all(|l| !l.starts_with("2\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+/// A unit-returning main: block 1 stores the unit return value
+/// on the signature line (line 1), as MIR spans `_0 = const ()`
+/// there, before the `Return` on the closing-brace line (3).
+fn unit_return_program() -> Program {
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::i64()],
+        vec![
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::Use(Operand::const_int(42)),
+                )],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines { statements: vec![line(2)], terminator: line(2) },
+        BlockSourceLines { statements: vec![line(1)], terminator: line(3) },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "x".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: None,
+        lines: (2, 2),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p
+}
+
+#[test]
+fn step_over_the_last_statement_lands_on_the_closing_brace_not_the_signature() {
+    let mut s = DebugSession::new(
+        unit_return_program(),
+        "main".to_string(),
+        vec![],
+        InterpConfig::default(),
+    );
+    s.set_source_text("test.rs", "fn main() {\n    let x = 42;\n}\n");
+    s.set_breakpoint("test.rs", 2);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::Next],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "3\t}"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().all(|l| !l.starts_with("1\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+/// The macro-expansion shape: a user statement on line 2, a
+/// compiler temp's store on line 3, and the call that uses the
+/// temp on line 4 (the using terminator's span, after macro
+/// collapse, sits on a different line than the temp's span).
+fn temp_store_program() -> Program {
+    let mut helper = Body::new(
+        "helper",
+        1,
+        vec![Ty::Unit, Ty::i64()],
+        vec![BasicBlockData::new(vec![], TerminatorKind::Return)],
+    );
+    helper.source_lines =
+        vec![BlockSourceLines { statements: vec![], terminator: line(4) }];
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::i64(), Ty::i64(), Ty::Unit],
+        vec![
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(1),
+                        Rvalue::Use(Operand::const_int(1)),
+                    ),
+                    Statement::assign(
+                        Place::from_index(2),
+                        Rvalue::Use(Operand::const_int(2)),
+                    ),
+                ],
+                TerminatorKind::Call {
+                    func: "helper".to_string(),
+                    args: vec![Operand::copy_local(2)],
+                    destination: Place::from_index(3),
+                    target: Some(BasicBlock(1)),
+                },
+            ),
+            BasicBlockData::new(vec![], TerminatorKind::Return),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines {
+            statements: vec![line(2), line(3)],
+            terminator: line(4),
+        },
+        BlockSourceLines { statements: vec![], terminator: line(5) },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "x".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: None,
+        lines: (2, 2),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.add_function(helper);
+    p.source_files = vec!["test.rs".to_string()];
+    p
+}
+
+#[test]
+fn step_over_skips_a_temp_store_for_the_call_it_feeds() {
+    let mut s = DebugSession::new(
+        temp_store_program(),
+        "main".to_string(),
+        vec![],
+        InterpConfig::default(),
+    );
+    s.set_source_text(
+        "test.rs",
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    helper();\n}\n",
+    );
+    s.set_breakpoint("test.rs", 2);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::Next],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "4\t    helper();"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().all(|l| !l.starts_with("3\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+

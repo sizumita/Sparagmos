@@ -1,7 +1,7 @@
 //! Session state and the drive hook: the command vocabulary, the session and its control block, and the stop machinery.
 
 use crate::interp::{Frame, Interpreter};
-use crate::ir::{Body, Program, SourceLine};
+use crate::ir::{Body, Local, Program, SourceLine, Ty};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use super::evaluate::{evaluate_print, render_print};
@@ -323,8 +323,42 @@ impl DebugSession {
     /// reported, the caller names the file it compiled).
     pub fn set_breakpoint(&mut self, file: &str, line: u32) {
         if let Some(id) = self.file_id(file) {
+            let line = self.resolve_breakpoint_line(id, line);
             self.breakpoints.insert((id, line));
         }
+    }
+
+    /// Resolve a requested breakpoint line the way a native
+    /// debugger resolves a linespec: a line no instruction is
+    /// attributed to (a line whose statements are all zero-sized
+    /// stores, storage markers and the like -- they emit no code
+    /// and so carry no line row) binds at the next line of the
+    /// file that does carry code. A line with a code position
+    /// binds at itself; a file with no later code line keeps the
+    /// requested line (the breakpoint then simply never binds).
+    fn resolve_breakpoint_line(&self, file: u32, line: u32) -> u32 {
+        let mut best: Option<u32> = None;
+        for body in self.program.functions.values() {
+            for (block, lines) in body.source_lines.iter().enumerate() {
+                let mut positions = lines
+                    .statements
+                    .iter()
+                    .enumerate()
+                    .map(|(stmt, pos)| (stmt, *pos))
+                    .collect::<Vec<_>>();
+                positions.push((lines.statements.len(), lines.terminator));
+                for (stmt, pos) in positions {
+                    if pos.file == file
+                        && pos.is_known()
+                        && pos.line >= line
+                        && generates_code(body, block, stmt)
+                    {
+                        best = Some(best.map_or(pos.line, |b: u32| b.min(pos.line)));
+                    }
+                }
+            }
+        }
+        best.unwrap_or(line)
     }
 
     /// Hand the session the source text of a file, for rendering
@@ -505,22 +539,21 @@ pub(crate) fn drive_hook(
     block: usize,
     stmt: usize,
 ) {
-    // Storage markers and nops generate no code, so native
-    // debuggers have no line row for them: they are not
-    // positions in the session's stream at all. (A macro block
-    // argument's result temp, for instance, gets a StorageLive
-    // whose span is the `$b` reference in the macro definition;
-    // counting it would stop the session on a line no debugger
-    // can stop on.)
-    if let Some(stmt_ref) = body.blocks.get(block).and_then(|b| b.statements.get(stmt)) {
-        if matches!(
-            stmt_ref.kind,
-            crate::ir::StatementKind::StorageLive(_)
-                | crate::ir::StatementKind::StorageDead(_)
-                | crate::ir::StatementKind::Nop
-        ) {
-            return;
-        }
+    // Positions that generate no code are not positions in the
+    // session's stream at all: native debuggers have no line row
+    // for them, so neither a breakpoint nor a step can stop
+    // there. (A macro block argument's result temp, for
+    // instance, gets a StorageLive whose span is the `$b`
+    // reference in the macro definition; counting it would stop
+    // the session on a line no debugger can stop on. A store of
+    // a zero-sized value -- `let a = ();`, the `_0 = const ()`
+    // a unit-returning body ends with, whose span is the
+    // function's signature line -- likewise emits no store, and
+    // a body's `Return` terminator, by contrast, does carry a
+    // row -- the closing-brace line -- and stepping stops there
+    // before returning to the caller, as gdb's does.)
+    if !generates_code(body, block, stmt) {
+        return;
     }
     let Some(pos) = position(body, block, stmt) else {
         return;
@@ -790,3 +823,84 @@ fn position(body: &Body, block: usize, stmt: usize) -> Option<SourceLine> {
     }
 }
 
+/// Whether native codegen emits code for the position at
+/// (`block`, `stmt`) of `body` -- a statement index past the
+/// block's statements denotes its terminator. Storage markers,
+/// nops and coverage counters emit nothing; a store into a
+/// whole local of a zero-sized type emits no store (the value
+/// has no bytes to write); and a whole-local store into a
+/// compiler temporary is code, but not a statement boundary
+/// (see the `Assign` arm). Everything else -- calls, branches,
+/// stores of sized values, and terminators (a `Return` carries
+/// the closing-brace line's row) -- is code a native line table
+/// carries a row for.
+fn generates_code(body: &Body, block: usize, stmt: usize) -> bool {
+    use crate::ir::StatementKind;
+    let Some(bb) = body.blocks.get(block) else {
+        return false;
+    };
+    if let Some(stmt_ref) = bb.statements.get(stmt) {
+        return match &stmt_ref.kind {
+            StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Nop
+            | StatementKind::Coverage(..) => false,
+            StatementKind::Assign(place, _) => {
+                if place.projection.is_empty() && local_is_zst(body, place.local) {
+                    return false;
+                }
+                // A whole-local store into a compiler temporary
+                // is not a statement boundary either: the temp
+                // holds an operand of the statement that uses
+                // it (a call argument, a return value in
+                // flight), and native line tables mark only the
+                // using statement's row as a statement start
+                // (DWARF `is_stmt`). Inside a macro expansion
+                // the temp's span can sit on a different line
+                // than the using terminator's -- a call
+                // argument's constant on the invocation line,
+                // the call itself collapsed to the macro
+                // definition line -- and counting the temp
+                // would stop the session between the two. A
+                // store is a boundary when it writes the return
+                // place, a named variable (a `debug_vars`
+                // entry), or a projection into an existing
+                // value.
+                !place.projection.is_empty()
+                    || place.local.0 == 0
+                    || body.debug_vars.iter().any(|v| {
+                        matches!(v.source, crate::ir::DebugVar::Place(l, _)
+                            if l == place.local.0)
+                    })
+            }
+            _ => true,
+        };
+    }
+    true
+}
+
+/// Whether `local` of `body` holds a zero-sized value: either
+/// the conversion recorded a canonical value for it (its
+/// `zst_locals` entry, which covers ADT shapes only the layout
+/// can prove), or its type is zero-sized by shape alone.
+fn local_is_zst(body: &Body, local: Local) -> bool {
+    if matches!(body.zst_locals.get(local.0), Some(Some(_))) {
+        return true;
+    }
+    body.local_ty(local).map(ty_is_zst_shape).unwrap_or(false)
+}
+
+/// Whether a type is zero-sized by its shape alone: unit,
+/// tuples of zero-sized types, arrays of zero-sized elements
+/// (and empty arrays), zero-capture closures and function
+/// items. The shape-only subset of `zst_value_of_ty` (see
+/// `interp::byteview`), restated here over the type alone.
+fn ty_is_zst_shape(ty: &Ty) -> bool {
+    match ty {
+        Ty::Unit | Ty::FnDef(_) => true,
+        Ty::Tuple(ts) => ts.iter().all(ty_is_zst_shape),
+        Ty::Array(elem, n) => *n == 0 || ty_is_zst_shape(elem),
+        Ty::Closure(_, 0) => true,
+        _ => false,
+    }
+}
