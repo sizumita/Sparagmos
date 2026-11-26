@@ -3897,6 +3897,141 @@ mod resolved_route_tests {
         );
     }
 
+    /// The unrecorded counterpart of
+    /// `interior_pointer_alloc_write_uses_the_allocations_type`:
+    /// the allocation's creation point recorded no declared
+    /// type, so the only type evidence anywhere is the
+    /// caller's pointee type (`Inner`). The shape-only wrapper
+    /// judgment still roots the navigation at the allocation's
+    /// own aggregate: writing the inner struct's second field
+    /// extends that struct; it does not descend into the first
+    /// field and corrupt it (issue #474, fixed by PR #613).
+    #[test]
+    fn interior_pointer_alloc_write_without_a_recorded_type() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::Inner".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        program.adt_field_tys.insert(
+            "probe::Outer".to_string(),
+            vec![vec![
+                Some(Ty::Int(IntTy::I32)),
+                Some(Ty::Adt("probe::Inner".to_string())),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Int(7),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Field(1)],
+        };
+        interp
+            .write_resolved_typed(
+                &mut frames,
+                &target,
+                Value::Int(30),
+                Some(&Ty::Adt("probe::Inner".to_string())),
+            )
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Int(7),
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                            Value::Int(30),
+                        ],
+                    },
+                ],
+            })
+        );
+    }
+
+    /// The no-evidence counterpart: the allocation has no
+    /// recorded type and the caller supplies no type evidence
+    /// either (`write_resolved`). The shape-only judgment
+    /// alone keeps the write rooted at the allocation's own
+    /// aggregate, so the inner struct's second field is
+    /// materialised and the first field stays intact
+    /// (issue #474, fixed by PR #613).
+    #[test]
+    fn interior_pointer_alloc_write_without_any_type_evidence() {
+        let mut program = Program::default();
+        program.adt_field_tys.insert(
+            "probe::Inner".to_string(),
+            vec![vec![
+                Some(Ty::Tuple(vec![
+                    Ty::Int(IntTy::I32),
+                    Ty::Int(IntTy::I32),
+                ])),
+                Some(Ty::Int(IntTy::I32)),
+            ]],
+        );
+        program.adt_field_tys.insert(
+            "probe::Outer".to_string(),
+            vec![vec![
+                Some(Ty::Int(IntTy::I32)),
+                Some(Ty::Adt("probe::Inner".to_string())),
+            ]],
+        );
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Int(7),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![Value::Int(10), Value::Int(20)])],
+                },
+            ],
+        });
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Field(1), RefProj::Field(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(30))
+            .expect("write");
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Int(7),
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Tuple(vec![Value::Int(10), Value::Int(20)]),
+                            Value::Int(30),
+                        ],
+                    },
+                ],
+            })
+        );
+    }
+
     /// Successive projected writes to a tuple local: the
     /// wrapper descent is judged against the tuple's declared
     /// element types, exactly as for a struct, so the second
