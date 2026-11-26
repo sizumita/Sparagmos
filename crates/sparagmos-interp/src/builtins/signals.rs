@@ -57,18 +57,22 @@ impl<'a> Interpreter<'a> {
                 Some(previous) => previous.act.clone(),
                 // No action was ever installed: the previous
                 // disposition is the default, whose structure
-                // is the installed one's all-zero twin (the
-                // default handler, an empty mask, no flags).
+                // is all zero (the default handler, an empty
+                // mask, no flags, no restorer).
                 None => match &new_action {
+                    // An install names the structure's shape
+                    // in its own action: the default is that
+                    // structure zeroed.
                     Some(action) => zeroed_twin(&action.act),
+                    // A pure query names no shape of its own;
+                    // the buffer the guest hands over for the
+                    // answer carries the structure's shape,
+                    // and zeroing its current contents leaf by
+                    // leaf yields exactly the default
+                    // structure.
                     None => {
-                        return Err(InterpError::UnsupportedTerminator {
-                            kind: format!(
-                                "runtime support: sigaction query of signal \
-                                 {signum}, which no earlier call installed \
-                                 an action for"
-                            ),
-                        });
+                        let current = self.read_resolved(frames, &target)?;
+                        zeroed_twin(&current)
                     }
                 },
             };

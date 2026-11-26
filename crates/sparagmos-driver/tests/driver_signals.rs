@@ -239,6 +239,78 @@ fn run_mode_sigaction_sig_ign_and_refusals() {
     run_ok("ign", IGN_AUX, IGN_MAIN, "survived\nrefusals ok\n");
 }
 
+/// A query (null `act`) of a signal no earlier call
+/// installed an action for — the shape of the
+/// `tests/ui/runtime/on-broken-pipe` records, whose helper
+/// reads the SIGPIPE disposition back before anything in
+/// the guest has installed one. The answer is the default
+/// disposition: an all-zero structure, written over
+/// whatever the answer buffer already held.
+const QUERY_AUX: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+use libc::*;
+
+pub fn run() {
+    unsafe {
+        // The on-broken-pipe helper's shape: a zeroed
+        // buffer, a null action, the handler read back.
+        let mut actual: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut actual), 0);
+        assert_eq!(actual.sa_sigaction, SIG_DFL);
+        assert_eq!(actual.sa_flags, 0);
+        println!("default query ok");
+
+        // Non-zero field values in the answer buffer are
+        // overwritten, not left behind.
+        let mut seeded: sigaction = std::mem::zeroed();
+        seeded.sa_sigaction = 0xABAB as sighandler_t;
+        seeded.sa_flags = 0x1234;
+        assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut seeded), 0);
+        assert_eq!(seeded.sa_sigaction, SIG_DFL);
+        assert_eq!(seeded.sa_flags, 0);
+        println!("seeded query ok");
+
+        // Another never-installed signal answers the same.
+        let mut other: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGTERM, std::ptr::null(), &mut other), 0);
+        assert_eq!(other.sa_sigaction, SIG_DFL);
+
+        // Installing afterwards reports the default as the
+        // previous disposition, and a query then reports
+        // the installed disposition.
+        let mut action: sigaction = std::mem::zeroed();
+        action.sa_sigaction = SIG_IGN as sighandler_t;
+        let mut prev: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGPIPE, &action, &mut prev), 0);
+        assert_eq!(prev.sa_sigaction, SIG_DFL);
+        let mut now: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut now), 0);
+        assert_eq!(now.sa_sigaction, SIG_IGN);
+        println!("round trip ok");
+    }
+}
+"#;
+
+const QUERY_MAIN: &str = r#"
+extern crate sigaux;
+
+fn main() {
+    sigaux::run();
+}
+"#;
+
+#[test]
+fn run_mode_sigaction_query_of_never_installed_signal() {
+    run_ok(
+        "query",
+        QUERY_AUX,
+        QUERY_MAIN,
+        "default query ok\nseeded query ok\nround trip ok\n",
+    );
+}
+
 #[test]
 fn run_mode_atexit_reverse_order() {
     run_ok(
