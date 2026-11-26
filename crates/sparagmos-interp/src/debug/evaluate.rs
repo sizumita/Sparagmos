@@ -329,58 +329,76 @@ fn resolve_static_base(
     })
 }
 
+/// The most pointer layers one implicit dereference follows.
+/// A declared type's chain is finite -- each step consumes one
+/// layer of it -- so the cap only guards a value-level cycle
+/// (a raw pointer whose allocation holds the same reference
+/// again), which no declared type describes and a native
+/// debugger's type-directed field access never follows either.
+const MAX_IMPLICIT_DEREFS: usize = 64;
+
 /// Follow a reference or smart-pointer value to its pointee:
 /// the (pointee, pointee descriptor) when the value is one, the
 /// value itself otherwise. Field and index steps apply this
 /// first, as a debugger's field access dereferences through
-/// references and smart pointers implicitly.
+/// references and smart pointers implicitly. The dereference
+/// repeats while the result is itself a pointer: a field step
+/// on a `Box<Box<Struct>>` reaches the struct however many
+/// smart-pointer layers wrap it, the reading gdb applies.
 fn deref_if_pointer(
     interp: &Interpreter,
     frames: &[Frame],
-    value: Value,
-    desc: Option<Desc>,
+    mut value: Value,
+    mut desc: Option<Desc>,
 ) -> Result<(Value, Option<Desc>), String> {
-    let is_pointer = matches!(
-        value,
-        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
-    ) || matches!(&desc, Some(Desc::Adt(tag)) if smart_pointer_pointee(tag).is_some());
-    if !is_pointer {
-        return Ok((value, desc));
-    }
-    let resolved = interp
-        .deref_value(frames, &value)
-        .map_err(|e| e.to_string())?;
-    let pointee = interp
-        .read_resolved(frames, &resolved)
-        .map_err(|e| e.to_string())?;
-    let next = match desc {
-        Some(
-            Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner),
-        ) => {
-            // A pointer whose pointee the value model holds as
-            // a sequence aggregate (a slice's base pointer: its
-            // deref yields the whole element tuple) describes
-            // the sequence, not the single element its type
-            // names -- the descriptor follows the value, so an
-            // index step through it reads the element descriptor
-            // from the sequence form.
-            if matches!(pointee, Value::Tuple(_))
-                && !matches!(
-                    inner.as_ref(),
-                    Desc::Slice(_) | Desc::Array(..) | Desc::Tuple(_)
-                )
-            {
-                Some(Desc::Slice(inner))
-            } else {
-                Some(*inner)
+    for _ in 0..MAX_IMPLICIT_DEREFS {
+        let is_pointer = matches!(
+            value,
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+        ) || matches!(&desc, Some(Desc::Adt(tag)) if smart_pointer_pointee(tag).is_some());
+        if !is_pointer {
+            break;
+        }
+        let resolved = interp
+            .deref_value(frames, &value)
+            .map_err(|e| e.to_string())?;
+        let pointee = interp
+            .read_resolved(frames, &resolved)
+            .map_err(|e| e.to_string())?;
+        let next = match desc {
+            Some(
+                Desc::Ref(inner)
+                | Desc::RefMut(inner)
+                | Desc::PtrConst(inner)
+                | Desc::PtrMut(inner),
+            ) => {
+                // A pointer whose pointee the value model holds as
+                // a sequence aggregate (a slice's base pointer: its
+                // deref yields the whole element tuple) describes
+                // the sequence, not the single element its type
+                // names -- the descriptor follows the value, so an
+                // index step through it reads the element descriptor
+                // from the sequence form.
+                if matches!(pointee, Value::Tuple(_))
+                    && !matches!(
+                        inner.as_ref(),
+                        Desc::Slice(_) | Desc::Array(..) | Desc::Tuple(_)
+                    )
+                {
+                    Some(Desc::Slice(inner))
+                } else {
+                    Some(*inner)
+                }
             }
-        }
-        Some(Desc::Adt(tag)) => {
-            smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
-        }
-        other => other,
-    };
-    Ok((pointee, next))
+            Some(Desc::Adt(tag)) => {
+                smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
+            }
+            other => other,
+        };
+        value = pointee;
+        desc = next;
+    }
+    Ok((value, desc))
 }
 
 /// The length a `.length` step reads: a fat pointer's element
