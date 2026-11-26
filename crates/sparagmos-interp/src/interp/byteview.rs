@@ -1702,6 +1702,65 @@ impl<'a> Interpreter<'a> {
         Ok(true)
     }
 
+    /// The number of slots one element of a bulk access spans
+    /// in the sequence `target` denotes, when the access's
+    /// element type is wider than the sequence's own elements
+    /// (a `usize` copy into a byte array's storage reached
+    /// through a unit-changing pointer cast chain: the
+    /// sequence's slots are bytes, so one element spans eight).
+    /// The sequence's own element size is the one conversion
+    /// recorded for the target's field path (the same
+    /// `field_elem_sizes` record the pointer arithmetic model
+    /// prices with), or the array element size for a bare
+    /// array local. Any shape whose sizes are not recorded, do
+    /// not divide evenly, or match already spans one slot.
+    fn seq_slot_stride(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        path: &[RefProj],
+        elem: Option<&Ty>,
+    ) -> usize {
+        let Some(elem) = elem else { return 1 };
+        let Some(elem_size) = self.ty_size(elem) else {
+            return 1;
+        };
+        let Resolved::Place {
+            frame_pos, local, ..
+        } = target
+        else {
+            return 1;
+        };
+        let Some(frame) = frames.get(*frame_pos) else {
+            return 1;
+        };
+        let Some(body) = self.program().functions.get(&frame.func) else {
+            return 1;
+        };
+        let mut field_path = Vec::new();
+        for step in path {
+            match step {
+                RefProj::Field(f) => field_path.push(*f),
+                _ => return 1,
+            }
+        }
+        let target_elem_size = if field_path.is_empty() {
+            match body.local_tys.get(*local) {
+                Some(Ty::Array(elem_ty, _)) => self.ty_size(elem_ty),
+                _ => None,
+            }
+        } else {
+            body.field_elem_sizes
+                .get(*local)
+                .and_then(|sizes| sizes.get(&field_path))
+                .copied()
+        };
+        match target_elem_size {
+            Some(t) if t > 0 && elem_size % t == 0 => (elem_size / t) as usize,
+            _ => 1,
+        }
+    }
+
     /// The directly-resolved target of element `index` of the
     /// sequence starting at `target`, when `target` denotes a
     /// single element of it (see [`Self::read_seq_at`]); `None`
@@ -1712,14 +1771,17 @@ impl<'a> Interpreter<'a> {
     /// access would report, so it propagates unchanged. A value
     /// target carries its projection like the other targets, so
     /// an element pointer into a constant aggregate adjusts the
-    /// same way; a target whose projection has no trailing index
-    /// step takes the plain access.
+    /// same way; the index step the access composes with may
+    /// sit behind whole-value entry steps (a transparent
+    /// wrapper's field-0 entry, a downcast), which the composed
+    /// target keeps; a target with no such index step takes the
+    /// plain access.
     pub(crate) fn seq_element_target(
         &self,
         frames: &[Frame],
         target: &Resolved,
         index: usize,
-        _elem: Option<&Ty>,
+        elem: Option<&Ty>,
     ) -> InterpResult<Option<Resolved>> {
         // A byte-denominated allocation target (see
         // `elem_block_projection`) reads its elements at the
@@ -1832,9 +1894,72 @@ impl<'a> Interpreter<'a> {
             | Resolved::Alloc { projection, .. }
             | Resolved::Value(_, projection) => projection,
         };
-        let Some((&RefProj::Index(start), head)) = projection.split_last() else {
+        // The element step the access composes with: the
+        // projection's trailing index step, or the index step
+        // its trailing whole-value entry steps enter (field-0
+        // and downcast steps -- the shape an array-to-element
+        // pointer cast through a transparent wrapper leaves:
+        // `[.., Index(k), Field(0)]` denotes element `k` of the
+        // outer sequence entered through the wrapper, so the
+        // sequence continues at the following elements entered
+        // the same way, and the composed access advances the
+        // index step and keeps the entry steps). Any other
+        // trailing shape (a genuine field of the element, a byte
+        // displacement) takes the plain indexed access.
+        let mut at = projection.len();
+        while at > 0 {
+            match projection[at - 1] {
+                RefProj::Field(0) | RefProj::Downcast(_) => at -= 1,
+                _ => break,
+            }
+        }
+        let Some((&RefProj::Index(start), head)) = projection[..at].split_last()
+        else {
+            // A bare sequence base (a leading field path with
+            // no element step) whose slots are narrower than
+            // the access's elements: the plain indexed access
+            // would land the access's element `index` in slot
+            // `index`, but the element spans `stride` slots and
+            // sits at slot `index * stride` (a byte array's
+            // storage filled with wider elements through a
+            // unit-changing pointer cast chain). Compose the
+            // element step here; any other bare shape takes
+            // the plain access.
+            if at == projection.len() {
+                let stride = self.seq_slot_stride(frames, target, projection, elem);
+                if stride > 1 {
+                    let mut projection = projection.to_vec();
+                    projection.push(RefProj::Index(index * stride));
+                    return Ok(Some(match target {
+                        Resolved::Place {
+                            frame_pos, local, ..
+                        } => Resolved::Place {
+                            frame_pos: *frame_pos,
+                            local: *local,
+                            projection,
+                        },
+                        Resolved::Static { name, .. } => Resolved::Static {
+                            name: name.clone(),
+                            projection,
+                        },
+                        Resolved::Alloc { id, .. } => Resolved::Alloc {
+                            id: *id,
+                            projection,
+                        },
+                        Resolved::Value(base, _) => {
+                            Resolved::Value(base.clone(), projection)
+                        }
+                    }));
+                }
+            }
             return Ok(None);
         };
+        let entry = &projection[at..];
+        // The slots one element of this access spans in the
+        // sequence the target denotes (see `seq_slot_stride`):
+        // the composed step advances by whole elements of the
+        // access, priced in the sequence's own slots.
+        let stride = self.seq_slot_stride(frames, target, head, elem);
         match self.read_resolved(frames, target) {
             // Whatever value sits at the position — a structured
             // element included — the target denotes that element
@@ -1855,7 +1980,8 @@ impl<'a> Interpreter<'a> {
             Err(e) => return Err(e),
         }
         let mut projection = head.to_vec();
-        projection.push(RefProj::Index(start + index));
+        projection.push(RefProj::Index(start + index * stride));
+        projection.extend_from_slice(entry);
         Ok(Some(match target {
             Resolved::Place {
                 frame_pos, local, ..

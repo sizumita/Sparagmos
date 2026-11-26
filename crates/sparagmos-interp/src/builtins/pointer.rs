@@ -20,8 +20,14 @@ impl<'a> Interpreter<'a> {
     /// when the position cannot be resolved structurally — as a
     /// trailing byte displacement, so a trailing step of either
     /// shape is read back as the position's element index.
-    /// `None` when the two targets are unrelated (their distance
-    /// is then meaningless in the guest too).
+    /// A projection whose only position step is a trailing field
+    /// step is ambiguous -- the field step can be an element
+    /// position in a tuple-like base or the last step of the path
+    /// to a sequence the field holds (whose base the projection
+    /// then denotes) -- so both readings are offered and the one
+    /// the two targets share decides. `None` when the two targets
+    /// share no reading (their distance is then meaningless in
+    /// the guest too).
 /// A structural fingerprint of a value (an FNV-1a walk over
 /// its shape and scalar leaves), used only as an identity key
 /// for pointer-distance purposes: two pointers whose base
@@ -129,7 +135,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         // Split a target into its base identity and the element
         // index its projection's element position denotes, if
         // any.
-        let split = |target: &Resolved| -> Option<(String, i128)> {
+        let split = |target: &Resolved| -> Option<Vec<(String, i128)>> {
             let (base, projection): (String, &[RefProj]) = match target {
                 Resolved::Place {
                     frame_pos,
@@ -177,12 +183,12 @@ fn value_fingerprint(value: &Value) -> u64 {
                 // pointer it lands on measure against each
                 // other (and against a plain index pointer).
                 if let Some((RefProj::Index(i), rest)) = rest.split_last() {
-                    return Some((
+                    return Some(vec![(
                         format!("{base}|{}", key(rest)),
                         *i as i128 + d / size,
-                    ));
+                    )]);
                 }
-                return Some((format!("{base}|{}", key(rest)), d / size));
+                return Some(vec![(format!("{base}|{}", key(rest)), d / size)]);
             }
             // Otherwise the position is the projection's element
             // step (see `element_position_step`): everything
@@ -198,13 +204,69 @@ fn value_fingerprint(value: &Value) -> u64 {
                         .map(|p| format!("{p:?}"))
                         .collect::<Vec<_>>()
                         .join("/");
-                    Some((format!("{base}|{key}"), i as i128))
+                    let mut candidates =
+                        vec![(format!("{base}|{key}"), i as i128)];
+                    // When the element step is the projection's
+                    // trailing field step (the fallback
+                    // `element_position_step` applies when the
+                    // projection carries no index step at all),
+                    // the projection is ambiguous: the field step
+                    // can equally be the last step of the path to
+                    // a sequence the field holds, the whole
+                    // projection then denoting that sequence's
+                    // base -- element 0, the reading
+                    // `array_position` gives a bare field base.
+                    // Offer that reading as a second candidate;
+                    // which reading the two targets share decides
+                    // (a pointer to an element of the sequence and
+                    // a pointer to its base must measure against
+                    // each other).
+                    if matches!(projection[at], RefProj::Field(_)) {
+                        let full = projection
+                            .iter()
+                            .map(|p| format!("{p:?}"))
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        candidates.push((format!("{base}|{full}"), 0));
+                    }
+                    // Whole-value entry steps after the element
+                    // step (a transparent wrapper's field-0
+                    // entry, a downcast) enter the element
+                    // itself: a pointer formed through the
+                    // wrapper and a plain element pointer denote
+                    // positions in the same sequence, so offer
+                    // the reading whose key drops the entry
+                    // steps as well.
+                    let suffix = &projection[at + 1..];
+                    if !suffix.is_empty()
+                        && suffix.iter().all(|step| {
+                            matches!(
+                                step,
+                                RefProj::Field(0) | RefProj::Downcast(_)
+                            )
+                        })
+                    {
+                        let prefix_key = projection[..at]
+                            .iter()
+                            .map(|p| format!("{p:?}"))
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        candidates.push((
+                            format!("{base}|{prefix_key}"),
+                            i as i128,
+                        ));
+                    }
+                    Some(candidates)
                 }
-                None => Some((format!("{base}|{}", key(projection)), 0)),
+                None => Some(vec![(format!("{base}|{}", key(projection)), 0)]),
             }
         };
         Ok(match (split(x), split(y)) {
-            (Some((bx, ix)), Some((by, iy))) if bx == by => Some(ix - iy),
+            (Some(xs), Some(ys)) => xs.iter().find_map(|(bx, ix)| {
+                ys.iter()
+                    .find(|(by, _)| by == bx)
+                    .map(|(_, iy)| ix - iy)
+            }),
             _ => None,
         })
     }

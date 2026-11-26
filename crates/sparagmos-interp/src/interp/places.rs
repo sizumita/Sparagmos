@@ -905,6 +905,60 @@ impl<'a> Interpreter<'a> {
                             } else {
                                 resolved
                             };
+                            // A thin pointer whose target is a
+                            // bare array base -- a leading field
+                            // path with no element step, the form
+                            // pointer casts leave behind when the
+                            // first-element step the pointer was
+                            // formed with is stripped (a fat
+                            // pointer's base kept by a fat-to-thin
+                            // cast, a cast chain redenominating a
+                            // byte array's elements) -- denotes
+                            // the array's first element whenever
+                            // the pointee is the element type or a
+                            // scalar (see
+                            // `bare_array_base_denotes_elem0`).
+                            // The dereference being the last step,
+                            // or a structural step following, is
+                            // what makes the position the element
+                            // itself; a following sequence step
+                            // continues the array's flat reading.
+                            // (The raw-block twin of this rule is
+                            // the `deref_elem0` entry above.)
+                            let resolved = {
+                                let next_is_structural = matches!(
+                                    place.projection.get(step_idx + 1),
+                                    Some(
+                                        ProjectionElem::Field(_)
+                                            | ProjectionElem::Downcast(_)
+                                            | ProjectionElem::UnionField { .. },
+                                    )
+                                );
+                                let denotes_elem0 = (is_last || next_is_structural)
+                                    && matches!(value, Value::Ref(_))
+                                    && pointee_ty.as_ref().is_some_and(|pointee| {
+                                        self.bare_array_base_denotes_elem0(
+                                            frames, &resolved, pointee,
+                                        )
+                                    });
+                                if denotes_elem0 {
+                                    let mut resolved = resolved;
+                                    match &mut resolved {
+                                        Resolved::Place {
+                                            projection, ..
+                                        }
+                                        | Resolved::Static {
+                                            projection, ..
+                                        } => {
+                                            projection.push(RefProj::Index(0));
+                                        }
+                                        _ => {}
+                                    }
+                                    resolved
+                                } else {
+                                    resolved
+                                }
+                            };
                             let resolved = match &pointee_ty {
                                 Some(pointee) => {
                                     let resolved = self.peel_maybe_uninit_entry(
@@ -1258,6 +1312,84 @@ impl<'a> Interpreter<'a> {
             (Ty::Slice(_) | Ty::Dynamic(_) | Ty::Never, _) => true,
             _ => false,
         }
+    }
+
+    /// Whether a dereference target that is a bare array base
+    /// (a place or static whose projection is a leading field
+    /// path with no element step) denotes the array's first
+    /// element for a pointee of `pointee`: the target's declared
+    /// type is an array, and the pointee either is the array's
+    /// element type or is a scalar -- a scalar pointee at an
+    /// array base can only denote an element-sized value there,
+    /// whatever denomination the pointer casts that formed the
+    /// pointer used (a byte array's storage read through a
+    /// `usize` pointer after a unit-changing cast chain). An
+    /// aggregate pointee that is not the element type may
+    /// denote the array as a whole and keeps the bare form.
+    fn bare_array_base_denotes_elem0(
+        &self,
+        frames: &[Frame],
+        resolved: &Resolved,
+        pointee: &Ty,
+    ) -> bool {
+        let (root_ty, projection) = match resolved {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let Some(frame) = frames.get(*frame_pos) else {
+                    return false;
+                };
+                let Some(home) = self.program.get(&frame.func) else {
+                    return false;
+                };
+                let Some(root) = home.local_ty(Local(*local)) else {
+                    return false;
+                };
+                (root.clone(), projection)
+            }
+            Resolved::Static { name, projection } => {
+                let Some(root) = self.program.static_tys.get(name) else {
+                    return false;
+                };
+                (root.clone(), projection)
+            }
+            _ => return false,
+        };
+        if !projection.iter().all(|step| {
+            matches!(
+                step,
+                RefProj::Field(_) | RefProj::Downcast(_) | RefProj::UnionField { .. }
+            )
+        }) {
+            return false;
+        }
+        let scalar_pointee = matches!(
+            pointee,
+            Ty::Bool | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_)
+        );
+        if let Some(Ty::Array(elem, _)) =
+            step_ty_across(Some(self.program), Some(root_ty), projection)
+        {
+            return pointee == &*elem || scalar_pointee;
+        }
+        // The declared-type walk cannot always judge the
+        // position: the field types of a generic ADT whose
+        // fields depend on its parameters are not recorded in
+        // the program's table. The stored value's own shape is
+        // the remaining evidence: a sequence aggregate (an
+        // array's tuple of elements, a byte block) at the bare
+        // base, read through a scalar pointee, denotes its
+        // first element -- a scalar dereference can only name
+        // an element-sized value at the position.
+        if !scalar_pointee {
+            return false;
+        }
+        let Ok(value) = self.read_resolved(frames, resolved) else {
+            return false;
+        };
+        matches!(value, Value::Tuple(_) | Value::Bytes(_))
     }
 
     fn peel_maybe_uninit_entry(
