@@ -128,3 +128,58 @@ fn run_mode_size_of_val_fn_item() {
     // that has no collected body in the program.
     run_ok("dst-fn-item", FN_ITEM_SRC, "0 0 0\n");
 }
+const TUPLE_TAIL_SRC: &str = r#"
+use std::mem;
+#[repr(C)]
+struct WT<T: ?Sized> { a: u16, t: T }
+fn main() { unsafe {
+    let p = WT { a: 7u16, t: (9u16, [1u8, 2, 3]) };
+    let r: &WT<(u16, [u8])> = mem::transmute((&p, 3usize));
+    println!("size {}", mem::size_of_val(r));
+    println!("align {}", mem::align_of_val(r));
+    println!("a {} t0 {}", r.a, r.t.0);
+    println!("t1 {} {} {}", r.t.1[0], r.t.1[1], r.t.1[2]);
+    let (base, n): (*const WT<(u16, [u8; 3])>, usize) = mem::transmute(r);
+    println!("back {} {}", n, (*base).t.1[2]);
+} }
+"#;
+
+#[test]
+fn run_mode_size_of_val_tuple_tail() {
+    // The unsized tail is a tuple whose last element is the
+    // slice: the `(ptr, len)` transmute forms the fat
+    // reference (a tuple tail has no unsizing coercion, so
+    // the transmute is the only formation route), and the
+    // composed size is padded to the composed alignment
+    // (2 + (2 + 3) bytes of fields, size 8).
+    run_ok(
+        "dst-tuple-tail",
+        TUPLE_TAIL_SRC,
+        "size 8\nalign 2\na 7 t0 9\nt1 1 2 3\nback 3 3\n",
+    );
+}
+
+const BARE_TUPLE_TAIL_SRC: &str = r#"
+use std::mem;
+fn main() { unsafe {
+    let p = (5u8, [10u32, 20, 30]);
+    let r: &(u8, [u32]) = mem::transmute((&p, 3usize));
+    println!("size {}", mem::size_of_val(r));
+    println!("align {}", mem::align_of_val(r));
+    println!("v {} {} {} {}", r.0, r.1[0], r.1[1], r.1[2]);
+    let (base, n): (*const (u8, [u32; 3]), usize) = mem::transmute(r);
+    println!("back {} {}", n, (*base).1[0]);
+} }
+"#;
+
+#[test]
+fn run_mode_size_of_val_bare_tuple_tail() {
+    // The pointee itself is the tuple: the same `(ptr, len)`
+    // formation and composition, with the tuple's sized
+    // prefix element placed before the slice tail.
+    run_ok(
+        "dst-bare-tuple-tail",
+        BARE_TUPLE_TAIL_SRC,
+        "size 16\nalign 4\nv 5 10 20 30\nback 3 10\n",
+    );
+}

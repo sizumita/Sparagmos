@@ -2204,7 +2204,12 @@ let inner = match (&src, target) {
     /// / `str` / `dyn` type itself, or a DST-wrapper ADT
     /// whose last field is (recursively) such a tail — the
     /// `Slice([u32])` wrapper inside a `PackedUnsized` is
-    /// the same tail one level down.
+    /// the same tail one level down. A tuple is a tail of
+    /// the same kind when its last field is: only a tuple's
+    /// last field may be unsized, and the fat metadata of a
+    /// tuple-tailed pointee is that field's metadata (the
+    /// `(u16, [u8])` tail of a `WT<(u16, [u8])>`, or a bare
+    /// `(u8, [u32])` pointee).
     fn tail_meta(
         &self,
         tail: &mir::Ty,
@@ -2222,6 +2227,9 @@ let inner = match (&src, target) {
                     return None;
                 }
                 let fields = self.instantiated_field_tys(def, args, 0)?;
+                self.tail_meta(fields.last()?, depth + 1)
+            }
+            mir::Ty::Tuple(fields) => {
                 self.tail_meta(fields.last()?, depth + 1)
             }
             _ => None,
