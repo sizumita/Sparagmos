@@ -6395,3 +6395,39 @@ fn run_mode_box_into_iter_drop_discipline_2024() {
         "stdout={stdout}"
     );
 }
+
+const ARRAY_SUBSLICE_BINDING_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let a = [D(1), D(2), D(3)];
+    let [_, _y @ ..] = a;
+    println!("bound");
+}
+"#;
+
+#[test]
+fn run_mode_array_subslice_binding_moves_window_out() {
+    // A by-value `@ ..` binding in an array pattern moves the
+    // sub-slice window out of the array: the move leaves the
+    // vacated window uninitialised, a whole-sub-slice write
+    // that distributes the uninitialised marker over the
+    // window's elements, and the array's remaining element
+    // drops on its own afterwards. The run prints the native
+    // drop order: the binding's elements first, then the
+    // element left in the array.
+    let dir = temp_dir("array-subslice-binding");
+    let src = fixture(&dir, "array_subslice_binding.rs", ARRAY_SUBSLICE_BINDING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the array sub-slice binding must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bound\ndtor 2\ndtor 3\ndtor 1\n",
+        "the moved window's elements drop with the binding, the rest with the array"
+    );
+}

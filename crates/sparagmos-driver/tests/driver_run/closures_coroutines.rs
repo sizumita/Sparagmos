@@ -1409,3 +1409,52 @@ fn run_mode_unresumed_coroutine_drops_upvars_in_field_order() {
         "drop x\ndrop y\ndone\n",
     );
 }
+// ----- coroutine drop glue: aggregate under construction across yields -----
+
+const COROUTINE_TWO_YIELD_TUPLE_DROP_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+use std::ops::Coroutine;
+use std::pin::Pin;
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let mut g = #[coroutine] || {
+        (D(70), yield D(71), D(72), yield D(73))
+    };
+    let _ = Pin::new(&mut g).resume(());
+    drop(g);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_coroutine_two_yield_tuple_drop_runs_placed_element_dtor() {
+    // A tuple under construction across two suspension points:
+    // the element placed before the first yield is live in the
+    // first suspension state, but the transformed body projects
+    // it only under the second state's index, so the first
+    // state's drop plan - built from projection evidence alone -
+    // never mentioned it and the element leaked when the
+    // suspended coroutine was dropped. The plan now accounts
+    // for a state's fields from the other states' plans for
+    // the same storage slot, so the placed element's destructor
+    // runs at the drop point.
+    let dir = temp_dir("coroutine-two-yield-tuple-drop");
+    let src = fixture(
+        &dir,
+        "coroutine_two_yield_tuple_drop.rs",
+        COROUTINE_TWO_YIELD_TUPLE_DROP_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the two-yield tuple coroutine drop must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dtor 71\ndtor 70\nafter drop\n",
+        "the yielded value drops at the resume statement, the placed element at the drop"
+    );
+}

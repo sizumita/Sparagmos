@@ -3078,6 +3078,33 @@ pub(crate) fn assign_projected(
             navigate_mut_grow(slot, head, func, place, grow, program, ty.clone())?;
         return assign_vec_len(head_slot, value, place);
     }
+    if let Some((&RefProj::Subslice { offset, len }, head)) = projection.split_last() {
+        // A write to a whole sub-slice: the window has no
+        // single slot to assign into (its elements live in the
+        // head's sequence), so the write distributes over the
+        // window's elements. Two value shapes denote a whole
+        // window: the element tuple a sub-slice read produces
+        // (a value stored into a sub-slice place is stored
+        // from exactly such a read), and the uninitialised
+        // marker a move out of the window leaves behind (the
+        // vacated elements clear one by one, so a later drop
+        // of the whole value skips them - a move of an array
+        // sub-slice pattern binding is the canonical case).
+        // Any other shape keeps the general path's judgement.
+        let elems: Option<Vec<Value>> = match &value {
+            Value::Uninit => Some(vec![Value::Uninit; len]),
+            Value::Tuple(items) if items.len() == len => Some(items.clone()),
+            _ => None,
+        };
+        if let Some(elems) = elems {
+            for (i, elem) in elems.into_iter().enumerate() {
+                let mut path: Vec<RefProj> = head.to_vec();
+                path.push(RefProj::Index(offset + i));
+                assign_projected(slot, &path, elem, func, place, grow, program, ty.clone())?;
+            }
+            return Ok(());
+        }
+    }
     let target = navigate_mut_grow(slot, projection, func, place, grow, program, ty)?;
     *target = value;
     Ok(())
@@ -4290,9 +4317,10 @@ pub(crate) fn navigate_mut_grow<'x>(
             // navigation continues into one of its elements (an
             // `Index` step composes the offset into the base) or
             // into a nested sub-slice (the offsets compose). A
-            // write to the whole sub-slice would have to splice
-            // the base's element sequence in place; no MIR
-            // assignment targets an unsized place that way, so it
+            // write to the whole sub-slice reaches this arm only
+            // in a shape `assign_projected`'s whole-window
+            // pre-pass does not distribute (it handles the
+            // element tuple and the uninitialised marker), so it
             // stays an explicit error rather than a silent
             // partial write.
             match rest.first() {
