@@ -1363,3 +1363,124 @@ fn run_mode_tail_expr_temporary_guard_poisons_on_unwind() {
          local's destructor panics, so its unwind drop poisons the lock"
     );
 }
+
+// ----- Mapped lock guards (PR #584 remainder) -----
+//
+// `MutexGuard::map` / `RwLockWriteGuard::map` /
+// `RwLockReadGuard::map` (and the mapped guards' own `map`)
+// build a guard whose first field is the `NonNull` pointer
+// to the mapped component itself: `Deref` / `DerefMut`
+// return that pointer's pointee, `Display` / `Debug` forward
+// to it, and the converted `Drop` body releases the lock
+// through the sys lock reference stored next to the pointer.
+
+const MAPPED_MUTEX_GUARD_SRC: &str = r#"
+#![feature(mapped_lock_guards)]
+use std::sync::{MappedMutexGuard, Mutex, MutexGuard};
+
+struct Pair { a: i32, b: String }
+
+fn main() {
+    let m = Mutex::new(Pair { a: 10, b: String::from("bee") });
+    {
+        let mut g = MutexGuard::map(m.lock().unwrap(), |p| &mut p.b);
+        println!("mapped: {}", *g);
+        g.push_str("!");
+        println!("display: {}", g);
+        println!("debug: {:?}", g);
+    }
+    println!("try after drop: {}", m.try_lock().is_ok());
+    {
+        let mut g = MutexGuard::map(m.lock().unwrap(), |p| &mut p.a);
+        *g += 1;
+        // A second mapping step, from the mapped guard itself.
+        let mut g2 = MappedMutexGuard::map(g, |a| a);
+        *g2 += 100;
+        println!("chained: {}", *g2);
+    }
+    let orig = m.lock().unwrap();
+    let failed = MutexGuard::filter_map(orig, |p| {
+        if p.a > 1000 { Some(&mut p.b) } else { None }
+    });
+    println!("filter_map err: {}", failed.is_err());
+    let orig = failed.unwrap_err();
+    println!("orig back: {} {}", orig.a, orig.b);
+    drop(orig);
+    let g = m.lock().unwrap();
+    println!("final: {} {}", g.a, g.b);
+}
+"#;
+
+#[test]
+fn run_mode_mapped_mutex_guard_deref_mut_fmt_and_drop() {
+    run_ok(
+        "mapped-mutex-guard",
+        MAPPED_MUTEX_GUARD_SRC,
+        "mapped: bee\ndisplay: bee!\ndebug: \"bee!\"\ntry after drop: true\n\
+         chained: 111\nfilter_map err: true\norig back: 111 bee!\n\
+         final: 111 bee!\n",
+    );
+}
+
+const MAPPED_RWLOCK_GUARD_SRC: &str = r#"
+#![feature(mapped_lock_guards)]
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+struct Pair { a: i32, b: i32 }
+
+fn main() {
+    let l = RwLock::new(Pair { a: 1, b: 2 });
+    {
+        let mut w = RwLockWriteGuard::map(l.write().unwrap(), |p| &mut p.b);
+        println!("write mapped: {}", *w);
+        *w += 20;
+        println!("write display: {}", w);
+        println!("try_read while mapped write: {}", l.try_read().is_err());
+    }
+    {
+        let r = RwLockReadGuard::map(l.read().unwrap(), |p| &p.b);
+        println!("read mapped: {}", *r);
+        println!("read debug: {:?}", r);
+        println!("try_write while mapped read: {}", l.try_write().is_err());
+    }
+    println!("try_write after drops: {}", l.try_write().is_ok());
+    println!("final: {} {}", l.read().unwrap().a, l.read().unwrap().b);
+}
+"#;
+
+#[test]
+fn run_mode_mapped_rwlock_guards_deref_fmt_and_drop() {
+    run_ok(
+        "mapped-rwlock-guard",
+        MAPPED_RWLOCK_GUARD_SRC,
+        "write mapped: 2\nwrite display: 22\n\
+         try_read while mapped write: true\nread mapped: 22\nread debug: 22\n\
+         try_write while mapped read: true\ntry_write after drops: true\n\
+         final: 1 22\n",
+    );
+}
+
+const MAPPED_GUARD_SLICE_SRC: &str = r#"
+#![feature(mapped_lock_guards)]
+use std::sync::{Mutex, MutexGuard};
+
+fn main() {
+    let m = Mutex::new(vec![10i32, 20, 30]);
+    {
+        let mut g = MutexGuard::map(m.lock().unwrap(), |v| &mut v[..]);
+        println!("slice len: {}", g.len());
+        g[1] = 99;
+        println!("slice: {:?}", g);
+    }
+    println!("final: {:?}", *m.lock().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_mapped_mutex_guard_slice_pointee() {
+    run_ok(
+        "mapped-mutex-guard-slice",
+        MAPPED_GUARD_SLICE_SRC,
+        "slice len: 3\nslice: [10, 99, 30]\nfinal: [10, 99, 30]\n",
+    );
+}

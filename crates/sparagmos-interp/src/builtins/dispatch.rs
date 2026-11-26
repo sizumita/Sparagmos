@@ -4773,6 +4773,22 @@ impl<'a> Interpreter<'a> {
                         &vals[0],
                         "Deref::deref for RwLockReadGuard",
                     )
+                } else if self_ty_is(self_ty, "std::sync::MappedMutexGuard")
+                    || self_ty_is(self_ty, "std::sync::MappedRwLockReadGuard")
+                    || self_ty_is(self_ty, "std::sync::MappedRwLockWriteGuard")
+                    || self_ty_is(self_ty, "std::sync::nonpoison::MappedMutexGuard")
+                    || self_ty_is(self_ty, "std::sync::nonpoison::MappedRwLockReadGuard")
+                    || self_ty_is(self_ty, "std::sync::nonpoison::MappedRwLockWriteGuard")
+                {
+                    // A mapped guard: field 0 is the `NonNull`
+                    // data pointer `map` built from the mapping
+                    // closure's returned reference, which denotes
+                    // the mapped component itself.
+                    self.mapped_guard_deref(
+                        frames,
+                        &vals[0],
+                        "Deref::deref for mapped lock guard",
+                    )
                 } else if self_ty.starts_with('&') {
                     // A reference's own `Deref` returns the inner
                     // reference itself: `<&T as Deref>::deref` and
@@ -7386,6 +7402,19 @@ impl<'a> Interpreter<'a> {
                         frames,
                         &vals[0],
                         "DerefMut::deref_mut for lock guard",
+                    )
+                } else if self_ty_is(self_ty, "std::sync::MappedMutexGuard")
+                    || self_ty_is(self_ty, "std::sync::MappedRwLockWriteGuard")
+                    || self_ty_is(self_ty, "std::sync::nonpoison::MappedMutexGuard")
+                    || self_ty_is(self_ty, "std::sync::nonpoison::MappedRwLockWriteGuard")
+                {
+                    // A mapped guard: as in `Deref`, field 0 is
+                    // the `NonNull` pointer to the mapped
+                    // component itself.
+                    self.mapped_guard_deref(
+                        frames,
+                        &vals[0],
+                        "DerefMut::deref_mut for mapped lock guard",
                     )
                 } else if self_ty.starts_with("&mut ") {
                     // A mutable reference's own `DerefMut` returns
