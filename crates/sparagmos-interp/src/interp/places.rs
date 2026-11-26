@@ -1084,10 +1084,47 @@ impl<'a> Interpreter<'a> {
             cur = self.project_step(frames, pending, RefProj::Field(0), body, place)?;
         }
         // A walk that ends inside the buffer wrapper chain
-        // denotes the buffer pointer itself.
+        // denotes the buffer pointer itself -- unless the
+        // vector at the chain's base is in its real aggregate
+        // form. There the chain positions are the aggregate's
+        // own fields (the `RawVec` at the vector's field 0,
+        // the `RawVecInner` at the buffer's field 0, and so on
+        // down the wrapper chain), so the position the walk
+        // reached is the base extended by the field steps it
+        // took into the chain. A reference formed over the
+        // position then denotes the bookkeeping storage
+        // itself, and the field steps a callee takes through
+        // it -- the capacity slot above all -- read and write
+        // the aggregate. Completing the walk as the bare
+        // buffer pointer instead loses the base: the pointer
+        // denotes the element storage, a dereference of a
+        // wrapper-typed reference over it cannot re-enter the
+        // chain (see `vec_buf_chain_reentry`), and the
+        // bookkeeping steps that follow could only fabricate
+        // values for slots that live in the aggregate.
         if buf_depth > 0 {
             if let Some(base) = buf_base.take() {
-                cur = self.buf_chain_pointer(frames, &base)?;
+                let real_form = matches!(
+                    self.read_resolved(frames, &base),
+                    Ok(held)
+                        if crate::builtins::vec_real_aggregate_parts(&held)
+                            .is_some()
+                );
+                if real_form {
+                    let mut resolved = base;
+                    let projection = match &mut resolved {
+                        Resolved::Place { projection, .. }
+                        | Resolved::Value(_, projection)
+                        | Resolved::Static { projection, .. }
+                        | Resolved::Alloc { projection, .. } => projection,
+                    };
+                    for _ in 0..buf_depth {
+                        projection.push(RefProj::Field(0));
+                    }
+                    cur = resolved;
+                } else {
+                    cur = self.buf_chain_pointer(frames, &base)?;
+                }
             }
         }
         Ok(cur)
