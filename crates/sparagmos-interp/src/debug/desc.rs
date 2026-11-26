@@ -109,6 +109,10 @@ impl Desc {
             Ty::Closure(name, _) => Desc::Closure(name.clone()),
             Ty::Dynamic(_) => Desc::Unknown,
             Ty::Coroutine(name) => Desc::Coroutine(name.clone()),
+            // A foreign (extern) type is a named opaque type:
+            // the debugger names it by its definition path, as
+            // it names an ADT.
+            Ty::Foreign(name) => Desc::Adt(name.clone()),
         }
     }
 

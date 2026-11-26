@@ -569,6 +569,11 @@ impl<'a> Converter<'a> {
             // resume / yield / return types, witness) are not needed
             // to execute the transformed body.
             mir::Ty::Coroutine(def, _) => ir::Ty::Coroutine(self.def_display_name(def)),
+            // A foreign (extern) type: opaque and unsized, with
+            // no values and no layout; only its rendered name is
+            // kept, as an ADT keeps only its name. It reaches
+            // execution only as the pointee of a (thin) pointer.
+            mir::Ty::Foreign(def) => ir::Ty::Foreign(self.def_display_name(def)),
             _ => return Err(unsupported()),
         })
     }

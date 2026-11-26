@@ -1502,6 +1502,67 @@ fn debug_mode_history_equality_at_fn_breakpoint_lldb() {
         "missing the comparison result in debug transcript: {stdout}"
     );
 }
+
+const DEBUG_FOREIGN_PTR_SRC: &str = r#"#![feature(extern_types)]
+extern "C" {
+    type Opaque;
+}
+fn main() {
+    let p = 0 as *const Opaque;
+    let q = p as *mut Opaque;
+    zzz();
+    let _ = (p, q);
+}
+fn zzz() {}
+"#;
+
+fn debug_driver_bootstrapped(dir: &Path, src: &Path, script: &str) -> Output {
+    let script_path = dir.join("session.script");
+    std::fs::write(&script_path, script).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("debug")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--debug-script")
+        .arg(&script_path)
+        .arg("--debug-dialect")
+        .arg("gdb")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+#[test]
+fn debug_mode_foreign_type_pointers_convert_and_answer_whatis() {
+    // A foreign (extern) type is opaque and unsized: no value
+    // of it can be formed, but pointers to it are ordinary
+    // thin pointers, and a body that only forms such pointers
+    // (here, null casts) must convert and run in a debugger
+    // session. Conversion used to refuse the type outright
+    // ("unsupported type in local ... Foreign (...)"), which
+    // held back the debuginfo suite's type-names record at
+    // the session stage.
+    let dir = temp_dir("debug-foreign-ptr");
+    let src = fixture(&dir, "foreign_ptr.rs", DEBUG_FOREIGN_PTR_SRC);
+    let out = debug_driver_bootstrapped(
+        &dir,
+        &src,
+        "break 8\nrun\nwhatis p\nwhatis q\nprint p\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "type = *const foreign_ptr::Opaque",
+        "type = *mut foreign_ptr::Opaque",
+        "$1 = 0x0",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
 const DEBUG_HUGE_VEC_SRC: &str = r#"fn main() {
     let mut vec: Vec<u8> = Vec::with_capacity(1_000_000_000);
     unsafe { vec.set_len(1_000_000_000) }
