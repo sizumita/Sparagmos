@@ -2852,15 +2852,32 @@ pub(crate) fn subslice_value(value: &Value, offset: usize, len: usize) -> Option
         // elements as themselves and the unmaterialised tail as
         // the uninitialised slots it denotes. The window is
         // bounded by the declared length, as in the projectors.
+        // A window that runs past the stored elements stays in
+        // the sparse form (its stored prefix rebased to the
+        // window, its declared length the window's) rather than
+        // materialising one slot per element, as in the
+        // projectors.
         Value::SparseVec { elems, len, .. } => {
             if end as u128 > *len {
                 return None;
             }
-            Some(Value::Tuple(
-                (offset..end)
-                    .map(|i| elems.get(i).cloned().unwrap_or(Value::Uninit))
-                    .collect(),
-            ))
+            if end <= elems.len() {
+                Some(Value::Tuple(
+                    (offset..end)
+                        .map(|i| elems.get(i).cloned().unwrap_or(Value::Uninit))
+                        .collect(),
+                ))
+            } else {
+                Some(Value::SparseVec {
+                    elems: if offset < elems.len() {
+                        elems[offset..].to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    len: (end - offset) as u128,
+                    cap: (end - offset) as u128,
+                })
+            }
         }
         _ => None,
     }

@@ -2303,6 +2303,14 @@ pub(crate) fn project_value_ev(
                     // length: the elements of the vector value
                     // are its first `len`, whatever spare
                     // capacity the storage accounts beyond them.
+                    // A window that runs past the stored elements
+                    // stays in the sparse form -- its stored
+                    // prefix rebased to the window, its declared
+                    // length the window's -- rather than
+                    // materialising one slot per element of a
+                    // length that was never materialised (a
+                    // `set_len` into the billions would otherwise
+                    // allocate a host slot for every element).
                     Value::SparseVec {
                         ref elems,
                         len: vec_len,
@@ -2311,13 +2319,25 @@ pub(crate) fn project_value_ev(
                         let total =
                             usize::try_from(vec_len).unwrap_or(usize::MAX);
                         check_subslice(total, start, *len)?;
-                        Value::Tuple(
-                            (start..end)
-                                .map(|i| {
-                                    elems.get(i).cloned().unwrap_or(Value::Uninit)
-                                })
-                                .collect(),
-                        )
+                        if end <= elems.len() {
+                            Value::Tuple(
+                                (start..end)
+                                    .map(|i| {
+                                        elems.get(i).cloned().unwrap_or(Value::Uninit)
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            Value::SparseVec {
+                                elems: if start < elems.len() {
+                                    elems[start..].to_vec()
+                                } else {
+                                    Vec::new()
+                                },
+                                len: *len as u128,
+                                cap: *len as u128,
+                            }
+                        }
                     }
                     // A sub-slice of a fat reference value (a
                     // constant slice's representation): a zero
@@ -3552,13 +3572,32 @@ pub(crate) fn project_value_ref_ev<'a>(
                         let total =
                             usize::try_from(*vec_len).unwrap_or(usize::MAX);
                         check_subslice(total, start, *len)?;
-                        Value::Tuple(
-                            (start..end)
-                                .map(|i| {
-                                    elems.get(i).cloned().unwrap_or(Value::Uninit)
-                                })
-                                .collect(),
-                        )
+                        // As in `project_value_ev`: a window inside
+                        // the stored elements reads as the dense
+                        // slice value; a window running past them
+                        // stays sparse (the stored prefix rebased
+                        // to the window, the declared length the
+                        // window's) rather than materialising a
+                        // slot per element.
+                        if end <= elems.len() {
+                            Value::Tuple(
+                                (start..end)
+                                    .map(|i| {
+                                        elems.get(i).cloned().unwrap_or(Value::Uninit)
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            Value::SparseVec {
+                                elems: if start < elems.len() {
+                                    elems[start..].to_vec()
+                                } else {
+                                    Vec::new()
+                                },
+                                len: *len as u128,
+                                cap: *len as u128,
+                            }
+                        }
                     }
                     Value::FatRef {
                         base,

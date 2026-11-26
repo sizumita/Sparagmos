@@ -1502,3 +1502,49 @@ fn debug_mode_history_equality_at_fn_breakpoint_lldb() {
         "missing the comparison result in debug transcript: {stdout}"
     );
 }
+const DEBUG_HUGE_VEC_SRC: &str = r#"fn main() {
+    let mut vec: Vec<u8> = Vec::with_capacity(1_000_000_000);
+    unsafe { vec.set_len(1_000_000_000) }
+    let slice = &vec[..];
+    zzz();
+    let _ = slice.len();
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_huge_sparse_vec_prints_without_materialising() {
+    // The `pretty-huge-vec` shape: a vector whose declared
+    // length runs into the billions past its stored elements
+    // (the sparse form). Slicing it must not materialise one
+    // host slot per element (that allocation exhausts the
+    // host), the pretty printers report the declared size with
+    // the bounded element block, and the function listing
+    // carries the slicing instance: its signature's return
+    // type is the declaration's associated-type projection
+    // (`Index::Output`), which the display-name computation
+    // must normalise to `&[u8]` -- fed to the compiler's
+    // debuginfo name machinery unnormalised, the projection
+    // is rejected and the instance silently drops out of the
+    // table.
+    let dir = temp_dir("debug-huge-vec");
+    let src = fixture(&dir, "huge_vec.rs", DEBUG_HUGE_VEC_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "pretty-printers\nbreak 5\nrun\nprint vec\nprint slice\ninfo-functions index\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = Vec(size=1000000000) = {",
+        "$2 = &[u8](size=1000000000) = {",
+        "::index<u8, core::ops::range::RangeFull, alloc::alloc::Global>(\
+            &alloc::vec::Vec<u8, alloc::alloc::Global>, core::ops::range::RangeFull) -> &[u8]",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
