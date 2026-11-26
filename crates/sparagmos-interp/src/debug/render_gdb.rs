@@ -16,6 +16,13 @@ use super::session::{DebugDialect, PrintFormat};
 /// safeguard, not a shaping rule.
 pub(super) const MAX_RENDER_DEPTH: usize = 24;
 
+/// The inline form of a union field a debugger cannot read:
+/// gdb reports such a field in place (`<error reading
+/// variable: ...>`) and still prints the union's other
+/// fields, so the whole-union rendering degrades the field
+/// instead of failing with it.
+pub(super) const UNION_FIELD_UNREADABLE: &str = "<error reading variable>";
+
 /// Render a sequence of element values, in one dialect's element
 /// form: per-element descriptors from `descs`, or one shared
 /// element descriptor.
@@ -297,6 +304,27 @@ fn render_gdb_mode(
             Some(Desc::Bool) => Some("false".to_string()),
             _ => None,
         },
+        Value::UnionBytes { bytes } => {
+            // A union in its byte form: the storage bytes are
+            // the value, and every declared field is read out
+            // of them (see `union_field_from_bytes`).
+            let Some(Desc::Adt(tag)) = desc else {
+                return None;
+            };
+            let shape = interp.program().adt_debug_shapes.get(tag)?;
+            if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+                return None;
+            }
+            let vshape = shape.variants.first()?;
+            let parts = union_parts_gdb(interp, frames, vshape, depth, pretty, elements, |i| {
+                union_field_from_bytes(&vshape.fields, bytes, i)
+            })?;
+            Some(format!(
+                "{} {{{}}}",
+                dwarf_type_name(tag),
+                parts.join(", ")
+            ))
+        }
         _ => None,
     }
 }
@@ -415,8 +443,76 @@ fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) / align.max(1) * align.max(1)
 }
 
+/// Whether a pointee type tag is one a pointer to it is fat
+/// for: a slice, `str`, or a `dyn` tail.
+fn fat_pointee(pointee: &str) -> bool {
+    let pointee = pointee.trim();
+    pointee == "str"
+        || pointee.starts_with("dyn ")
+        || (pointee.starts_with('[') && pointee.ends_with(']') && !pointee.contains(';'))
+}
+
+/// The pointee tag of a pointer type tag (a raw pointer or a
+/// reference), when the tag names a pointer at all.
+fn pointer_pointee(ty: &str) -> Option<&str> {
+    let ty = ty.trim();
+    if let Some(rest) = ty.strip_prefix("*const ") {
+        Some(rest)
+    } else if let Some(rest) = ty.strip_prefix("*mut ") {
+        Some(rest)
+    } else if let Some(rest) = ty.strip_prefix("&mut ") {
+        Some(rest)
+    } else {
+        ty.strip_prefix('&')
+    }
+}
+
+/// Whether a debugger field type tag names a thin pointer:
+/// a raw pointer or reference to a sized pointee, or a
+/// function pointer -- one address word of storage. A pointee
+/// named by an ADT tag is not judged here: the tag alone does
+/// not say whether that ADT is sized, so such a pointer is
+/// left to the stored-field identity and the byte forms of
+/// the fields around it.
+fn thin_pointer_tag(ty: &str) -> bool {
+    let ty = ty.trim();
+    // A function pointer's recorded tag is the bare kind name
+    // (the type tagger has no signature rendering for it).
+    if ty.starts_with("fn(") || ty == "FnPtr" {
+        return true;
+    }
+    let Some(pointee) = pointer_pointee(ty) else {
+        return false;
+    };
+    !fat_pointee(pointee) && !matches!(Desc::from_tag(pointee), Desc::Adt(_))
+}
+
+/// The fat-pointer kind a debugger field type tag names, when
+/// it names one: a two-word pointer (a data word plus a
+/// length or vtable word) to a slice, a `str`, or a `dyn`
+/// tail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FatPointerKind {
+    Slice,
+    Str,
+    Dyn,
+}
+
+fn fat_pointer_kind(ty: &str) -> Option<FatPointerKind> {
+    let pointee = pointer_pointee(ty)?.trim();
+    if pointee == "str" {
+        Some(FatPointerKind::Str)
+    } else if pointee.starts_with("dyn ") {
+        Some(FatPointerKind::Dyn)
+    } else if pointee.starts_with('[') && pointee.ends_with(']') && !pointee.contains(';') {
+        Some(FatPointerKind::Slice)
+    } else {
+        None
+    }
+}
+
 /// The (size, alignment) a debugger field type tag describes,
-/// for the scalar, tuple and array types a union's fields take:
+/// for the scalar, tuple, array and pointer types a union's fields take:
 /// the layout the byte reinterpretation of a union value's
 /// storage follows (a tuple's fields sit at the compiler's
 /// own offsets — see [`tuple_field_layout`]).
@@ -433,6 +529,12 @@ fn tag_layout(ty: &str) -> Option<(usize, usize)> {
     };
     if let Some(s) = scalar {
         return Some(s);
+    }
+    if thin_pointer_tag(ty) {
+        return Some((8, 8));
+    }
+    if fat_pointer_kind(ty).is_some() {
+        return Some((16, 8));
     }
     if ty.starts_with('(') && ty.ends_with(')') {
         let inner = &ty[1..ty.len() - 1];
@@ -563,9 +665,12 @@ fn tag_niche(ty: &str) -> Option<(u64, usize)> {
 
 /// Serialize a value as the little-endian bytes of its type
 /// (see [`tag_layout`]): the storage a union field of that type
-/// occupies. Types with no byte form here (references, ADT
-/// fields, strings) make the whole reinterpretation fail, and
-/// the union keeps the unrenderable form.
+/// occupies. A thin pointer serializes as its address word; a
+/// fat pointer as its data word and its length or vtable word
+/// (the data word in the interpreter-free reading,
+/// [`crate::interp::data_word`]). Types with no byte form here
+/// (ADT fields, strings) make the whole reinterpretation fail,
+/// and the union keeps the unrenderable form.
 fn value_to_union_bytes(value: &Value, ty: &str) -> Option<Vec<u8>> {
     let ty = ty.trim();
     match ty {
@@ -638,6 +743,35 @@ fn value_to_union_bytes(value: &Value, ty: &str) -> Option<Vec<u8>> {
             }
             Some(out)
         }
+        _ if thin_pointer_tag(ty) => match value {
+            Value::Ref(_) | Value::FnPtr(_) => {
+                let addr = crate::interp::synthetic_address(value)?;
+                Some((addr as u64).to_le_bytes().to_vec())
+            }
+            _ => None,
+        },
+        _ if fat_pointer_kind(ty).is_some() => match value {
+            Value::FatRef { base, len } => {
+                let mut out =
+                    (crate::interp::data_word(base) as u64).to_le_bytes().to_vec();
+                out.extend_from_slice(&(*len as u64).to_le_bytes());
+                Some(out)
+            }
+            Value::DynRef {
+                base,
+                concrete,
+                traits,
+                ..
+            } => {
+                let mut out =
+                    (crate::interp::data_word(base) as u64).to_le_bytes().to_vec();
+                out.extend_from_slice(
+                    &(crate::interp::vtable_word(concrete, traits) as u64).to_le_bytes(),
+                );
+                Some(out)
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -709,63 +843,162 @@ fn value_from_union_bytes(bytes: &[u8], ty: &str) -> Option<Value> {
             }
             Some(Value::Tuple(items))
         }
+        _ if thin_pointer_tag(ty) => {
+            let raw = bytes.get(..8)?;
+            let bits = u64::from_le_bytes(raw.try_into().ok()?);
+            Some(Value::Ref(crate::value::RefTarget::Address(bits)))
+        }
         _ => None,
     }
 }
 
-/// The values of every declared field of a union value: the
-/// value model stores only the written field (the slots before
-/// it uninitialised, the slots after it absent), while a
-/// debugger reads every field from the same storage, so the
-/// stored field's bytes are reinterpreted through each declared
-/// field's type.
-pub(super) fn union_field_values(
+/// The storage bytes of a union value in its aggregate form:
+/// the stored field serialized (see [`value_to_union_bytes`]),
+/// zero-extended to the widest field layout the shape
+/// declares (a field whose layout the byte forms cannot
+/// describe does not hold the others back). `None` when the
+/// stored field itself has no byte form.
+fn union_storage_bytes(
     shape_fields: &[sparagmos_mir::AdtDebugField],
     fields: &[Value],
-) -> Option<Vec<Value>> {
-    let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
+    stored: usize,
+) -> Option<Vec<u8>> {
     let stored_ty = &shape_fields.get(stored)?.ty;
     let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
     let size = shape_fields
         .iter()
-        .map(|f| tag_layout(&f.ty).map(|(s, _)| s))
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
+        .filter_map(|f| tag_layout(&f.ty).map(|(s, _)| s))
         .max()
         .unwrap_or(0);
     bytes.resize(size, 0);
-    shape_fields
-        .iter()
-        .map(|f| value_from_union_bytes(&bytes, &f.ty))
+    Some(bytes)
+}
+
+/// A fat pointer value read back from a union's storage
+/// words: the data word becomes an address-only pointer and
+/// the second word the length. A `dyn` field is not read this
+/// way: the model's vtable is an identity (the concrete type
+/// the table is for), not a word the storage carries, so a
+/// trait object read out of another field's storage has no
+/// honest value here.
+fn fat_value_from_words(bytes: &[u8], kind: FatPointerKind) -> Option<Value> {
+    let data = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+    let word = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+    match kind {
+        FatPointerKind::Slice | FatPointerKind::Str => Some(Value::FatRef {
+            base: Box::new(Value::Ref(crate::value::RefTarget::Address(data))),
+            len: u128::from(word),
+        }),
+        FatPointerKind::Dyn => None,
+    }
+}
+
+/// One field of a union value, produced from the union's
+/// storage independently of its sibling fields: the stored
+/// field as it stands, any other field reinterpreted through
+/// the storage bytes (see [`union_storage_bytes`] and
+/// [`fat_value_from_words`]). `None` for a field the storage
+/// cannot produce -- an ADT field whose layout the byte forms
+/// do not describe, a trait object read out of foreign
+/// storage -- which the whole-union rendering degrades in
+/// place rather than failing on: a real debugger reads every
+/// field from the same storage and reports the fields it
+/// cannot read inline.
+fn union_field_from(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    fields: &[Value],
+    stored: usize,
+    index: usize,
+) -> Option<Value> {
+    if index == stored {
+        return Some(fields[stored].clone());
+    }
+    let requested = shape_fields.get(index)?;
+    // A fat pointer read where the stored field is itself a
+    // fat pointer is the stored pointer under the requested
+    // field's type: the two fields share both storage words,
+    // and a debugger shows the one pointer for both.
+    if fat_pointer_kind(&requested.ty).is_some()
+        && matches!(fields[stored], Value::FatRef { .. } | Value::DynRef { .. })
+    {
+        return Some(fields[stored].clone());
+    }
+    let bytes = union_storage_bytes(shape_fields, fields, stored)?;
+    if let Some(value) = value_from_union_bytes(&bytes, &requested.ty) {
+        return Some(value);
+    }
+    fat_pointer_kind(&requested.ty).and_then(|kind| fat_value_from_words(&bytes, kind))
+}
+
+/// The values of every declared field of a union value, one
+/// entry per field: the value model stores only the written
+/// field (the slots before it uninitialised, the slots after
+/// it absent), while a debugger reads every field from the
+/// same storage, so each field is produced from the stored
+/// field's storage independently (see [`union_field_from`]).
+/// A field the storage cannot produce is `None`, not a
+/// failure of the whole.
+pub(super) fn union_field_values(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    fields: &[Value],
+) -> Vec<Option<Value>> {
+    let Some(stored) = fields.iter().rposition(|f| !matches!(f, Value::Uninit)) else {
+        return shape_fields.iter().map(|_| None).collect();
+    };
+    (0..shape_fields.len())
+        .map(|i| union_field_from(shape_fields, fields, stored, i))
         .collect()
 }
 
-/// One field of a union value: the stored field's bytes
-/// reinterpreted as the requested field's type. The stored
-/// field is serialized and the requested field deserialized
-/// independently of the union's other fields, so a sibling
-/// whose layout or byte conversion is unsupported (a raw
-/// pointer field, say) does not prevent reading a supported
-/// field -- the independence the whole-union reading in
-/// [`union_field_values`] cannot offer, since it must
-/// produce every field at once.
+/// One field of a union value in its byte form
+/// (`Value::UnionBytes`): the storage bytes are the value, so
+/// the field is read straight out of them -- the same
+/// reinterpretation [`union_field_from`] applies to the
+/// aggregate form's serialized storage, with a byte no write
+/// covered reading as zero (the fixed reading of storage past
+/// a write, as in the interpreter's own union reads).
+pub(super) fn union_field_from_bytes(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    bytes: &[Option<u8>],
+    index: usize,
+) -> Option<Value> {
+    let requested = shape_fields.get(index)?;
+    // The byte form covers only the written extent; storage
+    // past it reads as zero, as in the aggregate form's
+    // zero-extension to the widest declared field.
+    let size = shape_fields
+        .iter()
+        .filter_map(|f| tag_layout(&f.ty).map(|(s, _)| s))
+        .max()
+        .unwrap_or(0);
+    let mut concrete: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
+    concrete.resize(size.max(concrete.len()), 0);
+    if let Some(value) = value_from_union_bytes(&concrete, &requested.ty) {
+        return Some(value);
+    }
+    fat_pointer_kind(&requested.ty).and_then(|kind| fat_value_from_words(&concrete, kind))
+}
+
+/// One field of a union value: the field read through the
+/// storage reinterpretation (see [`union_field_from`] and
+/// [`union_field_from_bytes`]), independently of the union's
+/// other fields, so a sibling the storage cannot produce does
+/// not prevent reading a field it can.
 fn union_field_value(
     shape_fields: &[sparagmos_mir::AdtDebugField],
     value: &Value,
     index: usize,
 ) -> Option<Value> {
+    if let Value::UnionBytes { bytes } = value {
+        return union_field_from_bytes(shape_fields, bytes, index);
+    }
     let fields: &[Value] = match value {
         Value::Enum { fields, .. } => fields,
         Value::Tuple(fields) => fields,
         _ => return None,
     };
     let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
-    let stored_ty = &shape_fields.get(stored)?.ty;
-    let requested = shape_fields.get(index)?;
-    let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
-    let (size, _) = tag_layout(&requested.ty)?;
-    bytes.resize(size, 0);
-    value_from_union_bytes(&bytes, &requested.ty)
+    union_field_from(shape_fields, fields, stored, index)
 }
 
 /// The value of one field of the ADT value a descriptor
@@ -827,6 +1060,53 @@ pub(super) fn nonzero_lldb_expanded(
     Some(format!("{{ 0 = {{0:{text}}} }}"))
 }
 
+/// The `name: value` parts of a union's fields in gdb form,
+/// each field's value produced by `value_of` (the storage
+/// reinterpretation behind the aggregate and byte forms). A
+/// field with no producible value, or a value this renderer
+/// cannot shape, degrades in place (see
+/// [`UNION_FIELD_UNREADABLE`]): gdb reports such a field
+/// inline and still prints the rest of the union. A field
+/// renders in the caller's mode (pretty printers applied
+/// when the session enables them), like the fields of any
+/// other aggregate.
+fn union_parts_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    vshape: &sparagmos_mir::AdtDebugVariant,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+    value_of: impl Fn(usize) -> Option<Value>,
+) -> Option<Vec<String>> {
+    let mut parts = Vec::with_capacity(vshape.fields.len());
+    for (i, field) in vshape.fields.iter().enumerate() {
+        let name = field.name.as_deref()?;
+        let d = Desc::from_tag(&field.ty);
+        let r = value_of(i)
+            .and_then(|v| {
+                if pretty {
+                    render_gdb_any(interp, frames, &v, Some(&d), depth + 1, elements)
+                } else {
+                    render_gdb_mode(
+                        interp,
+                        frames,
+                        &v,
+                        Some(&d),
+                        false,
+                        None,
+                        depth + 1,
+                        false,
+                        elements,
+                    )
+                }
+            })
+            .unwrap_or_else(|| UNION_FIELD_UNREADABLE.to_string());
+        parts.push(format!("{name}: {r}"));
+    }
+    Some(parts)
+}
+
 /// Render one ADT value in gdb form (see [`render_gdb`]).
 #[allow(clippy::too_many_arguments)]
 fn render_adt_gdb(
@@ -849,28 +1129,10 @@ fn render_adt_gdb(
         // A union value stores only the written field; every
         // declared field is read back from the same storage
         // (see `union_field_values`).
-        let values = union_field_values(&vshape.fields, fields)?;
-        let mut parts = Vec::with_capacity(values.len());
-        for (i, v) in values.iter().enumerate() {
-            let name = vshape.fields[i].name.as_deref()?;
-            let d = Desc::from_tag(&vshape.fields[i].ty);
-            let r = if pretty {
-                render_gdb_any(interp, frames, v, Some(&d), depth + 1, elements)?
-            } else {
-                render_gdb_mode(
-                    interp,
-                    frames,
-                    v,
-                    Some(&d),
-                    false,
-                    None,
-                    depth + 1,
-                    false,
-                    elements,
-                )?
-            };
-            parts.push(format!("{name}: {r}"));
-        }
+        let values = union_field_values(&vshape.fields, fields);
+        let parts = union_parts_gdb(interp, frames, vshape, depth, pretty, elements, |i| {
+            values.get(i).cloned().flatten()
+        })?;
         return Some(format!("{tag} {{{}}}", parts.join(", ")));
     }
     if vshape.fields.len() != fields.len() {
