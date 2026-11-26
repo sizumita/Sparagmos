@@ -309,15 +309,20 @@ impl<'a> Converter<'a> {
         if is_wrapper && args.len() == 1 {
             return Some((args[0].clone(), false));
         }
-        if let Some(field) = self
-            .single_field_ty(def, args)
-            .filter(|field| matches!(field, mir::Ty::Array(..)))
-        {
-            // The restriction to array fields is load-bearing:
+        if let Some(field) = self.single_field_ty(def, args).filter(|field| {
+            matches!(field, mir::Ty::Array(..) | mir::Ty::Slice(..))
+        }) {
+            // The restriction to aggregate fields is load-bearing:
             // scalar-field wrappers include representation
             // wrappers over values this model stores bare (the
             // atomics' alignment wrappers), where a field
             // projection would address storage that is not there.
+            // A slice field is an aggregate like an array field --
+            // the one-field DST wrapper (`struct Slice([u32])`)
+            // whose tail a fat pointer denotes -- so the peel
+            // crosses it the same way, and `wrapper_peel`'s
+            // continuation into the sequence's first element
+            // applies unchanged.
             return Some((field, false));
         }
         self.prefix_field_ty(def, args).map(|ty| (ty, true))
