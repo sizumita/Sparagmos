@@ -2839,6 +2839,37 @@ pub(crate) fn projection_needs_composition(projection: &[RefProj]) -> bool {
     })
 }
 
+/// Whether an index step landing on `element` ranges inside
+/// it (the following steps of an index run nest as written)
+/// rather than denoting the next position of the sequence
+/// holding it (the run composes): the element is itself a
+/// sequence or an aggregate of elements. The `MaybeUninit`
+/// union form over a scalar payload is the one wrapper shape
+/// that does not nest — its payload is a scalar value, which
+/// no index step ranges inside.
+fn element_nests_index(element: &Value) -> bool {
+    match element {
+        Value::Tuple(_)
+        | Value::FatRef { .. }
+        | Value::Bytes(_)
+        | Value::Str(_)
+        | Value::SparseVec { .. } => true,
+        Value::Enum { variant, fields } => {
+            !(*variant == 0
+                && fields.len() == 1
+                && matches!(
+                    fields[0],
+                    Value::Bool(_)
+                        | Value::Int(_)
+                        | Value::Uint(_)
+                        | Value::Float(_)
+                        | Value::Float128(_)
+                ))
+        }
+        _ => false,
+    }
+}
+
 /// Compose the element-position index runs of a projection.
 ///
 /// An index step that lands on one element of a sequence,
@@ -2893,15 +2924,16 @@ pub(crate) fn compose_projection(
                     // shrink, a `set_len`) must not have the
                     // steps into its elements composed into
                     // positions of the sequence holding it.
-                    if !matches!(
-                        element,
-                        Value::Tuple(_)
-                            | Value::FatRef { .. }
-                            | Value::Bytes(_)
-                            | Value::Str(_)
-                            | Value::Enum { .. }
-                            | Value::SparseVec { .. }
-                    ) {
+                    // The one wrapper form that is not an
+                    // element aggregate is the `MaybeUninit`
+                    // union form — a one-field variant-0 wrapper
+                    // around a scalar payload, the shape a bulk
+                    // copy leaves in an element slot: the
+                    // element is the scalar in wrapper form,
+                    // and an index step cannot range inside a
+                    // scalar, so the run composes as it does
+                    // for the bare scalar.
+                    if !element_nests_index(&element) {
                         let merged = match subslice {
                             Some((offset, len)) => RefProj::Subslice {
                                 offset: total + offset,

@@ -5369,6 +5369,145 @@ fn run_mode_sort_interleaved_sixtyfour_scratch_merge() {
     );
 }
 
+const SORT_INTERLEAVED_FOUR_HUNDRED_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..100usize {
+        for p in 0..4usize {
+            v.push(p * 1000 + i);
+        }
+    }
+    v.sort();
+    let ok = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("len {} sorted {} first {} last {}", v.len(), ok, v[0], v[v.len()-1]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_interleaved_four_hundred_scratch_merge() {
+    // The four-hundred-element interleaved sort: driftsort's
+    // merge walks the scratch with pointers the cast chain
+    // left entered into element 0's `MaybeUninit` payload
+    // (`[Field(1), Index(0), Field(0)]` over the byte storage
+    // field). Two denomination gaps used to break it in
+    // sequence. The pointer offset over that entered position
+    // fell out of the declared-type array judgment (which
+    // required the index step to be trailing) into the
+    // value-shape absorption, which priced the offset in the
+    // offset's own element size over the byte-denominated
+    // container: `add(1)` on the `*mut usize` landed on byte
+    // slot 1 instead of slot 8, and the merge's comparisons
+    // read the union wrapper's storage as a unit value. The
+    // array judgment now splits a position into its index step
+    // and the whole-value entry steps behind it, prices the
+    // offset by the sequence's recorded element size, and
+    // keeps the entry steps. And the verification's `windows`
+    // read the sorted elements in the `MaybeUninit` union form
+    // the bulk copies left behind: an index run over the
+    // materialised window tuple refused to compose because
+    // the head element was an enum, so the second index
+    // ranged inside the one-field wrapper and reported a
+    // position past its end. A one-field variant-0 wrapper
+    // around a scalar payload is the scalar in wrapper form,
+    // not an element aggregate, so the run now composes.
+    run_ok(
+        "sort-interleaved-four-hundred",
+        SORT_INTERLEAVED_FOUR_HUNDRED_SRC,
+        "len 400 sorted true first 0 last 3099\n",
+    );
+}
+
+const MERGE_UP_BYTE_STORAGE_SRC: &str = r#"
+use std::mem::MaybeUninit;
+
+#[repr(C)]
+struct AlignedStorage {
+    _align: [usize; 0],
+    storage: [MaybeUninit<u8>; 4096],
+}
+
+impl AlignedStorage {
+    fn new() -> Self {
+        Self { _align: [], storage: [const { MaybeUninit::uninit() }; 4096] }
+    }
+    fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<usize>] {
+        let len = 4096 / std::mem::size_of::<usize>();
+        unsafe { core::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), len) }
+    }
+}
+
+struct MergeState {
+    start: *mut usize,
+    end: *mut usize,
+    dst: *mut usize,
+}
+
+impl MergeState {
+    unsafe fn merge_up(&mut self, mut right: *const usize, right_end: *const usize) {
+        unsafe {
+            let left = &mut self.start;
+            let out = &mut self.dst;
+            while *left != self.end && right as *const usize != right_end {
+                let consume_left = !(*right < **left);
+                let src = if consume_left { *left } else { right };
+                std::ptr::copy_nonoverlapping(src, *out, 1);
+                *left = left.add(consume_left as usize);
+                right = right.add(!consume_left as usize);
+                *out = out.add(1);
+            }
+        }
+    }
+}
+
+fn do_merge(v: &mut [usize], scratch: &mut [MaybeUninit<usize>], mid: usize) {
+    unsafe {
+        let buf = scratch.as_mut_ptr().cast::<usize>();
+        let v_base = v.as_mut_ptr();
+        let v_mid = v_base.add(mid);
+        let v_end = v_base.add(v.len());
+        std::ptr::copy_nonoverlapping(v_base, buf, mid);
+        let mut merge_state = MergeState { start: buf, end: buf.add(mid), dst: v_base };
+        merge_state.merge_up(v_mid, v_end);
+    }
+}
+
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..16usize {
+        for p in 0..4usize {
+            v.push(p * 1000 + i);
+        }
+    }
+    let mut stack_buf = AlignedStorage::new();
+    let scratch = stack_buf.as_uninit_slice_mut();
+    do_merge(&mut v, scratch, 32);
+    let mut wsum: usize = 0;
+    for (i, x) in v.iter().enumerate() {
+        wsum += (i + 1) * x;
+    }
+    println!("len {} first {} last {} wsum {}", v.len(), v[0], v[63], wsum);
+}
+"#;
+
+#[test]
+fn run_mode_merge_up_over_byte_storage_scratch() {
+    // The hand-written merge over a user-defined byte-storage
+    // scratch (the shape std's driftsort scratch takes, in
+    // user MIR): the scratch pointers are denominated through
+    // a `[MaybeUninit<u8>]` field reinterpreted as
+    // `[MaybeUninit<usize>]`, so the base pointer denotes
+    // element 0 entered through the union payload and every
+    // `add` must be priced in the storage's own byte slots
+    // (see `run_mode_sort_interleaved_four_hundred_scratch_merge`).
+    // The merge used to stop at the second element with a
+    // unit value assigned to a `usize` place.
+    run_ok(
+        "merge-up-byte-storage",
+        MERGE_UP_BYTE_STORAGE_SRC,
+        "len 64 first 0 last 3015 wsum 3272656\n",
+    );
+}
+
 const MAYBEUNINIT_SLICE_COPY_SRC: &str = r#"
 use std::mem::MaybeUninit;
 

@@ -2905,7 +2905,8 @@ impl<'a> Interpreter<'a> {
             Some(name) => self.static_array_position(name, &projection),
             None => self.array_position(frames, place, &projection, base, elem_size),
         };
-        if let Some((prefix, cur, elem)) = array_pos {
+        let array_judged = array_pos.is_some();
+        if let Some((prefix, cur, elem, tail)) = array_pos {
             if elem == 0 && total == 0 {
                 // A zero-sized element type: the position is
                 // denominated in elements alone (the byte
@@ -2923,6 +2924,7 @@ impl<'a> Interpreter<'a> {
                             },
                         )?));
                     }
+                    out.extend_from_slice(&tail);
                     return Ok(out);
                 }
             }
@@ -2946,6 +2948,7 @@ impl<'a> Interpreter<'a> {
                                 },
                             )?));
                         }
+                        out.extend_from_slice(&tail);
                         return Ok(out);
                     }
                 }
@@ -2960,7 +2963,7 @@ impl<'a> Interpreter<'a> {
         // above. The declared-type verdict governs whenever it
         // applies, so a byte displacement into a typed sequence is
         // never reinterpreted this way.
-        if array_pos.is_none()
+        if !array_judged
             && !self.byte_view_covers(frames, place, static_name, &projection, base)
         {
             if let Some(base) = base {
@@ -3318,9 +3321,12 @@ impl<'a> Interpreter<'a> {
     /// holds — the local itself (an array, or a sequence ADT
     /// whose value is its element sequence), or a sequence-typed
     /// field of it — and ends at the sequence base (element 0)
-    /// or at a single index into it. Returns the number of
-    /// leading steps that navigate to the sequence (a field
-    /// path), the current element index, and the element size.
+    /// or at a single index into it, possibly entered through
+    /// whole-value entry steps (see [`split_sequence_position`]).
+    /// Returns the number of leading steps that navigate to the
+    /// sequence (a field path), the current element index, the
+    /// element size, and the entry steps that follow the index
+    /// step, which the caller's rebuilt projection keeps.
     fn array_position(
         &self,
         frames: &[Frame],
@@ -3328,24 +3334,21 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         base: Option<&Value>,
         elem_size: Option<u64>,
-    ) -> Option<(usize, i128, i128)> {
+    ) -> Option<(usize, i128, i128, Vec<RefProj>)> {
         let (frame_id, local) = place?;
         let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
         let body = self.program().functions.get(&frame.func)?;
-        // Split the projection into a leading field path and an
-        // optional trailing index step: the steps that navigate
-        // to the sequence, then the position within it.
+        // Split the projection into a leading field path and
+        // the position within the sequence it navigates to: an
+        // optional index step and the whole-value entry steps
+        // that may follow it.
         let mut path: Vec<usize> = Vec::new();
         let mut steps = projection;
         while let Some((RefProj::Field(f), rest)) = steps.split_first() {
             path.push(*f);
             steps = rest;
         }
-        let cur = match steps {
-            [] => None,
-            [RefProj::Index(i)] => Some(i128::try_from(*i).ok()?),
-            _ => return None,
-        };
+        let (cur, tail) = split_sequence_position(steps)?;
         if !path.is_empty() {
             // A sequence held in a field: the position ends at
             // an element of it, or at its base — a bare field
@@ -3375,6 +3378,7 @@ impl<'a> Interpreter<'a> {
                 .copied()?;
             let cur = match cur {
                 Some(c) => c,
+                None if !tail.is_empty() => 0,
                 None => {
                     let root_ty = body.local_tys.get(local)?;
                     let mut cur_ty = WalkTy::Ty(root_ty.clone());
@@ -3410,7 +3414,7 @@ impl<'a> Interpreter<'a> {
             ) {
                 return None;
             }
-            return Some((path.len(), cur, i128::from(elem)));
+            return Some((path.len(), cur, i128::from(elem), tail.to_vec()));
         }
         let elem = match body.local_tys.get(local)? {
             Ty::Array(elem, _) => self.ty_size(elem)?,
@@ -3441,7 +3445,7 @@ impl<'a> Interpreter<'a> {
             }
             _ => return None,
         };
-        Some((0, cur.unwrap_or(0), i128::from(elem)))
+        Some((0, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
     }
 
     /// The array position a projection over the static `name`
@@ -3455,17 +3459,13 @@ impl<'a> Interpreter<'a> {
         &self,
         name: &str,
         projection: &[RefProj],
-    ) -> Option<(usize, i128, i128)> {
+    ) -> Option<(usize, i128, i128, Vec<RefProj>)> {
         let elem = match self.program().static_tys.get(name)? {
             Ty::Array(elem, _) => self.ty_size(elem)?,
             _ => return None,
         };
-        let cur = match projection {
-            [] => 0,
-            [RefProj::Index(i)] => i128::try_from(*i).ok()?,
-            _ => return None,
-        };
-        Some((0, cur, i128::from(elem)))
+        let (cur, tail) = split_sequence_position(projection)?;
+        Some((0, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
     }
 
     /// The value a `Resolved::Value` target denotes: its base
@@ -3487,6 +3487,36 @@ impl<'a> Interpreter<'a> {
                 None,
             )
         }
+    }
+}
+
+/// Split the steps that range over one sequence into the
+/// element position they denote: an optional index step (the
+/// current element; absent denotes the sequence base) and the
+/// whole-value entry steps behind it — field-0 and downcast
+/// steps, the shape a pointer cast into an element through a
+/// transparent wrapper or a union payload leaves
+/// (`[Index(k), Field(0)]` denotes element `k` entered through
+/// the wrapper, and entry steps with no index step enter the
+/// base element). The position is denominated in the
+/// sequence's own elements, whatever type the pointer was cast
+/// to: a cast changes the units a later offset counts in, not
+/// the slots the stored sequence is laid out in, so an offset
+/// over such a position must be priced by the sequence's
+/// recorded element size and the entry steps kept, exactly as
+/// the sequence accesses compose it (see
+/// `Interpreter::seq_element_target`). Any other step shape
+/// denotes no plain sequence position.
+fn split_sequence_position(
+    steps: &[RefProj],
+) -> Option<(Option<i128>, &[RefProj])> {
+    let entry = |s: &RefProj| matches!(s, RefProj::Field(0) | RefProj::Downcast(_));
+    match steps {
+        [RefProj::Index(i), rest @ ..] if rest.iter().all(entry) => {
+            Some((Some(i128::try_from(*i).ok()?), rest))
+        }
+        rest if rest.iter().all(entry) => Some((None, rest)),
+        _ => None,
     }
 }
 
