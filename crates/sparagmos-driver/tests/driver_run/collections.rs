@@ -3421,3 +3421,119 @@ fn run_mode_btree_map_debug_format() {
         "empty {}\nmap {1: 10, 2: 20}\nset {1, 3}\npretty {\n    1: 10,\n    2: 20,\n}\n"
     );
 }
+
+const ARRAY_INTO_ITER_CONSUMERS_O3_SRC: &str = r#"
+fn main() {
+    let v: Vec<i32> = [4, 5, 6].into_iter().collect();
+    println!("{}", v.len());
+    let mut s = 0;
+    for x in &v { s += x; }
+    println!("{}", s);
+    let total: i32 = [1, 2, 3].into_iter().sum();
+    println!("{}", total);
+    println!("{}", [1, 2, 3].into_iter().count());
+    let e: Vec<i32> = [].into_iter().collect();
+    println!("{}", e.len());
+    let w: Vec<String> = ["a".to_string(), "bb".to_string()].into_iter().collect();
+    println!("{}", w.len());
+    println!("{}", w[0].len() + w[1].len());
+}
+"#;
+
+#[test]
+fn run_mode_array_into_iter_consumers_o3() {
+    // At opt-level 3 the `into_iter` construction in `main`
+    // inlines, so the state a consumer builtin (`collect`,
+    // `sum`, `count`) receives is core's real nested layout
+    // (`IntoIter { inner: ManuallyDrop { value:
+    // PolymorphicIter { alive, data } } }`), not the modelled
+    // [items, next index] state the `IntoIterator` builtin
+    // builds at opt-level 0. The modelled step rejected that
+    // layout ("expected [items, next index], found 1
+    // field(s)"); the step now decodes the real layout and
+    // rebuilds it in the same shape.
+    let dir = temp_dir("arrayintoiterconsumers");
+    let src = fixture(&dir, "arrayintoiterconsumers.rs", ARRAY_INTO_ITER_CONSUMERS_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "array into_iter consumers at -O3 must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n15\n6\n3\n0\n2\n3\n"
+    );
+}
+
+const ARRAY_INTO_ITER_EXTEND_O3_SRC: &str = r#"
+use std::collections::VecDeque;
+fn main() {
+    let mut s = String::new();
+    s.extend(['a', 'b', 'c']);
+    println!("{}", s);
+    let mut d: VecDeque<i32> = VecDeque::new();
+    d.extend([1, 2, 3]);
+    println!("{}", d.len());
+    println!("{}", d[0] + d[1] + d[2]);
+}
+"#;
+
+#[test]
+fn run_mode_array_into_iter_extend_o3() {
+    // The `extend` consumers drain the same real-layout
+    // `array::IntoIter` state at opt-level 3 (see
+    // `run_mode_array_into_iter_consumers_o3`): `String`'s
+    // char extend and `VecDeque`'s extend both step it
+    // through the consumer machinery.
+    let dir = temp_dir("arrayintoiterextend");
+    let src = fixture(&dir, "arrayintoiterextend.rs", ARRAY_INTO_ITER_EXTEND_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "array into_iter extend at -O3 must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n3\n6\n");
+}
+
+const ARRAY_INTO_ITER_BY_REF_O3_SRC: &str = r#"
+fn main() {
+    let mut it = [1, 2, 3].into_iter();
+    let v: Vec<i32> = it.by_ref().take(2).collect();
+    println!("{}", v.len());
+    println!("{}", it.next().unwrap());
+    println!("{}", it.next().is_none());
+    let mut it2 = [4, 5, 6].into_iter();
+    println!("{}", it2.next_back().unwrap());
+    println!("{}", it2.next().unwrap());
+    println!("{}", it2.next_back().unwrap());
+    println!("{}", it2.next().is_none());
+}
+"#;
+
+#[test]
+fn run_mode_array_into_iter_by_ref_rebuild_o3() {
+    // A builtin consumer that partially drains a real-layout
+    // `array::IntoIter` (here `by_ref().take(2).collect()`)
+    // writes the stepped state back in the same real layout,
+    // so the guest's own inlined `next` that runs afterwards
+    // reads the narrowed alive range -- and the back step
+    // (`next_back`) narrows it from the other end, the two
+    // composing on one state.
+    let dir = temp_dir("arrayintoiterbyref");
+    let src = fixture(&dir, "arrayintoiterbyref.rs", ARRAY_INTO_ITER_BY_REF_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "array into_iter by_ref/back steps at -O3 must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2\n3\ntrue\n6\n4\n5\ntrue\n"
+    );
+}
