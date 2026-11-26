@@ -273,6 +273,83 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// A vtable dispatch the program holds no impl body for,
+    /// whose method the file-io model serves for the receiver's
+    /// concrete type. The standard streams' `Write` impls are
+    /// the case that arises: `<std::io::Stdout as std::io::Write>::
+    /// write` has no MIR body in the prebuilt library at all, so
+    /// no demand pass can put one in the program, while the same
+    /// call with a statically known receiver is served by the
+    /// captured-stream arms of `exec_file_io` (see
+    /// `file_io_terminator` in `mir_convert`). The model is keyed
+    /// on exactly the pair the fat pointer carries - the method's
+    /// definition name and the concrete type - so the dispatch
+    /// can be served the same way once the vtable lookup has
+    /// established that no body exists. Returns the name, the
+    /// generic arguments (the concrete type alone) and the
+    /// receiver (the fat pointer's data pointer, as a vtable
+    /// dispatch hands it over) when the dispatch is servable
+    /// this way.
+    pub(crate) fn dyn_file_io_target(
+        &self,
+        func: &str,
+        arg_values: &[Value],
+    ) -> Option<(String, Vec<String>, Value)> {
+        let Value::DynRef {
+            base,
+            concrete,
+            traits,
+            ..
+        } = arg_values.first()?
+        else {
+            return None;
+        };
+        let (trait_path, method) = func.rsplit_once("::")?;
+        if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        if !traits.iter().any(|t| t == trait_path) {
+            return None;
+        }
+        let generic_args = vec![concrete.clone()];
+        if !crate::builtins::is_file_io_call(func, &generic_args) {
+            return None;
+        }
+        Some((func.to_string(), generic_args, (**base).clone()))
+    }
+
+    /// Complete a call served by the dyn file-io lookup: run
+    /// the file-io model on the evaluated arguments, with the
+    /// fat pointer's data pointer as the receiver, and write
+    /// its result to the call's destination, exactly as a
+    /// `CallBuiltin` terminator for the same call completes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_dyn_file_io(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        name: &str,
+        generic_args: &[String],
+        receiver: Value,
+        mut arg_values: Vec<Value>,
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> InterpResult<()> {
+        if let Some(first) = arg_values.first_mut() {
+            *first = receiver;
+        }
+        let result = self.exec_file_io(frames, name, generic_args, arg_values)?;
+        match target {
+            Some(bb) => {
+                self.write_place(frames, body, destination, result)?;
+                Self::jump(frames, body, bb)
+            }
+            None => Err(InterpError::MissingContinuation {
+                func: name.to_string(),
+            }),
+        }
+    }
+
     /// Resolve a call that has no body under its own name against
     /// a `dyn` receiver: the vtable lookup, with the fat pointer's
     /// (concrete type, trait) pair standing in for the vtable.

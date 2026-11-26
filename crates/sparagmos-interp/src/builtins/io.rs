@@ -143,7 +143,7 @@ impl<'a> Interpreter<'a> {
     /// place. The guest-visible results are std's own shapes
     /// (the host errno in the `Os` error form, the bare-kind
     /// form for the errors std raises itself).
-    pub(super) fn exec_file_io(
+    pub(crate) fn exec_file_io(
         &mut self,
         frames: &mut Vec<Frame>,
         name: &str,

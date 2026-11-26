@@ -126,6 +126,7 @@ pub use self::lookup::{
     consumes_caller_location, fmt_trait_method, foreign_helper_lookup, intrinsic_lookup, lookup,
     lookup_qualified, net_trait_method, runtime_name_fallback,
 };
+pub(crate) use self::lookup::is_file_io_call;
 pub use self::names::{canonical_name, ty_tag, ty_tag_full};
 pub use self::registry::{
     BitOp, Builtin, FastFloatOp, FetchOp, FloatOp, FsSysOp, PathPart, RelOp, SatOp, SimdOp,

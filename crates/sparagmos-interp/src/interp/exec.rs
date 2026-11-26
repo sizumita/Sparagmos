@@ -676,13 +676,36 @@ impl<'a> Interpreter<'a> {
                     // when it is not a vtable dispatch, the
                     // builtin of the same name may serve it (see
                     // `builtin_name_fallback`). The vtable check
-                    // comes first, exactly as in `start_call`.
-                    let fallback = if self.virtual_call_target(func, &arg_values).is_none() {
+                    // comes first, exactly as in `start_call`. A
+                    // vtable dispatch whose concrete impl body is
+                    // not in the program may still be served, by
+                    // the file-io model, when the method is one
+                    // it serves for the receiver's concrete type
+                    // (see `dyn_file_io_target`).
+                    let vt = self.virtual_call_target(func, &arg_values);
+                    let fallback = if vt.is_none() {
                         self.builtin_name_fallback(func)
                     } else {
                         None
                     };
-                    let outcome = if let Some((canonical, kind, generic_args)) = fallback {
+                    let dyn_io = match &vt {
+                        Some(Err(InterpError::UnsupportedDynamicDispatch { .. })) => {
+                            self.dyn_file_io_target(func, &arg_values)
+                        }
+                        _ => None,
+                    };
+                    let outcome = if let Some((name, generic_args, receiver)) = dyn_io {
+                        self.complete_dyn_file_io(
+                            frames,
+                            body,
+                            &name,
+                            &generic_args,
+                            receiver,
+                            arg_values,
+                            destination,
+                            *target,
+                        )
+                    } else if let Some((canonical, kind, generic_args)) = fallback {
                         self.complete_builtin_name_fallback(
                             frames,
                             body,
@@ -729,14 +752,35 @@ impl<'a> Interpreter<'a> {
                             // method by its plain trait path has
                             // no body under that name; the builtin
                             // of the same name may serve it (see
-                            // `builtin_name_fallback`).
-                            let fallback =
-                                if self.virtual_call_target(&name, &arg_values).is_none() {
-                                    self.builtin_name_fallback(&name)
-                                } else {
-                                    None
-                                };
-                            if let Some((canonical, kind, generic_args)) = fallback {
+                            // `builtin_name_fallback`). A vtable
+                            // dispatch with no impl body in the
+                            // program may be served by the file-io
+                            // model instead (see
+                            // `dyn_file_io_target`).
+                            let vt = self.virtual_call_target(&name, &arg_values);
+                            let fallback = if vt.is_none() {
+                                self.builtin_name_fallback(&name)
+                            } else {
+                                None
+                            };
+                            let dyn_io = match &vt {
+                                Some(Err(
+                                    InterpError::UnsupportedDynamicDispatch { .. },
+                                )) => self.dyn_file_io_target(&name, &arg_values),
+                                _ => None,
+                            };
+                            if let Some((io_name, generic_args, receiver)) = dyn_io {
+                                self.complete_dyn_file_io(
+                                    frames,
+                                    body,
+                                    &io_name,
+                                    &generic_args,
+                                    receiver,
+                                    arg_values,
+                                    destination,
+                                    *target,
+                                )?;
+                            } else if let Some((canonical, kind, generic_args)) = fallback {
                                 self.complete_builtin_name_fallback(
                                     frames,
                                     body,

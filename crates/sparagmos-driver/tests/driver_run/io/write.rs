@@ -174,3 +174,80 @@ fn run_mode_write_fmt_cursor_and_dyn() {
         "cursor: n=42 x\nbuf: v7\n",
     );
 }
+
+const DYN_STDOUT_SRC: &str = r#"
+use std::io::{self, Write};
+
+fn f(wr: &mut dyn Write) {
+    wr.write_all(b"hello").ok().expect("failed");
+}
+
+fn main() {
+    let mut wr = Box::new(io::stdout()) as Box<dyn Write>;
+    f(&mut wr);
+    let mut direct: Box<dyn Write> = Box::new(io::stdout());
+    direct.write_all(b" direct").unwrap();
+    println!(" done");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_write_to_stdout_receiver() {
+    // Dynamic dispatch of `Write` methods on a `Stdout`
+    // receiver: `<Stdout as Write>::write` has no MIR body in
+    // the prebuilt library, so no vtable body exists to
+    // dispatch to; the file-io model serves the dispatch from
+    // the concrete type the fat pointer carries, exactly as
+    // it serves the statically-known call. Reaching the call
+    // goes through the call-site coercion `&mut Box<dyn
+    // Write>` -> `&mut dyn Write`, whose concrete type
+    // likewise rides on the stored pointer.
+    run_ok("dyn-write-stdout", DYN_STDOUT_SRC, "hello direct done\n");
+}
+
+const CALL_ARG_BOX_DYN_SRC: &str = r#"
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+struct Sink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn f(wr: &mut dyn Write) {
+    wr.write_all(b"hello").ok().expect("failed");
+}
+
+fn main() {
+    let shared = Arc::new(Mutex::new(Vec::new()));
+    let mut wr = Box::new(Sink(shared.clone())) as Box<dyn Write>;
+    f(&mut wr);
+    f(&mut wr);
+    let v = shared.lock().unwrap();
+    assert_eq!(&v[..], b"hellohello");
+    println!("call-arg box dyn ok");
+}
+"#;
+
+#[test]
+fn run_mode_call_arg_box_dyn_to_ref_dyn() {
+    // The call-site coercion of `tests/ui/coercion/
+    // box-dyn-to-ref-dyn.rs`: conversion records no concrete
+    // type for a dyn-to-dyn cast, so the interpreter reborrows
+    // the trait-object pointer stored behind the reference;
+    // the writes through the reborrow land on the concrete
+    // value behind the box.
+    run_ok(
+        "call-arg-box-dyn",
+        CALL_ARG_BOX_DYN_SRC,
+        "call-arg box dyn ok\n",
+    );
+}

@@ -43,17 +43,46 @@ impl<'a> Interpreter<'a> {
                     drop_glue,
                 }),
                 Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
-                    let concrete = concrete.clone().ok_or_else(|| {
-                        InterpError::UnsupportedRvalue {
-                            kind: "Unsize to dyn (no concrete type recorded)".to_string(),
+                    match concrete {
+                        Some(concrete) => Ok(Value::DynRef {
+                            base: Box::new(v),
+                            concrete: concrete.clone(),
+                            traits: traits.clone(),
+                            drop_glue: glue.clone().map(Box::new),
+                        }),
+                        // A `dyn`-to-`dyn` coercion whose operand
+                        // is a reference to a place holding a
+                        // trait-object pointer (a `&mut
+                        // Box<dyn Trait>` argument where a `&mut
+                        // dyn Trait` is expected): no concrete
+                        // type is static here - it rides on the
+                        // stored pointer. Read the stored pointer
+                        // and reborrow it: the data pointer and
+                        // the concrete type carry over, the
+                        // bounds become the cast's, and the
+                        // reborrow owns nothing, so no drop glue
+                        // attaches.
+                        None => {
+                            let resolved = self.deref_value(frames, &v)?;
+                            let stored = self.read_resolved(frames, &resolved)?;
+                            match stored {
+                                Value::DynRef {
+                                    base,
+                                    concrete: stored_concrete,
+                                    ..
+                                } => Ok(Value::DynRef {
+                                    base,
+                                    concrete: stored_concrete,
+                                    traits: traits.clone(),
+                                    drop_glue: None,
+                                }),
+                                _ => Err(InterpError::UnsupportedRvalue {
+                                    kind: "Unsize to dyn (no concrete type recorded)"
+                                        .to_string(),
+                                }),
+                            }
                         }
-                    })?;
-                    Ok(Value::DynRef {
-                        base: Box::new(v),
-                        concrete,
-                        traits: traits.clone(),
-                        drop_glue: glue.clone().map(Box::new),
-                    })
+                    }
                 }
                 other => Err(InterpError::type_mismatch(
                     "unsizing cast to dyn",
