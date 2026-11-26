@@ -1126,6 +1126,95 @@ class KnownBugScopeTests(unittest.TestCase):
                          "not attempted (known-bug)")
 
 
+class SanitizerVerdictScopeTests(unittest.TestCase):
+    """Sanitizer-report verdicts (issues #532, #509).
+
+    The exec run-fail family is classified by sanitizer_scope;
+    the compile-check run-fail-or-crash family by
+    sanitizer_run_fail_or_crash_scope. Both helpers classify
+    from the directive view alone.
+    """
+
+    def rec(self, nature="exec"):
+        return {"suite": "ui", "path": "tests/ui/sanitizer/x.rs",
+                "nature": nature, "single_file": True, "ffi": False,
+                "env_excluded": False}
+
+    def view(self, text, revision=None):
+        return header(text).view(revision)
+
+    def test_run_fail_or_crash_with_sanitizer_is_classified(self):
+        scope = run.sanitizer_run_fail_or_crash_scope(self.view(
+            "//@ needs-sanitizer-address\n"
+            "//@ compile-flags: -Z sanitizer=address -O -g\n"
+            "//@ run-fail-or-crash\n"
+            "//@ error-pattern: AddressSanitizer: stack-buffer-overflow\n"
+            "fn main() {}\n"))
+        self.assertIsNotNone(scope)
+        reason, bucket = scope
+        self.assertEqual(bucket,
+                         "not attempted (sanitizer instrumentation)")
+        self.assertIn("-Z sanitizer=address", reason)
+        self.assertIn("run-fail-or-crash", reason)
+
+    def test_joined_z_spelling_is_classified(self):
+        scope = run.sanitizer_run_fail_or_crash_scope(self.view(
+            "//@ compile-flags: -Zsanitizer=address -Clto=thin\n"
+            "//@ run-fail-or-crash\nfn main() {}\n"))
+        self.assertIsNotNone(scope)
+        self.assertIn("-Z sanitizer=address", scope[0])
+
+    def test_revision_scoped_sanitizer_flags(self):
+        text = ("//@ revisions: cfi kcfi\n"
+                "//@ [cfi] compile-flags: -Z sanitizer=cfi\n"
+                "//@ [kcfi] compile-flags: -Z sanitizer=kcfi\n"
+                "//@ run-fail-or-crash\nfn main() {}\n")
+        cfi = run.sanitizer_run_fail_or_crash_scope(
+            self.view(text, "cfi"))
+        kcfi = run.sanitizer_run_fail_or_crash_scope(
+            self.view(text, "kcfi"))
+        self.assertIsNotNone(cfi)
+        self.assertIsNotNone(kcfi)
+        self.assertIn("-Z sanitizer=cfi", cfi[0])
+        self.assertIn("-Z sanitizer=kcfi", kcfi[0])
+
+    def test_run_fail_or_crash_without_sanitizer_stays(self):
+        # The expected failure is the program's own; an
+        # execution could in principle judge it, so the view
+        # keeps the generic verdict-needs-execution bucket.
+        self.assertIsNone(run.sanitizer_run_fail_or_crash_scope(
+            self.view("//@ compile-flags: -O\n"
+                      "//@ run-fail-or-crash\nfn main() {}\n")))
+
+    def test_sanitizer_without_run_fail_or_crash_stays(self):
+        self.assertIsNone(run.sanitizer_run_fail_or_crash_scope(
+            self.view("//@ compile-flags: -Z sanitizer=address\n"
+                      "//@ check-pass\nfn main() {}\n")))
+
+    def test_run_fail_mode_is_the_exec_scopes_territory(self):
+        self.assertIsNone(run.sanitizer_run_fail_or_crash_scope(
+            self.view("//@ compile-flags: -Z sanitizer=leak\n"
+                      "//@ run-fail\nfn main() {}\n")))
+
+    def test_exec_sanitizer_scope_unchanged_by_the_helper(self):
+        scope = run.sanitizer_scope(self.rec(), self.view(
+            "//@ compile-flags: -Z sanitizer=leak\n"
+            "//@ run-fail\nfn main() {}\n"))
+        self.assertIsNotNone(scope)
+        self.assertEqual(scope[1],
+                         "not attempted (sanitizer instrumentation)")
+        self.assertIn("-Z sanitizer=leak", scope[0])
+        # A run-pass sanitizer view stays attempted, and the
+        # exec scope never fires for a compile-check record.
+        self.assertIsNone(run.sanitizer_scope(self.rec(), self.view(
+            "//@ compile-flags: -Z sanitizer=cfi\n"
+            "//@ run-pass\nfn main() {}\n")))
+        self.assertIsNone(run.sanitizer_scope(
+            self.rec(nature="compile-check"), self.view(
+                "//@ compile-flags: -Z sanitizer=leak\n"
+                "//@ run-fail\nfn main() {}\n")))
+
+
 class CompileExpectationTests(unittest.TestCase):
     def test_ui_default_is_check_fail(self):
         h = header("fn main() { let x: u8 = \"s\"; }\n")

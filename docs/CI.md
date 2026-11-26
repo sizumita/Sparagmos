@@ -248,7 +248,16 @@ denominator. Runs on every push to `main` and on manual dispatch.
   them as not attempted under the bucket
   `not attempted (sanitizer instrumentation)` (issue #532),
   the same shape as the coverage records above. The
-  denominator is unaffected. A run-pass sanitizer test
+  denominator is unaffected. The compile-check records of
+  the same family whose views declare `run-fail-or-crash`
+  rather than a run mode (the address, thread and CFI trap
+  tests) are recorded under the same bucket by stages 1
+  and 2: the verdict is the same sanitizer report awaited
+  from the run, which neither a conversion outcome nor an
+  uninstrumented execution can judge. A run-fail-or-crash
+  view without a sanitizer flag keeps the generic
+  verdict-needs-execution classification. A run-pass
+  sanitizer test
   (the cfi family, memory-passing, dataflow) is judged on
   the instrumented program running clean, which plain
   execution reproduces, so those stay attempted.

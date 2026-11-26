@@ -4688,20 +4688,71 @@ def sanitizer_scope(rec, view):
     # reproduces -- those stay attempted.
     if run_mode(view) != "run-fail":
         return None
+    name = _sanitizer_flag_name(view)
+    if name is None:
+        return None
+    return (
+        f"compile-flags request -Z sanitizer={name}: "
+        "the verdict is the sanitizer runtime's "
+        "report on the instrumented binary (its exit "
+        "class and diagnostic pattern), which no "
+        "execution of the uninstrumented program "
+        "under Sparagmos can reproduce",
+        "not attempted (sanitizer instrumentation)")
+
+
+def _sanitizer_flag_name(view):
+    """The sanitizer a view's compile-flags request, or None.
+
+    The suite spells the flag `-Z sanitizer=<name>`,
+    `-Zsanitizer=<name>`, or as a bare `sanitizer=<name>`
+    token following a separate `-Z`; all three spellings
+    appear in compile-flags values.
+    """
     for flag in view.values("compile-flags"):
         for token in flag.split():
             opt = token[2:] if token.startswith("-Z") else token
             if opt.startswith("sanitizer="):
-                name = opt.partition("=")[2]
-                return (
-                    f"compile-flags request -Z sanitizer={name}: "
-                    "the verdict is the sanitizer runtime's "
-                    "report on the instrumented binary (its exit "
-                    "class and diagnostic pattern), which no "
-                    "execution of the uninstrumented program "
-                    "under Sparagmos can reproduce",
-                    "not attempted (sanitizer instrumentation)")
+                return opt.partition("=")[2]
     return None
+
+
+def sanitizer_run_fail_or_crash_scope(view):
+    """(reason, bucket) for a compile-check view whose verdict
+    is a sanitizer report awaited from a run, else None.
+
+    The compile-check counterpart of sanitizer_scope: a view
+    declaring `run-fail-or-crash` whose compile-flags request
+    a sanitizer is judged by compiletest on the instrumented
+    binary's run -- the run must fail or crash with the
+    sanitizer runtime's diagnostic in its output (the view's
+    error-pattern directives name it: "AddressSanitizer:
+    stack-buffer-overflow", "WARNING: ThreadSanitizer: data
+    race", a CFI trap report). The instrumentation is added
+    by LLVM at codegen; no MIR the interpreter executes
+    carries it and the guest program is never instrumented,
+    so neither a conversion outcome nor an execution of the
+    uninstrumented program can reproduce the verdict -- the
+    same shape as the exec run-fail family (issue #532). A
+    run-fail-or-crash view without a sanitizer flag is not
+    classified here: its expected failure is the program's
+    own, which an execution could in principle judge, so it
+    keeps the generic verdict-needs-execution bucket.
+    """
+    if not view.has("run-fail-or-crash"):
+        return None
+    name = _sanitizer_flag_name(view)
+    if name is None:
+        return None
+    return (
+        f"compile-flags request -Z sanitizer={name}: "
+        "the run-fail-or-crash verdict is the sanitizer "
+        "runtime's report on the instrumented binary (its "
+        "failure/crash class and the diagnostic its "
+        "error-pattern names), which neither a conversion "
+        "outcome nor an execution of the uninstrumented "
+        "program under Sparagmos can reproduce",
+        "not attempted (sanitizer instrumentation)")
 
 
 # The ui suite's codegen/ subtree holds the tests whose
@@ -5077,6 +5128,10 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
     expectation = compile_expectation(rec["suite"], view)
     res["expectation"] = expectation
     if expectation is None:
+        scope = sanitizer_run_fail_or_crash_scope(view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
         res["reason"] = ("verdict involves executing the program "
                          "(run-fail-or-crash / run mode), which a "
                          "compile outcome alone cannot judge")
@@ -6199,6 +6254,10 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     if expectation is None and run_mode(view) not in ("run-pass",
                                                      "run-fail",
                                                      "run-crash"):
+        scope = sanitizer_run_fail_or_crash_scope(view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
         if rec["suite"] == "incremental":
             if revision is None:
                 res["reason"] = ("incremental test declares no "
