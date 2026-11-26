@@ -220,6 +220,42 @@ pub(super) fn path_text(value: &Value) -> Option<String> {
     None
 }
 
+/// The text a string-family value denotes: a bare string
+/// value is its own text, and a reference or fat pointer to
+/// one reads through to the pointee's text. The read resolves
+/// with no live frames: pointees held as values, statics or
+/// allocations resolve, while a pointee in a live frame's
+/// place does not (its rendering keeps the address form).
+pub(super) fn pointee_text(interp: &Interpreter, value: &Value) -> Option<String> {
+    match value {
+        Value::Str(s) => return Some(s.clone()),
+        Value::Bytes(b) => return Some(String::from_utf8_lossy(b).into_owned()),
+        _ => {}
+    }
+    // The resolution may land on a further pointer layer (a
+    // box's allocation holds the fat pointer to the string
+    // data, not the data itself): follow a bounded chain.
+    let mut current = value.clone();
+    for _ in 0..4 {
+        let pointee = pointee_value(interp, &current)?;
+        match pointee {
+            Value::Str(s) => return Some(s),
+            Value::Bytes(b) => {
+                return Some(String::from_utf8_lossy(&b).into_owned())
+            }
+            next => current = next,
+        }
+    }
+    None
+}
+
+/// The value a pointer-family value points at, resolved with
+/// no live frames (see [`pointee_text`] for the reach).
+pub(super) fn pointee_value(interp: &Interpreter, value: &Value) -> Option<Value> {
+    let resolved = interp.deref_value(&[], value).ok()?;
+    interp.read_resolved(&[], &resolved).ok()
+}
+
 /// lldb's summary for a `Vec` value: in this runtime's std model
 /// a vector is an ADT aggregate of its elements, not the
 /// library's buffer/length layout, so the debug-shape table

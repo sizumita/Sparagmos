@@ -3,7 +3,7 @@
 use crate::interp::{Frame, Interpreter};
 use crate::ir::Ty;
 use crate::value::Value;
-use super::desc::{Desc, dwarf_type_name, path_text, render_vec_lldb, tag_base_name};
+use super::desc::{Desc, dwarf_type_name, path_text, pointee_text, render_vec_lldb, tag_base_name};
 use super::evaluate::desc_scalar_width;
 use super::queries::nonzero_scalar;
 use super::render_gdb::{MAX_RENDER_DEPTH, nonzero_lldb_expanded, render_elements, render_gdb, union_field_values};
@@ -63,6 +63,7 @@ pub(super) fn render_lldb_compact(
                 &descs,
                 shared,
                 DebugDialect::Lldb,
+                None,
                 depth,
             )?;
             Some(format!("({})", parts.join(", ")))
@@ -92,6 +93,19 @@ pub(super) fn render_lldb_compact(
         | Value::FatRef { .. }
         | Value::DynRef { .. }
         | Value::FnPtr(_) => {
+            // A reference to `str` renders as the string's
+            // contents, as lldb renders a `str` child. A
+            // pointee the model cannot reach keeps the
+            // address form below.
+            if matches!(
+                desc,
+                Some(Desc::Ref(inner) | Desc::RefMut(inner))
+                    if matches!(inner.as_ref(), Desc::Str)
+            ) {
+                if let Some(text) = pointee_text(interp, value) {
+                    return Some(format!("\"{}\"", escape_str(&text)));
+                }
+            }
             let addr = crate::interp::synthetic_address(value)?;
             Some(format!("0x{addr:x}"))
         }
@@ -183,6 +197,7 @@ fn render_adt_lldb_compact(
                     &descs,
                     None,
                     DebugDialect::Lldb,
+                    None,
                     depth,
                 )?;
                 if nested {
@@ -331,7 +346,7 @@ fn named_field_values(
     let mut pairs = Vec::with_capacity(fields.len());
     for (i, field) in fields.iter().enumerate() {
         let d = Desc::from_tag(&vshape.fields[i].ty);
-        let gdb = render_gdb(interp, field, Some(&d), false, None, 1)?;
+        let gdb = render_gdb(interp, field, Some(&d), false, None, None, 1)?;
         let compact = render_lldb_compact(interp, field, Some(&d), false, true, 1)?;
         pairs.push((vshape.fields[i].name.clone()?, gdb, compact));
     }
@@ -408,7 +423,7 @@ pub(super) fn render_env_gdb(
     for (field, stored) in &pairs {
         let name = field.name.as_deref()?;
         let d = Desc::from_tag(&field.ty);
-        let rendered = render_gdb(interp, stored, Some(&d), false, None, depth + 1)?;
+        let rendered = render_gdb(interp, stored, Some(&d), false, None, None, depth + 1)?;
         parts.push(format!("{name}: {rendered}"));
     }
     match value {
@@ -651,6 +666,20 @@ pub(super) fn lldb_type_name(tag: &str) -> String {
 }
 
 /// Escape a string value for lldb's quoted string summary.
+/// Quote a string for gdb rendering, applying gdb's
+/// `print elements` truncation when a limit is set and the
+/// text is longer: the first `limit` characters, the closing
+/// quote, then gdb's `...` continuation marker.
+pub(super) fn quote_str(text: &str, elements: Option<usize>) -> String {
+    match elements {
+        Some(limit) if text.chars().count() > limit => {
+            let head: String = text.chars().take(limit).collect();
+            format!("\"{}\"...", escape_str(&head))
+        }
+        _ => format!("\"{}\"", escape_str(text)),
+    }
+}
+
 pub(super) fn escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

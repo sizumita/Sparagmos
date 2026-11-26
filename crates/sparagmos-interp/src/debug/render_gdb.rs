@@ -2,9 +2,9 @@
 
 use crate::interp::Interpreter;
 use crate::value::Value;
-use super::desc::{Desc, dwarf_type_name, split_top_level};
+use super::desc::{Desc, dwarf_type_name, first_generic_arg, path_text, pointee_text, pointee_value, split_top_level, tag_base_name};
 use super::queries::nonzero_scalar;
-use super::render_lldb::{render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width};
+use super::render_lldb::{quote_str, render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width};
 use super::session::{DebugDialect, PrintFormat};
 
 /// The deepest aggregate nesting the renderers unfold. A value
@@ -22,6 +22,7 @@ pub(super) fn render_elements(
     descs: &[Desc],
     shared: Option<&Desc>,
     dialect: DebugDialect,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<Vec<String>> {
     let mut parts = Vec::with_capacity(fields.len());
@@ -29,7 +30,7 @@ pub(super) fn render_elements(
         let d = shared.or_else(|| descs.get(i));
         parts.push(match dialect {
             DebugDialect::Gdb => {
-                render_gdb(interp, field, d, false, None, depth + 1)?
+                render_gdb(interp, field, d, false, None, elements, depth + 1)?
             }
             DebugDialect::Lldb => {
                 render_lldb_compact(interp, field, d, false, true, depth + 1)?
@@ -76,13 +77,37 @@ pub(super) fn render_gdb(
     desc: Option<&Desc>,
     top_char: bool,
     format: Option<PrintFormat>,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
     if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
-        return render_gdb(interp, &scalar, Some(&inner), top_char, format, depth);
+        return render_gdb(interp, &scalar, Some(&inner), top_char, format, elements, depth);
+    }
+    if let Some(Desc::Adt(tag)) = desc {
+        let dwarf = dwarf_type_name(tag);
+        // A `String` value in this model is its text (bare, or
+        // wrapped in the single-field layers `path_text`
+        // reads), not the library's buffer aggregate; gdb's
+        // raw form is that aggregate's structural expansion,
+        // synthesised from the text (see
+        // `string_structural_fields`).
+        if tag_base_name(&dwarf) == "String" {
+            if let Some(text) = string_text(value) {
+                let shape = interp.program().adt_debug_shapes.get(tag)?;
+                let fields = string_structural_fields(&text);
+                return render_adt_gdb(interp, tag, shape, 0, &fields, elements, depth);
+            }
+        }
+        // A `Box<str>` prints as the type followed by the
+        // pointee's bytes in array form.
+        if tag_base_name(&dwarf) == "Box" {
+            if let Some(rendered) = render_box_gdb(interp, value, &dwarf) {
+                return Some(rendered);
+            }
+        }
     }
     match value {
         Value::Bool(_)
@@ -119,6 +144,7 @@ pub(super) fn render_gdb(
                         Some(elem),
                         false,
                         None,
+                        elements,
                         depth + 1,
                     )?);
                 }
@@ -134,6 +160,7 @@ pub(super) fn render_gdb(
                     &descs,
                     None,
                     DebugDialect::Gdb,
+                    elements,
                     depth,
                 )?;
                 if parts.len() == 1 {
@@ -148,12 +175,54 @@ pub(super) fn render_gdb(
                 return None;
             };
             let shape = interp.program().adt_debug_shapes.get(tag)?;
-            render_adt_gdb(interp, tag, shape, *variant, fields, depth)
+            render_adt_gdb(interp, tag, shape, *variant, fields, elements, depth)
         }
         Value::Ref(_)
         | Value::FatRef { .. }
         | Value::DynRef { .. }
         | Value::FnPtr(_) => {
+            // A reference to `str` prints as the string's
+            // contents, as gdb prints a fat pointer to `str`.
+            // A pointee the model cannot reach (a live frame's
+            // place) keeps the address form below.
+            if matches!(
+                desc,
+                Some(Desc::Ref(inner) | Desc::RefMut(inner))
+                    if matches!(inner.as_ref(), Desc::Str)
+            ) {
+                if let Some(text) = pointee_text(interp, value) {
+                    return Some(quote_str(&text, elements));
+                }
+            }
+            // A fat pointer to an unsized ADT, reached through
+            // a pointer-typed position (a `NonNull` field, a
+            // raw pointer): gdb expands the pointee aggregate
+            // in place of the address.
+            if matches!(value, Value::Ref(_) | Value::FatRef { .. }) {
+                if let Some(tag) = fat_pointee_adt_tag(desc) {
+                    if adt_tail_unsized(interp, &tag) {
+                        if let Some(pointee) = pointee_value(interp, value) {
+                            if let Value::Enum { variant, fields } = &pointee {
+                                if let Some(shape) =
+                                    interp.program().adt_debug_shapes.get(&tag)
+                                {
+                                    if let Some(rendered) = render_adt_gdb(
+                                        interp,
+                                        &tag,
+                                        shape,
+                                        *variant,
+                                        fields,
+                                        elements,
+                                        depth + 1,
+                                    ) {
+                                        return Some(rendered);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let addr = crate::interp::synthetic_address(value)?;
             // A pointer to the unit type prints with its type
             // in cast form (`(*mut ()) 0x...`): the unit type
@@ -179,8 +248,137 @@ pub(super) fn render_gdb(
             Some(Desc::Bool) => Some("false".to_string()),
             _ => None,
         },
+        Value::Str(text) => {
+            // A string value prints as its quoted contents:
+            // a `str` place's value, and the value a `&str`
+            // local holds in this model. (A value described
+            // as `String` took the structural form above.)
+            Some(quote_str(text, elements))
+        }
         _ => None,
     }
+}
+
+/// The text of a `String`-described value: the bare string
+/// form, or the wrapped form `path_text` reads (a real buffer
+/// aggregate does not yield a text here, and keeps the
+/// structural rendering the shape table drives).
+fn string_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Str(s) => Some(s.clone()),
+        Value::Enum { .. } => path_text(value),
+        _ => None,
+    }
+}
+
+/// The field values of a `String`'s library aggregate
+/// (`String { vec: Vec { buf: RawVec { inner: RawVecInner {
+/// ptr, cap, alloc }, _marker }, len } }`) synthesised from
+/// its text: the buffer pointer denotes the text itself, and
+/// the capacity is the text's length (the model's string
+/// form carries no separate capacity; the interpreter's own
+/// structural projections read the same value for it).
+fn string_structural_fields(text: &str) -> Vec<Value> {
+    let len = text.len() as u128;
+    let ptr = Value::Ref(crate::value::RefTarget::value(Value::Str(
+        text.to_string(),
+    )));
+    let inner = Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![ptr],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(len)],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    };
+    let buf = Value::Enum {
+        variant: 0,
+        fields: vec![
+            inner,
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    };
+    let vec = Value::Enum {
+        variant: 0,
+        fields: vec![buf, Value::Uint(len)],
+    };
+    vec![vec]
+}
+
+/// gdb's raw form of a `Box<str>`: the type name followed by
+/// the pointee's bytes in array form. Any other box keeps the
+/// aggregate rendering.
+fn render_box_gdb(interp: &Interpreter, value: &Value, dwarf_tag: &str) -> Option<String> {
+    if first_generic_arg(dwarf_tag)? != "str" {
+        return None;
+    }
+    let text = pointee_text(interp, value).or_else(|| match value {
+        Value::Enum { fields, .. } if !fields.is_empty() => {
+            pointee_text(interp, &fields[0])
+        }
+        _ => None,
+    })?;
+    let bytes = text
+        .as_bytes()
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{dwarf_tag} [{bytes}]"))
+}
+
+/// The ADT tag a fat pointer's descriptor names as its
+/// pointee, for the positions gdb expands in place: a raw
+/// pointer to an ADT, or a `NonNull` to one.
+fn fat_pointee_adt_tag(desc: Option<&Desc>) -> Option<String> {
+    match desc {
+        Some(Desc::PtrConst(inner) | Desc::PtrMut(inner)) => match inner.as_ref() {
+            Desc::Adt(tag) => Some(tag.clone()),
+            _ => None,
+        },
+        Some(Desc::Adt(tag)) if tag_base_name(&dwarf_type_name(tag)) == "NonNull" => {
+            first_generic_arg(&dwarf_type_name(tag))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an ADT is dynamically sized, judged by its debug
+/// shape: its last field is a `str`, a slice, or an ADT that
+/// is itself dynamically sized.
+fn adt_tail_unsized(interp: &Interpreter, tag: &str) -> bool {
+    fn inner(interp: &Interpreter, tag: &str, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(shape) = interp.program().adt_debug_shapes.get(tag) else {
+            return false;
+        };
+        let Some(vshape) = shape.variants.first() else {
+            return false;
+        };
+        let Some(last) = vshape.fields.last() else {
+            return false;
+        };
+        match Desc::from_tag(&last.ty) {
+            Desc::Str | Desc::Slice(_) => true,
+            Desc::Adt(next) => inner(interp, &next, depth - 1),
+            _ => false,
+        }
+    }
+    inner(interp, tag, 4)
 }
 
 /// The byte width of an integer type tag, when the tag names
@@ -619,6 +817,7 @@ fn render_adt_gdb(
     shape: &sparagmos_mir::AdtDebugShape,
     variant: u32,
     fields: &[Value],
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
     // The printed name is the DWARF (definition-path) form of
@@ -635,7 +834,7 @@ fn render_adt_gdb(
         for (i, v) in values.iter().enumerate() {
             let name = vshape.fields[i].name.as_deref()?;
             let d = Desc::from_tag(&vshape.fields[i].ty);
-            let r = render_gdb(interp, v, Some(&d), false, None, depth + 1)?;
+            let r = render_adt_field_gdb(interp, v, &d, elements, depth + 1)?;
             parts.push(format!("{name}: {r}"));
         }
         return Some(format!("{tag} {{{}}}", parts.join(", ")));
@@ -653,14 +852,7 @@ fn render_adt_gdb(
         let mut parts = Vec::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
             let name = vshape.fields[i].name.as_deref()?;
-            let v = render_gdb(
-                interp,
-                field,
-                Some(&descs[i]),
-                false,
-                None,
-                depth + 1,
-            )?;
+            let v = render_adt_field_gdb(interp, field, &descs[i], elements, depth + 1)?;
             parts.push(format!("{name}: {v}"));
         }
         Some(parts)
@@ -680,6 +872,7 @@ fn render_adt_gdb(
                     &descs,
                     None,
                     DebugDialect::Gdb,
+                    elements,
                     depth,
                 )?;
                 Some(format!("{tag} ({})", parts.join(", ")))
@@ -700,6 +893,7 @@ fn render_adt_gdb(
                     &descs,
                     None,
                     DebugDialect::Gdb,
+                    elements,
                     depth,
                 )?;
                 Some(format!("{prefix}({})", parts.join(", ")))
@@ -709,3 +903,31 @@ fn render_adt_gdb(
     }
 }
 
+
+/// Render one field of an ADT aggregate in gdb form: a field
+/// of bare `str` type (an unsized tail field, as in
+/// `RcInner<str>`) has no value form of its own — gdb shows
+/// the field's data address — and every other field renders
+/// as [`render_gdb`] renders it.
+fn render_adt_field_gdb(
+    interp: &Interpreter,
+    field: &Value,
+    desc: &Desc,
+    elements: Option<usize>,
+    depth: usize,
+) -> Option<String> {
+    if matches!(desc, Desc::Str) {
+        // The field's own address when it is a pointer form;
+        // a bare string value denotes its data through the
+        // address of a reference to it.
+        let addr = crate::interp::synthetic_address(field).or_else(|| {
+            crate::interp::synthetic_address(&Value::Ref(
+                crate::value::RefTarget::value(field.clone()),
+            ))
+        });
+        if let Some(addr) = addr {
+            return Some(format!("0x{addr:x}"));
+        }
+    }
+    render_gdb(interp, field, Some(desc), false, None, elements, depth)
+}

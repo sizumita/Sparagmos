@@ -2,9 +2,9 @@
 
 use crate::interp::{Frame, Interpreter};
 use crate::value::{RefProj, RefTarget, Value};
-use super::desc::{Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level};
+use super::desc::{Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level, tag_base_name};
 use super::render_gdb::{MAX_RENDER_DEPTH, compress_repeats, render_gdb};
-use super::render_lldb::{escape_char, escape_str, lldb_type_name, render_lldb_compact};
+use super::render_lldb::{escape_char, escape_str, lldb_type_name, quote_str, render_lldb_compact};
 
 // ---------------------------------------------------------------------------
 // Pretty printers
@@ -55,7 +55,7 @@ fn printer_kind(dwarf_name: &str) -> Option<PrinterKind> {
     let parent = segs.next().unwrap_or("");
     Some(match (name, parent) {
         ("String", "string") => PrinterKind::String,
-        ("OsString", "os_str") => PrinterKind::OsString,
+        ("OsString", "os_str") | ("OsString", "ffi") => PrinterKind::OsString,
         ("Vec", "vec") => PrinterKind::Vec,
         ("VecDeque", "vec_deque") | ("VecDeque", "collections") => {
             PrinterKind::VecDeque
@@ -114,10 +114,11 @@ fn render_gdb_any(
     frames: &[Frame],
     value: &Value,
     desc: Option<&Desc>,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
-    render_pretty_gdb(interp, frames, value, desc, None, depth)
-        .or_else(|| render_gdb(interp, value, desc, false, None, depth))
+    render_pretty_gdb(interp, frames, value, desc, None, elements, depth)
+        .or_else(|| render_gdb(interp, value, desc, false, None, elements, depth))
 }
 
 /// Resolve a printed slice value to the value holding its
@@ -169,11 +170,16 @@ fn slice_pointee(
 /// `Value::SparseVec`) — bounded just past the print-elements
 /// limit, since the renderer truncates there anyway. A fully
 /// stored sequence passes through unchanged.
-fn render_sequence_elems(stored: &[Value], declared: u128) -> Vec<Value> {
+fn render_sequence_elems(
+    stored: &[Value],
+    declared: u128,
+    elements: Option<usize>,
+) -> Vec<Value> {
     let mut elems = stored.to_vec();
+    let limit = elements.unwrap_or(GDB_PRINT_ELEMENTS);
     let want = usize::try_from(declared)
         .unwrap_or(usize::MAX)
-        .min(GDB_PRINT_ELEMENTS + 1);
+        .min(limit + 1);
     if elems.len() < want {
         elems.resize(want, Value::Uninit);
     }
@@ -188,12 +194,13 @@ fn render_printer_children(
     frames: &[Frame],
     elems: &[Value],
     elem_desc: Option<&Desc>,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
-    let shown = elems.len().min(GDB_PRINT_ELEMENTS);
+    let shown = elems.len().min(elements.unwrap_or(GDB_PRINT_ELEMENTS));
     let mut rendered = Vec::with_capacity(shown);
     for elem in &elems[..shown] {
-        rendered.push(render_gdb_any(interp, frames, elem, elem_desc, depth + 1)?);
+        rendered.push(render_gdb_any(interp, frames, elem, elem_desc, elements, depth + 1)?);
     }
     let mut body = compress_repeats(&rendered);
     if elems.len() > shown {
@@ -216,6 +223,7 @@ pub(super) fn render_pretty_gdb(
     value: &Value,
     desc: Option<&Desc>,
     tag_hint: Option<&str>,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
     if depth > MAX_RENDER_DEPTH {
@@ -250,13 +258,13 @@ pub(super) fn render_pretty_gdb(
                 if declared == 0 {
                     Some(head)
                 } else {
-                    let elems = render_sequence_elems(&elems, declared);
+                    let elems = render_sequence_elems(&elems, declared, elements);
                     let block = render_printer_children(
                         interp,
                         frames,
                         &elems,
                         Some(elem),
-                        depth,
+                        elements,depth,
                     )?;
                     Some(format!("{head} = {block}"))
                 }
@@ -271,15 +279,72 @@ pub(super) fn render_pretty_gdb(
                     }
                     _ => return None,
                 };
-                Some(format!("\"{}\"", escape_str(&text)))
+                Some(quote_str(&text, elements))
             }
             _ => None,
         },
         Some(Desc::Adt(tag)) => {
-            let kind = printer_kind(&dwarf_type_name(tag))?;
-            render_printer_adt(interp, frames, kind, tag, value, depth)
+            if let Some(kind) = printer_kind(&dwarf_type_name(tag)) {
+                return render_printer_adt(interp, frames, kind, tag, value, elements, depth);
+            }
+            // No provider for this ADT: an enum still renders
+            // in its variant form, with each field rendered
+            // through the providers where one applies — the
+            // reading gdb itself gives, since its providers
+            // apply to a value's children whether or not the
+            // value's own type has one.
+            if let Value::Enum { variant, fields } = value {
+                return render_pretty_enum(
+                    interp, frames, tag, *variant, fields, elements, depth,
+                );
+            }
+            None
         }
         _ => None,
+    }
+}
+
+/// Render an enum value with no provider of its own in gdb
+/// form: the variant form the raw renderer gives, with each
+/// field rendered through [`render_gdb_any`] so a field whose
+/// type has a provider takes the provider's form.
+fn render_pretty_enum(
+    interp: &Interpreter,
+    frames: &[Frame],
+    tag: &str,
+    variant: u32,
+    fields: &[Value],
+    elements: Option<usize>,
+    depth: usize,
+) -> Option<String> {
+    let shape = interp.program().adt_debug_shapes.get(tag)?;
+    if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Enum) {
+        return None;
+    }
+    let vshape = shape.variants.get(variant as usize)?;
+    if vshape.fields.len() != fields.len() {
+        return None;
+    }
+    let prefix = format!("{}::{}", dwarf_type_name(tag), vshape.name);
+    if fields.is_empty() {
+        return Some(prefix);
+    }
+    let named = vshape.fields.iter().all(|f| f.name.is_some());
+    let mut parts = Vec::with_capacity(fields.len());
+    for (i, field) in fields.iter().enumerate() {
+        let d = Desc::from_tag(&vshape.fields[i].ty);
+        let v = render_gdb_any(interp, frames, field, Some(&d), elements, depth + 1)?;
+        if named {
+            let name = vshape.fields[i].name.as_deref()?;
+            parts.push(format!("{name}: {v}"));
+        } else {
+            parts.push(v);
+        }
+    }
+    if named {
+        Some(format!("{prefix}{{{}}}", parts.join(", ")))
+    } else {
+        Some(format!("{prefix}({})", parts.join(", ")))
     }
 }
 
@@ -290,6 +355,7 @@ fn render_printer_adt(
     kind: PrinterKind,
     tag: &str,
     value: &Value,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
     match kind {
@@ -298,7 +364,7 @@ fn render_printer_adt(
                 Value::Str(s) => Some(s.clone()),
                 _ => path_text(value),
             }?;
-            Some(format!("\"{}\"", escape_str(&text)))
+            Some(quote_str(&text, elements))
         }
         PrinterKind::Vec => {
             let elem =
@@ -314,13 +380,13 @@ fn render_printer_adt(
                     if *len == 0 {
                         Some(head)
                     } else {
-                        let elems = render_sequence_elems(elems, *len);
+                        let elems = render_sequence_elems(elems, *len, elements);
                         let block = render_printer_children(
                             interp,
                             frames,
                             &elems,
                             elem.as_ref(),
-                            depth,
+                            elements,depth,
                         )?;
                         Some(format!("{head} = {block}"))
                     }
@@ -335,7 +401,7 @@ fn render_printer_adt(
                             frames,
                             fields,
                             elem.as_ref(),
-                            depth,
+                            elements,depth,
                         )?;
                         Some(format!("{head} = {block}"))
                     }
@@ -358,7 +424,7 @@ fn render_printer_adt(
                 frames,
                 &pointee,
                 elem.as_ref(),
-                depth + 1,
+                elements, depth + 1,
             )?;
             let name = if kind == PrinterKind::Rc {
                 "Rc"
@@ -380,7 +446,7 @@ fn render_printer_adt(
                     frames,
                     &elems,
                     elem.as_ref(),
-                    depth,
+                    elements,depth,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -400,7 +466,7 @@ fn render_printer_adt(
                     frames,
                     &keys,
                     elem.as_ref(),
-                    depth,
+                    elements,depth,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -424,7 +490,7 @@ fn render_printer_adt(
                     &entries,
                     key_desc.as_ref(),
                     val_desc.as_ref(),
-                    depth,
+                    elements,depth,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -448,7 +514,7 @@ fn render_printer_adt(
                     &entries,
                     key_desc.as_ref(),
                     val_desc.as_ref(),
-                    depth,
+                    elements,depth,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -468,7 +534,7 @@ fn render_printer_adt(
                     frames,
                     &keys,
                     elem.as_ref(),
-                    depth,
+                    elements,depth,
                 )?;
                 Some(format!("{head} = {block}"))
             }
@@ -548,13 +614,14 @@ fn render_printer_map_children(
     entries: &[(Value, Value)],
     key_desc: Option<&Desc>,
     val_desc: Option<&Desc>,
+    elements: Option<usize>,
     depth: usize,
 ) -> Option<String> {
-    let shown = entries.len().min(GDB_PRINT_ELEMENTS);
+    let shown = entries.len().min(elements.unwrap_or(GDB_PRINT_ELEMENTS));
     let mut rendered = Vec::with_capacity(shown);
     for (k, v) in &entries[..shown] {
-        let ks = render_gdb_any(interp, frames, k, key_desc, depth + 1)?;
-        let vs = render_gdb_any(interp, frames, v, val_desc, depth + 1)?;
+        let ks = render_gdb_any(interp, frames, k, key_desc, elements, depth + 1)?;
+        let vs = render_gdb_any(interp, frames, v, val_desc, elements, depth + 1)?;
         rendered.push(format!("[{ks}] = {vs}"));
     }
     let mut body = compress_repeats(&rendered);
@@ -1021,19 +1088,39 @@ pub(super) fn render_lldb_provider_line(
             _ => None,
         },
         Some(Desc::Adt(tag)) => {
+            // A `Box<str>` takes the pointee's own provider
+            // form: the string summary with its character
+            // children, as for a `&str` print.
+            if tag_base_name(&dwarf_type_name(tag)) == "Box" {
+                if let Some(line) =
+                    render_lldb_box_line(interp, frames, value, tag_hint, expr)
+                {
+                    return Some(line);
+                }
+            }
             let kind = printer_kind(&dwarf_type_name(tag))?;
             match kind {
                 PrinterKind::Rc | PrinterKind::Arc => {
                     let (strong, weak, pointee, elem) =
                         rc_parts(interp, tag, value)?;
-                    let v = render_lldb_compact(
-                        interp,
-                        &pointee,
-                        elem.as_ref(),
-                        false,
-                        true,
-                        1,
-                    )?;
+                    let v = match &pointee {
+                        // A string pointee's child shows its
+                        // character children under the summary,
+                        // as lldb expands a `str` child.
+                        Value::Str(text) => format!(
+                            "\"{}\" {}",
+                            escape_str(text),
+                            str_char_children(text)
+                        ),
+                        _ => render_lldb_compact(
+                            interp,
+                            &pointee,
+                            elem.as_ref(),
+                            false,
+                            true,
+                            1,
+                        )?,
+                    };
                     // The `Rc` provider's child is named
                     // `value`, the `Arc` provider's `data`.
                     let child = if kind == PrinterKind::Rc {
@@ -1457,4 +1544,58 @@ mod hash_stride_tests {
         assert_eq!(size, 1);
         assert_eq!(entries, vec![(Value::Uint(1), Value::Uint(10))]);
     }
+}
+
+/// The character-children block lldb shows under a string
+/// summary: `{ [0] = 'H' [1] = 'e' ... }`, or the empty block
+/// for an empty string.
+fn str_char_children(text: &str) -> String {
+    let mut parts = Vec::with_capacity(text.len());
+    for (i, c) in text.chars().enumerate() {
+        parts.push(format!("[{i}] = '{}'", escape_char(c)));
+    }
+    if parts.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{ {} }}", parts.join(" "))
+    }
+}
+
+/// The lldb provider line for a `Box<str>`: the pointee's
+/// string summary with its character children, the form a
+/// `&str` print takes. Any other box keeps the other forms.
+fn render_lldb_box_line(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    tag_hint: Option<&str>,
+    expr: &str,
+) -> Option<String> {
+    let ptr = match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+        other => other,
+    };
+    // The resolution may land on a further pointer layer (a
+    // box's allocation holds the fat pointer to the string
+    // data, not the data itself): follow a bounded chain.
+    let mut current = ptr.clone();
+    let mut text = None;
+    for _ in 0..4 {
+        let resolved = interp.deref_value(frames, &current).ok()?;
+        let pointee = interp.read_resolved(frames, &resolved).ok()?;
+        match pointee {
+            Value::Str(s) => {
+                text = Some(s);
+                break;
+            }
+            next => current = next,
+        }
+    }
+    let text = text?;
+    let ty = tag_hint?.trim();
+    Some(format!(
+        "({ty}) {expr} = \"{}\" {}",
+        escape_str(&text),
+        str_char_children(&text)
+    ))
 }

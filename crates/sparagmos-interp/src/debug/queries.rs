@@ -737,7 +737,7 @@ pub(super) fn render_info_locals(
         seen.push(entry.name.clone());
         if let Ok(ev) = evaluate_expr(interp, ctl, frames, &entry.name) {
             if let Some(gdb) =
-                render_gdb(interp, &ev.value, ev.desc.as_ref(), ev.char, None, 0)
+                render_gdb(interp, &ev.value, ev.desc.as_ref(), ev.char, None, None, 0)
             {
                 lines.push(format!("{} = {gdb}", entry.name));
             }

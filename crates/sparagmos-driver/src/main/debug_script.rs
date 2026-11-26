@@ -79,6 +79,12 @@ pub(crate) fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String
                 }
                 break_fns.push(rest.to_string());
             }
+            "print-elements" => {
+                let n: usize = rest
+                    .parse()
+                    .map_err(|_| bad(&format!("bad print elements `{rest}`")))?;
+                commands.push(DebugCommand::SetPrintElements(n));
+            }
             "run" => commands.push(DebugCommand::Run),
             "continue" => commands.push(DebugCommand::Continue),
             "next" => commands.push(DebugCommand::Next),

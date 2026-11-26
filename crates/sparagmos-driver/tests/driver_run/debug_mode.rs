@@ -1216,3 +1216,122 @@ fn debug_mode_lldb_command_formats_are_honored() {
         );
     }
 }
+
+const DEBUG_STRING_FORMS_SRC: &str = r#"use std::rc::Rc;
+struct Foo {
+    inner: &'static str,
+}
+fn main() {
+    let plain_string = String::from("Hello");
+    let plain_str = "Hello";
+    let str_in_struct = Foo { inner: "Hello" };
+    let str_in_tuple = ("Hello", "World");
+    let box_str = Box::from("World");
+    let rc_str: Rc<str> = Rc::from("World");
+    zzz();
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_string_forms_render_in_gdb() {
+    // The raw (pretty printers off) gdb forms of the string
+    // values: a `String` local renders as its DWARF
+    // aggregate, a `&str` as its quoted contents, a `str`
+    // field of a struct as the address gdb shows for the
+    // field's data, a boxed `str` as its byte list, and an
+    // `Rc<str>`'s inner pointer expands inline (the pointer
+    // is fat), where an `Rc<&str>`'s stays an address.
+    let dir = temp_dir("debug-string-forms");
+    let src = fixture(&dir, "string_forms.rs", DEBUG_STRING_FORMS_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 12\nrun\nprint plain_string\nprint plain_str\nprint str_in_struct\nprint str_in_tuple\nprint box_str\nprint rc_str\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "alloc::string::String {vec: alloc::vec::Vec<u8, alloc::alloc::Global> {buf:",
+        "core::num::niche_types::UsizeNoHighBit (5)",
+        "len: 5}}",
+        "$2 = \"Hello\"",
+        "Foo {inner: \"Hello\"}",
+        "(\"Hello\", \"World\")",
+        "alloc::boxed::Box<str, alloc::alloc::Global> [87, 111, 114, 108, 100]",
+        "alloc::rc::RcInner<str> {strong:",
+        "value: 0x",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("could not be rendered"),
+        "string forms must render: {stdout}"
+    );
+}
+
+#[test]
+fn debug_mode_string_forms_render_in_lldb() {
+    // The lldb forms of the same values: a struct's `str`
+    // field renders as its quoted contents in the compact
+    // form, and a boxed `str` renders through its provider
+    // line with the character children appended.
+    let dir = temp_dir("debug-string-forms-lldb");
+    let src = fixture(&dir, "string_forms_lldb.rs", DEBUG_STRING_FORMS_SRC);
+    let out = debug_driver_lldb(
+        &dir,
+        &src,
+        "break 12\nrun\nprint str_in_struct\nprint box_str\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "str_in_struct = {inner:\"Hello\"}",
+        "box_str = \"World\" { [0] = 'W'",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_PRETTY_STRING_SRC: &str = r#"fn main() {
+    let os_string = std::ffi::OsString::from("IAMA OS string \u{1f603}");
+    let some_string = Some(String::from("IAMA optional string!"));
+    zzz();
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_pretty_string_providers_and_print_elements() {
+    // With the pretty printers on: an `OsString` renders
+    // through its provider (including under the `std::ffi`
+    // re-export path), an `Option<String>` renders its
+    // payload through the `String` provider, and a
+    // `set print elements` command truncates the string
+    // contents of later prints the way gdb truncates them.
+    let dir = temp_dir("debug-pretty-string");
+    let src = fixture(&dir, "pretty_string.rs", DEBUG_PRETTY_STRING_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "pretty-printers\nbreak 4\nrun\nprint os_string\nprint some_string\nprint-elements 5\nprint some_string\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "\"IAMA OS string \u{1f603}\"",
+        "Some(\"IAMA optional string!\")",
+        "Some(\"IAMA \"...",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}

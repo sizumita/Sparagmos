@@ -1406,11 +1406,30 @@ pub(super) fn evaluate_print(
                 &value,
                 desc.as_ref(),
                 ev.tag.as_deref(),
+                ctl.print_elements,
                 0,
             )
-            .or_else(|| render_gdb(interp, &value, desc.as_ref(), char, print.format, 0))
+            .or_else(|| {
+                render_gdb(
+                    interp,
+                    &value,
+                    desc.as_ref(),
+                    char,
+                    print.format,
+                    ctl.print_elements,
+                    0,
+                )
+            })
         } else {
-            render_gdb(interp, &value, desc.as_ref(), char, print.format, 0)
+            render_gdb(
+                interp,
+                &value,
+                desc.as_ref(),
+                char,
+                print.format,
+                ctl.print_elements,
+                0,
+            )
         },
         lldb,
     })
