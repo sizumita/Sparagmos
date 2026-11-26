@@ -800,7 +800,7 @@ fn info_functions_prefers_the_display_name_table() {
     for want in [
         "static fn x::generic_func<i32>(i32) -> i32;",
         "static fn x::helper<u8>();",
-        "static fn main();",
+        "static fn main() -> i64;",
     ] {
         assert!(
             run.transcript.iter().any(|l| l == want),
