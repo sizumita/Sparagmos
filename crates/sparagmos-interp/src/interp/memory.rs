@@ -2654,6 +2654,13 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A read through a foreign view (a reference transmuted
+        // to a different ADT over the same storage): the byte
+        // view owns it when it can judge it (see
+        // `Interpreter::foreign_read`).
+        if let Some(read) = self.foreign_read(frames, body, place, &target) {
+            return read;
+        }
         // Read through the borrowing form: a projected read lends
         // the denoted value out of the frame's storage, so only
         // the projected part is cloned into the owned result,
@@ -2694,6 +2701,15 @@ impl<'a> Interpreter<'a> {
                     return view;
                 }
             }
+        }
+        // A write through a foreign view (a reference
+        // transmuted to a different ADT over the same storage):
+        // the byte view owns it when it can judge it (see
+        // `Interpreter::foreign_write`).
+        if let Some(written) =
+            self.foreign_write(frames, body, place, &target, &value)
+        {
+            return written;
         }
         // A write of a zero-sized value through a dereference
         // that denoted no storage (see

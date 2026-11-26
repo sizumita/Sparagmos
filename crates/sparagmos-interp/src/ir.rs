@@ -2417,6 +2417,16 @@ pub struct Program {
     /// enum value's storage reads and writes the tag span
     /// recorded here as the discriminant's own bytes.
     pub adt_tag_layouts: sparagmos_mir::AdtTagLayouts,
+    /// Niche discriminant encodings of the program's
+    /// monomorphic enum instances, keyed like `adt_layouts`,
+    /// as recorded by the driver (see
+    /// `sparagmos_mir::AdtNiches`). The byte view of an enum
+    /// value's storage consults the encoding recorded here
+    /// when it moves the bytes of a niche-encoded enum (an
+    /// `Option<NonZero<T>>`'s storage is its payload scalar,
+    /// whose niche values name the fieldless variants) across
+    /// a foreign view's boundary.
+    pub adt_niches: sparagmos_mir::AdtNiches,
     /// Derived-`Debug` shapes of the program's monomorphic ADT
     /// instances, keyed by the rendered instance name (the type
     /// tag the formatter sees), as recorded by the driver (see
