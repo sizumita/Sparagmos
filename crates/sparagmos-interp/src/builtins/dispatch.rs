@@ -1983,7 +1983,7 @@ impl<'a> Interpreter<'a> {
             Builtin::ProcessCommandNew => {
                 arity(1)?;
                 let program = self.os_str_bytes(frames, &vals[0])?;
-                Ok(id_handle(self.new_command(command_state_new(program))))
+                Ok(command_value(self.new_command(command_state_new(program))))
             }
             Builtin::ProcessCommandArg => {
                 arity(2)?;
@@ -2171,7 +2171,7 @@ impl<'a> Interpreter<'a> {
                 let program = self.os_str_bytes(frames, &vals[0])?;
                 Ok(Value::Enum {
                     variant: 0,
-                    fields: vec![id_handle(self.new_command(command_state_new(program)))],
+                    fields: vec![command_value(self.new_command(command_state_new(program)))],
                 })
             }
             Builtin::ProcessCommandArgPublic => {

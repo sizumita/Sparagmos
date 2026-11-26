@@ -519,15 +519,46 @@ pub(super) fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState
     }
 }
 
+/// The value a sys `Command` has in the interpreter: an
+/// aggregate in the real layout's first three field positions.
+/// Field 0 (the `program` slot) carries the command id -- the
+/// program's bytes live in the command table ([`CommandState`]),
+/// not in the value. Field 1 (the `args` slot) is an empty
+/// placeholder; the arguments live in the table too. Field 2
+/// (the `env` slot) carries the environment-editor handle for
+/// the same command: std bodies inlined into the caller form
+/// the `&mut command.env` place directly (`Command::envs`
+/// reaches `CommandEnv::set` through `env_mut()`, whose body is
+/// `&mut self.env`), and the `CommandEnv` builtins resolve that
+/// place's value back to the command -- so the slot must hold
+/// an initialised value denoting the command, exactly what
+/// `ProcessCommandEnvMut` fabricates for the non-inlined path.
+/// The remaining fields are never materialised: no modelled
+/// path projects them, and the one-field handle this replaces
+/// was already short of the real layout in the same way.
+pub(super) fn command_value(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Uint(u128::from(id)), Value::Unit, id_handle(id)],
+    }
+}
+
 /// The command id a handle value carries, at whichever nesting
-/// the value arrives with (the bare handle, or the handle inside
-/// the public `Command` aggregate).
+/// the value arrives with (the bare handle, the sys `Command`
+/// aggregate, or the aggregate inside the public `Command`).
 fn command_handle_id(value: &Value) -> Option<u64> {
     let mut cur = value;
     loop {
         match cur {
             Value::Uint(id) => return Some(*id as u64),
             Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            // The sys `Command` aggregate (`command_value`): its
+            // first field carries the id directly.
+            Value::Enum { fields, .. }
+                if matches!(fields.first(), Some(Value::Uint(_))) =>
+            {
                 cur = &fields[0];
             }
             _ => return None,

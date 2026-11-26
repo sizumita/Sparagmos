@@ -807,15 +807,16 @@ pub enum Builtin {
     HashmapRandomKeys,
     /// `std::sys::process::unix::common::Command::new(&OsStr)`:
     /// begin a modelled process command. The returned value is
-    /// a handle carrying the id of the builder state in the
-    /// interpreter's command table (see [`CommandState`]); the
-    /// sys `Command` methods below record into that state. No
-    /// child process is ever started (see `ProcessSpawn`).
+    /// the sys `Command` aggregate (see `command_value`), which
+    /// carries the id of the builder state in the interpreter's
+    /// command table (see [`CommandState`]); the sys `Command`
+    /// methods below record into that state. No child process
+    /// is ever started (see `ProcessSpawn`).
     ProcessCommandNew,
     /// `std::process::Command::new(program)`: the public
     /// constructor. The public `Command` is a one-field struct
-    /// over the sys command, so the value is the sys handle
-    /// wrapped in one aggregate layer. (The public method
+    /// over the sys command, so the value is the sys command
+    /// aggregate wrapped in one aggregate layer. (The public method
     /// bodies are not available to conversion either, so the
     /// public builder surface is modelled here directly,
     /// alongside the sys layer other std code calls.)
