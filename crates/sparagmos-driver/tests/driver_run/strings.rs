@@ -2441,3 +2441,62 @@ fn run_mode_fmt_forward_integer_debug_types() {
         "3 -9 11\n",
     );
 }
+
+const STR_LINES_ZST_FN_SRC: &str = r#"
+fn main() {
+    let text = "alpha\r\nbeta\ngamma\r\n";
+    let mut total = 0;
+    for line in text.lines() {
+        total += line.len();
+        println!("{line}");
+    }
+    println!("total={total} count={}", text.lines().count());
+    let mut it = "x\ny".lines();
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+}
+"#;
+
+#[test]
+fn run_mode_str_lines_zst_fn() {
+    // `str::lines` is a `Map` over the zero-sized `LinesMap`
+    // callable (an `impl_fn_for_zst!` Fn type in core): its
+    // value is an untyped empty ADT and no collected body calls
+    // its `Fn::call` body, so the run needs the driver's ZST-Fn
+    // demand and the interpreter's type-directed dispatch for
+    // empty-ADT callables. The CRLF cases pin the body's own
+    // suffix stripping (not a reimplementation): a line ending
+    // in `\r\n` loses both bytes.
+    run_ok(
+        "str-lines-zst-fn",
+        STR_LINES_ZST_FN_SRC,
+        "alpha\nbeta\ngamma\ntotal=14 count=3\nSome(\"x\")\nSome(\"y\")\nNone\n",
+    );
+}
+
+const STR_LINES_ZST_FN_COMPOSED_SRC: &str = r#"
+fn main() {
+    let kept: Vec<String> = "one\ntwo\nthree\nfour"
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| l.to_uppercase())
+        .collect();
+    println!("{kept:?}");
+    let n = "a\nb\nc".lines().map(|l| l.len()).sum::<usize>();
+    println!("sum={n}");
+}
+"#;
+
+#[test]
+fn run_mode_str_lines_zst_fn_composed() {
+    // The ZST-Fn dispatch under adapter composition: `Lines`
+    // stepped as the inner iterator of `Filter` / `Map`
+    // adapters whose own callables are guest closures, and as
+    // the source of the `collect` / `sum` consumers.
+    run_ok(
+        "str-lines-zst-fn-composed",
+        STR_LINES_ZST_FN_COMPOSED_SRC,
+        "[\"THREE\", \"FOUR\"]\nsum=3\n",
+    );
+}

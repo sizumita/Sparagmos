@@ -1373,6 +1373,276 @@ pub(crate) fn demand_wake_instances(
 /// type — is absence everywhere. An impl under any generic
 /// spelling blocks certification: it keeps the interpreter's
 /// refusal for the type.
+/// Cap on ZST `Fn`-family bodies demanded per program across
+/// all [`demand_zst_fn_instances`] calls, mirroring the dyn
+/// demand's cap.
+const MAX_DEMANDED_ZST_FN_BODIES: usize = 256;
+
+/// The `Fn` / `FnMut` / `FnOnce` impl methods among `fn_defs`,
+/// keyed by the self type's path without its parameter list
+/// (see `drop_type_key`), one entry per (trait, method) impl.
+/// An impl method's name is
+/// `<SELF as std::ops::Fn<Args>>::call` (and its `FnMut` /
+/// `FnOnce` counterparts, under either the `std::` or the
+/// `core::` spelling of the trait path).
+fn fn_impl_methods(
+    fn_defs: Vec<rustc_public::ty::FnDef>,
+) -> std::collections::HashMap<String, Vec<rustc_public::ty::FnDef>> {
+    let mut out: std::collections::HashMap<
+        String,
+        Vec<rustc_public::ty::FnDef>,
+    > = std::collections::HashMap::new();
+    for f in fn_defs {
+        let name = f.name();
+        let Some(inner_end) = balanced_group_end(&name, 0) else {
+            continue;
+        };
+        let method = &name[inner_end + 1..];
+        if !matches!(method, "::call" | "::call_mut" | "::call_once") {
+            continue;
+        }
+        let inner = &name[1..inner_end];
+        let Some(as_pos) = top_level_as_pos(inner) else {
+            continue;
+        };
+        let trait_part = inner[as_pos + 4..].trim();
+        let trait_base = trait_part
+            .split('<')
+            .next()
+            .unwrap_or(trait_part)
+            .trim();
+        let expected = match method {
+            "::call" => ["std::ops::Fn", "core::ops::Fn"],
+            "::call_mut" => ["std::ops::FnMut", "core::ops::FnMut"],
+            _ => ["std::ops::FnOnce", "core::ops::FnOnce"],
+        };
+        if !expected.contains(&trait_base) {
+            continue;
+        }
+        let base = drop_type_key(&inner[..as_pos]);
+        out.entry(base).or_default().push(f);
+    }
+    out
+}
+
+/// Whether the ADT instantiation `(def, args)` is provably
+/// zero-sized from its structure alone: every variant's every
+/// field is itself provably zero-sized (an empty ADT, a tuple
+/// of such, a unit). The question is deliberately *not* asked
+/// through the compiler's layout machinery: a layout query on
+/// a type with an unsized field records a delayed compiler
+/// bug that fails the whole compilation at the end, even when
+/// the query itself is caught - and the types this demand
+/// serves (core's `impl_fn_for_zst!` family and its kin) are
+/// all fieldless or phantom-only, which the structural
+/// question decides exactly.
+fn adt_provable_zst(
+    def: &rustc_public::ty::AdtDef,
+    args: &GenericArgs,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let variants = def.variants();
+    if variants.is_empty() {
+        return false;
+    }
+    variants.iter().all(|variant| {
+        variant.fields().iter().all(|field| {
+            let declared = field.ty();
+            // Substituting the instance's arguments can hit the
+            // same normalization failures the drop walk screens
+            // for; with an alias anywhere, the declared type is
+            // judged instead (its parameters then simply fail
+            // the question unless the field is a fieldless ADT).
+            let judged = if type_tree_has_alias(&declared, 0)
+                || args.0.iter().any(|a| match a {
+                    GenericArgKind::Type(t) => type_tree_has_alias(t, 0),
+                    _ => false,
+                }) {
+                declared
+            } else {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    field.ty_with_args(args)
+                })) {
+                    Ok(t) => t,
+                    Err(_) => declared,
+                }
+            };
+            ty_provable_zst(&judged, args, depth + 1)
+        })
+    })
+}
+
+/// The field-type half of [`adt_provable_zst`]: a type is
+/// provably zero-sized when it is an ADT instantiation that
+/// is, a tuple of such types, or a generic parameter whose
+/// argument (in the enclosing ADT's argument list, by
+/// parameter index) is. Anything else - a scalar, a reference,
+/// an array, a string or slice shape - is not, conservatively:
+/// a callable the question misses keeps the interpreter's
+/// existing outcome, never a wrong body.
+fn ty_provable_zst(ty: &Ty, args: &GenericArgs, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Some(kind) = sparagmos_driver::convert::guarded_ty_kind(ty) else {
+        return false;
+    };
+    match kind {
+        TyKind::RigidTy(RigidTy::Adt(def, inner_args)) => {
+            adt_provable_zst(&def, &inner_args, depth)
+        }
+        TyKind::RigidTy(RigidTy::Tuple(ts)) => {
+            ts.iter().all(|t| ty_provable_zst(t, args, depth + 1))
+        }
+        TyKind::Param(param) => match args.0.get(param.index as usize) {
+            Some(GenericArgKind::Type(t)) => {
+                ty_provable_zst(t, &GenericArgs(Vec::new()), depth + 1)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Demand a converted body for the `Fn` / `FnMut` / `FnOnce`
+/// impl methods of every zero-sized ADT type the scanned bodies
+/// mention.
+///
+/// A zero-sized callable (core's `impl_fn_for_zst!` family -
+/// `str::LinesMap` behind `str::lines`, `char::CharEscapeDebug`,
+/// `char::IsWhitespace`, and their siblings) is consumed by the
+/// interpreter's iterator adapter steppers, which are builtins:
+/// no collected body ever calls the callable's `Fn::call` body,
+/// so the call-graph collection has no edge to demand it by, and
+/// the value itself is an untyped empty ADT the interpreter
+/// cannot dispatch from alone. Demanding the impl bodies here -
+/// for every zero-sized ADT with an `Fn`-family impl, whatever
+/// its name - puts them in the program under their instance
+/// names, where the interpreter's type-directed dispatch for
+/// empty-ADT callables finds them (see
+/// `Interpreter::call_callable_sync_typed`). Converted bodies
+/// join `seed_bodies`, so the reachability collection walks
+/// their callees too; the caller reruns this pass over the
+/// collected foreign bodies, whose own type mentions (a library
+/// adapter's state type, above all) are where these callables
+/// are usually named.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn demand_zst_fn_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+    demanded: &mut usize,
+) {
+    // Every ADT instantiation the scanned bodies mention, in
+    // first-mention order (the same walk the drop demand uses).
+    let mut candidates: Vec<(Ty, rustc_public::ty::AdtDef, GenericArgs)> =
+        Vec::new();
+    let mut seen: std::collections::HashSet<Ty> = Default::default();
+    for body in seed_bodies.iter() {
+        for decl in body.locals() {
+            drop_candidates(&decl.ty, &mut candidates, &mut seen);
+        }
+    }
+    let zst_candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, def, args)| {
+            !args_mention_params(args) && adt_provable_zst(def, args, 0)
+        })
+        .collect();
+    if zst_candidates.is_empty() {
+        return;
+    }
+    // The impl scan covers the local crate and every external
+    // crate, built once here: an `Fn` impl lives in its self
+    // type's defining crate (the orphan rule), but a type's
+    // rendered name need not start with that crate (facade
+    // re-exports), and the impl keys are rendered in the same
+    // facade path space - the same reasoning as the drop
+    // demand's foreign scan.
+    let mut all_defs: Vec<rustc_public::ty::FnDef> =
+        rustc_public::local_crate().fn_defs();
+    for krate in rustc_public::external_crates() {
+        if !krate.is_local {
+            all_defs.extend(foreign_fn_defs(&krate));
+        }
+    }
+    let impl_methods = fn_impl_methods(all_defs);
+    if impl_methods.is_empty() {
+        return;
+    }
+    let mut seen_instances: std::collections::HashSet<String> =
+        Default::default();
+    for (cand_ty, def, args) in &zst_candidates {
+        if *demanded >= MAX_DEMANDED_ZST_FN_BODIES {
+            return;
+        }
+        let type_key = drop_type_key(&def.name());
+        let Some(impl_fns) = impl_methods.get(&type_key) else {
+            continue;
+        };
+        for impl_fn in impl_fns {
+            if *demanded >= MAX_DEMANDED_ZST_FN_BODIES {
+                return;
+            }
+            let impl_fn = *impl_fn;
+            // The impl's generic arguments are recovered from
+            // the self type by unification, exactly as for a
+            // `Drop` impl (see `resolve_drop_instance`); a
+            // resolution failure or a compiler panic on an odd
+            // instantiation simply leaves this candidate
+            // undemanded.
+            let resolved = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    resolve_drop_instance(&impl_fn, cand_ty, args)
+                        .filter(|inst| inst.has_body())
+                        .and_then(|inst| {
+                            sparagmos_driver::convert::with_body_materialization(
+                                &inst.name(),
+                                || inst.body(),
+                            )
+                            .map(|body| (inst, body))
+                        })
+                }),
+            );
+            let Ok(Some((inst, sm_body))) = resolved else {
+                continue;
+            };
+            if !seen_instances.insert(inst.name().to_string()) {
+                continue;
+            }
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
+            let name = inst.name().to_string();
+            if bodies.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            let before = bodies.len();
+            convert_item(
+                conv,
+                report,
+                bodies,
+                body_def_ids,
+                body_def_names,
+                name,
+                def_id,
+                Ok(Some(sm_body.clone())),
+            );
+            if bodies.len() > before {
+                seed_bodies.push(sm_body);
+                *demanded += 1;
+            }
+        }
+    }
+}
+
 pub(crate) fn certify_drop_no_impl(
     conv: &mut Converter,
     bodies: &[rustc_public::mir::Body],

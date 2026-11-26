@@ -584,6 +584,25 @@ fn collect() -> ControlFlow<()> {
         &mut seed_bodies,
     );
 
+    // Demand the `Fn`-family impl bodies of the zero-sized
+    // callable types the converted bodies mention: an adapter
+    // builtin consumes such a callable without any call edge
+    // naming its body (see `demand_zst_fn_instances`). The
+    // demanded bodies join the seed bodies like the wake
+    // demand's, and the pass runs again over the collected
+    // foreign bodies below, where library adapters name these
+    // callables.
+    let mut zst_fn_demanded = 0usize;
+    demand_zst_fn_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut seed_bodies,
+        &mut zst_fn_demanded,
+    );
+
     // Convert the monomorphic instances of the generic local
     // function definitions that the converted bodies call; the
     // instance bodies join the reachability seeds below, so the
@@ -1064,6 +1083,67 @@ fn collect() -> ControlFlow<()> {
                 }
             }
             dtor_bodies.extend(dtor_bodies2);
+            if bodies.len() == bodies_before {
+                break;
+            }
+            if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
+                break;
+            }
+            let walk_seeds: Vec<rustc_public::mir::Body> =
+                all_bodies[seeds_before..].to_vec();
+            let reached = sparagmos_driver::reach::collect_reachable(
+                &mut conv,
+                &walk_seeds,
+                &local_defs,
+                sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+                collection_order,
+                &[],
+            );
+            if body_fetch_recursion_limit.is_none() {
+                body_fetch_recursion_limit = reached.recursion_limit.clone();
+            }
+            alias_sources.extend(reached.walked_bodies.iter().cloned());
+            all_bodies.extend(reached.walked_bodies.iter().cloned());
+            for ((name, body), (def_id, def_name)) in reached
+                .bodies
+                .into_iter()
+                .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+            {
+                if collected_ids.insert(def_id) {
+                    foreign_taken += 1;
+                    bodies.push((name, body));
+                    body_def_ids.push(def_id);
+                    body_def_names.push(def_name);
+                }
+            }
+            for entry in reached.reports {
+                if report_names.insert(entry.name.clone()) {
+                    report.functions.push(entry);
+                }
+            }
+        }
+    }
+    // Second ZST-Fn demand round over the full collected body
+    // set, mirroring the second drop round above: the first
+    // round only saw the entry crate's bodies, but the callable
+    // types at issue are named by foreign bodies (a library
+    // adapter's state type). The bodies this round converts are
+    // walked for their own callees and the enlarged set is
+    // demanded again, until a round converts nothing new.
+    {
+        let mut all_bodies = alias_sources.clone();
+        loop {
+            let seeds_before = all_bodies.len();
+            let bodies_before = bodies.len();
+            demand_zst_fn_instances(
+                &mut conv,
+                &mut report,
+                &mut bodies,
+                &mut body_def_ids,
+                &mut body_def_names,
+                &mut all_bodies,
+                &mut zst_fn_demanded,
+            );
             if bodies.len() == bodies_before {
                 break;
             }
