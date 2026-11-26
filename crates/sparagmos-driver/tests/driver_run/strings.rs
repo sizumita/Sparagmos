@@ -1663,6 +1663,84 @@ fn run_mode_str_split_whitespace() {
     );
 }
 
+const SLICE_SPLIT_SRC: &str = r#"
+fn main() {
+    // The vertical tab is not ASCII whitespace, so it
+    // stays inside the piece (the shape of
+    // tests/ui/whitespace/ascii_whitespace_excludes_vertical_tab.rs).
+    let parts: Vec<&str> = "a\u{b}b".split_ascii_whitespace().collect();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0], "a\u{b}b");
+    let parts2: Vec<&str> = "a b".split_ascii_whitespace().collect();
+    assert_eq!(parts2.len(), 2);
+    assert_eq!(parts2[0], "a");
+    assert_eq!(parts2[1], "b");
+    println!("cnt={}", "  aa\tb\n ccc ".split_ascii_whitespace().count());
+    println!("empty={}", "".split_ascii_whitespace().count());
+    println!("ws={}", " \t\n".split_ascii_whitespace().count());
+    let mut it = "a b c".split_ascii_whitespace();
+    assert_eq!(it.next_back(), Some("c"));
+    assert_eq!(it.next(), Some("a"));
+    assert_eq!(it.next_back(), Some("b"));
+    assert_eq!(it.next(), None);
+    println!("saw ok");
+    let data = [1u32, 0, 2, 3, 0, 4];
+    let parts: Vec<&[u32]> = data.split(|x| *x == 0).collect();
+    println!("split={parts:?}");
+    fn is_zero(x: &u32) -> bool { *x == 0 }
+    let parts4: Vec<&[u32]> = data.split(is_zero).collect();
+    println!("fnptr={parts4:?}");
+    let incl: Vec<&[u32]> = data.split_inclusive(|x| *x == 0).collect();
+    println!("incl={incl:?}");
+    let rs: Vec<&[u32]> = data.rsplit(|x| *x == 0).collect();
+    println!("rsplit={rs:?}");
+    let mut sp = data.split(|x| *x == 0);
+    println!("nb1={:?}", sp.next_back());
+    println!("nf1={:?}", sp.next());
+    println!("nb2={:?}", sp.next_back());
+    println!("nf2={:?}", sp.next());
+    let t: Vec<&[u8]> = b"a;".split(|b| *b == b';').collect();
+    println!("trail={}", t.len());
+    println!("lead={}", b";a".split(|b| *b == b';').count());
+}
+"#;
+
+#[test]
+fn run_mode_slice_split_family() {
+    // The `slice::Split` step machine and the
+    // `SplitAsciiWhitespace` delegations: core's
+    // `str::SplitAsciiWhitespace` is a one-field wrapper
+    // over `Map<Filter<slice::Split<u8, IsAsciiWhitespace>,
+    // BytesIsNotEmpty>, UnsafeBytesToStr>`, so its steps
+    // delegate to the wrapped `Map` under that tag, and
+    // the `slice::Split` state ([remaining, predicate,
+    // finished]) is scanned with the predicate applied
+    // through the modelled call path - a capturing closure
+    // and a function pointer here. `SplitInclusive` ends
+    // each piece just past the separator, and `RSplit`
+    // forwards its front step to the wrapped state's back
+    // step. Expected output was produced by the native
+    // 1.100.0 toolchain.
+    run_ok(
+        "slice-split-family",
+        SLICE_SPLIT_SRC,
+        "cnt=3\n\
+         empty=0\n\
+         ws=0\n\
+         saw ok\n\
+         split=[[1], [2, 3], [4]]\n\
+         fnptr=[[1], [2, 3], [4]]\n\
+         incl=[[1, 0], [2, 3, 0], [4]]\n\
+         rsplit=[[4], [2, 3], [1]]\n\
+         nb1=Some([4])\n\
+         nf1=Some([1])\n\
+         nb2=Some([2, 3])\n\
+         nf2=None\n\
+         trail=2\n\
+         lead=2\n",
+    );
+}
+
 const WRAPPER_DEFAULT_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

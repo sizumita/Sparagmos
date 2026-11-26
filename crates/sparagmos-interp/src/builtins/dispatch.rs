@@ -9322,6 +9322,14 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::slice::ChunksExactMut<")
             || self_ty.starts_with("std::slice::RChunksMut<")
             || self_ty.starts_with("std::slice::RChunksExactMut<")
+            || self_ty.starts_with("std::slice::Split<")
+            || self_ty.starts_with("core::slice::Split<")
+            || self_ty.starts_with("std::slice::SplitInclusive<")
+            || self_ty.starts_with("core::slice::SplitInclusive<")
+            || self_ty.starts_with("std::slice::RSplit<")
+            || self_ty.starts_with("core::slice::RSplit<")
+            || self_ty_is(self_ty, "std::str::SplitAsciiWhitespace")
+            || self_ty_is(self_ty, "core::slice::SplitAsciiWhitespace")
         {
             // These types are their own iterator: the
             // blanket `IntoIterator for I: Iterator` impl
