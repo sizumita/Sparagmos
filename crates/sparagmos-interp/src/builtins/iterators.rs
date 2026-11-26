@@ -1768,12 +1768,23 @@ impl<'a> Interpreter<'a> {
             // does, and the `windows` builtin's [slice, size,
             // next index] snapshot.
             let fields = iterator_fields(&state, self_ty)?;
+            // A yielded window is a snapshot: the step
+            // materialised exactly the window's elements, so
+            // the fat reference's base is that element tuple
+            // itself -- the denomination `index_range`'s
+            // materialised sub-slices use (see
+            // `SliceElems::sub_snapshot`). Denominating the
+            // base as an element position inside the tuple
+            // (a reference to the tuple at index 0) instead
+            // makes an index step through the window compose
+            // onto that position and land inside the first
+            // element whenever the element is itself a
+            // sequence, so `window[0]` over a
+            // `Vec<Vec<usize>>` read the inner vector's first
+            // element rather than the vector.
             let tail_slice = |elems: &[Value]| {
                 Value::FatRef {
-                    base: Box::new(Value::Ref(RefTarget::Value(
-                        Box::new(Value::Tuple(elems.to_vec())),
-                        vec![RefProj::Index(0)],
-                    ))),
+                    base: Box::new(Value::Tuple(elems.to_vec())),
                     len: elems.len() as u128,
                 }
             };
@@ -1975,11 +1986,12 @@ impl<'a> Interpreter<'a> {
         if size == 0 || len == 0 {
             return Ok((state.clone(), none_value()));
         }
+        // A yielded chunk is a snapshot, denominated
+        // exactly as the `Windows` step's windows are (see
+        // `tail_slice` there): the base is the chunk's
+        // materialised element tuple itself.
         let sub_slice = |part: &[Value]| Value::FatRef {
-            base: Box::new(Value::Ref(RefTarget::Value(
-                Box::new(Value::Tuple(part.to_vec())),
-                vec![RefProj::Index(0)],
-            ))),
+            base: Box::new(Value::Tuple(part.to_vec())),
             len: part.len() as u128,
         };
         // The plain variants' short chunk sits at the end
