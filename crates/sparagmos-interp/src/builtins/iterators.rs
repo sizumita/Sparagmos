@@ -104,6 +104,21 @@ impl<'a> Interpreter<'a> {
         self.iterator_next_at(frames, self_ty, &target)
     }
 
+    /// The `Map` type a `str::Lines` value wraps: core defines
+    /// `Lines` as a one-field wrapper over exactly this adapter
+    /// (its `Iterator` impl forwards both steps to the field),
+    /// so stepping a `Lines` state - in place or by value - is
+    /// stepping the field under this tag. The callable the tag
+    /// names is one of core's zero-sized `Fn` types, applied by
+    /// the type-directed dispatch in the `Map` step itself.
+    fn lines_map_ty(self_ty: &str) -> Option<&'static str> {
+        if self_ty_is(self_ty, "std::str::Lines") {
+            Some("std::iter::Map<std::str::SplitInclusive<char>, core::str::LinesMap>")
+        } else {
+            None
+        }
+    }
+
     /// `Iterator::next` on the iterator stored at `target`:
     /// mutate it in place and return the `Option` value.
     pub(super) fn iterator_next_at(
@@ -112,6 +127,11 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         target: &Resolved,
     ) -> InterpResult<Value> {
+        if let Some(map_ty) = Self::lines_map_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_at(frames, map_ty, &field);
+            }
+        }
         // A `Map` on a place-based state is stepped in place
         // (its closure's environment reference must name the
         // closure field's own storage); `map_next` declines a
@@ -371,6 +391,11 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         target: &Resolved,
     ) -> InterpResult<Value> {
+        if let Some(map_ty) = Self::lines_map_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_back_at(frames, map_ty, &field);
+            }
+        }
         // A `Map` on a place-based state is stepped in place,
         // exactly as for `next` (see `iterator_next_at`): its
         // closure's environment reference must name the closure
@@ -424,7 +449,13 @@ impl<'a> Interpreter<'a> {
             let callable = self.read_resolved(frames, &pred_target)?;
             let env_ref = self.target_ref_value(frames, &pred_target)?;
             let arg = Value::Ref(RefTarget::value(item.clone()));
-            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            let keep = self.call_callable_sync_typed(
+                frames,
+                &callable,
+                second_generic_arg(self_ty).unwrap_or(""),
+                Some(env_ref),
+                vec![arg],
+            )?;
             match keep {
                 Value::Bool(true) => return Ok(Some(some_value(item))),
                 Value::Bool(false) => continue,
@@ -462,7 +493,13 @@ impl<'a> Interpreter<'a> {
             let callable = self.read_resolved(frames, &pred_target)?;
             let env_ref = self.target_ref_value(frames, &pred_target)?;
             let arg = Value::Ref(RefTarget::value(item.clone()));
-            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            let keep = self.call_callable_sync_typed(
+                frames,
+                &callable,
+                second_generic_arg(self_ty).unwrap_or(""),
+                Some(env_ref),
+                vec![arg],
+            )?;
             match keep {
                 Value::Bool(true) => return Ok(Some(some_value(item))),
                 Value::Bool(false) => continue,
@@ -505,7 +542,13 @@ impl<'a> Interpreter<'a> {
             };
             let callable = self.read_resolved(frames, &closure_target)?;
             let env_ref = self.target_ref_value(frames, &closure_target)?;
-            let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+            let mapped = self.call_callable_sync_typed(
+                frames,
+                &callable,
+                second_generic_arg(self_ty).unwrap_or(""),
+                Some(env_ref),
+                vec![item],
+            )?;
             match option_payload(mapped)? {
                 Some(y) => return Ok(Some(some_value(y))),
                 None => continue,
@@ -536,7 +579,13 @@ impl<'a> Interpreter<'a> {
             };
             let callable = self.read_resolved(frames, &closure_target)?;
             let env_ref = self.target_ref_value(frames, &closure_target)?;
-            let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+            let mapped = self.call_callable_sync_typed(
+                frames,
+                &callable,
+                second_generic_arg(self_ty).unwrap_or(""),
+                Some(env_ref),
+                vec![item],
+            )?;
             match option_payload(mapped)? {
                 Some(y) => return Ok(Some(some_value(y))),
                 None => continue,
@@ -608,7 +657,13 @@ impl<'a> Interpreter<'a> {
         };
         let callable = self.read_resolved(frames, &closure_target)?;
         let env_ref = self.target_ref_value(frames, &closure_target)?;
-        let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+        let mapped = self.call_callable_sync_typed(
+            frames,
+            &callable,
+            second_generic_arg(self_ty).unwrap_or(""),
+            Some(env_ref),
+            vec![item],
+        )?;
         Ok(Some(some_value(mapped)))
     }
 
@@ -665,6 +720,19 @@ impl<'a> Interpreter<'a> {
                 }
                 _ => {}
             }
+        }
+        if let Some(map_ty) = Self::lines_map_ty(self_ty) {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Lines state",
+                    "[map]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_map, result) =
+                self.next_back_on_state(frames, map_ty, fields[0].clone())?;
+            return Ok((rebuild_state(&state, vec![new_map]), result));
         }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
@@ -848,7 +916,13 @@ impl<'a> Interpreter<'a> {
                     ));
                 };
                 let arg = Value::Ref(RefTarget::value(x.clone()));
-                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                let keep = self.call_callable_sync_typed(
+                    frames,
+                    &predicate,
+                    second_generic_arg(self_ty).unwrap_or(""),
+                    None,
+                    vec![arg],
+                )?;
                 match keep {
                     Value::Bool(true) => {
                         return Ok((
@@ -897,7 +971,13 @@ impl<'a> Interpreter<'a> {
                     ));
                 };
                 let mapped =
-                    self.call_callable_sync(frames, &closure, None, vec![x])?;
+                    self.call_callable_sync_typed(
+                        frames,
+                        &closure,
+                        second_generic_arg(self_ty).unwrap_or(""),
+                        None,
+                        vec![x],
+                    )?;
                 if let Some(y) = option_payload(mapped)? {
                     return Ok((
                         rebuild_state(&state, vec![inner, closure]),
@@ -929,7 +1009,13 @@ impl<'a> Interpreter<'a> {
                 )),
                 Some(x) => {
                     let mapped =
-                        self.call_callable_sync(frames, &fields[1], None, vec![x])?;
+                        self.call_callable_sync_typed(
+                            frames,
+                            &fields[1],
+                            second_generic_arg(self_ty).unwrap_or(""),
+                            None,
+                            vec![x],
+                        )?;
                     Ok((
                         rebuild_state(&state, vec![new_inner, fields[1].clone()]),
                         some_value(mapped),
@@ -1659,6 +1745,21 @@ impl<'a> Interpreter<'a> {
             };
             return Ok((new_state, some_value(item)));
         }
+        if let Some(map_ty) = Self::lines_map_ty(self_ty) {
+            // The value-level step of a `Lines`: step the wrapped
+            // `Map` state and rewrap it in the one-field state.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Lines state",
+                    "[map]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_map, result) =
+                self.next_on_state(frames, map_ty, &fields[0])?;
+            return Ok((rebuild_state(&state, vec![new_map]), result));
+        }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::ChunksExact<")
@@ -1929,7 +2030,13 @@ impl<'a> Interpreter<'a> {
             }),
             Resolved::Value(..) => unreachable!("closure target is a place"),
         };
-        let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+        let mapped = self.call_callable_sync_typed(
+            frames,
+            &callable,
+            second_generic_arg(self_ty).unwrap_or(""),
+            Some(env_ref),
+            vec![item],
+        )?;
         Ok(Some(some_value(mapped)))
     }
 
@@ -1988,7 +2095,13 @@ impl<'a> Interpreter<'a> {
             let callable = self.read_resolved(frames, &closure_target)?;
             let env_ref = self.target_ref_value(frames, &closure_target)?;
             let arg = Value::Ref(RefTarget::value(item.clone()));
-            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            let keep = self.call_callable_sync_typed(
+                frames,
+                &callable,
+                second_generic_arg(self_ty).unwrap_or(""),
+                Some(env_ref),
+                vec![arg],
+            )?;
             match keep {
                 Value::Bool(true) => continue,
                 Value::Bool(false) => {
@@ -2769,7 +2882,13 @@ impl<'a> Interpreter<'a> {
                     break;
                 };
                 let arg = Value::Ref(RefTarget::value(x.clone()));
-                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                let keep = self.call_callable_sync_typed(
+                    frames,
+                    &predicate,
+                    second_generic_arg(self_ty).unwrap_or(""),
+                    None,
+                    vec![arg],
+                )?;
                 match keep {
                     Value::Bool(true) => {
                         result = some_value(x);
@@ -2816,7 +2935,13 @@ impl<'a> Interpreter<'a> {
                 let Some(x) = option_payload_opt(item) else {
                     break;
                 };
-                let mapped = self.call_callable_sync(frames, &closure, None, vec![x])?;
+                let mapped = self.call_callable_sync_typed(
+                    frames,
+                    &closure,
+                    second_generic_arg(self_ty).unwrap_or(""),
+                    None,
+                    vec![x],
+                )?;
                 if let Some(y) = option_payload(mapped)? {
                     result = some_value(y);
                     break;
@@ -2853,7 +2978,13 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
                 let arg = Value::Ref(RefTarget::value(x.clone()));
-                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                let keep = self.call_callable_sync_typed(
+                    frames,
+                    &predicate,
+                    second_generic_arg(self_ty).unwrap_or(""),
+                    None,
+                    vec![arg],
+                )?;
                 match keep {
                     Value::Bool(true) => continue,
                     Value::Bool(false) => {
@@ -2927,7 +3058,13 @@ impl<'a> Interpreter<'a> {
                 None => (vec![new_inner, fields[1].clone()], none_value()),
                 Some(x) => {
                     let mapped =
-                        self.call_callable_sync(frames, &fields[1], None, vec![x])?;
+                        self.call_callable_sync_typed(
+                            frames,
+                            &fields[1],
+                            second_generic_arg(self_ty).unwrap_or(""),
+                            None,
+                            vec![x],
+                        )?;
                     (
                         vec![new_inner, fields[1].clone()],
                         some_value(mapped),

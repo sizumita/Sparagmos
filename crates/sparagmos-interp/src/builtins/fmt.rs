@@ -4622,6 +4622,15 @@ pub(super) fn first_generic_arg(tag: &str) -> Option<&str> {
     split_tag_list(inner).into_iter().next()
 }
 
+/// The second generic argument of a rendered type, if any: the
+/// callable type of an iterator adapter tag (`Map<I, F>` and its
+/// siblings all carry the callable second).
+pub(super) fn second_generic_arg(tag: &str) -> Option<&str> {
+    let open = tag.find('<')?;
+    let inner = tag_group_inner(tag, open)?;
+    split_tag_list(inner).into_iter().nth(1)
+}
+
 /// The element tag of a rendered array or slice tag
 /// (`[Point; 2]` / `[Point]` -> `Point`); empty when the tag is
 /// not in that form.

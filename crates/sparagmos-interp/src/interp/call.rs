@@ -1171,6 +1171,141 @@ impl<'a> Interpreter<'a> {
             )),
         }
     }
+
+    /// Apply a callable that the caller knows by type
+    /// (`callable_ty` is the rendered type of the callable value),
+    /// synchronously. A closure or function pointer is applied
+    /// exactly as in [`Self::call_callable_sync`]. An *empty ADT*
+    /// value - the value form of a zero-sized type - carries no
+    /// type information of its own, so a callable of that shape is
+    /// dispatched through its type instead: the unique `Fn` /
+    /// `FnMut` / `FnOnce` impl body the program holds for
+    /// `callable_ty` is called with `(receiver, argument tuple)`,
+    /// the receiver shaped as the impl body expects (a reference
+    /// when its first parameter is one - the caller's environment
+    /// reference when it has one - and the value itself when it
+    /// takes the receiver by value). This is the dispatch the
+    /// iterator adapter steppers need for the `impl_fn_for_zst!`
+    /// family in core (`str::LinesMap` behind `str::lines`, and
+    /// its siblings): those callables only ever reach a call
+    /// through an adapter's builtin step, never through a call
+    /// edge that would name their type. When no impl body matches,
+    /// the value falls through to the untyped dispatch and its
+    /// usual outcome.
+    pub(crate) fn call_callable_sync_typed(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        callable: &Value,
+        callable_ty: &str,
+        env_ref: Option<Value>,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let empty_adt = match callable {
+            Value::Enum { fields, .. } => fields.is_empty(),
+            Value::Tuple(fields) => fields.is_empty(),
+            _ => false,
+        };
+        if empty_adt && !callable_ty.is_empty() {
+            for (trait_path, method) in [
+                ("std::ops::Fn", "call"),
+                ("std::ops::FnMut", "call_mut"),
+                ("std::ops::FnOnce", "call_once"),
+            ] {
+                let Some(impl_name) =
+                    self.scan_virtual_impl(callable_ty, trait_path, method)
+                else {
+                    continue;
+                };
+                // A body that was demanded but not converted is
+                // not a dispatch target: `scan_virtual_impl`
+                // scans the unconverted set too, and calling one
+                // would only re-report its absence less clearly
+                // than the untyped path below.
+                if self.program.get(&impl_name).is_none() {
+                    continue;
+                }
+                let wants_ref = matches!(
+                    self.program
+                        .get(&impl_name)
+                        .and_then(|b| b.local_tys.get(1)),
+                    Some(Ty::Ref(..))
+                );
+                let receiver = if wants_ref {
+                    match env_ref {
+                        Some(
+                            r @ (Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }),
+                        ) => r,
+                        _ => ref_shaped_receiver(callable.clone()),
+                    }
+                } else {
+                    callable.clone()
+                };
+                let args = self.fn_args_adapted(&impl_name, args);
+                let result = self.call_sync(
+                    frames,
+                    &impl_name,
+                    vec![receiver, Value::Tuple(args)],
+                )
+                .map(fn_result_materialized);
+                return result;
+            }
+        }
+        self.call_callable_sync(frames, callable, env_ref, args)
+    }
+
+    /// Shape the argument values of a type-directed `Fn`-family
+    /// dispatch (see [`Self::call_callable_sync_typed`]) as the
+    /// impl body's argument tuple declares them: the adapter
+    /// steppers hold a `&str` item as the string data itself and
+    /// a slice item as its element tuple, but the body's tuple
+    /// element is the fat pointer those data denote, and the
+    /// body's own pointer arithmetic on a bare data value loses
+    /// the string it slices. An argument whose declared element
+    /// type is a reference is therefore handed over as the
+    /// reference value for the data (a fat pointer for a `str` or
+    /// slice element); every other argument passes through
+    /// unchanged.
+    fn fn_args_adapted(&self, impl_name: &str, args: Vec<Value>) -> Vec<Value> {
+        let Some(elem_tys) = self
+            .program
+            .get(impl_name)
+            .and_then(|b| b.local_tys.get(2))
+            .and_then(|t| match t {
+                Ty::Tuple(ts) => Some(ts.clone()),
+                _ => None,
+            })
+        else {
+            return args;
+        };
+        args.into_iter()
+            .enumerate()
+            .map(|(i, arg)| {
+                let Some(elem_ty) = elem_tys.get(i) else {
+                    return arg;
+                };
+                let Ty::Ref(pointee) = elem_ty else {
+                    return arg;
+                };
+                match (&**pointee, &arg) {
+                    (Ty::Str, Value::Str(text)) => Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::value(arg.clone()))),
+                        len: text.len() as u128,
+                    },
+                    (Ty::Slice(_), Value::Tuple(items)) => Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::value(arg.clone()))),
+                        len: items.len() as u128,
+                    },
+                    (Ty::Slice(_), Value::Str(text)) => Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::value(arg.clone()))),
+                        len: text.len() as u128,
+                    },
+                    _ => arg,
+                }
+            })
+            .collect()
+    }
 }
 
 impl<'a> Interpreter<'a> {
@@ -1847,6 +1982,45 @@ pub(crate) fn ref_to_field(recv: &Value, idx: usize) -> Option<Value> {
         RefTarget::Null | RefTarget::Address(_) => return None,
     }
     Some(Value::Ref(target))
+}
+
+/// Materialize the result of a type-directed `Fn`-family
+/// dispatch (see `Interpreter::call_callable_sync_typed`) when
+/// it is a fat pointer into value-form string data: the impl
+/// body's own pointer arithmetic on a `&str` it was handed as
+/// data produces a fat pointer whose base is a byte pointer
+/// into the string value (an index-0 projection of it), a shape
+/// whose pointee the value model cannot read back as the string
+/// slice it denotes. The denoted slice is exactly the string
+/// data the dispatch itself owns, so it is handed back in the
+/// model's canonical string-data form - the same form the
+/// argument arrived in. Any other result passes through
+/// unchanged.
+fn fn_result_materialized(value: Value) -> Value {
+    let Value::FatRef { base, len } = &value else {
+        return value;
+    };
+    let Value::Ref(RefTarget::Value(inner, projection)) = &**base else {
+        return value;
+    };
+    let index0_only = projection.len() <= 1
+        && projection
+            .iter()
+            .all(|p| matches!(p, RefProj::Index(0)));
+    if !index0_only {
+        return value;
+    }
+    match &**inner {
+        Value::Str(text) => {
+            let end = (*len as usize).min(text.len());
+            if text.is_char_boundary(end) {
+                Value::Str(text[..end].to_string())
+            } else {
+                value
+            }
+        }
+        _ => value,
+    }
 }
 
 fn ref_shaped_receiver(value: Value) -> Value {
