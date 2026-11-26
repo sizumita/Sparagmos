@@ -2955,3 +2955,94 @@ fn run_mode_char_escape_non_ascii_construction() {
          false\n",
     );
 }
+
+const STR_ESCAPE_ITER_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    for _c in "a\nb".escape_debug() {
+        n += 1;
+    }
+    println!("count-loop={n}");
+    let mut s = String::new();
+    for c in "x\u{1b}y".escape_default() {
+        s.push(c);
+    }
+    println!("collected={s}");
+    println!("count={}", "\u{10ffff}".escape_unicode().count());
+    println!("nth={:?}", "ab\nc".escape_default().nth(2));
+    let upper: String = "a\nb".escape_default().map(|c| c.to_ascii_uppercase()).collect();
+    println!("upper={upper}");
+    let taken: String = "hello\nworld".escape_unicode().take(7).collect();
+    println!("taken={taken}");
+    let mut done = "x".escape_default();
+    println!("fused={:?} {:?} {:?}", done.next(), done.next(), done.next());
+    let orig = "q\tz".escape_default();
+    println!("clone={} orig={}", orig.clone().collect::<String>(), orig.collect::<String>());
+    let mut m = 0;
+    "a\rb".escape_unicode().for_each(|_| m += 1);
+    println!("for-each={m}");
+}
+"#;
+
+#[test]
+fn run_mode_str_escape_iterators() {
+    // Direct iteration and the modelled consumers over
+    // the `str` escape iterators (`EscapeDebug` /
+    // `EscapeDefault` / `EscapeUnicode`): core defines
+    // them as one-field wrappers over a `FlatMap` of the
+    // string's `Chars` through the matching zero-sized
+    // `char` escape callable, and the step delegates to
+    // that composition — a `for` loop, `count`, `nth`,
+    // `Map` / `Take` composition, `for_each`, a fused
+    // exhaustion and a mid-iteration `Clone`. Expected
+    // output was produced by the native 1.100.0 toolchain.
+    run_ok(
+        "str-escape-iterators",
+        STR_ESCAPE_ITER_SRC,
+        "count-loop=4\n\
+         collected=x\\u{1b}y\n\
+         count=10\n\
+         nth=Some('\\\\')\n\
+         upper=A\\NB\n\
+         taken=\\u{68}\\\n\
+         fused=Some('x') None None\n\
+         clone=q\\tz orig=q\\tz\n\
+         for-each=17\n",
+    );
+}
+
+const STR_ESCAPE_DISPLAY_SRC: &str = r#"
+fn main() {
+    println!("dbg={}", "a\nb\t\\é".escape_debug());
+    println!("dft={}", "a\nb\t\\é".escape_default());
+    println!("uni={}", "a\nb\t\\é".escape_unicode());
+    println!("empty=[{}]", "".escape_debug());
+    let mut it = "a\nb".escape_debug();
+    let first = it.next().unwrap();
+    println!("rest={first} {}", it);
+    println!("width=[{:>8}]", "ab".escape_default());
+}
+"#;
+
+#[test]
+fn run_mode_str_escape_display() {
+    // `Display` of the `str` escape iterators: core
+    // defines the impls as `clone().try_for_each(write_char)`,
+    // and the formatter follows that definition over the
+    // modelled step — including a partially consumed
+    // iterator, whose `Display` yields only the remaining
+    // chars. The impls write char by char and never pad
+    // or truncate, so the `width` line's spec leaves the
+    // text untouched. Expected output was produced by
+    // the native 1.100.0 toolchain.
+    run_ok(
+        "str-escape-display",
+        STR_ESCAPE_DISPLAY_SRC,
+        "dbg=a\\nb\\t\\\\\u{e9}\n\
+         dft=a\\nb\\t\\\\\\u{e9}\n\
+         uni=\\u{61}\\u{a}\\u{62}\\u{9}\\u{5c}\\u{e9}\n\
+         empty=[]\n\
+         rest=a \\nb\n\
+         width=[ab]\n",
+    );
+}

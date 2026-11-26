@@ -2898,12 +2898,17 @@ impl<'a> Interpreter<'a> {
     /// chars the value's own modelled step still yields, in
     /// order — the text core's `Display` definitions for
     /// these types produce. `None` for any other type.
+    /// The formatting options do not apply: core's impls
+    /// write the chars one by one and never pad or
+    /// truncate, so a width, fill or precision in the
+    /// format spec leaves the text untouched (unlike the
+    /// primitive impls, which pad through the formatter).
     fn format_escape_display(
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
         ty: &str,
-        options: &FmtOptions,
+        _options: &FmtOptions,
     ) -> InterpResult<Option<String>> {
         let plain = pointee_tag(ty);
         if !escape_display_tag(plain) {
@@ -2923,7 +2928,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        Ok(Some(pad_str(&text, options)))
+        Ok(Some(text))
     }
 
     fn format_display(
@@ -4646,15 +4651,15 @@ fn array_tag_len(tag: &str) -> Option<usize> {
     None
 }
 
-/// Whether the type tag names one of the `char` escape
-/// iterator types, whose core `Display` is the drain of the
-/// iterator (see `format_escape_display`): the impls
-/// forward to the inner buffer state's own drain-shaped
-/// `Display`. The `str` escape types share that definition
-/// (`clone().try_for_each(write_char)`), but their iterator
-/// step is not modelled yet, so they are deliberately not
-/// named here: their `Display` keeps failing at the
-/// unconverted-ADT boundary until the step lands.
+/// Whether the type tag names one of the escape
+/// iterator types, whose core `Display` is the drain of
+/// the iterator (see `format_escape_display`): the
+/// `char` types' impls forward to the inner buffer
+/// state's own drain-shaped `Display`, and the `str`
+/// types' define it directly as
+/// `clone().try_for_each(write_char)`. Every one of
+/// these types' steps is modelled, so the drain serves
+/// them all.
 pub(super) fn escape_display_tag(plain: &str) -> bool {
     self_ty_is(plain, "core::char::EscapeDebug")
         || self_ty_is(plain, "std::char::EscapeDebug")
@@ -4662,6 +4667,12 @@ pub(super) fn escape_display_tag(plain: &str) -> bool {
         || self_ty_is(plain, "std::char::EscapeDefault")
         || self_ty_is(plain, "core::char::EscapeUnicode")
         || self_ty_is(plain, "std::char::EscapeUnicode")
+        || self_ty_is(plain, "core::str::EscapeDebug")
+        || self_ty_is(plain, "std::str::EscapeDebug")
+        || self_ty_is(plain, "core::str::EscapeDefault")
+        || self_ty_is(plain, "std::str::EscapeDefault")
+        || self_ty_is(plain, "core::str::EscapeUnicode")
+        || self_ty_is(plain, "std::str::EscapeUnicode")
 }
 
 pub(super) fn pointee_tag(ty: &str) -> &str {

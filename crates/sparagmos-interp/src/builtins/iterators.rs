@@ -137,6 +137,36 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The `FlatMap` type a `str` escape iterator value
+    /// wraps: core defines `str::EscapeDebug` /
+    /// `EscapeDefault` / `EscapeUnicode` as one-field
+    /// wrappers over exactly this composition (a `FlatMap`
+    /// of the string's `Chars` through the matching
+    /// zero-sized `char` escape callable), and their
+    /// `Iterator` impls forward the step to the field, so
+    /// stepping a `str` escape state - in place or by
+    /// value - is stepping the field under this tag. The
+    /// callable the tag names is one of core's zero-sized
+    /// `Fn` types, applied by the type-directed dispatch
+    /// in the `Map` step the flatten machine composes.
+    fn str_escape_flatmap_ty(self_ty: &str) -> Option<&'static str> {
+        if self_ty_is(self_ty, "std::str::EscapeDebug")
+            || self_ty_is(self_ty, "core::str::EscapeDebug")
+        {
+            Some("std::iter::FlatMap<std::str::Chars, std::char::EscapeDebug, core::str::CharEscapeDebug>")
+        } else if self_ty_is(self_ty, "std::str::EscapeDefault")
+            || self_ty_is(self_ty, "core::str::EscapeDefault")
+        {
+            Some("std::iter::FlatMap<std::str::Chars, std::char::EscapeDefault, core::str::CharEscapeDefault>")
+        } else if self_ty_is(self_ty, "std::str::EscapeUnicode")
+            || self_ty_is(self_ty, "core::str::EscapeUnicode")
+        {
+            Some("std::iter::FlatMap<std::str::Chars, std::char::EscapeUnicode, core::str::CharEscapeUnicode>")
+        } else {
+            None
+        }
+    }
+
     /// `Iterator::next` on the iterator stored at `target`:
     /// mutate it in place and return the `Option` value.
     pub(super) fn iterator_next_at(
@@ -153,6 +183,11 @@ impl<'a> Interpreter<'a> {
         if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
             if let Some(field) = extend_target(target, RefProj::Field(0)) {
                 return self.iterator_next_at(frames, filter_ty, &field);
+            }
+        }
+        if let Some(flatmap_ty) = Self::str_escape_flatmap_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_at(frames, flatmap_ty, &field);
             }
         }
         // A `Map` on a place-based state is stepped in place
@@ -1929,6 +1964,22 @@ impl<'a> Interpreter<'a> {
                 self.next_on_state(frames, filter_ty, &fields[0])?;
             return Ok((rebuild_state(&state, vec![new_filter]), result));
         }
+        if let Some(flatmap_ty) = Self::str_escape_flatmap_ty(self_ty) {
+            // The value-level step of a `str` escape
+            // iterator: step the wrapped `FlatMap` state
+            // and rewrap it in the one-field state.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "str escape iterator state",
+                    "[flat map]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_inner, result) =
+                self.next_on_state(frames, flatmap_ty, &fields[0])?;
+            return Ok((rebuild_state(&state, vec![new_inner]), result));
+        }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::ChunksExact<")
@@ -2877,6 +2928,20 @@ impl<'a> Interpreter<'a> {
             if let Some(step) = self.flatten_step_state(frames, self_ty, state, false)? {
                 return Ok(step);
             }
+        }
+        if is_str_escape_ty(self_ty) {
+            // The `str` escape iterators' step is the
+            // wrapped `FlatMap` composition's (see
+            // `str_escape_flatmap_ty`); it belongs here
+            // because the adapter arms below step their
+            // inner iterators through this entry (a `Map`
+            // over a `str::EscapeDebug` reaches the
+            // composition only from here). The delegation
+            // cannot recurse: `iterator_next_state` serves
+            // these types by stepping the field under the
+            // `FlatMap` tag, which the flatten arm above
+            // serves directly.
+            return self.iterator_next_state(frames, self_ty, state.clone());
         }
         if is_char_escape_ty(self_ty) {
             // The `char` escape iterators' step lives in
@@ -5216,6 +5281,7 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
         || is_char_escape_ty(self_ty)
+        || is_str_escape_ty(self_ty)
 }
 
 /// The outcome of one in-place step of an `Option<I>`
@@ -6915,6 +6981,21 @@ fn is_char_escape_ty(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::char::EscapeDefault")
         || self_ty_is(self_ty, "std::char::EscapeUnicode")
         || self_ty_is(self_ty, "core::char::EscapeUnicode")
+}
+
+/// Whether a rendered tag names one of the `str` escape
+/// iterators: `str::EscapeDebug`, `str::EscapeDefault`
+/// and `str::EscapeUnicode` are one-field wrappers over
+/// a `FlatMap` of the string's `Chars` through the
+/// matching `char` escape callable, whose step the
+/// `str_escape_flatmap_ty` delegation replays.
+fn is_str_escape_ty(self_ty: &str) -> bool {
+    self_ty_is(self_ty, "std::str::EscapeDebug")
+        || self_ty_is(self_ty, "core::str::EscapeDebug")
+        || self_ty_is(self_ty, "std::str::EscapeDefault")
+        || self_ty_is(self_ty, "core::str::EscapeDefault")
+        || self_ty_is(self_ty, "std::str::EscapeUnicode")
+        || self_ty_is(self_ty, "core::str::EscapeUnicode")
 }
 
 /// The bound past which an `EscapeIterInner` `alive` range
