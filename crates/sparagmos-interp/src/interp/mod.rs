@@ -660,6 +660,13 @@ pub struct Interpreter<'a> {
     >,
     /// The id the next opened file gets.
     next_file: std::cell::RefCell<u64>,
+    /// The guest's errno cell (see `errno_cell_ref` in
+    /// `interp::state`): the allocation id of the four-byte
+    /// block whose address the errno-location calls hand
+    /// out, or `None` until the first use allocates it.
+    /// Interior-mutable for the same reason as the file
+    /// table.
+    errno_cell: std::cell::RefCell<Option<u64>>,
     /// Modelled process commands under construction (see
     /// [`CommandState`]), keyed by the id inside the handle
     /// values. Interior-mutable for the same reason as the
@@ -945,6 +952,7 @@ impl<'a> Interpreter<'a> {
             files: std::cell::RefCell::new(HashMap::new()),
             sockets: std::cell::RefCell::new(HashMap::new()),
             next_file: std::cell::RefCell::new(3),
+            errno_cell: std::cell::RefCell::new(None),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),
             children: std::cell::RefCell::new(HashMap::new()),

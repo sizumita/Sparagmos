@@ -1815,6 +1815,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "libc::sigaction" | "libc::unix::sigaction" => Builtin::LibcSigaction,
         "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
         "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
+        "libc::read" | "libc::unix::read" => Builtin::LibcRead,
+        "std::sys::io::error::unix::errno_location"
+        | "libc::__errno_location"
+        | "libc::unix::__errno_location" => Builtin::ErrnoLocation,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }

@@ -1562,6 +1562,25 @@ pub enum Builtin {
     /// handlers in reverse registration order (see
     /// `run_exit_handlers` in `interp`).
     LibcAtexit,
+    /// `libc::read(fd, buf, count) -> ssize_t`: a read from
+    /// a guest descriptor (see `exec_libc_read` in
+    /// `builtins::libc_io`): the descriptor names an entry
+    /// of the interpreter's one descriptor space (the file
+    /// and socket tables), the read runs on the host object
+    /// behind it, and a descriptor naming no entry -- the
+    /// shape a cloexec descriptor has in a re-executed
+    /// child, whose tables start empty -- fails with
+    /// `EBADF` recorded in the errno cell, as the host
+    /// call's failure does.
+    LibcRead,
+    /// `std::sys::io::error::unix::errno_location()
+    /// -> *mut c_int` (and the libc crate's own
+    /// `__errno_location`): the address of the guest's
+    /// errno cell (see `exec_errno_location` in
+    /// `builtins::libc_io`), the cell
+    /// `std::io::Error::last_os_error` reads and the
+    /// failing descriptor operations write.
+    ErrnoLocation,
     /// `core::num::imp::overflow_panic::pow(base, exp)`: the
     /// exponentiation behind the primitive `pow` methods,
     /// panicking on overflow exactly like the checked

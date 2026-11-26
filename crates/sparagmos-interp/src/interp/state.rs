@@ -824,6 +824,37 @@ impl<'a> Interpreter<'a> {
         Some(result)
     }
 
+    /// The reference to the guest's errno cell, allocating
+    /// the cell on first use: a four-byte scalar block,
+    /// zeroed, whose address the errno-location calls
+    /// (`std::sys::io::error::unix::errno_location`, the
+    /// libc crate's `__errno_location`) hand the guest and
+    /// whose contents the failing descriptor operations
+    /// record their host errno in, for
+    /// `std::io::Error::last_os_error` to read back (see
+    /// `builtins::libc_io`). One cell per process, not per
+    /// thread: the interpreter's threads run cooperatively,
+    /// so the call-then-check sequence through which a
+    /// program observes errno cannot interleave with
+    /// another thread's failing call, which is the only
+    /// pattern a per-thread cell would change the outcome
+    /// of.
+    pub(crate) fn errno_cell_ref(&self) -> Value {
+        if let Some(id) = *self.errno_cell.borrow() {
+            return Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            });
+        }
+        let id = self.alloc_insert(Value::Int(0));
+        self.record_alloc_layout(id, 4, 4);
+        *self.errno_cell.borrow_mut() = Some(id);
+        Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        })
+    }
+
     /// Close the host socket behind table id `id` (the
     /// `SocketHandleDrop` plan's effect): removing the entry
     /// drops the host socket, closing the descriptor. An id
