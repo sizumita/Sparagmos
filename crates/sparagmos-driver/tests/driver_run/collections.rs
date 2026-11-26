@@ -550,6 +550,75 @@ fn run_mode_btree_set_multilevel_remove() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "count=58 sum=2523\n");
 }
 
+const BTREE_SET_MERGE_DRAIN_INSERT_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let mut s = BTreeSet::new();
+    for i in 0..200 {
+        s.insert(i);
+    }
+    for i in 0..190 {
+        s.remove(&i);
+    }
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_merge_drain_insert_built() {
+    // Draining an insert-built multi-level set from the
+    // front until its leaves merge: the merge pulls the
+    // parent pair down through slice_remove on the set's
+    // zero-sized value slots, and the remaining elements
+    // still walk in order.
+    let dir = temp_dir("btreesetmergedrainins");
+    let src = fixture(
+        &dir,
+        "btreesetmergedrainins.rs",
+        BTREE_SET_MERGE_DRAIN_INSERT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "draining a multi-level BTreeSet until leaves merge must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=10 sum=1945\n");
+}
+
+const BTREE_SET_MERGE_DRAIN_BULK_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let mut s: BTreeSet<i32> = (0..150).collect();
+    for i in 0..140 {
+        s.remove(&i);
+    }
+    println!("count={} sum={}", s.iter().count(), s.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_merge_drain_bulk_built() {
+    // The same front drain on a bulk-built set: the first
+    // leaf merge reads the parent node's zero-sized value
+    // slot, and the remaining elements still walk in order.
+    let dir = temp_dir("btreesetmergedrainbulk");
+    let src = fixture(
+        &dir,
+        "btreesetmergedrainbulk.rs",
+        BTREE_SET_MERGE_DRAIN_BULK_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "draining a bulk-built multi-level BTreeSet until leaves merge must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count=10 sum=1445\n");
+}
+
 const BTREE_SET_HEIGHT2_INSERT_SRC: &str = r#"
 use std::collections::BTreeSet;
 fn main() {
