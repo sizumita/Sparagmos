@@ -73,7 +73,7 @@ impl Converter {
         match &kind {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.record_layout(ty, def, args, &converted);
-                self.record_debug_shape(def, &converted);
+                self.record_debug_shape(def, args, &converted);
                 self.record_instance_shape(ty, def, args, &converted);
             }
             TyKind::RigidTy(RigidTy::Closure(..))
@@ -195,6 +195,17 @@ impl Converter {
     /// normalize, which panics inside the compiler and poisons the
     /// query it runs in.
     ///
+    /// Two conversion losses are repaired before the substitution.
+    /// A parameter index counts every parameter kind (lifetimes
+    /// and consts included) while the converted arguments keep
+    /// only the type arguments, so the arguments are first aligned
+    /// to the parameter positions (a placeholder sits at the other
+    /// kinds' positions, which no type parameter ever occupies).
+    /// And an array length that is a const parameter converts to
+    /// a nameless parameter form, so the instance's const argument
+    /// is resolved back into it by a parallel walk of the
+    /// definition's field type (`resolve_param_array_lens`).
+    ///
     /// Shape recording is auxiliary to the conversion in progress,
     /// exactly like `record_shape`: the current body's error list
     /// is saved and restored around the field conversions, and a
@@ -203,7 +214,7 @@ impl Converter {
     /// also depth-capped as a belt-and-braces bound (instances past
     /// the cap stay unsupported, like any other unrecorded
     /// instance).
-    fn record_debug_shape(&mut self, def: &AdtDef, converted: &sm::Ty) {
+    fn record_debug_shape(&mut self, def: &AdtDef, args: &GenericArgs, converted: &sm::Ty) {
         let kind = match def.kind() {
             AdtKind::Struct => sm::AdtShapeKind::Struct,
             AdtKind::Enum => sm::AdtShapeKind::Enum,
@@ -220,6 +231,21 @@ impl Converter {
             return;
         };
         let instance_args = instance_args.clone();
+        let mut converted_types = instance_args.iter();
+        let aligned_args: Vec<sm::Ty> = args
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, a)| match a {
+                GenericArgKind::Type(_) => converted_types
+                    .next()
+                    .cloned()
+                    .unwrap_or(sm::Ty::Error),
+                GenericArgKind::Const(_) | GenericArgKind::Lifetime(_) => {
+                    sm::Ty::Param(i as u32, String::new())
+                }
+            })
+            .collect();
         self.adt_debug_shapes.insert(
             key.clone(),
             sm::AdtDebugShape {
@@ -235,7 +261,9 @@ impl Converter {
             for field in variant.fields() {
                 let fty = field.ty();
                 let converted_field = self.ty(&fty);
-                let substituted = substitute_params(&converted_field, &instance_args);
+                let converted_field =
+                    resolve_param_array_lens(&fty, &converted_field, args);
+                let substituted = substitute_params(&converted_field, &aligned_args);
                 let tag = self.layout_key(&substituted);
                 // A tuple field's recorded name is its position
                 // written out as a number; anything else is a

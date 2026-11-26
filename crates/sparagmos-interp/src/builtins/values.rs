@@ -286,6 +286,30 @@ pub(super) fn deref_pointer_value(pointer: Value) -> InterpResult<Value> {
     }
 }
 
+/// The dereference of a `Pin<P>` value: the wrapper is a
+/// one-field aggregate holding the pointer value, and a
+/// nested `Pin` is itself a pointer wrapper around the next
+/// pointer, so the field extraction repeats while the type
+/// argument is itself a `Pin` (`Pin<Pin<&T>>` derefs to `&T`,
+/// the transitive `Target`). The innermost pointer then
+/// derefs by the usual pointer rule (`deref_pointer_value`).
+pub(super) fn pin_deref_value(
+    wrapper: Value,
+    self_ty: &str,
+    what: &str,
+) -> InterpResult<Value> {
+    let mut pointer = one_field_value(wrapper, what)?;
+    let mut inner_ty = first_generic_param(self_ty);
+    while let Some(ty) = inner_ty.as_deref() {
+        if !(ty.starts_with("std::pin::Pin<") || ty.starts_with("core::pin::Pin<")) {
+            break;
+        }
+        pointer = one_field_value(pointer, what)?;
+        inner_ty = first_generic_param(ty);
+    }
+    deref_pointer_value(pointer)
+}
+
 pub(super) fn cell_held(state: &Value) -> Option<&Value> {
     match state {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {

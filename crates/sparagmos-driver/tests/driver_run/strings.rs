@@ -3482,3 +3482,43 @@ fn run_mode_string_from_mut_str() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "\u{1F603} 4\nxy\n", "stdout={stdout}");
 }
+
+const DERIVED_DEBUG_CONST_PARAMS_SRC: &str = r#"
+#[derive(Debug)]
+struct S1<A> { a: A }
+#[derive(Debug)]
+struct S3<'a, const C: usize, T, U, const B: bool> {
+    t: T,
+    pd: std::marker::PhantomData<&'a [(usize, U); C]>,
+}
+fn main() {
+    let x: S3<'static, 123, S1<usize>, (), true> = S3 {
+        t: S1 { a: 3usize },
+        pd: std::marker::PhantomData::<&[(usize, ()); 123]>,
+    };
+    println!("{x:?}");
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_derived_const_params() {
+    // A derived `Debug` over an ADT whose generic parameters
+    // mix kinds: a parameter index counts lifetimes and
+    // consts too, so the recorded field tags must substitute
+    // the instance's type arguments at their own positions,
+    // and an array length that is a const parameter must
+    // resolve to the instance's value. Either loss leaves
+    // the `PhantomData` field's tag naming no recorded
+    // shape, and formatting stops.
+    let dir = temp_dir("derived-debug-const-params");
+    let src = fixture(&dir, "deriveddebug.rs", DERIVED_DEBUG_CONST_PARAMS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "S3 { t: S1 { a: 3 }, pd: PhantomData<&[(usize, ()); 123]> }\n",
+        "stdout={stdout}"
+    );
+}

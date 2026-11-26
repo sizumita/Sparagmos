@@ -4917,11 +4917,9 @@ impl<'a> Interpreter<'a> {
                     Ok(self.read_ref_once(frames, &vals[0])?)
                 } else if self_ty.starts_with("std::pin::Pin<") {
                     // `Pin<P>` derefs exactly as the pointer it
-                    // wraps: the wrapper is a one-field aggregate
-                    // holding the pointer value.
+                    // wraps (see `pin_deref_value`).
                     let wrapper = self.resolve_value(frames, &vals[0])?;
-                    let pointer = one_field_value(wrapper, "Deref::deref for Pin")?;
-                    deref_pointer_value(pointer)
+                    pin_deref_value(wrapper, self_ty, "Deref::deref for Pin")
                 } else if self_ty.starts_with("std::mem::ManuallyDrop<") {
                     // A one-field newtype wrapper: the result is a
                     // reference to the held value.
@@ -7982,12 +7980,9 @@ impl<'a> Interpreter<'a> {
                     Ok(self.read_ref_once(frames, &vals[0])?)
                 } else if self_ty.starts_with("std::pin::Pin<") {
                     // `Pin<P>` derefs exactly as the pointer it
-                    // wraps: the wrapper is a one-field aggregate
-                    // holding the pointer value.
+                    // wraps (see `pin_deref_value`).
                     let wrapper = self.resolve_value(frames, &vals[0])?;
-                    let pointer =
-                        one_field_value(wrapper, "DerefMut::deref_mut for Pin")?;
-                    deref_pointer_value(pointer)
+                    pin_deref_value(wrapper, self_ty, "DerefMut::deref_mut for Pin")
                 } else if self_ty.starts_with("std::panic::AssertUnwindSafe<") {
                     // A one-field newtype wrapper: the result is a
                     // mutable reference to the held value.
