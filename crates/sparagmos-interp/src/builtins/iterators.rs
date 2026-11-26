@@ -626,6 +626,63 @@ impl<'a> Interpreter<'a> {
     /// whose scan applies the predicate to each char of the
     /// remaining window. Any other searcher shape is the
     /// generic unsupported error, as before.
+    /// One front or back step of a `str` matches iterator
+    /// (`Matches` / `MatchIndices`), replaying core's searcher
+    /// step on the state the constructor's converted body
+    /// built: the two types are one-field wrappers over an
+    /// internal struct whose only field is the pattern's
+    /// searcher, and a step is exactly the searcher's
+    /// `next_match` / `next_match_back` -- `Matches` yields the
+    /// matched text, `MatchIndices` the pair of its byte index
+    /// and the text. The searcher shapes modelled are the
+    /// `char` pattern's (the search is a substring search for
+    /// the needle's UTF-8 encoding, as in `str_split_step`)
+    /// and the `CharEqSearcher` family -- a `char` predicate
+    /// (closure or function pointer) or a set of chars (a
+    /// `[char; N]` pattern's chars by value, or a `&[char]`
+    /// pattern's slice) -- whose scan tests each char of the
+    /// remaining window. Any other searcher shape is the
+    /// generic unsupported error, as before (a `&str` pattern's
+    /// `StrSearcher` is one: its constructor has no converted
+    /// body, so such an iterator is never even built).
+    fn str_matches_step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: &Value,
+        self_ty: &str,
+        back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let indices = self_ty.starts_with("std::str::MatchIndices<");
+        if let Some(mut parts) = StrMatchesParts::decode(state) {
+            let found = if back {
+                parts.next_match_back()
+            } else {
+                parts.next_match()
+            };
+            let new_state = parts.encode(state);
+            let item = matches_item(&parts.haystack, indices, found);
+            return Ok((new_state, item));
+        }
+        if let Some(mut parts) = StrMatchesEqParts::decode(state) {
+            if !parts.resolve_set(self, frames) {
+                return Err(unsupported(format!(
+                    "Iterator::next for {self_ty} is not runtime-supported"
+                )));
+            }
+            let found = if back {
+                parts.next_match_back(self, frames)?
+            } else {
+                parts.next_match(self, frames)?
+            };
+            let new_state = parts.encode(state);
+            let item = matches_item(&parts.haystack, indices, found);
+            return Ok((new_state, item));
+        }
+        Err(unsupported(format!(
+            "Iterator::next for {self_ty} is not runtime-supported"
+        )))
+    }
+
     fn str_split_step(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -784,6 +841,9 @@ impl<'a> Interpreter<'a> {
         }
         if is_str_split_ty(self_ty) {
             return self.str_split_step(frames, &state, self_ty, true);
+        }
+        if is_str_matches_ty(self_ty) {
+            return self.str_matches_step(frames, &state, self_ty, true);
         }
         if self_ty.starts_with("std::vec::Drain<")
             || self_ty.starts_with("alloc::vec::Drain<")
@@ -2720,6 +2780,9 @@ impl<'a> Interpreter<'a> {
         }
         if is_str_split_ty(self_ty) {
             return self.str_split_step(frames, state, self_ty, false);
+        }
+        if is_str_matches_ty(self_ty) {
+            return self.str_matches_step(frames, state, self_ty, false);
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<")
             || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -5056,6 +5119,8 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitTerminator<")
         || self_ty.starts_with("std::str::RSplitTerminator<")
         || self_ty.starts_with("std::str::SplitInclusive<")
+        || self_ty.starts_with("std::str::Matches<")
+        || self_ty.starts_with("std::str::MatchIndices<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
@@ -5471,6 +5536,8 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitTerminator<")
         || self_ty.starts_with("std::str::RSplitTerminator<")
         || self_ty.starts_with("std::str::SplitInclusive<")
+        || self_ty.starts_with("std::str::Matches<")
+        || self_ty.starts_with("std::str::MatchIndices<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
@@ -6954,6 +7021,14 @@ pub(super) fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<
     }
 }
 
+/// Whether a rendered tag names one of the `str` matches
+/// iterators whose state machine `str_matches_step` replays
+/// (`Matches`, `MatchIndices`).
+fn is_str_matches_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("std::str::Matches<")
+        || self_ty.starts_with("std::str::MatchIndices<")
+}
+
 /// Whether a rendered tag names one of the `str` split
 /// iterators whose state machine `str_split_step` replays
 /// (`Split`, `RSplit`, `SplitTerminator`, `RSplitTerminator`,
@@ -6965,6 +7040,413 @@ fn is_str_split_ty(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitTerminator<")
         || self_ty.starts_with("std::str::RSplitTerminator<")
         || self_ty.starts_with("std::str::SplitInclusive<")
+}
+
+/// How a `CharEqSearcher`'s char test is served: a guest
+/// predicate applied through the modelled call path, a set
+/// of chars tested by membership (resolved from the state),
+/// or a `&[char]` pattern's slice, resolved through the
+/// interpreter before the first step.
+enum MatchesEq {
+    Predicate(Value),
+    Set(Vec<char>),
+    SetRef(Value),
+}
+
+/// The item a matches step yields for one searcher match:
+/// the matched text for `Matches`, the pair of its byte
+/// index and the text for `MatchIndices`.
+fn matches_item(
+    haystack: &str,
+    indices: bool,
+    found: Option<(usize, usize)>,
+) -> Value {
+    match found {
+        Some((a, b)) => {
+            let piece = Value::Str(haystack[a..b].to_string());
+            if indices {
+                some_value(Value::Tuple(vec![Value::Uint(a as u128), piece]))
+            } else {
+                some_value(piece)
+            }
+        }
+        None => none_value(),
+    }
+}
+
+/// The decoded state of a `str` matches iterator over a
+/// `char` pattern: the pattern's `CharSearcher` fields, in
+/// the two one-field wrappers (`Matches` over
+/// `MatchesInternal`) the constructor built. The fields the
+/// machine does not read (the needle char, its size, the
+/// encoding array) are carried as their original values so
+/// the rebuilt state is field-exact, as in `StrSplitParts`.
+struct StrMatchesParts {
+    haystack: String,
+    finger: usize,
+    finger_back: usize,
+    needle: Vec<u8>,
+    needle_value: Value,
+    utf8_size_value: Value,
+    utf8_encoded_value: Value,
+}
+
+impl StrMatchesParts {
+    /// Decode the state value, or `None` when it is not the
+    /// char-searcher matches state (another pattern's
+    /// searcher, whose step stays unsupported).
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 1 {
+            return None;
+        }
+        let searcher = iterator_fields(&internal[0], "").ok()?;
+        if searcher.len() != 6 {
+            return None;
+        }
+        let Value::Str(haystack) = &searcher[0] else {
+            return None;
+        };
+        let as_usize = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Uint(x) => usize::try_from(*x).ok(),
+                _ => None,
+            }
+        };
+        let utf8_size = as_usize(&searcher[4])?;
+        if utf8_size == 0 || utf8_size > 4 {
+            return None;
+        }
+        let encoded = iterator_fields(&searcher[5], "").ok()?;
+        if encoded.len() != 4 {
+            return None;
+        }
+        let mut needle = Vec::with_capacity(utf8_size);
+        for slot in &encoded[..utf8_size] {
+            match slot {
+                Value::Uint(b) if *b <= 255 => needle.push(*b as u8),
+                _ => return None,
+            }
+        }
+        // The recorded encoding must be the needle char's own:
+        // the search below is a substring search for it.
+        if std::str::from_utf8(&needle).is_err() {
+            return None;
+        }
+        Some(StrMatchesParts {
+            haystack: haystack.clone(),
+            finger: as_usize(&searcher[1])?,
+            finger_back: as_usize(&searcher[2])?,
+            needle,
+            needle_value: searcher[3].clone(),
+            utf8_size_value: searcher[4].clone(),
+            utf8_encoded_value: searcher[5].clone(),
+        })
+    }
+
+    /// Rebuild the state value with the stepped fields, in
+    /// the exact shape `decode` read.
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded");
+        let new_searcher = rebuild_state(
+            &internal[0],
+            vec![
+                Value::Str(self.haystack.clone()),
+                Value::Uint(self.finger as u128),
+                Value::Uint(self.finger_back as u128),
+                self.needle_value.clone(),
+                self.utf8_size_value.clone(),
+                self.utf8_encoded_value.clone(),
+            ],
+        );
+        let new_internal = rebuild_state(&outer[0], vec![new_searcher]);
+        rebuild_state(state, vec![new_internal])
+    }
+
+    /// `CharSearcher::next_match`: the first needle
+    /// occurrence in `haystack[finger..finger_back]`; the
+    /// finger advances past it (the same search
+    /// `StrSplitParts` runs).
+    fn next_match(&mut self) -> Option<(usize, usize)> {
+        let bytes = self.haystack.as_bytes();
+        let range = bytes.get(self.finger..self.finger_back)?;
+        let at = range
+            .windows(self.needle.len())
+            .position(|w| w == self.needle.as_slice());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger = found + self.needle.len();
+                Some((found, self.finger))
+            }
+            None => {
+                self.finger = self.finger_back;
+                None
+            }
+        }
+    }
+
+    /// `CharSearcher::next_match_back`: the last needle
+    /// occurrence in `haystack[finger..finger_back]`; the
+    /// back finger retreats to its start.
+    fn next_match_back(&mut self) -> Option<(usize, usize)> {
+        let bytes = self.haystack.as_bytes();
+        let Some(range) = bytes.get(self.finger..self.finger_back) else {
+            self.finger_back = self.finger;
+            return None;
+        };
+        let at = range
+            .windows(self.needle.len())
+            .rposition(|w| w == self.needle.as_slice());
+        match at {
+            Some(at) => {
+                let found = self.finger + at;
+                self.finger_back = found;
+                Some((found, found + self.needle.len()))
+            }
+            None => {
+                self.finger_back = self.finger;
+                None
+            }
+        }
+    }
+}
+
+/// The decoded state of a `str` matches iterator over a
+/// `CharEqSearcher` pattern: the searcher is a one-field
+/// wrapper (the `CharPredicateSearcher`) over the
+/// three-field searcher -- the char test, the haystack and
+/// its `CharIndices` -- and the window the scan runs over
+/// is the front/back byte indices of the `CharIndices`'
+/// byte-slice iterator, exactly as in `StrSplitPredParts`.
+struct StrMatchesEqParts {
+    haystack: String,
+    front: usize,
+    back: usize,
+    char_eq: Value,
+    test: MatchesEq,
+}
+
+impl StrMatchesEqParts {
+    /// Decode the state value, or `None` when it is not the
+    /// char-eq searcher matches state. A predicate the
+    /// modelled call path cannot apply -- anything but a
+    /// closure or a function pointer; a zero-sized `Fn`
+    /// type's value carries no callable identity of its own
+    /// -- also declines, as in `StrSplitPredParts`.
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 1 {
+            return None;
+        }
+        let wrapper = iterator_fields(&internal[0], "").ok()?;
+        if wrapper.len() != 1 {
+            return None;
+        }
+        let searcher = iterator_fields(&wrapper[0], "").ok()?;
+        if searcher.len() != 3 {
+            return None;
+        }
+        let test = match &searcher[0] {
+            Value::Closure { .. } | Value::FnPtr(_) => {
+                MatchesEq::Predicate(searcher[0].clone())
+            }
+            Value::Tuple(items) => {
+                MatchesEq::Set(char_set_of(items)?)
+            }
+            Value::FatRef { .. } => MatchesEq::SetRef(searcher[0].clone()),
+            _ => return None,
+        };
+        let Value::Str(haystack) = &searcher[1] else {
+            return None;
+        };
+        // `CharIndices` pairs the front char index with its
+        // `Chars`, which wraps the byte-slice iterator whose
+        // bounds are the window.
+        let char_indices = iterator_fields(&searcher[2], "").ok()?;
+        if char_indices.len() != 2 {
+            return None;
+        }
+        let chars = iterator_fields(&char_indices[1], "").ok()?;
+        if chars.len() != 1 {
+            return None;
+        }
+        let (front, back) = slice_iter_bounds(&chars[0], "").ok()?;
+        Some(StrMatchesEqParts {
+            haystack: haystack.clone(),
+            front,
+            back,
+            char_eq: searcher[0].clone(),
+            test,
+        })
+    }
+
+    /// Resolve a `&[char]` pattern's slice to its chars, so
+    /// the scan tests membership directly. `false` when the
+    /// slice's elements do not read as chars, leaving the
+    /// step to the generic unsupported error.
+    fn resolve_set(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> bool {
+        let MatchesEq::SetRef(reference) = &self.test else {
+            return true;
+        };
+        let Ok(target) = interp.deref_value(frames, reference) else {
+            return false;
+        };
+        let Ok(value) = interp.read_resolved(frames, &target) else {
+            return false;
+        };
+        let fields = match &value {
+            Value::Tuple(items) => items.clone(),
+            Value::Enum { fields, .. } => fields.clone(),
+            _ => return false,
+        };
+        match char_set_of(&fields) {
+            Some(chars) => {
+                self.test = MatchesEq::Set(chars);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Rebuild the state value with the stepped fields, in
+    /// the exact shape `decode` read.
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded");
+        let wrapper = iterator_fields(&internal[0], "").expect("state decoded");
+        let searcher = iterator_fields(&wrapper[0], "").expect("state decoded");
+        let char_indices = iterator_fields(&searcher[2], "").expect("state decoded");
+        let chars = iterator_fields(&char_indices[1], "").expect("state decoded");
+        let iter_fields = iterator_fields(&chars[0], "").expect("state decoded");
+        let new_front =
+            iter_ptr_with_index(&iter_fields[0], self.front).expect("state decoded");
+        let new_back =
+            iter_ptr_with_index(&iter_fields[1], self.back).expect("state decoded");
+        let new_iter = rebuild_state(
+            &chars[0],
+            vec![new_front, new_back, iter_fields[2].clone()],
+        );
+        let new_chars = rebuild_state(&char_indices[1], vec![new_iter]);
+        // The `CharIndices` front field is the char index of
+        // the window's front byte position.
+        let front_index = self.haystack[..self.front].chars().count();
+        let new_indices = rebuild_state(
+            &searcher[2],
+            vec![Value::Uint(front_index as u128), new_chars],
+        );
+        let new_searcher = rebuild_state(
+            &wrapper[0],
+            vec![
+                self.char_eq.clone(),
+                Value::Str(self.haystack.clone()),
+                new_indices,
+            ],
+        );
+        let new_wrapper = rebuild_state(&internal[0], vec![new_searcher]);
+        let new_internal = rebuild_state(&outer[0], vec![new_wrapper]);
+        rebuild_state(state, vec![new_internal])
+    }
+
+    /// The searcher's char test: apply the predicate through
+    /// the modelled call path, or test set membership.
+    fn matches(
+        &self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+        c: char,
+    ) -> InterpResult<bool> {
+        match &self.test {
+            MatchesEq::Predicate(predicate) => {
+                match interp.call_callable_sync(
+                    frames,
+                    predicate,
+                    None,
+                    vec![Value::Uint(c as u32 as u128)],
+                )? {
+                    Value::Bool(b) => Ok(b),
+                    other => Err(InterpError::type_mismatch(
+                        "matches predicate result",
+                        "a boolean",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            MatchesEq::Set(chars) => Ok(chars.contains(&c)),
+            MatchesEq::SetRef(_) => Err(unsupported(
+                "matches char set was not resolved before the step",
+            )),
+        }
+    }
+
+    /// The searcher's `next_match`: the first char of the
+    /// window the char test accepts. Rejected chars are
+    /// consumed, as the searcher's own `next` consumes them,
+    /// so the front ends just past the accepted char, or at
+    /// the window's back when no char is accepted.
+    fn next_match(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<(usize, usize)>> {
+        let window = self.haystack[self.front..self.back].to_string();
+        for (rel, c) in window.char_indices() {
+            let at = self.front + rel;
+            if self.matches(interp, frames, c)? {
+                self.front = at + c.len_utf8();
+                return Ok(Some((at, self.front)));
+            }
+        }
+        self.front = self.back;
+        Ok(None)
+    }
+
+    /// The searcher's `next_match_back`: the last accepted
+    /// char of the window; the back retreats to its start.
+    fn next_match_back(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<(usize, usize)>> {
+        let window = self.haystack[self.front..self.back].to_string();
+        for (rel, c) in window.char_indices().rev() {
+            let at = self.front + rel;
+            if self.matches(interp, frames, c)? {
+                self.back = at;
+                return Ok(Some((at, at + c.len_utf8())));
+            }
+        }
+        self.back = self.front;
+        Ok(None)
+    }
+}
+
+/// The chars of a char-set pattern's recorded elements, or
+/// `None` when an element is not a char value.
+fn char_set_of(items: &[Value]) -> Option<Vec<char>> {
+    let mut chars = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Uint(x) => {
+                chars.push(char::from_u32(u32::try_from(*x).ok()?)?)
+            }
+            _ => return None,
+        }
+    }
+    Some(chars)
 }
 
 /// The decoded state of a `str` split iterator: core's

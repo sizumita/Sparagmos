@@ -1414,6 +1414,125 @@ fn run_mode_str_split_predicate_family() {
     );
 }
 
+const STR_MATCHES_SRC: &str = r#"fn main() {
+    let v: Vec<(usize, &str)> = "αXβXγ".match_indices('X').collect();
+    println!("mb={v:?}");
+    let v2: Vec<(usize, &str)> = "αβγβδ".match_indices('β').collect();
+    println!("mb-needle={v2:?}");
+    let m: Vec<&str> = "aXbXc".matches('X').collect();
+    println!("m={m:?}");
+    let mut it = "a.b.c.d".match_indices('.');
+    println!("i1={:?}", it.next());
+    println!("i2={:?}", it.next_back());
+    println!("i3={:?}", it.next());
+    println!("i4={:?}", it.next_back());
+    println!("i5={:?}", it.next());
+    let w: Vec<&str> = "x=y=z".matches('=').rev().collect();
+    println!("rev={w:?}");
+    println!("none={}", "abc".matches('z').count());
+    println!("empty={}", "".matches('z').count());
+    let e: Vec<(usize, &str)> = "XaX".match_indices('X').collect();
+    println!("ends={e:?}");
+    let total: usize = "aXbXcX".match_indices('X').map(|(i, _)| i).sum();
+    println!("sum={total}");
+    println!("last={:?}", "aXbXc".matches('X').last());
+    println!("cnt={}", "aXbXc".matches('X').count());
+    let mut it2 = "a b c".match_indices(' ');
+    let p = it2.next().unwrap();
+    println!("eq={} len={} disp=[{}]", p.1 == " ", p.1.len(), p.1);
+}
+"#;
+
+#[test]
+fn run_mode_str_matches_family() {
+    // The `Matches` / `MatchIndices` family over a `char`
+    // pattern (core's `CharSearcher`): both directions and
+    // their interleaving on one state, multi-byte haystacks
+    // and needles with exact byte indices, the consumers,
+    // and the yielded pieces as string values (equality,
+    // length, Display). Expected output was produced by the
+    // native 1.100.0 toolchain.
+    run_ok(
+        "str-matches-family",
+        STR_MATCHES_SRC,
+        "mb=[(2, \"X\"), (5, \"X\")]\n\
+         mb-needle=[(2, \"β\"), (6, \"β\")]\n\
+         m=[\"X\", \"X\"]\n\
+         i1=Some((1, \".\"))\n\
+         i2=Some((5, \".\"))\n\
+         i3=Some((3, \".\"))\n\
+         i4=None\n\
+         i5=None\n\
+         rev=[\"=\", \"=\"]\n\
+         none=0\n\
+         empty=0\n\
+         ends=[(0, \"X\"), (2, \"X\")]\n\
+         sum=9\n\
+         last=Some(\"X\")\n\
+         cnt=2\n\
+         eq=true len=1 disp=[ ]\n"
+    );
+}
+
+const STR_MATCHES_EQ_SRC: &str = r#"fn is_digit(c: char) -> bool {
+    c.is_ascii_digit()
+}
+
+fn main() {
+    let target = 'l';
+    let p: Vec<(usize, &str)> = "hello world"
+        .match_indices(|c: char| c == target)
+        .collect();
+    println!("pred={p:?}");
+    let mut pit = "hello".match_indices(|c: char| c == 'l');
+    println!("b1={:?}", pit.next_back());
+    println!("f1={:?}", pit.next());
+    println!("b2={:?}", pit.next_back());
+    let pm: Vec<&str> = "hello".matches(|c: char| c == 'l').collect();
+    println!("pred-m={pm:?}");
+    let d: Vec<&str> = "a1b22c".matches(is_digit).collect();
+    println!("fnptr={d:?}");
+    let s: Vec<(usize, &str)> = "a1b2c3".match_indices(['1', '2', '3']).collect();
+    println!("set={s:?}");
+    let set: &[char] = &['a', 'b'];
+    let mut sit = "abcba".match_indices(set);
+    println!("s1={:?}", sit.next_back());
+    println!("s2={:?}", sit.next());
+    println!("s3={:?}", sit.next());
+    println!("s4={:?}", sit.next_back());
+    let sm: Vec<&str> = "xaybz".matches(['a', 'b']).collect();
+    println!("set-m={sm:?}");
+    println!("setcnt={}", "a1b2".matches(['1', '2']).count());
+}
+"#;
+
+#[test]
+fn run_mode_str_matches_eq_family() {
+    // The `Matches` / `MatchIndices` family over the
+    // `CharEqSearcher` patterns: a capturing closure and a
+    // function-pointer predicate, and char sets as a
+    // `[char; N]` pattern and a `&[char]` slice, in both
+    // directions. Expected output was produced by the
+    // native 1.100.0 toolchain.
+    run_ok(
+        "str-matches-eq-family",
+        STR_MATCHES_EQ_SRC,
+        "pred=[(2, \"l\"), (3, \"l\"), (9, \"l\")]\n\
+         b1=Some((3, \"l\"))\n\
+         f1=Some((2, \"l\"))\n\
+         b2=None\n\
+         pred-m=[\"l\", \"l\"]\n\
+         fnptr=[\"1\", \"2\", \"2\"]\n\
+         set=[(1, \"1\"), (3, \"2\"), (5, \"3\")]\n\
+         s1=Some((4, \"a\"))\n\
+         s2=Some((0, \"a\"))\n\
+         s3=Some((1, \"b\"))\n\
+         s4=Some((3, \"b\"))\n\
+         set-m=[\"a\", \"b\"]\n\
+         setcnt=2\n"
+    );
+}
+
 const WRAPPER_DEFAULT_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
