@@ -710,9 +710,10 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   timeouts cannot express this bound: a driver that balloons
   faster than its timeout (Issue #480's debugger session grew
   at ~190 MB/s against a 240 s timeout) exhausts the hosted
-  runner's 16 GB and kills the whole shard job, and since a
-  shard's results are written only when it finishes, every
-  result in the shard is lost (Issue #483). The bound sits at
+  runner's 16 GB and kills the whole shard job (Issue #483).
+  The runner's incremental results snapshots bound how much
+  judged work such a kill loses, but the shard still has to be
+  re-run to complete. The bound sits at
   roughly twice the largest legitimate driver RSS measured
   (~2.6 GB for a stage-4 guest run), and two `--jobs` slots at
   the bound plus the native side and the runner stay inside

@@ -159,6 +159,15 @@ faster than its timeout would otherwise exhaust the host's RAM
 and kill the whole measurement job (Issue #483). The native
 compiles and runs -- the reference oracle -- are not bounded.
 
+The results file is also written incrementally: every 500 judged
+records, and once more when the last record finishes, the results
+so far replace --out as a snapshot carrying a top-level
+"complete": false marker, so a shard killed mid-run (host OOM,
+job-level timeout) keeps the records it already judged on disk.
+ci-subset-tools merge refuses files carrying that marker, so a
+partial file is never merged silently as a complete result; the
+final write at the end of a completed run carries no marker.
+
 Usage:
     python3 scripts/rustc-subset-run.py \
         --survey-json subset-survey.json \
@@ -8854,6 +8863,43 @@ def fill_result_rustdoc(rec, rust_dir, driver_bin, out):
                             rust_dir, out)
 
 
+def write_partial_results(out, results, denominator, wall_seconds,
+                          jobs, jit):
+    """Persist the results judged so far to `out`, marked incomplete.
+
+    The snapshot carries the final file's aggregates/results shape
+    -- aggregates cover the records judged so far, against the
+    survey denominator -- plus a top-level "complete": false
+    marker, and ci-subset-tools merge refuses files carrying that
+    marker, so a partial file can never be merged silently as a
+    complete result.  The write is atomic (a sibling temp file
+    replaced over `out`), so a kill during the snapshot itself
+    leaves the previous snapshot, never a truncated one.  The
+    final write in main() replaces the snapshot with the complete
+    payload, which carries no marker.
+    """
+    ordered = sorted(results, key=lambda r: r["path"])
+
+    def count(status):
+        return sum(1 for r in ordered if r["status"] == status)
+
+    agg = {
+        "denominator": denominator,
+        "results_total": len(ordered),
+        "passed": count("pass"),
+        "failed": count("fail"),
+        "unsupported": count("unsupported"),
+        "not_attempted": count("not-attempted"),
+        "jit_mode": bool(jit),
+        "wall_seconds": round(wall_seconds, 1),
+        "jobs": jobs,
+    }
+    payload = {"aggregates": agg, "results": ordered, "complete": False}
+    tmp = out.parent / (out.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1, sort_keys=True))
+    os.replace(tmp, out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--survey-json", type=Path, required=True,
@@ -9019,6 +9065,23 @@ def main():
 
     results = []
     t0 = time.time()
+
+    snapshot_warned = False
+
+    def snapshot_partial():
+        # A failed snapshot must never kill the run: the final
+        # write at the end of main() keeps its historical behaviour
+        # (and its failure mode) either way.
+        nonlocal snapshot_warned
+        try:
+            write_partial_results(args.out, results, denominator,
+                                  time.time() - t0, args.jobs, args.jit)
+        except OSError as e:
+            if not snapshot_warned:
+                snapshot_warned = True
+                print(f"warning: partial results snapshot failed: {e}",
+                      file=sys.stderr, flush=True)
+
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=args.jobs) as pool:
         futs = [pool.submit(process_test, r, args.rust_dir,
@@ -9047,6 +9110,8 @@ def main():
             if done % 500 == 0:
                 print(f"  {done}/{total_jobs} "
                       f"({time.time() - t0:.0f}s)", flush=True)
+                snapshot_partial()
+    snapshot_partial()
     wall = time.time() - t0
 
     for r in others:

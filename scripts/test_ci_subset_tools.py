@@ -130,6 +130,19 @@ class MergeCliTests(unittest.TestCase):
         self.assertEqual(merged["aggregates"]["denominator"], 4)
         self.assertEqual(merged["aggregates"]["passed"], 3)
 
+    def test_merge_refuses_partial_shard(self):
+        partial = self.dir / "shard-partial.json"
+        data = result_file([record("e.rs", "exec")])
+        data["complete"] = False
+        partial.write_text(json.dumps(data))
+        res = subprocess.run(
+            [sys.executable, str(SCRIPT), "merge", "--out", str(self.out),
+             str(partial)],
+            capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("partial results file", res.stderr)
+        self.assertFalse(self.out.exists())
+
     def test_merge_with_matching_expectations_and_survey(self):
         res = self.run_merge(
             "--expect-total", "4",

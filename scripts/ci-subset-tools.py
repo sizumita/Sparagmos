@@ -149,6 +149,12 @@ def merge_files(paths):
     jit_mode = False
     for path in paths:
         data = load_json(path)
+        if data.get("complete") is False:
+            raise SystemExit(
+                f"error: {path} is a partial results file from an "
+                "interrupted rustc-subset-run.py run (marked "
+                "\"complete\": false); refusing to merge it as a "
+                "complete result")
         agg = data.get("aggregates", {})
         wall += float(agg.get("wall_seconds", 0.0))
         jit_mode = jit_mode or bool(agg.get("jit_mode", False))
