@@ -5268,3 +5268,167 @@ fn run_mode_sort_interleaved_scratch_partition() {
         "sorted: [0, 1, 2, 3, 4, 5, 6, 7, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007]\n",
     );
 }
+
+const SORT_INTERLEAVED_FORTY_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..10usize {
+        for p in 0..4usize {
+            v.push(p * 1000 + i);
+        }
+    }
+    v.sort();
+    let ok = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("len {} sorted {} first {} last {}", v.len(), ok, v[0], v[v.len()-1]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_interleaved_forty_scratch_offset_from() {
+    // At forty elements driftsort's merge measures the saved
+    // run against the scratch base with `ptr_offset_from`:
+    // one pointer denotes an element through the storage
+    // field's index step, the other is the bare field base the
+    // cast chain left behind. The distance split read the
+    // trailing field step as the element index under an empty
+    // prefix key, so the two never shared a key and the
+    // intrinsic reported unrelated pointers. The split now
+    // also offers the bare-base reading (the field path as the
+    // key, index 0), so the pair measures.
+    run_ok(
+        "sort-interleaved-forty",
+        SORT_INTERLEAVED_FORTY_SRC,
+        "len 40 sorted true first 0 last 3009\n",
+    );
+}
+
+const SORT_TWO_SORTED_RUNS_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..16usize {
+        v.push(i * 2);
+    }
+    for i in 0..16usize {
+        v.push(i * 2 + 1);
+    }
+    v.sort();
+    let ok = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("len {} sorted {} first {} last {}", v.len(), ok, v[0], v[v.len()-1]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_two_sorted_runs_merge_scratch_first_use() {
+    // Two pre-sorted runs of sixteen: driftsort finds both
+    // runs already sorted, so `merge` is the first user of a
+    // pristine scratch. Three denomination gaps used to break
+    // it in sequence: the stored scratch pointer is the bare
+    // field base (its first-element step stripped by the cast
+    // chain), so the merge's first comparison read the whole
+    // storage array instead of element 0; the run copy into
+    // the byte-denominated storage landed element `i` in byte
+    // slot `i` instead of slot `i * size_of::<T>()`; and the
+    // elements the copy moved can carry the `MaybeUninit`
+    // union form, which a scalar comparison now reads through.
+    // The dereference of a bare array base denotes element 0
+    // for an element or scalar pointee, bulk sequence access
+    // prices its stride from the recorded field element size,
+    // and the comparison unwraps a one-sided wrapper form.
+    run_ok(
+        "sort-two-sorted-runs",
+        SORT_TWO_SORTED_RUNS_SRC,
+        "len 32 sorted true first 0 last 31\n",
+    );
+}
+
+const SORT_INTERLEAVED_SIXTYFOUR_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..16usize {
+        for p in 0..4usize {
+            v.push(p * 1000 + i);
+        }
+    }
+    v.sort();
+    let ok = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("len {} sorted {} first {} last {}", v.len(), ok, v[0], v[v.len()-1]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_interleaved_sixtyfour_scratch_merge() {
+    // The sixty-four-element interleaved sort: the scratch
+    // merge path at the size where the saved run no longer
+    // fits the small-sort special cases (see
+    // `run_mode_sort_two_sorted_runs_merge_scratch_first_use`
+    // for the denomination gaps in this path).
+    run_ok(
+        "sort-interleaved-sixtyfour",
+        SORT_INTERLEAVED_SIXTYFOUR_SRC,
+        "len 64 sorted true first 0 last 3015\n",
+    );
+}
+
+const MAYBEUNINIT_SLICE_COPY_SRC: &str = r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    let mut v: Vec<usize> = vec![0, 1000, 2000, 3000, 1, 1001, 2001, 3001];
+    let mut storage: [MaybeUninit<usize>; 8] = [const { MaybeUninit::uninit() }; 8];
+    unsafe {
+        let buf = storage.as_mut_ptr().cast::<usize>();
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf, 4);
+        println!("first {}", *buf);
+        println!("second {}", *buf.add(1));
+    }
+    println!("v0 {}", v[0]);
+}
+"#;
+
+#[test]
+fn run_mode_maybeuninit_slice_copy_wider_elements() {
+    // A bulk copy into `[MaybeUninit<T>]` storage through the
+    // cast pointer: the destination target ends in the
+    // wrapper's field-0 entry step behind the first-element
+    // index step, and the plain indexed write appended the
+    // element index after the entry, navigating into the
+    // scalar payload. The sequence access now composes with
+    // the index step behind whole-value entry steps, keeping
+    // the entry, so the elements land in the storage slots.
+    run_ok(
+        "maybeuninit-slice-copy",
+        MAYBEUNINIT_SLICE_COPY_SRC,
+        "first 0\nsecond 1000\nv0 0\n",
+    );
+}
+
+const OFFSET_FROM_WRAPPER_DENOMINATED_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<usize> = (0..64).collect();
+    let base = v.as_mut_ptr();
+    unsafe {
+        let wrapped = base.add(40) as *mut std::mem::MaybeUninit<usize>;
+        let plain = base.add(24) as *const usize;
+        let d = (wrapped as *const usize).offset_from(plain);
+        println!("dist {d}");
+        let d2 = plain.offset_from(wrapped as *const usize);
+        println!("dist2 {d2}");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_offset_from_wrapper_denominated_pointer() {
+    // A distance between an element pointer denominated
+    // through a wrapper entry (its projection carries the
+    // entry step after the element step) and a plain element
+    // pointer into the same buffer: the distance split's key
+    // included the entry step, so the two never shared a key.
+    // The split now also offers the reading whose key drops
+    // the whole-value entry steps after the element step.
+    run_ok(
+        "offset-from-wrapper-denominated",
+        OFFSET_FROM_WRAPPER_DENOMINATED_SRC,
+        "dist 16\ndist2 -16\n",
+    );
+}

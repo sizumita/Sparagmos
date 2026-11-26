@@ -1,5 +1,6 @@
 //! Value equality and comparison for the equality builtins.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 
@@ -10,6 +11,38 @@ use crate::interp::{
 use crate::value::{RefTarget, Value};
 
 use super::*;
+
+
+/// One operand of an equality or comparison builtin, with a
+/// one-field wrapper form around a scalar (the `MaybeUninit`
+/// union form a bulk copy can leave in an element slot)
+/// replaced by the scalar it holds, when the other operand
+/// is a bare scalar: the comparison is over the element
+/// type, and only one side's storage carries the wrapper
+/// form. Any other shape passes through unchanged.
+fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
+    fn is_scalar(v: &Value) -> bool {
+        matches!(
+            v,
+            Value::Uint(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Float128(_)
+                | Value::Bool(_)
+        )
+    }
+    if !is_scalar(other) {
+        return v;
+    }
+    match &*v {
+        Value::Enum { variant: 0, fields }
+            if fields.len() == 1 && is_scalar(&fields[0]) =>
+        {
+            Cow::Owned(fields[0].clone())
+        }
+        _ => v,
+    }
+}
 
 impl<'a> Interpreter<'a> {
     pub(crate) fn values_equal(
@@ -45,6 +78,8 @@ impl<'a> Interpreter<'a> {
         }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
+        let a = unwrap_scalar_form(a, &b);
+        let b = unwrap_scalar_form(b, &a);
         // A `VecDeque` value (the real aggregate: wrapped head,
         // length, ring buffer) compares by its logical element
         // sequence, as the type's own `PartialEq` does: the
@@ -437,6 +472,8 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
+        let a = unwrap_scalar_form(a, &b);
+        let b = unwrap_scalar_form(b, &a);
         // A vector value in its sparse form (declared length
         // below the stored elements: the spare capacity a
         // growth or a shrink leaves behind) orders by its
