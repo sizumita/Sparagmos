@@ -1481,11 +1481,14 @@ fn consumer_instance_needs_body(
     // faithful execution and is demanded here. The iterator
     // type is one of the definition's generic arguments (the
     // Vec's own parameters come first), so every argument is
-    // judged, as for the nested entry above.
+    // judged, as for the nested entry above. The judgement
+    // is the recursive body-served predicate, so an adapter
+    // over such an iterator -- whose step composes the inner
+    // step -- is judged by its source.
     if canonical.starts_with("std::vec::Vec") && canonical.ends_with("::extend_trusted") {
         return args.0.iter().any(|arg| {
             matches!(arg, GenericArgKind::Type(ty)
-                if hash_iterator_ty(ty) || collection_iterator_ty(ty))
+                if body_served_iterator_ty(ty))
         });
     }
     let iter_arg = match canonical {
@@ -1522,13 +1525,15 @@ fn consumer_instance_needs_body(
             // nested `Vec::from_iter` body) reads the upper
             // bound as an exact capacity and panics with
             // `capacity overflow` when it is `None`, so for
-            // the body-served iterators the instance body --
+            // the body-served iterators (possibly wrapped in
+            // adapter types, judged by the recursive
+            // predicate) the instance body --
             // the type's own override -- is the only faithful
             // execution and is demanded here.
             let Some(GenericArgKind::Type(ty)) = args.0.first() else {
                 return false;
             };
-            return hash_iterator_ty(ty) || collection_iterator_ty(ty);
+            return body_served_iterator_ty(ty);
         }
         "std::iter::ExactSizeIterator::len" => {
             // `len` likewise: the builtin serves the call
