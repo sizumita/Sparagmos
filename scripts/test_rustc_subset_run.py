@@ -5383,3 +5383,49 @@ class CoverageNormalizeTests(unittest.TestCase):
         self.assertEqual(
             run.normalize_cov_map_output(text, "/x/tests/coverage"),
             "Function name: f\n- file 0 => $DIR/a.rs\n")
+
+
+class PartialResultsTests(unittest.TestCase):
+    def record(self, path, status):
+        return {"suite": "ui", "path": path, "nature": "exec",
+                "single_file": True, "ffi": False, "status": status,
+                "reason": "", "bucket": "", "mode": None,
+                "seconds": 0.0}
+
+    def test_snapshot_is_marked_incomplete_and_well_formed(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "results.json"
+            results = [self.record("b.rs", "fail"),
+                       self.record("a.rs", "pass"),
+                       self.record("c.rs", "not-attempted")]
+            run.write_partial_results(out, results, 24937, 12.34, 48,
+                                      False)
+            data = json.loads(out.read_text())
+            self.assertIs(data["complete"], False)
+            # records are stored in the final file's path order
+            self.assertEqual([r["path"] for r in data["results"]],
+                             ["a.rs", "b.rs", "c.rs"])
+            agg = data["aggregates"]
+            self.assertEqual(agg["denominator"], 24937)
+            self.assertEqual(agg["results_total"], 3)
+            self.assertEqual(agg["passed"], 1)
+            self.assertEqual(agg["failed"], 1)
+            self.assertEqual(agg["not_attempted"], 1)
+            self.assertEqual(agg["unsupported"], 0)
+            self.assertFalse(agg["jit_mode"])
+            # the temp file is replaced, not left behind
+            self.assertFalse((Path(d) / "results.json.tmp").exists())
+
+    def test_later_snapshot_replaces_earlier(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "results.json"
+            run.write_partial_results(
+                out, [self.record("a.rs", "pass")], 10, 1.0, 2, True)
+            run.write_partial_results(
+                out, [self.record("a.rs", "pass"),
+                      self.record("b.rs", "pass")], 10, 2.0, 2, True)
+            data = json.loads(out.read_text())
+            self.assertIs(data["complete"], False)
+            self.assertEqual(data["aggregates"]["results_total"], 2)
+            self.assertEqual(data["aggregates"]["passed"], 2)
+            self.assertTrue(data["aggregates"]["jit_mode"])
