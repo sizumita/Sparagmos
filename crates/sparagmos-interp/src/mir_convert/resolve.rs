@@ -570,6 +570,7 @@ fn convert_all_with(
     out.fn_display_names = program.fn_display_names.clone();
     out.crate_overflow_checks = program.crate_overflow_checks.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
+    out.needs_drop_verdicts = program.needs_drop_verdicts.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();
     merge_static_seeds(&mut all_static_seeds, &conv);

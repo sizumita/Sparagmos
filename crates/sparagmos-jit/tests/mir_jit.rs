@@ -193,6 +193,7 @@ fn build_with_table(
         source_files: Default::default(),
         drop_trivial_adts: Default::default(),
         drop_no_impl_adts: Default::default(),
+        needs_drop_verdicts: Default::default(),
         dtor_bodies: Default::default(),
 
         track_caller_defs: Default::default(),

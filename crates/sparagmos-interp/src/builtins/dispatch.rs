@@ -8226,7 +8226,20 @@ impl<'a> Interpreter<'a> {
             Builtin::MemNeedsDrop => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
-                match needs_drop_for_tag(tag) {
+                // The compiler's verdict recorded at
+                // conversion for the types the program's own
+                // `needs_drop` calls ask about is exact — it
+                // is the emptiness of the type's drop-in-place
+                // shim, so it agrees with the glue the program
+                // runs. The static tag table answers for the
+                // types no recorded verdict names.
+                let needs = self
+                    .program()
+                    .needs_drop_verdicts
+                    .get(tag)
+                    .copied()
+                    .or_else(|| needs_drop_for_tag(tag));
+                match needs {
                     Some(needs) => Ok(Value::Bool(needs)),
                     None => Err(unsupported(format!(
                         "needs_drop for {tag} is not runtime-supported"
