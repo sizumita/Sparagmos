@@ -2218,6 +2218,18 @@ impl<'a> Interpreter<'a> {
     /// (a byte-length reinterpretation over a wider element
     /// type is the canonical case), and it keeps the raw-parts
     /// denomination the readers already serve.
+    ///
+    /// It is recorded only where the collision is real: the
+    /// element at the window's start is itself a sequence of
+    /// exactly the fat length. A formation whose start element
+    /// is a scalar, or a sequence of a different length, is
+    /// already denominated unambiguously by the element step
+    /// (a reader tells the two readings apart by length), and
+    /// rewriting its base would disturb the readers that key
+    /// on the element-step shape -- the ordinary `split_at`
+    /// halves over a scalar sequence, the line pieces of a
+    /// `str`, and a sort's slices over its buffer and scratch
+    /// storage all form through here.
     pub(crate) fn raw_parts_base(
         &self,
         frames: &[Frame],
@@ -2300,18 +2312,40 @@ impl<'a> Interpreter<'a> {
             | Value::Ref(RefTarget::Static { projection, .. })
             | Value::Ref(RefTarget::Alloc { projection, .. })
             | Value::Ref(RefTarget::Value(_, projection)) => match projection.last() {
-                Some(RefProj::Subslice { offset, .. }) => *offset as u128,
+                Some(RefProj::Subslice { offset, .. }) => *offset,
                 _ => return base,
             },
             _ => return base,
         };
-        let head_len = self
+        let head_value = self
             .deref_value(frames, &head)
             .and_then(|target| self.read_resolved(frames, &target))
-            .ok()
-            .and_then(|value| value.len());
+            .ok();
+        let head_len = head_value.as_ref().and_then(|value| value.len());
+        let collides = head_value
+            .as_ref()
+            .and_then(|value| {
+                project_value(
+                    value.clone(),
+                    &[RefProj::Index(start)],
+                    "raw parts base",
+                    "raw parts base",
+                )
+                .ok()
+            })
+            .is_some_and(|element| {
+                matches!(
+                    element,
+                    Value::Tuple(_)
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                        | Value::Enum { .. }
+                        | Value::SparseVec { .. }
+                        | Value::FatRef { .. }
+                ) && element.len() == Some(len)
+            });
         match head_len {
-            Some(head_len) if start + len <= head_len => candidate,
+            Some(head_len) if start as u128 + len <= head_len && collides => candidate,
             _ => base,
         }
     }
