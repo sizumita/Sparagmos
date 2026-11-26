@@ -4332,6 +4332,37 @@ impl<'a> Interpreter<'a> {
                         None => self.path_bytes_of(frames, &value)?.0,
                     };
                     Ok(pathbuf_value(&bytes))
+                } else if target == "std::process::Stdio"
+                    && matches!(
+                        source,
+                        "std::fs::File"
+                            | "std::process::ChildStdin"
+                            | "std::process::ChildStdout"
+                            | "std::process::ChildStderr"
+                            | "std::os::fd::OwnedFd"
+                    )
+                {
+                    // std's `From` impls for `Stdio` wrap the
+                    // source handle in the sys enum's `Fd`
+                    // variant under the public one-field
+                    // wrapper -- the shape `stdio_config_of`
+                    // decodes to the file the handle carries.
+                    // A source value that does not bottom out
+                    // at a file-table id is not a handle this
+                    // model can hand to a child; it keeps the
+                    // unsupported error below.
+                    match crate::interp::file_handle_id(&value) {
+                        Some(_) => Ok(Value::Enum {
+                            variant: 0,
+                            fields: vec![Value::Enum {
+                                variant: 3,
+                                fields: vec![value],
+                            }],
+                        }),
+                        None => Err(unsupported(format!(
+                            "From::from from {source} to {target} is not runtime-supported"
+                        ))),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"

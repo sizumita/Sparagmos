@@ -953,6 +953,115 @@ fn run_mode_process_host_stdio_from_child_stdout_broken_pipe() {
     );
 }
 
+const PROCESS_HOST_STDIO_FROM_SRC: &str = r#"
+use std::fs::File;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "emit-out" {
+        println!("hello-from-child");
+        return;
+    }
+    if args.len() > 1 && args[1] == "cat" {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).unwrap();
+        print!("{buf}");
+        return;
+    }
+    if args.len() > 1 && args[1] == "emit-err" {
+        eprintln!("guest-err-line");
+        std::process::exit(3);
+    }
+    let dir = &args[1];
+    let me = std::env::current_exe().unwrap();
+
+    // A child's stdout is a guest `File`, through the
+    // explicit `Stdio::from(File)` conversion.
+    let out_path = format!("{dir}/out.txt");
+    let file = File::create(&out_path).unwrap();
+    let status = Command::new(&me)
+        .arg("emit-out")
+        .stdout(Stdio::from(file))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(&out_path).unwrap(),
+        "hello-from-child\n"
+    );
+
+    // A child's stdin is a guest `File`, likewise.
+    let in_path = format!("{dir}/in.txt");
+    let mut f = File::create(&in_path).unwrap();
+    f.write_all(b"line-from-file\n").unwrap();
+    drop(f);
+    let infile = File::open(&in_path).unwrap();
+    let out = Command::new(&me)
+        .arg("cat")
+        .stdin(Stdio::from(infile))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "line-from-file\n");
+
+    // A child's stderr is a guest `File`, through `Into`.
+    let err_path = format!("{dir}/err.txt");
+    let errfile = File::create(&err_path).unwrap();
+    let err_stdio: Stdio = errfile.into();
+    let status = Command::new(&me)
+        .arg("emit-err")
+        .stderr(err_stdio)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(
+        std::fs::read_to_string(&err_path).unwrap(),
+        "guest-err-line\n"
+    );
+
+    // A taken child pipe handle converts explicitly too.
+    let mut producer = Command::new(&me)
+        .arg("emit-out")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let taken = producer.stdout.take().unwrap();
+    let out = Command::new(&me)
+        .arg("cat")
+        .stdin(Stdio::from(taken))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hello-from-child\n");
+    assert!(producer.wait().unwrap().success());
+    println!("stdio-from-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_stdio_from_file_and_child_handles() {
+    let dir = temp_dir("proc-host-stdio-from");
+    let src = fixture(
+        &dir,
+        "process_host_stdio_from.rs",
+        PROCESS_HOST_STDIO_FROM_SRC,
+    );
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--guest-process-host")
+        .arg("--guest-arg")
+        .arg(&dir_arg)
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "stdio-from-ok\n");
+}
+
 const PROCESS_HOST_FAILURE_SRC: &str = r#"
 use std::io::ErrorKind;
 use std::process::Command;
