@@ -823,10 +823,29 @@ pub enum Builtin {
     /// `std::panicking::catch_unwind::cleanup(payload)`: box a raw
     /// panic payload into a `Box<dyn Any + Send>` (a `DynRef` in
     /// this value model). The native cleanup also decrements the
-    /// panic count; no guest program can observe that counter
-    /// through the modelled surface (`std::panicking()` is not
-    /// modelled), so there is nothing further to do.
+    /// panic count; in this model the count is the interpreter's
+    /// in-flight count (see `Interpreter::panics_in_flight`) and
+    /// the catch protocol decrements it when the panic is
+    /// consumed (see `Interpreter::exec_catch_unwind`), so there
+    /// is nothing further to do here.
     PanicCleanup,
+    /// `std::panicking::panicking()` / `std::thread::panicking()`:
+    /// whether the calling thread is currently unwinding a
+    /// panic. Served from the interpreter's per-thread in-flight
+    /// panic count (see `Interpreter::panics_in_flight`) — the
+    /// count std's runtime maintains through `__rust_start_panic`
+    /// and the catch cleanup, which the interpreter's raise /
+    /// catch protocol mirrors. This is the query the sync poison
+    /// flags consult when a lock guard drops during unwinding.
+    Panicking,
+    /// `std::rt::panic_count::count_is_zero()` and
+    /// `std::rt::panic_count::is_zero_slow_path()`: the runtime's
+    /// own spellings of the same query — the check the collected
+    /// `panicking()` body is built on in this std build, and the
+    /// fallback its inlined forms call when the global count is
+    /// nonzero (the global word itself is kept current by the
+    /// interpreter; see `Interpreter::sync_global_panic_count`).
+    PanicCountIsZero,
     /// `std::panicking::begin_panic(payload)` /
     /// `std::rt::begin_panic(payload)`: raise a guest panic
     /// carrying the argument as its payload. This is the sink

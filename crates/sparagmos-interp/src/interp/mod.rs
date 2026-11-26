@@ -514,7 +514,8 @@ pub struct Interpreter<'a> {
     /// or taken by the libtest harness model), keyed by thread
     /// id. std's per-thread panic count: a panic raised while
     /// another is in flight on the same thread forces a full
-    /// backtrace in its report.
+    /// backtrace in its report, and the count is what
+    /// `std::panicking()` reads (see `Interpreter::panicking`).
     panics_in_flight: std::cell::RefCell<HashMap<u64, usize>>,
     /// Whether the process's first Off-style panic report has
     /// printed the `RUST_BACKTRACE=1` note (std's FIRST_PANIC):

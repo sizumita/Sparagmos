@@ -489,12 +489,22 @@ fn registry_covers_the_modelled_callees() {
 
 #[test]
 fn catch_unwind_family_registers() {
-    let cases: [(&str, Builtin); 10] = [
+    let cases: [(&str, Builtin); 14] = [
         ("std::intrinsics::catch_unwind", Builtin::CatchUnwind),
         ("core::intrinsics::catch_unwind", Builtin::CatchUnwind),
         (
             "std::panicking::catch_unwind::cleanup",
             Builtin::PanicCleanup,
+        ),
+        ("std::panicking::panicking", Builtin::Panicking),
+        ("std::thread::panicking", Builtin::Panicking),
+        (
+            "std::rt::panic_count::count_is_zero",
+            Builtin::PanicCountIsZero,
+        ),
+        (
+            "std::rt::panic_count::is_zero_slow_path",
+            Builtin::PanicCountIsZero,
         ),
         ("std::panicking::begin_panic", Builtin::PanicAny),
         ("std::rt::begin_panic", Builtin::PanicAny),

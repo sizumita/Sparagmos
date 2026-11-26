@@ -374,6 +374,17 @@ pub enum Builtin {
     /// arguments and raise the guest panic with that message
     /// (the call never returns in core either).
     PanicFmt,
+    /// `std::panicking::panicking()` / `std::thread::panicking()`:
+    /// whether the calling thread is unwinding a panic. The JIT
+    /// never unwinds through guest code (a guest panic leaves
+    /// through the program's panic flag), so no guest code can
+    /// observe an in-flight panic: constantly false, the value
+    /// the interpreter's model also reports outside unwinding.
+    Panicking,
+    /// `std::rt::panic_count::count_is_zero()`: the runtime's own
+    /// spelling of the same query; constantly true here, for the
+    /// reason `Panicking` is constantly false.
+    PanicCountIsZero,
     /// `core::panicking::assert_failed(kind, &left, &right,
     /// args)`: raise the guest panic with core's assertion
     /// message -- the comparison head, the formatted custom
@@ -434,6 +445,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::rt::panic_fmt" | "core::panicking::panic_fmt" => Builtin::PanicFmt,
         "std::panicking::begin_panic" | "std::rt::begin_panic" => Builtin::PanicAny,
         "core::panicking::assert_failed" => Builtin::PanicAssertFailed,
+        "std::panicking::panicking" | "std::thread::panicking" => Builtin::Panicking,
+        "std::rt::panic_count::count_is_zero" => Builtin::PanicCountIsZero,
+        "std::rt::panic_count::is_zero_slow_path" => Builtin::PanicCountIsZero,
         "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(0),
         "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(1),
         "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(2),
