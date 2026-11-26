@@ -82,12 +82,17 @@ impl<'a> Interpreter<'a> {
             && self.target_is_scalar_storage(frames, &target, size as usize)
         {
             // One element of the storage's own width: the
-            // element is the scalar itself. (Judged before the
-            // byte reading below, whose one-byte case it
+            // element is the scalar itself, or -- for an
+            // element of a different scalar kind -- its
+            // punned reading under that kind. (Judged
+            // before the byte reading below, whose one-byte case it
             // subsumes: a `bool` element — the
             // `slice::from_ref(&true)` shape — is the scalar,
             // not its byte.)
-            return Some(vec![scalar]);
+            return Some(vec![
+                self.punned_scalar_element(frames, &target, elem_tag)
+                    .unwrap_or(scalar),
+            ]);
         }
         if size == 1 {
             // Byte elements: the storage's own bytes under its
@@ -126,8 +131,12 @@ impl<'a> Interpreter<'a> {
         }
         if *len == 1 && self.target_is_scalar_storage(frames, &target, size as usize) {
             // One element of the storage's own width: the
-            // element is the scalar itself.
-            return Some(vec![scalar]);
+            // element is the scalar itself, or its punned
+            // reading under a different element kind.
+            return Some(vec![
+                self.punned_scalar_element(frames, &target, elem_tag)
+                    .unwrap_or(scalar),
+            ]);
         }
         None
     }

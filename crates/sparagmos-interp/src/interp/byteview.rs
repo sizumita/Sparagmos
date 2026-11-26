@@ -953,7 +953,15 @@ impl<'a> Interpreter<'a> {
         let (pos, _) = self.projection_storage_offset(&base_ty, projection)?;
         let position_value =
             project_value(base.clone(), projection, &func, &place_desc).ok()?;
-        if self.flatten_scalar(&position_value, shape).is_ok() {
+        // A position value that already IS a value of the
+        // shape's own kind is the plain load. One that merely
+        // flattens under the shape (an unsigned integer under
+        // a signed shape of the same width) is a different
+        // reading of the position's bits, and the composition
+        // below is its reading.
+        if self.flatten_scalar(&position_value, shape).is_ok()
+            && scalar_agrees_with_shape(&position_value, shape)
+        {
             return None;
         }
         let layout = self.byte_layout_of_ty(&base_ty)?;
@@ -988,43 +996,137 @@ impl<'a> Interpreter<'a> {
         Some(self.construct_scalar(bits, shape))
     }
 
+    /// The element a scalar-backed slice denotes when the
+    /// slice's element type is a scalar of the storage's own
+    /// width but a different kind (a punned view: a `&[f32]`
+    /// over a `u32` place, a `&[u32]` over an `f32`): the
+    /// storage's bytes under its declared layout, constructed
+    /// through the element's shape. The storage's own value is
+    /// a different reading of the same bytes, so a snapshot
+    /// holding it (an iterator's element snapshot) shows the
+    /// wrong value to every consumer that resolves the element
+    /// directly. `None` when the view is not such a pun --
+    /// either side not a scalar, the kinds in agreement, the
+    /// widths apart, or the storage's bytes beyond judgement --
+    /// in which case the element is the storage value itself.
+    pub(crate) fn punned_scalar_element(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem_tag: &str,
+    ) -> Option<Value> {
+        let shape = scalar_shape_of_tag(elem_tag)?;
+        let (_, _, root_ty, _, _) = self.byte_view_base(frames, target)?;
+        let root_kind = match self.byte_layout_of_ty(&root_ty) {
+            Some(ByteLayout::Scalar(kind)) => kind,
+            _ => return None,
+        };
+        if scalar_kind_key(root_kind) == scalar_shape_key(&shape) {
+            return None;
+        }
+        let width = root_kind.width();
+        if width != (shape.bits() / 8) as usize {
+            return None;
+        }
+        let bytes = self.scalar_storage_layout_bytes(frames, target, width)?;
+        let mut bits: u128 = 0;
+        for (i, byte) in bytes.iter().enumerate() {
+            bits |= u128::from(*byte) << (8 * i);
+        }
+        self.construct_scalar(bits, &shape).ok()
+    }
+
     /// The pointee a format argument of scalar type `ty`
     /// (the argument's rendered type tag) denotes through a
     /// byte-displaced target: the tag is the load's width, so
     /// the byte view composes the value exactly (see
     /// [`Self::byte_view_shaped_load`]). `None` when the tag
     /// names no scalar shape, the target is not a reference to
-    /// a judged position, or the view does not judge it.
+    /// a judged position, or the view does not judge it. The
+    /// `Pointer` trait never reaches here: it asks for the
+    /// argument's address, not its pointee (the caller keeps
+    /// it on the plain path).
     pub(crate) fn byte_view_fmt_arg(
         &self,
         frames: &[Frame],
         target: &Value,
         ty: &str,
     ) -> Option<InterpResult<Value>> {
-        let shape = match ty.trim() {
-            "bool" => ScalarShape::Bool,
-            "char" => ScalarShape::Char,
-            "i8" => ScalarShape::Int { bits: 8, signed: true },
-            "i16" => ScalarShape::Int { bits: 16, signed: true },
-            "i32" => ScalarShape::Int { bits: 32, signed: true },
-            "i64" => ScalarShape::Int { bits: 64, signed: true },
-            "i128" => ScalarShape::Int { bits: 128, signed: true },
-            "isize" => ScalarShape::Int { bits: 64, signed: true },
-            "u8" => ScalarShape::Int { bits: 8, signed: false },
-            "u16" => ScalarShape::Int { bits: 16, signed: false },
-            "u32" => ScalarShape::Int { bits: 32, signed: false },
-            "u64" => ScalarShape::Int { bits: 64, signed: false },
-            "u128" => ScalarShape::Int { bits: 128, signed: false },
-            "usize" => ScalarShape::Int { bits: 64, signed: false },
-            "f16" => ScalarShape::Float { bits: 16 },
-            "f32" => ScalarShape::Float { bits: 32 },
-            "f64" => ScalarShape::Float { bits: 64 },
-            "f128" => ScalarShape::Float { bits: 128 },
-            _ => return None,
-        };
-        let resolved = self.deref_value(frames, target).ok()?;
-        self.byte_view_shaped_load(frames, &resolved, &shape)
-            .or_else(|| self.byte_view_compose(frames, &resolved, &shape))
+        let shape = scalar_shape_of_tag(ty)?;
+        let mut resolved = self.deref_value(frames, target).ok()?;
+        // The argument's target can denote a place holding the
+        // reference itself (an argument spilled through a
+        // local, the shape a raw `core::fmt::rt::Argument`
+        // carries): the plain resolution follows the reference
+        // chain to the pointee, and the byte view must reach
+        // the same position before it can judge it. The hop
+        // guard mirrors `resolve_ref`'s: the shapes that
+        // resolve to themselves are not followed.
+        for _ in 0..8 {
+            if let Some(view) = self
+                .byte_view_shaped_load(frames, &resolved, &shape)
+                .or_else(|| self.byte_view_compose(frames, &resolved, &shape))
+            {
+                return Some(view);
+            }
+            let value = self.read_resolved(frames, &resolved).ok()?;
+            // A position the byte view cannot place (an
+            // element position of a sequence form, above all)
+            // whose plainly read value flattens under the
+            // shape but is not a value of the shape's own
+            // kind: the storage holds the pointee's bits
+            // under a different scalar kind (a punned view),
+            // and the tag is the reading that counts, so the
+            // value is constructed from those bits. A boolean
+            // shape has no flattening from an integer value;
+            // the byte it denotes is the pattern.
+            if !matches!(
+                value,
+                Value::Ref(_)
+                    | Value::FatRef { .. }
+                    | Value::DynRef { .. }
+            ) && !scalar_agrees_with_shape(&value, &shape)
+            {
+                let bits = match self.flatten_scalar(&value, &shape) {
+                    Ok(bits) => Some(bits),
+                    Err(_) => match (&shape, &value) {
+                        (ScalarShape::Bool, Value::Uint(b)) => {
+                            Some(u128::from(*b != 0))
+                        }
+                        (ScalarShape::Bool, Value::Int(b)) => {
+                            Some(u128::from(*b != 0))
+                        }
+                        _ => None,
+                    },
+                };
+                if let Some(bits) = bits {
+                    if let Ok(constructed) =
+                        self.construct_scalar(bits, &shape)
+                    {
+                        return Some(Ok(constructed));
+                    }
+                }
+            }
+            resolved = match &value {
+                Value::Ref(RefTarget::Null)
+                | Value::Ref(RefTarget::Address(_)) => break,
+                Value::FatRef { base, .. }
+                    if matches!(
+                        &**base,
+                        Value::Tuple(_)
+                            | Value::SparseVec { .. }
+                            | Value::Ref(RefTarget::Address(_))
+                    ) =>
+                {
+                    break
+                }
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    self.deref_value(frames, &value).ok()?
+                }
+                _ => break,
+            };
+        }
+        None
     }
 
     /// The pointee a format argument of array type `ty` (the
@@ -3140,6 +3242,104 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.store_target_root(frames, target, composed)
+    }
+}
+
+/// The scalar shape a rendered type tag names (a format
+/// argument's type tag, a builtin's element tag), with any
+/// reference or pointer wrappers stripped: `&u32`, `*const f32`
+/// and `u32` all name the same shape. `None` when the tag names
+/// no scalar type.
+pub(crate) fn scalar_shape_of_tag(tag: &str) -> Option<ScalarShape> {
+    let mut tag = tag;
+    loop {
+        tag = tag.trim_start();
+        if let Some(rest) = tag.strip_prefix("&mut ") {
+            tag = rest;
+        } else if let Some(rest) = tag.strip_prefix('&') {
+            tag = rest;
+        } else if let Some(rest) = tag.strip_prefix("*const ") {
+            tag = rest;
+        } else if let Some(rest) = tag.strip_prefix("*mut ") {
+            tag = rest;
+        } else {
+            break;
+        }
+    }
+    match tag.trim() {
+        "bool" => Some(ScalarShape::Bool),
+        "char" => Some(ScalarShape::Char),
+        "i8" => Some(ScalarShape::Int { bits: 8, signed: true }),
+        "i16" => Some(ScalarShape::Int { bits: 16, signed: true }),
+        "i32" => Some(ScalarShape::Int { bits: 32, signed: true }),
+        "i64" => Some(ScalarShape::Int { bits: 64, signed: true }),
+        "i128" => Some(ScalarShape::Int { bits: 128, signed: true }),
+        "isize" => Some(ScalarShape::Int { bits: 64, signed: true }),
+        "u8" => Some(ScalarShape::Int { bits: 8, signed: false }),
+        "u16" => Some(ScalarShape::Int { bits: 16, signed: false }),
+        "u32" => Some(ScalarShape::Int { bits: 32, signed: false }),
+        "u64" => Some(ScalarShape::Int { bits: 64, signed: false }),
+        "u128" => Some(ScalarShape::Int { bits: 128, signed: false }),
+        "usize" => Some(ScalarShape::Int { bits: 64, signed: false }),
+        "f16" => Some(ScalarShape::Float { bits: 16 }),
+        "f32" => Some(ScalarShape::Float { bits: 32 }),
+        "f64" => Some(ScalarShape::Float { bits: 64 }),
+        "f128" => Some(ScalarShape::Float { bits: 128 }),
+        _ => None,
+    }
+}
+
+/// The (kind class, bit width) a byte-view scalar kind is
+/// compared by: two scalar readings of one storage agree
+/// exactly when their keys do.
+fn scalar_kind_key(kind: ByteScalar) -> (u8, u32) {
+    match kind {
+        ByteScalar::Int(t) => (1, t.bits()),
+        ByteScalar::Uint(t) => (2, t.bits()),
+        ByteScalar::Float(t) => (3, t.bits()),
+        ByteScalar::Bool => (4, 8),
+        ByteScalar::Char => (5, 32),
+    }
+}
+
+/// Whether `value` is already a value of `shape`'s own
+/// kind: a signed shape over a signed value, an unsigned
+/// shape over an unsigned one, a float shape over a float
+/// value, a boolean over a boolean, a char over its code
+/// point. A value that merely flattens under the shape (an
+/// unsigned integer under a signed shape of the same width)
+/// is a different reading of the same bits, not the shape's
+/// value.
+pub(crate) fn scalar_agrees_with_shape(
+    value: &Value,
+    shape: &ScalarShape,
+) -> bool {
+    matches!(
+        (shape, value),
+        (ScalarShape::Int { signed: true, .. }, Value::Int(_))
+            | (ScalarShape::Int { signed: false, .. }, Value::Uint(_))
+            | (ScalarShape::Float { bits: 128 }, Value::Float128(_))
+            | (ScalarShape::Float { .. }, Value::Float(_))
+            | (ScalarShape::Bool, Value::Bool(_))
+            | (ScalarShape::Char, Value::Uint(_))
+    )
+}
+
+/// The key of [`scalar_kind_key`] for a scalar shape; a
+/// non-scalar shape's key matches no scalar kind's.
+fn scalar_shape_key(shape: &ScalarShape) -> (u8, u32) {
+    match shape {
+        ScalarShape::Int { bits, signed } => {
+            if *signed {
+                (1, *bits)
+            } else {
+                (2, *bits)
+            }
+        }
+        ScalarShape::Float { bits } => (3, *bits),
+        ScalarShape::Bool => (4, 8),
+        ScalarShape::Char => (5, 32),
+        _ => (0, 0),
     }
 }
 
