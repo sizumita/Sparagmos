@@ -440,6 +440,30 @@ impl DriverProcessHost {
         if let Some(cwd) = &request.cwd {
             cmd.current_dir(os(cwd));
         }
+        // The child starts with the `SIGPIPE`
+        // disposition the guest's spawn semantics name
+        // (see `ProcessSpawnRequest::child_sigpipe`):
+        // this process's own spawn applies the driver
+        // binary's runtime rule (the default reset to
+        // `SIG_DFL`), which is the guest's rule only
+        // under the default setup, so a `pre_exec` hook
+        // — which std runs in the child after its own
+        // reset, before exec — installs the guest's
+        // disposition.
+        {
+            use std::os::unix::process::CommandExt as _;
+            let disposition = request.child_sigpipe as usize;
+            unsafe {
+                cmd.pre_exec(move || {
+                    const SIGPIPE: i32 = 13;
+                    const SIG_ERR: usize = usize::MAX;
+                    if host_signal(SIGPIPE, disposition) == SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         Ok((cmd, self_run, stderr_file))
     }
 
@@ -474,6 +498,15 @@ impl DriverProcessHost {
         entry.exit = Some(exit_code);
         Ok(exit_code)
     }
+}
+
+/// `signal(2)` from the libc the driver links, named
+/// directly: the process host needs this one call in a
+/// spawned child (see `assemble`), and the driver takes
+/// no libc dependency for it.
+extern "C" {
+    #[link_name = "signal"]
+    fn host_signal(signum: i32, handler: usize) -> usize;
 }
 
 impl sparagmos_interp::ProcessHostOps for DriverProcessHost {

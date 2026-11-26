@@ -22,6 +22,7 @@ pub(crate) fn execute(
     guest_args: &[String],
     overflow_checks: bool,
     panic_abort: bool,
+    sigpipe: sparagmos_interp::SigpipeInit,
     tool_programs: &[String],
     guest_stderr_file: Option<&str>,
     guest_stdout_passthrough: bool,
@@ -107,6 +108,7 @@ pub(crate) fn execute(
         program_path: program_name.to_string(),
         overflow_checks,
         panic_abort,
+        sigpipe,
         // Real child processes in any run that named no
         // tool programs: a recipe's invocations are the
         // tool runner's to answer, and its runs configure
@@ -380,6 +382,7 @@ pub(crate) fn execute_debug(
     guest_args: &[String],
     overflow_checks: bool,
     panic_abort: bool,
+    sigpipe: sparagmos_interp::SigpipeInit,
     script_path: Option<&str>,
     dialect_name: &str,
     hide_locals: bool,
@@ -422,6 +425,7 @@ pub(crate) fn execute_debug(
         program_path: input.to_string(),
         overflow_checks,
         panic_abort,
+        sigpipe,
         ..sparagmos_interp::InterpConfig::default()
     };
     let mut session = match sparagmos_interp::debug_mir(

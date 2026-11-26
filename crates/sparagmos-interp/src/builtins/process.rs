@@ -85,7 +85,8 @@ impl<'a> Interpreter<'a> {
         };
         check_host_stdio(state)?;
         let files = self.stdio_files(state)?;
-        let request = process_spawn_request(state, output_captured, files);
+        let request =
+            process_spawn_request(state, output_captured, files, self.child_sigpipe());
         match host.0.run(request) {
             Ok(outcome) => {
                 self.close_wired_stdin(state);
@@ -117,7 +118,8 @@ impl<'a> Interpreter<'a> {
         };
         check_host_stdio(state)?;
         let files = self.stdio_files(state)?;
-        let request = process_spawn_request(state, false, files);
+        let request =
+            process_spawn_request(state, false, files, self.child_sigpipe());
         match host.0.spawn(request) {
             Ok(spawned) => {
                 self.close_wired_stdin(state);
@@ -886,6 +888,7 @@ fn process_spawn_request(
     state: &crate::interp::CommandState,
     output_captured: bool,
     stdio_files: [Option<std::fs::File>; 3],
+    child_sigpipe: u64,
 ) -> crate::interp::ProcessSpawnRequest {
     use crate::interp::ProcessStdio;
     let [stdin_file, stdout_file, stderr_file] = stdio_files;
@@ -953,6 +956,7 @@ fn process_spawn_request(
             },
             stderr_file,
         ),
+        child_sigpipe,
     }
 }
 

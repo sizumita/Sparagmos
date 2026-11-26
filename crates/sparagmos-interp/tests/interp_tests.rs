@@ -2,7 +2,9 @@
 //! programs whose expected results are obvious by inspection.
 
 use sparagmos_interp::ir::*;
-use sparagmos_interp::{interpret, InterpConfig, InterpError, Interpreter, Value};
+use sparagmos_interp::{
+    interpret, InterpConfig, InterpError, Interpreter, SigpipeInit, Value,
+};
 
 fn bb(statements: Vec<Statement>, terminator: TerminatorKind) -> BasicBlockData {
     BasicBlockData::new(statements, terminator)
@@ -531,6 +533,7 @@ fn step_limit_stops_infinite_loop() {
             process_host: None,
             thread_quantum: 8192,
             stdout_sink: None,
+            sigpipe: SigpipeInit::Default,
         },
     );
     let err = interp.run("forever", vec![]).unwrap_err();
@@ -648,6 +651,7 @@ fn call_depth_limit_stops_unbounded_recursion() {
             process_host: None,
             thread_quantum: 8192,
             stdout_sink: None,
+            sigpipe: SigpipeInit::Default,
         },
     );
     let err = interp.run("f", vec![]).unwrap_err();

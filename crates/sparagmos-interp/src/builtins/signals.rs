@@ -54,6 +54,26 @@ impl<'a> Interpreter<'a> {
         if !is_null_pointer(&vals[2]) {
             let target = self.deref_value(frames, &vals[2])?;
             let previous_value = match &previous {
+                Some(previous) if previous.runtime_init => {
+                    // The previous disposition is the one
+                    // the runtime initialisation installed:
+                    // it has no guest structure of its own,
+                    // so the answer takes the shape this
+                    // call names — the installed action's
+                    // zeroed twin for an install, the
+                    // answer buffer's zeroed twin for a
+                    // pure query — with the handler leaf
+                    // set to the installed handler.
+                    let shape = match &new_action {
+                        Some(action) => zeroed_twin(&action.act),
+                        None => {
+                            let current =
+                                self.read_resolved(frames, &target)?;
+                            zeroed_twin(&current)
+                        }
+                    };
+                    with_handler(shape, &previous.handler)
+                }
                 Some(previous) => previous.act.clone(),
                 // No action was ever installed: the previous
                 // disposition is the default, whose structure
@@ -123,6 +143,48 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+/// A `sigaction` structure value with its handler
+/// leaf set to `handler`: the first field of the
+/// aggregate form, the first eight bytes of the byte
+/// form. The leaf keeps its own scalar kind; a shape
+/// with no handler leaf is returned unchanged.
+fn with_handler(value: Value, handler: &Value) -> Value {
+    let bits: u128 = match handler {
+        Value::Int(bits) => *bits as u128,
+        Value::Uint(bits) => *bits,
+        _ => return value,
+    };
+    let leaf = |old: &Value| match old {
+        Value::Int(_) => Value::Int(bits as i128),
+        _ => Value::Uint(bits),
+    };
+    match value {
+        Value::Bytes(mut bytes) => {
+            if bytes.len() >= 8 {
+                bytes[0..8]
+                    .copy_from_slice(&(bits as u64).to_le_bytes());
+            }
+            Value::Bytes(bytes)
+        }
+        Value::Tuple(mut fields) => {
+            if let Some(first) = fields.first_mut() {
+                *first = leaf(first);
+            }
+            Value::Tuple(fields)
+        }
+        Value::Enum {
+            variant,
+            mut fields,
+        } => {
+            if let Some(first) = fields.first_mut() {
+                *first = leaf(first);
+            }
+            Value::Enum { variant, fields }
+        }
+        other => other,
+    }
+}
+
 /// A signal-number argument (or a `c_int` structure field)
 /// as an `i64`.
 fn signal_number_arg(name: &str, value: &Value) -> InterpResult<i64> {
@@ -170,6 +232,7 @@ fn parse_sigaction(name: &str, act: &Value) -> InterpResult<SignalAction> {
             handler: Value::Uint(handler as u128),
             flags: flags as i64,
             act: act.clone(),
+            runtime_init: false,
         });
     }
     let fields = value_elements(act)?;
@@ -185,6 +248,7 @@ fn parse_sigaction(name: &str, act: &Value) -> InterpResult<SignalAction> {
         handler: fields[0].clone(),
         flags,
         act: act.clone(),
+        runtime_init: false,
     })
 }
 

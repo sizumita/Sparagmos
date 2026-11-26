@@ -327,6 +327,50 @@ fn session_panic_abort(args: &[String]) -> bool {
     panic.as_deref() == Some("abort")
 }
 
+/// The session's `SIGPIPE` setup, resolved from the
+/// final rustc argument list the way rustc resolves it:
+/// the last `-Z on-broken-pipe=<mode>` wins (`error`
+/// installs `SIG_IGN`, `kill` installs `SIG_DFL`,
+/// `inherit` installs nothing); without one, the
+/// runtime default applies (install `SIG_IGN`, with
+/// the spawn-time reset for children). The interpreter
+/// needs the resolved value because the runtime
+/// initialisation that performs the setup natively is
+/// not guest code it executes (see
+/// `InterpConfig::sigpipe`). The `#[unix_sigpipe]`
+/// crate attribute names the same modes in source; it
+/// is not read here.
+fn session_sigpipe(args: &[String]) -> sparagmos_interp::SigpipeInit {
+    let mut mode = sparagmos_interp::SigpipeInit::Default;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let text: Option<&str> = if a == "-Z" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("-Z")
+        };
+        if let Some(t) = text {
+            if let Some((name, value)) = t.split_once('=') {
+                if name == "on-broken-pipe" {
+                    mode = match value {
+                        "error" => sparagmos_interp::SigpipeInit::Ignore,
+                        "kill" => sparagmos_interp::SigpipeInit::SigDfl,
+                        "inherit" => sparagmos_interp::SigpipeInit::Inherit,
+                        // rustc itself rejects the other
+                        // values (e.g. `default`) before a
+                        // run can observe them.
+                        _ => mode,
+                    };
+                }
+            }
+        }
+        i += 1;
+    }
+    mode
+}
+
 /// Print the convert-mode conversion report for a collected
 /// program (the report `jit-compile` prints as well, before its
 /// own `jit-compiled:` line).
@@ -1152,6 +1196,7 @@ fn driver_main_inner() {
     //   in run mode, for the guest program's output alone.
     let overflow_checks = session_overflow_checks(&args);
     let panic_abort = session_panic_abort(&args);
+    let sigpipe = session_sigpipe(&args);
     let previous_hook = begin_panic_capture();
     let mut stdout_guard = match &compiler_stdout {
         Some(path) => StdoutToStderr::to_file(std::path::Path::new(path)),
@@ -1198,6 +1243,7 @@ fn driver_main_inner() {
                     &guest_args,
                     overflow_checks,
                     panic_abort,
+                    sigpipe,
                     debug_script.as_deref(),
                     &debug_dialect,
                     hide_locals,
@@ -1271,6 +1317,7 @@ fn driver_main_inner() {
                     &guest_args,
                     overflow_checks,
                     panic_abort,
+                    sigpipe,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
                     guest_stdout_passthrough,

@@ -34,11 +34,38 @@ pub(crate) struct SignalAction {
     pub(crate) handler: Value,
     pub(crate) flags: i64,
     pub(crate) act: Value,
+    /// Whether this is the disposition the runtime
+    /// initialisation installed for `SIGPIPE` before
+    /// the entry ran (see `SigpipeInit`): its `act` is
+    /// the handler value itself, not a guest structure
+    /// — the `sigaction` builtin derives the shape of
+    /// an `oldact` answer for it from the call, the way
+    /// it derives the never-installed default's.
+    pub(crate) runtime_init: bool,
+}
+
+impl SignalAction {
+    /// The disposition the runtime initialisation
+    /// installs for `SIGPIPE` before the entry runs:
+    /// the handler sentinel (`SIG_IGN` or `SIG_DFL`),
+    /// no flags, no guest structure.
+    pub(crate) fn runtime_init(handler: u64) -> SignalAction {
+        SignalAction {
+            handler: Value::Uint(handler as u128),
+            flags: 0,
+            act: Value::Uint(handler as u128),
+            runtime_init: true,
+        }
+    }
 }
 
 /// The `SA_SIGINFO` flag: the handler takes the
 /// three-argument (signum, siginfo, context) form.
 const SA_SIGINFO: i64 = 0x4;
+
+/// `SIGPIPE`, the signal the runtime initialisation
+/// sets up before the entry runs (see `SigpipeInit`).
+pub(crate) const SIGPIPE: i64 = 13;
 
 /// The default disposition of a signal with no installed
 /// handler, from the Linux table: most signals terminate
@@ -77,6 +104,32 @@ impl<'a> Interpreter<'a> {
         match new {
             Some(action) => table.insert(signum, action),
             None => table.get(&signum).cloned(),
+        }
+    }
+
+    /// The `SIGPIPE` disposition a child of the guest
+    /// starts with (0 for `SIG_DFL`, 1 for `SIG_IGN`),
+    /// as the host must arrange it before exec (see
+    /// `ProcessSpawnRequest::child_sigpipe`): under the
+    /// default runtime setup std resets the signal to
+    /// `SIG_DFL` in the child whatever the guest's
+    /// current disposition is; under an explicitly
+    /// named mode the child inherits the guest's
+    /// current disposition as exec leaves it — an
+    /// ignored signal stays ignored, anything else (a
+    /// handler, the default) becomes the default,
+    /// since a caught signal's handler does not
+    /// survive exec.
+    pub(crate) fn child_sigpipe(&self) -> u64 {
+        if !self.config.sigpipe.on_broken_pipe_used() {
+            return 0;
+        }
+        match self.signal_actions.borrow().get(&SIGPIPE) {
+            Some(action) => match &action.handler {
+                Value::Int(1) | Value::Uint(1) => 1,
+                _ => 0,
+            },
+            None => 0,
         }
     }
 
