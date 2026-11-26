@@ -31,7 +31,12 @@
 //!   modelled implementation owns those definition names, and the
 //!   interpreter prefers converted bodies over builtins, so a
 //!   collected body would shadow the model. The exclusion is per
-//!   definition, matching the builtin registry's granularity.
+//!   definition, matching the builtin registry's granularity. The
+//!   one exception is a definition demanded *as a value* whose
+//!   builtin the runtime cannot serve by name (see
+//!   `value_demand_needs_body`): a call through the value names
+//!   the plain definition with no call site for conversion to
+//!   bake a builtin into, so the real body is collected for it.
 //! - Targets whose resolved instance belongs to the local crate are
 //!   the local item loop's business and are skipped here.
 //! - One function's conversion failure never stops the others: each
@@ -627,6 +632,7 @@ pub fn collect_reachable(
             if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
                 && !consumer_instance_needs_body(&def, &canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
+                && !value_demand_needs_body(&canonical, demand)
             {
                 if builtin_seen.insert(def_id) {
                     records.push(Record {
@@ -1072,7 +1078,7 @@ pub fn collect_reachable(
 /// count must equal that variant's field count. Anything else
 /// returns `None` and the target keeps its "no MIR body available"
 /// record.
-fn synthetic_ctor_body(
+pub fn synthetic_ctor_body(
     conv: &mut Converter,
     def: &rustc_public::ty::FnDef,
     inst: &Instance,
@@ -1389,6 +1395,29 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
         }
         TyKind::Alias(_, alias) => walk_closure_args(&alias.args, out),
         _ => {}
+    }
+}
+
+/// Whether a builtin-owned definition demanded *as a value*
+/// still needs its body collected. A direct call to such a
+/// definition is converted to the builtin, but a call *through*
+/// the value (`.map(std::mem::drop)`, `.map(Deref::deref)`, a
+/// function pointer formed from the item) reaches the runtime
+/// as a bare name with no instance attached: conversion had no
+/// call site at which to bake a `CallBuiltin`, so the only
+/// faithful execution is the definition's own body, collected
+/// under the plain definition name the value carries. The one
+/// exception is the value-semantics models the runtime serves
+/// by name (`builtins::runtime_name_fallback` -- `Clone::clone`
+/// and family): those compute from the argument values alone,
+/// need nothing conversion bakes in, and stay excluded.
+fn value_demand_needs_body(canonical: &str, demand: Demand) -> bool {
+    if demand != Demand::Value {
+        return false;
+    }
+    match sparagmos_interp::builtins::lookup_qualified(canonical) {
+        Some(kind) => !sparagmos_interp::builtins::runtime_name_fallback(kind),
+        None => false,
     }
 }
 

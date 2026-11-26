@@ -901,3 +901,44 @@ fn run_mode_aux_same_crate_name_module_drop_runs() {
         "the destructor runs at the end of the block"
     );
 }
+
+const AUX_CTOR_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+pub struct RemoteC(pub u32);
+
+#[derive(Debug, PartialEq)]
+pub struct RemoteG<T>(pub T);
+"#;
+
+const AUX_CTOR_MAIN_SRC: &str = r#"
+extern crate auxlib;
+use auxlib::{RemoteC, RemoteG};
+fn main() {
+    let virtual_remotec: &dyn Fn(_) -> RemoteC = &RemoteC;
+    assert_eq!(virtual_remotec(1), RemoteC(1));
+    let virtual_remoteg: &dyn Fn(_) -> RemoteG<u32> = &RemoteG;
+    assert_eq!(virtual_remoteg(1), RemoteG(1));
+    println!("ctor ok");
+}
+"#;
+
+#[test]
+fn run_mode_aux_ctor_as_dyn_fn_value() {
+    // The issue-39823 shape: an auxiliary crate's tuple-struct
+    // constructor coerced to a `&dyn Fn` value. The mention
+    // reaches the driver inside a promoted constant, and a
+    // foreign constructor has no MIR body in the crate metadata,
+    // so the constant-function collection pass synthesizes the
+    // constructor body the same way the reach walk does.
+    let dir = temp_dir("aux-ctor-value");
+    let aux = fixture(&dir, "auxlib.rs", AUX_CTOR_SRC);
+    let src = fixture(&dir, "ctor_main.rs", AUX_CTOR_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an aux constructor used as a dyn Fn value must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ctor ok\n");
+}

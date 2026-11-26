@@ -69,7 +69,14 @@ pub fn consumes_caller_location(kind: Builtin) -> bool {
 /// enum comparisons order structurally, as they do for a
 /// `CallBuiltin` whose discriminant table conversion could not
 /// bake either). Anything else keeps the missing-body error.
-pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
+///
+/// The driver uses the same predicate from the other side: a
+/// builtin-owned definition demanded *as a value* whose kind is
+/// not servable here gets its real body collected instead (see
+/// `value_demand_needs_body` in the driver's reach walk), so a
+/// call through the value runs the body the compiler would have
+/// run — drop glue and all — under the plain definition name.
+pub fn runtime_name_fallback(kind: Builtin) -> bool {
     matches!(
         kind,
         Builtin::PartialEqEq
