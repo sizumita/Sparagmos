@@ -75,6 +75,8 @@ pub(crate) fn build_program(
     program.dtor_bodies = c.dtor_bodies.clone();
     program.track_caller_defs = c.track_caller_defs.clone();
     program.fn_shim_locations = c.fn_shim_locations.clone();
+    program.coroutine_shim_location = c.coroutine_shim_location.clone();
+    program.track_caller_coroutines = c.track_caller_coroutines.clone();
     program.link_symbols = c.link_symbols.clone();
     program.source_files = c.source_files.clone();
     program.coverage = c.coverage.clone();

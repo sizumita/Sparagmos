@@ -689,6 +689,15 @@ impl<'a> Interpreter<'a> {
         self.eval_constant(c).ok()
     }
 
+    /// The `Coroutine::resume` shim's location stamp: the
+    /// location a track-caller coroutine body entered through
+    /// a `dyn` receiver observes (see
+    /// `ir::Program::coroutine_shim_location`).
+    fn coroutine_shim_stamp_value(&self) -> Option<Value> {
+        let c = self.program.coroutine_shim_location.as_ref()?;
+        self.eval_constant(c).ok()
+    }
+
     /// [`Interpreter::start_call`] with the caller-location
     /// stamps a call edge can carry beyond its argument list:
     /// `edge_stamp` is a call-site stamp (the stamp a
@@ -790,6 +799,28 @@ impl<'a> Interpreter<'a> {
                     };
                     let mut args = arg_values;
                     args[0] = receiver;
+                    // A coroutine body entered through the
+                    // `Coroutine::resume` vtable slot observes
+                    // the shim's own location (the trait
+                    // method's definition in core): `resume`
+                    // is not `#[track_caller]`, so no caller
+                    // location forwards through it, and an
+                    // entry carrying no stamp presents the
+                    // shim stamp as a fixed stamp.
+                    let stamp = if stamp.is_none()
+                        && impl_func.contains("::{closure#")
+                        && func.rsplit_once("::").is_some_and(|(tp, m)| {
+                            m == "resume"
+                                && matches!(
+                                    tp,
+                                    "std::ops::Coroutine" | "core::ops::Coroutine"
+                                )
+                        })
+                    {
+                        self.coroutine_shim_stamp_value().or(stamp)
+                    } else {
+                        stamp
+                    };
                     let (edge, fixed) = if forwardable {
                         (stamp, None)
                     } else {
@@ -856,7 +887,14 @@ impl<'a> Interpreter<'a> {
                         .get(&caller.func)
                         .and_then(|b| b.caller_location_local)
                     {
-                        stamp = caller.locals[caller_idx].clone();
+                        // A caller whose location local was
+                        // never bound (a body entered with no
+                        // stamp from any source) has no location
+                        // to forward: the stamp stands.
+                        let received = &caller.locals[caller_idx];
+                        if !matches!(received, Value::Uninit) {
+                            stamp = received.clone();
+                        }
                     }
                 }
             }
@@ -1832,7 +1870,7 @@ fn strip_generic_groups(path: &str) -> Option<(String, Vec<String>)> {
 /// `{closure#N}` segment, and the tag's generic arguments (the
 /// enclosing definition's arguments first, then the coroutine
 /// signature's own). `None` when the tag is not of this shape.
-fn parse_coroutine_tag(tag: &str) -> Option<(String, String, Vec<String>)> {
+pub(crate) fn parse_coroutine_tag(tag: &str) -> Option<(String, String, Vec<String>)> {
     let idx = tag.rfind("::{closure#")?;
     let parent = &tag[..idx];
     let rest = &tag[idx + 2..];
@@ -1853,7 +1891,7 @@ fn parse_coroutine_tag(tag: &str) -> Option<(String, String, Vec<String>)> {
 /// [`strip_generic_groups`]), plus the `{closure#N}` segment.
 /// `None` when the key is not a coroutine body key of this
 /// shape.
-fn parse_coroutine_key(key: &str) -> Option<(String, String, Vec<String>)> {
+pub(crate) fn parse_coroutine_key(key: &str) -> Option<(String, String, Vec<String>)> {
     let idx = key.rfind("::{closure#")?;
     let rest = &key[idx + 2..];
     let seg_end = rest.find('}')?;

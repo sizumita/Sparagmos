@@ -201,6 +201,14 @@ pub struct MirProgram {
     /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
     /// `call_once`), as recorded by the driver.
     pub fn_shim_locations: [Option<mir::ConstValue>; 3],
+    /// The location stamp of the `Coroutine::resume` vtable
+    /// shim (the trait method definition in core), as
+    /// recorded by the driver.
+    pub coroutine_shim_location: Option<mir::ConstValue>,
+    /// Plain definition paths of the program's
+    /// `#[track_caller]` coroutines, as recorded by the
+    /// driver (see `Converter::track_caller_coroutines`).
+    pub track_caller_coroutines: Vec<String>,
     /// Link symbols of the program's function instances, keyed
     /// by the instance's `DefId`, as recorded by the driver (see
     /// `Converter::link_symbols` in the driver crate). A

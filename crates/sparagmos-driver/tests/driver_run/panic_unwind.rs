@@ -1754,6 +1754,62 @@ fn run_mode_caller_location_through_closures() {
     );
 }
 
+const CALLER_LOCATION_COROUTINE_SRC: &str = r#"
+#![feature(stmt_expr_attributes)]
+#![feature(closure_track_caller)]
+#![feature(coroutines)]
+#![feature(coroutine_trait)]
+use std::ops::{Coroutine, CoroutineState};
+use std::panic::Location;
+use std::pin::Pin;
+type Loc = &'static Location<'static>;
+#[track_caller]
+fn dyn_coro(v: Pin<&mut dyn Coroutine<(), Yield = Loc, Return = ()>>) -> Loc {
+    match v.resume(()) {
+        CoroutineState::Yielded(l) => l,
+        CoroutineState::Complete(()) => unreachable!(),
+    }
+}
+#[track_caller]
+fn mono_coro<F>(v: Pin<&mut F>) -> Loc
+where
+    F: Coroutine<(), Yield = Loc, Return = ()>,
+{
+    match v.resume(()) {
+        CoroutineState::Yielded(l) => l,
+        CoroutineState::Complete(()) => unreachable!(),
+    }
+}
+fn main() {
+    let c1 = #[track_caller] #[coroutine] |_: ()| {
+        yield Location::caller();
+    };
+    let d = dyn_coro(Box::pin(c1).as_mut());
+    println!("dyn-other {} {} {}", d.file() != file!(), d.line(), d.column());
+    let c2 = #[track_caller] #[coroutine] |_: ()| {
+        yield Location::caller();
+    };
+    let m = mono_coro(Box::pin(c2).as_mut());
+    println!("mono {} {}", m.line(), m.column());
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_through_coroutines() {
+    // A track-caller coroutine resumed through a generic
+    // `Coroutine` wrapper observes the wrapper's call site
+    // (36:13); resumed through a `dyn Coroutine` receiver it
+    // observes the `Coroutine::resume` shim's location in
+    // core (the trait method's definition, 119:5), not this
+    // file: `resume` is not `#[track_caller]`, so no caller
+    // location forwards through it.
+    run_ok(
+        "caller-location-coroutine",
+        CALLER_LOCATION_COROUTINE_SRC,
+        "dyn-other true 119 5\nmono 36 13\n",
+    );
+}
+
 const RESULT_ERR_FMT_PANIC_DROP_EXITS_SRC: &str = r#"
 use std::fmt;
 struct E;

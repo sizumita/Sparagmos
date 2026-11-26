@@ -2703,6 +2703,13 @@ pub struct Program {
     /// Bound when a track-caller closure is entered through a
     /// `dyn` receiver.
     pub fn_shim_locations: [Option<Constant>; 3],
+    /// The location stamp of the `Coroutine::resume` vtable
+    /// shim: the trait method definition in core, which the
+    /// compiler attributes the resume glue to. Bound when a
+    /// track-caller coroutine body is entered through a `dyn`
+    /// receiver (the resume method is not `#[track_caller]`,
+    /// so no caller location forwards through it).
+    pub coroutine_shim_location: Option<Constant>,
 }
 
 impl Program {

@@ -2437,6 +2437,91 @@ fn note_fn_shim(
     }
 }
 
+/// Record what a `Coroutine` trait reference's vtable
+/// carries for the interpreter's track-caller handling: the
+/// `resume` shim's location stamp, and — when the vtable's
+/// method entry is the compiler's resume shim, which it
+/// generates only for a `#[track_caller]` coroutine — the
+/// coroutine's plain definition path. A coroutine that is
+/// not `#[track_caller]` has its own resume instance as the
+/// entry instead, and there is nothing to record for it.
+fn note_coroutine_shim(
+    conv: &mut Converter,
+    tr: &rustc_public::ty::TraitRef,
+) {
+    if !matches!(
+        tr.def_id.name().as_str(),
+        "std::ops::Coroutine" | "core::ops::Coroutine"
+    ) {
+        return;
+    }
+    let Ok(entries) = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| tr.vtable_entries()),
+    ) else {
+        return;
+    };
+    for entry in entries {
+        let rustc_public::ty::VtblEntry::Method(inst) = entry else {
+            continue;
+        };
+        let Ok(Some(host)) = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| {
+                sparagmos_driver::convert::with_body_materialization(
+                    &inst.name(),
+                    || inst.body(),
+                )
+            }),
+        ) else {
+            continue;
+        };
+        if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Shim) {
+            if let Some(path) = shim_coroutine_path(&host) {
+                conv.note_track_caller_coroutine(path);
+            }
+        }
+        conv.note_coroutine_shim_location(&host, &tr.def_id);
+        return;
+    }
+}
+
+/// The plain definition path of the coroutine a
+/// `Coroutine::resume` shim body forwards to: the shim's
+/// call names the resume method with the coroutine type as
+/// its `Self` argument, and the coroutine definition's name
+/// is the path the interpreter registers the coroutine body
+/// under, without instance arguments.
+fn shim_coroutine_path(shim: &rustc_public::mir::Body) -> Option<String> {
+    for block in &shim.blocks {
+        let rustc_public::mir::TerminatorKind::Call { func, .. } =
+            &block.terminator.kind
+        else {
+            continue;
+        };
+        let rustc_public::mir::Operand::Constant(c) = func else {
+            continue;
+        };
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(
+            _,
+            args,
+        )) = c.const_.ty().kind()
+        else {
+            continue;
+        };
+        let Some(rustc_public::ty::GenericArgKind::Type(self_ty)) =
+            args.0.first()
+        else {
+            continue;
+        };
+        if let rustc_public::ty::TyKind::RigidTy(
+            rustc_public::ty::RigidTy::Coroutine(def, _),
+        ) = self_ty.kind()
+        {
+            return Some(def.name());
+        }
+    }
+    None
+}
+
 pub(crate) fn demand_dyn_instances(
     conv: &mut Converter,
     report: &mut ConversionReport,
@@ -2501,6 +2586,7 @@ pub(crate) fn demand_dyn_instances(
                         note_fn_shim(conv, &tr);
                         continue;
                     }
+                    note_coroutine_shim(conv, &tr);
                     let Ok(entries) = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| tr.vtable_entries()),
                     ) else {

@@ -167,6 +167,8 @@ fn build_with_table(
 
         track_caller_defs: Default::default(),
         fn_shim_locations: Default::default(),
+        coroutine_shim_location: Default::default(),
+        track_caller_coroutines: Default::default(),
         link_symbols: Default::default(),
         intrinsic_defs: Default::default(),
         async_closure_defs: Default::default(),

@@ -135,6 +135,15 @@ pub(crate) struct Collected {
     /// stamps (see `Converter::fn_shim_locations`), for the
     /// interpreter.
     pub(crate) fn_shim_locations: [Option<sparagmos_mir::ConstValue>; 3],
+    /// The `Coroutine::resume` vtable shim's location stamp
+    /// (see `Converter::coroutine_shim_location`), for the
+    /// program build.
+    pub(crate) coroutine_shim_location: Option<sparagmos_mir::ConstValue>,
+    /// Plain definition paths of the program's
+    /// `#[track_caller]` coroutines (see
+    /// `Converter::track_caller_coroutines`), for the
+    /// program build.
+    pub(crate) track_caller_coroutines: Vec<String>,
     /// Link symbols of the program's instances (see
     /// `Converter::link_symbols`), for the interpreter.
     pub(crate) link_symbols: std::collections::HashMap<sparagmos_mir::DefId, String>,
