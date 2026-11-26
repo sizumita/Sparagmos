@@ -1484,3 +1484,78 @@ fn run_mode_mapped_mutex_guard_slice_pointee() {
         "slice len: 3\nslice: [10, 99, 30]\nfinal: [10, 99, 30]\n",
     );
 }
+
+const MUTEX_DEBUG_SRC: &str = r#"
+use std::sync::Mutex;
+fn main() {
+    let m = Mutex::new(5);
+    println!("{:?}", m);
+    println!("{:#?}", m);
+    let g = m.lock().unwrap();
+    println!("{:?}", m);
+    drop(g);
+    println!("{:?}", m);
+}
+"#;
+
+#[test]
+fn run_mode_mutex_debug_format() {
+    let dir = temp_dir("mutex-debug");
+    let src = fixture(&dir, "mutex_debug.rs", MUTEX_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Mutex Debug program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Mutex { data: 5, poisoned: false, .. }\n\
+         Mutex {\n    data: 5,\n    poisoned: false,\n    ..\n}\n\
+         Mutex { data: \"<locked>\", poisoned: false, .. }\n\
+         Mutex { data: 5, poisoned: false, .. }\n",
+        "std's handwritten Mutex Debug form: the guarded value, \
+         the quoted <locked> placeholder while a guard is held, \
+         the poison flag and the non-exhaustive tail, in both \
+         the plain and pretty layouts"
+    );
+}
+
+const RWLOCK_DEBUG_SRC: &str = r#"
+use std::sync::RwLock;
+fn main() {
+    let r = RwLock::new(String::from("hi"));
+    println!("{:?}", r);
+    let w = r.write().unwrap();
+    println!("{:?}", r);
+    drop(w);
+    let g = r.read().unwrap();
+    println!("{:?}", r);
+    drop(g);
+    println!("{:#?}", r);
+}
+"#;
+
+#[test]
+fn run_mode_rwlock_debug_format() {
+    let dir = temp_dir("rwlock-debug");
+    let src = fixture(&dir, "rwlock_debug.rs", RWLOCK_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "RwLock Debug program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "RwLock { data: \"hi\", poisoned: false, .. }\n\
+         RwLock { data: <locked>, poisoned: false, .. }\n\
+         RwLock { data: \"hi\", poisoned: false, .. }\n\
+         RwLock {\n    data: \"hi\",\n    poisoned: false,\n    ..\n}\n",
+        "std's handwritten RwLock Debug form: a held read guard \
+         does not block the read the Debug impl performs, a held \
+         write guard shows the bare <locked> placeholder"
+    );
+}
