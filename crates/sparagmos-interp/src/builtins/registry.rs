@@ -1488,6 +1488,28 @@ pub enum Builtin {
     /// machine address whose alignment could be observed, so
     /// the alignment argument only documents the request.
     LibcPosixMemalign,
+    /// `libc::sigaction(signum, act, oldact) -> c_int`:
+    /// install the action `act` names for `signum` in the
+    /// interpreter's signal table (a null `act` only
+    /// queries), write the previously installed action
+    /// through `oldact` when it is non-null, and answer 0.
+    /// The recorded action keeps the installed structure
+    /// verbatim; delivery consults only its handler field
+    /// and its `SA_SIGINFO` flag (see the signal model in
+    /// `interp`).
+    LibcSigaction,
+    /// `libc::raise(sig) -> c_int`: deliver the signal to
+    /// the guest itself, synchronously — the installed
+    /// handler runs to completion before the call returns,
+    /// an ignored signal does nothing, and a signal whose
+    /// default disposition terminates the process aborts
+    /// the run (see `deliver_signal` in `interp`).
+    LibcRaise,
+    /// `libc::atexit(func) -> c_int`: record `func` as an
+    /// exit handler; the entry's exit runs the recorded
+    /// handlers in reverse registration order (see
+    /// `run_exit_handlers` in `interp`).
+    LibcAtexit,
     /// `core::num::imp::overflow_panic::pow(base, exp)`: the
     /// exponentiation behind the primitive `pow` methods,
     /// panicking on overflow exactly like the checked
