@@ -28,6 +28,7 @@ mod pointers;
 mod process;
 mod run_basics;
 mod rustdoc_path;
+mod string_mutators;
 mod strings;
 mod summary_mode;
 mod sync;

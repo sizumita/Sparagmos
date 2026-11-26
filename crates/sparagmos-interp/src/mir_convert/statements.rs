@@ -1134,6 +1134,56 @@ impl<'a> Converter<'a> {
         }))
     }
 
+    /// A direct `Add::add` call whose Self type is `String`
+    /// converts to a builtin node: the collected body has
+    /// `push_str` inlined into it and walks the vector's raw
+    /// parts, which the string model cannot serve (see the
+    /// `String` case of the `Add` dispatch in `builtins`).
+    /// Every other `Add` call keeps the normal paths, exactly
+    /// as for the time types above.
+    fn string_add_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some((name, generic_args, _raw)) = self.resolve_external_callee(func) else {
+            return Ok(None);
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        if canonical != "std::ops::Add::add" {
+            return Ok(None);
+        }
+        let Some(self_ty) = generic_args.first() else {
+            return Ok(None);
+        };
+        if self_ty != "std::string::String" && self_ty != "alloc::string::String" {
+            return Ok(None);
+        }
+        let mut ir_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            ir_args.push(self.convert_operand(body, arg, None)?);
+        }
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args: generic_args.to_vec(),
+            args: ir_args,
+            destination: self.convert_place(body, destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            consumed_glue: None,
+            skipped_glue: None,
+            elem_glue: None,
+            receiver_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+            unique_elem: None,
+            zeroed_value: None,
+        }))
+    }
+
     /// A direct call to a `std::io::Read` / `Write` / `Seek`
     /// method whose Self type is `std::fs::File` (or a
     /// child-process pipe handle, whose value is a file-table
@@ -1948,6 +1998,14 @@ impl<'a> Converter<'a> {
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
                 } else if let Some(term) = self.time_add_sub_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
+                } else if let Some(term) = self.string_add_terminator(
                     body,
                     func,
                     args,

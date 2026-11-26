@@ -926,6 +926,11 @@ impl<'a> Interpreter<'a> {
         {
             return self.drain_next_state(frames, state, true);
         }
+        if self_ty.starts_with("std::string::Drain")
+            || self_ty.starts_with("alloc::string::Drain")
+        {
+            return self.string_drain_next_state(frames, state, true);
+        }
         if self_ty.starts_with("std::path::Components") {
             // The back step of the state `Builtin::PathComponents`
             // builds, replaying the host's parsing (see
@@ -1515,6 +1520,99 @@ impl<'a> Interpreter<'a> {
         Ok((new_state, some_value(item)))
     }
 
+    /// One step of a `std::string::Drain`: the state is the
+    /// real layout the constructor's converted body built --
+    /// `[string, start, end, iter]` -- and a step is exactly
+    /// the wrapped `Chars` step std's own `next` / `next_back`
+    /// forward to (the yielded chars are copies; the byte
+    /// range itself leaves the string only when the drain
+    /// value is dropped, by the `StringDrainDrop` plan). Any
+    /// other field shape keeps the generic unsupported error.
+    fn string_drain_next_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: Value,
+        from_back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = iterator_fields(&state, "std::string::Drain")?;
+        if fields.len() != 4 {
+            return Err(InterpError::type_mismatch(
+                "string Drain state",
+                "[string, start, end, iter]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        // A drain built over a string in its real aggregate
+        // layout holds a `Chars` whose byte pointers denote
+        // the string's own storage rather than a value
+        // snapshot; snapshot the remaining bytes once, after
+        // which the state has the builtin form and steps
+        // normally.
+        let chars = match self.string_drain_chars_snapshot(frames, &fields[3]) {
+            Some(normalized) => normalized?,
+            None => fields[3].clone(),
+        };
+        let (new_chars, item) = if from_back {
+            self.next_back_on_state(frames, "std::str::Chars", chars)?
+        } else {
+            self.iterator_next_state(frames, "std::str::Chars", chars)?
+        };
+        let mut fields = fields;
+        fields[3] = new_chars;
+        Ok((rebuild_state(&state, fields), item))
+    }
+
+    /// The builtin snapshot form of a string drain's `Chars`
+    /// state when its byte pointers are storage-backed (the
+    /// drain was built over a string in its real aggregate
+    /// layout): the remaining bytes read through the pointers,
+    /// rebuilt with `str_chars_value`. `None` when the state
+    /// already denotes a value snapshot (or anything else the
+    /// generic `Chars` step itself judges).
+    fn string_drain_chars_snapshot(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        chars: &Value,
+    ) -> Option<InterpResult<Value>> {
+        let inner = str_iter_inner(chars, "std::str::Chars").ok()?;
+        let fields = iterator_fields(&inner, "std::slice::Iter").ok()?;
+        if fields.len() != 3 {
+            return None;
+        }
+        let ptr = iter_ptr_value(&fields[0])?;
+        let end = iter_ptr_value(&fields[1])?;
+        let (Value::Ref(ptr_target), Value::Ref(end_target)) = (&ptr, &end) else {
+            return None;
+        };
+        if matches!(ptr_target, RefTarget::Value(..) | RefTarget::Null) {
+            return None;
+        }
+        let end_target = end_target.clone();
+        let mut bytes = Vec::new();
+        let mut cur = ptr;
+        loop {
+            let Value::Ref(target) = &cur else {
+                return None;
+            };
+            if *target == end_target {
+                break;
+            }
+            let byte = match self
+                .deref_value(frames, &cur)
+                .and_then(|resolved| self.read_resolved(frames, &resolved))
+            {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            bytes.push(byte);
+            cur = match self.ptr_offset_value(frames, cur, 1, Some(1), false) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+        Some(Ok(str_chars_value(bytes)))
+    }
+
     /// One step of `std::io::Lines<B>`: the state is the
     /// one-field value the constructor's converted body
     /// built, holding the reader; the step is `read_line`
@@ -1692,6 +1790,11 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("alloc::vec::Drain<")
         {
             return self.drain_next_state(frames, state, false);
+        }
+        if self_ty.starts_with("std::string::Drain")
+            || self_ty.starts_with("alloc::string::Drain")
+        {
+            return self.string_drain_next_state(frames, state, false);
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<") {
             // The state holds the receiver handle; iteration is

@@ -916,6 +916,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::FileHandleDrop => true,
             // Closing a socket handle calls no destructor body.
             ir::DropPlan::SocketHandleDrop => true,
+            // Removing a string drain's range calls no
+            // destructor body.
+            ir::DropPlan::StringDrainDrop => true,
             // Releasing a weak reference calls no destructor body.
             ir::DropPlan::RcWeakRelease => true,
             // A waker's release is chosen from the value at run

@@ -1182,6 +1182,38 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::StringPushStr
         }
         "std::string::String::push" | "alloc::string::String::push" => Builtin::StringPush,
+        "std::string::String::insert" | "alloc::string::String::insert" => {
+            Builtin::StringInsert
+        }
+        "std::string::String::insert_str" | "alloc::string::String::insert_str" => {
+            Builtin::StringInsertStr
+        }
+        "std::string::String::remove" | "alloc::string::String::remove" => {
+            Builtin::StringRemove
+        }
+        "std::string::String::truncate" | "alloc::string::String::truncate" => {
+            Builtin::StringTruncate
+        }
+        "std::string::String::pop" | "alloc::string::String::pop" => Builtin::StringPop,
+        "std::string::String::clear" | "alloc::string::String::clear" => {
+            Builtin::StringClear
+        }
+        "std::string::String::retain" | "alloc::string::String::retain" => {
+            Builtin::StringRetain
+        }
+        "std::string::String::replace_range" | "alloc::string::String::replace_range" => {
+            Builtin::StringReplaceRange
+        }
+        "std::string::String::split_off" | "alloc::string::String::split_off" => {
+            Builtin::StringSplitOff
+        }
+        "std::string::String::reserve" | "alloc::string::String::reserve"
+        | "std::string::String::reserve_exact" | "alloc::string::String::reserve_exact" => {
+            Builtin::StringReserve
+        }
+        "std::string::String::try_reserve" | "alloc::string::String::try_reserve"
+        | "std::string::String::try_reserve_exact"
+        | "alloc::string::String::try_reserve_exact" => Builtin::StringTryReserve,
         "core::str::<impl str>::len" => Builtin::StrLen,
         "core::str::<impl str>::is_empty" => Builtin::StrIsEmpty,
         "core::str::<impl str>::as_bytes" => Builtin::StrAsBytes,

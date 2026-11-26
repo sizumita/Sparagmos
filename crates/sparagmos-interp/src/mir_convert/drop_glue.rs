@@ -624,6 +624,19 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             | "std::sys::net::connection::socket::Socket" => {
                 return Some(P::SocketHandleDrop)
             }
+            // A `std::string::Drain`: the destructor's only
+            // observable effect -- deleting its byte range
+            // from the string it points at -- is the
+            // interpreter's string-drain drop plan (the
+            // collected destructor body reaches it through
+            // `as_mut_vec` and a temporary `Vec::drain`,
+            // whose raw-parts walk the string model cannot
+            // serve). The remaining fields are a raw pointer,
+            // two bounds and a `Chars` over a snapshot: none
+            // carries glue of its own.
+            "std::string::Drain" | "alloc::string::Drain" => {
+                return Some(P::StringDrainDrop)
+            }
             // The child-process pipe handles: the value is the
             // pipe end's file-table id under the same wrapper
             // chain as `File`'s, and the destructor's only
