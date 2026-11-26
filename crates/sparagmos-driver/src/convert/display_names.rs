@@ -68,7 +68,7 @@ pub(crate) fn record_fn_instance(inst: &Instance) {
 /// entry cannot be computed (an exotic instance kind, a name
 /// computation that panics) are skipped under the resolution
 /// containment discipline. Empty outside a debug session.
-pub fn drain_fn_display_names() -> Vec<(String, String)> {
+pub fn drain_fn_display_names() -> Vec<(String, String, String)> {
     let instances = FN_INSTANCE_RECORDS.with(|records| {
         let mut records = records.borrow_mut();
         records.0.clear();
@@ -85,9 +85,9 @@ pub fn drain_fn_display_names() -> Vec<(String, String)> {
     for inst in &instances {
         let (result, _emitted) =
             with_instance_resolution_contained(|| fn_display_entry(tcx, inst));
-        if let Ok(Some((display, signature))) = result {
+        if let Ok(Some((display, signature, ptr_spelling))) = result {
             if seen.insert(display.clone()) {
-                table.push((display, signature));
+                table.push((display, signature, ptr_spelling));
             }
         }
     }
@@ -110,7 +110,7 @@ pub fn drain_fn_display_names() -> Vec<(String, String)> {
 fn fn_display_entry(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     inst: &Instance,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     use rustc_codegen_ssa::debuginfo::type_names;
     let internal = rustc_public::rustc_internal::internal(tcx, inst.clone());
     let def_id = internal.def_id();
@@ -201,7 +201,55 @@ fn fn_display_entry(
         }
         s
     };
-    Some((format!("{scope}::{name}"), signature))
+
+    // The spelling of the instance's type as a bare function
+    // pointer, the form a debugger type query gives a
+    // function-item value (`unsafe extern "C" fn(*const u8,
+    // ...) -> isize`): the declaration signature above omits
+    // the safety / ABI prefix and the variadic tail, all of
+    // which the type name carries. Empty for closures and
+    // coroutines, whose types are not function pointers.
+    let ptr_spelling = if matches!(
+        tcx.def_key(def_id).disambiguated_data.data,
+        rustc_hir::definitions::DefPathData::Closure
+    ) {
+        String::new()
+    } else {
+        let sig = internal
+            .ty(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
+            .fn_sig(tcx);
+        let sig = tcx.instantiate_bound_regions_with_erased(sig);
+        let mut out = String::new();
+        if matches!(sig.safety(), rustc_hir::Safety::Unsafe) {
+            out.push_str("unsafe ");
+        }
+        // The ABI's own name (`Rust`, `C`, `system`, ...):
+        // its Display form already carries the quotes, and
+        // the debuginfo spelling quotes every non-Rust one.
+        let abi_name = sig.abi().to_string();
+        if abi_name != "\"Rust\"" {
+            out.push_str(&format!("extern {abi_name} "));
+        }
+        out.push_str("fn");
+        if sig.c_variadic() {
+            // Insert the variadic tail into the signature's
+            // parameter list, before its closing paren.
+            let close = signature.rfind(')').unwrap_or(signature.len());
+            let (head, tail) = signature.split_at(close);
+            if head.ends_with('(') {
+                out.push_str(head);
+                out.push_str("...");
+            } else {
+                out.push_str(head);
+                out.push_str(", ...");
+            }
+            out.push_str(tail);
+        } else {
+            out.push_str(&signature);
+        }
+        out
+    };
+Some((format!("{scope}::{name}"), signature, ptr_spelling))
 }
 
 /// The qualified name of an item's parent item: the crate name

@@ -2477,8 +2477,8 @@ pub struct Program {
     /// programs.
     pub source_files: Vec<String>,
     /// Debugger display names of the program's function
-    /// instances: `(display name, declaration signature)`
-    /// pairs the driver recorded at conversion, naming each
+    /// instances: `(display name, declaration signature,
+    /// fn-pointer spelling)` triples the driver recorded at conversion, naming each
     /// resolved instance the way the compiler's debug info
     /// does (generic arguments substituted, `{impl#N}` /
     /// `{closure#N}` path segments, a closure's single
@@ -2488,7 +2488,7 @@ pub struct Program {
     /// declaration of the same name. Empty for hand-built
     /// programs and for programs collected outside a debug
     /// session.
-    pub fn_display_names: Vec<(String, String)>,
+    pub fn_display_names: Vec<(String, String, String)>,
     /// Resolved overflow-checks settings of the guest crates
     /// the driver compiled separately (its `--aux` crates),
     /// keyed by crate name (a `::` segment of a body name:

@@ -143,7 +143,7 @@ pub(crate) struct Collected {
     /// instances (see
     /// `sparagmos_driver::convert::drain_fn_display_names`),
     /// for the interpreter's program. Empty outside debug mode.
-    pub(crate) fn_display_names: Vec<(String, String)>,
+    pub(crate) fn_display_names: Vec<(String, String, String)>,
     /// Resolved overflow-checks settings of the separately
     /// compiled auxiliary crates, keyed by crate name, as
     /// recorded by `main` from each crate's own build (see

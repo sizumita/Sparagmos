@@ -5371,13 +5371,18 @@ pub(super) fn is_slice_tag(tag: &str) -> bool {
         return false;
     };
     let mut depth = 0i32;
+    let mut prev = '\0';
     for c in inner.chars() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            // The `>` of a function pointer signature's `->`
+            // closes nothing (see `split_top_level`).
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth -= 1,
             ';' if depth == 0 => return false,
             _ => {}
         }
+        prev = c;
     }
     true
 }

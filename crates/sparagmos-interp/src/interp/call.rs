@@ -16,6 +16,9 @@ fn generic_args_of(name: &str) -> Option<Vec<&str>> {
     for i in open..bytes.len() {
         match bytes[i] {
             b'<' | b'(' | b'[' => depth += 1,
+            // The `>` of a `->` arrow (a function-pointer
+            // signature inside the name) closes no bracket.
+            b'>' if i > open && bytes[i - 1] == b'-' => {}
             b'>' | b')' | b']' => {
                 depth -= 1;
                 if depth == 0 {
@@ -36,9 +39,11 @@ pub(crate) fn split_top_level_str(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(s[start..i].trim());
@@ -46,6 +51,7 @@ pub(crate) fn split_top_level_str(s: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        prev = c;
     }
     parts.push(s[start..].trim());
     parts
@@ -107,6 +113,7 @@ pub(crate) fn impl_qualified_self_type(name: &str) -> Option<String> {
     while i < bytes.len() {
         match bytes[i] {
             b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
             b'>' => {
                 depth -= 1;
                 if depth == 0 {
