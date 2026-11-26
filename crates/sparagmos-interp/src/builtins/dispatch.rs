@@ -8474,6 +8474,14 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 self.exec_libc_atexit(frames, name, &vals)
             }
+            Builtin::LibcRead => {
+                arity(3)?;
+                self.exec_libc_read(frames, name, &vals)
+            }
+            Builtin::ErrnoLocation => {
+                arity(0)?;
+                self.exec_errno_location()
+            }
             Builtin::AtomicCxchg => {
                 arity(3)?;
                 // Single-threaded: nothing can intervene between

@@ -1404,3 +1404,163 @@ fn run_mode_exit_status_debug_names_the_wait_status() {
     );
     assert_eq!(stdout, "Ok(ExitStatus(unix_wait_status(0)))\n");
 }
+
+// ---------------------------------------------------------------------------
+// `libc::read` and the errno cell (issue #513): a guest
+// descriptor read runs on the host object behind the
+// descriptor's table entry, a descriptor naming no entry
+// fails with `EBADF` in the errno cell -- the shape the
+// rustc record `tests/ui/process/fds-are-cloexec.rs`
+// asserts in a re-executed child, whose descriptor tables
+// start empty -- and `io::Error::last_os_error` reads the
+// recorded errno back through the errno location. The
+// libc calls live in an auxiliary crate (the driver's own
+// sysroot pin serves its `extern crate libc;`, as in the
+// ffi aux test); the main fixtures use only std.
+// ---------------------------------------------------------------------------
+
+const LIBC_READ_AUX_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+pub const EBADF: i32 = libc::EBADF;
+pub const ENOTCONN: i32 = libc::ENOTCONN;
+
+/// `libc::read(fd, buf, buf.len())` and the errno the
+/// call leaves behind, as `(return, raw_os_error)`.
+pub fn read_into(fd: i32, buf: &mut [u8]) -> (i64, Option<i32>) {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    (n as i64, std::io::Error::last_os_error().raw_os_error())
+}
+"#;
+
+const LIBC_READ_SRC: &str = r#"
+extern crate libc_read_probe;
+
+use std::io::Write as _;
+use std::os::unix::io::AsRawFd as _;
+
+fn main() {
+    // A descriptor naming no entry, and a negative one:
+    // -1 with EBADF recorded.
+    let mut b = [0u8; 2];
+    let (n, e) = libc_read_probe::read_into(9999, &mut b);
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_read_probe::EBADF));
+    let (n, e) = libc_read_probe::read_into(-3, &mut b);
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_read_probe::EBADF));
+
+    // A real file: the bytes land in the buffer, and the
+    // next read is at end of file.
+    let dir = std::env::args().nth(1).unwrap();
+    let path = format!("{dir}/data.bin");
+    std::fs::write(&path, b"hello").unwrap();
+    let f = std::fs::File::open(&path).unwrap();
+    let mut buf = [0u8; 8];
+    let (n, _) = libc_read_probe::read_into(f.as_raw_fd(), &mut buf);
+    assert_eq!(n, 5);
+    assert_eq!(&buf[..5], b"hello");
+    let (n, _) = libc_read_probe::read_into(f.as_raw_fd(), &mut buf);
+    assert_eq!(n, 0);
+
+    // A connected stream carries the bytes; the listening
+    // descriptor itself answers with the kernel's error.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut sender = std::net::TcpStream::connect(addr).unwrap();
+    let (receiver, _) = listener.accept().unwrap();
+    sender.write_all(b"abc").unwrap();
+    let mut b2 = [0u8; 4];
+    let (n, _) = libc_read_probe::read_into(receiver.as_raw_fd(), &mut b2);
+    assert_eq!(n, 3);
+    assert_eq!(&b2[..3], b"abc");
+    let (n, e) = libc_read_probe::read_into(listener.as_raw_fd(), &mut b2);
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_read_probe::ENOTCONN));
+    println!("libc-read-ok");
+}
+"#;
+
+#[test]
+fn run_mode_libc_read_descriptors_and_errno() {
+    let dir = temp_dir("libc-read");
+    let aux = fixture(&dir, "libc_read_probe.rs", LIBC_READ_AUX_SRC);
+    let src = fixture(&dir, "libc_read.rs", LIBC_READ_SRC);
+    let spec = format!("libc_read_probe={}", aux.display());
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let out = run_driver_extra(
+        &src,
+        &["--aux", &spec, "--guest-arg", &dir_arg],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "libc-read-ok\n", "stderr={stderr}");
+}
+
+const FDS_CLOEXEC_SRC: &str = r#"
+extern crate libc_read_probe;
+
+use std::os::unix::io::AsRawFd as _;
+use std::process::{Command, Stdio};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        // The child: every descriptor number the parent
+        // passed names nothing here (each was cloexec in
+        // the parent, and this process's tables start
+        // empty), so every read fails with EBADF.
+        let mut b = [0u8; 2];
+        for a in &args[1..] {
+            let fd: i32 = a.parse().unwrap();
+            let (n, e) = libc_read_probe::read_into(fd, &mut b);
+            assert_eq!(n, -1, "fd {fd}");
+            assert_eq!(e, Some(libc_read_probe::EBADF), "fd {fd}");
+        }
+        return;
+    }
+    let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut piped = Command::new(std::env::args().next().unwrap())
+        .arg("100")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pipe1 = piped.stdin.take().unwrap();
+    let pipe2 = piped.stdout.take().unwrap();
+    let pipe3 = piped.stderr.take().unwrap();
+    let status = Command::new(std::env::args().next().unwrap())
+        .arg(file.as_raw_fd().to_string())
+        .arg(listener.as_raw_fd().to_string())
+        .arg(udp.as_raw_fd().to_string())
+        .arg(pipe1.as_raw_fd().to_string())
+        .arg(pipe2.as_raw_fd().to_string())
+        .arg(pipe3.as_raw_fd().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(piped.wait().unwrap().success());
+    println!("cloexec-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_fds_are_cloexec() {
+    let dir = temp_dir("fds-cloexec");
+    let aux = fixture(&dir, "libc_read_probe.rs", LIBC_READ_AUX_SRC);
+    let src = fixture(&dir, "fds_cloexec.rs", FDS_CLOEXEC_SRC);
+    let spec = format!("libc_read_probe={}", aux.display());
+    let out = run_driver_extra(
+        &src,
+        &["--aux", &spec, "--guest-process-host"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "cloexec-ok\n", "stderr={stderr}");
+}
