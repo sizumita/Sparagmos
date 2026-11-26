@@ -2475,6 +2475,13 @@ pub struct Program {
     /// consulted by the `size_of` / `align_of` / `size_of_val`
     /// builtins for ADT tags the static layout table cannot answer.
     pub adt_layouts: std::collections::HashMap<String, (u64, u64)>,
+    /// Runtime layout descriptors of the program's
+    /// dynamically sized ADT instances, keyed like
+    /// `adt_layouts`, as recorded by the driver (see
+    /// `sparagmos_mir::AdtDstLayout`). The `size_of_val` /
+    /// `align_of_val` builtins compose a DST value's layout
+    /// from its descriptor and the tail's dynamic layout.
+    pub adt_dst_layouts: sparagmos_mir::AdtDstLayouts,
     /// What each vtable-pointer identity number in the program
     /// denotes: the concrete type and trait bounds a `dyn`
     /// pointer formed for that vtable answers to, with the

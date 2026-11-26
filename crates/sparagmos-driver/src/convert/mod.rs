@@ -161,6 +161,14 @@ pub struct Converter {
     /// compiler cannot give (generic parameters, unsized types) get
     /// no entry.
     pub adt_layouts: sm::AdtLayouts,
+    /// Runtime layout descriptors of the dynamically sized
+    /// ADT instances converted so far, keyed like
+    /// `adt_layouts` (see `sm::AdtDstLayout`). Handed to the
+    /// interpreter with the converted program: its
+    /// `size_of_val` / `align_of_val` builtins compose a DST
+    /// value's layout from the descriptor and the tail's
+    /// dynamic layout.
+    pub adt_dst_layouts: sm::AdtDstLayouts,
     /// Per-variant field byte layouts of the monomorphic ADT
     /// instances converted so far, keyed like `adt_layouts`
     /// (see `sm::AdtFieldLayouts`). Handed to the interpreter

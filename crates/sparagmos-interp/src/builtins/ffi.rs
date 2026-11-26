@@ -11,6 +11,36 @@ use crate::value::{RefProj, RefTarget, Value};
 use super::fmt::pointee_tag;
 
 
+/// The fat-pointer metadata a value carries for its innermost
+/// unsized tail: a slice length, or the concrete type name a
+/// `dyn` value's vtable answers for. The fat pointer of a
+/// dynamically sized aggregate carries the *tail's* metadata,
+/// so one value's metadata governs every aggregate layer
+/// between it and the tail.
+#[derive(Clone)]
+enum DstMeta {
+    Len(u128),
+    Concrete(String),
+}
+
+fn dst_meta_of(value: &Value) -> Option<DstMeta> {
+    match value {
+        Value::FatRef { len, .. } => Some(DstMeta::Len(*len)),
+        Value::DynRef { concrete, .. } => {
+            Some(DstMeta::Concrete(concrete.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn align_up_u128(n: u128, align: u128) -> Option<u128> {
+    if align <= 1 {
+        return Some(n);
+    }
+    n.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
+
 impl<'a> Interpreter<'a> {
     /// The bytes of a `&[u8]` argument.
     pub(super) fn arg_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
@@ -70,6 +100,216 @@ impl<'a> Interpreter<'a> {
             return None;
         };
         self.layout_of(&concrete)
+    }
+
+    /// The `(size, align)` of a value of a dynamically sized
+    /// type, composed from the value itself: the layout the
+    /// `size_of_val` / `align_of_val` builtins answer when
+    /// neither the static layout table nor the `dyn` vtable
+    /// path can. An aggregate with an unsized tail (a struct or
+    /// union with a driver-recorded descriptor, or a tuple) is
+    /// its prefix plus the tail's own dynamic layout, the tail
+    /// placed at the prefix end rounded up to the tail's
+    /// effective alignment; a function item type is zero-sized.
+    /// `None` when the composition cannot be carried out (the
+    /// caller stays unsupported).
+    pub(super) fn dst_size_align_of_val(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        tag: &str,
+    ) -> Option<(u128, u128)> {
+        self.dst_layout_of(frames, value, None, tag)
+    }
+
+    /// The recursive composition behind
+    /// [`Self::dst_size_align_of_val`]: `carrier` is the value
+    /// (or the reference denoting it) whose type `tag` names,
+    /// and `inherited` is the fat-pointer metadata an enclosing
+    /// aggregate's pointer carries for this tail (see
+    /// [`DstMeta`]); a carrier carrying metadata of its own
+    /// supersedes the inherited one.
+    fn dst_layout_of(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        carrier: &Value,
+        inherited: Option<&DstMeta>,
+        tag: &str,
+    ) -> Option<(u128, u128)> {
+        let tag = tag.trim();
+        let own = dst_meta_of(carrier);
+        let meta = own.as_ref().or(inherited);
+        if tag == "str" {
+            let len = match meta {
+                Some(DstMeta::Len(n)) => *n,
+                _ => {
+                    let v = self.resolve_value(frames, carrier).ok()?;
+                    match v {
+                        Value::Str(text) => text.len() as u128,
+                        _ => self.resolve_string(frames, carrier).ok()?.len()
+                            as u128,
+                    }
+                }
+            };
+            return Some((len, 1));
+        }
+        if super::is_slice_tag(tag) {
+            let elem = &tag[1..tag.len() - 1];
+            let (elem_size, elem_align) = self.layout_of(elem)?;
+            let len = match meta {
+                Some(DstMeta::Len(n)) => *n,
+                _ => self.resolve_value(frames, carrier).ok()?.len()?,
+            };
+            return Some((len.checked_mul(elem_size)?, elem_align));
+        }
+        if pointee_tag(tag).starts_with("dyn ") {
+            if let Some(DstMeta::Concrete(concrete)) = meta {
+                return self.layout_of(concrete);
+            }
+            return self.dyn_layout_of(frames, carrier, tag);
+        }
+        if let Some(layout) = self.layout_of(tag) {
+            return Some(layout);
+        }
+        if let Some(desc) =
+            self.program().adt_dst_layouts.get(tag).cloned()
+        {
+            let (tail_size, tail_align) =
+                self.dst_tail_layout(frames, carrier, meta, &desc)?;
+            let eff_align = match desc.pack {
+                Some(pack) => tail_align.min(u128::from(pack)),
+                None => tail_align,
+            };
+            let prefix_align = u128::from(desc.prefix_align);
+            if desc.union {
+                return Some((
+                    u128::from(desc.prefix_end).max(tail_size),
+                    prefix_align.max(eff_align),
+                ));
+            }
+            let tail_offset =
+                align_up_u128(u128::from(desc.prefix_end), eff_align)?;
+            return Some((
+                tail_offset.checked_add(tail_size)?,
+                prefix_align.max(eff_align),
+            ));
+        }
+        if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
+            return self.dst_tuple_layout_of(frames, carrier, meta, tag);
+        }
+        // A function item type is zero-sized: the carrier
+        // resolves to the function pointer value itself.
+        // (An intrinsic-backed item like `std::mem::size_of`
+        // has no collected body, so the program's function
+        // table cannot name it; the value can.)
+        if let Ok(Value::FnPtr(_)) = self.resolve_value(frames, carrier) {
+            return Some((0, 1));
+        }
+        // A function item type is zero-sized: its tag is the
+        // instance name of a function of the program. The
+        // tag drops the generic arguments the program's
+        // function keys carry, so an exact key or a key
+        // continuing with the argument list both name the
+        // item.
+        if self.program().functions.keys().any(|name| {
+            name == tag
+                || name.strip_prefix(tag).is_some_and(|rest| {
+                    rest.starts_with('<') || rest.starts_with("::<")
+                })
+        }) {
+            return Some((0, 1));
+        }
+        None
+    }
+
+    /// The dynamic layout of the unsized tail field a DST
+    /// descriptor names: the tail value sits in the pointee
+    /// aggregate's recorded field, under the fat metadata of
+    /// the whole value. When the pointee cannot be read (an
+    /// address-only fat pointer, whose metadata is all the
+    /// value carries), the recursion runs on the carrier
+    /// itself, where the metadata alone decides the `str` /
+    /// slice / `dyn` tails.
+    fn dst_tail_layout(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        carrier: &Value,
+        meta: Option<&DstMeta>,
+        desc: &sparagmos_mir::AdtDstLayout,
+    ) -> Option<(u128, u128)> {
+        if let Some(pointee) = self.dst_pointee(frames, carrier) {
+            let fields = match &pointee {
+                Value::Enum { fields, .. } => Some(fields),
+                Value::Tuple(items) => Some(items),
+                _ => None,
+            };
+            if let Some(tail) =
+                fields.and_then(|f| f.get(desc.tail_field as usize))
+            {
+                let tail = tail.clone();
+                return self.dst_layout_of(frames, &tail, meta, &desc.tail_ty);
+            }
+        }
+        self.dst_layout_of(frames, carrier, meta, &desc.tail_ty)
+    }
+
+    /// The aggregate value a fat or thin reference denotes,
+    /// for the DST layout composition: references resolve to
+    /// their pointee, and a `DynRef` unwraps to the value
+    /// behind its base (the sized aggregate the coercion
+    /// started from).
+    fn dst_pointee(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        carrier: &Value,
+    ) -> Option<Value> {
+        let v = self.resolve_value(frames, carrier).ok()?;
+        match v {
+            Value::DynRef { base, .. } => self.dst_pointee(frames, &base),
+            other => Some(other),
+        }
+    }
+
+    /// The layout of a tuple with an unsized last element: the
+    /// sized elements' layouts are static (their sum is the
+    /// prefix end, as in the static tuple layout), and the
+    /// last element's layout is dynamic (see
+    /// [`Self::dst_layout_of`]).
+    fn dst_tuple_layout_of(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        carrier: &Value,
+        meta: Option<&DstMeta>,
+        tag: &str,
+    ) -> Option<(u128, u128)> {
+        let inner = &tag[1..tag.len() - 1];
+        let parts = super::split_top_level(inner);
+        let (last, prefix) = parts.split_last()?;
+        // Every element before the last must have a static
+        // layout: the composition is only sound when the last
+        // element is the dynamic one.
+        let mut prefix_end: u128 = 0;
+        let mut prefix_align: u128 = 1;
+        for part in prefix {
+            let (size, align) = self.layout_of(part)?;
+            prefix_end = prefix_end.checked_add(size)?;
+            prefix_align = prefix_align.max(align);
+        }
+        let pointee = self.dst_pointee(frames, carrier)?;
+        let Value::Tuple(items) = &pointee else {
+            return None;
+        };
+        let tail = items.get(parts.len() - 1)?.clone();
+        let (tail_size, tail_align) =
+            self.dst_layout_of(frames, &tail, meta, last)?;
+        if prefix.is_empty() {
+            return Some((tail_size, tail_align));
+        }
+        let tail_offset = align_up_u128(prefix_end, tail_align)?;
+        Some((
+            tail_offset.checked_add(tail_size)?,
+            prefix_align.max(tail_align),
+        ))
     }
 
     /// `ThinBox<T>` dereference, shared by `Deref` and

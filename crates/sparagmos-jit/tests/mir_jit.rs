@@ -174,6 +174,7 @@ fn build_with_table(
         coverage: Default::default(),
         adt_discriminants: table,
         adt_layouts: Default::default(),
+        adt_dst_layouts: Default::default(),
         coroutine_layouts: Default::default(),
         adt_shapes: Default::default(),
         adt_debug_shapes: Default::default(),

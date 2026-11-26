@@ -7634,13 +7634,16 @@ impl<'a> Interpreter<'a> {
                     self.dyn_layout_of(frames, &vals[0], tag)
                 {
                     Ok(Value::Uint(size))
+                } else if let Some((size, _)) = self.layout_of(tag) {
+                    Ok(Value::Uint(size))
+                } else if let Some((size, _)) =
+                    self.dst_size_align_of_val(frames, &vals[0], tag)
+                {
+                    Ok(Value::Uint(size))
                 } else {
-                    match self.layout_of(tag) {
-                        Some((size, _)) => Ok(Value::Uint(size)),
-                        None => Err(unsupported(format!(
-                            "size_of_val for {tag} is not runtime-supported"
-                        ))),
-                    }
+                    Err(unsupported(format!(
+                        "size_of_val for {tag} is not runtime-supported"
+                    )))
                 }
             }
             Builtin::MemAlignOfVal => {
@@ -7660,13 +7663,16 @@ impl<'a> Interpreter<'a> {
                     self.dyn_layout_of(frames, &vals[0], tag)
                 {
                     Ok(Value::Uint(align))
+                } else if let Some((_, align)) = self.layout_of(tag) {
+                    Ok(Value::Uint(align))
+                } else if let Some((_, align)) =
+                    self.dst_size_align_of_val(frames, &vals[0], tag)
+                {
+                    Ok(Value::Uint(align))
                 } else {
-                    match self.layout_of(tag) {
-                        Some((_, align)) => Ok(Value::Uint(align)),
-                        None => Err(unsupported(format!(
-                            "align_of_val for {tag} is not runtime-supported"
-                        ))),
-                    }
+                    Err(unsupported(format!(
+                        "align_of_val for {tag} is not runtime-supported"
+                    )))
                 }
             }
             Builtin::FastFloat(op) => {

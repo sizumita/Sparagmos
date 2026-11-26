@@ -36,6 +36,10 @@ pub(crate) struct Collected {
     /// Layouts of the converted monomorphic ADT instances, for the
     /// interpreter (see `Converter::adt_layouts`).
     pub(crate) adt_layouts: sparagmos_mir::AdtLayouts,
+    /// Runtime layout descriptors of the converted
+    /// dynamically sized ADT instances, for the interpreter
+    /// (see `Converter::adt_dst_layouts`).
+    pub(crate) adt_dst_layouts: sparagmos_mir::AdtDstLayouts,
     /// Per-variant field byte layouts of the converted
     /// monomorphic ADT instances, for the interpreter (see
     /// `Converter::adt_field_layouts`).

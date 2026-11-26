@@ -54,6 +54,11 @@ pub struct MirProgram {
     /// (see [`mir::AdtLayouts`]). Consulted by the `size_of` /
     /// `align_of` / `size_of_val` builtins for ADT type tags.
     pub adt_layouts: mir::AdtLayouts,
+    /// Runtime layout descriptors of the program's
+    /// dynamically sized ADT instances, as recorded by the
+    /// driver (see [`mir::AdtDstLayout`]). Converted into the
+    /// interpreter's table (see `ir::Program::adt_dst_layouts`).
+    pub adt_dst_layouts: mir::AdtDstLayouts,
     /// Vtable identities minted by the driver while decoding
     /// constants: for each vtable-pointer identity number, the
     /// (concrete type, principal trait names) pair it denotes.

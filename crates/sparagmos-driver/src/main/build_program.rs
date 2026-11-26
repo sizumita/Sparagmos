@@ -55,6 +55,7 @@ pub(crate) fn build_program(
     program.fn_abis = c.fn_abis.clone();
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();
+    program.adt_dst_layouts = c.adt_dst_layouts.clone();
     program.adt_field_layouts = c.adt_field_layouts.clone();
     program.tuple_layouts = c.tuple_layouts.clone();
     program.adt_tag_layouts = c.adt_tag_layouts.clone();

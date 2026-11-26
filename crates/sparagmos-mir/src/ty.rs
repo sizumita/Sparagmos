@@ -120,6 +120,47 @@ pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 /// to read.
 pub type AdtFieldLayouts = std::collections::HashMap<String, Vec<Vec<(u64, u64)>>>;
 
+/// How the interpreter composes the layout of one dynamically
+/// sized ADT instance (a struct or union whose one unsized
+/// field is the tail) at runtime: the size of a value is the
+/// tail field's offset plus the tail's own dynamic size, and
+/// the tail's offset is the recorded sized-prefix end rounded
+/// up to the tail's effective alignment (its dynamic alignment
+/// capped by the repr's pack, if any). The driver records one
+/// entry per unsized instance it converts; the instance itself
+/// gets no [`AdtLayouts`] entry, because its size is not a
+/// constant. Keyed like [`AdtLayouts`] by the rendered instance
+/// name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdtDstLayout {
+    /// Byte offset just past the last sized field, in the
+    /// layout the compiler computes (the prefix fields laid out
+    /// among themselves, the tail not yet placed): for a struct,
+    /// the offset the tail field's placement starts from; for a
+    /// union, the largest sized field's size.
+    pub prefix_end: u64,
+    /// The sized prefix's alignment contribution: the largest
+    /// effective alignment among the sized fields (each capped
+    /// by `pack`), raised by a `repr(align)` if the ADT has one.
+    pub prefix_align: u64,
+    /// The `repr(packed(N))` alignment cap, if the ADT has one.
+    pub pack: Option<u64>,
+    /// Declaration-order index of the one unsized field.
+    pub tail_field: u32,
+    /// The unsized field's type, rendered as a type tag the way
+    /// [`AdtLayouts`] keys are rendered: the interpreter
+    /// recurses into the tail with this tag.
+    pub tail_ty: String,
+    /// The ADT is a union: its fields share offset 0, so the
+    /// size is the larger of the prefix end and the tail's size
+    /// rather than their sum.
+    pub union: bool,
+}
+
+/// Per-instance dynamically-sized ADT layout descriptors,
+/// keyed like [`AdtLayouts`] (see [`AdtDstLayout`]).
+pub type AdtDstLayouts = std::collections::HashMap<String, AdtDstLayout>;
+
 /// Storage layouts of the monomorphic tuple types in a
 /// program: the tuple's total storage size in bytes and, per
 /// field in declaration order, the field's (byte offset, byte
