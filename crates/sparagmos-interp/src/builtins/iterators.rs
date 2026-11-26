@@ -2109,7 +2109,8 @@ impl<'a> Interpreter<'a> {
                 }
             };
             if fields.len() == 2 {
-                let (elems, _) = self.slice_elements(frames, &fields[0])?;
+                let (elems, _) =
+                    self.adapter_slice_elements(frames, self_ty, &fields[0])?;
                 let size = size_of(&fields[1])?;
                 if size == 0 || elems.len() < size {
                     return Ok((state, none_value()));
@@ -2128,7 +2129,8 @@ impl<'a> Interpreter<'a> {
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            let (elems, _) = self.slice_elements(frames, &fields[0])?;
+            let (elems, _) =
+                self.adapter_slice_elements(frames, self_ty, &fields[0])?;
             let size = size_of(&fields[1])?;
             let index = match fields[2] {
                 Value::Uint(v) => v as usize,
@@ -2344,7 +2346,8 @@ impl<'a> Interpreter<'a> {
             },
             self_ty,
         )?;
-        let (elems, _) = self.slice_elements(frames, slice_field)?;
+        let (elems, _) =
+            self.adapter_slice_elements(frames, self_ty, slice_field)?;
         let len = elems.len();
         if size == 0 || len == 0 {
             return Ok((state.clone(), none_value()));
@@ -4552,6 +4555,29 @@ impl<'a> Interpreter<'a> {
     /// pointer's address (see `iterator_len`). The receiver
     /// is a reference for `as_slice` / `as_mut_slice` and
     /// the state itself for `into_slice`.
+    /// The elements of a slice adapter state's slice
+    /// field under the element type the adapter's own type
+    /// names, composed from the storage's bytes when the
+    /// slice's formation regrouped them (see
+    /// `regrouped_iter_elements`); the plain element
+    /// reading otherwise.
+    pub(super) fn adapter_slice_elements(
+        &self,
+        frames: &[Frame],
+        self_ty: &str,
+        slice_field: &Value,
+    ) -> InterpResult<(Vec<Value>, u128)> {
+        if let Some(elem_ty) = adapter_element_tag(self_ty).and_then(ty_from_tag) {
+            if let Some(elems) =
+                self.regrouped_iter_elements(frames, slice_field, &elem_ty)
+            {
+                let len = elems.len() as u128;
+                return Ok((elems, len));
+            }
+        }
+        self.slice_elements(frames, slice_field)
+    }
+
     pub(super) fn slice_iter_as_slice(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -7177,6 +7203,17 @@ fn iter_zst_remaining(fields: &[Value]) -> Option<u64> {
 /// a byte displacement over such an element stays unjudged
 /// (a displacement-free element pointer is judged by its
 /// trailing element step alone).
+/// The element type tag a slice adapter's rendered type
+/// names after its lifetime argument
+/// (`std::slice::Windows<'_, [u8; 2]>` -> `[u8; 2]`): the
+/// last top-level generic argument. `None` when the tag
+/// names no generic arguments.
+fn adapter_element_tag(self_ty: &str) -> Option<&str> {
+    let open = self_ty.find('<')?;
+    let close = self_ty.rfind('>')?;
+    split_top_level(&self_ty[open + 1..close]).into_iter().last()
+}
+
 fn slice_iter_elem_size(self_ty: &str) -> Option<u64> {
     let elem = first_generic_param(self_ty)?;
     let elem = elem.trim();

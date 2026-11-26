@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 
 use crate::error::{InterpError, InterpResult};
+use crate::ir::Ty;
 use crate::interp::{
     project_value, rc_handle_id, scalar_storage_byte, scalar_storage_len,
     Frame, Interpreter, Resolved,
@@ -139,6 +140,37 @@ impl<'a> Interpreter<'a> {
             ]);
         }
         None
+    }
+
+    /// The elements an iteration over the slice `value`
+    /// yields under the element type `elem_ty` the
+    /// consumer's own type names, when the slice is a fat
+    /// pointer whose formation regrouped its storage's
+    /// elements (see `foreign_slice_elements`): the
+    /// elements composed from the storage's bytes under
+    /// that type, rather than the stored shape the plain
+    /// element reading materialises. A reference to the
+    /// fat pointer is followed. `None` when the value
+    /// denotes no such pointer or the view does not judge
+    /// it; the caller keeps its ordinary element reading.
+    pub(crate) fn regrouped_iter_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_ty: &Ty,
+    ) -> Option<Vec<Value>> {
+        let fat = match value {
+            Value::FatRef { .. } => value.clone(),
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value).ok()?;
+                match self.read_resolved(frames, &target).ok()? {
+                    v @ Value::FatRef { .. } => v,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        self.foreign_slice_elements(frames, &fat, elem_ty)
     }
 
     pub(crate) fn slice_elements(

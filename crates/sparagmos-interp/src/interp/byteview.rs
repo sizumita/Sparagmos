@@ -2987,8 +2987,14 @@ impl<'a> Interpreter<'a> {
     /// storage a `*const [[u8; 2]]` ranges over), so the
     /// elements are constructed from the storage's bytes
     /// under that type, `len` of them from the storage's
-    /// start. `None` when the base does not denote such a
-    /// storage root (a stored projection, a value target, an
+    /// start. The base may reach the root through a leading
+    /// step that starts at the storage's first byte under
+    /// any denomination (a whole-slice re-slice, a
+    /// first-element pointer); a step starting further in
+    /// is denominated by the view that formed it, which the
+    /// target does not record, so the view declines it.
+    /// `None` when the base does not denote such a storage
+    /// root (a stored projection, a value target, an
     /// allocation element block), the storage's own element
     /// already is `elem_ty` (the ordinary element readings
     /// denominate it correctly), the regrouped extent runs
@@ -3004,8 +3010,11 @@ impl<'a> Interpreter<'a> {
         };
         let target = self.deref_value(frames, base).ok()?;
         let (birth, projection) = self.target_birth(frames, &target)?;
-        if !projection.is_empty() {
-            return None;
+        match projection {
+            []
+            | [RefProj::Subslice { offset: 0, .. }]
+            | [RefProj::Index(0)] => {}
+            _ => return None,
         }
         let Ty::Array(birth_elem, _) = &birth else {
             return None;
