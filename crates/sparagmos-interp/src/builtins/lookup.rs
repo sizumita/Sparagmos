@@ -1089,6 +1089,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
         "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
         "core::slice::copy_from_slice_impl::len_mismatch_fail" => Builtin::LenMismatchFail,
+        "std::str::pattern::StrSearcher::new" => Builtin::StrSearcherNew,
         "core::slice::memchr::memchr" => Builtin::Memchr { reverse: false },
         "core::slice::memchr::memrchr" => Builtin::Memchr { reverse: true },
         "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,

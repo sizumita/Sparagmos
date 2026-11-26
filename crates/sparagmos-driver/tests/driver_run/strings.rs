@@ -2984,6 +2984,40 @@ fn main() {
 }
 "#;
 
+const STR_SEARCHER_SRC: &str = r#"fn main() {
+    // TwoWay payload: multi-byte needles, incl. a periodic one.
+    let t = "the quick the";
+    println!("tw={:?}", t.matches("the").collect::<Vec<_>>());
+    println!("twi={:?}", t.match_indices("the").collect::<Vec<_>>());
+    println!("per={:?}", "abcabcabc".matches("abcab").collect::<Vec<_>>());
+    println!("ovl={:?}", "aaaa".matches("aa").collect::<Vec<_>>());
+    // Byte payload: a one-byte needle.
+    println!("byte={:?}", "aXbXc".matches("X").collect::<Vec<_>>());
+    println!("bytei={:?}", "aXbXc".match_indices("X").collect::<Vec<_>>());
+    // Empty payload: a match at every char boundary.
+    println!("emp={:?}", "ab".matches("").collect::<Vec<_>>());
+    println!("empi={:?}", "a\u{306}b".match_indices("").collect::<Vec<_>>());
+    println!("emp0={:?}", "".matches("").collect::<Vec<_>>());
+    // Split family over &str patterns.
+    println!("sp={:?}", "one::two::three".split("::").collect::<Vec<_>>());
+    println!("rsp={:?}", "one::two::three".rsplit("::").collect::<Vec<_>>());
+    println!("spt={:?}", "a--b--c--".split_terminator("--").collect::<Vec<_>>());
+    println!("rspt={:?}", "a--b--c--".rsplit_terminator("--").collect::<Vec<_>>());
+    println!("spi={:?}", "a--b--c--".split_inclusive("--").collect::<Vec<_>>());
+    println!("spb={:?}", "aXbXcXd".split("X").collect::<Vec<_>>());
+    println!("spe={:?}", "ab".split("").collect::<Vec<_>>());
+    println!("sped={:?}", "xxmidxx".split("xx").collect::<Vec<_>>());
+    println!("spn={:?}", "ab".split("abcdef").collect::<Vec<_>>());
+    println!("spp={:?}", "mississippi".split("ss").collect::<Vec<_>>());
+    // The converted Searcher bodies over the built state.
+    let s = "hello world, hello two-way";
+    println!("c={} f={:?} rf={:?} sw={} ew={}",
+        s.contains("two-way"), s.find("world"), s.rfind("hello"),
+        s.starts_with("hello"), s.ends_with("two"));
+    println!("c1={} f1={:?}", s.contains("o"), s.find("o"));
+}
+"#;
+
 #[test]
 fn run_mode_str_escape_iterators() {
     // Direct iteration and the modelled consumers over
@@ -3044,5 +3078,45 @@ fn run_mode_str_escape_display() {
          empty=[]\n\
          rest=a \\nb\n\
          width=[ab]\n",
+    );
+}
+
+#[test]
+fn run_mode_str_searcher_pattern_family() {
+    // The `Matches` / `MatchIndices` and split families over
+    // an `&str` pattern: the pattern's `StrSearcher`
+    // constructor has no MIR body in core's rlib (it is not
+    // `#[inline]`), so the `StrSearcherNew` builtin builds
+    // the state -- all three payloads (the two-way searcher
+    // for a multi-byte needle, the byte searcher for a
+    // one-byte needle, the empty searcher for an empty
+    // needle) -- and the modelled steps plus the converted
+    // `Searcher` bodies (`contains` / `find` / `rfind` /
+    // `starts_with` / `ends_with`) read it. Expected output
+    // was produced by the native 1.100.0 toolchain.
+    run_ok(
+        "str-searcher-pattern-family",
+        STR_SEARCHER_SRC,
+        "tw=[\"the\", \"the\"]\n\
+         twi=[(0, \"the\"), (10, \"the\")]\n\
+         per=[\"abcab\"]\n\
+         ovl=[\"aa\", \"aa\"]\n\
+         byte=[\"X\", \"X\"]\n\
+         bytei=[(1, \"X\"), (3, \"X\")]\n\
+         emp=[\"\", \"\", \"\"]\n\
+         empi=[(0, \"\"), (1, \"\"), (3, \"\"), (4, \"\")]\n\
+         emp0=[\"\"]\n\
+         sp=[\"one\", \"two\", \"three\"]\n\
+         rsp=[\"three\", \"two\", \"one\"]\n\
+         spt=[\"a\", \"b\", \"c\"]\n\
+         rspt=[\"c\", \"b\", \"a\"]\n\
+         spi=[\"a--\", \"b--\", \"c--\"]\n\
+         spb=[\"a\", \"b\", \"c\", \"d\"]\n\
+         spe=[\"\", \"a\", \"b\", \"\"]\n\
+         sped=[\"\", \"mid\", \"\"]\n\
+         spn=[\"ab\"]\n\
+         spp=[\"mi\", \"i\", \"ippi\"]\n\
+         c=true f=Some(6) rf=Some(13) sw=true ew=false\n\
+         c1=true f1=Some(4)\n"
     );
 }
