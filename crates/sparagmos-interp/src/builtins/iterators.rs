@@ -3273,6 +3273,90 @@ impl<'a> Interpreter<'a> {
                 ),
                 _ => (fields, none_value()),
             }
+        } else if self_ty.starts_with("std::ops::RangeFrom<") {
+            // An unbounded range: the state is the next bound
+            // alone, and a step yields it and stores its
+            // successor -- core's `Step::forward`, whose
+            // overflow behaviour (the addition panic under
+            // overflow checks, the wrap to the minimum
+            // without) the session's own setting decides, as
+            // the `#[rustc_inherit_overflow_checks]` on the
+            // step prescribes. The successor is computed
+            // first, exactly as core's `next` computes it
+            // before yielding, so stepping at the maximum
+            // panics without yielding.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "RangeFrom state",
+                    "[start]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let elem = range_elem_ty(self_ty);
+            if !range_elem_step_served(elem) {
+                return Err(unsupported(format!(
+                    "Iterator::next for {self_ty} is not runtime-supported"
+                )));
+            }
+            let start = fields[0].clone();
+            let next = range_step_forward(&start, elem, self.overflow_checks())?;
+            (vec![next], some_value(start))
+        } else if self_ty.starts_with("std::range::RangeFromIter<") {
+            // The new range API's by-value iterator: the
+            // state is [start, exhausted], where the flag
+            // records that the maximum has been yielded under
+            // overflow checks. The step replays core's
+            // implementation (library/core/src/range/iter.rs)
+            // exactly: an exhausted iterator first re-steps
+            // its bound -- `Step::forward`, which panics
+            // under overflow checks and wraps without -- and
+            // clears the flag; then the step itself is the
+            // checked step when the session has overflow
+            // checks (the maximum is yielded once, with the
+            // flag set and the bound left in place) and the
+            // wrapping step when it does not.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "RangeFromIter state",
+                    "[start, exhausted]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let elem = range_elem_ty(self_ty);
+            if !range_elem_step_served(elem) {
+                return Err(unsupported(format!(
+                    "Iterator::next for {self_ty} is not runtime-supported"
+                )));
+            }
+            let mut start = fields[0].clone();
+            let exhausted = match &fields[1] {
+                Value::Bool(b) => *b,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "RangeFromIter exhausted flag",
+                        "boolean",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            if exhausted {
+                start = range_step_forward(&start, elem, self.overflow_checks())?;
+            }
+            if self.overflow_checks() {
+                match range_step_forward_checked(&start, elem)? {
+                    Some(next) => (
+                        vec![next, Value::Bool(false)],
+                        some_value(start),
+                    ),
+                    None => (
+                        vec![start.clone(), Value::Bool(true)],
+                        some_value(start),
+                    ),
+                }
+            } else {
+                let next = range_step_forward(&start, elem, false)?;
+                (vec![next, Value::Bool(false)], some_value(start))
+            }
         } else if self_ty.starts_with("std::iter::Empty<") {
             // An empty iterator yields `None` forever.
             (fields, none_value())
@@ -3890,6 +3974,114 @@ impl<'a> Interpreter<'a> {
                         some_value(mapped),
                     )
                 }
+            }
+        } else if self_ty.starts_with("std::iter::StepBy<") {
+            // `StepBy` is (inner iterator, step - 1, first
+            // take). The generic step (core's default
+            // `StepByImpl::spec_next`) is the inner `nth` of
+            // 0 on the first step and of `step - 1` after
+            // that: skip that many items, then yield the
+            // next; an inner iterator that runs out during
+            // the skips yields `None` and stays exhausted.
+            // For an integer `Range` inner (and the new
+            // `RangeIter`) core specialises instead: the
+            // constructor has rewritten the range's end into
+            // the count of items left to yield, and the step
+            // yields the bound while the count lasts, steps
+            // it by the (element-clamped) step, and counts
+            // down -- the `first take` flag plays no part.
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "StepBy state",
+                    "[iterator, step - 1, first take]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let step_minus_one = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "StepBy step",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let first_take = match fields[2] {
+                Value::Bool(b) => b,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "StepBy first take flag",
+                        "boolean",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            if let Some(elem) = step_by_spec_range_elem(inner_ty) {
+                let rfields = iterator_fields(&fields[0], inner_ty)?;
+                if rfields.len() != 2 {
+                    return Err(InterpError::type_mismatch(
+                        "StepBy specialised range state",
+                        "[start, remaining count]",
+                        format!("{} field(s)", rfields.len()),
+                    ));
+                }
+                let remaining = match rfields[1] {
+                    Value::Uint(v) => v,
+                    Value::Int(v) => v as u128,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "StepBy specialised range count",
+                            "integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                if remaining == 0 {
+                    (fields, none_value())
+                } else {
+                    let step = (step_minus_one + 1).min(
+                        range_elem_max(elem).expect("specialised element"),
+                    );
+                    let new_start = range_wrapping_add(&rfields[0], elem, step)
+                        .expect("specialised element steps");
+                    let new_remaining = match rfields[1] {
+                        Value::Uint(v) => Value::Uint(v - 1),
+                        Value::Int(v) => Value::Int(v - 1),
+                        _ => unreachable!("remaining checked above"),
+                    };
+                    let new_inner = rebuild_state(
+                        &fields[0],
+                        vec![new_start, new_remaining],
+                    );
+                    (
+                        vec![new_inner, fields[1].clone(), fields[2].clone()],
+                        some_value(rfields[0].clone()),
+                    )
+                }
+            } else {
+                let mut inner = fields[0].clone();
+                let mut to_skip = if first_take { 0 } else { step_minus_one };
+                let mut result = none_value();
+                loop {
+                    let (new_inner, item) =
+                        self.iterator_next_state(frames, inner_ty, inner)?;
+                    inner = new_inner;
+                    let Some(x) = option_payload_opt(item) else {
+                        break;
+                    };
+                    if to_skip > 0 {
+                        to_skip -= 1;
+                        continue;
+                    }
+                    result = some_value(x);
+                    break;
+                }
+                (
+                    vec![inner, fields[1].clone(), Value::Bool(false)],
+                    result,
+                )
             }
         } else if self_ty.starts_with("std::iter::Skip<") {
             // `Skip` is (inner iterator, remaining skip count):
@@ -4891,6 +5083,14 @@ impl<'a> Interpreter<'a> {
                 return Ok(hint(n, Some(n)));
             }
         }
+        if self_ty.starts_with("std::ops::RangeFrom<")
+            || self_ty.starts_with("std::range::RangeFromIter<")
+        {
+            // Unbounded: core's `size_hint` is
+            // `(usize::MAX, None)` for both the legacy
+            // `RangeFrom` and the new `RangeFromIter`.
+            return Ok(hint(u128::from(u64::MAX), None));
+        }
         let fields = iterator_fields(&state, self_ty)?;
         if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
@@ -5662,6 +5862,8 @@ pub fn iterator_len_modelled(self_ty: &str) -> bool {
 pub fn iterator_next_modelled(self_ty: &str) -> bool {
     self_ty.starts_with("std::ops::Range<")
         || self_ty.starts_with("std::ops::RangeInclusive<")
+        || self_ty.starts_with("std::ops::RangeFrom<")
+        || self_ty.starts_with("std::range::RangeFromIter<")
         || self_ty.starts_with("std::slice::Iter<")
         || self_ty.starts_with("std::slice::IterMut<")
         || self_ty.starts_with("std::collections::btree_set::Iter<")
@@ -6028,6 +6230,22 @@ fn into_iter_identity(ty: &str) -> bool {
         || ty.starts_with("std::sync::mpsc::TryIter<")
 }
 
+/// The element type of a `StepBy` inner iterator core's
+/// specialised range implementation serves (`Range` and the
+/// new `RangeIter` over the unsigned integers), or `None`
+/// for the generic `StepBy` step.
+fn step_by_spec_range_elem(inner_ty: &str) -> Option<&str> {
+    for prefix in ["std::ops::Range<", "std::range::RangeIter<"] {
+        if let Some(rest) = inner_ty.strip_prefix(prefix) {
+            let elem = rest.strip_suffix('>')?;
+            if matches!(elem, "u8" | "u16" | "u32" | "u64" | "usize") {
+                return Some(elem);
+            }
+        }
+    }
+    None
+}
+
 /// The `Iterator::Item` type tag of an iterator type tag,
 /// where it is a type-level function of the tag: the first
 /// type argument of the source iterators that carry their
@@ -6090,6 +6308,7 @@ fn iterator_item_ty(ty: &str) -> Option<String> {
         "std::ops::Range<",
         "std::ops::RangeInclusive<",
         "std::ops::RangeFrom<",
+        "std::range::RangeFromIter<",
     ] {
         if ty.starts_with(prefix) {
             return Some(first_generic_arg(ty)?.to_string());
