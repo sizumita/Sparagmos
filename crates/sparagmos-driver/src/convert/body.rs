@@ -32,6 +32,7 @@ impl Converter {
             env_shape_attempted: std::collections::HashSet::new(),
             debug_shape_depth: 0,
             thread_locals: sm::ThreadLocals::new(),
+            extra_static_seeds: sm::ExtraStaticSeeds::new(),
             adt_instance_shapes: sm::AdtInstanceShapes::new(),
             adt_niches: sm::AdtNiches::new(),
             source_files: Vec::new(),

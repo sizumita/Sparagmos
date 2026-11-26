@@ -252,6 +252,15 @@ pub struct Converter {
     /// initializer cannot be decoded gets no entry, and its
     /// `ThreadLocalRef` stays an explicit error at run time.
     pub thread_locals: sm::ThreadLocals,
+    /// Seeds of statics no converted body references, keyed
+    /// by the static's name with its declared type (see
+    /// `sm::StaticSeedDef`): the `core::unicode::unicode_data`
+    /// skiplist tables, recorded by
+    /// [`Converter::note_unicode_data_tables`] when a
+    /// `lookup_slow` callee is part of the program. Handed to
+    /// the interpreter with the converted program, whose seed
+    /// table the `lookup_slow` runtime model reads them from.
+    pub extra_static_seeds: sm::ExtraStaticSeeds,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, keyed by the rendered instance
     /// name (see `sm::AdtInstanceShapes`). Handed to the

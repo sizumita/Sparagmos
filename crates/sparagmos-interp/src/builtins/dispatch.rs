@@ -3688,6 +3688,10 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::FsSys(op) => self.exec_fs_sys(frames, op, vals),
             Builtin::NetSys(op) => self.exec_net_sys(frames, op, generic_args, vals),
+            Builtin::UnicodeLookupSlow(property) => {
+                arity(1)?;
+                self.exec_unicode_lookup_slow(property, &vals)
+            }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
                 // `From::from` renders the callee's generic

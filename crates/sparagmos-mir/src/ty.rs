@@ -59,6 +59,27 @@ pub struct ThreadLocalDef {
 /// `DefId` of the static item.
 pub type ThreadLocals = std::collections::HashMap<DefId, ThreadLocalDef>;
 
+/// One driver-recorded seed of a static no converted body
+/// references: its declared type and its decoded initializer,
+/// in the shape [`ThreadLocalDef`] carries for thread-locals.
+/// The ordinary seed path reaches a static only through a
+/// converted reference to it; a static whose only readers are
+/// functions with no MIR body in the shipped libraries (core's
+/// generated unicode skiplist tables, read solely by the
+/// property modules' `lookup_slow`) is never referenced, so
+/// the driver records its seed directly, keyed by the static's
+/// name — the key the interpreter's seed table and the runtime
+/// model that reads the static both use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticSeedDef {
+    pub ty: Ty,
+    pub init: crate::ConstValue,
+}
+
+/// Driver-recorded static seeds, keyed by the static's name
+/// (see [`StaticSeedDef`]).
+pub type ExtraStaticSeeds = std::collections::HashMap<String, StaticSeedDef>;
+
 /// Declared types of a program's statics, keyed by the `DefId`
 /// of the static item. The interpreter consults a static's
 /// declared type when a pointer offset over the static must be

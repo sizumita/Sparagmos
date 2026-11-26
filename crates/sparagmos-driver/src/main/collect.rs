@@ -1456,6 +1456,19 @@ fn collect() -> ControlFlow<()> {
         }
     }
 
+    // The unicode skiplist tables' seeds, recorded only
+    // when a `lookup_slow` callee is part of the program:
+    // those statics' only reader has no converted body, so
+    // nothing else ever names them (see
+    // `Converter::note_unicode_data_tables`).
+    if conv
+        .def_names
+        .iter()
+        .any(|n| n.contains("::unicode_data::") && n.ends_with("::lookup_slow"))
+    {
+        conv.note_unicode_data_tables();
+    }
+
     let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
 
     // Certify the dropped types whose drop glue the compiler
@@ -1490,6 +1503,7 @@ fn collect() -> ControlFlow<()> {
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
         env_debug_shapes: conv.env_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
+        extra_static_seeds: conv.extra_static_seeds.clone(),
         static_tys: conv.static_tys_mir.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
