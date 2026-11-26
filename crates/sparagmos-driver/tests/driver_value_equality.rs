@@ -22,6 +22,14 @@
 //!   function pointer into an integer-typed destination: the
 //!   enum is represented as its discriminant integer, and the
 //!   value must cross the return boundary as that integer.
+//! * A `Vec` (or slice) compared against an array at
+//!   `-Copt-level=3`, where core's slice equality lowers to
+//!   the `compare_bytes` intrinsic over byte-denominated
+//!   pointers: the byte range over a wider-element sequence
+//!   must be read element by element at the element width,
+//!   not element-per-byte (which walks into the buffer
+//!   block's uninitialised spare-capacity slots, or past the
+//!   end of a constant array).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -83,6 +91,29 @@ fn assert_runs(tag: &str, src: &str, marker: &str) {
     let dir = temp_dir(tag);
     let file = fixture(&dir, "main.rs", src);
     let out = run_driver(&file);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains(marker),
+        "driver run failed for {tag}: status {:?}, stdout: {stdout}, stderr: {stderr}",
+        out.status
+    );
+}
+
+fn run_driver_extra(src: &Path, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .args(extra)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+fn assert_runs_o3(tag: &str, src: &str, marker: &str) {
+    let dir = temp_dir(tag);
+    let file = fixture(&dir, "main.rs", src);
+    let out = run_driver_extra(&file, &["--rustc-arg", "-Copt-level=3"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -188,5 +219,87 @@ fn main() {
 }
 "#,
         "clike-return ok",
+    );
+}
+
+#[test]
+fn vec_array_equality_o3() {
+    assert_runs_o3(
+        "vec-array-o3",
+        r#"
+fn main() {
+    // The reported shape: spare capacity in the buffer
+    // block must not be read by the slice-equality path.
+    let mut v: Vec<i32> = Vec::with_capacity(8);
+    v.push(1);
+    v.push(2);
+    assert!(v == [1, 2]);
+    assert!(v != [1, 3]);
+    assert!(v != [1, 2, 3]);
+    // An exactly-sized buffer has no spare slots; the
+    // over-read past its end is the same stop.
+    assert!(vec![1, 2] == [1, 2]);
+    assert!(vec![1, 2] != [2, 1]);
+    // Neighbouring comparison shapes over the same path.
+    assert!(vec![1, 2] == vec![1, 2]);
+    assert!(&[1, 2] == &[1, 2]);
+    assert!(&[1, 2] != &[1, 3]);
+    // A difference above the low byte must still register:
+    // the range is the elements' bytes, not their low bytes.
+    assert!(vec![256i32] != [0i32]);
+    assert!(vec![256i32] == [256i32]);
+    assert!(vec![-1i32, 2] == [-1, 2]);
+    assert!(vec![-1i32] != [255i32]);
+    println!("vec-array-eq-o3 ok");
+}
+"#,
+        "vec-array-eq-o3 ok",
+    );
+}
+
+#[test]
+fn vec_array_equality_element_widths_o3() {
+    assert_runs_o3(
+        "vec-array-widths-o3",
+        r#"
+fn main() {
+    assert!(vec![1000u16, 2] == [1000, 2]);
+    assert!(vec![1000u16] != [1001u16]);
+    assert!(vec![0x0102_0304_0506_0708u64, 9] == [0x0102_0304_0506_0708, 9]);
+    assert!(vec![1.5f32, -2.25] == [1.5, -2.25]);
+    assert!(vec![1.5f32] != [1.25f32]);
+    assert!(vec![true, false] == [true, false]);
+    assert!(vec![true] != [false]);
+    assert!(vec![-1i8, 2] == [-1, 2]);
+    assert!(vec!['a', 'b'] == ['a', 'b']);
+    assert!(vec![0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128]
+        == [0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128]);
+    println!("vec-array-widths-o3 ok");
+}
+"#,
+        "vec-array-widths-o3 ok",
+    );
+}
+
+#[test]
+fn slice_cmp_memcmp_order_o3() {
+    assert_runs_o3(
+        "slice-cmp-o3",
+        r#"
+use std::cmp::Ordering;
+fn main() {
+    // Slice ordering runs over the same intrinsic (core
+    // maps its result back to the elements' numeric order,
+    // so 256 orders after 255 despite its low byte being 0).
+    assert_eq!(vec![2i32].as_slice().cmp(&[1i32]), Ordering::Greater);
+    assert_eq!(vec![256i32].as_slice().cmp(&[255i32]), Ordering::Greater);
+    assert_eq!(vec![255i32].as_slice().cmp(&[256i32]), Ordering::Less);
+    assert_eq!(vec![1u64, 9].as_slice().cmp(&[1u64, 8]), Ordering::Greater);
+    assert_eq!(vec![1u8, 2].as_slice().cmp(&[1u8, 3]), Ordering::Less);
+    assert_eq!(vec![1i32, 2].as_slice().cmp(&[1i32, 2]), Ordering::Equal);
+    println!("slice-cmp-o3 ok");
+}
+"#,
+        "slice-cmp-o3 ok",
     );
 }

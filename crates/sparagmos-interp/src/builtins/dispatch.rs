@@ -8621,8 +8621,7 @@ impl<'a> Interpreter<'a> {
                         ));
                     }
                 };
-                let a = self.read_byte_range(frames, &vals[0], n)?;
-                let b = self.read_byte_range(frames, &vals[1], n)?;
+                let (a, b) = self.read_compare_ranges(frames, &vals[0], &vals[1], n)?;
                 let ord = a.cmp(&b);
                 Ok(Value::Int(match ord {
                     std::cmp::Ordering::Less => -1,
