@@ -804,3 +804,100 @@ fn run_mode_aux_crate_binds_prebuilt_aux_lib() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "val=8\n");
 }
+
+
+const AUX_SAMENAME_DROP_SRC: &str = r#"
+#![crate_name = "sharedname"]
+
+pub struct Guard<X: std::fmt::Debug> { pub val: X }
+
+impl<X: std::fmt::Debug> Drop for Guard<X> {
+    fn drop(&mut self) { println!("dropping {:?}", self.val); }
+}
+
+pub struct Plain(pub u32);
+
+impl Drop for Plain {
+    fn drop(&mut self) { println!("dropping plain {}", self.0); }
+}
+
+pub mod lib {
+    pub struct X(pub u8);
+
+    impl Drop for X {
+        fn drop(&mut self) {
+            assert_eq!(self.0, 5);
+            println!("x dropped with {}", self.0);
+        }
+    }
+}
+"#;
+
+const AUX_SAMENAME_DROP_MAIN_SRC: &str = r#"
+extern crate sharedname as aux;
+fn main() {
+    let _g = aux::Guard { val: 7u32 };
+    let _p = aux::Plain(3);
+    println!("body");
+}
+"#;
+
+const AUX_SAMENAME_MODULE_DROP_MAIN_SRC: &str = r#"
+extern crate sharedname as aux;
+fn main() {
+    {
+        let _x = aux::lib::X(5);
+        println!("inside");
+    }
+    println!("after");
+}
+"#;
+
+#[test]
+fn run_mode_aux_same_crate_name_drops_run() {
+    // An auxiliary crate carrying the entry crate's own name
+    // (the test harness's aux-build convention): its types
+    // render under the local crate's name, so the drop demand
+    // dispatched on the rendered name alone looked for their
+    // `Drop` impls among the local crate's items only, never
+    // demanded the destructor bodies, and the run stopped at
+    // the drop with an unknown function (Issue #513: the
+    // cross-crate `Drop` records). Both the generic and the
+    // concrete destructor must run, in drop order.
+    let dir = temp_dir("aux-samename-drop");
+    let aux = fixture(&dir, "sharedname-aux.rs", AUX_SAMENAME_DROP_SRC);
+    let src = fixture(&dir, "sharedname.rs", AUX_SAMENAME_DROP_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("sharedname", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "same-named aux drops must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\ndropping plain 3\ndropping 7\n",
+        "the auxiliary destructors run in drop order"
+    );
+}
+
+#[test]
+fn run_mode_aux_same_crate_name_module_drop_runs() {
+    // The same-named auxiliary crate's type in a submodule,
+    // dropped at the end of a block scope.
+    let dir = temp_dir("aux-samename-module-drop");
+    let aux = fixture(&dir, "sharedname-aux.rs", AUX_SAMENAME_DROP_SRC);
+    let src = fixture(&dir, "sharedname.rs", AUX_SAMENAME_MODULE_DROP_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("sharedname", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "same-named aux module drop must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "inside\nx dropped with 5\nafter\n",
+        "the destructor runs at the end of the block"
+    );
+}
