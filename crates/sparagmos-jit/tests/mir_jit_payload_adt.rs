@@ -12,6 +12,8 @@ use sparagmos_interp::{InterpError, MirRunError, Value};
 use sparagmos_jit::{JitCallError, JitError, JitProgram, MirFunctionInput, MirProgramInput};
 use sparagmos_mir as mir;
 
+mod common;
+
 // ----- small builders (same conventions as mir_jit.rs) ---------------------
 
 fn def(index: u32) -> mir::DefId {
@@ -126,8 +128,8 @@ fn build_with_table(
         names: names.clone(),
         adt_discriminants: table.clone(),
     };
-    let interp_in = sparagmos_interp::MirProgram {
-        functions: specs
+    let interp_in = common::interp_program(
+        specs
             .iter()
             .map(|s| sparagmos_interp::MirFunction {
                 name: s.name.to_string(),
@@ -135,44 +137,9 @@ fn build_with_table(
                 body: s.body.clone(),
             })
             .collect(),
-        fn_names: names,
-        fn_display_names: Default::default(),
-        crate_overflow_checks: Default::default(),
-        fn_abis: Default::default(),
-        coverage: Default::default(),
-        adt_discriminants: table,
-        adt_layouts: Default::default(),
-        adt_dst_layouts: Default::default(),
-        coroutine_layouts: Default::default(),
-        adt_shapes: Default::default(),
-        adt_debug_shapes: Default::default(),
-        adt_field_layouts: Default::default(),
-        vtable_identities: Default::default(),
-        tuple_layouts: Default::default(),
-        adt_tag_layouts: Default::default(),
-        env_debug_shapes: Default::default(),
-        panic_handler: Default::default(),
-        links_std: Default::default(),
-        thread_locals: Default::default(),
-        extra_static_seeds: Default::default(),
-        static_tys: Default::default(),
-        adt_instance_shapes: Default::default(),
-        adt_niches: Default::default(),
-        mat_plans: Default::default(),
-        source_files: Default::default(),
-        drop_trivial_adts: Default::default(),
-        drop_no_impl_adts: Default::default(),
-        needs_drop_verdicts: Default::default(),
-        dtor_bodies: Default::default(),
-
-        track_caller_defs: Default::default(),
-        fn_shim_locations: Default::default(),
-        coroutine_shim_location: Default::default(),
-        track_caller_coroutines: Default::default(),
-        link_symbols: Default::default(),
-        intrinsic_defs: Default::default(),
-        async_closure_defs: Default::default(),
-    };
+        names,
+        table,
+    );
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)
 }
