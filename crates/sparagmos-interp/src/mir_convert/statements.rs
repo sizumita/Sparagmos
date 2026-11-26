@@ -347,8 +347,9 @@ impl<'a> Converter<'a> {
     /// iterator type the modelled consumers cannot drain: a
     /// hash-collection iterator or one of the concrete
     /// collection iterators whose collected `next` bodies are
-    /// the faithful execution (see
-    /// `builtins::collection_iterator_tag`). The in-place /
+    /// the faithful execution, possibly wrapped in adapter
+    /// types whose steps compose the inner step (see
+    /// `builtins::body_served_iterator_tag`). The in-place /
     /// nested collect entries are pre-empted by the builtin
     /// only for iterators the state machine serves; for a
     /// body-served iterator the entry's own body chain --
@@ -362,8 +363,7 @@ impl<'a> Converter<'a> {
         };
         raw_generic_args.iter().any(|ty| {
             let tag = crate::builtins::ty_tag(ty, self.names);
-            crate::builtins::hash_iterator_tag(&tag)
-                || crate::builtins::collection_iterator_tag(&tag)
+            crate::builtins::body_served_iterator_tag(&tag)
         })
     }
 
@@ -595,11 +595,12 @@ impl<'a> Converter<'a> {
         // Hash-collection iteration is the inverse of the
         // consumer rule below: the builtin models many iterator
         // types, but a raw table's walk is not one of them, so
-        // the body is preferred exactly for the hash shapes.
+        // the body is preferred exactly for the hash shapes --
+        // including an adapter over one, whose composed step
+        // bottoms out in the same walk.
         match kind {
             crate::builtins::Builtin::IteratorNext => {
-                return (crate::builtins::hash_iterator_tag(&tag)
-                    || crate::builtins::collection_iterator_tag(&tag)
+                return (crate::builtins::body_served_iterator_tag(&tag)
                     || crate::builtins::btree_iterator_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
             }

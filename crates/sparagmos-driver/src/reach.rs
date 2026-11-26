@@ -1330,8 +1330,9 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 }
 
 /// Whether a call target naming one of the iterator-consumer
-/// builtins (`Iterator::count` / `fold` / `for_each` /
-/// `collect`, `FromIterator::from_iter`) must still have its
+/// builtins (`Iterator::count` / `fold` / `try_fold` /
+/// `for_each` / `collect` / `nth`,
+/// `FromIterator::from_iter`) must still have its
 /// instance body collected: the builtins drive the modelled
 /// `next` state machine, which only the builtin-produced
 /// iterator states satisfy, so for any other iterator type the
@@ -1339,6 +1340,16 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// faithful execution and conversion prefers it when present.
 /// The iterator type is the call's first generic argument, or
 /// the third for `from_iter` (whose first is the collection).
+///
+/// `try_fold` and `nth` belong to the same rule as the other
+/// consumers: core's `all` / `any` (and every other default
+/// consumer that delegates to `try_fold`) reach the iterator
+/// only through the `try_fold` instance, and `nth`'s own
+/// default body is a plain `next` loop, so when the state
+/// machine cannot step the iterator -- a hash table's walk, a
+/// concrete collection iterator, a user-defined iterator --
+/// the collected bodies are the only faithful execution,
+/// exactly as for `count` / `fold`.
 fn consumer_instance_needs_body(
     def: &rustc_public::ty::FnDef,
     canonical: &str,
@@ -1426,8 +1437,7 @@ fn consumer_instance_needs_body(
             return false;
         };
         return if canonical.ends_with("next") {
-            hash_iterator_ty(ty)
-                || collection_iterator_ty(ty)
+            body_served_iterator_ty(ty)
                 || btree_iterator_ty(ty)
                 || (str_iter_ty(ty) && !str_split_char_ty(ty))
                 || foreign_adt_ty(ty)
@@ -1442,8 +1452,10 @@ fn consumer_instance_needs_body(
     // The nested / in-place collect entries for `Vec`: the
     // builtin pre-empts them for iterators the modelled
     // state machine drains, but for a body-served iterator
-    // (a hash iterator or a concrete collection iterator)
-    // the entry's own body chain -- which steps the source
+    // (a hash iterator or a concrete collection iterator,
+    // possibly wrapped in adapter types whose steps compose
+    // the inner step) the entry's own body chain -- which
+    // steps the source
     // through its collected `next` body -- is the only
     // faithful execution, so the instance is collected (the
     // conversion side lifts the pre-emption for the same
@@ -1456,14 +1468,16 @@ fn consumer_instance_needs_body(
     ) {
         return args.0.iter().any(|arg| {
             matches!(arg, GenericArgKind::Type(ty)
-                if hash_iterator_ty(ty) || collection_iterator_ty(ty))
+                if body_served_iterator_ty(ty))
         });
     }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
         | "std::iter::Iterator::fold"
+        | "std::iter::Iterator::try_fold"
         | "std::iter::Iterator::for_each"
-        | "std::iter::Iterator::collect" => 0,
+        | "std::iter::Iterator::collect"
+        | "std::iter::Iterator::nth" => 0,
         "std::iter::FromIterator::from_iter" => 2,
         "std::iter::DoubleEndedIterator::next_back" => {
             // `next_back` differs from the consumers above: the
@@ -1531,8 +1545,9 @@ fn consumer_instance_needs_body(
     if iterator_self_modelled(ty) {
         return false;
     }
-    // A `fold` instance whose body drives the iterator through
-    // the `TrustedRandomAccess` specialization (core's adapter
+    // A `fold` / `try_fold` instance whose body drives the
+    // iterator through the `TrustedRandomAccess`
+    // specialization (core's adapter
     // helpers reach `__iterator_get_unchecked` and read the
     // sides through stored index/length counters) cannot run on
     // a modelled adapter state: the state machine maintains no
@@ -1542,13 +1557,16 @@ fn consumer_instance_needs_body(
     // body spells out — is the faithful execution for those
     // instances, and every other consumer (`count`, `for_each`,
     // `last`, `sum`, `reduce`, ...) reaches it through its own
-    // collected default body, which delegates to `fold`. The
+    // collected default body, which delegates to `fold` (or to
+    // `try_fold`, for `all` / `any` and their kin). The
     // remaining instances — the default body itself and the
     // composition overrides that delegate to the inner
     // iterator's consumers — keep their bodies as today.
-    if canonical == "std::iter::Iterator::fold"
-        && iterator_adapter_modelled(ty)
-        && fold_instance_tra_specialized(def, args)
+    if matches!(
+        canonical,
+        "std::iter::Iterator::fold" | "std::iter::Iterator::try_fold"
+    ) && iterator_adapter_modelled(ty)
+        && consumer_instance_tra_specialized(def, args)
     {
         return false;
     }
@@ -1580,8 +1598,9 @@ fn iterator_adapter_modelled(ty: &Ty) -> bool {
     )
 }
 
-/// Whether the resolved `Iterator::fold` instance is served by
-/// core's `TrustedRandomAccess` specialization: the instance
+/// Whether the resolved `Iterator::fold` / `try_fold`
+/// instance is served by core's `TrustedRandomAccess`
+/// specialization: the instance
 /// body, followed through the adapter-helper bodies it
 /// delegates to (the `*Impl` / `Spec*` traits under
 /// `core::iter::adapters`), calls an unchecked-access entry
@@ -1591,7 +1610,7 @@ fn iterator_adapter_modelled(ty: &Ty) -> bool {
 /// those entries. The walk is bounded; any resolution or body
 /// failure answers "not specialized", keeping today's
 /// collection.
-fn fold_instance_tra_specialized(
+fn consumer_instance_tra_specialized(
     def: &rustc_public::ty::FnDef,
     args: &GenericArgs,
 ) -> bool {
@@ -1678,6 +1697,27 @@ fn index_self_modelled(ty: &Ty) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether this type is an iterator the modelled consumers
+/// cannot drain -- a hash-collection iterator or one of the
+/// concrete collection iterators -- possibly wrapped in
+/// adapter types whose steps compose the inner iterator's
+/// step, so an adapter over a body-served iterator is itself
+/// body-served. The Stable MIR counterpart of
+/// `builtins::body_served_iterator_tag` in sparagmos-interp,
+/// judged recursively over the ADT's generic arguments.
+fn body_served_iterator_ty(ty: &Ty) -> bool {
+    if hash_iterator_ty(ty) || collection_iterator_ty(ty) {
+        return true;
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(_, args))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    args.0.iter().any(|arg| {
+        matches!(arg, GenericArgKind::Type(inner)
+            if body_served_iterator_ty(inner))
+    })
 }
 
 /// Whether this type is a hash-collection iterator (the

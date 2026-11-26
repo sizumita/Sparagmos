@@ -2366,3 +2366,166 @@ fn run_mode_flatten_and_flat_map_next_back() {
         "front and back steps drain the composition symmetrically"
     );
 }
+
+const HASH_ITER_CONSUMERS_SRC: &str = r#"
+use std::collections::{HashMap, HashSet};
+fn main() {
+    let s: HashSet<i32> = [1, 2, 3, 4].into_iter().collect();
+    println!("all={}", s.iter().all(|x| *x > 0));
+    println!("all2={}", s.iter().all(|x| *x > 2));
+    println!("any={}", s.iter().any(|x| *x == 3));
+    println!("any2={}", s.iter().any(|x| *x == 9));
+    println!("find={:?}", s.iter().find(|x| **x == 3));
+    println!("position_some={}", s.iter().position(|x| *x == 3).is_some());
+    let mut it = s.iter();
+    println!("nth_some={} rest={}", it.nth(1).is_some(), it.count());
+    println!("count={} fold={}", s.iter().count(), s.iter().fold(0, |a, x| a + *x));
+    let m: HashMap<i32, i32> = [(1, 10), (2, 20), (3, 30)].into_iter().collect();
+    println!("mapall={}", m.iter().all(|(k, v)| *v == *k * 10));
+    println!("mapany={}", m.iter().any(|(k, _)| *k == 2));
+    println!("mapvalues={}", m.values().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_hash_iter_consumers() {
+    // The consumers that reach the iterator through
+    // `try_fold` (`all` / `any` / `find` / `position`) and
+    // `nth` over a hash-collection iterator: the builtin
+    // consumers drive the modelled `next` state machine,
+    // which cannot walk a raw table, so the collected
+    // instance bodies are the execution -- the same rule the
+    // older consumers (`count` / `fold`) already had. Every
+    // printed value is iteration-order independent (a hash
+    // table's order is not part of the contract).
+    let dir = temp_dir("hash_iter_consumers");
+    let src = fixture(&dir, "hash_iter_consumers.rs", HASH_ITER_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "try_fold / nth consumers over hash iterators must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "all=true\nall2=false\nany=true\nany2=false\nfind=Some(3)\nposition_some=true\nnth_some=true rest=2\ncount=4 fold=10\nmapall=true\nmapany=true\nmapvalues=60\n"
+    );
+}
+
+const CUSTOM_ITER_CONSUMERS_SRC: &str = r#"
+struct Count { n: u32, max: u32 }
+impl Iterator for Count {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.n < self.max { self.n += 1; Some(self.n) } else { None }
+    }
+}
+fn main() {
+    println!("uall={}", (Count { n: 0, max: 3 }).all(|x| x > 0));
+    println!("uany={}", (Count { n: 0, max: 3 }).any(|x| x == 2));
+    let mut it = Count { n: 0, max: 5 };
+    println!("unth={:?}", it.nth(2));
+    println!("ucount={}", (Count { n: 0, max: 4 }).count());
+}
+"#;
+
+#[test]
+fn run_mode_custom_iterator_consumers() {
+    // The same consumer rule for a user-defined iterator:
+    // its `next` is an ordinary collected body, so the
+    // `try_fold` / `nth` instance bodies that compose it are
+    // collected and preferred over the builtin consumers,
+    // exactly as for the hash iterators.
+    let dir = temp_dir("custom_iter_consumers");
+    let src = fixture(&dir, "custom_iter_consumers.rs", CUSTOM_ITER_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "try_fold / nth consumers over a user-defined iterator must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "uall=true\nuany=true\nunth=Some(3)\nucount=4\n"
+    );
+}
+
+const ADAPTER_OVER_HASH_COLLECT_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let s: HashSet<i32> = [1, 2, 3, 4, 5].into_iter().collect();
+    let mapped: Vec<i32> = s.iter().map(|x| *x + 1).collect();
+    println!("mapcollect={}", mapped.iter().sum::<i32>());
+    let filtered: Vec<i32> = s.iter().filter(|x| **x % 2 == 0).cloned().collect();
+    println!("filtercollect={} {}", filtered.len(), filtered.iter().sum::<i32>());
+    let cloned: Vec<i32> = s.iter().cloned().collect();
+    println!("clonedcollect={}", cloned.len());
+    let skipped: Vec<i32> = s.iter().skip(2).cloned().collect();
+    println!("skipcollect={}", skipped.len());
+    let taken: Vec<i32> = s.iter().take(2).cloned().collect();
+    println!("takecollect={}", taken.len());
+}
+"#;
+
+#[test]
+fn run_mode_adapter_over_hash_iter_collect() {
+    // Collecting an adapter over a hash iterator into a
+    // `Vec`: the nested / in-place collect entries are
+    // pre-empted by their builtin only for iterators the
+    // state machine drains, and an adapter's step composes
+    // its inner iterator's step, so an adapter over a
+    // body-served iterator is itself body-served -- the
+    // collected entry chain, stepping the adapter's own
+    // collected `next` body, is the execution.
+    let dir = temp_dir("adapter_hash_collect");
+    let src = fixture(&dir, "adapter_hash_collect.rs", ADAPTER_OVER_HASH_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collect of adapters over a hash iterator must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mapcollect=20\nfiltercollect=2 6\nclonedcollect=5\nskipcollect=3\ntakecollect=2\n"
+    );
+}
+
+const LINKED_LIST_ITER_CONSUMERS_SRC: &str = r#"
+use std::collections::LinkedList;
+fn main() {
+    let mut l: LinkedList<i32> = LinkedList::new();
+    l.push_back(1);
+    l.push_back(2);
+    l.push_back(3);
+    println!("llall={}", l.iter().all(|x| *x > 0));
+    println!("llany={}", l.iter().any(|x| *x == 2));
+    println!("llcount={}", l.iter().count());
+    let mut it = l.iter();
+    println!("llnth={:?}", it.nth(1));
+}
+"#;
+
+#[test]
+fn run_mode_linked_list_iter_consumers() {
+    // The concrete collection iterators share the hash
+    // iterators' arrangement (their `next` bodies are the
+    // faithful execution), so the `try_fold` / `nth`
+    // consumers over them follow the same rule.
+    let dir = temp_dir("linked_list_iter_consumers");
+    let src = fixture(&dir, "linked_list_iter_consumers.rs", LINKED_LIST_ITER_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "try_fold / nth consumers over a LinkedList iterator must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "llall=true\nllany=true\nllcount=3\nllnth=Some(2)\n"
+    );
+}

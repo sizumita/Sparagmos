@@ -109,8 +109,8 @@ pub(crate) use self::views::*;
 pub(crate) use self::waker::*;
 
 pub use self::iterators::{
-    hash_collection_tag, hash_iterator_tag, iterator_consumer_modelled, iterator_len_modelled,
-    iterator_next_back_modelled, iterator_next_modelled,
+    body_served_iterator_tag, hash_collection_tag, hash_iterator_tag, iterator_consumer_modelled,
+    iterator_len_modelled, iterator_next_back_modelled, iterator_next_modelled,
 };
 pub use self::lookup::{
     consumes_caller_location, fmt_trait_method, foreign_helper_lookup, intrinsic_lookup, lookup,
