@@ -674,6 +674,50 @@ impl<'a> Interpreter<'a> {
                     })
                 }
             }
+            Builtin::EnvVars | Builtin::EnvVarsOs => {
+                arity(0)?;
+                // A snapshot of the host environment at the call,
+                // in environ order. The guest runs in-process, so
+                // the host environment is the guest's environment:
+                // the same source `EnvGetenv` / `EnvVarInner`
+                // read and `EnvSetenv` / `EnvUnsetenv` mutate, so
+                // an enumeration always agrees with single-key
+                // lookups. The wrapper shape matches the real std
+                // layout -- `Vars { inner: VarsOs }`, `VarsOs {
+                // inner: sys::env::Env }`, and the common `Env {
+                // iter: vec::IntoIter<(OsString, OsString)> }` --
+                // because std's own `Iterator::next` / `size_hint`
+                // bodies for `Vars` / `VarsOs` / `Env` are
+                // collected and run against this value. The
+                // innermost value is the `vec::IntoIter` in this
+                // model's iteration-state shape ([element
+                // snapshot, next index]).
+                use std::os::unix::ffi::OsStrExt as _;
+                let items: Vec<Value> = std::env::vars_os()
+                    .map(|(k, v)| {
+                        Value::Tuple(vec![
+                            os_string_value(k.as_bytes()),
+                            os_string_value(v.as_bytes()),
+                        ])
+                    })
+                    .collect();
+                let common_env = Value::Enum {
+                    variant: 0,
+                    fields: vec![owned_iter_state(items)],
+                };
+                let vars_os = Value::Enum {
+                    variant: 0,
+                    fields: vec![common_env],
+                };
+                if kind == Builtin::EnvVarsOs {
+                    Ok(vars_os)
+                } else {
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![vars_os],
+                    })
+                }
+            }
             Builtin::ProcessExit => {
                 arity(1)?;
                 let code = as_i128(&vals[0], name)? as i32;
@@ -9270,11 +9314,14 @@ impl<'a> Interpreter<'a> {
             Ok(slice_iter_value(elems))
         } else if self_ty_is(self_ty, "std::env::Args")
             || self_ty_is(self_ty, "std::env::ArgsOs")
+            || self_ty_is(self_ty, "std::env::Vars")
+            || self_ty_is(self_ty, "std::env::VarsOs")
             || self_ty_is(self_ty, "std::env::SplitPaths")
             || self_ty.starts_with("std::slice::Windows<")
         {
-            // The env argument iterators are their own
-            // `IntoIterator` (the state `env::args` built).
+            // The env argument and environment iterators are
+            // their own `IntoIterator` (the states `env::args`
+            // and `env::vars` built).
             Ok(value)
         } else if self_ty.starts_with("std::vec::Vec<")
             || self_ty.starts_with("alloc::vec::Vec<")
