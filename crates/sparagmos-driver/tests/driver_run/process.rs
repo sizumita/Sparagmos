@@ -791,6 +791,89 @@ fn run_mode_process_host_self_reexec() {
     assert!(stderr.contains("child-stderr"), "stderr={stderr}");
 }
 
+const PROCESS_HOST_SELF_SPAWN_SRC: &str = r#"
+use std::env;
+use std::io::Read;
+use std::process::{Command, Stdio};
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "child" {
+        eprintln!("spawned-child-stderr");
+        println!("spawned-child-stdout");
+        std::process::exit(3);
+    }
+    // spawn + wait_with_output: the child's stderr reaches
+    // the guest as a stream, as it does for a host child.
+    let out = Command::new(&args[0])
+        .arg("child")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "spawned-child-stdout\n"
+    );
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "spawned-child-stderr\n"
+    );
+    // Reading the stderr handle before wait observes the
+    // same stream.
+    let mut child = Command::new(&args[0])
+        .arg("child")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut text = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "spawned-child-stderr\n");
+    assert_eq!(child.wait().unwrap().code(), Some(3));
+    // The same through the guest's own executable path.
+    let me = env::current_exe().unwrap();
+    let out = Command::new(&me)
+        .arg("child")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "spawned-child-stderr\n"
+    );
+    println!("process-host-self-spawn-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_self_spawn_stderr() {
+    let dir = temp_dir("proc-host-self-spawn");
+    let src = fixture(
+        &dir,
+        "process_host_self_spawn.rs",
+        PROCESS_HOST_SELF_SPAWN_SRC,
+    );
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-self-spawn-ok\n"
+    );
+}
+
 const PROCESS_HOST_FAILURE_SRC: &str = r#"
 use std::io::ErrorKind;
 use std::process::Command;

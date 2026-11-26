@@ -44,8 +44,9 @@ pub(crate) struct HostChild {
     /// interpreter at spawn, so there is nothing to drain.
     diag: Option<std::thread::JoinHandle<Vec<u8>>>,
     /// A self-child's guest-stderr channel file (the guest
-    /// reads its end through the interpreter); removed once
-    /// the child's end has been observed.
+    /// reads the stream fed from it through the interpreter;
+    /// see `guest_stderr_stream`); removed once the child's
+    /// end has been observed.
     stderr_file: Option<std::path::PathBuf>,
     self_run: bool,
     /// The exit code once the end has been observed, so
@@ -110,6 +111,58 @@ fn drain_pipe<R: std::io::Read>(mut pipe: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = pipe.read_to_end(&mut buf);
     buf
+}
+
+/// The guest-visible stderr stream of a spawned self-child:
+/// a pipe fed by a thread tailing the guest-stderr channel
+/// file. The nested driver writes the guest's stderr to the
+/// file (its own stderr is the diagnostic stream), but the
+/// file itself cannot be the guest's stream: a plain file's
+/// reads answer end-of-file as soon as they reach the bytes
+/// written so far, so a guest reading its child's stderr
+/// while the child still runs observes an empty stream. The
+/// pipe restores the native shape -- reads wait for the
+/// child's writes, and the stream ends once the child has
+/// ended (signalled by the diagnostic drain's completion)
+/// and the file's remaining bytes have been carried over.
+fn guest_stderr_stream(
+    file: &std::path::Path,
+    diag_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::fs::File> {
+    use std::io::{Read as _, Write as _};
+    let mut source = std::fs::File::open(file).ok()?;
+    let (reader, mut writer) = std::io::pipe().ok()?;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        // Set once the child's end is observed: the stream
+        // finishes after one more drain pass, so bytes the
+        // child wrote just before ending are not left behind.
+        let mut final_pass = false;
+        loop {
+            match source.read(&mut buf) {
+                Ok(0) => {
+                    if final_pass {
+                        break;
+                    }
+                    if diag_done
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        final_pass = true;
+                    }
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(5),
+                    );
+                }
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Some(pipe_file(reader))
 }
 
 /// One host child being run to completion for a
@@ -436,9 +489,9 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             .stderr(std::process::Stdio::piped());
         if self_run {
             // The guest-stderr channel file exists before the
-            // child starts, so its read end can be handed over
-            // now; the nested driver writes through its own
-            // handle on the same file.
+            // child starts, so the stream feeding the guest
+            // can open it now; the nested driver writes
+            // through its own handle on the same file.
             if let Some(file) = &stderr_file {
                 let _ = std::fs::File::create(file);
             }
@@ -449,11 +502,25 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         let stdout = child.stdout.take().map(pipe_file);
         let (stderr, diag) = if self_run {
             let pipe = child.stderr.take().expect("piped stderr");
-            let drain =
-                std::thread::spawn(move || drain_pipe(pipe));
-            let guest = stderr_file
-                .as_ref()
-                .and_then(|file| std::fs::File::open(file).ok());
+            // The diagnostic stream closes when the nested
+            // process ends; the drain's completion is what
+            // ends the guest's stderr stream (see
+            // `guest_stderr_stream`).
+            let diag_done = std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            );
+            let flag = diag_done.clone();
+            let drain = std::thread::spawn(move || {
+                let drained = drain_pipe(pipe);
+                flag.store(
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                drained
+            });
+            let guest = stderr_file.as_ref().and_then(|file| {
+                guest_stderr_stream(file, diag_done)
+            });
             (guest, Some(drain))
         } else {
             (child.stderr.take().map(pipe_file), None)
