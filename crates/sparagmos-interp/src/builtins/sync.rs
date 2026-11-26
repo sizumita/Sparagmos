@@ -5,7 +5,7 @@
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     channel_handle_id,
-    Frame, Interpreter,
+    Frame, Interpreter, Resolved,
 };
 use crate::value::{RefProj, Value};
 
@@ -84,6 +84,417 @@ impl<'a> Interpreter<'a> {
         } else {
             unsupported(self.block_forever_message(name, situation))
         }
+    }
+
+
+    /// The wait at the heart of the contended sys lock
+    /// acquisitions: run scheduling rounds until `attempt`
+    /// takes the lock. A round that makes no progress leaves
+    /// the wait unservable from here — one final attempt (the
+    /// holder may have released the lock on its way into a
+    /// block, which the round does not count as progress),
+    /// then the outcome of [`Self::block_or_suspend`]: a
+    /// spawned thread parks, and its re-activation re-runs the
+    /// whole builtin, re-checking the word from scratch.
+    pub(super) fn wait_for_sys_lock(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        name: &str,
+        situation: &str,
+        mut attempt: impl FnMut(&mut Self, &mut Vec<Frame>) -> InterpResult<bool>,
+    ) -> InterpResult<Value> {
+        loop {
+            if attempt(self, frames)? {
+                return Ok(Value::Unit);
+            }
+            self.tick_step()?;
+            let (_, progressed) = self.schedule_round(frames)?;
+            if !progressed {
+                if attempt(self, frames)? {
+                    return Ok(Value::Unit);
+                }
+                return Err(self.block_or_suspend(name, situation));
+            }
+        }
+    }
+
+    /// `std::sys::sync::mutex::futex::Mutex::lock_contended`:
+    /// the fast path's compare-exchange found the mutex held,
+    /// so wait for the holder to release it and take it. The
+    /// body's spin is the scheduler's business in this model —
+    /// waiting means running the other threads until the word
+    /// changes (see [`Self::wait_for_sys_lock`]).
+    pub(super) fn sys_mutex_lock_contended(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, arg)?;
+        self.wait_for_sys_lock(
+            frames,
+            name,
+            "the mutex is locked and no pending thread can release it",
+            move |this, frames| this.sys_mutex_contended_attempt(frames, &target, name),
+        )
+    }
+
+    /// One acquisition attempt of the sys mutex's contended
+    /// path: take the lock if the word is unlocked, otherwise
+    /// mark it contended — the holder's unlock then takes its
+    /// wake path — and report that the caller must wait. The
+    /// read, the mark and the take are one builtin step: no
+    /// other thread runs between them, so they compose exactly
+    /// like the body's compare-exchange and swap.
+    pub(super) fn sys_mutex_contended_attempt(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        name: &str,
+    ) -> InterpResult<bool> {
+        self.modify_resolved(frames, target, |value| {
+            if sys_lock_word(value).is_none() {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys mutex value",
+                    value.kind_name(),
+                ));
+            }
+            let slot = sys_lock_word_mut(value).expect("the word shape was just read");
+            let state = *slot as u32;
+            if state == SYS_MUTEX_UNLOCKED {
+                *slot = u128::from(SYS_MUTEX_LOCKED);
+                Ok(true)
+            } else {
+                if state == SYS_MUTEX_LOCKED {
+                    *slot = u128::from(SYS_MUTEX_CONTENDED);
+                }
+                Ok(false)
+            }
+        })
+    }
+
+    /// `std::sys::sync::rwlock::futex::RwLock::read_contended`:
+    /// wait until the rwlock can be read-locked and take a
+    /// read lock.
+    pub(super) fn sys_rwlock_read_contended(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, arg)?;
+        // The body's `has_slept`: any attempt past the first
+        // in this activation runs after a wait (a scheduling
+        // round), which is when the downgrade handoff case of
+        // `is_read_lockable_after_wakeup` applies. A resumed
+        // activation starts un-slept again, which only costs
+        // the stricter check once.
+        let mut attempts = 0usize;
+        self.wait_for_sys_lock(
+            frames,
+            name,
+            "the rwlock cannot be read-locked and no pending thread can change that",
+            move |this, frames| {
+                attempts += 1;
+                this.sys_rwlock_read_attempt(frames, &target, attempts > 1, name)
+            },
+        )
+    }
+
+    /// One acquisition attempt of the sys rwlock's contended
+    /// read path (see [`Self::sys_rwlock_read_contended`]):
+    /// take a read lock when the state allows it, otherwise
+    /// set the readers-waiting bit and report that the caller
+    /// must wait.
+    pub(super) fn sys_rwlock_read_attempt(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        has_slept: bool,
+        name: &str,
+    ) -> InterpResult<bool> {
+        self.modify_resolved(frames, target, |value| {
+            if sys_rwlock_state(value).is_none() {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys rwlock value",
+                    value.kind_name(),
+                ));
+            }
+            let slot = sys_rwlock_state_mut(value).expect("the word shape was just read");
+            let state = *slot as u32;
+            if (has_slept && sys_rwlock_is_read_lockable_after_wakeup(state))
+                || sys_rwlock_is_read_lockable(state)
+            {
+                *slot = u128::from(state + SYS_RWLOCK_READ_LOCKED);
+                Ok(true)
+            } else if state & SYS_RWLOCK_MASK == SYS_RWLOCK_MAX_READERS {
+                // The body's assertion: the reader count is
+                // full.
+                Err(InterpError::Panic {
+                    message: "too many active read locks on RwLock".to_string(),
+                    payload: None,
+                })
+            } else {
+                if state & SYS_RWLOCK_READERS_WAITING == 0 {
+                    *slot = u128::from(state | SYS_RWLOCK_READERS_WAITING);
+                }
+                Ok(false)
+            }
+        })
+    }
+
+    /// `std::sys::sync::rwlock::futex::RwLock::write_contended`:
+    /// wait until the rwlock is unlocked and take the write
+    /// lock.
+    pub(super) fn sys_rwlock_write_contended(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, arg)?;
+        // The body's `other_writers_waiting`: once this call
+        // has waited, the writers-waiting bit stays on across
+        // its own acquisition, so the unlock that follows
+        // routes the wake to the next writer.
+        let mut other_writers_waiting = 0u32;
+        self.wait_for_sys_lock(
+            frames,
+            name,
+            "the rwlock is locked and no pending thread can release it",
+            move |this, frames| {
+                this.sys_rwlock_write_attempt(
+                    frames,
+                    &target,
+                    &mut other_writers_waiting,
+                    name,
+                )
+            },
+        )
+    }
+
+    /// One acquisition attempt of the sys rwlock's contended
+    /// write path (see [`Self::sys_rwlock_write_contended`]):
+    /// take the write lock when the state is unlocked,
+    /// otherwise set the writers-waiting bit and report that
+    /// the caller must wait.
+    pub(super) fn sys_rwlock_write_attempt(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        other_writers_waiting: &mut u32,
+        name: &str,
+    ) -> InterpResult<bool> {
+        self.modify_resolved(frames, target, |value| {
+            if sys_rwlock_state(value).is_none() {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys rwlock value",
+                    value.kind_name(),
+                ));
+            }
+            let slot = sys_rwlock_state_mut(value).expect("the word shape was just read");
+            let state = *slot as u32;
+            if sys_rwlock_is_unlocked(state) {
+                *slot = u128::from(
+                    state | SYS_RWLOCK_WRITE_LOCKED | *other_writers_waiting,
+                );
+                Ok(true)
+            } else {
+                if state & SYS_RWLOCK_WRITERS_WAITING == 0 {
+                    *slot = u128::from(state | SYS_RWLOCK_WRITERS_WAITING);
+                }
+                *other_writers_waiting = SYS_RWLOCK_WRITERS_WAITING;
+                Ok(false)
+            }
+        })
+    }
+
+    /// `std::sys::sync::rwlock::futex::RwLock::wake_writer_or_readers`:
+    /// the caller's unlock left the lock unlocked with the
+    /// waiting bits of `state` set; route the next
+    /// acquisition, exactly as the body does: a lone waiting
+    /// writer is handed the lock through the writer-notify
+    /// word, waiting readers keep priority over a second
+    /// writer only when no writer could be woken, and readers
+    /// alone are woken by clearing their bit — in this model
+    /// the cleared word, observed at the waiters' next
+    /// activation, is the wake.
+    pub(super) fn sys_rwlock_wake_writer_or_readers(
+        &self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        state: u32,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, arg)?;
+        let mut state = state;
+        // If only writers are waiting, wake one of them.
+        if state == SYS_RWLOCK_WRITERS_WAITING {
+            match self.sys_rwlock_state_cas(frames, &target, state, 0, name)? {
+                Ok(()) => {
+                    self.sys_rwlock_wake_writer(frames, &target, name)?;
+                    return Ok(Value::Unit);
+                }
+                Err(current) => state = current,
+            }
+        }
+        // If both writers and readers are waiting, leave the
+        // readers waiting and wake one writer.
+        if state == SYS_RWLOCK_READERS_WAITING + SYS_RWLOCK_WRITERS_WAITING {
+            if self
+                .sys_rwlock_state_cas(
+                    frames,
+                    &target,
+                    state,
+                    SYS_RWLOCK_READERS_WAITING,
+                    name,
+                )?
+                .is_err()
+            {
+                // The lock got locked in the meantime; its new
+                // holder routes the next wake.
+                return Ok(Value::Unit);
+            }
+            if self.sys_rwlock_wake_writer(frames, &target, name)? {
+                return Ok(Value::Unit);
+            }
+            state = SYS_RWLOCK_READERS_WAITING;
+        }
+        // If readers are waiting, wake them all.
+        if state == SYS_RWLOCK_READERS_WAITING {
+            let _ = self.sys_rwlock_state_cas(frames, &target, state, 0, name)?;
+        }
+        Ok(Value::Unit)
+    }
+
+    /// The compare-exchange on the sys rwlock's state word
+    /// that the wake routing is built from: `Ok(())` when the
+    /// word held `expected` and now holds `new`, `Err(word)`
+    /// with the word as it stands otherwise. One builtin
+    /// step, so no other thread runs between the check and
+    /// the set.
+    pub(super) fn sys_rwlock_state_cas(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        expected: u32,
+        new: u32,
+        name: &str,
+    ) -> InterpResult<Result<(), u32>> {
+        self.modify_resolved(frames, target, |value| {
+            if sys_rwlock_state(value).is_none() {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys rwlock value",
+                    value.kind_name(),
+                ));
+            }
+            let slot = sys_rwlock_state_mut(value).expect("the word shape was just read");
+            let state = *slot as u32;
+            if state == expected {
+                *slot = u128::from(new);
+                Ok(Ok(()))
+            } else {
+                Ok(Err(state))
+            }
+        })
+    }
+
+    /// Wake one writer waiting on the sys rwlock: bump the
+    /// writer-notify word, whose change is what a waiting
+    /// writer's next activation observes. Returns the futex
+    /// wake's result: whether a writer was actually blocked
+    /// on the notify word. This model keeps no per-lock wait
+    /// queue, so it cannot know — and, like the platforms std
+    /// notes always report `false`, it reports that none was
+    /// woken: the caller's fallback then wakes the readers as
+    /// well, and every waiter re-checks the state word at its
+    /// next activation, so the extra wake is unobservable.
+    pub(super) fn sys_rwlock_wake_writer(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        name: &str,
+    ) -> InterpResult<bool> {
+        self.modify_resolved(frames, target, |value| {
+            if sys_rwlock_notify_word(value).is_none() {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys rwlock value",
+                    value.kind_name(),
+                ));
+            }
+            let slot =
+                sys_rwlock_notify_word_mut(value).expect("the word shape was just read");
+            *slot = u128::from((*slot as u32).wrapping_add(1));
+            Ok(false)
+        })
+    }
+
+
+    /// `std::sys::sync::futex::unix::futex_wait`: wait until
+    /// the futex word differs from `expected` — the platform
+    /// primitive the sys locks, `Once`, the condvar and the
+    /// thread parker sleep on. Returns at once (`true`) when
+    /// the word has already changed; otherwise the wait runs
+    /// scheduling rounds like the lock waits (see
+    /// [`Self::wait_for_sys_lock`]). A timed wait whose word
+    /// no pending thread can change reports the timeout
+    /// (`false`): natively the thread would sleep on until
+    /// its deadline with the same outcome, and no thread
+    /// could have woken it in between.
+    pub(super) fn futex_wait(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        arg: &Value,
+        expected: u32,
+        has_timeout: bool,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, arg)?;
+        loop {
+            if self.futex_word_differs(frames, &target, expected, name)? {
+                return Ok(Value::Bool(true));
+            }
+            self.tick_step()?;
+            let (_, progressed) = self.schedule_round(frames)?;
+            if !progressed {
+                if self.futex_word_differs(frames, &target, expected, name)? {
+                    return Ok(Value::Bool(true));
+                }
+                if has_timeout {
+                    return Ok(Value::Bool(false));
+                }
+                return Err(self.block_or_suspend(
+                    name,
+                    "the futex word is unchanged and no pending thread can change it",
+                ));
+            }
+        }
+    }
+
+    /// Whether the futex word `target` denotes currently
+    /// differs from `expected` (the check `futex_wait` makes
+    /// before sleeping and after every wake).
+    pub(super) fn futex_word_differs(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        expected: u32,
+        name: &str,
+    ) -> InterpResult<bool> {
+        let value = self.read_resolved(frames, target)?;
+        let word = sys_lock_word(&value).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a futex word",
+                value.kind_name(),
+            )
+        })?;
+        Ok(word != expected)
     }
 
     /// `Sender::send` / `SyncSender::send`: enqueue the value,
@@ -425,4 +836,124 @@ pub(super) fn child_handle_id(value: &Value) -> Option<u64> {
         Some(Value::Int(id)) => Some(*id as u64),
         _ => None,
     }
+}
+
+// ----- The futex-backed sys locks (std's `sys::sync` layer) -----
+
+/// The sys mutex's futex word states (std's
+/// `sys::sync::mutex::futex`): unlocked, locked, and locked
+/// with waiters.
+const SYS_MUTEX_UNLOCKED: u32 = 0;
+const SYS_MUTEX_LOCKED: u32 = 1;
+const SYS_MUTEX_CONTENDED: u32 = 2;
+
+/// The sys rwlock's state word layout (std's
+/// `sys::sync::rwlock::futex`): the low 30 bits count the
+/// readers (all bits set is the write lock), bit 30 marks
+/// readers waiting and bit 31 marks writers waiting. The
+/// second word, `writer_notify`, is a sequence counter
+/// writers wait on.
+const SYS_RWLOCK_READ_LOCKED: u32 = 1;
+const SYS_RWLOCK_MASK: u32 = (1 << 30) - 1;
+const SYS_RWLOCK_WRITE_LOCKED: u32 = SYS_RWLOCK_MASK;
+const SYS_RWLOCK_MAX_READERS: u32 = SYS_RWLOCK_MASK - 1;
+const SYS_RWLOCK_READERS_WAITING: u32 = 1 << 30;
+const SYS_RWLOCK_WRITERS_WAITING: u32 = 1 << 31;
+
+/// Whether the sys rwlock state is unlocked (std's
+/// `is_unlocked`).
+pub(super) fn sys_rwlock_is_unlocked(state: u32) -> bool {
+    state & SYS_RWLOCK_MASK == 0
+}
+
+/// Whether a reader may take the sys rwlock in `state`
+/// (std's `is_read_lockable`).
+pub(super) fn sys_rwlock_is_read_lockable(state: u32) -> bool {
+    state & SYS_RWLOCK_MASK < SYS_RWLOCK_MAX_READERS
+        && state & SYS_RWLOCK_READERS_WAITING == 0
+        && state & SYS_RWLOCK_WRITERS_WAITING == 0
+}
+
+/// Whether a woken reader may take the sys rwlock in
+/// `state` (std's `is_read_lockable_after_wakeup`: the
+/// downgrade handoff case, where the lock is already
+/// read-locked and writers may be waiting).
+pub(super) fn sys_rwlock_is_read_lockable_after_wakeup(state: u32) -> bool {
+    state & SYS_RWLOCK_MASK < SYS_RWLOCK_MAX_READERS
+        && state & SYS_RWLOCK_READERS_WAITING == 0
+        && state & SYS_RWLOCK_MASK != SYS_RWLOCK_WRITE_LOCKED
+        && !sys_rwlock_is_unlocked(state)
+}
+
+/// The futex word at the bottom of a sys lock field's
+/// wrapper chain: a sys lock stores each futex as an atomic
+/// cell around the word, and the conversion's value for the
+/// chain is single-field aggregates down to the word
+/// itself. `None` for any other shape.
+pub(super) fn sys_lock_word(value: &Value) -> Option<u32> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Uint(n) => return Some(*n as u32),
+            Value::Enum { fields, .. } if fields.len() == 1 => cur = &fields[0],
+            Value::Tuple(fields) if fields.len() == 1 => cur = &fields[0],
+            _ => return None,
+        }
+    }
+}
+
+/// The mutable futex word at the bottom of a sys lock
+/// field's wrapper chain (see [`sys_lock_word`]).
+pub(super) fn sys_lock_word_mut(value: &mut Value) -> Option<&mut u128> {
+    match value {
+        Value::Uint(n) => Some(n),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            sys_lock_word_mut(fields.get_mut(0)?)
+        }
+        Value::Tuple(fields) if fields.len() == 1 => {
+            sys_lock_word_mut(fields.get_mut(0)?)
+        }
+        _ => None,
+    }
+}
+
+/// Field `index` of a sys lock value (the sys rwlock's two
+/// futex fields, in declaration order).
+pub(super) fn sys_lock_field(value: &Value, index: usize) -> Option<&Value> {
+    match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields.get(index),
+        _ => None,
+    }
+}
+
+/// Mutable field `index` of a sys lock value (see
+/// [`sys_lock_field`]).
+pub(super) fn sys_lock_field_mut(value: &mut Value, index: usize) -> Option<&mut Value> {
+    match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => fields.get_mut(index),
+        _ => None,
+    }
+}
+
+/// The sys rwlock's `state` word (its first field).
+pub(super) fn sys_rwlock_state(value: &Value) -> Option<u32> {
+    sys_lock_word(sys_lock_field(value, 0)?)
+}
+
+/// The mutable sys rwlock `state` word (see
+/// [`sys_rwlock_state`]).
+pub(super) fn sys_rwlock_state_mut(value: &mut Value) -> Option<&mut u128> {
+    sys_lock_word_mut(sys_lock_field_mut(value, 0)?)
+}
+
+/// The sys rwlock's `writer_notify` word (its second
+/// field).
+pub(super) fn sys_rwlock_notify_word(value: &Value) -> Option<u32> {
+    sys_lock_word(sys_lock_field(value, 1)?)
+}
+
+/// The mutable sys rwlock `writer_notify` word (see
+/// [`sys_rwlock_notify_word`]).
+pub(super) fn sys_rwlock_notify_word_mut(value: &mut Value) -> Option<&mut u128> {
+    sys_lock_word_mut(sys_lock_field_mut(value, 1)?)
 }

@@ -1559,3 +1559,183 @@ fn run_mode_rwlock_debug_format() {
          write guard shows the bare <locked> placeholder"
     );
 }
+
+// ----- Contended sys locks (futex-backed Mutex / RwLock) -----
+
+const MUTEX_CONTENDED_SRC: &str = r#"use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let m = Arc::new(Mutex::new(0u32));
+    let m1 = Arc::clone(&m);
+    let h1 = thread::spawn(move || {
+        let mut g = m1.lock().unwrap();
+        *g += 1;
+        // Hold the lock across a long computation: the
+        // scheduler quantum expires many times before the
+        // unlock, so the second thread's lock below is
+        // genuinely contended and must wait for the holder.
+        let mut s = 0u64;
+        for i in 0..200_000u64 {
+            s = s.wrapping_add(i);
+        }
+        std::hint::black_box(s);
+        *g += 1;
+    });
+    let m2 = Arc::clone(&m);
+    let h2 = thread::spawn(move || {
+        let mut g = m2.lock().unwrap();
+        *g += 10;
+    });
+    h1.join().unwrap();
+    h2.join().unwrap();
+    let v = *m.lock().unwrap();
+    assert_eq!(v, 12);
+    println!("mutex contention ok: {v}");
+}
+"#;
+
+#[test]
+fn run_mode_mutex_contended_lock_waits_for_holder() {
+    let dir = temp_dir("mutex-contended");
+    let src = fixture(&dir, "mutex_contended.rs", MUTEX_CONTENDED_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mutex contention ok: 12\n"
+    );
+}
+
+const RWLOCK_CONTENDED_SRC: &str = r#"use std::sync::{Arc, RwLock};
+use std::thread;
+
+fn spin() {
+    let mut s = 0u64;
+    for i in 0..200_000u64 {
+        s = s.wrapping_add(i);
+    }
+    std::hint::black_box(s);
+}
+
+fn main() {
+    let l = Arc::new(RwLock::new(0u32));
+    let l1 = Arc::clone(&l);
+    let h1 = thread::spawn(move || {
+        let mut g = l1.write().unwrap();
+        *g += 1;
+        spin();
+        *g += 1;
+    });
+    let l3 = Arc::clone(&l);
+    let h3 = thread::spawn(move || {
+        let g = l3.read().unwrap();
+        std::hint::black_box(*g);
+    });
+    let l2 = Arc::clone(&l);
+    let h2 = thread::spawn(move || {
+        let mut g = l2.write().unwrap();
+        *g += 10;
+    });
+    h1.join().unwrap();
+    h3.join().unwrap();
+    h2.join().unwrap();
+    let v = *l.read().unwrap();
+    assert_eq!(v, 12);
+    println!("rwlock contention ok: {v}");
+}
+"#;
+
+#[test]
+fn run_mode_rwlock_contended_locks_wait_for_holder() {
+    let dir = temp_dir("rwlock-contended");
+    let src = fixture(&dir, "rwlock_contended.rs", RWLOCK_CONTENDED_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "rwlock contention ok: 12\n"
+    );
+}
+
+const MUTEX_SELF_DEADLOCK_SRC: &str = r#"use std::sync::Mutex;
+fn main() {
+    let m = Mutex::new(1u32);
+    let _first = m.lock().unwrap();
+    // A second lock while the first guard is alive deadlocks
+    // natively; the model must report the unservable wait
+    // rather than fabricate an acquisition.
+    let _second = m.lock().unwrap();
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_mutex_self_deadlock_is_reported_not_served() {
+    let dir = temp_dir("mutex-self-deadlock");
+    let src = fixture(&dir, "mutex_self_deadlock.rs", MUTEX_SELF_DEADLOCK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("would block forever"),
+        "stderr={stderr}"
+    );
+}
+
+const RWLOCK_DOWNGRADE_SRC: &str = r#"use std::sync::{Arc, RwLock};
+use std::thread;
+
+fn spin() {
+    let mut s = 0u64;
+    for i in 0..200_000u64 {
+        s = s.wrapping_add(i);
+    }
+    std::hint::black_box(s);
+}
+
+fn main() {
+    let l = Arc::new(RwLock::new(5u32));
+    let l1 = Arc::clone(&l);
+    let h1 = thread::spawn(move || {
+        let mut g = l1.write().unwrap();
+        *g += 1;
+        spin();
+        let g = std::sync::RwLockWriteGuard::downgrade(g);
+        assert_eq!(*g, 6);
+        spin();
+    });
+    let l3 = Arc::clone(&l);
+    let h3 = thread::spawn(move || {
+        let g = l3.read().unwrap();
+        std::hint::black_box(*g);
+    });
+    h1.join().unwrap();
+    h3.join().unwrap();
+    println!("downgrade ok");
+}
+"#;
+
+#[test]
+fn run_mode_rwlock_downgrade_releases_waiting_reader() {
+    let dir = temp_dir("rwlock-downgrade");
+    let src = fixture(&dir, "rwlock_downgrade.rs", RWLOCK_DOWNGRADE_SRC);
+    let out = run_driver(&src);
+    assert!(
+        out.status.success(),
+        "status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "downgrade ok\n");
+}

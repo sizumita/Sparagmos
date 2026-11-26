@@ -857,6 +857,31 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::thread::spawn" | "std::thread::spawn_unchecked" => Builtin::ThreadSpawn,
         "std::sync::Barrier::new" => Builtin::BarrierNew,
         "std::sync::Barrier::wait" => Builtin::BarrierWait,
+        // The futex-backed sys locks (std's `sys::sync`
+        // layer): the fast paths are plain atomic operations
+        // the converted bodies serve, but the contended paths
+        // sleep on a futex and have no converted body; the
+        // builtins model the waiting on the cooperative
+        // scheduler instead (see `builtins::sync`).
+        "std::sys::sync::mutex::futex::Mutex::lock_contended" => {
+            Builtin::SysMutexLockContended
+        }
+        "std::sys::sync::mutex::futex::Mutex::wake" => Builtin::SysMutexWake,
+        "std::sys::sync::rwlock::futex::RwLock::read_contended" => {
+            Builtin::SysRwLockReadContended
+        }
+        "std::sys::sync::rwlock::futex::RwLock::write_contended" => {
+            Builtin::SysRwLockWriteContended
+        }
+        "std::sys::sync::rwlock::futex::RwLock::wake_writer_or_readers" => {
+            Builtin::SysRwLockWakeWriterOrReaders
+        }
+        // The futex primitives themselves: bodies that ARE
+        // converted (the rwlock's `downgrade`, `Once`, the
+        // condvar, the thread parker) call them directly.
+        "std::sys::sync::futex::unix::futex_wait" => Builtin::FutexWait,
+        "std::sys::sync::futex::unix::futex_wake" => Builtin::FutexWake,
+        "std::sys::sync::futex::unix::futex_wake_all" => Builtin::FutexWakeAll,
         "std::backtrace::Backtrace::capture" => Builtin::BacktraceCapture,
         "std::backtrace::Backtrace::force_capture" => {
             Builtin::BacktraceForceCapture
