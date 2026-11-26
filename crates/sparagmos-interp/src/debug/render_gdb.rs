@@ -3,8 +3,10 @@
 use crate::interp::Interpreter;
 use crate::value::Value;
 use super::desc::{Desc, dwarf_type_name, split_top_level};
-use super::queries::nonzero_scalar;
-use super::render_lldb::{render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width};
+use super::queries::{desc_type_name, nonzero_scalar};
+use super::render_lldb::{
+    escape_str, render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width,
+};
 use super::session::{DebugDialect, PrintFormat};
 
 /// The deepest aggregate nesting the renderers unfold. A value
@@ -150,10 +152,26 @@ pub(super) fn render_gdb(
             let shape = interp.program().adt_debug_shapes.get(tag)?;
             render_adt_gdb(interp, tag, shape, *variant, fields, depth)
         }
-        Value::Ref(_)
-        | Value::FatRef { .. }
-        | Value::DynRef { .. }
-        | Value::FnPtr(_) => {
+        Value::Str(s) => {
+            // gdb prints a `str` value -- a `&str` place, or a
+            // str place a dereference reached -- as its text.
+            // A `String`/`OsString` place holds the same value
+            // form, but gdb prints those as their struct
+            // expansion; the descriptor tells the two apart, and
+            // the expansion is not this arm's to synthesize.
+            if str_place_desc(desc) {
+                Some(format!("\"{}\"", escape_str(s)))
+            } else {
+                None
+            }
+        }
+        Value::FatRef { base, len } => {
+            render_fat_ref_gdb(value, base, *len, desc)
+        }
+        Value::DynRef {
+            concrete, traits, ..
+        } => render_dyn_ref_gdb(value, concrete, traits, desc),
+        Value::Ref(_) | Value::FnPtr(_) => {
             let addr = crate::interp::synthetic_address(value)?;
             // A pointer to the unit type prints with its type
             // in cast form (`(*mut ()) 0x...`): the unit type
@@ -180,6 +198,103 @@ pub(super) fn render_gdb(
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether a descriptor names a `str` place itself or a
+/// pointer-like place (a reference or a raw pointer) whose
+/// pointee is `str`: the places gdb prints as the string text.
+pub(super) fn str_place_desc(desc: Option<&Desc>) -> bool {
+    match desc {
+        Some(Desc::Str) => true,
+        Some(
+            Desc::Ref(inner)
+            | Desc::RefMut(inner)
+            | Desc::PtrConst(inner)
+            | Desc::PtrMut(inner),
+        ) => matches!(inner.as_ref(), Desc::Str),
+        _ => false,
+    }
+}
+
+/// The text a fat pointer's base carries when the base is a
+/// value snapshot of the text itself (a string constant's
+/// storage in this model): the one base form whose bytes the
+/// renderers can read without the frame stack. Any other base
+/// (a live place, an allocation) stays unreadable here.
+pub(super) fn fat_base_text(base: &Value) -> Option<String> {
+    match base {
+        Value::Str(s) => Some(s.clone()),
+        Value::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        Value::Ref(crate::value::RefTarget::Value(snapshot, projection))
+            if projection.is_empty() =>
+        {
+            fat_base_text(snapshot)
+        }
+        _ => None,
+    }
+}
+
+/// Render a fat pointer in gdb's form. gdb's Rust support
+/// prints a fat pointer as the struct its DWARF describes:
+/// the pointer type's name, then the metadata fields --
+/// `data_ptr` and `length`. A fat pointer to `str` is the
+/// exception: gdb prints the string's text, which the base
+/// snapshot carries when it carries it at all; a base the
+/// renderer cannot read keeps the bare-address form. The
+/// struct form needs no read, so it is unconditional.
+fn render_fat_ref_gdb(
+    value: &Value,
+    base: &Value,
+    len: u128,
+    desc: Option<&Desc>,
+) -> Option<String> {
+    let addr = crate::interp::synthetic_address(value)?;
+    if str_place_desc(desc) {
+        return match fat_base_text(base) {
+            Some(text) => Some(format!("\"{}\"", escape_str(&text))),
+            None => Some(format!("0x{addr:x}")),
+        };
+    }
+    let name = match desc {
+        Some(Desc::Adt(tag)) => Some(dwarf_type_name(tag)),
+        Some(_) => desc_type_name(desc?),
+        None => None,
+    };
+    match name {
+        Some(name) => Some(format!("{name} {{data_ptr: 0x{addr:x}, length: {len}}}")),
+        None => Some(format!("0x{addr:x}")),
+    }
+}
+
+/// Render a trait-object fat pointer in gdb's form: the
+/// pointer type's name, then the `pointer` and `vtable`
+/// fields. The vtable word is the model's own identity for
+/// the (concrete type, trait bounds) pair, in the same
+/// synthetic address space as every other printed address.
+/// A descriptor that recovers no type name (a bare `&dyn`
+/// whose pointee descriptor was not recovered) keeps the
+/// bare-address form.
+fn render_dyn_ref_gdb(
+    value: &Value,
+    concrete: &str,
+    traits: &[String],
+    desc: Option<&Desc>,
+) -> Option<String> {
+    let addr = crate::interp::synthetic_address(value)?;
+    let name = match desc {
+        Some(Desc::Adt(tag)) => Some(dwarf_type_name(tag)),
+        Some(_) => desc_type_name(desc?),
+        None => None,
+    };
+    match name {
+        Some(name) => {
+            let vtable = crate::interp::vtable_word(concrete, traits);
+            Some(format!(
+                "{name} {{pointer: 0x{addr:x}, vtable: 0x{vtable:x}}}"
+            ))
+        }
+        None => Some(format!("0x{addr:x}")),
     }
 }
 

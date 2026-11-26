@@ -6,7 +6,10 @@ use crate::value::Value;
 use super::desc::{Desc, dwarf_type_name, path_text, render_vec_lldb, tag_base_name};
 use super::evaluate::desc_scalar_width;
 use super::queries::nonzero_scalar;
-use super::render_gdb::{MAX_RENDER_DEPTH, nonzero_lldb_expanded, render_elements, render_gdb, union_field_values};
+use super::render_gdb::{
+    MAX_RENDER_DEPTH, fat_base_text, nonzero_lldb_expanded, render_elements, render_gdb,
+    str_place_desc, union_field_values,
+};
 use super::session::{DebugDialect, PrintFormat};
 
 /// Render a value in lldb's compact form (the summary its
@@ -88,10 +91,20 @@ pub(super) fn render_lldb_compact(
             let shape = interp.program().adt_debug_shapes.get(tag)?;
             render_adt_lldb_compact(interp, shape, *variant, fields, nested, depth)
         }
-        Value::Ref(_)
-        | Value::FatRef { .. }
-        | Value::DynRef { .. }
-        | Value::FnPtr(_) => {
+        Value::Ref(_) | Value::DynRef { .. } | Value::FnPtr(_) => {
+            let addr = crate::interp::synthetic_address(value)?;
+            Some(format!("0x{addr:x}"))
+        }
+        Value::FatRef { base, .. } => {
+            // A fat reference to `str` whose base is a value
+            // snapshot of the text renders as the text, as a
+            // `str` value itself does below; any other fat
+            // reference keeps the address form.
+            if str_place_desc(desc) {
+                if let Some(text) = fat_base_text(base) {
+                    return Some(format!("\"{}\"", escape_str(&text)));
+                }
+            }
             let addr = crate::interp::synthetic_address(value)?;
             Some(format!("0x{addr:x}"))
         }

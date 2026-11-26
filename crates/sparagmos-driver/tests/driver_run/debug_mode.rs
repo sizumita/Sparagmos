@@ -1216,3 +1216,99 @@ fn debug_mode_lldb_command_formats_are_honored() {
         );
     }
 }
+
+const DEBUG_FAT_PTR_FORMS_SRC: &str = r#"struct Foo<T: ?Sized> {
+    value: T,
+}
+
+fn main() {
+    let foo: Foo<Foo<[u8; 4]>> = Foo { value: Foo { value: *b"abc\0" } };
+    let a: &Foo<[u8]> = &foo.value;
+    let b: &Foo<Foo<[u8]>> = &foo;
+    let c: &Foo<dyn std::fmt::Debug> = &Foo { value: 7i32 };
+    let _box: Box<Foo<dyn std::fmt::Debug>> = Box::new(Foo { value: 8i32 });
+    zzz();
+}
+
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_unsized_fat_pointer_forms() {
+    // gdb prints a fat pointer as the struct its DWARF
+    // describes -- the pointer type's name, then the metadata
+    // fields (`data_ptr`/`length` for a slice tail,
+    // `pointer`/`vtable` for a trait-object tail) -- not as a
+    // bare address. The addresses themselves are the model's
+    // synthetic ones, so the assertions pin the form around
+    // them.
+    let dir = temp_dir("debug-fat-ptr-forms");
+    let src = fixture(&dir, "fat_ptr_forms.rs", DEBUG_FAT_PTR_FORMS_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 11\nrun\nprint a\nprint b\nprint c\nprint _box\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "&fat_ptr_forms::Foo<[u8]> {data_ptr: 0x",
+        "&fat_ptr_forms::Foo<fat_ptr_forms::Foo<[u8]>> {data_ptr: 0x",
+        ", length: 4}",
+        "&fat_ptr_forms::Foo<dyn core::fmt::Debug> {pointer: 0x",
+        ", vtable: 0x",
+        "alloc::boxed::Box<fat_ptr_forms::Foo<dyn core::fmt::Debug>, \
+         alloc::alloc::Global> {pointer: 0x",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_STR_TEXT_SRC: &str = r#"struct Holder<'a> {
+    inner: &'a str,
+}
+
+fn main() {
+    let plain: &str = "Hello";
+    let holder = Holder { inner: "Hello" };
+    let pair = ("Hello", "World");
+    let slice: &[u8] = &[1, 2, 3];
+    zzz();
+}
+
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_str_values_render_as_text() {
+    // gdb prints a `str` value -- a `&str` local, a `&str`
+    // field, a tuple of them -- as its quoted text, in both
+    // of the value forms the model gives it (the text itself,
+    // or a fat reference whose base is a snapshot of the
+    // text). A slice reference prints in the fat-pointer
+    // struct form.
+    let dir = temp_dir("debug-str-text");
+    let src = fixture(&dir, "str_text.rs", DEBUG_STR_TEXT_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 10\nrun\nprint plain\nprint holder\nprint pair\nprint slice\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = \"Hello\"",
+        "str_text::Holder {inner: \"Hello\"}",
+        "$3 = (\"Hello\", \"World\")",
+        "&[u8] {data_ptr: 0x",
+        ", length: 3}",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
