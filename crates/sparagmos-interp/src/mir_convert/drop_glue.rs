@@ -1323,6 +1323,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         // addresses the same private slot place conversion
         // wrote its value into, not the shared slot of the
         // sized field whose offset it happens to share.
+        // The steps run in reverse field order: dropping a
+        // suspended coroutine drops the locals live across the
+        // suspension point the way the body's own drop
+        // elaboration would drop them if the function returned
+        // there - last declared, first dropped - and the
+        // layout numbers a state's fields in declaration
+        // order (parameters first, then locals), so the last
+        // field is the last-declared local. The unresumed
+        // state above is exempt: its upvars are the value's
+        // own fields and drop in field order, like a struct's.
         let key = crate::builtins::ty_tag(&mir::Ty::Coroutine(def, args.to_vec()), conv.names);
         if let Some(slots) = conv.coroutine_layouts.get(&key) {
             for (v, plan) in plans.iter_mut().enumerate().skip(1) {
@@ -1346,6 +1356,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                             });
                         }
                     }
+                    steps.reverse();
                     *plan = P::Seq(steps);
                 }
             }
