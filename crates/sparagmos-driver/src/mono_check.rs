@@ -110,6 +110,37 @@
 //!   computation's static path produces (see
 //!   `panic_runtime_finding`).
 //!
+//! - Calls to intrinsics that must be overridden but are not
+//!   (rustc_codegen_ssa's code generation raises an internal
+//!   error — "intrinsic ... must be overridden by codegen
+//!   backend, but isn't" — when such a call reaches it
+//!   unshimmed): a `#[rustc_intrinsic]` item declared without
+//!   a body has no fallback, so every backend must shim every
+//!   call to it; code generation serves a call from its
+//!   generic intrinsic handling first and the backend's own
+//!   shims second, and a call neither serves is the error.
+//!   This backend's shims are the interpreter's builtin
+//!   registry — the dispatch conversion itself performs for
+//!   a body-less callee — so `check_intrinsic_overrides`
+//!   replays that dispatch on the callee's canonical name
+//!   and reports the call when no lookup serves it. An
+//!   intrinsic with a fallback body is never reported: the
+//!   body is the fallback, and leaving it unshimmed is
+//!   legal.
+//!
+//! - `#[linkage = "common"]` statics with a non-zero
+//!   initializer (the LLVM verifier's "'common' global must
+//!   have a zero initializer", a fatal error when code
+//!   generation emits the module): a common global is a
+//!   tentative definition the linker merges, so its
+//!   initializer must be the zero initializer. The check
+//!   below (`common_linkage_finding`) reads the linkage
+//!   from the compiler's own codegen attributes and the
+//!   initializer from the compiler's own static evaluation,
+//!   and reports the static when the initializer carries a
+//!   relocation (a pointer constant is not a zero
+//!   initializer) or a non-zero byte.
+//!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
 //! positively present, mirroring the corresponding rustc error.
@@ -133,6 +164,76 @@ pub fn check_bodies(bodies: &[Body]) -> Option<String> {
         }
     }
     None
+}
+
+/// The unshimmed-intrinsic verdict over the converted bodies:
+/// a call to an intrinsic that must be overridden, which this
+/// backend serves with no shim, is the internal error
+/// rustc_codegen_ssa raises when the same call reaches its
+/// code generation (see the module documentation). Like the
+/// collector verdicts in `check_required_consts`, the driver
+/// chains this check only in the compilation-verdict modes:
+/// in the executing modes the interpreter, not a compilation
+/// verdict, decides what a call does.
+pub fn check_intrinsic_overrides(bodies: &[Body]) -> Option<String> {
+    for body in bodies {
+        for bb in &body.blocks {
+            let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
+                continue;
+            };
+            if let Some(err) = check_override_call(func) {
+                return Some(err);
+            }
+        }
+    }
+    None
+}
+
+/// The verdict for one call: `Some` when the callee is an
+/// intrinsic that must be overridden and no builtin lookup
+/// serves it. The resolution discipline is `check_call`'s:
+/// the callee resolves to an intrinsic instance, and only
+/// the positively-present shape is reported.
+fn check_override_call(func: &Operand) -> Option<String> {
+    let Operand::Constant(c) = func else {
+        return None;
+    };
+    let Some(kind) = guarded_ty_kind(&c.const_.ty()) else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = &kind else {
+        return None;
+    };
+    let (def, args) = (*def, args.clone());
+    let intrinsic = def.as_intrinsic()?;
+    if !intrinsic.must_be_overridden() {
+        return None;
+    }
+    let inst = Instance::resolve(def, &args).ok()?;
+    if !matches!(inst.kind, InstanceKind::Intrinsic) {
+        return None;
+    }
+    // Replay the dispatch conversion performs for a body-less
+    // callee (see `mir_convert`'s external-callee chain): the
+    // qualified registry lookup, the foreign-helper lookup,
+    // then the intrinsic lookup. A hit is this backend's shim
+    // for the call; no hit is code generation's fallback,
+    // which for a must-be-overridden intrinsic is the
+    // internal error. (The remaining conversion dispatches
+    // key on trait methods and format machinery, which an
+    // intrinsic definition never names.)
+    let canonical = sparagmos_interp::builtins::canonical_name(&def.name());
+    let served = sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
+        || sparagmos_interp::builtins::foreign_helper_lookup(&canonical).is_some()
+        || sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some();
+    if served {
+        return None;
+    }
+    Some(format!(
+        "intrinsic `{}` must be overridden by codegen backend, \
+         but isn't (no backend shim serves this call)",
+        intrinsic.fn_name()
+    ))
 }
 
 fn check_body(
@@ -1226,6 +1327,7 @@ pub fn check_required_consts() -> Option<String> {
     walk.finding
         .or_else(|| generic_export_finding(tcx))
         .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
+        .or_else(|| common_linkage_finding(tcx))
         .or_else(|| panic_runtime_finding(tcx))
 }
 
@@ -1462,6 +1564,52 @@ fn duplicate_symbol_finding<'tcx>(
 /// static. An rlib-only compilation computes an empty list
 /// natively and validates nothing, so it is skipped the same
 /// way.
+/// The common-linkage verdict over the crate's local
+/// statics, mirroring the LLVM verifier's rejection of a
+/// common global with a non-zero initializer ("'common'
+/// global must have a zero initializer"), which code
+/// generation hits fatally when it emits the module.
+///
+/// The static set is the one `duplicate_symbol_finding`
+/// enumerates (every local static), the linkage is the
+/// compiler's own codegen attribute for the static, and
+/// the initializer is the compiler's own static
+/// evaluation, so a static reported here is exactly one
+/// whose emitted global the verifier rejects. Only
+/// positive evidence counts: a relocation anywhere in the
+/// initializer (a pointer constant is not a zero
+/// initializer), or a non-zero byte in the evaluated
+/// initializer. A foreign static has no initializer to
+/// evaluate, and a static whose evaluation fails takes no
+/// part — the required-constant walk reports evaluation
+/// failures of collected statics itself.
+fn common_linkage_finding<'tcx>(tcx: rustc_middle::ty::TyCtxt<'tcx>) -> Option<String> {
+    for local_def_id in tcx.iter_local_def_id() {
+        let def_id = local_def_id.to_def_id();
+        if !matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::Static { .. }) {
+            continue;
+        }
+        let attrs = tcx.codegen_fn_attrs(def_id);
+        if attrs.linkage != Some(rustc_attr_ir::Linkage::Common) {
+            continue;
+        }
+        let Ok(alloc) = tcx.eval_static_initializer(def_id) else {
+            continue;
+        };
+        let inner = alloc.inner();
+        let bytes = inner.inspect_with_uninit_and_ptr_outside_interpreter(0..inner.len());
+        let relocated = inner.provenance().ptrs().values().next().is_some();
+        if relocated || bytes.iter().any(|&b| b != 0) {
+            return Some(format!(
+                "static `{}` has common linkage but a non-zero initializer \
+                 ('common' global must have a zero initializer)",
+                tcx.def_path_str(def_id)
+            ));
+        }
+    }
+    None
+}
+
 fn panic_runtime_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
     use rustc_structures::CrateType;
 

@@ -1340,8 +1340,12 @@ fn collect() -> ControlFlow<()> {
     // precedence), the collector verdicts `mono_check` replays
     // over the instances it collects (the required-constant
     // evaluation, the per-instance `check_mono_item` checks, the
-    // duplicate-symbol verdict and the panic-runtime validation;
-    // also collection-time errors, so they come next), and the
+    // duplicate-symbol verdict, the common-linkage verdict and
+    // the panic-runtime validation; also collection-time
+    // errors, so they come next), the unshimmed-intrinsic
+    // verdict over the converted bodies (a codegen-stage
+    // rejection, gated like the collector verdicts so it cannot
+    // pre-empt execution), and the
     // checks of `sparagmos_driver::mono_check` over the converted
     // bodies (invalid SIMD intrinsic instantiations and SIMD
     // layouts, types too big for the target architecture), and
@@ -1363,6 +1367,12 @@ fn collect() -> ControlFlow<()> {
                 return None;
             }
             sparagmos_driver::mono_check::check_required_consts()
+        })
+        .or_else(|| {
+            if !COMPILE_VERDICT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            sparagmos_driver::mono_check::check_intrinsic_overrides(&alias_sources)
         })
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources))
         .or_else(|| sparagmos_driver::mono_check::take_mono_item_finding());
