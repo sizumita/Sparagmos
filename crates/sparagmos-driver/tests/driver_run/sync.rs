@@ -1196,3 +1196,170 @@ fn run_mode_lock_guards_release_on_unwind() {
          so the lock can be taken again afterwards"
     );
 }
+
+const POISON_ON_UNWIND_SRC: &str = r#"
+use std::sync::{Mutex, RwLock};
+
+fn main() {
+    let m = Mutex::new(0);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = m.lock().unwrap();
+        panic!("boom");
+    }));
+    assert!(r.is_err());
+    println!("mutex poisoned: {}", m.is_poisoned());
+    println!("mutex lock err: {}", m.lock().is_err());
+    let l = RwLock::new(1);
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = l.write().unwrap();
+        panic!("boom2");
+    }));
+    assert!(r2.is_err());
+    println!("rwlock poisoned: {}", l.is_poisoned());
+    println!("panicking outside: {}", std::thread::panicking());
+}
+"#;
+
+#[test]
+fn run_mode_lock_guards_poison_on_unwind() {
+    let dir = temp_dir("guard-poison-unwind");
+    let src = fixture(&dir, "guard_poison_unwind.rs", POISON_ON_UNWIND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "poison program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mutex poisoned: true\nmutex lock err: true\n\
+         rwlock poisoned: true\npanicking outside: false\n",
+        "a guard dropped by unwinding observes `panicking()` and \
+         poisons its lock; outside unwinding the query is false"
+    );
+}
+
+const PANICKING_IN_DROP_SRC: &str = r#"
+struct Probe;
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        println!("drop panicking: {}", std::thread::panicking());
+    }
+}
+
+fn main() {
+    let _ = std::panic::catch_unwind(|| {
+        let _p = Probe;
+        panic!("x");
+    });
+    let _p2 = Probe;
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_panicking_observed_in_drop_during_unwind() {
+    let dir = temp_dir("panicking-in-drop");
+    let src = fixture(&dir, "panicking_in_drop.rs", PANICKING_IN_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "panicking-in-drop program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop panicking: true\ndone\ndrop panicking: false\n",
+        "a destructor run by unwinding observes `panicking() == true`; \
+         the same destructor at normal scope exit observes false"
+    );
+}
+
+const RESUMED_PANICKING_SRC: &str = r#"
+struct Probe;
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        println!("drop panicking: {}", std::thread::panicking());
+    }
+}
+
+fn main() {
+    let r = std::panic::catch_unwind(|| panic!("first"));
+    let payload = r.unwrap_err();
+    println!("caught panicking: {}", std::thread::panicking());
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _p = Probe;
+        std::panic::resume_unwind(payload);
+    }));
+    println!("after panicking: {}", std::thread::panicking());
+}
+"#;
+
+#[test]
+fn run_mode_resumed_panic_panicking_in_drop() {
+    let dir = temp_dir("resumed-panicking");
+    let src = fixture(&dir, "resumed_panicking.rs", RESUMED_PANICKING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "resumed-panic program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught panicking: false\ndrop panicking: true\nafter panicking: false\n",
+        "a resumed panic counts as in flight again while it unwinds, \
+         and stops counting once the outer catch consumes it"
+    );
+}
+
+const TAIL_EXPR_LOCK_POISON_SRC: &str = r#"
+use std::sync::Mutex;
+
+struct PanicOnDrop;
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        panic!()
+    }
+}
+
+fn f(m: &Mutex<i32>) -> i32 {
+    let _x = PanicOnDrop;
+    *m.lock().unwrap()
+}
+
+fn main() {
+    let m = Mutex::new(0);
+    let _ = std::panic::catch_unwind(|| f(&m));
+    println!("poisoned: {}", m.is_poisoned());
+}
+"#;
+
+#[test]
+fn run_mode_tail_expr_temporary_guard_poisons_on_unwind() {
+    let dir = temp_dir("tail-expr-lock-poison");
+    let src = fixture(
+        &dir,
+        "tail_expr_lock_poison.rs",
+        TAIL_EXPR_LOCK_POISON_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "tail-expr poison program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "poisoned: true\n",
+        "the tail-expression guard temporary is still held when the \
+         local's destructor panics, so its unwind drop poisons the lock"
+    );
+}

@@ -66,6 +66,7 @@ impl<'a> Interpreter<'a> {
             *n += 1;
             *n
         };
+        self.sync_global_panic_count();
         // The panic's report state (its entry path and its
         // force-no-backtrace flag) is consumed by this fire: a
         // later panic that records neither starts clean.
@@ -401,6 +402,51 @@ impl<'a> Interpreter<'a> {
         if let Some(n) = counts.get_mut(&tid) {
             *n = n.saturating_sub(1);
         }
+        drop(counts);
+        self.sync_global_panic_count();
+    }
+
+    /// Bring the guest-visible global panic-count static (see
+    /// [`GLOBAL_PANIC_COUNT_STATIC`]) in line with the
+    /// interpreter's per-thread in-flight counts, whose total is
+    /// the value std's runtime would have published there. A
+    /// program that never names the static pays nothing; one
+    /// whose seed was recorded is seeded on first use, in case a
+    /// panic precedes the first guest read.
+    fn sync_global_panic_count(&self) {
+        let name = GLOBAL_PANIC_COUNT_STATIC;
+        if !self.statics.borrow().contains_key(name) {
+            if !self.program.static_seeds.contains_key(name) {
+                return;
+            }
+            if self.ensure_static_seeded(name).is_err() {
+                return;
+            }
+        }
+        let total: u128 = self
+            .panics_in_flight
+            .borrow()
+            .values()
+            .map(|n| *n as u128)
+            .sum();
+        if let Some(stored) = self.statics.borrow_mut().get_mut(name) {
+            set_scalar_leaf(stored, total);
+        }
+    }
+
+    /// Whether the current thread is unwinding a panic (std's
+    /// `panicking()`): its in-flight panic count is nonzero. The
+    /// count is raised when a panic is raised (see
+    /// [`Interpreter::fire_panic_hook`]) and when one is resumed
+    /// (see [`Interpreter::note_resumed_panic`]), and lowered
+    /// when a panic is consumed (see
+    /// [`Interpreter::note_panic_finished`]).
+    pub(crate) fn panicking(&self) -> bool {
+        let tid = self.current_thread_id();
+        self.panics_in_flight
+            .borrow()
+            .get(&tid)
+            .is_some_and(|n| *n > 0)
     }
 
     /// The backtrace style one panic report prints, resolved
@@ -660,6 +706,7 @@ thread '{name}' ({tid}) panicked:
             *n += 1;
             *n
         };
+        self.sync_global_panic_count();
         if self.panic_report_suppressed.get() {
             return;
         }
@@ -754,6 +801,16 @@ thread '{name}' ({tid}) panicked:
     /// the flag, and the hook does not fire for it.
     pub(crate) fn note_resumed_panic(&mut self) {
         self.resume_signaled = true;
+        // std's `resume_unwind` re-enters `__rust_start_panic`,
+        // which counts the panic as in flight again (the catch
+        // that produced the payload had consumed it): destructors
+        // run by the resumed unwinding observe `panicking()`.
+        let tid = self.current_thread_id();
+        {
+            let mut counts = self.panics_in_flight.borrow_mut();
+            *counts.entry(tid).or_insert(0) += 1;
+        }
+        self.sync_global_panic_count();
     }
 
     /// Record that the in-flight panic was consumed by a
@@ -853,5 +910,37 @@ pub(crate) fn format_assert_message(
             num(vals.first()?)?,
             num(vals.get(1)?)?,
         )),
+    }
+}
+
+/// The name of std's process-wide in-flight panic counter
+/// static: the storage the panic runtime's `__rust_start_panic`
+/// and catch cleanup maintain natively, and the fast path of
+/// the `panicking()` query reads. The interpreter is the panic
+/// runtime in this model, so it keeps the static's word equal
+/// to the total of its own per-thread counts (see
+/// `Interpreter::panics_in_flight`) whenever they change: guest
+/// bodies that inline the query — std's poison flag check does —
+/// then observe the count the runtime would have kept.
+const GLOBAL_PANIC_COUNT_STATIC: &str = "std::rt::panic_count::GLOBAL_PANIC_COUNT";
+
+/// Set the first integer leaf of an aggregate value, descending
+/// one aggregate level at a time: the shape of a counter
+/// static's storage (an atomic word inside its `UnsafeCell` and
+/// newtype wrappers). Returns whether a leaf was found.
+fn set_scalar_leaf(value: &mut Value, n: u128) -> bool {
+    match value {
+        Value::Uint(word) => {
+            *word = n;
+            true
+        }
+        Value::Int(word) => {
+            *word = n as i128;
+            true
+        }
+        Value::Enum { fields, .. } | Value::Tuple(fields) => {
+            fields.iter_mut().any(|f| set_scalar_leaf(f, n))
+        }
+        _ => false,
     }
 }

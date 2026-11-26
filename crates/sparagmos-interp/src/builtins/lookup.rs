@@ -915,6 +915,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::CatchUnwind
         }
         "std::panicking::catch_unwind::cleanup" => Builtin::PanicCleanup,
+        "std::panicking::panicking" | "std::thread::panicking" => Builtin::Panicking,
+        "std::rt::panic_count::count_is_zero" => Builtin::PanicCountIsZero,
+        "std::rt::panic_count::is_zero_slow_path" => Builtin::PanicCountIsZero,
         "std::panicking::begin_panic" | "std::rt::begin_panic" => Builtin::PanicAny,
         "std::panic::resume_unwind" | "std::panicking::resume_unwind" => {
             Builtin::ResumeUnwind

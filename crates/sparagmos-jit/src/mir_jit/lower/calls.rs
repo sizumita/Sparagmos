@@ -1575,6 +1575,21 @@ impl<'a> FnLower<'a> {
                 self.finish_builtin_call(&dst_loc, dst, target, false);
                 Ok(())
             }
+            Builtin::Panicking | Builtin::PanicCountIsZero => {
+                if !args.is_empty() {
+                    return Err(self.err("panic-count query with arguments"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(
+                        self.err("panic-count query destination is not one word")
+                    );
+                }
+                let imm = if kind == Builtin::PanicCountIsZero { 1 } else { 0 };
+                self.emit(Instr::Const { dst, imm });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
             Builtin::MustUse => {
                 if args.len() != 1 {
                     return Err(self.err("must_use with wrong arity"));

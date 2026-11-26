@@ -5530,6 +5530,14 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
+            Builtin::Panicking => {
+                arity(0)?;
+                Ok(Value::Bool(self.panicking()))
+            }
+            Builtin::PanicCountIsZero => {
+                arity(0)?;
+                Ok(Value::Bool(!self.panicking()))
+            }
             Builtin::PanicAny => {
                 arity(1)?;
                 let ty = generic_args.first().cloned().unwrap_or_default();
