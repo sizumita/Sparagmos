@@ -1087,8 +1087,33 @@ impl<'a> Interpreter<'a> {
                                     // themselves: follow the deref
                                     // chain until the callable value
                                     // itself shows.
+                                    //
+                                    // `direct_ref` tracks the
+                                    // reference that directly denotes
+                                    // the value the chain currently
+                                    // shows: the receiver itself at
+                                    // first, then each reference the
+                                    // chain follows. The environment
+                                    // reference a closure body
+                                    // receives must be that reference
+                                    // - the body's capture reads
+                                    // project through it onto the
+                                    // callable value itself. An outer
+                                    // reference of the chain denotes a
+                                    // place holding the next reference
+                                    // (a `&mut F` stored in another
+                                    // closure's capture field is the
+                                    // common shape), and a body
+                                    // entered through it reads that
+                                    // stored reference where its first
+                                    // capture belongs.
+                                    let mut direct_ref = recv.clone();
                                     let mut unwrapped = false;
                                     for _ in 0..8 {
+                                        let followed_ref = matches!(
+                                            value,
+                                            Value::Ref(_) | Value::FatRef { .. }
+                                        );
                                         let next = match &value {
                                             Value::Ref(_) | Value::FatRef { .. } => {
                                                 let Ok(t) =
@@ -1117,6 +1142,9 @@ impl<'a> Interpreter<'a> {
                                             }
                                             _ => break,
                                         };
+                                        if followed_ref {
+                                            direct_ref = value.clone();
+                                        }
                                         value = next;
                                     }
                                     if matches!(value, Value::DynRef { .. }) {
@@ -1138,7 +1166,7 @@ impl<'a> Interpreter<'a> {
                                             Value::Ref(RefTarget::value(value.clone()));
                                         (value, env)
                                     } else {
-                                        (value, recv)
+                                        (value, direct_ref)
                                     }
                                 }
                                 Value::DynRef { .. } => {
