@@ -393,6 +393,141 @@ pub(crate) fn substitute_params(ty: &sm::Ty, args: &[sm::Ty]) -> sm::Ty {
     }
 }
 
+/// Resolve the array lengths of a converted field type whose
+/// length is one of the ADT's const parameters. Conversion
+/// renders such a length in the nameless parameter form (the
+/// value exists only at the instance), which renders into a
+/// field tag that names no recorded shape; walking the
+/// definition's field type and the converted type in parallel
+/// puts the instance argument's value back. A length that does
+/// not resolve — a const expression over parameters, a
+/// non-usize const — keeps the parameter form, exactly as
+/// conversion left it. The two types are structurally
+/// parallel (conversion preserves the shape and only filters
+/// the non-type arguments out of argument lists), so the walk
+/// consumes converted arguments in the order the raw arguments
+/// present their type arguments; a shape the walk does not
+/// recognise is returned unchanged.
+pub(crate) fn resolve_param_array_lens(
+    raw: &rustc_public::ty::Ty,
+    converted: &sm::Ty,
+    args: &GenericArgs,
+) -> sm::Ty {
+    let Some(kind) = guarded_ty_kind(raw) else {
+        return converted.clone();
+    };
+    match (&kind, converted) {
+        (TyKind::RigidTy(RigidTy::Array(elem, len)), sm::Ty::Array(celem, clen)) => {
+            let len = match (len.kind(), clen) {
+                (TyConstKind::Param(p), sm::ArrayLen::Param(_)) => args
+                    .0
+                    .get(p.index as usize)
+                    .and_then(|a| match a {
+                        GenericArgKind::Const(c) => c.eval_target_usize().ok(),
+                        _ => None,
+                    })
+                    .map(sm::ArrayLen::Known)
+                    .unwrap_or_else(|| clen.clone()),
+                _ => clen.clone(),
+            };
+            sm::Ty::Array(
+                Box::new(resolve_param_array_lens(elem, celem, args)),
+                len,
+            )
+        }
+        (TyKind::RigidTy(RigidTy::Adt(_, raw_args)), sm::Ty::Adt(def, conv_args)) => {
+            sm::Ty::Adt(*def, resolve_param_arg_list(&raw_args.0, conv_args, args))
+        }
+        (TyKind::RigidTy(RigidTy::FnDef(_, raw_args)), sm::Ty::FnDef(def, conv_args)) => {
+            sm::Ty::FnDef(*def, resolve_param_arg_list(&raw_args.0, conv_args, args))
+        }
+        (
+            TyKind::RigidTy(RigidTy::Closure(_, raw_args)),
+            sm::Ty::Closure(def, conv_args),
+        ) => sm::Ty::Closure(
+            *def,
+            resolve_param_arg_list(&raw_args.0, conv_args, args),
+        ),
+        (
+            TyKind::RigidTy(RigidTy::Coroutine(_, raw_args)),
+            sm::Ty::Coroutine(def, conv_args),
+        ) => sm::Ty::Coroutine(
+            *def,
+            resolve_param_arg_list(&raw_args.0, conv_args, args),
+        ),
+        (TyKind::Alias(_, alias), sm::Ty::Alias(k, def, conv_args)) => sm::Ty::Alias(
+            *k,
+            *def,
+            resolve_param_arg_list(&alias.args.0, conv_args, args),
+        ),
+        (TyKind::RigidTy(RigidTy::Ref(_, elem, _)), sm::Ty::Ref(region, celem, cm)) => {
+            sm::Ty::Ref(
+                region.clone(),
+                Box::new(resolve_param_array_lens(elem, celem, args)),
+                *cm,
+            )
+        }
+        (TyKind::RigidTy(RigidTy::RawPtr(elem, _)), sm::Ty::RawPtr(celem, cm)) => {
+            sm::Ty::RawPtr(
+                Box::new(resolve_param_array_lens(elem, celem, args)),
+                *cm,
+            )
+        }
+        (TyKind::RigidTy(RigidTy::Slice(elem)), sm::Ty::Slice(celem)) => {
+            sm::Ty::Slice(Box::new(resolve_param_array_lens(elem, celem, args)))
+        }
+        (TyKind::RigidTy(RigidTy::Pat(elem, _)), sm::Ty::Pat(celem, cpat)) => sm::Ty::Pat(
+            Box::new(resolve_param_array_lens(elem, celem, args)),
+            cpat.clone(),
+        ),
+        (TyKind::RigidTy(RigidTy::Tuple(raw_items)), sm::Ty::Tuple(conv_items)) => {
+            sm::Ty::Tuple(
+                raw_items
+                    .iter()
+                    .zip(conv_items.iter())
+                    .map(|(r, c)| resolve_param_array_lens(r, c, args))
+                    .collect(),
+            )
+        }
+        (TyKind::RigidTy(RigidTy::FnPtr(poly)), sm::Ty::FnPtr(csig)) => {
+            let raw_ios = &poly.value.inputs_and_output;
+            let mut conv_ios: Vec<&sm::Ty> = csig.inputs.iter().collect();
+            conv_ios.push(&csig.output);
+            if raw_ios.len() != conv_ios.len() {
+                return converted.clone();
+            }
+            let mut resolved: Vec<sm::Ty> = raw_ios
+                .iter()
+                .zip(conv_ios.iter())
+                .map(|(r, c)| resolve_param_array_lens(r, c, args))
+                .collect();
+            let output = resolved.pop().unwrap_or_else(sm::Ty::unit);
+            let mut sig = (**csig).clone();
+            sig.inputs = resolved;
+            sig.output = Box::new(output);
+            sm::Ty::FnPtr(Box::new(sig))
+        }
+        _ => converted.clone(),
+    }
+}
+
+fn resolve_param_arg_list(
+    raw_args: &[GenericArgKind],
+    conv_args: &[sm::Ty],
+    args: &GenericArgs,
+) -> Vec<sm::Ty> {
+    let mut conv_iter = conv_args.iter();
+    raw_args
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgKind::Type(t) => {
+                conv_iter.next().map(|c| resolve_param_array_lens(t, c, args))
+            }
+            GenericArgKind::Const(_) | GenericArgKind::Lifetime(_) => None,
+        })
+        .collect()
+}
+
 pub(crate) fn ty_has_param(ty: &sm::Ty) -> bool {
     match ty {
         sm::Ty::Param(..) => true,
