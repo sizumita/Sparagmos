@@ -585,6 +585,8 @@ impl<'a> Converter<'a> {
             crate::builtins::Builtin::IteratorNext => raw_generic_args.first(),
             crate::builtins::Builtin::IteratorNth => raw_generic_args.first(),
             crate::builtins::Builtin::IteratorLen => raw_generic_args.first(),
+            crate::builtins::Builtin::IteratorSizeHint => raw_generic_args.first(),
+            crate::builtins::Builtin::VecExtendTrusted => raw_generic_args.last(),
             crate::builtins::Builtin::IntoIter => raw_generic_args.first(),
             _ => return false,
         };
@@ -607,6 +609,34 @@ impl<'a> Converter<'a> {
             crate::builtins::Builtin::IntoIter => {
                 return (crate::builtins::hash_collection_tag(&tag)
                     || crate::builtins::collection_container_tag(&tag))
+                    && self.resolve_body_callee(func).is_some();
+            }
+            crate::builtins::Builtin::VecExtendTrusted => {
+                // The trusted-extend builtin drains the
+                // iterator through the modelled `next` state
+                // machine, which cannot step a body-served
+                // iterator; the collected body steps the
+                // source through its own collected `next` body
+                // and writes through the modelled buffer
+                // pointers, so it wins for those sources
+                // whenever the program has a clean one.
+                return (crate::builtins::hash_iterator_tag(&tag)
+                    || crate::builtins::collection_iterator_tag(&tag))
+                    && self.resolve_body_callee(func).is_some();
+            }
+            crate::builtins::Builtin::IteratorSizeHint => {
+                // The `size_hint` builtin computes the exact
+                // pair only for the iterators whose states it
+                // models; for a body-served iterator (a hash
+                // iterator or a concrete collection iterator)
+                // it answers the trait default `(0, None)`,
+                // which the collected `TrustedLen` collect
+                // entry reads as an unbounded capacity and
+                // panics on. The instance body is the type's
+                // own override and wins whenever the program
+                // has a clean one, exactly as for `next`.
+                return (crate::builtins::hash_iterator_tag(&tag)
+                    || crate::builtins::collection_iterator_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
             }
             _ => {}

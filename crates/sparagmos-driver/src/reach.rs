@@ -1471,6 +1471,23 @@ fn consumer_instance_needs_body(
                 if body_served_iterator_ty(ty))
         });
     }
+    // `Vec::extend_trusted`: the builtin drains the iterator
+    // through the modelled `next` state machine, which cannot
+    // step a body-served iterator, so when the entry's own
+    // body chain runs for such a source (the `TrustedLen`
+    // collect path above), the trusted-extend body -- which
+    // steps the source through its collected `next` body and
+    // writes through the modelled buffer pointers -- is the
+    // faithful execution and is demanded here. The iterator
+    // type is one of the definition's generic arguments (the
+    // Vec's own parameters come first), so every argument is
+    // judged, as for the nested entry above.
+    if canonical.starts_with("std::vec::Vec") && canonical.ends_with("::extend_trusted") {
+        return args.0.iter().any(|arg| {
+            matches!(arg, GenericArgKind::Type(ty)
+                if hash_iterator_ty(ty) || collection_iterator_ty(ty))
+        });
+    }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
         | "std::iter::Iterator::fold"
@@ -1492,6 +1509,26 @@ fn consumer_instance_needs_body(
                 return false;
             };
             return !iterator_back_modelled(ty);
+        }
+        "std::iter::Iterator::size_hint" => {
+            // `size_hint` likewise: the builtin serves the
+            // call directly for the iterators whose states it
+            // models, computing the exact pair from the state,
+            // but a body-served iterator's state is the real
+            // layout, which the builtin does not read -- it
+            // answers the trait default `(0, None)` there.
+            // That answer is contract-valid in general, yet
+            // the collected `TrustedLen` collect entry (the
+            // nested `Vec::from_iter` body) reads the upper
+            // bound as an exact capacity and panics with
+            // `capacity overflow` when it is `None`, so for
+            // the body-served iterators the instance body --
+            // the type's own override -- is the only faithful
+            // execution and is demanded here.
+            let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+                return false;
+            };
+            return hash_iterator_ty(ty) || collection_iterator_ty(ty);
         }
         "std::iter::ExactSizeIterator::len" => {
             // `len` likewise: the builtin serves the call

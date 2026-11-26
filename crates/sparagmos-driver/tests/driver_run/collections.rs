@@ -2598,3 +2598,93 @@ fn run_mode_linked_list_iter_consumers() {
         "llall=true\nllany=true\nllcount=3\nllnth=Some(2)\n"
     );
 }
+
+
+const LINKED_LIST_COLLECT_SRC: &str = r#"
+use std::collections::LinkedList;
+fn main() {
+    let mut l: LinkedList<i32> = LinkedList::new();
+    l.push_back(1); l.push_back(2); l.push_back(3);
+    let v: Vec<&i32> = l.iter().collect();
+    println!("bare={:?}", v);
+    for x in l.iter_mut() { *x += 10; }
+    let v: Vec<&i32> = l.iter().collect();
+    println!("mutated={:?}", v);
+    let mut big: LinkedList<i32> = LinkedList::new();
+    for i in 0..40 { big.push_back(i * 3); }
+    let w: Vec<&i32> = big.iter().collect();
+    println!("big={} {}", w.len(), w[39]);
+    let v: Vec<i32> = big.into_iter().collect();
+    println!("owned={} {}", v.len(), v.iter().sum::<i32>());
+    let e: LinkedList<i32> = LinkedList::new();
+    let v: Vec<&i32> = e.iter().collect();
+    println!("empty={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_linked_list_collect_into_vec() {
+    // Collecting a `LinkedList` iterator into a `Vec` runs
+    // the collected `TrustedLen` chain: the nested
+    // `Vec::from_iter` body reads `size_hint`'s upper bound
+    // as an exact capacity (and panics with `capacity
+    // overflow` when it is `None`), then the trusted-extend
+    // body drains the source. Both calls must come from the
+    // collected bodies for a body-served iterator -- the
+    // `size_hint` builtin answers the trait default
+    // `(0, None)` for a real-layout state it does not read,
+    // and the trusted-extend builtin drains through the
+    // modelled `next` machine, which cannot step one.
+    let dir = temp_dir("linkedlistcollect");
+    let src = fixture(&dir, "linkedlistcollect.rs", LINKED_LIST_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collecting LinkedList iterators into a Vec must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bare=[1, 2, 3]\nmutated=[11, 12, 13]\nbig=40 117\nowned=40 2340\nempty=[]\n"
+    );
+}
+
+const COLLECTION_SIZE_HINT_SRC: &str = r#"
+use std::collections::{LinkedList, VecDeque};
+fn main() {
+    let mut l: LinkedList<i32> = LinkedList::new();
+    l.push_back(1); l.push_back(2); l.push_back(3);
+    println!("hint {:?}", l.iter().size_hint());
+    let mut it = l.iter();
+    it.next();
+    println!("hint {:?}", it.size_hint());
+    println!("len {}", l.iter().len());
+    let mut d: VecDeque<i32> = VecDeque::new();
+    d.push_back(4); d.push_back(5);
+    println!("hint {:?}", d.iter().size_hint());
+}
+"#;
+
+#[test]
+fn run_mode_collection_iterator_size_hint_is_exact() {
+    // A body-served collection iterator's `size_hint` is
+    // its own override (an exact remaining count), served
+    // by the collected body: the builtin's trait-default
+    // `(0, None)` answer for a real-layout state is
+    // observable here directly, not only through the
+    // `TrustedLen` collect entry that panics on it.
+    let dir = temp_dir("collectionsizehint");
+    let src = fixture(&dir, "collectionsizehint.rs", COLLECTION_SIZE_HINT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "size_hint of LinkedList / VecDeque iterators must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hint (3, Some(3))\nhint (2, Some(2))\nlen 3\nhint (2, Some(2))\n"
+    );
+}
