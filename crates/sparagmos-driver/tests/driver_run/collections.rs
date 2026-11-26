@@ -3580,3 +3580,54 @@ fn run_mode_binary_heap_pop() {
         "Some(5)\nSome(4)\nsum 5\nNone\n"
     );
 }
+
+const TYPED_ARENA_EMPTY_SRC: &str = r#"
+struct Chunk<T> { storage: std::ptr::NonNull<[std::mem::MaybeUninit<T>]>, entries: usize }
+impl<T> Drop for Chunk<T> {
+    fn drop(&mut self) { unsafe { drop(Box::from_raw(self.storage.as_mut())) } }
+}
+struct Arena<T> { chunks: std::cell::RefCell<Vec<Chunk<T>>>, _own: std::marker::PhantomData<T> }
+impl<T> Default for Arena<T> {
+    fn default() -> Self { Arena { chunks: Default::default(), _own: std::marker::PhantomData } }
+}
+impl<T> Drop for Arena<T> {
+    fn drop(&mut self) {
+        let mut b = self.chunks.borrow_mut();
+        if let Some(mut last) = b.pop() { let _ = &mut last; }
+    }
+}
+fn main() {
+    let a = Arena::<u32>::default();
+    drop(a);
+    println!("arena-ok");
+}
+"#;
+
+#[test]
+fn run_mode_typed_arena_empty_drop_mir_opt3() {
+    // The `rustc_arena::TypedArena` shape: a `RefCell<Vec<Chunk>>`
+    // whose element's destructor rebuilds a `Box` from the chunk's
+    // `NonNull` slice storage. At mir-opt-level 3 the construction
+    // of the arena is inlined, so the chunk vector reaches its
+    // drop in the real aggregate form ([RawVec, len]) with a
+    // dangling address-only buffer pointer and length 0. The drop
+    // glue must run the element plan over the vector's elements
+    // (none), never over the aggregate's fields: running it over
+    // the buffer descriptor called the chunk destructor at the
+    // RawVec position, which read the dangling pointer as the
+    // chunk's storage and stopped at its dereference
+    // (tests/ui-fulldeps/dropck_tarena_sound_drop.rs).
+    let dir = temp_dir("typed-arena-empty-drop");
+    let src = fixture(&dir, "typedarena.rs", TYPED_ARENA_EMPTY_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--edition", "2021", "--rustc-arg", "-Zmir-opt-level=3"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty real-form chunk vector must drop cleanly; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "arena-ok\n");
+}
