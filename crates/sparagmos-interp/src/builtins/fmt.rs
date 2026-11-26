@@ -3093,6 +3093,65 @@ impl<'a> Interpreter<'a> {
         Ok(Some(text))
     }
 
+    /// The `Display` rendering of a `core::panic::PanicInfo` /
+    /// `core::panic::PanicMessage` value, or `None` when `ty`
+    /// names neither. The info's fields are
+    /// `(message, location, can_unwind, force_no_backtrace)` and
+    /// the message's single field is its `fmt::Arguments`; both
+    /// are stored behind references in the aggregate.
+    fn format_panic_display(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        ty: &str,
+    ) -> InterpResult<Option<String>> {
+        let tag = pointee_tag(ty);
+        let head = tag.split('<').next().unwrap_or(tag).trim();
+        let fields = match value {
+            Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+            _ => return Ok(None),
+        };
+        if head == "core::panic::PanicMessage" {
+            let Some(message) = fields.first() else {
+                return Ok(None);
+            };
+            let message = self.resolve_value(frames, message)?;
+            return match message {
+                Value::FmtArguments(args) => {
+                    Ok(Some(self.format_arguments(frames, &args, 0)?))
+                }
+                _ => Ok(None),
+            };
+        }
+        if head != "core::panic::PanicInfo" || fields.len() != 4 {
+            return Ok(None);
+        }
+        let message = self.resolve_value(frames, &fields[0])?;
+        let Value::FmtArguments(args) = message else {
+            return Ok(None);
+        };
+        let message = self.format_arguments(frames, &args, 0)?;
+        let location = self.resolve_value(frames, &fields[1])?;
+        let loc_fields = match &location {
+            Value::Enum { fields, .. } | Value::Tuple(fields) => fields.clone(),
+            _ => return Ok(None),
+        };
+        if loc_fields.len() != 3 {
+            return Ok(None);
+        }
+        let file = self.resolve_value(frames, &loc_fields[0])?;
+        let line = self.resolve_value(frames, &loc_fields[1])?;
+        let col = self.resolve_value(frames, &loc_fields[2])?;
+        let (Value::Str(file), Value::Uint(line), Value::Uint(col)) =
+            (file, line, col)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(format!(
+            "panicked at {file}:{line}:{col}:\n{message}"
+        )))
+    }
+
     fn format_display(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3100,6 +3159,17 @@ impl<'a> Interpreter<'a> {
         ty: &str,
         options: &FmtOptions,
     ) -> InterpResult<String> {
+        // `core::panic::PanicInfo` and `core::panic::PanicMessage`
+        // have fixed, small `Display` impls in core (the info
+        // prints `panicked at {location}:\n{message}`, the message
+        // formats its `fmt::Arguments`) and no Stable MIR body, so
+        // the structural engine renders them from the value's
+        // fields like the other core types it models. A panic
+        // handler in a `no_std` program reaches them through
+        // `PanicInfo::to_string` / its message accessor.
+        if let Some(text) = self.format_panic_display(frames, value, ty)? {
+            return Ok(pad_str(&text, options));
+        }
         match value {
             Value::Int(v) => Ok(format_int_radix(*v, None, 10, "", options)),
             Value::Uint(v) => {

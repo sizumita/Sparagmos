@@ -573,6 +573,8 @@ fn convert_all_with(
     out.needs_drop_verdicts = program.needs_drop_verdicts.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();
+    out.panic_handler = program.panic_handler.clone();
+    out.links_std = program.links_std;
     merge_static_seeds(&mut all_static_seeds, &conv);
     out.static_seeds = all_static_seeds
         .into_iter()

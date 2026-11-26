@@ -678,6 +678,39 @@ thread '{name}' ({tid}) panicked:
         self.print_report_backtrace_part(frames, in_flight, origin, no_backtrace);
     }
 
+    /// Print std's default allocation-error hook output for a
+    /// failed allocation of `size` bytes: `rust_oom` runs the
+    /// hook (`default_alloc_error_hook`) before aborting. The
+    /// hook prints the failure line, then the backtrace part
+    /// for the resolved style; in the Off case the note line
+    /// is printed unconditionally (the hook does not consult
+    /// the panic report's FIRST_PANIC gate). A second failure
+    /// in the same process prints the message with the
+    /// recursion-guard line and no backtrace part (the hook's
+    /// `PREV_ALLOC_FAILURE` static, modelled by
+    /// `alloc_failure_reported`).
+    pub(crate) fn print_alloc_error_default_hook(&mut self, frames: &[Frame], size: u128) {
+        if self.alloc_failure_reported.get() {
+            self.push_error_output(&format!(
+                "memory allocation of {size} bytes failed\nskipping backtrace printing to avoid potential recursion\n"
+            ));
+            return;
+        }
+        self.alloc_failure_reported.set(true);
+        self.push_error_output(&format!("memory allocation of {size} bytes failed\n"));
+        match self.report_backtrace(1, false) {
+            ReportBacktrace::None | ReportBacktrace::Off => {
+                self.push_error_output(
+                    "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+                );
+            }
+            style => {
+                let text = self.render_backtrace(frames, style, &None);
+                self.push_error_output(&text);
+            }
+        }
+    }
+
     /// Fire the hook machinery for one of the runtime's own
     /// nounwind panics — `panic_cannot_unwind` at a nounwind
     /// boundary, `panic_in_cleanup` after a fresh panic in a

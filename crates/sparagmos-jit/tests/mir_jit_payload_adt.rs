@@ -151,6 +151,8 @@ fn build_with_table(
         tuple_layouts: Default::default(),
         adt_tag_layouts: Default::default(),
         env_debug_shapes: Default::default(),
+        panic_handler: Default::default(),
+        links_std: Default::default(),
         thread_locals: Default::default(),
         extra_static_seeds: Default::default(),
         static_tys: Default::default(),

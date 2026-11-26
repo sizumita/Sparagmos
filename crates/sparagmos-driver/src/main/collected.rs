@@ -119,6 +119,13 @@ pub(crate) struct Collected {
     /// with the user's own `main`; run mode enters through this
     /// id, never through the name alone.
     pub(crate) entry_def_id: Option<sparagmos_mir::DefId>,
+    /// The body name of the crate graph's `panic_handler`
+    /// lang item, when the graph defines one and its body was
+    /// collected (see `MirProgram::panic_handler`).
+    pub(crate) panic_handler: Option<String>,
+    /// Whether the crate graph links `std` (see
+    /// `MirProgram::links_std`).
+    pub(crate) links_std: bool,
     /// Definition-location stamps of the program's
     /// `#[track_caller]` instances (see
     /// `Converter::track_caller_defs`), for the interpreter.

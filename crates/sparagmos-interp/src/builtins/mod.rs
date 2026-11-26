@@ -34,6 +34,7 @@
 use crate::error::InterpError;
 use crate::value::Value;
 
+mod alloc_error;
 mod atomics;
 mod backtrace;
 mod btree;

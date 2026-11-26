@@ -4503,7 +4503,25 @@ impl<'a> Interpreter<'a> {
             Builtin::Deref => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                if self_ty == "std::string::String" {
+                // A `no_std` guest names the library types
+                // through its own crate's extern prelude
+                // (`test::alloc::string::String`), where a std
+                // guest sees the `std::` re-export path; drop one
+                // leading segment when what follows is a library
+                // path so both spellings reach the models below.
+                let self_ty = match self_ty.split_once("::") {
+                    Some((_, rest))
+                        if rest.starts_with("alloc::")
+                            || rest.starts_with("core::")
+                            || rest.starts_with("std::") =>
+                    {
+                        rest
+                    }
+                    _ => self_ty,
+                };
+                if self_ty == "std::string::String"
+                    || self_ty == "alloc::string::String"
+                {
                     // `String::deref -> &str`: the string data itself.
                     let s = self.resolve_string(frames, &vals[0])?;
                     Ok(Value::Str(s))
@@ -4537,7 +4555,9 @@ impl<'a> Interpreter<'a> {
                     // `CString::deref -> &CStr`: the fat
                     // reference over the owned buffer.
                     self.c_string_deref(frames, &vals[0])
-                } else if self_ty.starts_with("std::borrow::Cow<") {
+                } else if self_ty.starts_with("std::borrow::Cow<")
+                    || self_ty.starts_with("alloc::borrow::Cow<")
+                {
                     // `Cow<B>::deref -> &B::Target`: the borrowed
                     // variant's field already IS the target value
                     // (a `&str` / `&[u8]` reference value); the
@@ -4566,7 +4586,9 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
-                } else if self_ty.starts_with("std::vec::Vec<") {
+                } else if self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<")
+                {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     let len = pointee.len().ok_or_else(|| {
                         InterpError::type_mismatch(
@@ -4586,7 +4608,9 @@ impl<'a> Interpreter<'a> {
                         self_ty,
                         "Deref::deref for SmallVec",
                     )
-                } else if self_ty.starts_with("std::boxed::Box<") {
+                } else if self_ty.starts_with("std::boxed::Box<")
+                    || self_ty.starts_with("alloc::boxed::Box<")
+                {
                     // A built box's single field is its allocation
                     // pointer, and `deref` yields that very
                     // reference: it names the pointee's storage in
@@ -5621,6 +5645,14 @@ impl<'a> Interpreter<'a> {
                     .unwrap_or_else(|_| right.to_string());
                 message = format!("{message}\n  left: {left_text}\n right: {right_text}");
                 Err(InterpError::panic_string_payload(message))
+            }
+            Builtin::HandleAllocError => {
+                arity(1)?;
+                self.exec_handle_alloc_error(frames, &vals[0])
+            }
+            Builtin::RawVecHandleError => {
+                arity(1)?;
+                self.exec_raw_vec_handle_error(frames, &vals[0])
             }
             Builtin::PanicNounwindFmt => {
                 // `panic_nounwind_fmt(args, force_no_backtrace)`:
@@ -7574,11 +7606,31 @@ impl<'a> Interpreter<'a> {
             Builtin::DerefMut => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                if self_ty == "std::string::String" {
+                // A `no_std` guest names the library types
+                // through its own crate's extern prelude
+                // (`test::alloc::string::String`), where a std
+                // guest sees the `std::` re-export path; drop one
+                // leading segment when what follows is a library
+                // path so both spellings reach the models below.
+                let self_ty = match self_ty.split_once("::") {
+                    Some((_, rest))
+                        if rest.starts_with("alloc::")
+                            || rest.starts_with("core::")
+                            || rest.starts_with("std::") =>
+                    {
+                        rest
+                    }
+                    _ => self_ty,
+                };
+                if self_ty == "std::string::String"
+                    || self_ty == "alloc::string::String"
+                {
                     // `&mut str` over the `String` place itself: reads
                     // see the string data, writes replace it.
                     Ok(vals.into_iter().next().expect("arity checked"))
-                } else if self_ty.starts_with("std::vec::Vec<") {
+                } else if self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<")
+                {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     let len = pointee.len().ok_or_else(|| {
                         InterpError::type_mismatch(
@@ -7602,7 +7654,9 @@ impl<'a> Interpreter<'a> {
                     // `CString::deref_mut -> &mut CStr`: the
                     // same fat reference `deref` produces.
                     self.c_string_deref(frames, &vals[0])
-                } else if self_ty.starts_with("std::boxed::Box<") {
+                } else if self_ty.starts_with("std::boxed::Box<")
+                    || self_ty.starts_with("alloc::boxed::Box<")
+                {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     // As in `Deref`: a `Box<dyn Trait>` dereferences
                     // to the fat pointer itself, and a built box

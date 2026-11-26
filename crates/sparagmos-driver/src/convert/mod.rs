@@ -72,8 +72,8 @@ pub(crate) use self::helpers::*;
 
 pub use self::guard::{
     compiler_tcx, drop_glue_lang_item_defined, materialization_emitted, materialization_lint,
-    resolution_emitted, resolve_closure_guarded, resolve_instance_guarded, set_compiler_tcx,
-    with_body_materialization,
+    panic_handler_def, resolution_emitted, resolve_closure_guarded, resolve_instance_guarded,
+    set_compiler_tcx, with_body_materialization,
 };
 pub use self::display_names::{drain_fn_display_names, set_debug_session};
 pub use self::helpers::{

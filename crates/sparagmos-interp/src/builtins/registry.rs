@@ -1641,6 +1641,26 @@ pub enum Builtin {
     /// new_size) -> *mut u8`: a fresh block holding the old
     /// block's contents; the old block is freed.
     RustRealloc,
+    /// `alloc::alloc::handle_alloc_error(layout) -> !`: the
+    /// allocation-failure endpoint every allocator null result
+    /// funnels into. It has no Stable MIR body anywhere (the
+    /// shipped alloc compiles it behind cfg flags Stable MIR
+    /// does not expose), so the runtime models its dispatch:
+    /// a guest `#[alloc_error_handler]`'s generated
+    /// `__rust_alloc_error_handler` shim when the program
+    /// defines one, std's default hook plus abort when the
+    /// program links std, and alloc's `__rdl_alloc_error_handler`
+    /// nounwind panic (to the guest panic handler, when the
+    /// program defines one) otherwise. See
+    /// `builtins::alloc_error`.
+    HandleAllocError,
+    /// `alloc::raw_vec::handle_error(TryReserveError) -> !`:
+    /// RawVec's reserve-failure endpoint, likewise body-less
+    /// in Stable MIR. `CapacityOverflow` is the
+    /// `capacity overflow` panic; `AllocError { layout }`
+    /// forwards to `handle_alloc_error`. See
+    /// `builtins::alloc_error`.
+    RawVecHandleError,
     /// `libc::unix::malloc(size) -> *mut u8`: the bottom of the
     /// system allocator's call chain — a fresh uninitialised
     /// block of `size` bytes in the allocation store, the same

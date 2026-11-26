@@ -2643,6 +2643,19 @@ pub struct Program {
     /// allocation the program makes. Empty when the program has
     /// no custom allocator.
     pub alloc_shims: std::collections::HashMap<String, String>,
+    /// Program key of the body the compiler designated the
+    /// crate graph's `panic_handler` lang item, when the
+    /// driver recorded one (see `MirProgram::panic_handler`).
+    /// The allocation-error model delivers alloc's default
+    /// (`__rdl`) panic to this body in a program that links
+    /// no std and defines no `#[alloc_error_handler]`.
+    pub panic_handler: Option<String>,
+    /// Whether the program's crate graph links `std`, as
+    /// recorded by the driver (see `MirProgram::links_std`):
+    /// the allocation-error model runs std's default hook
+    /// and aborts for such a program, and alloc's `__rdl`
+    /// panic otherwise.
+    pub links_std: bool,
     /// Per-capture "taken by reference" flags of the program's
     /// async closures, keyed by the closure's program key (the
     /// key a `Value::Closure` carries): entry `i` is true when

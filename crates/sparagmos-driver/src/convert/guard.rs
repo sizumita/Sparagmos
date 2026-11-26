@@ -355,3 +355,20 @@ pub fn drop_glue_lang_item_defined() -> bool {
         .get(rustc_attr_ir::lang_items::LangItem::DropGlue)
         .is_some()
 }
+
+/// The Stable MIR `DefId` of the local item the
+/// `#[panic_handler]` attribute marks, when the crate
+/// defines one: the definition the unwinder delivers every
+/// panic to in a `no_std` program. (In this toolchain the
+/// panic handler is an attribute-marked item, not a lang
+/// item.) The allocation-error model delivers alloc's
+/// default (`__rdl`) panic to the same definition. Outside a
+/// compilation callback there is no graph to consult and the
+/// item is reported absent.
+pub fn panic_handler_def() -> Option<rustc_public::DefId> {
+    let tcx = compiler_tcx()?;
+    let internal = tcx
+        .lang_items()
+        .get(rustc_attr_ir::lang_items::LangItem::PanicImpl)?;
+    Some(rustc_public::rustc_internal::stable(internal))
+}

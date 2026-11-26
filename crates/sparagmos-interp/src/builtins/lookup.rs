@@ -1057,7 +1057,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         | "std::task::LocalWaker::wake_by_ref"
         | "core::task::LocalWaker::wake_by_ref" => Builtin::WakerWakeByRef,
         "std::hint::must_use" => Builtin::MustUse,
-        "std::ops::Deref::deref" => Builtin::Deref,
+        "std::ops::Deref::deref" | "core::ops::Deref::deref" => Builtin::Deref,
         "std::path::Path::parent" => Builtin::PathPart(PathPart::Parent),
         "std::path::Path::file_name" => Builtin::PathPart(PathPart::FileName),
         "std::path::Path::file_stem" => Builtin::PathPart(PathPart::FileStem),
@@ -1144,7 +1144,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::default::Default::default" | "core::default::Default::default" => {
             Builtin::DefaultDefault
         }
-        "std::string::ToString::to_string" => Builtin::ToStringToString,
+        "std::string::ToString::to_string" | "alloc::string::ToString::to_string" => Builtin::ToStringToString,
         // The `String` / `str` surface the abstract string value
         // can answer directly. Registering a name here also keeps
         // the driver from collecting the std body (see
@@ -1372,7 +1372,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::iter::empty" => Builtin::IterEmpty,
         "std::ops::Index::index" => Builtin::IndexIndex,
         "std::ops::IndexMut::index_mut" => Builtin::IndexMut,
-        "std::ops::DerefMut::deref_mut" => Builtin::DerefMut,
+        "std::ops::DerefMut::deref_mut" | "core::ops::DerefMut::deref_mut" => Builtin::DerefMut,
         _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::new") => {
             Builtin::CellNew
         }
@@ -1858,6 +1858,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAlloc { zeroed: true },
         "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
         "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
+        "alloc::alloc::handle_alloc_error" | "std::alloc::handle_alloc_error" => {
+            Builtin::HandleAllocError
+        }
+        "alloc::raw_vec::handle_error" => Builtin::RawVecHandleError,
         "libc::unix::malloc" => Builtin::LibcMalloc,
         "libc::unix::calloc" => Builtin::LibcCalloc,
         "libc::unix::free" => Builtin::LibcFree,
@@ -1866,6 +1870,11 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "libc::sigaction" | "libc::unix::sigaction" => Builtin::LibcSigaction,
         "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
         "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
+        // `exit` ends the process with the given status,
+        // running the registered `atexit` handlers: the
+        // same observable behaviour as `std::process::exit`,
+        // whose builtin serves both.
+        "libc::exit" | "libc::unix::exit" => Builtin::ProcessExit,
         "libc::read" | "libc::unix::read" => Builtin::LibcRead,
         "libc::write" | "libc::unix::write" => Builtin::LibcWrite,
         "std::sys::io::error::unix::errno_location"
