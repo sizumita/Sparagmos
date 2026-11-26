@@ -2887,3 +2887,51 @@ fn run_mode_linked_list_adapter_collect_into_vec() {
         "cloned=[1, 2, 3]\nchint (3, Some(3))\ncopied=[1, 2, 3]\nmapped=[2, 3, 4]\nbig=40 117\nownedmapped=40 2380\n"
     );
 }
+const SPARSE_VEC_HUGE_SLICE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<u8> = Vec::with_capacity(1_000_000_000);
+    unsafe { v.set_len(1_000_000_000) }
+    let s = &v[..];
+    println!("len {}", s.len());
+    let tail = &s[999_999_995..];
+    println!("tail {}", tail.len());
+    let head = &s[..7];
+    println!("head {}", head.len());
+    let mut w: Vec<u8> = Vec::with_capacity(16);
+    w.extend_from_slice(&[1, 2, 3]);
+    unsafe { w.set_len(1_000_000_000) }
+    let win = &w[1..3];
+    println!("win {} {}", win[0], win[1]);
+    let past = &w[3..];
+    println!("past {}", past.len());
+    let past2 = &w[2..];
+    println!("past2 {} {}", past2.len(), past2[0]);
+}
+"#;
+
+#[test]
+fn run_mode_sparse_vec_huge_slice_windows() {
+    // A vector whose declared length runs past its stored
+    // elements (the sparse form, from a `with_capacity` +
+    // `set_len` into the billions): a sub-slice window inside
+    // the stored elements reads as the dense slice value it
+    // always was, and a window running past them keeps the
+    // sparse form -- the stored prefix rebased to the window,
+    // the declared length the window's -- instead of
+    // materialising one host slot per element of the window
+    // (a billion-slot allocation that exhausts the host).
+    // Windows of a window compose onto the same forms.
+    let dir = temp_dir("sparsevechugeslice");
+    let src = fixture(&dir, "sparsevechugeslice.rs", SPARSE_VEC_HUGE_SLICE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "slicing a huge sparse vector must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 1000000000\ntail 5\nhead 7\nwin 2 3\npast 999999997\npast2 999999998 3\n"
+    );
+}

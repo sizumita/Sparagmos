@@ -153,9 +153,12 @@ fn fn_display_entry(
         // env type is the closure type itself under its debuginfo
         // name (the `{closure_env#N}` form with the enclosing
         // function's arguments).
-        let env_ty = internal.ty(
-            tcx,
+        let env_ty = tcx.normalize_erasing_regions(
             rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(internal.ty(
+                tcx,
+                rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            )),
         );
         let env = type_names::compute_debuginfo_type_name(tcx, env_ty, true);
         format!("(*mut {env})")
@@ -164,6 +167,18 @@ fn fn_display_entry(
             .ty(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
             .fn_sig(tcx);
         let sig = tcx.instantiate_bound_regions_with_erased(sig);
+        // The debuginfo name machinery is fed the types codegen
+        // would show it: monomorphised and normalised. The
+        // instantiated signature still carries the declaration's
+        // projection aliases (a trait method's associated-type
+        // output, `Index::Output` for a `Vec` index), which the
+        // name computation rejects outright, so normalise the
+        // signature the way the generic arguments above are
+        // normalised before naming any of its types.
+        let sig = tcx.normalize_erasing_regions(
+            rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(sig),
+        );
         let mut s = String::from("(");
         for (index, input) in sig.inputs().iter().enumerate() {
             if index > 0 {
