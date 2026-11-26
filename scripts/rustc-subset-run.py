@@ -2382,13 +2382,24 @@ def _proc_macro_chain(test_path, fname, edition, modifiers=None):
 
     Returns (chain, error): chain is a list of (crate_name,
     source_path, forced_crate_type, extern_modifiers) in
-    dependency order -- the auxiliary crates the proc-macro crate
-    itself depends on first (its own aux directives, resolved
-    transitively), the proc-macro crate last with its type forced
-    to proc-macro and the `//@ proc-macro:` directive's own
-    modifiers attached, the treatment compiletest's directive
-    names. Which edition each crate is built with is decided at
-    build time from its own header.
+    dependency order -- the test's own auxiliary crates first (see
+    below), then the auxiliary crates the proc-macro crate itself
+    depends on (its own aux directives, resolved transitively),
+    the proc-macro crate last with its type forced to proc-macro
+    and the `//@ proc-macro:` directive's own modifiers attached,
+    the treatment compiletest's directive names. Which edition
+    each crate is built with is decided at build time from its
+    own header.
+
+    The test's own crates lead because compiletest builds a
+    test's auxiliary crates before its proc-macro crates, into
+    one shared directory every auxiliary build can see: a
+    proc-macro crate can name a crate the TEST's header declares
+    (`extern crate make_macro;` in meta-macro.rs, from the test's
+    `//@ aux-build:make-macro.rs`) that its own header never
+    mentions. The test's proc-macro crates themselves are not
+    specs here (top_proc_macro=False): the caller builds those
+    itself and passes them as extra_externs.
     """
     src = _find_proc_macro_file(test_path, fname)
     if src is None:
@@ -2396,10 +2407,29 @@ def _proc_macro_chain(test_path, fname, edition, modifiers=None):
     deps, err = resolve_aux_specs(src)
     if err:
         return None, err
+    test_specs, err = resolve_aux_specs(test_path,
+                                        top_proc_macro=False)
+    if err:
+        return None, err
     text = src.read_text(errors="ignore")
     name = declared_crate_name(text) or Path(fname).stem.replace("-", "_")
-    chain = [(spec.name, spec.path, spec.crate_type, spec.modifiers)
-             for spec in deps]
+    chain = []
+    seen = {}
+    for spec in test_specs + deps:
+        if spec.path == src and spec.name == name:
+            # The proc-macro crate itself, named transitively by
+            # an auxiliary file: the forced entry below is it.
+            continue
+        if spec.name in seen:
+            if seen[spec.name] != spec.path:
+                return None, (f"auxiliary crate `{spec.name}` is "
+                              f"provided by two files: "
+                              f"{seen[spec.name].name} and "
+                              f"{spec.path.name}")
+            continue
+        seen[spec.name] = spec.path
+        chain.append((spec.name, spec.path, spec.crate_type,
+                      spec.modifiers))
     chain.append((name, src, "proc-macro", modifiers))
     return chain, None
 
@@ -5083,14 +5113,16 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
         res["bucket"] = "not attempted (verdict needs execution)"
         return res
     args = list(rev_args)
+    aux_libs = []
     if view.has("add-minicore"):
-        mc_args, mc_err = minicore_test_args(view, rust_dir, edition,
-                                             flags)
+        mc_args, mc_libs, mc_err = minicore_test_args(
+            view, rust_dir, edition, flags)
         if mc_err is not None:
             res["reason"] = mc_err
             res["bucket"] = "not attempted (minicore build)"
             return res
         args += mc_args
+        aux_libs = mc_libs
     args += compiletest_mode_args(rec["suite"], flags)
     args += pretty_unpretty_args(rec["suite"], view)
     args += check_mode_lint_args(expectation)
@@ -5107,6 +5139,7 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=stamp_revision_cfg(aux_specs,
                                                      revision),
+                        aux_libs=aux_libs,
                         env_extra=cenv,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
@@ -5394,10 +5427,14 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # runs them: the suite's minicore stub crate
 # (tests/auxiliary/minicore.rs) is built with the pinned rustc under
 # the test's own edition and compile-flags (plus the
-# minicore-compile-flags), and the resulting rlib is forwarded to the
-# driver's embedded rustc as `--extern minicore=...` together with
-# the `-Cpanic=abort` / `-Cforce-unwind-tables=yes` pair compiletest
-# adds for no_core tests. Builds are cached per flag variant; a
+# minicore-compile-flags), and the resulting rlib is forwarded to
+# the driver's embedded rustc as `--extern minicore=...` together
+# with the `-Cpanic=abort` / `-Cforce-unwind-tables=yes` pair
+# compiletest adds for no_core tests, and handed to the driver
+# additionally as a prebuilt auxiliary
+# (`--aux-lib minicore=...;collect=no`) so the driver's auxiliary
+# builds bind it the way compiletest binds it into the auxiliary
+# builds that declare it. Builds are cached per flag variant; a
 # variant that fails to build leaves its tests not attempted with
 # that reason, never judged against a missing extern.
 # Tests with auxiliary crates are attempted as in stage 1: the aux
@@ -5565,8 +5602,13 @@ _TARGET_NOT_DEMANDED_RE = re.compile(
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
                  env_extra=None, env_remove=(), jit=False,
-                 aux_env_scrub=(), capture_stdout=False):
+                 aux_env_scrub=(), capture_stdout=False, aux_libs=()):
     """Run the driver in convert-only mode and parse its report.
+
+    `aux_libs` are prebuilt library auxiliaries as (name, path,
+    collect) triples, handed to the driver with `--aux-lib`; a
+    collect=False entry binds everywhere it is declared without
+    joining the converted program (the minicore stub).
 
     Returns a dict with exit_code (None on timeout), converted and
     skipped counts (None when no report was printed), the
@@ -5631,6 +5673,11 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    for name, lib, collect in aux_libs:
+        arg = f"{name}={lib}"
+        if not collect:
+            arg += ";collect=no"
+        argv += ["--aux-lib", arg]
     for d in aux_native_lib_dirs(path):
         argv += ["--aux-native-lib", d]
     for name in aux_env_scrub:
@@ -6125,27 +6172,43 @@ def _build_minicore(rust_dir, edition, flags, minicore_flags):
 
 
 def minicore_test_args(view, rust_dir, edition, flags):
-    """The extra rustc arguments an add-minicore view's conversion
-    needs: the panic/unwind pair and `--extern minicore=<rlib>`.
+    """The extra arguments an add-minicore view's conversion needs:
+    the panic/unwind pair and `--extern minicore=<rlib>` as rustc
+    arguments (the native oracle's compile and the run mode take
+    them as before), and the minicore rlib additionally as a
+    prebuilt auxiliary on the driver's `--aux-lib` channel.
 
-    Returns (args, None), or (None, reason) when the arguments cannot
-    be produced (a minicore-compile-flags `--edition`, which
-    compiletest itself rejects, or a failed minicore build); the
-    caller reports the test as not attempted with that reason.
+    The prebuilt entry exists for the driver's auxiliary builds:
+    compiletest builds minicore before a test's auxiliary crates
+    and binds it into every auxiliary build whose own file
+    declares `//@ add-minicore`, so an auxiliary source's
+    `extern crate minicore;` must resolve during its own build
+    too -- bound only into the main compilation (the forwarded
+    `--extern` is a main-compilation argument), it fails there
+    with E0463. The entry is not collected: the stub's rlib
+    carries no encoded MIR for its non-generic functions, and it
+    was never a conversion source when it was only forwarded.
+
+    Returns (args, aux_libs, None), or (None, None, reason) when
+    the arguments cannot be produced (a minicore-compile-flags
+    `--edition`, which compiletest itself rejects, or a failed
+    minicore build); the caller reports the test as not attempted
+    with that reason.
     """
     mc_flags = []
     for v in view.values("minicore-compile-flags"):
         mc_flags.extend(split_flags(v))
     for t in mc_flags:
         if t == "--edition" or t.startswith("--edition="):
-            return (None, "minicore-compile-flags specify --edition "
-                    "(compiletest rejects this; the edition directive "
-                    "governs both compilations)")
+            return (None, None, "minicore-compile-flags specify "
+                    "--edition (compiletest rejects this; the "
+                    "edition directive governs both compilations)")
     rlib, err = minicore_rlib(rust_dir, edition, flags, mc_flags)
     if err is not None:
-        return (None, err)
+        return (None, None, err)
     return (["-Cpanic=abort", "-Cforce-unwind-tables=yes",
-             "--extern", f"minicore={rlib}"], None)
+             "--extern", f"minicore={rlib}"],
+            [("minicore", rlib, False)], None)
 
 
 def _sets_incremental(args):
@@ -6233,14 +6296,16 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     args = []
     if revision is not None:
         args += revision_args(view, revision, all_revisions)
+    aux_libs = []
     if view.has("add-minicore"):
-        mc_args, mc_err = minicore_test_args(view, rust_dir, edition,
-                                             flags)
+        mc_args, mc_libs, mc_err = minicore_test_args(
+            view, rust_dir, edition, flags)
         if mc_err is not None:
             res["reason"] = mc_err
             res["bucket"] = "not attempted (minicore build)"
             return res
         args += mc_args
+        aux_libs = mc_libs
     # Crate type: the driver's convert mode names none of its own
     # (compiletest parity: compiletest passes no --crate-type for a
     # test file, so a source-level #![crate_type] or the rustc
@@ -6309,7 +6374,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
                             suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
-                        aux_specs=specs, env_extra=cenv,
+                        aux_specs=specs, aux_libs=aux_libs,
+                        env_extra=cenv,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
                         capture_stdout=print_view,

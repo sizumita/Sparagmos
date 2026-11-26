@@ -1740,8 +1740,9 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             captured["rustc_args"] = list(rustc_args)
+            captured["aux_libs"] = list(aux_libs)
             captured["capture_stdout"] = capture_stdout
             return conv_result
 
@@ -1770,6 +1771,12 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertIn("-Cforce-unwind-tables=yes", args)
         i = args.index("--extern")
         self.assertEqual(args[i + 1], "minicore=/fake/libminicore.rlib")
+        # The rlib also travels as a prebuilt auxiliary (not
+        # collected), so an auxiliary build that declares
+        # minicore binds it during its own build too.
+        self.assertEqual(
+            captured["aux_libs"],
+            [("minicore", Path("/fake/libminicore.rlib"), False)])
 
     def test_add_minicore_build_failure_is_not_attempted(self):
         rec = self.write_test("//@ add-minicore\n//@ check-fail\n"
@@ -1836,7 +1843,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             calls.append(list(rustc_args))
             return conv()
 
@@ -1859,7 +1866,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             calls.append(list(rustc_args))
             for rev, res in by_rev.items():
                 if rev in rustc_args or \
@@ -2089,7 +2096,7 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -2498,7 +2505,7 @@ class ProcessStage2AuxTests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -2862,7 +2869,7 @@ class ProcessStage2RevisionTests(unittest.TestCase):
         orig = run.convert_side
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False):
+                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -3664,6 +3671,30 @@ class ProcMacroExternTests(unittest.TestCase):
         self.assertEqual([(n, f) for n, _, f, _mod in chain],
                          [("dep", None), ("pm", "proc-macro")])
 
+    def test_chain_includes_the_tests_own_aux_builds(self):
+        # compiletest builds a test's auxiliary crates before its
+        # proc-macro crates into one shared directory, so a
+        # proc-macro crate can name a crate only the TEST's header
+        # declares (meta-macro-hygiene: meta-macro.rs's
+        # `extern crate make_macro;` answers the test's
+        # `//@ aux-build:make-macro.rs`, a directive meta-macro.rs
+        # itself never carries). Without the test's specs in the
+        # chain the proc-macro build fails with E0463.
+        main = self.write(
+            "t.rs",
+            "//@ aux-build: make-macro.rs\n"
+            "//@ proc-macro: meta-macro.rs\n")
+        self.write("auxiliary/make-macro.rs", "pub fn f() {}\n")
+        self.write("auxiliary/meta-macro.rs",
+                   "extern crate make_macro;\n"
+                   "extern crate proc_macro;\n")
+        chain, err = run._proc_macro_chain(main, "meta-macro.rs",
+                                           "2021")
+        self.assertIsNone(err)
+        self.assertEqual([(n, f) for n, _, f, _mod in chain],
+                         [("make_macro", None),
+                          ("meta_macro", "proc-macro")])
+
     def test_later_directive_build_sees_earlier_crate(self):
         seen_extra = []
 
@@ -3710,7 +3741,7 @@ class ProcMacroExternTests(unittest.TestCase):
 
         def capture(path, edition, driver_bin, rustc_args=(),
                     aux_specs=(), env_extra=None, env_remove=(),
-                    jit=False, aux_env_scrub=(), capture_stdout=False):
+                    jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
             seen["args"] = list(rustc_args)
             return conv()
 

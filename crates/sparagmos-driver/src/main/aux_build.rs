@@ -528,7 +528,45 @@ pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
     Ok(parsed)
 }
 
+/// Parse one `--aux-lib` value: `<name>=<path>` optionally followed
+/// by `;collect=no`. A prebuilt auxiliary binds into the main
+/// compilation and into the auxiliary builds that declare it,
+/// exactly like a compiled one; whether its functions join the
+/// converted program is the caller's `collect` choice (default
+/// yes, a compiled auxiliary's treatment). A caller whose artifact
+/// must not be a conversion source -- the minicore stub, whose
+/// rlib carries no encoded MIR for its non-generic functions --
+/// passes `collect=no`: the crate still binds everywhere it is
+/// declared, it is simply never collected.
+pub(crate) fn parse_aux_lib_spec(
+    spec: &str,
+) -> Result<(String, std::path::PathBuf, bool), String> {
+    let (name, rest) = spec
+        .split_once('=')
+        .filter(|(n, r)| !n.is_empty() && !r.is_empty())
+        .ok_or_else(|| format!("--aux-lib needs a <name>=<path> value, got: {spec}"))?;
+    let mut parts = rest.split(';');
+    let path = parts.next().unwrap_or("");
+    if path.is_empty() {
+        return Err(format!("--aux-lib needs a <name>=<path> value, got: {spec}"));
+    }
+    let mut collect = true;
+    for attr in parts {
+        let (key, value) = attr
+            .split_once('=')
+            .filter(|(_, v)| !v.is_empty())
+            .ok_or_else(|| format!("--aux-lib attribute needs <key>=<value>, got: {attr}"))?;
+        match (key, value) {
+            ("collect", "no") => collect = false,
+            ("collect", "yes") => collect = true,
+            _ => return Err(format!("unknown --aux-lib attribute: {attr}")),
+        }
+    }
+    Ok((name.to_string(), std::path::PathBuf::from(path), collect))
+}
+
 /// One compiled auxiliary crate.
+#[derive(Clone)]
 pub(crate) struct AuxBuilt {
     /// The name the crate was compiled under: its source's own
     /// `#![crate_name]` when it declares one, else the source file
