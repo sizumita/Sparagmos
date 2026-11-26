@@ -561,6 +561,8 @@ impl<'a> Converter<'a> {
             || tag.starts_with("std::str::SplitTerminator<")
             || tag.starts_with("std::str::RSplitTerminator<")
             || tag.starts_with("std::str::SplitInclusive<")
+            || tag.starts_with("std::str::SplitN<")
+            || tag.starts_with("std::str::RSplitN<")
             || tag.starts_with("std::str::Matches<")
             || tag.starts_with("std::str::MatchIndices<")
     }
