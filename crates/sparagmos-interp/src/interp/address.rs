@@ -2597,6 +2597,7 @@ impl<'a> Interpreter<'a> {
                     elem_size,
                     base,
                     count,
+                    false,
                 )?;
                 Ok(RefTarget::Place {
                     frame,
@@ -2622,6 +2623,7 @@ impl<'a> Interpreter<'a> {
                     elem_size,
                     base.as_ref(),
                     count,
+                    false,
                 )?;
                 Ok(RefTarget::Static { name, projection })
             }
@@ -2660,6 +2662,7 @@ impl<'a> Interpreter<'a> {
                     elem_size,
                     base,
                     count,
+                    true,
                 )?;
                 Ok(RefTarget::Alloc { id, projection })
             }
@@ -2690,6 +2693,7 @@ impl<'a> Interpreter<'a> {
                                 elem_size,
                                 Some(&v),
                                 count,
+                                false,
                             )?;
                             Ok(RefTarget::Value(v, projection))
                         }
@@ -2762,6 +2766,7 @@ impl<'a> Interpreter<'a> {
                         elem_size,
                         Some(&v),
                         count,
+                        false,
                     )?;
                     Ok(RefTarget::Value(v, projection))
                 }
@@ -2879,6 +2884,7 @@ impl<'a> Interpreter<'a> {
         elem_size: Option<u64>,
         base: Option<&Value>,
         count: i128,
+        storage_grows: bool,
     ) -> InterpResult<Vec<RefProj>> {
         // A displacement already carried on the target accumulates
         // into this one: the combination is what decides
@@ -2973,6 +2979,7 @@ impl<'a> Interpreter<'a> {
                     total,
                     elem_size,
                     count,
+                    storage_grows,
                 ) {
                     return Ok(absorbed);
                 }
@@ -3066,6 +3073,7 @@ impl<'a> Interpreter<'a> {
         total: i128,
         elem_size: Option<u64>,
         off_count: i128,
+        storage_grows: bool,
     ) -> Option<Vec<RefProj>> {
         let size = i128::from(elem_size?);
         // Navigate to the container the position sits in. A
@@ -3245,7 +3253,12 @@ impl<'a> Interpreter<'a> {
                 };
                 let new_index =
                     Self::offset_elem_index(*snap_index, total, size, off_count)?;
-                if new_index > count {
+                if new_index > count
+                    && !(storage_grows
+                        && matches!(snap_container, Value::Tuple(_))
+                        && new_index
+                            <= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS as i128)
+                {
                     return None;
                 }
                 let new_index = usize::try_from(new_index).ok()?;
@@ -3301,7 +3314,20 @@ impl<'a> Interpreter<'a> {
             _ => return None,
         };
         let new_index = Self::offset_elem_index(index, total, size, off_count)?;
-        if new_index > count {
+        // The stored length is the container's extent only
+        // for storage that cannot grow: a sequence tuple in
+        // allocation storage grows past its stored prefix
+        // with uninitialized slots (the write navigation
+        // grows it on access, bounded by the same
+        // materialisation limit), so an offset denominated
+        // in whole elements over such a container absorbs
+        // up to that limit — the position it denotes is the
+        // element the access itself will materialise.
+        if new_index > count
+            && !(storage_grows
+                && matches!(container, Value::Tuple(_))
+                && new_index <= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS as i128)
+        {
             return None;
         }
         let new_index = usize::try_from(new_index).ok()?;
