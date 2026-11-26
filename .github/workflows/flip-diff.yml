@@ -8,24 +8,31 @@ name: Flip Diff
 # full official measurement is the Official Measurement workflow, not
 # this one.
 #
-# Triggering:
-# - Add a label named `flip-diff:<kw1+kw2+...>` to a pull request; the
-#   keywords are matched as substrings of the test paths. (`+` is the
-#   separator because label names cannot contain commas.) A labelled
-#   pull request re-runs automatically on every push. GitHub caps
-#   label names at 50 characters, so a long keyword set does not fit
-#   in a label; those targets are run by manual dispatch instead.
-# - Or run the workflow manually (workflow_dispatch). The dispatch
-#   form takes the target explicitly (a PR number, or a head ref plus
-#   a base ref), so it also works for pull requests whose branch does
-#   not carry this workflow file yet: the measurement scripts are
-#   taken from the ref the workflow was dispatched on, and only the
-#   code under test comes from the target ref.
+# Keyword resolution order:
+# (a) the workflow_dispatch input,
+# (b) a `flip-diff:<kw1+kw2+...>` label on the pull request (keywords
+#     are matched as substrings of the test paths; `+` is the separator
+#     because label names cannot contain commas),
+# (c) a `Flip-diff keywords: kw1+kw2+...` line in the pull request body
+#     (for long keyword sets that do not fit in a label: GitHub caps
+#     label names at 50 characters).
+#
+# Triggering and gating:
+# - On pull_request this job always runs as a required status check
+#   for GitHub-native auto-merge. If no keywords can be resolved it
+#   succeeds without measuring. If the diff contains any loss, the
+#   job FAILS and auto-merge is blocked.
+# - A labelled pull request re-runs automatically on every push.
+# - workflow_dispatch runs are reporting only: they never fail on
+#   losses. The dispatch form takes the target explicitly (a PR
+#   number, or a head ref plus a base ref), so it also works for pull
+#   requests whose branch does not carry this workflow file yet: the
+#   measurement scripts are taken from the ref the workflow was
+#   dispatched on, and only the code under test comes from the
+#   target ref.
 #
 # The result lands in the job summary and, when a PR is known, as a
-# comment on the PR. The job does not fail on losses: whether a loss
-# blocks a merge is the integrator's call (some flips are known flakes
-# and are arbitrated case by case).
+# comment on the PR.
 
 on:
   pull_request:
@@ -78,9 +85,6 @@ jobs:
     name: flip-diff
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(join(github.event.pull_request.labels.*.name, ','), 'flip-diff:')
     steps:
       - name: Resolve target (keywords, head, base, PR)
         id: cfg
@@ -95,6 +99,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             keywords="$INPUT_KEYWORDS"
@@ -113,21 +118,42 @@ jobs:
             base_ref="${base_ref:-main}"
           else
             keywords="$(echo "$LABELS_JSON" | jq -r '[.[] | select(startswith("flip-diff:"))][0] // "" | ltrimstr("flip-diff:") | gsub("\\+"; ",")')"
+            if [ -z "$keywords" ] && [ -n "$PR_BODY" ]; then
+              body_line="$(printf '%s\n' "$PR_BODY" | grep -i 'flip-diff keywords:' | head -n 1 || true)"
+              if [ -n "$body_line" ]; then
+                keywords="$(printf '%s' "$body_line" | sed 's/^.*flip-diff keywords://I' | tr -d '`[:space:]' | tr '+' ',')"
+              fi
+            fi
             pr_number="$PR_NUMBER"
             head_ref="$PR_HEAD_SHA"
             base_ref="$PR_BASE_SHA"
           fi
           if [ -z "$keywords" ]; then
-            echo "::error::no flip-diff keywords resolved (label flip-diff:<kw1+kw2+...> or dispatch input required)"
-            exit 1
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::no flip-diff keywords resolved (label flip-diff:<kw1+kw2+...> or dispatch input required)"
+              exit 1
+            fi
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "keywords=" >> "$GITHUB_OUTPUT"
+            echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+            echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+            echo "no flip-diff keywords resolved; skipping measurement"
+            exit 0
           fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
           echo "keywords=$keywords" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "keywords: $keywords; head: $head_ref; base: $base_ref; pr: $pr_number"
 
+      - name: No flip-diff targets
+        if: steps.cfg.outputs.skip == '1'
+        run: echo "No flip-diff targets resolved; skipping measurement." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout target head
+        if: steps.cfg.outputs.skip != '1'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.cfg.outputs.head_ref }}
@@ -137,11 +163,13 @@ jobs:
       # a checkout into the workspace root cleans the workspace and
       # would delete a scripts checkout made before it.
       - name: Checkout workflow scripts
+        if: steps.cfg.outputs.skip != '1'
         uses: actions/checkout@v4
         with:
           path: .wf
 
       - name: Install Rust 1.100.0 with rustc-dev
+        if: steps.cfg.outputs.skip != '1'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
@@ -282,6 +310,7 @@ jobs:
             x86_64-unknown-uefi
 
       - name: Cache rust source tree and survey
+        if: steps.cfg.outputs.skip != '1'
         uses: actions/cache@v4
         with:
           path: |
@@ -290,6 +319,7 @@ jobs:
           key: rust-survey-1.100.0-v1
 
       - name: Fetch rust tree and generate survey (on cache miss)
+        if: steps.cfg.outputs.skip != '1'
         run: |
           if [ ! -d "$RUST_SURVEY_DIR" ]; then
             python3 .wf/scripts/rustc-subset-survey.py --fetch \
@@ -301,6 +331,7 @@ jobs:
           ls -la "$SURVEY_JSON"
 
       - name: Build topical population
+        if: steps.cfg.outputs.skip != '1'
         run: |
           python3 .wf/scripts/ci-subset-tools.py filter \
             --survey "$SURVEY_JSON" \
@@ -308,11 +339,13 @@ jobs:
             --out "$RUNNER_TEMP/population.json"
 
       - name: Build head driver
+        if: steps.cfg.outputs.skip != '1'
         env:
           RUSTC_BOOTSTRAP: "1"
         run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
 
       - name: Build base driver
+        if: steps.cfg.outputs.skip != '1'
         env:
           RUSTC_BOOTSTRAP: "1"
         run: |
@@ -320,6 +353,7 @@ jobs:
           cargo build --manifest-path "$RUNNER_TEMP/base-tree/crates/sparagmos-driver/Cargo.toml"
 
       - name: Run subset with base driver
+        if: steps.cfg.outputs.skip != '1'
         run: |
           python3 .wf/scripts/rustc-subset-run.py \
             --survey-json "$RUNNER_TEMP/population.json" \
@@ -329,6 +363,7 @@ jobs:
             --jobs 2
 
       - name: Run subset with head driver
+        if: steps.cfg.outputs.skip != '1'
         run: |
           python3 .wf/scripts/rustc-subset-run.py \
             --survey-json "$RUNNER_TEMP/population.json" \
@@ -338,7 +373,7 @@ jobs:
             --jobs 2
 
       - name: Diff and report
-        if: always()
+        if: always() && steps.cfg.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.cfg.outputs.pr_number }}
@@ -353,7 +388,7 @@ jobs:
           fi
 
       - name: Upload result JSONs
-        if: always()
+        if: always() && steps.cfg.outputs.skip != '1'
         uses: actions/upload-artifact@v4
         with:
           name: flip-diff-results-${{ github.run_id }}
@@ -362,3 +397,21 @@ jobs:
             ${{ runner.temp }}/head-results.json
             ${{ runner.temp }}/population.json
           retention-days: 30
+
+      - name: Gate on losses
+        if: always() && github.event_name == 'pull_request' && steps.cfg.outputs.skip != '1'
+        run: |
+          if [ ! -f "$RUNNER_TEMP/flip.txt" ]; then
+            echo "::error::flip-diff result file not found ($RUNNER_TEMP/flip.txt)"
+            exit 1
+          fi
+          loss="$(head -n 1 "$RUNNER_TEMP/flip.txt" | grep -oP 'loss: \K[0-9]+' || true)"
+          if [ -z "$loss" ]; then
+            echo "::error::could not parse loss count from flip-diff result"
+            exit 1
+          fi
+          if [ "$loss" -gt 0 ]; then
+            echo "::error::flip-diff found $loss loss(es); blocking auto-merge"
+            exit 1
+          fi
+          echo "flip-diff gate passed: no losses"
