@@ -66,7 +66,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{self, AggregateKind, Operand, Rvalue, StatementKind, TerminatorKind};
-use rustc_public::ty::{ClosureDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind};
+use rustc_public::ty::{
+    ClosureDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind, UintTy,
+};
 use rustc_public::CrateDef;
 
 use sparagmos_mir as sm;
@@ -1580,6 +1582,27 @@ fn consumer_instance_needs_body(
                 if body_served_iterator_ty(ty))
         }) || last_ty.is_some_and(|ty| guest_stepped_iterator_ty(ty));
     }
+    // `Write::write_fmt`: the builtin serves the call itself
+    // only for the receivers whose writes it models -- the
+    // standard streams and their locks, `File`, and the
+    // in-place `Vec<u8>` append (see `Builtin::WriteFmt` in
+    // sparagmos-interp). For every other `Self` type the
+    // builtin stops the call outright, so the instance body
+    // -- the trait's default (`core::io::write::
+    // default_write_fmt`, an adapter streaming the pieces
+    // through the type's own `write_all`) or the type's own
+    // override -- is the only faithful execution and must be
+    // collected. The `Self` type is the call's first generic
+    // argument.
+    if matches!(
+        canonical,
+        "std::io::Write::write_fmt" | "core::io::Write::write_fmt"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+            return false;
+        };
+        return !write_fmt_self_served(ty);
+    }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
         | "std::iter::Iterator::fold"
@@ -1826,6 +1849,41 @@ fn index_self_modelled(ty: &Ty) -> bool {
             def.name().as_str(),
             "std::vec::Vec" | "alloc::vec::Vec" | "std::string::String"
         ),
+        _ => false,
+    }
+}
+
+/// Whether this `Write::write_fmt` `Self` type is one the
+/// interpreter's builtin serves itself: the standard streams
+/// and their locks (including the `std::sys` stdio handles
+/// std's own code writes through), `File`, or a `Vec<u8>`
+/// (the in-place append). A reference `Self` (the blanket
+/// `impl Write for &mut W`) is judged by its pointee. A `dyn`
+/// receiver counts as served here: the vtable demand, not
+/// this judgement, collects its concrete instances, and the
+/// conversion binds the call to the vtable dispatch.
+fn write_fmt_self_served(ty: &Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => write_fmt_self_served(&inner),
+        Some(TyKind::RigidTy(RigidTy::Dynamic(..))) => true,
+        Some(TyKind::RigidTy(RigidTy::Adt(def, args))) => match def.name().as_str() {
+            "std::io::Stdout"
+            | "std::io::StdoutLock"
+            | "std::io::Stderr"
+            | "std::io::StderrLock"
+            | "std::sys::stdio::unix::Stdout"
+            | "std::sys::stdio::unix::Stderr"
+            | "std::fs::File" => true,
+            "std::vec::Vec" | "alloc::vec::Vec" => matches!(
+                args.0.first(),
+                Some(GenericArgKind::Type(elem))
+                    if matches!(
+                        guarded_ty_kind(elem),
+                        Some(TyKind::RigidTy(RigidTy::Uint(UintTy::U8)))
+                    )
+            ),
+            _ => false,
+        },
         _ => false,
     }
 }

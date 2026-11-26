@@ -468,6 +468,22 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The parts of `args` in template order (see
+    /// `format_template_parts`): a plain string is one part.
+    pub(crate) fn format_arguments_parts(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        args: &FmtArguments,
+        indent: usize,
+    ) -> (Vec<String>, Option<InterpError>) {
+        match args {
+            FmtArguments::Plain(s) => (vec![s.clone()], None),
+            FmtArguments::Template { template, args } => {
+                self.format_template_parts(frames, template, args, indent)
+            }
+        }
+    }
+
     fn format_template(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -475,9 +491,38 @@ impl<'a> Interpreter<'a> {
         args: &[Value],
         indent: usize,
     ) -> InterpResult<String> {
-        let mut out = String::new();
+        let (parts, failure) = self.format_template_parts(frames, template, args, indent);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(parts.join("")),
+        }
+    }
+
+    /// The parts of a template in order -- literal pieces and
+    /// formatted arguments as separate strings -- stopping at
+    /// the first failure: the parts composed before it are
+    /// returned alongside the error, so a streaming consumer
+    /// (core's `fmt::write`, see `Builtin::FmtWrite`) can
+    /// deliver them before reporting the failure, in the
+    /// order the body itself composes and writes them.
+    fn format_template_parts(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        template: &[u8],
+        args: &[Value],
+        indent: usize,
+    ) -> (Vec<String>, Option<InterpError>) {
+        let mut parts: Vec<String> = Vec::new();
         let mut arg_index = 0usize;
         let mut i = 0usize;
+        macro_rules! attempt {
+            ($e:expr) => {
+                match $e {
+                    Ok(value) => value,
+                    Err(error) => return (parts, Some(error)),
+                }
+            };
+        }
         while i < template.len() {
             let b = template[i];
             if b == 0 {
@@ -486,17 +531,20 @@ impl<'a> Interpreter<'a> {
             if b < 0x80 {
                 // Short literal piece: one length byte, then the bytes.
                 let len = b as usize;
-                out.push_str(template_piece(template, i + 1, len)?);
+                let piece = attempt!(template_piece(template, i + 1, len));
+                parts.push(piece.to_string());
                 i += 1 + len;
             } else if b == 0x80 {
                 // Long literal piece: 0x80, u16 LE length, then bytes.
-                let len = read_u16(template, i + 1)? as usize;
-                out.push_str(template_piece(template, i + 3, len)?);
+                let len = attempt!(read_u16(template, i + 1)) as usize;
+                let piece = attempt!(template_piece(template, i + 3, len));
+                parts.push(piece.to_string());
                 i += 3 + len;
             } else if b == 0xC0 {
                 // Placeholder with entirely default options.
-                let arg = template_arg(args, arg_index)?;
-                out.push_str(&self.format_arg(frames, arg, &FmtOptions::new(), indent)?);
+                let arg = attempt!(template_arg(args, arg_index));
+                let text = attempt!(self.format_arg(frames, arg, &FmtOptions::new(), indent));
+                parts.push(text);
                 arg_index += 1;
                 i += 1;
             } else if b & 0xC0 == 0xC0 {
@@ -506,24 +554,24 @@ impl<'a> Interpreter<'a> {
                 let mut options = FmtOptions::new();
                 let mut j = i + 1;
                 if b & 0x01 != 0 {
-                    options.flags = read_u32(template, j)?;
+                    options.flags = attempt!(read_u32(template, j));
                     j += 4;
                 }
                 if b & 0x02 != 0 {
-                    let raw = read_u16(template, j)?;
+                    let raw = attempt!(read_u16(template, j));
                     j += 2;
                     options.width = if b & 0x10 != 0 {
-                        self.count_arg(args, raw as usize)?
+                        attempt!(self.count_arg(args, raw as usize))
                     } else {
                         raw
                     };
                     options.flags |= WIDTH_FLAG;
                 }
                 if b & 0x04 != 0 {
-                    let raw = read_u16(template, j)?;
+                    let raw = attempt!(read_u16(template, j));
                     j += 2;
                     options.precision = if b & 0x20 != 0 {
-                        self.count_arg(args, raw as usize)?
+                        attempt!(self.count_arg(args, raw as usize))
                     } else {
                         raw
                     };
@@ -531,18 +579,22 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut this_arg = arg_index;
                 if b & 0x08 != 0 {
-                    this_arg = read_u16(template, j)? as usize;
+                    this_arg = attempt!(read_u16(template, j)) as usize;
                     j += 2;
                 }
-                let arg = template_arg(args, this_arg)?;
-                out.push_str(&self.format_arg(frames, arg, &options, indent)?);
+                let arg = attempt!(template_arg(args, this_arg));
+                let text = attempt!(self.format_arg(frames, arg, &options, indent));
+                parts.push(text);
                 arg_index += 1;
                 i = j;
             } else {
-                return Err(template_error("unexpected byte at a part boundary"));
+                return (
+                    parts,
+                    Some(template_error("unexpected byte at a part boundary")),
+                );
             }
         }
-        Ok(out)
+        (parts, None)
     }
 
     /// An indirect width/precision: the argument at `idx` must be a
@@ -1551,6 +1603,36 @@ impl<'a> Interpreter<'a> {
         };
         self.formatter_push(state.formatter, &text);
         Ok(())
+    }
+
+    /// The panic core's `default_write_fmt` raises when a
+    /// formatting trait implementation returns `Err(fmt::Error)`
+    /// and the sink itself did not fail: core's own message, at
+    /// its fixed position in `core::io::write` (pinned to the
+    /// toolchain build, as the runtime's other fixed library
+    /// positions are). The stamp, origin and backtrace notes
+    /// are recorded here, as for the detached rendering in
+    /// `format_debug_detached`, which raises the same panic
+    /// for the report's sink; the caller returns the error
+    /// into the drive loop, which runs the unwind (and fires
+    /// the panic hook, which the detached path fires itself).
+    pub(crate) fn fmt_returned_error_panic(&mut self) -> InterpError {
+        let message = "a formatting trait implementation returned an error \
+             when the underlying stream did not";
+        self.note_panic_stamp(Value::Ref(RefTarget::value(Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Str(
+                    "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/io/write.rs"
+                        .to_string(),
+                ),
+                Value::Uint(411),
+                Value::Uint(17),
+            ],
+        })));
+        self.note_panic_origin(PanicOrigin::PanicFmt);
+        self.note_panic_no_backtrace(false);
+        InterpError::panic_str_payload(message)
     }
 
     /// Render `value` through the `Debug` formatting engine

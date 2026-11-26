@@ -767,8 +767,23 @@ impl<'a> Interpreter<'a> {
                     .strip_prefix("&mut ")
                     .or_else(|| self_ty.strip_prefix("&"))
                     .unwrap_or(self_ty);
-                let text =
-                    self.format_arguments(frames, &self.coerce_arguments(frames, &vals[1], name)?, 0)?;
+                let text = match self.format_arguments(
+                    frames,
+                    &self.coerce_arguments(frames, &vals[1], name)?,
+                    0,
+                ) {
+                    Ok(text) => text,
+                    // A formatting trait implementation returned
+                    // `Err(fmt::Error)`: this builtin *is* core's
+                    // `default_write_fmt` for its receivers, and
+                    // its sinks have not failed before the text
+                    // is composed, so core's outcome is the
+                    // panic, not an `Err` value.
+                    Err(InterpError::FmtReturnedError { .. }) => {
+                        return Err(self.fmt_returned_error_panic());
+                    }
+                    Err(error) => return Err(error),
+                };
                 match self_ty {
                     "std::io::Stdout"
                     | "std::io::StdoutLock"
@@ -850,16 +865,25 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::FmtWrite => {
                 arity(2)?;
-                let text =
-                    self.format_arguments(frames, &self.coerce_arguments(frames, &vals[1], name)?, 0)?;
                 // The output is a `&mut dyn Write`: resolve it to
                 // the dyn value, then deliver the formatted text
                 // through the concrete type's own `write_str`. The
                 // real `fmt::write` body walks the template and
-                // calls `write_str` piece by piece; one `write_str`
-                // of the whole formatted text is the same
-                // observable output, and matches the fast path the
-                // body itself takes for a plain string.
+                // calls `write_str` piece by piece, in template
+                // order, stopping at the first failure: a writer
+                // error ends the walk (later pieces are neither
+                // written nor, in the body, composed), and a
+                // formatting failure -- a trait implementation
+                // returning `Err(fmt::Error)` -- is the call's own
+                // `Err` result once the pieces before it are
+                // delivered; the caller (core's
+                // `default_write_fmt` checking its adapter,
+                // `format!`'s expect, ...) decides what it means.
+                // The parts are composed up front here, so a
+                // piece's formatting runs even when an earlier
+                // piece's write then fails, where the body would
+                // not have composed it; the delivery order and
+                // the failure precedence are the body's.
                 let dyn_value = match &vals[0] {
                     Value::DynRef { .. } => vals[0].clone(),
                     Value::Ref(_) => {
@@ -903,7 +927,33 @@ impl<'a> Interpreter<'a> {
                         )))
                     }
                 };
-                self.call_sync(frames, &impl_name, vec![receiver, Value::Str(text)])
+                let coerced = self.coerce_arguments(frames, &vals[1], name)?;
+                let (parts, failure) = self.format_arguments_parts(frames, &coerced, 0);
+                for part in parts {
+                    let wrote = self.call_sync(
+                        frames,
+                        &impl_name,
+                        vec![receiver.clone(), Value::Str(part)],
+                    )?;
+                    match wrote {
+                        Value::Enum { variant: 0, .. } => {}
+                        other => return Ok(other),
+                    }
+                }
+                match failure {
+                    None => Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Unit],
+                    }),
+                    Some(InterpError::FmtReturnedError { .. }) => Ok(Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        }],
+                    }),
+                    Some(error) => Err(error),
+                }
             }
             Builtin::Format => {
                 arity(1)?;

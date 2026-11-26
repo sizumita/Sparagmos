@@ -1356,13 +1356,45 @@ impl<'a> Interpreter<'a> {
         } else if let Some(rest) = trait_path.strip_prefix("core::") {
             paths.push(format!("std::{rest}"));
         }
+        let keys = || {
+            self.program
+                .functions
+                .keys()
+                .chain(self.program.unconverted.keys())
+        };
+        // A first pass for the candidate whose `Self` spelling
+        // is the queried type itself, up to the spellings the
+        // two sides legitimately differ in (see
+        // `normalize_impl_self`): the base-name match below
+        // cannot tell two impls of one generic type apart --
+        // the `default_write_fmt` adapters over two different
+        // writers, say -- and this pass can.
+        let wanted = normalize_impl_self(concrete);
+        let mut exact: Option<&String> = None;
+        for key in keys() {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            let Some((self_part, trait_base, key_method)) = parse_impl_key(base) else {
+                continue;
+            };
+            if key_method != method
+                || !paths.iter().any(|p| p == &trait_base)
+                || normalize_impl_self(&self_part) != wanted
+            {
+                continue;
+            }
+            if exact == Some(key) {
+                continue;
+            }
+            if exact.is_some() {
+                return None;
+            }
+            exact = Some(key);
+        }
+        if let Some(key) = exact {
+            return Some(key.clone());
+        }
         let mut found: Option<String> = None;
-        for key in self
-            .program
-            .functions
-            .keys()
-            .chain(self.program.unconverted.keys())
-        {
+        for key in keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
             let Some((self_part, trait_base, key_method)) =
                 parse_impl_key(base).or_else(|| parse_impl_block_key(base))
@@ -1998,6 +2030,90 @@ fn impl_self_matches(self_part: &str, name: &str) -> bool {
     }
     self_base.rsplit("::").next().unwrap_or(self_base)
         == name.rsplit("::").next().unwrap_or(name)
+}
+
+/// The spelling of an impl `Self` type (or of a queried
+/// concrete type) with the parts the two sides legitimately
+/// differ in removed, so spellings of one type compare
+/// equal: lifetime arguments (`'_`, `'static`, named
+/// lifetimes), which rendered type names drop and instance
+/// keys keep, and the defaulted allocator argument
+/// (`std::alloc::Global`), which rendered names spell out
+/// and instance keys elide. Argument lists are processed at
+/// every nesting level; a list emptied by the removals is
+/// dropped with its brackets.
+fn normalize_impl_self(name: &str) -> String {
+    fn list(chars: &[char], start: usize) -> (String, usize) {
+        // `chars[start]` is '<': render the argument list
+        // (possibly to nothing) and return the index just
+        // past its closing '>'.
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut i = start + 1;
+        let mut depth = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '-' && chars.get(i + 1) == Some(&'>') {
+                current.push_str("->");
+                i += 2;
+            } else if c == '<' {
+                let (rendered, next) = list(chars, i);
+                current.push_str(&rendered);
+                i = next;
+            } else if c == '>' && depth == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                let kept: Vec<&str> = args
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|a| {
+                        !a.starts_with('\'')
+                            && *a != "std::alloc::Global"
+                            && *a != "alloc::alloc::Global"
+                    })
+                    .collect();
+                if kept.is_empty() {
+                    return (String::new(), i + 1);
+                }
+                return (format!("<{}>", kept.join(", ")), i + 1);
+            } else if c == '(' || c == '[' {
+                depth += 1;
+                current.push(c);
+                i += 1;
+            } else if c == ')' || c == ']' {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+                i += 1;
+            } else if c == ',' && depth == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                current = String::new();
+                i += 1;
+            } else {
+                current.push(c);
+                i += 1;
+            }
+        }
+        (current, i)
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            let (rendered, next) = list(&chars, i);
+            out.push_str(&rendered);
+            i = next;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Whether `v` holds a callable value anywhere inside it (a
