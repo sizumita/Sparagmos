@@ -981,3 +981,218 @@ fn main() {
 fn run_mode_mpsc_iter_map_collect() {
     run_ok("mpsc-iter-map", MPSC_ITER_MAP_SRC, "map: [20]\n");
 }
+
+
+// ----- Sync lock guards (Issue #541) -----
+//
+// `Mutex::lock` / `RwLock::read` / `RwLock::write` execute
+// through the converted std bodies; what the runtime adds is
+// the guards' `Deref` / `DerefMut` (the pointee is the lock
+// aggregate's data field -- for a read guard, the `NonNull`
+// data pointer the constructor stored, which denotes the
+// lock's `UnsafeCell` place), the guards' `Drop` running the
+// converted destructor body (which releases the lock), and
+// `Display` / `Debug` forwarding to the guarded value.
+
+const MUTEX_GUARD_SRC: &str = r#"
+use std::sync::Mutex;
+
+fn main() {
+    let m = Mutex::new(41i32);
+    {
+        let mut g = m.lock().unwrap();
+        *g += 1;
+        println!("in-lock: {}", *g);
+        println!("display-guard: {}", g);
+        println!("debug-guard: {:?}", g);
+    }
+    let g2 = m.lock().unwrap();
+    println!("after: {}", *g2);
+}
+"#;
+
+#[test]
+fn run_mode_mutex_guard_deref_mut_and_fmt() {
+    let dir = temp_dir("mutex-guard");
+    let src = fixture(&dir, "mutex_guard.rs", MUTEX_GUARD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "MutexGuard program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in-lock: 42\ndisplay-guard: 42\ndebug-guard: 42\nafter: 42\n",
+        "mutation through the guard lands in the lock, the guard \
+         formats as its pointee, and dropping it releases the lock"
+    );
+}
+
+const RWLOCK_GUARD_SRC: &str = r#"
+use std::sync::RwLock;
+
+fn main() {
+    let l = RwLock::new(String::from("hello"));
+    {
+        let r = l.read().unwrap();
+        println!("read: {}", *r);
+        println!("read-display: {}", r);
+    }
+    {
+        let mut w = l.write().unwrap();
+        w.push_str(" world");
+        println!("write-debug: {:?}", w);
+    }
+    let r1 = l.read().unwrap();
+    let r2 = l.read().unwrap();
+    println!("two readers: {} {}", *r1, *r2);
+    println!("try_write while read: {}", l.try_write().is_err());
+    drop(r1);
+    drop(r2);
+    println!("final: {}", *l.read().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_rwlock_guards_deref_and_try() {
+    let dir = temp_dir("rwlock-guard");
+    let src = fixture(&dir, "rwlock_guard.rs", RWLOCK_GUARD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "RwLock guard program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "read: hello\nread-display: hello\nwrite-debug: \"hello world\"\n\
+         two readers: hello world hello world\ntry_write while read: true\n\
+         final: hello world\n",
+        "read/write guards deref to the shared value, readers \
+         coexist, try_write reports the read hold, and the write \
+         guard's mutation is visible after its drop"
+    );
+}
+
+const GUARD_DROP_RELEASE_SRC: &str = r#"
+use std::sync::{Arc, Mutex};
+
+fn main() {
+    let m = Mutex::new(0i32);
+    for _ in 0..5 {
+        let mut g = m.lock().unwrap();
+        *g += 1;
+    }
+    println!("looped: {}", *m.lock().unwrap());
+    let g = m.lock().unwrap();
+    println!("try while held: {}", m.try_lock().is_err());
+    drop(g);
+    println!("try after drop: {}", m.try_lock().is_ok());
+
+    let counter = Arc::new(Mutex::new(0i32));
+    let c2 = Arc::clone(&counter);
+    let h = std::thread::spawn(move || {
+        for _ in 0..10 {
+            *c2.lock().unwrap() += 1;
+        }
+    });
+    h.join().unwrap();
+    println!("count: {}", *counter.lock().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_mutex_guard_drop_releases_lock() {
+    let dir = temp_dir("guard-drop-release");
+    let src = fixture(&dir, "guard_drop_release.rs", GUARD_DROP_RELEASE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guard drop program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "looped: 5\ntry while held: true\ntry after drop: true\ncount: 10\n",
+        "a dropped guard releases the mutex (re-locking and \
+         try_lock succeed), including across a spawned thread"
+    );
+}
+
+const READ_GUARD_VEC_SRC: &str = r#"
+use std::sync::RwLock;
+
+fn main() {
+    let v = RwLock::new(vec![5, 6, 7]);
+    let r = v.read().unwrap();
+    println!("len: {}", r.len());
+    println!("first: {}", r[0]);
+    println!("dbg: {:?}", *r);
+    println!("guard dbg: {:?}", r);
+}
+"#;
+
+#[test]
+fn run_mode_rwlock_read_guard_vec_pointee() {
+    let dir = temp_dir("read-guard-vec");
+    let src = fixture(&dir, "read_guard_vec.rs", READ_GUARD_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "read guard Vec program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len: 3\nfirst: 5\ndbg: [5, 6, 7]\nguard dbg: [5, 6, 7]\n",
+        "the read guard's stored data pointer denotes the \
+         lock's UnsafeCell place, so the pointee is the cell's \
+         contents (the whole Vec, not a prefix of it)"
+    );
+}
+
+const GUARD_UNWIND_RELEASE_SRC: &str = r#"
+use std::sync::RwLock;
+
+fn main() {
+    let l = RwLock::new(7i32);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _r = l.read().unwrap();
+        panic!("x");
+    }));
+    assert!(r.is_err());
+    println!("write after unwind: {}", *l.write().unwrap());
+    let l2 = RwLock::new(3i32);
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _w = l2.write().unwrap();
+        panic!("y");
+    }));
+    assert!(r2.is_err());
+    let g = l2.read().unwrap_or_else(|e| e.into_inner());
+    println!("read after write-unwind: {}", *g);
+}
+"#;
+
+#[test]
+fn run_mode_lock_guards_release_on_unwind() {
+    let dir = temp_dir("guard-unwind-release");
+    let src = fixture(&dir, "guard_unwind_release.rs", GUARD_UNWIND_RELEASE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guard unwind program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "write after unwind: 7\nread after write-unwind: 3\n",
+        "a guard dropped by unwinding still runs its destructor, \
+         so the lock can be taken again afterwards"
+    );
+}

@@ -7,7 +7,7 @@ use crate::interp::{
     channel_handle_id,
     Frame, Interpreter,
 };
-use crate::value::Value;
+use crate::value::{RefProj, Value};
 
 use super::*;
 
@@ -214,8 +214,136 @@ impl<'a> Interpreter<'a> {
             }
         }
     }
+
+    /// `Deref` / `DerefMut` for a lock guard whose first field
+    /// is a reference to the lock itself (`MutexGuard`,
+    /// `RwLockWriteGuard`, in the shape the converted lock
+    /// bodies build them): the guarded value is the lock
+    /// aggregate's data field -- field 2, the `UnsafeCell` --
+    /// and the reference denotes the cell's held value (its
+    /// field 0), a live place, so reads and writes through the
+    /// result reach the storage every guard of the lock shares.
+    pub(super) fn lock_guard_deref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let guard = self.resolve_value(frames, arg)?;
+        let fields = match guard {
+            Value::Enum { fields, .. } if fields.len() >= 2 => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    name,
+                    "a lock guard aggregate",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let lock_ref = fields.into_iter().next().expect("len checked");
+        let target = match lock_ref {
+            Value::Ref(target) => target,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    name,
+                    "a reference to the lock",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let data = target
+            .projected(RefProj::Field(2))
+            .and_then(|t| t.projected(RefProj::Field(0)))
+            .ok_or_else(|| {
+                unsupported(format!(
+                    "{name}: the guard's lock reference denotes no live place"
+                ))
+            })?;
+        Ok(Value::Ref(data))
+    }
+
+    /// `Deref` for `RwLockReadGuard`: unlike the other lock
+    /// guards, its first field is not the lock reference but a
+    /// `NonNull` aggregate holding the data pointer the guard's
+    /// constructor took from the lock's `UnsafeCell`. That
+    /// pointer denotes the cell's place (see
+    /// `project_pointee_cell`), so the pointee is the cell's
+    /// field 0.
+    pub(super) fn read_guard_deref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let guard = self.resolve_value(frames, arg)?;
+        let fields = match guard {
+            Value::Enum { fields, .. } if !fields.is_empty() => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    name,
+                    "a read guard aggregate",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let mut pointer = fields.into_iter().next().expect("len checked");
+        // Peel the `NonNull` wrapper (and any further one-field
+        // wrapper the constructor left around the pointer).
+        loop {
+            match pointer {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    pointer = fields.into_iter().next().expect("len checked");
+                }
+                // The pointer denotes the lock's `UnsafeCell`
+                // place (std forms it by casting a pointer to
+                // the cell, and a cast does not change the
+                // denoted place in this model): the pointee is
+                // the cell's field 0.
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                    return project_pointee_cell(pointer);
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        name,
+                        "a data pointer",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+    }
 }
 
+/// Projects a lock guard's data pointer through the
+/// `UnsafeCell` it denotes: std forms the pointer by casting
+/// `UnsafeCell::get`'s result, and a pointer cast does not
+/// change the denoted place in this model, so the raw pointer
+/// a read guard stores denotes the lock's cell place and the
+/// guarded value is that place's field 0. A fat or dyn
+/// pointer's base is projected the same way.
+pub(super) fn project_pointee_cell(pointer: Value) -> InterpResult<Value> {
+    Ok(match pointer {
+        Value::Ref(target) => Value::Ref(target.projected(RefProj::Field(0)).ok_or_else(
+            || unsupported("a lock guard data pointer with no live place"),
+        )?),
+        Value::FatRef { base, len } => Value::FatRef {
+            base: Box::new(project_pointee_cell(*base)?),
+            len,
+        },
+        Value::DynRef {
+            base,
+            concrete,
+            traits,
+            drop_glue,
+        } => Value::DynRef {
+            base: Box::new(project_pointee_cell(*base)?),
+            concrete,
+            traits,
+            drop_glue,
+        },
+        other => other,
+    })
+}
 /// A `std::sync::Barrier` handle value denoting
 /// barrier-table id `id`: the id in the handle's only slot.
 /// The guest treats the value opaquely -- it is stored,

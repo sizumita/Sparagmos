@@ -70,6 +70,25 @@ pub(crate) enum GlueCompletion {
     Sync,
 }
 
+/// Whether `value` is shaped like a lock guard the converted
+/// lock bodies built: an aggregate whose first field is a
+/// reference -- to the lock for `MutexGuard` /
+/// `RwLockWriteGuard`, or, for `RwLockReadGuard`, the `NonNull`
+/// data pointer (a one-field aggregate around a reference).
+fn lock_guard_shaped(value: &Value) -> bool {
+    fn ref_like(value: &Value) -> bool {
+        match value {
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => true,
+            Value::Enum { fields, .. } if fields.len() == 1 => ref_like(&fields[0]),
+            _ => false,
+        }
+    }
+    match value {
+        Value::Enum { fields, .. } => fields.first().is_some_and(ref_like),
+        _ => false,
+    }
+}
+
 impl<'a> Interpreter<'a> {
     /// Read the value at `root` + `path` for drop glue: `Ok(None)`
     /// when any part of the way is uninitialized (a moved-out or
@@ -1542,6 +1561,21 @@ impl<'a> Interpreter<'a> {
                                 }
                                 active.work.push((sub, *pointee));
                             }
+                        }
+                    }
+                    P::GuardDtor { func } => {
+                        // Run the guard's destructor only on a
+                        // value shaped like a guard the converted
+                        // lock bodies built (see the plan's doc):
+                        // re-queue it as a plain destructor call.
+                        // A moved-out or forged (stdio lock) value
+                        // has no destructor to run.
+                        let shaped = match self.read_at(frames, &active.root, &path)? {
+                            Some(value) => lock_guard_shaped(&value),
+                            None => false,
+                        };
+                        if shaped {
+                            active.work.push((path, P::CallDtor { func }));
                         }
                     }
                     P::CallDtor { func } => {
