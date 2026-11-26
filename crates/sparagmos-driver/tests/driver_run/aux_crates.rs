@@ -78,6 +78,52 @@ fn run_mode_aux_crate_functions_execute() {
 }
 
 
+const AUX_STATICS_SRC: &str = r#"
+pub static ANSWER: u64 = 42;
+pub static NEGATIVE: i32 = -7;
+"#;
+
+const AUX_STATICS_MAIN_SRC: &str = r#"
+extern crate auxlib;
+fn main() {
+    println!("{}", auxlib::ANSWER);
+    println!("{}", auxlib::NEGATIVE);
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_statics_print() {
+    // Printing statics defined in an auxiliary crate under
+    // `-O`: the optimized body references the static directly
+    // from the raw `format_args!` argument, and the
+    // interpreter's Display recovery reads the static's declared
+    // type from the program's static type tables. The driver's
+    // item scan records local statics only, so the declared type
+    // must be recorded at the reference that names the static --
+    // without it this run stops at the Display recovery
+    // (Issue #513).
+    let dir = temp_dir("aux-statics");
+    let aux = fixture(&dir, "auxlib.rs", AUX_STATICS_SRC);
+    let src = fixture(&dir, "auxmain.rs", AUX_STATICS_MAIN_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("-O")
+        .arg("--aux")
+        .arg(format!("auxlib={}", aux.display()))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "aux statics must print; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n-7\n");
+}
+
+
 const AUX_PM_SRC: &str = r#"
 extern crate proc_macro;
 use proc_macro::TokenStream;

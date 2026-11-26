@@ -271,6 +271,30 @@ impl Converter {
                 } else {
                     def
                 };
+                // A static defined in another crate is a real
+                // item the item scan does not enumerate (the scan
+                // covers local items only), so its declared type
+                // is recorded here, at the first reference that
+                // names it: the program's static tables are keyed
+                // from this record (a whole-static reference's
+                // seed is decoded against it below, and the
+                // interpreter's declared-type recovery for static
+                // references consults it). Local statics keep the
+                // scan's record: the ones the scan misses are
+                // anonymous promoted statics, whose type query can
+                // ICE (see the scan in `collect`), so they are not
+                // asked here. The query is contained the way the
+                // scan contains it.
+                if !def.krate().is_local {
+                    let def_id = self.crate_def_id(&def);
+                    if !self.static_tys.contains_key(&def_id) {
+                        if let Ok(ty) = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| def.ty()),
+                        ) {
+                            self.note_static_ty(&def, ty);
+                        }
+                    }
+                }
                 let init = self.static_initializer(&def)?;
                 (init, Some(def))
             }
