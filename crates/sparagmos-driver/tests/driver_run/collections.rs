@@ -271,8 +271,8 @@ fn run_mode_iterator_for_each_mutates_captures() {
 
 const ITER_COLLECT_UNSUPPORTED_SRC: &str = r#"
 fn main() {
-    let set: std::collections::BTreeSet<i32> = (0..3).collect();
-    println!("n={}", set.len());
+    let list: std::collections::LinkedList<i32> = (0..3).collect();
+    println!("n={}", list.len());
 }
 "#;
 
@@ -282,8 +282,9 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
     // named, not with an approximation or a conversion error
     // from deep inside the collected FromIterator chain.
     // (`HashSet` / `HashMap` used to be this test's example;
-    // since #350 their collected bodies execute instead, so
-    // the still-unmodelled `BTreeSet` stands in.)
+    // since #350 their collected bodies execute instead, and
+    // `BTreeSet` / `BTreeMap` followed in #545, so the
+    // still-unmodelled `LinkedList` stands in.)
     let dir = temp_dir("iter_collect_unsupported");
     let src = fixture(&dir, "iter_collect_unsupported.rs", ITER_COLLECT_UNSUPPORTED_SRC);
     let out = run_driver(&src);
@@ -294,9 +295,124 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
         "unmodelled collect target must exit 2; stderr={stderr}"
     );
     assert!(
-        stderr.contains("collect into std::collections::BTreeSet")
+        stderr.contains("collect into std::collections::LinkedList")
             && stderr.contains("is not runtime-supported"),
         "the target is named in the reason; stderr={stderr}"
+    );
+}
+
+const BTREE_SET_COLLECT_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let s: BTreeSet<i32> = (0..3).collect();
+    let sum: i32 = s.iter().sum();
+    println!("len={} sum={}", s.len(), sum);
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_collect() {
+    // Collecting into a `BTreeSet` executes the collection's
+    // own `FromIterator` body (the bulk bottom-up build over
+    // the collected vector), as for the hash collections in
+    // #350: the elements land sorted and deduplicated in the
+    // tree's node storage, iteration reads them back in
+    // order, and the set drops cleanly at the end of `main`.
+    let dir = temp_dir("btreesetcollect");
+    let src = fixture(&dir, "btreesetcollect.rs", BTREE_SET_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collecting into BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3 sum=3\n");
+}
+
+const BTREE_SET_FROM_ITER_SRC: &str = r#"
+use std::collections::BTreeSet;
+use std::iter::FromIterator;
+fn main() {
+    let s = BTreeSet::from_iter([5, 4, 4]);
+    let sum: i32 = s.iter().sum();
+    println!("len={} sum={}", s.len(), sum);
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_from_iter() {
+    // `BTreeSet::from_iter` over an array: the source
+    // iterator's elements are collected into a vector, sorted,
+    // and built into the tree bottom-up; the duplicate
+    // element is dropped by the build.
+    let dir = temp_dir("btreesetfromiter");
+    let src = fixture(&dir, "btreesetfromiter.rs", BTREE_SET_FROM_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "BTreeSet::from_iter must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=2 sum=9\n");
+}
+
+const BTREE_SET_COLLECT_FROM_VEC_SRC: &str = r#"
+use std::collections::BTreeSet;
+fn main() {
+    let v = vec![5, 4, 4];
+    let s: BTreeSet<i32> = v.into_iter().collect();
+    let sum: i32 = s.iter().sum();
+    println!("len={} sum={}", s.len(), sum);
+}
+"#;
+
+#[test]
+fn run_mode_btree_set_collect_from_vec_iter() {
+    // Collecting a `vec::IntoIter`: the B-tree build wraps
+    // the collected vector's iterator in its deduplicating
+    // sorted iterator and steps it in its real layout.
+    let dir = temp_dir("btreesetcollectvec");
+    let src = fixture(&dir, "btreesetcollectvec.rs", BTREE_SET_COLLECT_FROM_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collecting a vec::IntoIter into BTreeSet must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=2 sum=9\n");
+}
+
+const BTREE_MAP_COLLECT_SRC: &str = r#"
+use std::collections::BTreeMap;
+use std::iter::FromIterator;
+fn main() {
+    let m: BTreeMap<i32, i32> = [(1, 10), (2, 20)].into_iter().collect();
+    println!("len={} v1={:?}", m.len(), m.get(&1));
+    let m2 = BTreeMap::from_iter([(3, 30), (1, 10)]);
+    println!("len={} v3={:?}", m2.len(), m2.get(&3));
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_collect_and_from_iter() {
+    // The map forms of the same paths: `collect` and
+    // `from_iter` build the tree from the key/value pairs and
+    // lookups read the values back out of the node storage.
+    let dir = temp_dir("btreemapcollect");
+    let src = fixture(&dir, "btreemapcollect.rs", BTREE_MAP_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collecting into BTreeMap must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=2 v1=Some(10)\nlen=2 v3=Some(30)\n"
     );
 }
 

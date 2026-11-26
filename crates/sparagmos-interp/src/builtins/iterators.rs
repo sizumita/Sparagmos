@@ -2274,6 +2274,24 @@ impl<'a> Interpreter<'a> {
             return self.iterator_next_state(frames, self_ty, state.clone());
         }
         let fields = iterator_fields(state, self_ty)?;
+        // A `vec::IntoIter` in its real field layout (the
+        // aggregate an inlined `Vec::into_iter` construction
+        // inside a collected body builds -- the iterator the
+        // B-tree bulk sorted build steps, above all): the
+        // modelled arm below steps only the [items, next
+        // index] state the `IntoIterator` builtin builds, so
+        // the real layout is stepped on its pointer pair
+        // first, the real-layout step the slice iterators get
+        // from `slice_iter_step_real`.
+        if (self_ty.starts_with("std::vec::IntoIter<")
+            || self_ty.starts_with("alloc::vec::IntoIter<"))
+            && fields.len() == 6
+        {
+            if let Some(step) = vec_into_iter_step_real(self, frames, self_ty, &fields) {
+                let (new_fields, item) = step?;
+                return Ok((iterator_state_like(state, new_fields), item));
+            }
+        }
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
                 return Err(InterpError::type_mismatch(
@@ -4328,6 +4346,43 @@ pub fn hash_collection_tag(self_ty: &str) -> bool {
         || hash_iterator_tag(self_ty)
 }
 
+/// Whether this type tag names a B-tree collection
+/// (`BTreeMap` / `BTreeSet`): the `collect` / `from_iter`
+/// consumer builtins can only build the target shapes they
+/// model natively -- a sorted tree is not one of them --
+/// while the collected instance bodies (collect into a
+/// `Vec`, sort, then the bulk bottom-up build) execute
+/// faithfully for any iterator, modelled or not, the
+/// arrangement the hash collections use (see
+/// `hash_collection_tag`).
+pub fn btree_collection_tag(self_ty: &str) -> bool {
+    let inner = self_ty
+        .strip_prefix("&mut ")
+        .or_else(|| self_ty.strip_prefix('&'))
+        .unwrap_or(self_ty);
+    inner.starts_with("std::collections::BTreeMap<")
+        || inner.starts_with("std::collections::BTreeSet<")
+        || inner.starts_with("alloc::collections::BTreeMap<")
+        || inner.starts_with("alloc::collections::BTreeSet<")
+}
+
+/// Whether this type tag names a B-tree sorted-build
+/// iterator (`DedupSortedIter`, the deduplicating wrapper
+/// `BTreeMap::from_iter` feeds its bulk bottom-up build):
+/// its `next` steps a one-element lookahead state the
+/// modelled state machines do not reproduce -- the
+/// collected impl body is the faithful execution, the
+/// arrangement the hash iterators use (see
+/// `hash_iterator_tag`).
+pub fn btree_iterator_tag(self_ty: &str) -> bool {
+    let bare = self_ty
+        .strip_prefix("&mut ")
+        .or_else(|| self_ty.strip_prefix('&'))
+        .unwrap_or(self_ty);
+    bare.starts_with("alloc::collections::btree::dedup_sorted_iter::DedupSortedIter<")
+        || bare.starts_with("std::collections::btree::dedup_sorted_iter::DedupSortedIter<")
+}
+
 /// Whether this type is one of the concrete collection
 /// iterators whose `next` the modelled state machine does
 /// not step -- the `LinkedList` / `VecDeque` / `BinaryHeap`
@@ -4862,6 +4917,57 @@ fn iterator_next_back_state(
     Err(unsupported(format!(
         "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"
     )))
+}
+
+/// One `next` step of a `vec::IntoIter` in its real field
+/// layout ([buf, phantom, cap, alloc, ptr, end], the fields
+/// of `alloc::vec::into_iter::IntoIter`): the layout an
+/// inlined `Vec::into_iter` construction inside a collected
+/// body builds, where the modelled [items, next index]
+/// state the arm in `next_on_state` steps is the form the
+/// `IntoIterator` builtin builds instead. The step reads
+/// the element at the current pointer and advances the
+/// pointer by one element; the exhausted pair answers
+/// `None` with the state unchanged. The consumed slot is
+/// not cleared: every later reader of the iterator (the
+/// remaining steps, its drop glue, `as_slice`) reads the
+/// `ptr..end` range, never behind the current pointer.
+/// `None` when the fields are not the real layout's
+/// readable pointer pair (an address-only buffer, a
+/// zero-sized element type), leaving the caller its shape
+/// error.
+fn vec_into_iter_step_real(
+    interp: &Interpreter,
+    frames: &mut Vec<Frame>,
+    self_ty: &str,
+    fields: &[Value],
+) -> Option<InterpResult<(Vec<Value>, Value)>> {
+    if fields.len() != 6 {
+        return None;
+    }
+    let ptr_field = &fields[4];
+    let ptr_ref = iter_ptr_value(ptr_field)?;
+    let end_ref = iter_ptr_value(&fields[5])?;
+    if ptr_ref == end_ref {
+        return Some(Ok((fields.to_vec(), none_value())));
+    }
+    let elem_tag = first_generic_arg(self_ty)?;
+    let (size, _) = interp.layout_of(elem_tag)?;
+    if size == 0 {
+        return None;
+    }
+    let size = u64::try_from(size).ok()?;
+    let cur = iter_ptr_index(&ptr_ref, Some(size))?;
+    let last = iter_ptr_index(&end_ref, Some(size))?;
+    if cur >= last {
+        return Some(Ok((fields.to_vec(), none_value())));
+    }
+    let target = interp.deref_value(frames, &ptr_ref).ok()?;
+    let item = interp.read_resolved(frames, &target).ok()?;
+    let advanced = iter_ptr_with_index(ptr_field, cur + 1)?;
+    let mut new_fields = fields.to_vec();
+    new_fields[4] = advanced;
+    Some(Ok((new_fields, some_value(item))))
 }
 
 /// One step of a real-layout `slice::Iter` state whose

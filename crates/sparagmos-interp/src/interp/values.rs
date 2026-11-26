@@ -321,6 +321,25 @@ impl<'a> Interpreter<'a> {
                 });
             }
         }
+        // A `UsizeNoHighBit` place (a `RawVecInner`'s capacity
+        // slot): the type is a one-field wrapper around a
+        // `usize`, and the capacity the resolver's buffer-chain
+        // walk reports for a vector in its element-list form
+        // is the bare count (see `resolve_place_mode`).
+        // Storing the bare count into the wrapper place wraps
+        // it in the one-field aggregate, the exact inverse of
+        // the wrapper-unwrap for scalar targets below, as for
+        // `Unaligned` above.
+        if let Some(Ty::Adt(name)) = ty {
+            if name == "core::num::niche_types::UsizeNoHighBit"
+                && matches!(value, Value::Uint(_))
+            {
+                return Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![value],
+                });
+            }
+        }
         // A scalar place whose value arrives as a one-field wrapper
         // aggregate: reading through a raw pointer into a transparent
         // wrapper (`UnsafeCell<T>`, the `AtomicUsize`-family structs,
