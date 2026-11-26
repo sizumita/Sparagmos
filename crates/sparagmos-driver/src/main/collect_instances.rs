@@ -399,6 +399,15 @@ pub(crate) fn collect_local_instances(
                 );
                 continue;
             }
+            // The instance whose body is fetched below: the
+            // demanded instance itself, or - for an
+            // extern-item-impl (EII) function declaration, which
+            // has no body of its own - the registered
+            // implementation's instance (see
+            // `convert::eii_impl_instance`). The converted body
+            // is registered under the demanded instance either
+            // way, the key its call sites resolve through.
+            let mut body_inst = inst;
             if !inst.has_body() {
                 // A compiler intrinsic the interpreter models
                 // is served by the builtin, the way a demanded
@@ -426,14 +435,19 @@ pub(crate) fn collect_local_instances(
                         continue;
                     }
                 }
-                let reason = match inst.kind {
-                    rustc_public::mir::mono::InstanceKind::Intrinsic => {
-                        "compiler intrinsic (no fallback body)"
+                match sparagmos_driver::convert::eii_impl_instance(&inst) {
+                    Some(impl_inst) => body_inst = impl_inst,
+                    None => {
+                        let reason = match inst.kind {
+                            rustc_public::mir::mono::InstanceKind::Intrinsic => {
+                                "compiler intrinsic (no fallback body)"
+                            }
+                            _ => "no MIR body available",
+                        };
+                        fail_all(&mut *demands, &owners, reason.to_string());
+                        continue;
                     }
-                    _ => "no MIR body available",
-                };
-                fail_all(&mut *demands, &owners, reason.to_string());
-                continue;
+                }
             }
             // Mirror the virtual guard for compiler-generated
             // impl bodies over a SIMD type: the derived body
@@ -448,7 +462,7 @@ pub(crate) fn collect_local_instances(
             // Hand-written methods over SIMD types do not trip
             // the ban (their bodies choose their own accesses)
             // and are fetched as usual.
-            if sparagmos_driver::convert::generated_simd_impl_method(&inst) {
+            if sparagmos_driver::convert::generated_simd_impl_method(&body_inst) {
                 fail_all(
                     &mut *demands,
                     &owners,
@@ -456,7 +470,7 @@ pub(crate) fn collect_local_instances(
                 );
                 continue;
             }
-            let ibody = match fetch_instance_body(&inst) {
+            let ibody = match fetch_instance_body(&body_inst) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     fail_all(&mut *demands, &owners, "no MIR body available".to_string());

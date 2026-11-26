@@ -92,6 +92,7 @@ pub use self::screen::{
     unnormalizable_projection_in_body, unnormalizable_projection_in_instance,
     UNNORMALIZABLE_PROJECTION_REASON,
 };
+pub use self::statics::eii_impl_instance;
 
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
