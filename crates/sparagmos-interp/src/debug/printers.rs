@@ -129,17 +129,17 @@ fn elements_cap(elements: usize) -> usize {
     }
 }
 
-/// Truncate a printed string the way gdb's `print elements`
-/// setting truncates one: past the limit, the first `elements`
-/// characters and an ellipsis (which the caller then quotes).
-/// A setting of 0 is "unlimited" and never truncates.
-fn truncate_print_string(text: &str, elements: usize) -> String {
+/// Render a printed string the way gdb renders one under
+/// its `print elements` setting: quoted, and past the limit
+/// the first `elements` characters, the closing quote, and
+/// only then the ellipsis (`"IAMA "...`). A setting of 0 is
+/// "unlimited" and never truncates.
+fn quote_print_string(text: &str, elements: usize) -> String {
     if elements == 0 || text.chars().count() <= elements {
-        return text.to_string();
+        return format!("\"{}\"", escape_str(text));
     }
-    let mut out: String = text.chars().take(elements).collect();
-    out.push_str("...");
-    out
+    let head: String = text.chars().take(elements).collect();
+    format!("\"{}\"...", escape_str(&head))
 }
 
 /// Render a value in gdb form with the pretty printers applied
@@ -326,10 +326,7 @@ pub(super) fn render_pretty_gdb(
                     }
                     _ => return None,
                 };
-                Some(format!(
-                    "\"{}\"",
-                    escape_str(&truncate_print_string(&text, elements))
-                ))
+                Some(quote_print_string(&text, elements))
             }
             _ => None,
         },
@@ -357,10 +354,7 @@ fn render_printer_adt(
                 Value::Str(s) => Some(s.clone()),
                 _ => path_text(value),
             }?;
-            Some(format!(
-                "\"{}\"",
-                escape_str(&truncate_print_string(&text, elements))
-            ))
+            Some(quote_print_string(&text, elements))
         }
         PrinterKind::Vec => {
             let elem =
