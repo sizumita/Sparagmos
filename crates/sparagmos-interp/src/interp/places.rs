@@ -74,6 +74,17 @@ impl<'a> Interpreter<'a> {
         // target the chain started from.
         let mut buf_base: Option<Resolved> = None;
         let mut buf_depth = 0usize;
+        // A suspected `Vec` position the type tracking could
+        // not name: a `Field` step out of a named transparent
+        // wrapper (`ManuallyDrop<Vec>` above all) whose field
+        // type the field-type table cannot record (a generic
+        // parameter at its head) leaves the walk on the
+        // wrapper's payload with no declared type, and the
+        // payload may be a vector whose structural fields the
+        // following steps name. The suspicion is armed by that
+        // step and judged by the next field step against the
+        // payload's own shape (see the `Field` arm).
+        let mut buf_suspect = false;
         // A `Field(0)` step that landed on a byte-vector-shaped
         // value (an `Enum` of byte elements: the stored form of
         // a `Vec<u8>` the type tracking could not reach, e.g.
@@ -130,6 +141,9 @@ impl<'a> Interpreter<'a> {
             // is decided by the step that follows it; a
             // non-field step makes it the plain field access it
             // is, appended before this step is processed.
+            if !matches!(elem, ProjectionElem::Field(_)) {
+                buf_suspect = false;
+            }
             if pending_vec.is_some()
                 && !matches!(elem, ProjectionElem::Field(_))
             {
@@ -157,6 +171,11 @@ impl<'a> Interpreter<'a> {
                         cur = container;
                         fat_skip = depth;
                     }
+                    // The suspicion a previous wrapper step
+                    // armed (see the state above) is judged by
+                    // this step; it does not survive past it
+                    // unless this step re-arms it.
+                    let suspect = std::mem::take(&mut buf_suspect);
                     fat_cap = None;
                     fat_elem_string = None;
                     fat_elem_ty = None;
@@ -325,6 +344,43 @@ impl<'a> Interpreter<'a> {
                         };
                         cur_ty = Some(Ty::Uint(UintTy::Usize));
                         Resolved::Value(Value::Uint(count), Vec::new())
+                    } else if suspect
+                        && cur_ty.is_none()
+                        && *idx == 0
+                        && self.suspected_vec_position(frames, &cur)
+                    {
+                        // The suspected vector position (see
+                        // the state above): the wrapper's
+                        // payload is a materialised vector
+                        // value, so this step is its buffer
+                        // field -- enter the wrapper chain
+                        // exactly as for a named `Vec` position.
+                        buf_base = Some(cur.clone());
+                        buf_depth = 1;
+                        cur_ty = None;
+                        cur
+                    } else if suspect
+                        && cur_ty.is_none()
+                        && *idx == 1
+                        && self.suspected_vec_position(frames, &cur)
+                    {
+                        // The suspected vector's length slot,
+                        // read as for a named `Vec` position.
+                        let held = self.read_resolved(frames, &cur)?;
+                        let count = match crate::builtins::vec_real_aggregate_parts(
+                            &held,
+                        ) {
+                            Some((_, len)) => len as u128,
+                            None => held.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("length of {place}"),
+                                    "vector value",
+                                    "value without a length",
+                                )
+                            })?,
+                        };
+                        cur_ty = Some(Ty::Uint(UintTy::Usize));
+                        Resolved::Value(Value::Uint(count), Vec::new())
                     } else if *idx == 0 && cur_ty.is_none() && root_is_path_chain {
                         // The type tracking has no type for this
                         // step (a wrapper descent the program's
@@ -373,6 +429,13 @@ impl<'a> Interpreter<'a> {
                     } else {
                         buf_depth = 0;
                         buf_base = None;
+                        // Whether this step descends out of a
+                        // named transparent wrapper (see
+                        // `transparent_wrapper_ty`): judged
+                        // before the type tracking advances
+                        // past the step.
+                        let wrapper_descent = *idx == 0
+                            && matches!(&cur_ty, Some(t) if transparent_wrapper_ty(t));
                         cur_ty = match &cur_ty {
                             Some(Ty::Tuple(ts)) => ts.get(*idx as usize).cloned(),
                             Some(Ty::Array(elem, _)) => Some((**elem).clone()),
@@ -380,6 +443,19 @@ impl<'a> Interpreter<'a> {
                             _ => None,
                         };
                         cur_variant = 0;
+                        // A descent out of a transparent
+                        // wrapper whose field type the tracking
+                        // cannot name (a generic parameter at
+                        // its head: `ManuallyDrop<T>` above
+                        // all) leaves the walk on the payload
+                        // with no declared type: arm the
+                        // suspicion that the payload is a
+                        // vector whose structural fields the
+                        // following steps name (see the state
+                        // above).
+                        if wrapper_descent && cur_ty.is_none() {
+                            buf_suspect = true;
+                        }
                         self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
                     }
                 }
@@ -1790,6 +1866,27 @@ impl<'a> Interpreter<'a> {
     /// field 1 its length; see the string arms of
     /// `project_value`). Entering the chain there would form
     /// an element pointer into a value that stores no elements.
+    /// Whether the position `pos` denotes holds a value in a
+    /// vector's own shape: a sparse vector, or an aggregate
+    /// whose fields are all values of one kind -- an element
+    /// list. A struct aggregate's fields are its declared
+    /// fields, of heterogeneous kinds in general, so a
+    /// payload of that shape is not judged a vector (an empty
+    /// or one-field aggregate is vacuous: it has no field a
+    /// structural step could misread as an element). This is
+    /// the judgment the suspected-position arms apply to a
+    /// payload the type tracking could not name (see the
+    /// `buf_suspect` state in `resolve_place_mode`).
+    fn suspected_vec_position(&self, frames: &[Frame], pos: &Resolved) -> bool {
+        match self.read_resolved(frames, pos) {
+            Ok(Value::SparseVec { .. }) => true,
+            Ok(Value::Enum { fields, .. }) => fields
+                .windows(2)
+                .all(|w| w[0].kind_name() == w[1].kind_name()),
+            _ => false,
+        }
+    }
+
     fn vec_position_materialised(&self, frames: &[Frame], pos: &Resolved) -> bool {
         matches!(
             self.read_resolved(frames, pos),
@@ -2826,6 +2923,26 @@ pub(crate) fn buf_chain_depth(ty: &Ty) -> Option<usize> {
     }
 }
 
+/// Whether `ty` names one of the std newtype wrappers whose
+/// single field is the wrapped value itself (`ManuallyDrop`,
+/// `Pin`, `AssertUnwindSafe`): a field step out of one is a
+/// descent into the payload, never a read of the wrapper's
+/// own storage. Matched on the defining path, with or
+/// without the generic arguments the rendered name carries.
+pub(crate) fn transparent_wrapper_ty(ty: &Ty) -> bool {
+    let Ty::Adt(name) = ty else { return false };
+    let base = name.split('<').next().unwrap_or(name.as_str());
+    matches!(
+        base,
+        "std::mem::ManuallyDrop"
+            | "core::mem::ManuallyDrop"
+            | "std::pin::Pin"
+            | "core::pin::Pin"
+            | "std::panic::AssertUnwindSafe"
+            | "core::panic::AssertUnwindSafe"
+    )
+}
+
 /// Whether the type is a `Vec` ADT instance, under either its
 /// `std` or its `alloc` spelling.
 pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
@@ -2833,11 +2950,37 @@ pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
         Ty::Adt(name) => {
             name == "std::vec::Vec"
                 || name == "alloc::vec::Vec"
-                || name.starts_with("std::vec::Vec<")
-                || name.starts_with("alloc::vec::Vec<")
+                || vec_spelling(name, "std::vec::Vec<")
+                || vec_spelling(name, "alloc::vec::Vec<")
         }
         _ => false,
     }
+}
+
+/// Whether `name` is exactly `prefix` (which ends in `<`)
+/// followed by a balanced generic argument list and nothing
+/// else. A type nested in the named type's impl block
+/// (`Vec<T, A>::dedup_by::FillGapOnDrop`) carries the same
+/// prefix but continues past the argument list, and is not
+/// the type itself.
+fn vec_spelling(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut depth = 1usize;
+    for (idx, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx + ch.len_utf8() == rest.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether a one-field wrapper's only field is an aggregate the

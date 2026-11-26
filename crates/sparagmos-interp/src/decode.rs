@@ -61,8 +61,8 @@ use std::rc::Rc;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     cast_place_ty, cast_src_ty, constant_ty, describe_resolved, eval_binary, eval_cast, eval_unary,
-    navigate_mut, navigate_mut_grow, operand_pointee_ty, project_value, project_value_ev, Frame,
-    Interpreter,
+    is_vec_adt_ty, navigate_mut_grow, operand_pointee_ty, project_value_ev,
+    transparent_wrapper_ty, Frame, Interpreter,
 };
 use crate::ir::{
     BasicBlock, BinOp, Body, Constant, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
@@ -256,6 +256,26 @@ fn classify_place(place: &Place) -> PlaceKind {
         .collect();
     let desc: Rc<str> = Rc::from(describe_resolved(place.local.0, &proj));
     PlaceKind::LocalProj(proj.into(), desc)
+}
+
+/// The original place a decoded `LocalProj` destination was
+/// classified from, rebuilt from its precomputed projection
+/// (only `Field` / `Downcast` steps occur there, by the
+/// classification that produced it). `None` for any other
+/// step, which the classification never admits.
+fn local_proj_place(local: u32, proj: &[RefProj]) -> Option<Place> {
+    let projection = proj
+        .iter()
+        .map(|step| match step {
+            RefProj::Field(idx) => Some(ProjectionElem::Field(*idx)),
+            RefProj::Downcast(v) => Some(ProjectionElem::Downcast(*v)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Place {
+        local: Local(local as usize),
+        projection,
+    })
 }
 
 /// Whether a constant evaluates without touching interpreter
@@ -502,6 +522,62 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether `place`'s projection denotes a `Vec`'s
+    /// structural fields at any step: the declared type is
+    /// tracked from the place's local through field steps
+    /// exactly as the general resolver tracks it (see
+    /// `Interpreter::adt_field_ty`), and a `Field(0)` or
+    /// `Field(1)` step whose base type is a `Vec` ADT names
+    /// the buffer field or the length slot -- neither is
+    /// storage in the element-list value the projected fast
+    /// paths walk, so those paths must not serve the place.
+    /// A `Field(0)` descent out of a named transparent
+    /// wrapper (`ManuallyDrop<Vec>` above all) whose field
+    /// type the tracking cannot name likewise delegates when
+    /// a `Field(0)` / `Field(1)` step follows it: the payload
+    /// may be a vector, a position the general resolver
+    /// judges by the payload's shape.
+    pub(crate) fn vec_structural_place(&self, body: &Body, place: &Place) -> bool {
+        let mut cur_ty: Option<Ty> = body.local_ty(place.local).cloned();
+        let mut variant = 0usize;
+        // The suspicion the general resolver arms (see
+        // `resolve_place_mode`): a `Field(0)` descent out of a
+        // named transparent wrapper whose field type the
+        // tracking cannot name leaves the payload's type
+        // unknown, and a `Field(0)` / `Field(1)` step on the
+        // payload may enter a `Vec`'s structural fields.
+        let mut suspect = false;
+        for elem in &place.projection {
+            match elem {
+                ProjectionElem::Field(idx) => {
+                    if let Some(ty) = &cur_ty {
+                        if is_vec_adt_ty(ty) && (*idx == 0 || *idx == 1) {
+                            return true;
+                        }
+                    }
+                    if suspect && (*idx == 0 || *idx == 1) {
+                        return true;
+                    }
+                    let stepped = match &cur_ty {
+                        Some(ty) => self.adt_field_ty(ty, variant, *idx),
+                        None => None,
+                    };
+                    suspect = *idx == 0
+                        && matches!(&cur_ty, Some(t) if transparent_wrapper_ty(t))
+                        && stepped.is_none();
+                    cur_ty = stepped;
+                    variant = 0;
+                }
+                ProjectionElem::Downcast(v) => {
+                    variant = *v as usize;
+                    suspect = false;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Read a `Field` / `Downcast`-only projected place over a
     /// local of the executing frame, mirroring the general path
     /// (resolve, then `read_resolved`) step for step: the base
@@ -522,6 +598,17 @@ impl<'a> Interpreter<'a> {
         desc: &str,
         place: &Place,
     ) -> InterpResult<Value> {
+        // A projection that walks a `Vec`'s structural fields
+        // (its buffer-wrapper chain or its length slot) is not
+        // the syntactic walk this fast path mirrors: the value
+        // model holds a vector as its element list, so those
+        // steps denote the vector's buffer bookkeeping, which
+        // only the general resolver answers (see
+        // `resolve_place_mode`'s buffer-chain walk). Delegate,
+        // as for the uninitialized base below.
+        if self.vec_structural_place(body, place) {
+            return self.read_place(frames, body, place);
+        }
         let local = local as usize;
         let frame = frames.last().expect("frame");
         let base = match frame.locals.get(local) {
@@ -620,6 +707,18 @@ impl<'a> Interpreter<'a> {
                 desc,
                 place,
             } => {
+                // A move out of a `Vec`'s structural fields
+                // (see `read_local_proj`): the clearing below
+                // navigates the element list, which is not the
+                // storage the place denotes -- the general
+                // operand evaluation owns the shape.
+                if self.vec_structural_place(body, place) {
+                    return self.eval_operand(
+                        frames,
+                        body,
+                        &Operand::Move(place.clone()),
+                    );
+                }
                 let value = self.read_local_proj(frames, body, *local, proj, desc, place)?;
                 // The clearing `eval_operand` performs for a
                 // move out of a projected place, through the
@@ -659,6 +758,17 @@ impl<'a> Interpreter<'a> {
                 Ok(())
             }
             DDst::LocalProj { local, proj, desc } => {
+                // A write to a `Vec`'s structural fields (see
+                // `read_local_proj`): the slot navigation below
+                // walks the element list, but the place denotes
+                // the vector's buffer bookkeeping -- the
+                // general write owns the shape (its `Vec`
+                // buffer-slot and length-slot interceptions).
+                if let Some(place) = local_proj_place(*local, proj) {
+                    if self.vec_structural_place(body, &place) {
+                        return self.write_place(frames, body, &place, value);
+                    }
+                }
                 let local = *local as usize;
                 let pos = frames.len() - 1;
                 let func = frames[pos].func.clone();

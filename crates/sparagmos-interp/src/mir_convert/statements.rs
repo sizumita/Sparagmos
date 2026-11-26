@@ -480,20 +480,24 @@ impl<'a> Converter<'a> {
         let Some(iter_ty) = iter_ty else {
             return false;
         };
-        // A `collect` into a hash collection is not pre-empted:
-        // the builtin can only build the target shapes it
-        // models natively -- a hash table is not one of them --
-        // while the collected instance bodies (the trait
-        // default delegating to the collection's own
-        // `FromIterator` body, `with_hasher` + `extend` over
-        // the raw-table memory model) execute faithfully for
-        // any iterator, modelled or not. The target is the
-        // call's second generic argument (the first is the
-        // iterator).
+        // A `collect` into a hash or B-tree collection is not
+        // pre-empted: the builtin can only build the target
+        // shapes it models natively -- a hash table or a
+        // sorted tree is not one of them -- while the
+        // collected instance bodies (the trait default
+        // delegating to the collection's own `FromIterator`
+        // body: `with_hasher` + `extend` over the raw-table
+        // memory model for a hash target, collect into a
+        // `Vec` + sort + the bulk bottom-up build for a
+        // B-tree target) execute faithfully for any iterator,
+        // modelled or not. The target is the call's second
+        // generic argument (the first is the iterator).
         if kind == crate::builtins::Builtin::IteratorCollect {
             if let Some(target_ty) = raw_generic_args.get(1) {
                 let target_tag = crate::builtins::ty_tag(target_ty, self.names);
-                if crate::builtins::hash_collection_tag(&target_tag) {
+                if crate::builtins::hash_collection_tag(&target_tag)
+                    || crate::builtins::btree_collection_tag(&target_tag)
+                {
                     return false;
                 }
             }
@@ -547,7 +551,8 @@ impl<'a> Converter<'a> {
         match kind {
             crate::builtins::Builtin::IteratorNext => {
                 return (crate::builtins::hash_iterator_tag(&tag)
-                    || crate::builtins::collection_iterator_tag(&tag))
+                    || crate::builtins::collection_iterator_tag(&tag)
+                    || crate::builtins::btree_iterator_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
             }
             crate::builtins::Builtin::IntoIter => {
@@ -557,18 +562,20 @@ impl<'a> Converter<'a> {
             }
             _ => {}
         }
-        // Hash-collection targets of `collect` / `from_iter`
-        // are the same inversion one level up: the builtin
-        // drains the iterator itself and can only build the
-        // target shapes it models natively -- a hash table is
-        // not one of them -- while the instance bodies
-        // (`with_hasher` + `extend` over the raw-table memory
-        // model) execute faithfully for any iterator, modelled
-        // or not, so the body wins whenever the program has
-        // one. The target is the call's second generic
-        // argument for `collect` (whose first is the iterator)
-        // and its first for `from_iter` (whose first is the
-        // collection itself).
+        // Hash- and B-tree-collection targets of `collect` /
+        // `from_iter` are the same inversion one level up: the
+        // builtin drains the iterator itself and can only
+        // build the target shapes it models natively -- a hash
+        // table or a sorted tree is not one of them -- while
+        // the instance bodies (for a hash target,
+        // `with_hasher` + `extend` over the raw-table memory
+        // model; for a B-tree target, collect into a `Vec` +
+        // sort + the bulk bottom-up build) execute faithfully
+        // for any iterator, modelled or not, so the body wins
+        // whenever the program has one. The target is the
+        // call's second generic argument for `collect` (whose
+        // first is the iterator) and its first for `from_iter`
+        // (whose first is the collection itself).
         if matches!(
             kind,
             crate::builtins::Builtin::IteratorCollect
@@ -580,7 +587,9 @@ impl<'a> Converter<'a> {
             };
             if let Some(target_ty) = target_ty {
                 let target_tag = crate::builtins::ty_tag(target_ty, self.names);
-                if crate::builtins::hash_collection_tag(&target_tag) {
+                if crate::builtins::hash_collection_tag(&target_tag)
+                    || crate::builtins::btree_collection_tag(&target_tag)
+                {
                     return self.resolve_body_callee(func).is_some();
                 }
             }

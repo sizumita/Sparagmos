@@ -1428,6 +1428,7 @@ fn consumer_instance_needs_body(
         return if canonical.ends_with("next") {
             hash_iterator_ty(ty)
                 || collection_iterator_ty(ty)
+                || btree_iterator_ty(ty)
                 || (str_iter_ty(ty) && !str_split_char_ty(ty))
                 || foreign_adt_ty(ty)
         } else {
@@ -1497,14 +1498,17 @@ fn consumer_instance_needs_body(
     let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
         return false;
     };
-    // Hash-collection targets of `collect` / `from_iter`: the
-    // consumer builtins drain the iterator themselves and can
-    // only build the target shapes they model natively -- a
-    // hash table is not one of them -- while the instance
-    // bodies (`with_hasher` + `extend` over the raw-table
-    // memory model) are plain collected code that executes
-    // faithfully for any iterator, modelled or not. The body
-    // is therefore demanded whenever the target is a hash
+    // Hash- and B-tree-collection targets of `collect` /
+    // `from_iter`: the consumer builtins drain the iterator
+    // themselves and can only build the target shapes they
+    // model natively -- a hash table or a sorted tree is not
+    // one of them -- while the instance bodies (for a hash
+    // target, `with_hasher` + `extend` over the raw-table
+    // memory model; for a B-tree target, collect into a
+    // `Vec` + sort + the bulk bottom-up build) are plain
+    // collected code that executes faithfully for any
+    // iterator, modelled or not. The body is therefore
+    // demanded whenever the target is a hash or B-tree
     // collection, ahead of the modelled-iterator rule below.
     // The target is the call's second generic argument for
     // `collect` (whose first is the iterator) and its first
@@ -1519,7 +1523,7 @@ fn consumer_instance_needs_body(
             0
         };
         if let Some(GenericArgKind::Type(target)) = args.0.get(target_arg) {
-            if hash_collection_ty(target) {
+            if hash_collection_ty(target) || btree_collection_ty(target) {
                 return true;
             }
         }
@@ -1716,6 +1720,40 @@ fn hash_collection_ty(ty: &Ty) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether this `IntoIterator` `Self` type is a B-tree
+/// collection, or a reference to one: their `collect` /
+/// `from_iter` instance bodies are plain collected code, as
+/// with the hash collections (see `hash_collection_ty`).
+fn btree_collection_ty(ty: &Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => matches!(
+            def.name().as_str(),
+            "std::collections::BTreeMap" | "std::collections::BTreeSet"
+        ),
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => {
+            btree_collection_ty(&inner)
+        }
+        _ => false,
+    }
+}
+
+/// Whether this type is the B-tree sorted-build iterator
+/// (`DedupSortedIter`), judged by the ADT definition name,
+/// as in `hash_iterator_ty`. A reference is peeled before
+/// judging (the `&mut I` blanket `Iterator` impl names the
+/// reference as its `Self` type).
+fn btree_iterator_ty(ty: &Ty) -> bool {
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return btree_iterator_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    name.starts_with("alloc::collections::btree::dedup_sorted_iter::DedupSortedIter")
+        || name.starts_with("std::collections::btree::dedup_sorted_iter::DedupSortedIter")
 }
 
 /// Whether this type is a concrete collection iterator
