@@ -870,6 +870,17 @@ pub(crate) fn synthetic_addr(v: &Value) -> u128 {
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
                     RefProj::VecLen => (7u128, 0u128),
+                    RefProj::View(ty) => {
+                        // The recorded denomination is part
+                        // of the target's identity, as the
+                        // other steps are.
+                        let mut th: u128 = 0xcbf2_9ce4_8422_2325;
+                        for b in format!("{ty:?}").bytes() {
+                            th ^= u128::from(b);
+                            th = th.wrapping_mul(0x100_0000_01b3);
+                        }
+                        (8u128, th)
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -890,6 +901,17 @@ pub(crate) fn synthetic_addr(v: &Value) -> u128 {
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
                     RefProj::VecLen => (7u128, 0u128),
+                    RefProj::View(ty) => {
+                        // The recorded denomination is part
+                        // of the target's identity, as the
+                        // other steps are.
+                        let mut th: u128 = 0xcbf2_9ce4_8422_2325;
+                        for b in format!("{ty:?}").bytes() {
+                            th ^= u128::from(b);
+                            th = th.wrapping_mul(0x100_0000_01b3);
+                        }
+                        (8u128, th)
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -913,6 +935,17 @@ pub(crate) fn synthetic_addr(v: &Value) -> u128 {
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
                     RefProj::VecLen => (7u128, 0u128),
+                    RefProj::View(ty) => {
+                        // The recorded denomination is part
+                        // of the target's identity, as the
+                        // other steps are.
+                        let mut th: u128 = 0xcbf2_9ce4_8422_2325;
+                        for b in format!("{ty:?}").bytes() {
+                            th ^= u128::from(b);
+                            th = th.wrapping_mul(0x100_0000_01b3);
+                        }
+                        (8u128, th)
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -938,6 +971,17 @@ pub(crate) fn synthetic_addr(v: &Value) -> u128 {
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
                     RefProj::VecLen => (7u128, 0u128),
+                    RefProj::View(ty) => {
+                        // The recorded denomination is part
+                        // of the target's identity, as the
+                        // other steps are.
+                        let mut th: u128 = 0xcbf2_9ce4_8422_2325;
+                        for b in format!("{ty:?}").bytes() {
+                            th ^= u128::from(b);
+                            th = th.wrapping_mul(0x100_0000_01b3);
+                        }
+                        (8u128, th)
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);

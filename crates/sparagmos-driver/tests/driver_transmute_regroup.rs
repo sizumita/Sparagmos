@@ -590,3 +590,137 @@ fn main() {
          plain: 30\n"
     );
 }
+
+/// The nested element of a regrouped slice view through the
+/// formatting machinery: the format argument for `p[1][0]`
+/// reaches the formatter as a target whose steps the birth
+/// type (`[[u8; 3]; 2]`) denominates differently from the
+/// view (`[[u8; 2]]`), so the argument's value comes from
+/// the denomination the dereference recorded on the target
+/// (see `RefProj::View`). A reference to the element bound
+/// first and dereferenced later resolves through the same
+/// record.
+#[test]
+fn cast_slice_regroup_nested_fmt_element() {
+    let stdout = run_ok(
+        "cast-nested-fmt",
+        "cast_nested_fmt.rs",
+        r#"
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let p: *const [[u8; 3]] = &l;
+    let p: &[[u8; 2]] = unsafe { &*(p as *const [[u8; 2]]) };
+    // body read (control)
+    let x = p[1][0];
+    println!("body: {x}");
+    // fmt argument through the cast: nested element
+    println!("fmt: {}", p[1][0]);
+    println!("fmt-debug: {:?}", p[1][0]);
+    // stored reference bound first, dereferenced later
+    let r = &p[1][0];
+    println!("stored: {}", *r);
+    println!("stored-fmt: {:?}", r);
+    // first element for contrast
+    println!("fmt00: {}", p[0][0]);
+    println!("fmt10-arr: {:?}", p[1]);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "body: 6\n\
+         fmt: 6\n\
+         fmt-debug: 6\n\
+         stored: 6\n\
+         stored-fmt: 6\n\
+         fmt00: 3\n\
+         fmt10-arr: [6, 4]\n"
+    );
+}
+
+/// A thin pointer cast regrouping the storage it points
+/// at: the `[u8; 2]` the cast names is the denomination the
+/// dereference records, so the index steps the `Index`
+/// screen appends to the stored target price through it
+/// (the second byte of the storage), not through the birth
+/// type's row. The slice cast over the same storage keeps
+/// its own element denomination.
+#[test]
+fn thin_cast_regroup_index() {
+    let stdout = run_ok(
+        "thin-cast",
+        "thin_cast.rs",
+        r#"
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let r: &[u8; 2] = unsafe { &*(&l as *const [[u8; 3]; 2] as *const [u8; 2]) };
+    println!("body: {}", r[1]);
+    let rr = &r[1];
+    println!("stored: {}", *rr);
+    println!("fmt: {}", r[1]);
+    let s: &[u8] = unsafe { &*(&l as *const [[u8; 3]; 2] as *const [u8; 4] as *const [u8]) };
+    println!("slice-body: {}", s[3]);
+    let sr = &s[3];
+    println!("slice-stored: {}", *sr);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "body: 2\n\
+         stored: 2\n\
+         fmt: 2\n\
+         slice-body: 4\n\
+         slice-stored: 4\n"
+    );
+}
+
+/// A non-zero-offset re-slice of a regrouped view: the
+/// `Subslice` step of `&p[1..]` prices through the
+/// denomination the dereference recorded (its offset is
+/// one `[u8; 2]` element in, not one birth row), for the
+/// `Debug` rendering, the iteration, and the format
+/// argument alike; and writes through the denominated view
+/// land on the view's bytes of the birth storage.
+#[test]
+fn cast_slice_regroup_reslice_and_write() {
+    let stdout = run_ok(
+        "cast-reslice",
+        "cast_reslice.rs",
+        r#"
+fn main() {
+    let mut a: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let base: *const [[u8; 3]] = &a;
+    let p: &[[u8; 2]] = unsafe { &*(base as *const [[u8; 2]]) };
+    let r = &p[1..];
+    println!("reslice: {:?}", r);
+    let mut sum = 0u32;
+    for row in r {
+        for x in row {
+            sum += *x as u32;
+        }
+    }
+    println!("reslice sum: {sum}");
+    println!("reslice fmt: {}", r[0][1]);
+    let r0 = &p[0..];
+    println!("reslice0: {:?}", r0);
+    {
+        let basem: *mut [[u8; 3]] = &mut a;
+        let pm: &mut [[u8; 2]] = unsafe { &mut *(basem as *mut [[u8; 2]]) };
+        pm[1][0] = 40;
+        let q: &mut [u8; 2] = &mut pm[0];
+        q[1] = 20;
+    }
+    println!("after writes: {:?}", a);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "reslice: [[6, 4]]\n\
+         reslice sum: 10\n\
+         reslice fmt: 4\n\
+         reslice0: [[3, 2], [6, 4]]\n\
+         after writes: [[3, 20, 40], [4, 5, 1]]\n"
+    );
+}

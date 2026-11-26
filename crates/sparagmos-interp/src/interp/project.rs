@@ -2499,6 +2499,15 @@ pub(crate) fn project_value_ev(
                 })?;
                 Value::Uint(len)
             }
+            RefProj::View(_) => {
+                // The recorded denomination (see
+                // `RefProj::View`) does not move the
+                // position: the structural projector keeps
+                // the birth reading, and the byte view
+                // prices the marked steps (see
+                // `Interpreter::view_read`).
+                value
+            }
         };
     }
     Ok(value)
@@ -2695,6 +2704,10 @@ pub(crate) fn step_ty_across(
                 ty
             }
             RefProj::Index(_) => stepped_index_ty(ty.as_ref()),
+            RefProj::View(view) => {
+                variant = 0;
+                Some(view.clone())
+            }
             _ => None,
         };
         if ty.is_none() {
@@ -3678,6 +3691,14 @@ pub(crate) fn project_value_ref_ev<'a>(
                     "the untyped value projector",
                 ));
             }
+            RefProj::View(_) => {
+                // The recorded denomination (see
+                // `RefProj::View`) does not move the
+                // position: the structural projector keeps
+                // the birth reading, and the byte view
+                // prices the marked steps (see
+                // `Interpreter::view_read`).
+            }
             RefProj::VecLen => {
                 // The length slot is not storage inside the
                 // vector value, so the step materialises the
@@ -3936,6 +3957,12 @@ pub(crate) fn navigate_mut_grow<'x>(
                 program,
                 stepped_field_ty(program, ty.as_ref(), 0, *idx),
             )
+        }
+        RefProj::View(_) => {
+            // The recorded denomination (see `RefProj::View`)
+            // does not move the position: the write continues
+            // into the same slot, as a zero displacement does.
+            navigate_mut_grow(slot, rest, func, place, grow, program, ty)
         }
         RefProj::ByteOffset(disp) => {
             if *disp == 0 {

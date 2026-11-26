@@ -1774,6 +1774,23 @@ impl<'a> Interpreter<'a> {
                 {
                     return Ok(Cow::Owned(self.read_resolved_typed(frames, target, ty)?));
                 }
+                // A target carrying a recorded denomination
+                // (see `RefProj::View`): the byte view prices
+                // its steps through the recorded view where it
+                // can judge them (see `Interpreter::view_read`);
+                // a declined or uninitialised view keeps the
+                // borrowed projection below, as in
+                // `read_resolved_typed`.
+                if let Some(view) = self.view_read(frames, target) {
+                    match view {
+                        Ok(value) if value != Value::Uninit => {
+                            return Ok(Cow::Owned(value));
+                        }
+                        Ok(_) => {}
+                        Err(InterpError::UninitializedRead { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
                 let frame = &frames[*frame_pos];
                 let base = frame.locals.get(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
@@ -1881,6 +1898,25 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         ty: Option<&Ty>,
     ) -> InterpResult<Value> {
+        // A target carrying a recorded denomination (see
+        // `RefProj::View`): the byte view prices its steps
+        // through the recorded view where it can judge them
+        // (see `Interpreter::view_read`). A declined view, a
+        // judged span whose value is the uninitialised marker,
+        // and a judged uninitialised span all keep the
+        // ordinary path's outcome handling below.
+        if !matches!(target, Resolved::Value(..)) {
+            if let Some(view) = self.view_read(frames, target) {
+                match view {
+                    Ok(value) if value != Value::Uninit => {
+                        return Ok(value);
+                    }
+                    Ok(_) => {}
+                    Err(InterpError::UninitializedRead { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         match target {
             Resolved::Value(base, projection) => {
                 let value = self.value_target_value(base, projection)?;
@@ -2259,6 +2295,17 @@ impl<'a> Interpreter<'a> {
         // with the held field's bytes (see
         // `union_crossing_write`); every other write takes the
         // ordinary path below.
+        // A write through a target carrying a recorded
+        // denomination (see `RefProj::View`) first offers the
+        // span to the byte view, which splices the value's
+        // bytes into the birth storage (see
+        // `Interpreter::view_write`); a declined view falls to
+        // the paths below unchanged.
+        if !matches!(target, Resolved::Value(..)) {
+            if let Some(written) = self.view_write(frames, target, &value) {
+                return written;
+            }
+        }
         let grow = matches!(target, Resolved::Alloc { .. });
         let mut pending = Some(value);
         let crossed = self.union_crossing_write(
@@ -3248,6 +3295,9 @@ pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String 
             }
             RefProj::VecLen => {
                 let _ = write!(out, ".len");
+            }
+            RefProj::View(ty) => {
+                let _ = write!(out, " as view {ty:?}");
             }
         }
     }
