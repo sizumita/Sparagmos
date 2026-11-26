@@ -802,6 +802,24 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                // A stored fat pointer is the argument's value
+                // itself (a slice): resolving it would read the
+                // stored aggregate and lose a regrouping cast's
+                // element shape, so hand the fat pointer itself
+                // to the formatter, as the element-base cases
+                // above do (its own arm resolves it when the
+                // view does not regroup it).
+                if *trait_ == FmtTrait::Debug && pointee_tag(ty).starts_with('[') {
+                    if let Ok(resolved) = self.deref_value(frames, target) {
+                        if let Ok(stored) = self.read_resolved(frames, &resolved) {
+                            if let Some(fat) = self.denoted_fat_ref(frames, &stored) {
+                                return self.format_value(
+                                    frames, &fat, *trait_, ty, options, indent,
+                                );
+                            }
+                        }
+                    }
+                }
                 // A scalar argument read through a
                 // byte-displaced pointer: the argument's type
                 // tag is the load's width, and the byte view of
@@ -810,7 +828,10 @@ impl<'a> Interpreter<'a> {
                 // storage).
                 let pointee = match self.byte_view_fmt_arg(frames, target, ty) {
                     Some(view) => view?,
-                    None => self.resolve_value(frames, target)?,
+                    None => match self.regrouped_fmt_arg(frames, target, ty) {
+                        Some(view) => view?,
+                        None => self.resolve_value(frames, target)?,
+                    },
                 };
                 self.format_value(frames, &pointee, *trait_, ty, options, indent)
             }
@@ -1035,6 +1056,34 @@ impl<'a> Interpreter<'a> {
         Some(variant.fields.iter().map(|f| f.ty.clone()).collect())
     }
 
+    /// The fat pointer a trait-object data pointer denotes,
+    /// when it denotes one directly or through the reference
+    /// to the place holding it (a `&dyn Debug` built over a
+    /// `&&[T]` field): the slice value a regrouping cast's
+    /// element shape rides on, which resolving the pointer
+    /// would collapse into the stored aggregate.
+    fn denoted_fat_ref(&self, frames: &[Frame], base: &Value) -> Option<Value> {
+        // The pointer may denote the fat pointer through a
+        // short reference chain (the place holding it, a
+        // reference to the value a temporary read out of the
+        // field): follow the denotation to the slice value.
+        let mut current = base.clone();
+        for _ in 0..4 {
+            if matches!(current, Value::FatRef { .. }) {
+                return Some(current);
+            }
+            if !matches!(current, Value::Ref(_)) {
+                return None;
+            }
+            let target = self.deref_value(frames, &current).ok()?;
+            current = self.read_resolved(frames, &target).ok()?;
+        }
+        if matches!(current, Value::FatRef { .. }) {
+            return Some(current);
+        }
+        None
+    }
+
     /// Format one finisher/builder field: a `&dyn Debug`
     /// value whose full type tag `tag` comes from the
     /// containing type's recorded shape. The dyn value is
@@ -1056,6 +1105,18 @@ impl<'a> Interpreter<'a> {
         indent: usize,
     ) -> InterpResult<String> {
         if let Value::DynRef { base, .. } = value {
+            // A slice field's data pointer is the fat pointer
+            // itself: resolving it would read the stored
+            // aggregate and lose a regrouping cast's element
+            // shape, so the fat pointer formats as the slice
+            // it denotes.
+            if pointee_tag(tag).starts_with('[') {
+                if let Some(fat) = self.denoted_fat_ref(frames, base) {
+                    return self.format_value(
+                        frames, &fat, FmtTrait::Debug, tag, options, indent,
+                    );
+                }
+            }
             let resolved = self.resolve_value(frames, base)?;
             // As in `format_value`'s `DynRef` arm, the handle
             // shaping needs the allocation's contents to license
@@ -1817,6 +1878,29 @@ impl<'a> Interpreter<'a> {
                 )));
             }
             let elem = slice_elem_tag(pointee_tag(ty));
+            // A fat pointer whose formation regrouped its
+            // storage's elements under a different element
+            // shape (a pointer cast: the `[[u8; 3]; 2]` storage
+            // ranged over as `[[u8; 2]]`): the stored elements
+            // are the birth shape's, so the byte view rebuilds
+            // them under the tag's element type, as it does for
+            // slice comparisons, and the rebuilt elements format
+            // as the sequence they are.
+            if let Some(elem_ty) = ty_from_tag(elem) {
+                if let Some(items) =
+                    self.foreign_slice_elements(frames, value, &elem_ty)
+                {
+                    return self.format_debug_seq(
+                        frames,
+                        &Value::Tuple(items),
+                        options,
+                        indent,
+                        '[',
+                        ']',
+                        elem,
+                    );
+                }
+            }
             // A base denoting an element of a container denotes
             // the slice from that element on: keep the fat pointer
             // itself so the sequence formatter reads the elements
@@ -1846,6 +1930,18 @@ impl<'a> Interpreter<'a> {
             // `Pointer` keeps the existing behaviour: the value
             // model has no address to print for the data pointer.
             if !matches!(trait_, FmtTrait::Pointer | FmtTrait::DebugNoop) {
+                // A slice trait object's data pointer is the
+                // fat pointer itself: resolving it would read
+                // the stored aggregate and lose a regrouping
+                // cast's element shape, so the fat pointer
+                // formats as the slice it denotes.
+                if pointee_tag(concrete).starts_with('[') {
+                    if let Some(fat) = self.denoted_fat_ref(frames, base) {
+                        return self.format_value(
+                            frames, &fat, trait_, concrete, options, indent,
+                        );
+                    }
+                }
                 // Core's `Debug` impls for the `dyn Any` family
                 // ignore the concrete value and print `Any { .. }`:
                 // the vtable entry for such an object is that impl,
@@ -3604,6 +3700,20 @@ impl<'a> Interpreter<'a> {
             // reach this formatter directly: its elements are the
             // base's elements truncated to the carried length.
             Value::FatRef { .. } => {
+                // A regrouped fat pointer (see `format_value`):
+                // the byte view's elements under the element
+                // type, when it judges the view.
+                if let Some(elem) = ty_from_tag(elem_ty) {
+                    if let Some(items) =
+                        self.foreign_slice_elements(frames, value, &elem)
+                    {
+                        let tys: Vec<&str> =
+                            items.iter().map(|_| elem_ty).collect();
+                        return self.format_debug_seq_items(
+                            frames, &items, options, indent, open, close, &tys,
+                        );
+                    }
+                }
                 let (items, _) = self.slice_elements(frames, value)?;
                 let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
                 return self.format_debug_seq_items(
