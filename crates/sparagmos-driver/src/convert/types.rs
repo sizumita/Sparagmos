@@ -57,6 +57,18 @@ impl Converter {
             // with the type recorded as the unit placeholder.
             return sm::Ty::unit();
         };
+        if !crate::reach::ty_within_expanded_size(ty, crate::reach::MAX_TY_EXPANDED_SIZE) {
+            // The type's expanded tree is past the conversion
+            // size limit (see `MAX_TY_EXPANDED_SIZE`): refuse it
+            // here, before any of it is materialized, and let
+            // the body carrying it fail with this reason like
+            // any other unsupported construct.
+            self.err(format!(
+                "expanded type tree exceeds the conversion size limit ({} nodes)",
+                crate::reach::MAX_TY_EXPANDED_SIZE
+            ));
+            return sm::Ty::Error;
+        }
         let converted = self.ty_inner(ty);
         match &kind {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
