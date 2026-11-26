@@ -728,17 +728,27 @@ fn collect() -> ControlFlow<()> {
         (usize, (usize, usize, usize)),
     > = HashMap::new();
     let mut dyn_demanded = 0usize;
-    let dyn_seeds = demand_dyn_instances(
-        &mut conv,
-        &mut report,
-        &mut bodies,
-        &mut body_def_ids,
-        &mut body_def_names,
-        &reach_seeds.clone(),
-        &deferred_def_set,
-        &mut dyn_credited,
-        &mut dyn_demanded,
-    );
+    // A recursion-limit failure recorded by the demand passes
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared):
+    // the conversions and collections below can only build a
+    // program the compilation has already failed, so they are
+    // skipped wholesale when the slot is set.
+    let dyn_seeds = if demand_state.recursion_limit.is_some() {
+        Vec::new()
+    } else {
+        demand_dyn_instances(
+            &mut conv,
+            &mut report,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &reach_seeds.clone(),
+            &deferred_def_set,
+            &mut dyn_credited,
+            &mut dyn_demanded,
+        )
+    };
     reach_seeds.extend(dyn_seeds.iter().cloned());
     // The vtable-demanded bodies also join the instance-demand
     // scan set: a demanded method body can itself demand generic
@@ -777,14 +787,27 @@ fn collect() -> ControlFlow<()> {
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
-    let reached = sparagmos_driver::reach::collect_reachable(
-        &mut conv,
-        &reach_seeds,
-        &local_defs,
-        sparagmos_driver::reach::MAX_COLLECTED_BODIES,
-        collection_order,
-        &entry_seeds,
-    );
+    let reached = if demand_state.recursion_limit.is_some() {
+        sparagmos_driver::reach::CollectedFns {
+            bodies: Vec::new(),
+            body_def_ids: Vec::new(),
+            body_def_names: Vec::new(),
+            reports: Vec::new(),
+            stable_bodies: Vec::new(),
+            limit_reached: false,
+            recursion_limit: None,
+            walked_bodies: Vec::new(),
+        }
+    } else {
+        sparagmos_driver::reach::collect_reachable(
+            &mut conv,
+            &reach_seeds,
+            &local_defs,
+            sparagmos_driver::reach::MAX_COLLECTED_BODIES,
+            collection_order,
+            &entry_seeds,
+        )
+    };
     if body_fetch_recursion_limit.is_none() {
         body_fetch_recursion_limit = reached.recursion_limit.clone();
     }
@@ -879,17 +902,21 @@ fn collect() -> ControlFlow<()> {
         dyn_scan.extend(new_instances.iter().cloned());
         dyn_scan.extend(new_closure_bodies.iter().cloned());
         dyn_scan.extend(new_coroutine_bodies.iter().cloned());
-        let new_dyn_bodies = demand_dyn_instances(
-            &mut conv,
-            &mut report,
-            &mut bodies,
-            &mut body_def_ids,
-            &mut body_def_names,
-            &dyn_scan,
-            &deferred_def_set,
-            &mut dyn_credited,
-            &mut dyn_demanded,
-        );
+        let new_dyn_bodies = if demand_state.recursion_limit.is_some() {
+            Vec::new()
+        } else {
+            demand_dyn_instances(
+                &mut conv,
+                &mut report,
+                &mut bodies,
+                &mut body_def_ids,
+                &mut body_def_names,
+                &dyn_scan,
+                &deferred_def_set,
+                &mut dyn_credited,
+                &mut dyn_demanded,
+            )
+        };
         // Newly converted bodies also decode constants, which
         // can materialize further closures as values (the
         // `RandomState::new::KEYS` shape: a foreign constant's
@@ -1054,7 +1081,7 @@ fn collect() -> ControlFlow<()> {
     // motivating case), and those drops need the same
     // destructor bodies. Instances the first round already
     // converted are skipped by identity inside the pass.
-    {
+    if demand_state.recursion_limit.is_none() {
         let mut all_bodies = alias_sources.clone();
         // The destructor bodies this round converts call
         // functions of their own (the array clone guard's drop
@@ -1133,7 +1160,7 @@ fn collect() -> ControlFlow<()> {
     // adapter's state type). The bodies this round converts are
     // walked for their own callees and the enlarged set is
     // demanded again, until a round converts nothing new.
-    {
+    if demand_state.recursion_limit.is_none() {
         let mut all_bodies = alias_sources.clone();
         loop {
             let seeds_before = all_bodies.len();

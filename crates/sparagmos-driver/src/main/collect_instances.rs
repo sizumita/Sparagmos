@@ -93,6 +93,86 @@ pub(crate) struct InstanceDemandState {
     pub(crate) recursion_limit: Option<String>,
 }
 
+/// One demanded instance whose body was fetched during the
+/// demand scan of [`collect_local_instances`] but whose
+/// conversion is deferred until the scan drains (see the note
+/// at the fetch site there).
+struct PendingInstance {
+    referenced: rustc_public::DefId,
+    inst: rustc_public::mir::mono::Instance,
+    owners: Vec<rustc_public::DefId>,
+    ref_name: String,
+    ibody: rustc_public::mir::Body,
+}
+
+/// Convert one deferred instance body and record the outcome
+/// exactly as the demand scan's inline conversion did: the
+/// body joins the program under its display name (the plain
+/// definition name for the first converted instance of a
+/// definition, the instance-suffixed name afterwards), the
+/// owners' converted counts rise, and a conversion failure is
+/// recorded against every owner.
+#[allow(clippy::too_many_arguments)]
+fn convert_pending_instance(
+    conv: &mut Converter,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    plain_taken: &mut HashSet<rustc_public::DefId>,
+    taken: &mut usize,
+    demands: &mut HashMap<rustc_public::DefId, Demand>,
+    pending: PendingInstance,
+) {
+    let PendingInstance {
+        referenced,
+        inst,
+        owners,
+        ref_name,
+        ibody,
+    } = pending;
+    match convert_body_isolated(conv, &ibody) {
+        Ok(converted) => {
+            // No representability screen: these are local
+            // functions, and the item loop converts local
+            // bodies without one. A body the interpreter
+            // cannot represent stays in the program and is
+            // recorded unconverted by the interpreter's own
+            // per-body isolation if it is ever called.
+            *taken += 1;
+            let counts = (
+                ibody.blocks.len(),
+                ibody.locals().len(),
+                ibody.arg_locals().len(),
+            );
+            // Display name: the first converted instance of
+            // the referenced definition carries its plain
+            // name; further instances are suffixed with the
+            // instance name (the reachability collection's
+            // rule for foreign instances).
+            let display = if plain_taken.insert(referenced) {
+                ref_name.clone()
+            } else {
+                format!("{} [{}]", ref_name, inst.name())
+            };
+            bodies.push((display, converted));
+            body_def_ids.push(conv.instance_def_id(referenced, &inst));
+            body_def_names.push(ref_name);
+            for owner in &owners {
+                let demand = demands.entry(*owner).or_default();
+                demand.converted += 1;
+                if demand.first_counts.is_none() {
+                    demand.first_counts = Some(counts);
+                }
+            }
+        }
+        Err(errs) => {
+            for e in errs {
+                fail_all(demands, &owners, e);
+            }
+        }
+    }
+}
+
 /// Convert the monomorphic instances of generic local function
 /// definitions that a set of bodies actually calls.
 ///
@@ -142,14 +222,51 @@ pub(crate) fn collect_local_instances(
         recursion_limit,
     } = state;
 
+    // A recursion-limit failure recorded by an earlier pass
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared), so
+    // no demand collected here can change the outcome; skip the
+    // pass entirely.
+    if recursion_limit.is_some() {
+        return Vec::new();
+    }
+
     let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
     let deferred_ctors: HashSet<rustc_public::DefId> =
         deferred.iter().filter(|d| d.ctor).map(|d| d.def).collect();
     let mut queue: VecDeque<(rustc_public::mir::Body, DemandPath)> =
         seeds.iter().map(|b| (b.clone(), DemandPath::new())).collect();
     let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
+    // Conversions are deferred until the demand scan below
+    // drains: the scan (target resolution, the size and depth
+    // caps, the body fetch) is what decides whether the demand
+    // graph is finite, and a size- or depth-increasing
+    // instantiation chain is only known to be one once the
+    // caps trip — converting each body as it is fetched spends
+    // the full conversion cost of every level of such a chain
+    // (each level's types larger than the last, its projection
+    // resolutions posing trait goals that overflow the solver
+    // and are reported one by one) before the trip can seal
+    // the compilation failure that makes the conversions moot.
+    // rustc's collector, which the caps mirror, never converts
+    // at all: it records the demanded instances and reports
+    // the recursion limit the moment the depth cap trips.
+    // Deferring keeps the scan's decisions identical — the
+    // same targets are resolved, capped and fetched in the
+    // same order, and the conversions then run in fetch order
+    // — while a scan that seals a recursion-limit failure
+    // skips them wholesale.
+    let mut pending: std::collections::VecDeque<PendingInstance> =
+        std::collections::VecDeque::new();
 
     while let Some((body, path)) = queue.pop_front() {
+        // A recursion-limit failure seals the compilation
+        // verdict (see the entry check): the demands of the
+        // bodies still queued cannot change it, and the
+        // deferred conversions are skipped with the scan.
+        if recursion_limit.is_some() {
+            break;
+        }
         // Instance resolution and body access go through the
         // compiler's internals and can panic on exotic targets
         // (higher-ranked and late-bound types are known cases).
@@ -356,44 +473,40 @@ pub(crate) fn collect_local_instances(
                     continue;
                 }
             };
-            match convert_body_isolated(&mut *conv, &ibody) {
-                Ok(converted) => {
-                    // No representability screen: these are local
-                    // functions, and the item loop converts local
-                    // bodies without one. A body the interpreter
-                    // cannot represent stays in the program and is
-                    // recorded unconverted by the interpreter's own
-                    // per-body isolation if it is ever called.
-                    *taken += 1;
-                    queue.push_back((ibody.clone(), child_path.clone()));
-                    extra_seeds.push(ibody.clone());
-                    let counts = (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
-                    // Display name: the first converted instance of
-                    // the referenced definition carries its plain
-                    // name; further instances are suffixed with the
-                    // instance name (the reachability collection's
-                    // rule for foreign instances).
-                    let ref_name = def.name();
-                    let display = if plain_taken.insert(referenced) {
-                        ref_name.clone()
-                    } else {
-                        format!("{} [{}]", ref_name, inst.name())
-                    };
-                    bodies.push((display, converted));
-                    body_def_ids.push(conv.instance_def_id(referenced, &inst));
-                    body_def_names.push(ref_name);
-                    for owner in &owners {
-                        let demand = demands.entry(*owner).or_default();
-                        demand.converted += 1;
-                        if demand.first_counts.is_none() {
-                            demand.first_counts = Some(counts);
-                        }
-                    }
-                }
-                Err(errs) => {
-                    for e in errs {
-                        fail_all(&mut *demands, &owners, e);
-                    }
+            // The fetched body joins the scan queue and the
+            // seed set exactly as an already-converted body
+            // would; only the conversion itself is deferred
+            // (see `pending` above).
+            queue.push_back((ibody.clone(), child_path.clone()));
+            extra_seeds.push(ibody.clone());
+            pending.push_back(PendingInstance {
+                referenced,
+                inst,
+                owners,
+                ref_name: def.name(),
+                ibody,
+            });
+            // The collection cap judges conversions, so it
+            // must see the same `taken` count an inline
+            // conversion would have produced by now: flush the
+            // deferred conversions before the cap can bind, so
+            // no cap check ever runs against a count that
+            // pending conversions would still change. Away
+            // from the cap the check below cannot fire in
+            // either arrangement (taken + pending stays under
+            // it), which is what makes the deferral exact.
+            if *taken + pending.len() >= MAX_LOCAL_INSTANCES {
+                while let Some(item) = pending.pop_front() {
+                    convert_pending_instance(
+                        &mut *conv,
+                        &mut *bodies,
+                        &mut *body_def_ids,
+                        &mut *body_def_names,
+                        &mut *plain_taken,
+                        &mut *taken,
+                        &mut *demands,
+                        item,
+                    );
                 }
             }
         }
@@ -404,6 +517,33 @@ pub(crate) fn collect_local_instances(
             // slot — a later, genuinely fatal panic must report
             // its own message.
             let _ = take_captured_panic();
+        }
+    }
+
+    // Run the deferred conversions in fetch order — unless
+    // the scan sealed a recursion-limit failure, in which case
+    // the compilation is failed with that verdict and the
+    // converted bodies would be discarded unread. Each
+    // conversion is isolated the way the scan isolates each
+    // body: a panic the conversion's own containment resumes
+    // abandons that one conversion, not the rest.
+    if recursion_limit.is_none() {
+        while let Some(item) = pending.pop_front() {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                convert_pending_instance(
+                    &mut *conv,
+                    &mut *bodies,
+                    &mut *body_def_ids,
+                    &mut *body_def_names,
+                    &mut *plain_taken,
+                    &mut *taken,
+                    &mut *demands,
+                    item,
+                );
+            }));
+            if outcome.is_err() {
+                let _ = take_captured_panic();
+            }
         }
     }
 
@@ -471,6 +611,15 @@ pub(crate) fn collect_closure_instances(
         foreign_fn_demands: _,
         recursion_limit,
     } = state;
+
+    // A recursion-limit failure recorded by an earlier pass
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared), so
+    // no demand collected here can change the outcome; skip the
+    // pass entirely.
+    if recursion_limit.is_some() {
+        return Vec::new();
+    }
 
     let deferred_names: HashMap<rustc_public::DefId, &str> =
         deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
@@ -741,6 +890,15 @@ pub(crate) fn collect_const_closure_instances(
         recursion_limit,
     } = state;
 
+    // A recursion-limit failure recorded by an earlier pass
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared), so
+    // no demand collected here can change the outcome; skip the
+    // pass entirely.
+    if recursion_limit.is_some() {
+        return Vec::new();
+    }
+
     let deferred_names: HashMap<rustc_public::DefId, &str> =
         deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
     let mut converted_bodies: Vec<rustc_public::mir::Body> = Vec::new();
@@ -956,6 +1114,15 @@ pub(crate) fn collect_const_fn_instances(
         recursion_limit,
     } = state;
 
+    // A recursion-limit failure recorded by an earlier pass
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared), so
+    // no demand collected here can change the outcome; skip the
+    // pass entirely.
+    if recursion_limit.is_some() {
+        return Vec::new();
+    }
+
     let deferred_names: HashMap<rustc_public::DefId, &str> =
         deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
     let mut converted_bodies: Vec<rustc_public::mir::Body> = Vec::new();
@@ -1155,6 +1322,15 @@ pub(crate) fn collect_coroutine_instances(
         foreign_fn_demands: _,
         recursion_limit,
     } = state;
+
+    // A recursion-limit failure recorded by an earlier pass
+    // seals the compilation verdict (the demand state's slot is
+    // the verdict chain's first input and is never cleared), so
+    // no demand collected here can change the outcome; skip the
+    // pass entirely.
+    if recursion_limit.is_some() {
+        return Vec::new();
+    }
 
     let deferred_names: HashMap<rustc_public::DefId, &str> =
         deferred.iter().map(|d| (d.def, d.name.as_str())).collect();

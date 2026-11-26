@@ -337,6 +337,100 @@ fn impls_of_trait(trait_def: rustc_public::DefId) -> Vec<ImplDef> {
     })
 }
 
+/// One implementation's trait reference, materialized
+/// once for the resolution scan (see `impl_scan_entries`).
+#[derive(Clone)]
+struct ImplScanEntry {
+    impl_def: ImplDef,
+    self_ty: Ty,
+    args: GenericArgs,
+}
+
+/// The implementations of a trait organized for the
+/// resolution scan in `projection_impl_assigned_ty`.
+/// An implementation whose self type is headed by an
+/// ADT can only match a self type headed by the same
+/// ADT -- the structural match compares rigid heads
+/// before anything else -- so those implementations
+/// are kept in per-ADT buckets and a scan walks only
+/// the bucket for the resolved self type's head, plus
+/// the implementations whose self type has no ADT head
+/// (a parameter, a reference, an alias, ...), which
+/// can match any head. The trait references are
+/// materialized once per compilation and kept in
+/// `TRAIT_IMPL_SCANS`: reading `ImplDef::trait_impl`
+/// crosses the compiler bridge and rebuilds the
+/// reference -- the self type included -- on every
+/// call, so a scan that re-read it for every
+/// implementation of a widely implemented trait, for
+/// every projection the screen resolves, would spend
+/// its time repeating bridge traffic the first scan
+/// already paid for.
+struct TraitImplScan {
+    generic: Vec<ImplScanEntry>,
+    by_head: HashMap<rustc_public::DefId, Vec<ImplScanEntry>>,
+}
+
+thread_local! {
+    /// The running compilation's per-trait resolution
+    /// scans, built lazily (see `impl_scan_entries`),
+    /// kept for the compilation like `IMPLS_BY_TRAIT`.
+    static TRAIT_IMPL_SCANS: std::cell::RefCell<
+        Option<HashMap<rustc_public::DefId, TraitImplScan>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The scan entries that can match a self type with
+/// the given ADT head. A `None` head -- a resolved
+/// self type that is not an ADT -- can match any
+/// implementation, so every entry is returned.
+fn impl_scan_entries(
+    trait_def: rustc_public::DefId,
+    head: Option<rustc_public::DefId>,
+) -> Vec<ImplScanEntry> {
+    TRAIT_IMPL_SCANS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let scans = cache.get_or_insert_with(HashMap::new);
+        let scan = scans.entry(trait_def).or_insert_with(|| {
+            let mut scan = TraitImplScan {
+                generic: Vec::new(),
+                by_head: HashMap::new(),
+            };
+            for impl_def in impls_of_trait(trait_def) {
+                let tref = impl_def.trait_impl().value;
+                let entry = ImplScanEntry {
+                    impl_def,
+                    self_ty: tref.self_ty(),
+                    args: tref.args().clone(),
+                };
+                match guarded_ty_kind(&entry.self_ty) {
+                    Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => {
+                        scan.by_head.entry(def.def_id()).or_default().push(entry);
+                    }
+                    _ => scan.generic.push(entry),
+                }
+            }
+            scan
+        });
+        match head {
+            Some(head) => {
+                let mut entries = scan.generic.clone();
+                if let Some(bucket) = scan.by_head.get(&head) {
+                    entries.extend(bucket.iter().cloned());
+                }
+                entries
+            }
+            None => {
+                let mut entries = scan.generic.clone();
+                for bucket in scan.by_head.values() {
+                    entries.extend(bucket.iter().cloned());
+                }
+                entries
+            }
+        }
+    })
+}
+
 /// The type the applicable implementation assigns a
 /// projection's item, read from the implementation table:
 /// the implementations of the projection's trait whose
@@ -373,9 +467,13 @@ fn projection_impl_assigned_ty(
         return None;
     };
     let resolved_self = resolve_screen_self_ty(self_ty, ambient, depth + 1)?;
+    let head = match guarded_ty_kind(&resolved_self) {
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => Some(def.def_id()),
+        _ => None,
+    };
     let mut candidates: Vec<(Ty, ImplDef)> = Vec::new();
-    for impl_def in impls_of_trait(trait_def) {
-        let tref = impl_def.trait_impl().value;
+    for entry in impl_scan_entries(trait_def, head) {
+        let impl_def = entry.impl_def;
         // A projection carrying fewer arguments than the
         // trait reference cannot be this implementation's.
         // Arguments beyond the trait reference's are the
@@ -383,12 +481,12 @@ fn projection_impl_assigned_ty(
         // type's -- and instantiate the item alongside the
         // implementation's arguments when its assigned type
         // is read, below.
-        if alias.args.0.len() < tref.args().0.len() {
+        if alias.args.0.len() < entry.args.0.len() {
             continue;
         }
         let mut bindings: HashMap<u32, GenericArgKind> = HashMap::new();
         if !match_impl_self_ty(
-            &tref.self_ty(),
+            &entry.self_ty,
             &resolved_self,
             ambient,
             &mut bindings,
@@ -405,8 +503,8 @@ fn projection_impl_assigned_ty(
         // remaining arguments must match the projection's
         // too, binding implementation parameters that
         // appear only in those positions.
-        if !tref
-            .args()
+        if !entry
+            .args
             .0
             .iter()
             .skip(1)
@@ -421,7 +519,7 @@ fn projection_impl_assigned_ty(
         // can stand in for it.
         let mut args = impl_instantiation_args(&impl_def, &bindings)?;
         args.0
-            .extend_from_slice(&alias.args.0[tref.args().0.len()..]);
+            .extend_from_slice(&alias.args.0[entry.args.0.len()..]);
         let ty = match impl_item_assigned_ty(&impl_def, alias, &args) {
             Some(ty) => ty,
             None => {
@@ -1314,10 +1412,59 @@ fn bind_impl_arg(
 /// never poses the normalization it screens for. A type the
 /// walk cannot judge (an unaskable kind, an unresolved
 /// parameter) counts as no finding.
+/// The types one screen question has already walked clean,
+/// keyed by the shallowest depth at which a walk of the type
+/// completed (see `projection_screen_ty`).
+type ScreenVisited = HashMap<Ty, usize>;
+
+/// Walk a type for a projection that cannot normalize (see
+/// `unnormalizable_projection_in_instance`), memoizing clean
+/// walks within the question.
+///
+/// A walk entered without an ambient substitution cannot
+/// consult one anywhere in its subtree — only a declared
+/// type's parameters do, and declared types are entered with
+/// the ambient they resolve through, never without — so its
+/// outcome is a function of the type and the remaining depth
+/// budget alone, and the budget only ever shrinks the search:
+/// a type walked clean at a shallower depth (a larger budget)
+/// is clean at any deeper one. The compiler interns types as
+/// a DAG, but the walk is a tree walk, so a shared subterm —
+/// the suffix of a growing adapter tower, reached once per
+/// field and argument path that mentions it — would
+/// otherwise be re-walked once per path, exponentially often
+/// in the tower's height: screening one demanded instance of
+/// a tower-shaped program cost more than converting it. The
+/// record is created per question by the callers, so no
+/// verdict leaks across questions.
 fn projection_screen_ty(
     ty: &Ty,
     ambient: Option<&GenericArgs>,
     depth: usize,
+    visited: &mut ScreenVisited,
+) -> Option<String> {
+    if ambient.is_none() {
+        if let Some(&walked_depth) = visited.get(ty) {
+            if walked_depth <= depth {
+                return None;
+            }
+        }
+    }
+    let result = projection_screen_ty_walk(ty, ambient, depth, visited);
+    if result.is_none() && ambient.is_none() {
+        visited
+            .entry(*ty)
+            .and_modify(|d| *d = (*d).min(depth))
+            .or_insert(depth);
+    }
+    result
+}
+
+fn projection_screen_ty_walk(
+    ty: &Ty,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+    visited: &mut ScreenVisited,
 ) -> Option<String> {
     if depth >= 8 {
         return None;
@@ -1352,18 +1499,19 @@ fn projection_screen_ty(
                     ));
                 }
             }
-            projection_screen_args(&alias.args, ambient, depth + 1)
+            projection_screen_args(&alias.args, ambient, depth + 1, visited)
         }
         TyKind::RigidTy(r) => match r {
             RigidTy::Adt(def, a2) => {
                 let composed = compose_screen_args(&a2, ambient);
-                projection_screen_args(&a2, ambient, depth + 1).or_else(|| {
+                projection_screen_args(&a2, ambient, depth + 1, visited).or_else(|| {
                     def.variants().iter().find_map(|variant| {
                         variant.fields().iter().find_map(|field| {
                             projection_screen_ty(
                                 &field.ty(),
                                 Some(&composed),
                                 depth + 1,
+                                visited,
                             )
                         })
                     })
@@ -1373,24 +1521,24 @@ fn projection_screen_ty(
             | RigidTy::RawPtr(inner, _)
             | RigidTy::Slice(inner)
             | RigidTy::Pat(inner, _) => {
-                projection_screen_ty(&inner, ambient, depth + 1)
+                projection_screen_ty(&inner, ambient, depth + 1, visited)
             }
             RigidTy::Array(elem, len) => {
-                projection_screen_ty(&elem, ambient, depth + 1).or_else(|| {
-                    projection_screen_const(&len, ambient, depth + 1)
+                projection_screen_ty(&elem, ambient, depth + 1, visited).or_else(|| {
+                    projection_screen_const(&len, ambient, depth + 1, visited)
                 })
             }
             RigidTy::Tuple(ts) => ts
                 .iter()
-                .find_map(|t| projection_screen_ty(t, ambient, depth + 1)),
+                .find_map(|t| projection_screen_ty(t, ambient, depth + 1, visited)),
             RigidTy::FnDef(_, a2) => {
-                projection_screen_args(&a2, ambient, depth + 1).or_else(|| {
+                projection_screen_args(&a2, ambient, depth + 1, visited).or_else(|| {
                     ty.kind().fn_sig().and_then(|sig| {
                         sig.skip_binder()
                             .inputs_and_output
                             .iter()
                             .find_map(|t| {
-                                projection_screen_ty(t, None, depth + 1)
+                                projection_screen_ty(t, None, depth + 1, visited)
                             })
                     })
                 })
@@ -1399,11 +1547,11 @@ fn projection_screen_ty(
                 .skip_binder()
                 .inputs_and_output
                 .iter()
-                .find_map(|t| projection_screen_ty(t, ambient, depth + 1)),
+                .find_map(|t| projection_screen_ty(t, ambient, depth + 1, visited)),
             RigidTy::Closure(_, a2)
             | RigidTy::Coroutine(_, a2)
             | RigidTy::CoroutineWitness(_, a2) => {
-                projection_screen_args(&a2, ambient, depth + 1)
+                projection_screen_args(&a2, ambient, depth + 1, visited)
             }
             RigidTy::Dynamic(preds, _) => preds.iter().find_map(|pred| {
                 match &pred.value {
@@ -1412,6 +1560,7 @@ fn projection_screen_ty(
                             &tref.generic_args,
                             ambient,
                             depth + 1,
+                            visited,
                         )
                     }
                     ExistentialPredicate::Projection(pred) => {
@@ -1419,6 +1568,7 @@ fn projection_screen_ty(
                             &pred.generic_args,
                             ambient,
                             depth + 1,
+                            visited,
                         )
                     }
                     ExistentialPredicate::AutoTrait(_) => None,
@@ -1429,7 +1579,7 @@ fn projection_screen_ty(
         TyKind::Param(p) => {
             match ambient.and_then(|a| a.0.get(p.index as usize)) {
                 Some(GenericArgKind::Type(t)) => {
-                    projection_screen_ty(t, None, depth + 1)
+                    projection_screen_ty(t, None, depth + 1, visited)
                 }
                 _ => None,
             }
@@ -1444,13 +1594,14 @@ fn projection_screen_args(
     args: &GenericArgs,
     ambient: Option<&GenericArgs>,
     depth: usize,
+    visited: &mut ScreenVisited,
 ) -> Option<String> {
     if depth >= 8 {
         return None;
     }
     args.0.iter().find_map(|arg| match arg {
-        GenericArgKind::Type(t) => projection_screen_ty(t, ambient, depth),
-        GenericArgKind::Const(c) => projection_screen_const(c, ambient, depth),
+        GenericArgKind::Type(t) => projection_screen_ty(t, ambient, depth, visited),
+        GenericArgKind::Const(c) => projection_screen_const(c, ambient, depth, visited),
         GenericArgKind::Lifetime(_) => None,
     })
 }
@@ -1462,13 +1613,14 @@ fn projection_screen_const(
     c: &rustc_public::ty::TyConst,
     ambient: Option<&GenericArgs>,
     depth: usize,
+    visited: &mut ScreenVisited,
 ) -> Option<String> {
     if depth >= 8 {
         return None;
     }
     match c.kind() {
         TyConstKind::Unevaluated(_, args) => {
-            projection_screen_args(&args, ambient, depth)
+            projection_screen_args(&args, ambient, depth, visited)
         }
         _ => None,
     }
@@ -1577,8 +1729,9 @@ pub fn unnormalizable_projection_in_instance(
     inst: &Instance,
 ) -> Option<String> {
     screen_question(|| {
-        projection_screen_ty(&inst.ty(), None, 0)
-            .or_else(|| projection_screen_args(&inst.args(), None, 0))
+        let mut visited = HashMap::new();
+        projection_screen_ty(&inst.ty(), None, 0, &mut visited)
+            .or_else(|| projection_screen_args(&inst.args(), None, 0, &mut visited))
     })
 }
 
@@ -1604,8 +1757,9 @@ pub fn unnormalizable_projection_in_body(
 fn unnormalizable_projection_in_body_walk(
     body: &mir::Body,
 ) -> Option<String> {
+    let mut visited = HashMap::new();
     for local in body.locals() {
-        if let Some(reason) = projection_screen_ty(&local.ty, None, 0) {
+        if let Some(reason) = projection_screen_ty(&local.ty, None, 0, &mut visited) {
             return Some(reason);
         }
     }
@@ -1616,16 +1770,17 @@ fn unnormalizable_projection_in_body_walk(
             for op in std::iter::once(func).chain(args.iter()) {
                 let reason = match op {
                     mir::Operand::Constant(c) => {
-                        projection_screen_ty(&c.const_.ty(), None, 0)
+                        projection_screen_ty(&c.const_.ty(), None, 0, &mut visited)
                             .or_else(|| match c.const_.kind() {
                                 ConstantKind::Ty(tc) => {
-                                    projection_screen_const(&tc, None, 0)
+                                    projection_screen_const(&tc, None, 0, &mut visited)
                                 }
                                 ConstantKind::Unevaluated(uneval) => {
                                     projection_screen_args(
                                         &uneval.args,
                                         None,
                                         0,
+                                        &mut visited,
                                     )
                                 }
                                 _ => None,
@@ -1634,7 +1789,7 @@ fn unnormalizable_projection_in_body_walk(
                     mir::Operand::RuntimeChecks(_) => None,
                     mir::Operand::Copy(place) | mir::Operand::Move(place) => {
                         place.ty(body.locals()).ok().and_then(|ty| {
-                            projection_screen_ty(&ty, None, 0)
+                            projection_screen_ty(&ty, None, 0, &mut visited)
                         })
                     }
                 };
