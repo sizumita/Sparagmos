@@ -685,10 +685,14 @@ impl<'a> Interpreter<'a> {
     /// searcher -- the search is a substring search for the
     /// needle's UTF-8 encoding, which is exact because a char's
     /// encoding never occurs inside another char's -- and the
-    /// `char`-predicate searcher (`CharPredicateSearcher`),
-    /// whose scan applies the predicate to each char of the
-    /// remaining window. Any other searcher shape is the
-    /// generic unsupported error, as before.
+    /// `CharEqSearcher` family (`MultiCharEqSearcher`): a
+    /// `char` predicate, whose scan applies the predicate to
+    /// each char of the remaining window, or a set of chars (a
+    /// `[char; N]` pattern's chars by value, or a `&[char]` /
+    /// `&[char; N]` pattern's reference, resolved before the
+    /// first step), whose scan tests membership. Any other
+    /// searcher shape is the generic unsupported error, as
+    /// before.
     /// One front or back step of a `str` matches iterator
     /// (`Matches` / `MatchIndices`), replaying core's searcher
     /// step on the state the constructor's converted body
@@ -779,6 +783,11 @@ impl<'a> Interpreter<'a> {
             });
         }
         if let Some(mut parts) = StrSplitPredParts::decode(state, self_ty) {
+            if !parts.resolve_set(self, frames) {
+                return Err(unsupported(format!(
+                    "Iterator::next for {self_ty} is not runtime-supported"
+                )));
+            }
             let item = match (back == reversed, inclusive) {
                 (true, false) => parts.next(self, frames)?,
                 (true, true) => parts.next_inclusive(self, frames)?,
@@ -7559,7 +7568,9 @@ impl StrMatchesEqParts {
             Value::Tuple(items) => {
                 MatchesEq::Set(char_set_of(items)?)
             }
-            Value::FatRef { .. } => MatchesEq::SetRef(searcher[0].clone()),
+            Value::FatRef { .. } | Value::Ref(_) => {
+                MatchesEq::SetRef(searcher[0].clone())
+            }
             _ => return None,
         };
         let Value::Str(haystack) = &searcher[1] else {
@@ -7586,9 +7597,10 @@ impl StrMatchesEqParts {
         })
     }
 
-    /// Resolve a `&[char]` pattern's slice to its chars, so
-    /// the scan tests membership directly. `false` when the
-    /// slice's elements do not read as chars, leaving the
+    /// Resolve a char-set pattern's reference (a `&[char]`
+    /// pattern's slice, a `&[char; N]` pattern's array) to
+    /// its chars, so the scan tests membership directly.
+    /// `false` when the set does not resolve, leaving the
     /// step to the generic unsupported error.
     fn resolve_set(
         &mut self,
@@ -7598,18 +7610,7 @@ impl StrMatchesEqParts {
         let MatchesEq::SetRef(reference) = &self.test else {
             return true;
         };
-        let Ok(target) = interp.deref_value(frames, reference) else {
-            return false;
-        };
-        let Ok(value) = interp.read_resolved(frames, &target) else {
-            return false;
-        };
-        let fields = match &value {
-            Value::Tuple(items) => items.clone(),
-            Value::Enum { fields, .. } => fields.clone(),
-            _ => return false,
-        };
-        match char_set_of(&fields) {
+        match resolve_char_set(interp, frames, reference) {
             Some(chars) => {
                 self.test = MatchesEq::Set(chars);
                 true
@@ -7743,6 +7744,51 @@ fn char_set_of(items: &[Value]) -> Option<Vec<char>> {
         }
     }
     Some(chars)
+}
+
+/// Resolve a char-set pattern's reference to the chars it
+/// names. A fat reference whose base is the sequence value
+/// itself names its elements directly; any other reference
+/// is dereferenced and its pointee read, following further
+/// references the pointee's own value is stored behind (a
+/// promoted array's slice value, for one, sits in a place
+/// holding the slice's own fat reference), until the
+/// elements read as a sequence of chars. `None` when a hop
+/// fails or the elements are not chars.
+fn resolve_char_set(
+    interp: &mut Interpreter<'_>,
+    frames: &mut Vec<Frame>,
+    reference: &Value,
+) -> Option<Vec<char>> {
+    let mut current = reference.clone();
+    for _ in 0..8 {
+        // A fat reference whose base is the sequence value
+        // itself names its elements directly: the first
+        // `len` of them are the set.
+        if let Value::FatRef { base, len } = &current {
+            let n = usize::try_from(*len).ok()?;
+            match &**base {
+                Value::Tuple(items) => {
+                    return char_set_of(items.get(..n)?)
+                }
+                Value::Enum { fields, .. } => {
+                    return char_set_of(fields.get(..n)?)
+                }
+                _ => {}
+            }
+        }
+        let target = interp.deref_value(frames, &current).ok()?;
+        let value = interp.read_resolved(frames, &target).ok()?;
+        match &value {
+            Value::Tuple(items) => return char_set_of(items),
+            Value::Enum { fields, .. } => return char_set_of(fields),
+            Value::FatRef { .. } | Value::Ref(_) => {
+                current = value.clone()
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The decoded state of a `str` split iterator: core's
@@ -8003,11 +8049,24 @@ impl StrSplitParts {
     }
 }
 
+/// How a split `CharEqSearcher`'s char test is served: a
+/// guest predicate applied through the modelled call path,
+/// a set of chars tested by membership (resolved from the
+/// state), or a char set behind a reference (a `&[char]` or
+/// `&[char; N]` pattern), resolved through the interpreter
+/// before the first step. The matches family's `MatchesEq`
+/// is the same trichotomy.
+enum SplitEq {
+    Predicate,
+    Set(Vec<char>),
+    SetRef(Value),
+}
+
 /// The decoded state of a `str` split iterator over a
-/// `char`-predicate pattern: core's `SplitInternal` fields
-/// plus the `CharPredicateSearcher` state the step machine
-/// drives. The searcher is a one-field wrapper over the
-/// `MultiCharEqSearcher` -- its predicate, its haystack and
+/// `CharEq` pattern: core's `SplitInternal` fields plus the
+/// `MultiCharEqSearcher` state the step machine drives. The
+/// searcher is a one-field wrapper over the
+/// `MultiCharEqSearcher` -- its char test, its haystack and
 /// its `CharIndices` -- and the window the scan runs over is
 /// the front/back byte indices of the `CharIndices`'
 /// byte-slice iterator: the searcher's front step consumes
@@ -8020,7 +8079,8 @@ struct StrSplitPredParts {
     haystack: String,
     front: usize,
     back: usize,
-    predicate: Value,
+    char_eq: Value,
+    test: SplitEq,
     predicate_ty: String,
     allow_trailing_empty: bool,
     finished: bool,
@@ -8028,16 +8088,19 @@ struct StrSplitPredParts {
 
 impl StrSplitPredParts {
     /// Decode the state value, or `None` when it is not the
-    /// predicate-searcher split state (another pattern's
-    /// searcher, whose step stays unsupported). A predicate
-    /// the modelled call path cannot apply also declines,
-    /// leaving the state to the generic unsupported error:
-    /// the applicable shapes are a closure, a function
-    /// pointer, and the empty value of a zero-sized `Fn`
-    /// type (core's `impl_fn_for_zst!` family), which
-    /// carries no callable identity of its own and is
-    /// applied through the type-directed dispatch under
-    /// the pattern type the split's tag names.
+    /// char-eq-searcher split state (another pattern's
+    /// searcher, whose step stays unsupported). The char
+    /// test the state carries decides the arm: a predicate
+    /// the modelled call path cannot apply declines, leaving
+    /// the state to the generic unsupported error -- the
+    /// applicable shapes are a closure, a function pointer,
+    /// and the empty value of a zero-sized `Fn` type (core's
+    /// `impl_fn_for_zst!` family), which carries no callable
+    /// identity of its own and is applied through the
+    /// type-directed dispatch under the pattern type the
+    /// split's tag names. A char set is the `[char; N]`
+    /// pattern's chars by value, or a reference to the set
+    /// (a `&[char]` / `&[char; N]` pattern).
     fn decode(state: &Value, self_ty: &str) -> Option<Self> {
         let outer = iterator_fields(state, "").ok()?;
         if outer.len() != 1 {
@@ -8055,15 +8118,20 @@ impl StrSplitPredParts {
         if searcher.len() != 3 {
             return None;
         }
-        let predicate_applicable = match &searcher[0] {
-            Value::Closure { .. } | Value::FnPtr(_) => true,
-            Value::Enum { fields, .. } => fields.is_empty(),
-            Value::Tuple(fields) => fields.is_empty(),
-            _ => false,
+        let test = match &searcher[0] {
+            Value::Closure { .. } | Value::FnPtr(_) => SplitEq::Predicate,
+            Value::Enum { fields, .. } if fields.is_empty() => {
+                SplitEq::Predicate
+            }
+            Value::Tuple(fields) if fields.is_empty() => {
+                SplitEq::Predicate
+            }
+            Value::Tuple(items) => SplitEq::Set(char_set_of(items)?),
+            Value::FatRef { .. } | Value::Ref(_) => {
+                SplitEq::SetRef(searcher[0].clone())
+            }
+            _ => return None,
         };
-        if !predicate_applicable {
-            return None;
-        }
         let Value::Str(haystack) = &searcher[1] else {
             return None;
         };
@@ -8091,7 +8159,8 @@ impl StrSplitPredParts {
             haystack: haystack.clone(),
             front,
             back,
-            predicate: searcher[0].clone(),
+            char_eq: searcher[0].clone(),
+            test,
             predicate_ty: first_generic_arg(self_ty).unwrap_or("").to_string(),
             allow_trailing_empty: internal[3] == Value::Bool(true),
             finished: internal[4] == Value::Bool(true),
@@ -8127,7 +8196,7 @@ impl StrSplitPredParts {
         let new_searcher = rebuild_state(
             &matcher[0],
             vec![
-                self.predicate.clone(),
+                self.char_eq.clone(),
                 Value::Str(self.haystack.clone()),
                 new_indices,
             ],
@@ -8147,26 +8216,54 @@ impl StrSplitPredParts {
     }
 
     /// The searcher's `char_eq.matches`: apply the predicate
-    /// to one char.
+    /// through the modelled call path, or test set membership.
     fn matches(
         &self,
         interp: &mut Interpreter<'_>,
         frames: &mut Vec<Frame>,
         c: char,
     ) -> InterpResult<bool> {
-        match interp.call_callable_sync_typed(
-            frames,
-            &self.predicate,
-            &self.predicate_ty,
-            None,
-            vec![Value::Uint(c as u32 as u128)],
-        )? {
-            Value::Bool(b) => Ok(b),
-            other => Err(InterpError::type_mismatch(
-                "split predicate result",
-                "a boolean",
-                other.kind_name(),
+        match &self.test {
+            SplitEq::Predicate => match interp.call_callable_sync_typed(
+                frames,
+                &self.char_eq,
+                &self.predicate_ty,
+                None,
+                vec![Value::Uint(c as u32 as u128)],
+            )? {
+                Value::Bool(b) => Ok(b),
+                other => Err(InterpError::type_mismatch(
+                    "split predicate result",
+                    "a boolean",
+                    other.kind_name(),
+                )),
+            },
+            SplitEq::Set(chars) => Ok(chars.contains(&c)),
+            SplitEq::SetRef(_) => Err(unsupported(
+                "split char set was not resolved before the step",
             )),
+        }
+    }
+
+    /// Resolve a char-set pattern's reference to its chars,
+    /// so the scan tests membership directly. `false` when
+    /// the set does not resolve, leaving the step to the
+    /// generic unsupported error. A by-value test needs no
+    /// resolution.
+    fn resolve_set(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> bool {
+        let SplitEq::SetRef(reference) = &self.test else {
+            return true;
+        };
+        match resolve_char_set(interp, frames, reference) {
+            Some(chars) => {
+                self.test = SplitEq::Set(chars);
+                true
+            }
+            None => false,
         }
     }
 

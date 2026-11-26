@@ -1414,6 +1414,80 @@ fn run_mode_str_split_predicate_family() {
     );
 }
 
+const STR_SPLIT_CHAR_SET_SRC: &str = r#"fn show(label: &str, v: Vec<&str>) {
+    println!("{label}={v:?}");
+}
+
+fn main() {
+    show("split", "a,b;c".split(&[',', ';'][..]).collect());
+    show("rsplit", "a,b;c".rsplit(&[',', ';'][..]).collect());
+    show("term", "a,b;c,".split_terminator(&[',', ';'][..]).collect());
+    show("rterm", "a,b;c,".rsplit_terminator(&[',', ';'][..]).collect());
+    show("incl", "a,b;c".split_inclusive(&[',', ';'][..]).collect());
+    show("arr", "a,b;c".split([',', ';']).collect());
+    show("refarr", "a,b;c".split(&[',', ';']).collect());
+    let arr = [',', ';', 'x'];
+    show("subslice", "a,b;c".split(&arr[..2]).collect());
+    let v: Vec<char> = vec![',', ';'];
+    show("vec", "a,b;c".split(&v[..]).collect());
+    show("mb", "aαbβc".split(&['α', 'β'][..]).collect());
+    show("empty-set", "a,b".split(&[][..]).collect());
+    let mut it = "a,b;c,d".split(&[',', ';'][..]);
+    println!("i1={:?}", it.next());
+    println!("i2={:?}", it.next_back());
+    println!("i3={:?}", it.next());
+    println!("i4={:?}", it.next_back());
+    println!("i5={:?}", it.next());
+    let m: Vec<&str> = "a,b;c".matches(&[',', ';'][..]).collect();
+    println!("matches={m:?}");
+    let mi: Vec<(usize, &str)> = "a,b;c".match_indices(&[',', ';'][..]).collect();
+    println!("indices={mi:?}");
+    let ma: Vec<&str> = "a,b;c".matches([',', ';']).collect();
+    println!("matches-arr={ma:?}");
+    let mr: Vec<&str> = "a,b;c".matches(&[',', ';']).collect();
+    println!("matches-refarr={mr:?}");
+    println!("cnt={}", "a,b;c".split(&[',', ';'][..]).count());
+}
+"#;
+
+#[test]
+fn run_mode_str_split_char_set_family() {
+    // The `Split` and `Matches` families over the char-set
+    // forms of core's `MultiCharEqSearcher`: a `&[char]`
+    // pattern's slice, a `[char; N]` pattern's chars by
+    // value, a `&[char; N]` pattern's reference, a sub-slice
+    // of a larger array, a `Vec`'s slice, multi-byte set
+    // chars, the empty set, front/back interleaving on one
+    // state, and the matches family's three set forms.
+    // Expected output was produced by the native 1.100.0
+    // toolchain.
+    run_ok(
+        "str-split-char-set-family",
+        STR_SPLIT_CHAR_SET_SRC,
+        "split=[\"a\", \"b\", \"c\"]\n\
+         rsplit=[\"c\", \"b\", \"a\"]\n\
+         term=[\"a\", \"b\", \"c\"]\n\
+         rterm=[\"c\", \"b\", \"a\"]\n\
+         incl=[\"a,\", \"b;\", \"c\"]\n\
+         arr=[\"a\", \"b\", \"c\"]\n\
+         refarr=[\"a\", \"b\", \"c\"]\n\
+         subslice=[\"a\", \"b\", \"c\"]\n\
+         vec=[\"a\", \"b\", \"c\"]\n\
+         mb=[\"a\", \"b\", \"c\"]\n\
+         empty-set=[\"a,b\"]\n\
+         i1=Some(\"a\")\n\
+         i2=Some(\"d\")\n\
+         i3=Some(\"b\")\n\
+         i4=Some(\"c\")\n\
+         i5=None\n\
+         matches=[\",\", \";\"]\n\
+         indices=[(1, \",\"), (3, \";\")]\n\
+         matches-arr=[\",\", \";\"]\n\
+         matches-refarr=[\",\", \";\"]\n\
+         cnt=3\n",
+    );
+}
+
 const STR_MATCHES_SRC: &str = r#"fn main() {
     let v: Vec<(usize, &str)> = "αXβXγ".match_indices('X').collect();
     println!("mb={v:?}");
