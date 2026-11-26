@@ -2890,7 +2890,7 @@ impl<'a> Interpreter<'a> {
         }
         let array_pos = match static_name {
             Some(name) => self.static_array_position(name, &projection),
-            None => self.array_position(frames, place, &projection, base),
+            None => self.array_position(frames, place, &projection, base, elem_size),
         };
         if let Some((prefix, cur, elem)) = array_pos {
             if elem == 0 && total == 0 {
@@ -3314,6 +3314,7 @@ impl<'a> Interpreter<'a> {
         place: Option<(u64, usize)>,
         projection: &[RefProj],
         base: Option<&Value>,
+        elem_size: Option<u64>,
     ) -> Option<(usize, i128, i128)> {
         let (frame_id, local) = place?;
         let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
@@ -3333,20 +3334,60 @@ impl<'a> Interpreter<'a> {
             _ => return None,
         };
         if !path.is_empty() {
-            // A sequence held in a field: the position must end
-            // at an element of it (a bare field projection
-            // denotes the sequence value itself, whose positions
-            // are denominated in the field type's own size, not
-            // its element size). The element size is the one
-            // conversion recorded for the field path, and the
-            // value held at the path must actually be the
-            // element container, as for the local case below.
-            let cur = cur?;
+            // A sequence held in a field: the position ends at
+            // an element of it, or at its base — a bare field
+            // projection denotes element 0, exactly as a bare
+            // local position does below. The one denomination
+            // that must not be read as an element position is
+            // the whole-field one: a pointer to the sequence
+            // value itself, whose element size is the field
+            // type's own size. When the offset's element size
+            // is that size (and not also the sequence's
+            // element size — the single-element case, where
+            // the two readings coincide), the position stays
+            // unjudged here and the displacement is carried.
+            // A field type whose size is not derivable (a
+            // debug shape can leave an array length
+            // unresolved) gives no positive evidence of the
+            // whole-field denomination, so the base reading
+            // stands there too.
+            // The element size is the one conversion recorded
+            // for the field path, and the value held at the
+            // path must actually be the element container, as
+            // for the local case below.
             let elem = body
                 .field_elem_sizes
                 .get(local)
                 .and_then(|sizes| sizes.get(&path))
                 .copied()?;
+            let cur = match cur {
+                Some(c) => c,
+                None => {
+                    let root_ty = body.local_tys.get(local)?;
+                    let mut cur_ty = WalkTy::Ty(root_ty.clone());
+                    for &f in &path {
+                        cur_ty = self.field_walk_ty(&cur_ty, 0, f)?;
+                    }
+                    // The field type's size, where it is
+                    // derivable: a debug shape can leave an
+                    // array's length unresolved (`[T; _]`), in
+                    // which case the whole-field denomination
+                    // cannot be positively identified and the
+                    // base reading stands.
+                    let field_size = match &cur_ty {
+                        WalkTy::Ty(t) => self.ty_size_full(t),
+                        WalkTy::Tag(tag) => self
+                            .layout_of(tag)
+                            .and_then(|(size, _)| u64::try_from(size).ok()),
+                    };
+                    if let Some(field_size) = field_size {
+                        if elem_size == Some(field_size) && field_size != elem {
+                            return None;
+                        }
+                    }
+                    0
+                }
+            };
             let field_steps: Vec<RefProj> =
                 path.iter().map(|f| RefProj::Field(*f)).collect();
             let held = self.value_target_value(base?, &field_steps).ok()?;
