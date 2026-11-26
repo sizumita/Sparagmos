@@ -56,6 +56,54 @@ fn run_mode_pin_from_box() {
     assert_eq!(stdout, "4\n5\n", "stdout={stdout}");
 }
 
+const NESTED_PIN_DEREF_SRC: &str = r#"
+#![feature(arbitrary_self_types)]
+#![feature(rustc_attrs)]
+use std::pin::Pin;
+trait Trait {
+    fn by_pin2(self: Pin<Pin<&Self>>) -> i64;
+    fn by_pin3(self: Pin<Pin<Pin<&Self>>>) -> i64;
+    fn by_pin_box(self: Pin<Box<Self>>) -> i64;
+    fn bump(self: Pin<Pin<&mut Self>>);
+}
+impl Trait for i64 {
+    fn by_pin2(self: Pin<Pin<&Self>>) -> i64 { *self }
+    fn by_pin3(self: Pin<Pin<Pin<&Self>>>) -> i64 { *self }
+    fn by_pin_box(self: Pin<Box<Self>>) -> i64 { *self }
+    fn bump(mut self: Pin<Pin<&mut Self>>) { *self += 10; }
+}
+fn main() {
+    let v = 5i64;
+    let p2 = Pin::new(Pin::new(&v)) as Pin<Pin<&dyn Trait>>;
+    println!("{}", p2.by_pin2());
+    let p3 = Pin::new(Pin::new(Pin::new(&v))) as Pin<Pin<Pin<&dyn Trait>>>;
+    println!("{}", p3.by_pin3());
+    let pb = Pin::new(Box::new(4i64)) as Pin<Box<dyn Trait>>;
+    println!("{}", pb.by_pin_box());
+    let mut w = 1i64;
+    let pm = Pin::new(Pin::new(&mut w)) as Pin<Pin<&mut dyn Trait>>;
+    pm.bump();
+    println!("{}", w);
+}
+"#;
+
+#[test]
+fn run_mode_nested_pin_deref() {
+    // A `Pin` around another `Pin` derefs through both
+    // wrappers: `Pin<P>`'s target is `P`'s own target, so
+    // the `Deref` / `DerefMut` models unwrap the wrapper
+    // chain before the pointer rule applies. A single
+    // unwrap left a reference to the inner wrapper, which
+    // the method body's return assignment rejected.
+    let dir = temp_dir("nested-pin-deref");
+    let src = fixture(&dir, "nestedpin.rs", NESTED_PIN_DEREF_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "5\n5\n4\n11\n", "stdout={stdout}");
+}
+
 const NONNULL_FROM_MUT_SRC: &str = r#"
 use std::ptr::NonNull;
 fn main() {
