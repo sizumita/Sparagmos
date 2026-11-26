@@ -58,6 +58,9 @@ impl<'a> Interpreter<'a> {
                 outcome: None,
             },
         );
+        // A fresh thread is pending: its callable can still
+        // be activated (see the `pending_threads` field).
+        self.pending_threads.borrow_mut().insert(id);
         id
     }
 
@@ -180,6 +183,7 @@ impl<'a> Interpreter<'a> {
         let start = {
             let mut threads = self.threads.borrow_mut();
             let Some(slot) = threads.get_mut(&id) else {
+                self.pending_threads.borrow_mut().remove(&id);
                 return Ok(ThreadRun::Finished);
             };
             if let Some(parked) = slot.parked.take() {
@@ -190,15 +194,22 @@ impl<'a> Interpreter<'a> {
                 {
                     Start::Resume(parked.frames)
                 } else {
+                    // The segment stays parked, hence pending.
                     slot.parked = Some(parked);
+                    self.pending_threads.borrow_mut().insert(id);
                     return Ok(ThreadRun::NotRunnable);
                 }
             } else if let Some(callable) = slot.callable.take() {
                 Start::Fresh(callable)
             } else {
+                self.pending_threads.borrow_mut().remove(&id);
                 return Ok(ThreadRun::Finished);
             }
         };
+        // The activation takes the thread out of the pending
+        // set; a park below puts it back (see the
+        // `pending_threads` field).
+        self.pending_threads.borrow_mut().remove(&id);
         let previous = self.current_thread.get();
         self.current_thread.set(id);
         // The thread's own stack starts here: the frames below
@@ -246,6 +257,7 @@ impl<'a> Interpreter<'a> {
                     below,
                 });
             }
+            self.pending_threads.borrow_mut().insert(id);
             return Ok(ThreadRun::Yielded);
         }
         if matches!(result, Err(InterpError::Suspended)) {
@@ -265,6 +277,7 @@ impl<'a> Interpreter<'a> {
                     below,
                 });
             }
+            self.pending_threads.borrow_mut().insert(id);
             return Ok(ThreadRun::Blocked);
         }
         // The thread's code has finished: run the thread-local
@@ -339,15 +352,15 @@ impl<'a> Interpreter<'a> {
         let mut ran = false;
         let mut visited: HashSet<u64> = HashSet::new();
         loop {
+            // The smallest unvisited pending id (the set's
+            // size is the number of live threads — see the
+            // `pending_threads` field).
             let next = self
-                .threads
+                .pending_threads
                 .borrow()
                 .iter()
-                .filter(|(id, slot)| {
-                    !visited.contains(id)
-                        && (slot.callable.is_some() || slot.parked.is_some())
-                })
-                .map(|(id, _)| *id)
+                .copied()
+                .filter(|id| !visited.contains(id))
                 .min();
             let Some(id) = next else {
                 return Ok(ran);
@@ -378,11 +391,7 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<()> {
         loop {
             let ran = self.drain_threads(frames)?;
-            let any_pending = self
-                .threads
-                .borrow()
-                .values()
-                .any(|slot| slot.callable.is_some() || slot.parked.is_some());
+            let any_pending = !self.pending_threads.borrow().is_empty();
             if !any_pending || !ran {
                 return Ok(());
             }
@@ -420,14 +429,10 @@ impl<'a> Interpreter<'a> {
         frames: &mut Vec<Frame>,
     ) -> InterpResult<(bool, bool)> {
         let epoch_before = self.channel_epoch.get();
-        let mut ids: Vec<u64> = self
-            .threads
-            .borrow()
-            .iter()
-            .filter(|(_, slot)| slot.callable.is_some() || slot.parked.is_some())
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_unstable();
+        // The pending set iterates in ascending id order —
+        // the spawn order the round has always used (see the
+        // `pending_threads` field).
+        let ids: Vec<u64> = self.pending_threads.borrow().iter().copied().collect();
         let mut ran_any = false;
         let mut progressed = false;
         for id in ids {

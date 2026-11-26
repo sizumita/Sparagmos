@@ -824,6 +824,68 @@ fn run_mode_scheduler_join_does_not_starve_third_thread() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "join fairness ok\n");
 }
 
+// ----- scheduler pending set (Issue #399) -----
+//
+// The scheduler's rounds, drains and yield decisions walk
+// an incrementally maintained set of the threads that can
+// still be activated, not the whole thread table (which
+// keeps every finished thread's outcome for `join`). The
+// rendezvous below only complete if the bookkeeping stays
+// exact across the transitions: a live sender must be found
+// by a `recv_timeout` retry loop after hundreds of threads
+// have spawned and finished, and a parked barrier waiter
+// must be resumed.
+
+const PENDING_SET_SRC: &str = r#"
+use std::sync::mpsc::channel;
+use std::time::Duration;
+
+fn main() {
+    // Churn: many threads spawn, run and finish; their
+    // slots stay in the thread table with their outcomes.
+    for _ in 0..200 {
+        let h = std::thread::spawn(|| 1 + 1);
+        assert_eq!(h.join().unwrap(), 2);
+    }
+    // A recv_timeout loop that only the one live sender can
+    // satisfy: every timeout asks the scheduler for a round,
+    // and the round must find the sender among the dead
+    // slots.
+    let (tx, rx) = channel();
+    let sender = std::thread::spawn(move || {
+        tx.send(17).unwrap();
+    });
+    let mut got = None;
+    for _ in 0..100000 {
+        match rx.recv_timeout(Duration::from_micros(1)) {
+            Ok(v) => {
+                got = Some(v);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    assert_eq!(got, Some(17));
+    sender.join().unwrap();
+    // A parked-thread rendezvous after the churn: both
+    // barrier parties must be resumed.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let barrier2 = barrier.clone();
+    let h = std::thread::spawn(move || {
+        barrier2.wait();
+        5
+    });
+    barrier.wait();
+    assert_eq!(h.join().unwrap(), 5);
+    println!("pending set ok");
+}
+"#;
+
+#[test]
+fn run_mode_scheduler_pending_set_after_thread_churn() {
+    run_ok("sched-pending-set", PENDING_SET_SRC, "pending set ok\n");
+}
+
 const SCHED_HARNESS_SPIN_SRC: &str = r#"use std::sync::mpsc::channel;
 
 fn spin_on_channel() {
