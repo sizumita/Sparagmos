@@ -9062,6 +9062,10 @@ impl<'a> Interpreter<'a> {
                 arity(3)?;
                 self.exec_libc_sigaction(frames, name, &vals)
             }
+            Builtin::LibcSignal => {
+                arity(2)?;
+                self.exec_libc_signal(frames, name, &vals)
+            }
             Builtin::LibcRaise => {
                 arity(1)?;
                 self.exec_libc_raise(frames, name, &vals)

@@ -1864,6 +1864,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "libc::unix::realloc" => Builtin::LibcRealloc,
         "libc::unix::posix_memalign" => Builtin::LibcPosixMemalign,
         "libc::sigaction" | "libc::unix::sigaction" => Builtin::LibcSigaction,
+        "libc::signal" | "libc::unix::signal" => Builtin::LibcSignal,
+        "libc::bsd_signal" | "libc::unix::bsd_signal" => Builtin::LibcSignal,
         "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
         "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
         "libc::read" | "libc::unix::read" => Builtin::LibcRead,

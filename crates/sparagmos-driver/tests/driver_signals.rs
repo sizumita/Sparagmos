@@ -1,7 +1,8 @@
 //! Run-mode tests for the signal model (Issue #513):
-//! `libc::sigaction` registration and query, synchronous
-//! `libc::raise` delivery to the installed handler, and
-//! `libc::atexit` handlers running at program exit.
+//! `libc::sigaction` registration and query, `libc::signal`
+//! installation, synchronous `libc::raise` delivery to
+//! the installed handler, and `libc::atexit` handlers
+//! running at program exit.
 //!
 //! The guest programs use libc through an auxiliary crate
 //! (the driver's own sysroot pinning serves the aux build,
@@ -473,5 +474,85 @@ fn run_mode_atexit_reverse_order() {
         ORDER_AUX,
         ORDER_MAIN,
         "body\nsecond registered\nfirst registered\n",
+    );
+}
+
+/// `libc::signal`: the shape of the
+/// `tests/ui/runtime/on-broken-pipe/inherit.rs` record —
+/// install `SIG_IGN` for SIGPIPE and have the install be
+/// visible to a later query — plus the C contract around
+/// it: the call answers the handler it replaces, a
+/// handler installed this way stays installed across
+/// delivery (the BSD form), and the uncatchable signals
+/// and invalid numbers answer `SIG_ERR`. On the base
+/// tree the program stops at the signal call (no
+/// converted body, no model).
+const SIGNAL_AUX: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+use libc::*;
+
+unsafe extern "C" fn handler_a(signum: c_int) {
+    println!("A {signum}");
+}
+
+pub fn run() {
+    unsafe {
+        // A first install answers the disposition the
+        // runtime initialisation seeded for SIGPIPE
+        // (SIG_IGN); a signal without a seed answers the
+        // default disposition, as SIGUSR1 does below.
+        assert_eq!(signal(SIGPIPE, SIG_IGN), SIG_IGN);
+
+        // The install is visible to a sigaction query,
+        // with the SA_RESTART flag `signal` installs with.
+        let mut actual: sigaction = std::mem::zeroed();
+        assert_eq!(sigaction(SIGPIPE, std::ptr::null(), &mut actual), 0);
+        assert_eq!(actual.sa_sigaction, SIG_IGN);
+        assert_eq!(actual.sa_flags, SA_RESTART as _);
+        println!("pipe ignored");
+
+        // Installing a handler answers the disposition it
+        // replaces (the default here), and delivery
+        // reaches the handler — twice: the BSD form keeps
+        // the handler installed across delivery.
+        assert_eq!(signal(SIGUSR1, handler_a as sighandler_t), SIG_DFL);
+        assert_eq!(raise(SIGUSR1), 0);
+        assert_eq!(raise(SIGUSR1), 0);
+        println!("handled twice");
+
+        // Replacing a handler answers the old one, and
+        // restoring the default answers the ignore.
+        assert_eq!(signal(SIGUSR1, SIG_IGN), handler_a as sighandler_t);
+        assert_eq!(signal(SIGUSR1, SIG_DFL), SIG_IGN);
+        println!("replaced ok");
+
+        // The uncatchable signals and invalid numbers
+        // answer SIG_ERR.
+        assert_eq!(signal(SIGKILL, SIG_IGN), SIG_ERR);
+        assert_eq!(signal(SIGSTOP, SIG_IGN), SIG_ERR);
+        assert_eq!(signal(0, SIG_IGN), SIG_ERR);
+        assert_eq!(signal(65, SIG_IGN), SIG_ERR);
+        println!("refusals ok");
+    }
+}
+"#;
+
+const SIGNAL_MAIN: &str = r#"
+extern crate sigaux;
+
+fn main() {
+    sigaux::run();
+}
+"#;
+
+#[test]
+fn run_mode_libc_signal_install_query_and_delivery() {
+    run_ok(
+        "signal",
+        SIGNAL_AUX,
+        SIGNAL_MAIN,
+        "pipe ignored\nA 10\nA 10\nhandled twice\nreplaced ok\nrefusals ok\n",
     );
 }
