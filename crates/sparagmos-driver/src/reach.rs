@@ -32,8 +32,8 @@
 //!   interpreter prefers converted bodies over builtins, so a
 //!   collected body would shadow the model. The exclusion is per
 //!   definition, matching the builtin registry's granularity. The
-//!   one exception is a definition demanded *as a value* whose
-//!   builtin the runtime cannot serve by name (see
+//!   one exception is a definition demanded *as a value* of a
+//!   kind the value-demand exception covers (see
 //!   `value_demand_needs_body`): a call through the value names
 //!   the plain definition with no call site for conversion to
 //!   bake a builtin into, so the real body is collected for it.
@@ -1406,17 +1406,30 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// as a bare name with no instance attached: conversion had no
 /// call site at which to bake a `CallBuiltin`, so the only
 /// faithful execution is the definition's own body, collected
-/// under the plain definition name the value carries. The one
-/// exception is the value-semantics models the runtime serves
-/// by name (`builtins::runtime_name_fallback` -- `Clone::clone`
-/// and family): those compute from the argument values alone,
-/// need nothing conversion bakes in, and stay excluded.
+/// under the plain definition name the value carries.
+///
+/// The exception is deliberately limited to the kinds whose
+/// value call the runtime cannot serve by name *and* whose
+/// bodies do not shadow a model that owns a representation:
+/// `mem::drop` (the body runs the argument's drop glue, which
+/// no name-served model computes) and `Deref::deref` (a plain
+/// projection). Collecting the body of a representation-owning
+/// model instead — the `fmt` argument construction, `Box`
+/// allocation, `_print`, the panic formatting path — makes the
+/// interpreter prefer the real body over the model and breaks
+/// the representation agreement between them (the async-closure
+/// corpus tests are the regression that pins this). Extend the
+/// kind list only with a value-call regression test per kind.
 fn value_demand_needs_body(canonical: &str, demand: Demand) -> bool {
     if demand != Demand::Value {
         return false;
     }
     match sparagmos_interp::builtins::lookup_qualified(canonical) {
-        Some(kind) => !sparagmos_interp::builtins::runtime_name_fallback(kind),
+        Some(kind) => matches!(
+            kind,
+            sparagmos_interp::builtins::Builtin::MemDrop
+                | sparagmos_interp::builtins::Builtin::Deref
+        ),
         None => false,
     }
 }
