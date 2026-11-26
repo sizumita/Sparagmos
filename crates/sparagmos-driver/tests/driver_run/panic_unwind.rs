@@ -1504,6 +1504,175 @@ fn run_mode_caller_location_through_fn_pointer_is_the_definition() {
     );
 }
 
+const CALLER_LOCATION_FNPTR_OPT_SRC: &str = r#"
+fn ptr_call(f: fn()) {
+    f();
+}
+
+fn pass_to_ptr_call<T>(f: fn(T), x: T) {
+    f(x);
+}
+
+#[track_caller]
+fn tracked() {
+    let expected_line = line!() - 1;
+    let location = std::panic::Location::caller();
+    assert_eq!(location.line(), expected_line);
+}
+
+#[track_caller]
+fn tracked_unit(_: ()) {
+    let expected_line = line!() - 1;
+    let location = std::panic::Location::caller();
+    assert_eq!(location.line(), expected_line);
+}
+
+trait Trait {
+    fn trait_tracked();
+    fn trait_tracked_unit(_: ());
+}
+
+impl Trait for () {
+    #[track_caller]
+    fn trait_tracked() {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+
+    #[track_caller]
+    fn trait_tracked_unit(_: ()) {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+}
+
+trait TrackedTrait {
+    #[track_caller]
+    fn trait_tracked_default() {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+
+    #[track_caller]
+    fn trait_tracked_unit_default(_: ()) {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+}
+
+impl TrackedTrait for () {}
+
+trait BlanketTracked {
+    #[track_caller]
+    fn tracked_blanket();
+    #[track_caller]
+    fn tracked_blanket_unit(_: ());
+}
+
+impl BlanketTracked for () {
+    fn tracked_blanket() {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+
+    fn tracked_blanket_unit(_: ()) {
+        let expected_line = line!() - 1;
+        let location = std::panic::Location::caller();
+        assert_eq!(location.line(), expected_line);
+    }
+}
+
+fn main() {
+    ptr_call(tracked);
+    ptr_call(<() as Trait>::trait_tracked);
+    ptr_call(<() as TrackedTrait>::trait_tracked_default);
+    ptr_call(<() as BlanketTracked>::tracked_blanket);
+    pass_to_ptr_call(tracked_unit, ());
+    pass_to_ptr_call(<() as Trait>::trait_tracked_unit, ());
+    pass_to_ptr_call(<() as TrackedTrait>::trait_tracked_unit_default, ());
+    pass_to_ptr_call(<() as BlanketTracked>::tracked_blanket_unit, ());
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_through_fn_pointer_at_optimized_mir() {
+    // At mir-opt level 4 `Location::caller` is inlined into
+    // each `#[track_caller]` body, so the body's first
+    // terminator carries the inlined intrinsic's scope: the
+    // definition-location stamp recorded for a body entered
+    // through a function pointer must still name the body's
+    // definition, not the inlined call's site inside the body.
+    // Covers a free function, a trait method, a trait default
+    // method and a blanket-tracked impl method, with and
+    // without an argument (the rustc
+    // `rfc-2091-track-caller/tracked-fn-ptr{,-with-arg}`
+    // shapes).
+    let dir = temp_dir("caller-location-fnptr-opt");
+    let src = fixture(
+        &dir,
+        "caller_location_fnptr_opt.rs",
+        CALLER_LOCATION_FNPTR_OPT_SRC,
+    );
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-Zmir-opt-level=4"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+}
+
+const CALLER_LOCATION_CALL_CHAIN_OPT_SRC: &str = r#"
+use std::panic::Location;
+
+struct Foo;
+
+impl Foo {
+    #[inline(always)]
+    #[track_caller]
+    fn check_loc(&self, line: u32, col: u32) -> &Self {
+        let loc = Location::caller();
+        assert_eq!(loc.line(), line);
+        assert_eq!(loc.column(), col);
+        self
+    }
+}
+
+fn main() {
+    let foo = Foo;
+    foo.
+        check_loc(line!(), 9).check_loc(line!(), 31)
+        .check_loc(line!(), 10);
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_method_call_chain_at_optimized_mir() {
+    // At mir-opt level 4 the function operand of a method call
+    // can arrive as a promoted constant whose span was erased,
+    // leaving the terminator's own span, which starts at the
+    // receiver (`foo` on the line above the first segment): the
+    // `#[track_caller]` stamp of each call in the chain must
+    // still name that segment's method name (the rustc
+    // `rfc-2091-track-caller/call-chain` shape).
+    let dir = temp_dir("caller-location-call-chain-opt");
+    let src = fixture(
+        &dir,
+        "caller_location_call_chain_opt.rs",
+        CALLER_LOCATION_CALL_CHAIN_OPT_SRC,
+    );
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-Zmir-opt-level=4"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+}
+
 const CALLER_LOCATION_DYN_SRC: &str = r#"
 trait Tr {
     #[track_caller]

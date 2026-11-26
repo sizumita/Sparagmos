@@ -175,6 +175,14 @@ impl Converter {
         .unwrap_or(false);
         if operand_has_position {
             term.source_info.span = c.span;
+        } else if let Some(span) =
+            self.method_call_name_span(term.source_info.span, &canonical)
+        {
+            // The operand's span was erased, and the terminator's
+            // own span starts at the receiver: for a method call
+            // the stamp must name the method name's own span,
+            // recovered from the call's source text.
+            term.source_info.span = span;
         }
         let mc = body.caller_location(&term, None);
         let constant = self.constant(&mir::ConstOperand {
