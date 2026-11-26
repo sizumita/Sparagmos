@@ -1089,6 +1089,8 @@ impl<'a> Converter<'a> {
             "std::io::Read::read_buf_exact",
             "std::io::Write::write",
             "std::io::Write::write_all",
+            "std::io::Write::write_vectored",
+            "std::io::Read::read_vectored",
             "std::io::Write::flush",
             "std::io::Seek::seek",
             "std::io::Seek::rewind",
@@ -1110,7 +1112,16 @@ impl<'a> Converter<'a> {
                 .strip_prefix("&mut ")
                 .or_else(|| self_ty.strip_prefix("&"))
                 .unwrap_or(self_ty);
-            self_ty == "std::fs::File"
+            self_ty == "std::net::TcpStream"
+                && matches!(
+                    canonical.as_str(),
+                    "std::io::Read::read"
+                        | "std::io::Read::read_vectored"
+                        | "std::io::Write::write"
+                        | "std::io::Write::write_vectored"
+                        | "std::io::Write::flush"
+                )
+                || self_ty == "std::fs::File"
                 || (matches!(
                     canonical.as_str(),
                     "std::io::Write::write"

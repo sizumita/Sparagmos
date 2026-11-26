@@ -1528,6 +1528,17 @@ pub enum DropPlan {
     /// closing the host file exactly as the real descriptor's
     /// close does. A moved-out handle has no file to close.
     FileHandleDrop,
+    /// Close the host socket behind the `std::net` handle
+    /// value this plan applies to (the interpreter's socket
+    /// model, see the socket table in `interp.rs`): the guest
+    /// value is the wrapper chain (`TcpListener` -> sys
+    /// `TcpListener` -> `Socket` -> `FileDesc` -> `OwnedFd`,
+    /// and the `TcpStream` / `UdpSocket` analogues) whose
+    /// descriptor slot holds the socket table's id, and
+    /// dropping the handle removes that entry, closing the
+    /// host socket exactly as the real descriptor's close
+    /// does. A moved-out handle has no socket to close.
+    SocketHandleDrop,
     /// Drop one strong handle of a reference-counted allocation
     /// (the `Rc` / `Arc` destructor in the interpreter's allocation
     /// model, see `RefTarget::Alloc`): decrement the allocation's

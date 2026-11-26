@@ -692,7 +692,7 @@ impl<'a> Interpreter<'a> {
     /// by reference or by value), a single address
     /// (`SocketAddr` / `SocketAddrV4` / `SocketAddrV6`), an
     /// `(address, port)` pair, and a slice of addresses.
-    fn resolve_socket_addrs(
+    pub(super) fn resolve_socket_addrs(
         &mut self,
         frames: &mut Vec<Frame>,
         self_ty: &str,
@@ -3781,6 +3781,51 @@ pub(super) fn socket_addr_value(value: &Value) -> Option<Value> {
         return Some(socket_addr_v6_value(octets, port, flowinfo, scope_id));
     }
     None
+}
+
+/// The host `SocketAddr` a guest address value denotes (any
+/// of the single-address forms [`socket_addr_value`]
+/// normalizes), for the socket table's host operations.
+pub(super) fn host_socket_addr(value: &Value) -> Option<std::net::SocketAddr> {
+    let normalized = socket_addr_value(value)?;
+    let Value::Enum { variant, fields } = &normalized else {
+        return None;
+    };
+    let inner = fields.first()?;
+    match variant {
+        0 => {
+            let (octets, port) = socket_v4_fields(inner)?;
+            Some(std::net::SocketAddr::from((octets, port)))
+        }
+        1 => {
+            let (octets, port, flowinfo, scope_id) = socket_v6_fields(inner)?;
+            Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(octets),
+                port,
+                flowinfo,
+                scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// A guest `SocketAddr` value for a host address (the
+/// canonical shape [`socket_addr_v4_value`] /
+/// [`socket_addr_v6_value`] build), for the socket table's
+/// host operation results.
+pub(super) fn socket_addr_from_host(addr: std::net::SocketAddr) -> Value {
+    match addr {
+        std::net::SocketAddr::V4(a) => {
+            socket_addr_v4_value(a.ip().octets(), a.port())
+        }
+        std::net::SocketAddr::V6(a) => socket_addr_v6_value(
+            a.ip().octets(),
+            a.port(),
+            a.flowinfo(),
+            a.scope_id(),
+        ),
+    }
 }
 
 /// An `IpAddr` (or a bare `Ipv4Addr` / `Ipv6Addr`) value

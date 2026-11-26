@@ -86,6 +86,16 @@ impl<'a> Interpreter<'a> {
             }
             return self.exec_file_io(frames, name, generic_args, vals);
         }
+        // `Read` / `Write` leaf methods on `std::net::TcpStream`:
+        // conversion emits a builtin node only for those calls
+        // (see `file_io_terminator` in `mir_convert`).
+        if is_stream_io_call(name, generic_args) {
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                vals.push(self.eval_operand(frames, body, arg)?);
+            }
+            return self.exec_stream_io(frames, name, vals);
+        }
         let kind = lookup(name)
             .or_else(|| foreign_helper_lookup(name))
             .or_else(|| intrinsic_lookup(name))
@@ -3879,6 +3889,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Bool(path_ends_with(&path, &child)))
             }
             Builtin::FsSys(op) => self.exec_fs_sys(frames, op, vals),
+            Builtin::NetSys(op) => self.exec_net_sys(frames, op, generic_args, vals),
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
                 // `From::from` renders the callee's generic

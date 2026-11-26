@@ -20,6 +20,7 @@ mod generics;
 mod io;
 mod libtest;
 mod mono;
+mod net;
 mod numerics;
 mod panic_unwind;
 mod pointers;

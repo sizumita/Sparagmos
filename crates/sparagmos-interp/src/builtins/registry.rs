@@ -172,6 +172,13 @@ pub enum Builtin {
     /// so the converted public `std::fs` bodies above them run
     /// unchanged.
     FsSys(FsSysOp),
+    /// A `std::sys::net::connection::socket` leaf operation,
+    /// performed on the interpreter's host socket table: the
+    /// arguments and results are plain values (addresses in
+    /// std's `SocketAddr` shape, `io::Error` in std's own
+    /// shape), so the converted public `std::net` bodies above
+    /// them run unchanged.
+    NetSys(NetSysOp),
     /// `std::process::exit(code)`: end the run with the given
     /// exit code (see `InterpError::ProcessExit`).
     ProcessExit,
@@ -1646,6 +1653,62 @@ pub enum FsSysOp {
     Rename,
     SetPermissions,
     Symlink,
+}
+
+/// The `std::sys::net::connection::socket` leaf operations
+/// the interpreter performs on its host socket table (see
+/// `exec_net_sys` in `builtins::net`). Blocking operations
+/// (`Accept`, `StreamRead`, `UdpRecv`, ...) run through the
+/// cooperative scheduler exactly like the mpsc waits: the
+/// host sockets are nonblocking, and a would-block outcome
+/// drives the other guest threads until one can proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetSysOp {
+    ListenerBind,
+    ListenerAccept,
+    ListenerSocketAddr,
+    ListenerDuplicate,
+    ListenerSetTtl,
+    ListenerTtl,
+    ListenerSetOnlyV6,
+    ListenerOnlyV6,
+    ListenerTakeError,
+    ListenerSetNonblocking,
+    StreamConnect,
+    StreamConnectTimeout,
+    StreamSocketAddr,
+    StreamPeerAddr,
+    StreamRead,
+    StreamReadVectored,
+    StreamWrite,
+    StreamWriteVectored,
+    StreamPeek,
+    StreamDuplicate,
+    StreamShutdown,
+    StreamSetNodelay,
+    StreamNodelay,
+    StreamSetTtl,
+    StreamTtl,
+    StreamTakeError,
+    StreamSetNonblocking,
+    StreamSetReadTimeout,
+    StreamReadTimeout,
+    StreamSetWriteTimeout,
+    StreamWriteTimeout,
+    UdpBind,
+    UdpSocketAddr,
+    UdpDuplicate,
+    UdpRecvFrom,
+    UdpSendTo,
+    UdpConnect,
+    UdpRecv,
+    UdpSend,
+    UdpSetBroadcast,
+    UdpBroadcast,
+    UdpSetTtl,
+    UdpTtl,
+    UdpTakeError,
+    UdpSetNonblocking,
 }
 
 /// A relational operator selected by a `PartialOrd` method.

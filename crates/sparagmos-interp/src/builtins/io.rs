@@ -45,7 +45,7 @@ impl<'a> Interpreter<'a> {
 
     /// The bytes of a byte-slice value (the buffer a `Write`
     /// call hands over).
-    fn slice_bytes(
+    pub(super) fn slice_bytes(
         &self,
         frames: &[Frame],
         value: &Value,
@@ -65,7 +65,7 @@ impl<'a> Interpreter<'a> {
     /// rebuilt with the new bytes in place and stored back
     /// through the pointer's target, preserving the container's
     /// shape (array tuple, vector element list, sparse vector).
-    fn write_bytes_into_slice(
+    pub(super) fn write_bytes_into_slice(
         &self,
         frames: &mut Vec<Frame>,
         fat: &Value,
