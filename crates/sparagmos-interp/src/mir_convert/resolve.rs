@@ -895,6 +895,8 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::ChannelHandleDrop { .. } => true,
             // Closing a file handle calls no destructor body.
             ir::DropPlan::FileHandleDrop => true,
+            // Closing a socket handle calls no destructor body.
+            ir::DropPlan::SocketHandleDrop => true,
             // Releasing a weak reference calls no destructor body.
             ir::DropPlan::RcWeakRelease => true,
             // A waker's release is chosen from the value at run

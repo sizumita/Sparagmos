@@ -907,6 +907,24 @@ impl<'a> Interpreter<'a> {
                         };
                         self.file_handle_closed(id);
                     }
+                    P::SocketHandleDrop => {
+                        // A moved-out / never-written handle has
+                        // no socket to close, exactly like drop
+                        // flags in real MIR.
+                        let Some(value) =
+                            self.read_at(frames, &active.root, &path)?
+                        else {
+                            continue;
+                        };
+                        let Some(id) = file_handle_id(&value) else {
+                            return Err(InterpError::type_mismatch(
+                                "socket handle drop glue",
+                                "a std::net handle",
+                                value.kind_name(),
+                            ));
+                        };
+                        self.socket_handle_closed(id);
+                    }
                     P::RcHandleDrop { value } => {
                         // A moved-out / never-written handle has no
                         // count to decrement, exactly like drop

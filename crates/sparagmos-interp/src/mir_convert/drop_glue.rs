@@ -545,6 +545,26 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             | "std::sys::fd::unix::FileDesc" | "std::os::fd::OwnedFd" => {
                 return Some(P::FileHandleDrop)
             }
+            // The `std::net` wrapper chains (`TcpListener` ->
+            // sys `TcpListener` -> `Socket` -> `FileDesc` ->
+            // `OwnedFd`, and the `TcpStream` / `UdpSocket`
+            // analogues): the value is a socket-table id in the
+            // descriptor slot, and the destructor's only
+            // observable effect — closing the host socket — is
+            // the interpreter's socket-handle drop plan. Every
+            // layer above `FileDesc` takes the same plan (the
+            // two bottom layers are shared with the file model
+            // and keep its plan: a socket value's own plan is
+            // this leaf at its outermost layer, so the shared
+            // layers' plans never run for a socket).
+            "std::net::TcpListener" | "std::net::TcpStream"
+            | "std::net::UdpSocket"
+            | "std::sys::net::connection::socket::TcpListener"
+            | "std::sys::net::connection::socket::TcpStream"
+            | "std::sys::net::connection::socket::UdpSocket"
+            | "std::sys::net::connection::socket::Socket" => {
+                return Some(P::SocketHandleDrop)
+            }
             // The child-process pipe handles: the value is the
             // pipe end's file-table id under the same wrapper
             // chain as `File`'s, and the destructor's only

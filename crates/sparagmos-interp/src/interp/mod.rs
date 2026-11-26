@@ -636,6 +636,17 @@ pub struct Interpreter<'a> {
     files: std::cell::RefCell<
         HashMap<u64, std::cell::RefCell<std::fs::File>>,
     >,
+    /// Open host sockets of the `std::net` value model (see
+    /// `socket_value` in `builtins::net`): the table holds the
+    /// real host socket each guest handle delegates to, keyed
+    /// by the id in the handle value's descriptor slot. Ids
+    /// come from the file counter (`next_file`): files and
+    /// sockets share the guest's one descriptor space. Each
+    /// entry is itself a cell for the same reason as the file
+    /// entries.
+    sockets: std::cell::RefCell<
+        HashMap<u64, std::cell::RefCell<SocketEntry>>,
+    >,
     /// The id the next opened file gets.
     next_file: std::cell::RefCell<u64>,
     /// Modelled process commands under construction (see
@@ -910,6 +921,7 @@ impl<'a> Interpreter<'a> {
             wake_dispatch: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
             files: std::cell::RefCell::new(HashMap::new()),
+            sockets: std::cell::RefCell::new(HashMap::new()),
             next_file: std::cell::RefCell::new(3),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),

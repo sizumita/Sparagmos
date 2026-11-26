@@ -300,6 +300,57 @@ pub(crate) struct ChildState {
     pub drains: Vec<(bool, std::thread::JoinHandle<Vec<u8>>)>,
 }
 
+/// One host socket behind a guest `std::net` handle value
+/// (see the socket model in `builtins::net`): the real host
+/// socket the handle delegates to, plus the guest-visible
+/// state the host object cannot carry for the model. The
+/// host socket itself is always nonblocking: a guest-visible
+/// blocking operation is emulated by the cooperative
+/// scheduler (the mpsc waits' pattern), and `nonblocking`
+/// records the mode the guest selected, which decides
+/// whether a would-block outcome suspends or surfaces as
+/// the `WouldBlock` error. The stream timeouts are the
+/// guest's `set_read_timeout` / `set_write_timeout` values:
+/// on a nonblocking host socket they cannot fire by
+/// themselves, so a would-block outcome while one is set
+/// is the timeout outcome std reports (`WouldBlock`).
+pub(crate) enum SocketEntry {
+    Listener {
+        socket: std::net::TcpListener,
+        nonblocking: bool,
+    },
+    Stream {
+        socket: std::net::TcpStream,
+        nonblocking: bool,
+        read_timeout: Option<std::time::Duration>,
+        write_timeout: Option<std::time::Duration>,
+    },
+    Udp {
+        socket: std::net::UdpSocket,
+        nonblocking: bool,
+    },
+}
+
+impl SocketEntry {
+    /// The guest-selected nonblocking mode of the entry.
+    pub(crate) fn nonblocking(&self) -> bool {
+        match self {
+            SocketEntry::Listener { nonblocking, .. }
+            | SocketEntry::Stream { nonblocking, .. }
+            | SocketEntry::Udp { nonblocking, .. } => *nonblocking,
+        }
+    }
+
+    /// Record the guest-selected nonblocking mode.
+    pub(crate) fn set_nonblocking(&mut self, value: bool) {
+        match self {
+            SocketEntry::Listener { nonblocking, .. }
+            | SocketEntry::Stream { nonblocking, .. }
+            | SocketEntry::Udp { nonblocking, .. } => *nonblocking = value,
+        }
+    }
+}
+
 /// One `std::sync::Barrier`'s shared state (see the
 /// `Barrier` builtins in `builtins.rs`): how many parties
 /// wait at the barrier, how many have arrived in the
@@ -737,6 +788,45 @@ impl<'a> Interpreter<'a> {
         let entry = files.get(&id)?;
         let result = f(&mut entry.borrow_mut());
         Some(result)
+    }
+
+    /// Register a host socket in the socket table and return
+    /// the id the guest handle value carries. Socket ids come
+    /// from the same counter as file ids: both surface to the
+    /// guest as descriptor numbers (a socket handle's
+    /// `as_raw_fd` is its table id), and the descriptor space
+    /// is one space, so no two live handles of either kind
+    /// ever share a number.
+    pub(crate) fn register_socket(&self, entry: SocketEntry) -> u64 {
+        let id = *self.next_file.borrow();
+        *self.next_file.borrow_mut() = id + 1;
+        self.sockets
+            .borrow_mut()
+            .insert(id, std::cell::RefCell::new(entry));
+        id
+    }
+
+    /// Run `f` against the socket behind table id `id`;
+    /// `None` when the id names no open socket (a handle
+    /// closed already, or one the model never issued).
+    pub(crate) fn with_socket<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut SocketEntry) -> R,
+    ) -> Option<R> {
+        let sockets = self.sockets.borrow();
+        let entry = sockets.get(&id)?;
+        let result = f(&mut entry.borrow_mut());
+        Some(result)
+    }
+
+    /// Close the host socket behind table id `id` (the
+    /// `SocketHandleDrop` plan's effect): removing the entry
+    /// drops the host socket, closing the descriptor. An id
+    /// that names no open socket is already closed, so there
+    /// is nothing to do.
+    pub(crate) fn socket_handle_closed(&self, id: u64) {
+        self.sockets.borrow_mut().remove(&id);
     }
 
     /// Close the host file behind table id `id` (the
