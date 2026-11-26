@@ -507,3 +507,74 @@ fn run_mode_nested_aux_crates_execute() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "val=42\n");
 }
+
+const AUX_PREBUILT_STUB_SRC: &str = r#"
+pub fn stub_val() -> i32 { 7 }
+"#;
+
+const AUX_USES_PREBUILT_SRC: &str = r#"
+extern crate stub;
+
+pub fn dep_val() -> i32 { stub::stub_val() + 1 }
+"#;
+
+const AUX_USES_PREBUILT_MAIN_SRC: &str = r#"
+extern crate depaux;
+
+fn main() {
+    println!("val={}", depaux::dep_val());
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_binds_prebuilt_aux_lib() {
+    // A prebuilt library auxiliary (--aux-lib) precedes the
+    // auxiliary builds: an auxiliary source that declares it
+    // (`extern crate stub;` here; `extern crate minicore;` in an
+    // `//@ add-minicore` test's auxiliary file) binds it during
+    // its own build, not only in the main compilation. Without
+    // the prebuilt entries in the auxiliary builds' visibility
+    // list, this run stops at the auxiliary build with E0463.
+    // The stub rlib is built the way the driver's own auxiliary
+    // builds are (MIR encoded), with the pinned toolchain the
+    // harness's native side invokes as well.
+    let dir = temp_dir("aux-prebuilt");
+    let stub_src = fixture(&dir, "stub.rs", AUX_PREBUILT_STUB_SRC);
+    let rlib = dir.join("libstub.rlib");
+    let build = Command::new("rustup")
+        .args(["run", "1.100.0", "rustc"])
+        .arg(&stub_src)
+        .arg("--crate-type")
+        .arg("rlib")
+        .arg("--crate-name")
+        .arg("stub")
+        .arg("-Zalways-encode-mir")
+        .arg("-o")
+        .arg(&rlib)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to build the prebuilt stub");
+    assert!(
+        build.status.success(),
+        "the prebuilt stub must compile: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let dep = fixture(&dir, "depaux.rs", AUX_USES_PREBUILT_SRC);
+    let src = fixture(&dir, "prebuiltmain.rs", AUX_USES_PREBUILT_MAIN_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--aux")
+        .arg(format!("depaux={}", dep.display()))
+        .arg("--aux-lib")
+        .arg(format!("stub={};collect=no", rlib.display()))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an auxiliary crate must bind a prebuilt auxiliary it declares; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "val=8\n");
+}

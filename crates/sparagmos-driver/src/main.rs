@@ -76,6 +76,17 @@
 //! proc macros run inside the compiler at compile time, and a
 //! cdylib exposes no Rust API to call.
 //!
+//! `--aux-lib <name>=<path>` (repeatable) names a prebuilt library
+//! auxiliary instead: a support library the harness built once
+//! (compiletest's minicore stub, run-make's support library). It
+//! binds into the main compilation and into every auxiliary build
+//! that declares it -- compiletest's support libraries precede a
+//! test's own auxiliary builds, so an auxiliary source's
+//! `extern crate minicore;` resolves during its own build. The
+//! optional `;collect=no` attribute keeps its functions out of
+//! the converted program (the minicore stub's rlib carries no
+//! encoded MIR for its non-generic functions).
+//!
 //! Crate type: run mode pins `--crate-type=lib` (unless the caller
 //! forwards one). Convert mode pins nothing, mirroring compiletest,
 //! which names no crate type for a test file: a forwarded
@@ -759,7 +770,7 @@ fn driver_main_inner() {
     let mut debug_dialect = "gdb".to_string();
     let mut input: Option<String> = None;
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
-    let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut aux_lib_specs: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
     let mut aux_native_lib_dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut aux_env_scrub: Vec<String> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
@@ -879,12 +890,10 @@ fn driver_main_inner() {
                     eprintln!("--aux-lib needs a <name>=<path> value");
                     exit_process(2);
                 });
-                match spec.split_once('=') {
-                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
-                        aux_lib_specs.push((name.to_string(), std::path::PathBuf::from(path)));
-                    }
-                    _ => {
-                        eprintln!("--aux-lib needs a <name>=<path> value, got: {spec}");
+                match parse_aux_lib_spec(&spec) {
+                    Ok(parsed) => aux_lib_specs.push(parsed),
+                    Err(reason) => {
+                        eprintln!("{reason}");
                         exit_process(2);
                     }
                 }
@@ -926,7 +935,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -972,8 +981,13 @@ fn driver_main_inner() {
             .collect();
         let aux_lib_specs = aux_lib_specs
             .iter()
-            .map(|(name, lib)| {
-                (name.clone(), absolutize_path(lib).display().to_string())
+            .map(|(name, lib, collect)| {
+                let mut text =
+                    format!("{}={}", name, absolutize_path(lib).display());
+                if !collect {
+                    text += ";collect=no";
+                }
+                text
             })
             .collect();
         Some(sparagmos_interp::ProcessHost(std::sync::Arc::new(
@@ -1011,18 +1025,47 @@ fn driver_main_inner() {
     let aux_dir = out_dir.join("aux");
     let _ = std::fs::create_dir_all(&aux_dir);
     let mut aux_built: Vec<AuxBuilt> = Vec::new();
+    // Prebuilt library auxiliaries (--aux-lib): the artifact
+    // already exists (a support library built once by the
+    // harness), so there is nothing to compile; the entry takes
+    // part in binding and collection exactly like a compiled
+    // auxiliary. The binding is unconditional -- the crate is
+    // part of the harness's contract with the guest (a recipe
+    // never declares it) -- so `main` adds the name to the
+    // session's declared set below.
+    //
+    // The prebuilt entries also lead the visibility list the
+    // auxiliary compilations bind from: compiletest builds its
+    // support libraries (minicore above all) before a test's
+    // auxiliary crates, so an auxiliary source that declares one
+    // (`extern crate minicore;` in an auxiliary file of an
+    // `//@ add-minicore` test) binds it during its own build,
+    // not only in the main compilation below.
+    let prebuilt: Vec<AuxBuilt> = aux_lib_specs
+        .iter()
+        .map(|(name, path, collect)| AuxBuilt {
+            name: name.clone(),
+            extern_name: name.clone(),
+            artifact: Some(path.clone()),
+            collect: *collect,
+        })
+        .collect();
+    let mut visible: Vec<AuxBuilt> = prebuilt.clone();
     for spec in &aux_specs {
         match compile_aux(
             &sysroot,
             &edition,
             &aux_dir,
             spec,
-            &aux_built,
+            &visible,
             &aux_native_lib_dirs,
             &aux_env_scrub,
             mode,
         ) {
-            Ok(built) => aux_built.push(built),
+            Ok(built) => {
+                visible.push(built.clone());
+                aux_built.push(built);
+            }
             Err(reason) => {
                 if mode == Mode::RunJit {
                     eprintln!("sparagmos-driver run-jit: unsupported: {reason}");
@@ -1037,22 +1080,7 @@ fn driver_main_inner() {
             }
         }
     }
-    // Prebuilt library auxiliaries (--aux-lib): the artifact
-    // already exists (a support library built once by the
-    // harness), so there is nothing to compile; the entry takes
-    // part in binding and collection exactly like a compiled
-    // auxiliary. The binding is unconditional -- the crate is
-    // part of the harness's contract with the guest (a recipe
-    // never declares it) -- so `main` adds the name to the
-    // session's declared set below.
-    for (name, path) in &aux_lib_specs {
-        aux_built.push(AuxBuilt {
-            name: name.clone(),
-            extern_name: name.clone(),
-            artifact: Some(path.clone()),
-            collect: true,
-        });
-    }
+    aux_built.extend(prebuilt);
     let collect_names: Vec<String> = aux_built
         .iter()
         .filter(|b| b.collect)
@@ -1136,7 +1164,7 @@ fn driver_main_inner() {
         args.push(format!("dependency={}", aux_dir.display()));
         // A prebuilt auxiliary's own dependencies live next to
         // it (the build's deps directory), not in `aux_dir`.
-        for (_, path) in &aux_lib_specs {
+        for (_, path, _) in &aux_lib_specs {
             if let Some(parent) = path.parent() {
                 args.push("-L".to_string());
                 args.push(format!("dependency={}", parent.display()));
@@ -1154,7 +1182,7 @@ fn driver_main_inner() {
         top_names.extend(locator_names.iter().cloned());
         // Prebuilt auxiliaries bind unconditionally (see the
         // --aux-lib note at their construction).
-        top_names.extend(aux_lib_specs.iter().map(|(name, _)| name.clone()));
+        top_names.extend(aux_lib_specs.iter().map(|(name, _, _)| name.clone()));
         let mut binding_declared = declared_binding_names(&main_text);
         binding_declared.extend(locator_names.iter().cloned());
         for built in &aux_built {

@@ -20,7 +20,7 @@ pub(crate) struct DriverProcessHost {
     pub(crate) edition: String,
     pub(crate) rustc_args: Vec<String>,
     pub(crate) aux_specs: Vec<String>,
-    pub(crate) aux_lib_specs: Vec<(String, String)>,
+    pub(crate) aux_lib_specs: Vec<String>,
     pub(crate) children: std::sync::Mutex<
         std::collections::HashMap<u64, HostChild>,
     >,
@@ -395,8 +395,8 @@ impl DriverProcessHost {
             for spec in &self.aux_specs {
                 cmd.arg("--aux").arg(spec);
             }
-            for (name, lib) in &self.aux_lib_specs {
-                cmd.arg("--aux-lib").arg(format!("{name}={lib}"));
+            for spec in &self.aux_lib_specs {
+                cmd.arg("--aux-lib").arg(spec);
             }
             for arg in &self.rustc_args {
                 cmd.arg("--rustc-arg").arg(arg);
