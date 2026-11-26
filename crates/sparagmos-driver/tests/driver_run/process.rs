@@ -1665,3 +1665,35 @@ fn run_mode_process_host_fds_are_cloexec() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
     assert_eq!(stdout, "cloexec-ok\n", "stderr={stderr}");
 }
+
+const ENV_VARS_SRC: &str = r#"
+use std::env;
+fn main() {
+    env::set_var("SPARAGMOS_ENV_VARS_MARKER", "marked-42");
+    let all: Vec<(String, String)> = env::vars().collect();
+    assert!(
+        all.iter().any(|(k, v)| k == "SPARAGMOS_ENV_VARS_MARKER" && v == "marked-42"),
+        "vars() missed the set_var entry"
+    );
+    // The enumeration agrees with single-key lookups, and the
+    // two iterators agree on the count.
+    for (k, v) in env::vars_os() {
+        assert_eq!(env::var_os(&k).as_deref(), Some(v.as_os_str()));
+    }
+    assert_eq!(env::vars_os().count(), all.len());
+    assert_eq!(env::vars().size_hint(), (all.len(), Some(all.len())));
+    env::remove_var("SPARAGMOS_ENV_VARS_MARKER");
+    assert!(env::vars().all(|(k, _)| k != "SPARAGMOS_ENV_VARS_MARKER"));
+    println!("env-vars-ok");
+}
+"#;
+
+#[test]
+fn run_mode_env_vars_enumeration() {
+    let dir = temp_dir("env-vars");
+    let src = fixture(&dir, "env_vars.rs", ENV_VARS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "env-vars-ok\n");
+}

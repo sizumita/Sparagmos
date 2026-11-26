@@ -471,6 +471,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::io::_eprint" => Builtin::Eprint,
         "std::env::args" => Builtin::EnvArgs,
         "std::env::args_os" => Builtin::EnvArgsOs,
+        "std::env::vars" => Builtin::EnvVars,
+        "std::env::vars_os" => Builtin::EnvVarsOs,
         "std::env::current_exe" => Builtin::EnvCurrentExe,
         "std::env::var::inner" => Builtin::EnvVarInner,
         "std::env::split_paths" => Builtin::EnvSplitPaths,

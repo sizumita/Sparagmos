@@ -1995,6 +1995,54 @@ impl<'a> Interpreter<'a> {
                 },
             ));
         }
+        if self_ty_is(self_ty, "std::env::Vars") || self_ty_is(self_ty, "std::env::VarsOs") {
+            // `Vars { inner: VarsOs }` / `VarsOs { inner:
+            // sys::env::Env }` / the common `Env { iter:
+            // vec::IntoIter<(OsString, OsString)> }`: step the
+            // innermost owned-iterator state and rebuild the
+            // wrappers, mirroring the `Args` step above. The
+            // stored elements are the environment snapshot's
+            // pairs in the standard `OsString` buffer form;
+            // `VarsOs::next` yields them as-is, while
+            // `Vars::next` converts each side through
+            // `OsString::into_string`, whose unwrap panics on
+            // invalid Unicode (see `vars_pair_to_strings`).
+            let depth = if self_ty_is(self_ty, "std::env::Vars") { 3 } else { 2 };
+            let mut inner = &state;
+            for _ in 0..depth {
+                inner = match inner {
+                    Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("{self_ty} state"),
+                            "nested one-field iterator wrappers",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+            }
+            let (new_inner, item) = step_owned_iter(inner, self_ty)?;
+            let mut rebuilt = new_inner;
+            for _ in 0..depth {
+                rebuilt = Value::Enum {
+                    variant: 0,
+                    fields: vec![rebuilt],
+                };
+            }
+            let item = match item {
+                Some(value) if self_ty_is(self_ty, "std::env::Vars") => {
+                    Some(vars_pair_to_strings(value)?)
+                }
+                other => other,
+            };
+            return Ok((
+                rebuilt,
+                match item {
+                    Some(value) => some_value(value),
+                    None => none_value(),
+                },
+            ));
+        }
         if self_ty.starts_with("std::path::Components") {
             // The state is the path's byte string and the
             // numbers of components consumed from each end (see
@@ -4514,9 +4562,19 @@ impl<'a> Interpreter<'a> {
             // Not overridden in std: the trait default.
             return Ok(hint(0, None));
         }
-        if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
+        if self_ty_is(self_ty, "std::env::Args")
+            || self_ty_is(self_ty, "std::env::ArgsOs")
+            || self_ty_is(self_ty, "std::env::Vars")
+            || self_ty_is(self_ty, "std::env::VarsOs")
+        {
             // Delegates to the inner `vec::IntoIter`'s exact count.
-            let depth = if self_ty_is(self_ty, "std::env::Args") { 3 } else { 2 };
+            let depth = if self_ty_is(self_ty, "std::env::Args")
+                || self_ty_is(self_ty, "std::env::Vars")
+            {
+                3
+            } else {
+                2
+            };
             let mut inner = &state;
             for _ in 0..depth {
                 inner = match inner {
@@ -5675,6 +5733,8 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty_is(self_ty, "std::env::Args")
         || self_ty_is(self_ty, "std::env::ArgsOs")
+        || self_ty_is(self_ty, "std::env::Vars")
+        || self_ty_is(self_ty, "std::env::VarsOs")
         || self_ty_is(self_ty, "std::fs::ReadDir")
         || self_ty_is(self_ty, "std::env::SplitPaths")
         || self_ty.starts_with("std::slice::Windows<")
@@ -6021,6 +6081,8 @@ fn into_iter_identity(ty: &str) -> bool {
         || ty.starts_with("std::slice::RChunksExactMut<")
         || self_ty_is(ty, "std::env::Args")
         || self_ty_is(ty, "std::env::ArgsOs")
+        || self_ty_is(ty, "std::env::Vars")
+        || self_ty_is(ty, "std::env::VarsOs")
         || self_ty_is(ty, "std::env::SplitPaths")
         || ty.starts_with("std::slice::Windows<")
         || ty.starts_with("std::sync::mpsc::Iter<")
@@ -6192,6 +6254,8 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::option::IterMut<")
         || self_ty_is(self_ty, "std::env::Args")
         || self_ty_is(self_ty, "std::env::ArgsOs")
+        || self_ty_is(self_ty, "std::env::Vars")
+        || self_ty_is(self_ty, "std::env::VarsOs")
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::path::Components")
         || self_ty.starts_with("std::iter::Once<")
@@ -6392,6 +6456,42 @@ fn step_owned_iter_back(
     } else {
         Ok((state.clone(), None))
     }
+}
+
+/// One `Vars::next` item conversion: the stored
+/// `(OsString, OsString)` pair becomes the `(String, String)`
+/// pair `Vars` yields, through the same
+/// `OsString::into_string` the native body unwraps -- invalid
+/// Unicode is the native unwrap panic.
+fn vars_pair_to_strings(item: Value) -> InterpResult<Value> {
+    let fields = match &item {
+        Value::Tuple(fields) if fields.len() == 2 => fields.clone(),
+        other => {
+            return Err(InterpError::type_mismatch(
+                "Vars item",
+                "(OsString, OsString) pair",
+                other.kind_name(),
+            ))
+        }
+    };
+    let mut strings = Vec::new();
+    for side in &fields {
+        let bytes = os_string_bytes(side).ok_or_else(|| {
+            InterpError::type_mismatch("Vars item", "OsString value", side.kind_name())
+        })?;
+        match String::from_utf8(bytes) {
+            Ok(text) => strings.push(Value::Str(text)),
+            Err(error) => {
+                return Err(InterpError::Panic {
+                    message: format!(
+                        "called `Result::unwrap()` on an `Err` value: {error:?}"
+                    ),
+                    payload: None,
+                })
+            }
+        }
+    }
+    Ok(Value::Tuple(strings))
 }
 
 /// One back step (`DoubleEndedIterator::next_back`) of an

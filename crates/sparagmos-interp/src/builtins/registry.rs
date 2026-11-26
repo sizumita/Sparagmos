@@ -28,6 +28,15 @@ pub enum Builtin {
     /// argument strings; the iterator step presents each in
     /// the standard `OsString` buffer form).
     EnvArgsOs,
+    /// `std::env::vars() -> Vars`: the environment iterator
+    /// over the host environment, snapshotted at the call
+    /// (the wrapper-shape documentation is on the dispatch
+    /// arm, next to `EnvArgs`).
+    EnvVars,
+    /// `std::env::vars_os() -> VarsOs`: the environment
+    /// iterator over `OsString` keys and values, snapshotted
+    /// from the host environment at the call.
+    EnvVarsOs,
     /// `std::env::current_exe() -> io::Result<PathBuf>`: the
     /// host executable's path (the driver binary's own path —
     /// the guest observes a real, existing path, as it would
