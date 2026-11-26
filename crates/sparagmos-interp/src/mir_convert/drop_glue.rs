@@ -339,6 +339,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // The unit allocator marker: a zero-sized value with
             // no fields and no `Drop` impl.
             "std::alloc::Global" => return Some(P::Trivial),
+            // `NonZero<T>` wraps a primitive integer in a niche
+            // wrapper (`T::NonZeroInner`, an associated type the
+            // evidence tables cannot resolve, which is why the
+            // generic path below plans its one field as
+            // `Untyped` and the plan never collapses): it has no
+            // `Drop` impl and its only content is the integer
+            // itself, so its glue is empty whatever a value
+            // holding one (a slice window / chunk iterator, say)
+            // looks like in the model.
+            "std::num::NonZero" | "core::num::NonZero" => return Some(P::Trivial),
             // The raw allocation buffer behind the modelled
             // containers (`Vec`, `String`, `VecDeque`): rustc's
             // generated drop glue for a container drops the
@@ -858,11 +868,28 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // Borrowing iterators own nothing: the references (and,
             // for `IterMut`, the container snapshot) inside the
             // modelled state are not owned values, and the real
-            // types have no glue of their own.
+            // types have no glue of their own. The slice chunk /
+            // window family belongs here too: each holds a borrowed
+            // slice plus a plain size, and the modelled states do
+            // not always keep the native field count (the `windows`
+            // builtin's state is a [slice, size, next index]
+            // snapshot of a two-field struct), so a fields plan
+            // built from the native shape cannot be run against
+            // them -- with no owned content, the trivial plan is
+            // the exact one.
             "std::option::Iter" | "core::option::Iter"
             | "std::option::IterMut" | "core::option::IterMut"
             | "std::slice::Iter" | "core::slice::Iter"
             | "std::slice::IterMut" | "core::slice::IterMut"
+            | "std::slice::Windows" | "core::slice::Windows"
+            | "std::slice::Chunks" | "core::slice::Chunks"
+            | "std::slice::ChunksMut" | "core::slice::ChunksMut"
+            | "std::slice::ChunksExact" | "core::slice::ChunksExact"
+            | "std::slice::ChunksExactMut" | "core::slice::ChunksExactMut"
+            | "std::slice::RChunks" | "core::slice::RChunks"
+            | "std::slice::RChunksMut" | "core::slice::RChunksMut"
+            | "std::slice::RChunksExact" | "core::slice::RChunksExact"
+            | "std::slice::RChunksExactMut" | "core::slice::RChunksExactMut"
             | "std::str::Chars" | "core::str::Chars"
             | "std::str::Bytes" | "core::str::Bytes"
             | "std::collections::btree_set::Iter"

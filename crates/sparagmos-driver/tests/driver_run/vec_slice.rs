@@ -4309,6 +4309,77 @@ fn run_mode_chunks_windows_len() {
     );
 }
 
+
+const WINDOWS_COLLECT_NESTED_SRC: &str = r#"
+fn main() {
+    let v: Vec<Vec<usize>> = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+    let w: Vec<&[Vec<usize>]> = v.windows(2).collect();
+    println!("len {}", w.len());
+    println!("w0 {:?}", w[0]);
+    println!("w1 {:?}", w[1]);
+    println!("first {}", w[0][0][0]);
+    println!("last {}", w[1][1][1]);
+}
+"#;
+
+#[test]
+fn run_mode_windows_collect_nested_vec_and_drop() {
+    // Collecting `windows` into a `Vec` and dropping the
+    // result stopped at an unsupported `Drop` terminator:
+    // the glue conversion attached to the consuming
+    // `collect` call planned the `Windows` iterator's fields
+    // from its native two-field shape -- the second field is
+    // a `NonZero<usize>`, whose inner type is an associated
+    // type the evidence tables cannot resolve, so its plan
+    // stayed a one-field `Untyped` plan and never collapsed
+    // -- and then tried to run that plan against the modelled
+    // state, a [slice, window size, next index] snapshot with
+    // three fields. `NonZero` is glue-free (a primitive
+    // integer in a niche wrapper) and the borrowing slice
+    // iterators own nothing, so both plans are trivial now.
+    // The collected windows also read through the window
+    // slices the step machine manufactures: those denoted
+    // their snapshot tuple at an element position, which the
+    // slice reader mistook for the first element's own
+    // elements when that element was itself a sequence of
+    // the window's length (here a `Vec` of two numbers), so
+    // `w[0]` printed the first inner vector instead of the
+    // window. The manufactured slices now denote the
+    // snapshot itself.
+    run_ok(
+        "windows-collect-nested",
+        WINDOWS_COLLECT_NESTED_SRC,
+        "len 2\nw0 [[1, 2], [3, 4]]\nw1 [[3, 4], [5, 6]]\nfirst 1\nlast 6\n",
+    );
+}
+
+const WINDOWS_COLLECT_SCALAR_SRC: &str = r#"
+fn main() {
+    let v = vec![1usize, 2, 3, 4];
+    let w: Vec<&[usize]> = v.windows(2).collect();
+    println!("len {}", w.len());
+    println!("w0 {:?}", w[0]);
+    println!("w2 {:?}", w[2]);
+    let nested: Vec<Vec<usize>> = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+    let c: Vec<&[Vec<usize>]> = nested.chunks(2).collect();
+    println!("chunks {} {:?} {:?}", c.len(), c[0][0], c[1][0]);
+}
+"#;
+
+#[test]
+fn run_mode_windows_collect_scalar_and_chunks_collect_nested() {
+    // The scalar-element shape of the same collect-and-drop
+    // path (the `Drop` failure did not depend on the element
+    // type), and the chunk family's manufactured slices over
+    // nested vectors, which had the same element-position
+    // denomination as the window slices.
+    run_ok(
+        "windows-collect-scalar",
+        WINDOWS_COLLECT_SCALAR_SRC,
+        "len 3\nw0 [1, 2]\nw2 [3, 4]\nchunks 2 [1, 2] [5, 6]\n",
+    );
+}
+
 const CHUNKS_MUT_LEN_SRC: &str = r#"
 use std::iter::ExactSizeIterator;
 fn main() {
