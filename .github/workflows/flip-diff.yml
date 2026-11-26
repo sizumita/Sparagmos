@@ -11,7 +11,10 @@ name: Flip Diff
 # Triggering:
 # - Add a label named `flip-diff:<kw1+kw2+...>` to a pull request; the
 #   keywords are matched as substrings of the test paths. (`+` is the
-#   separator because label names cannot contain commas.)
+#   separator because label names cannot contain commas.) A labelled
+#   pull request re-runs automatically on every push. GitHub caps
+#   label names at 50 characters, so a long keyword set does not fit
+#   in a label; those targets are run by manual dispatch instead.
 # - Or run the workflow manually (workflow_dispatch). The dispatch
 #   form takes the target explicitly (a PR number, or a head ref plus
 #   a base ref), so it also works for pull requests whose branch does
@@ -49,10 +52,13 @@ permissions:
   contents: read
   pull-requests: write
 
-# Subset runs stay serialised across the whole repository: two
-# flip-diff jobs never measure at the same time.
+# Runs are serialised per measurement target (one pull request, or one
+# dispatched target): a re-run for the same target queues behind the
+# previous run instead of cancelling it. Different targets measure in
+# parallel; every job gets its own hosted runner, so no cross-target
+# serialisation is needed.
 concurrency:
-  group: flip-diff
+  group: flip-diff-${{ github.event.pull_request.number || inputs.pr_number || inputs.head_ref || github.ref }}
   cancel-in-progress: false
 
 env:
