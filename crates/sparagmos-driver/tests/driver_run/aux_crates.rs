@@ -124,6 +124,61 @@ fn run_mode_aux_crate_statics_print() {
 }
 
 
+const AUX_EII_DECL_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+#[eii(eii1)]
+pub static DECL1: u64;
+"#;
+
+const AUX_EII_DECL_MAIN_SRC: &str = r#"
+extern crate decllib as codegen;
+
+#[codegen::eii1]
+static EII1_IMPL: u64 = 5;
+
+fn main() {
+    println!("{}", EII1_IMPL);
+    println!("{}", codegen::DECL1);
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_eii_decl_reads_impl_seed() {
+    // An extern-item-impl (EII) declaration in an auxiliary
+    // crate whose implementation is defined in the main crate:
+    // reading the declaration must read the implementation's
+    // storage. The compiler's registry of implementations is
+    // per crate -- the auxiliary crate's map names no
+    // implementation for its declaration, because the
+    // implementation is recorded in the main crate's map -- so
+    // resolving the declaration from its own crate's registry
+    // alone finds nothing, the reference falls back to an
+    // uninitialized foreign-static seed, and the read stops as
+    // an uninitialized-place read (Issue #513, the
+    // tests/ui/eii/static/cross_crate_decl shape).
+    let dir = temp_dir("aux-eii-decl");
+    let aux = fixture(&dir, "decllib.rs", AUX_EII_DECL_SRC);
+    let src = fixture(&dir, "eiideclmain.rs", AUX_EII_DECL_MAIN_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("-O")
+        .arg("--aux")
+        .arg(format!("decllib={}", aux.display()))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the EII declaration must read its implementation's value; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n5\n");
+}
+
+
 const AUX_PM_SRC: &str = r#"
 extern crate proc_macro;
 use proc_macro::TokenStream;
