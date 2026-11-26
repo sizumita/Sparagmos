@@ -3035,9 +3035,22 @@ impl<'a> Interpreter<'a> {
                         // aggregate layer or the pointer itself);
                         // any other field-0 shape is not a wrapper
                         // chain and keeps the strict reading below.
+                        // The classification names the chain from
+                        // the operand place, so it cannot name a
+                        // chain whose operand place projects
+                        // through storage it does not model (a
+                        // coroutine state slot, say); the value's
+                        // own field-0 descent then arbitrates —
+                        // a descent that verifiably bottoms out
+                        // at a pointer is the same chain, while a
+                        // value stored directly in the field (a
+                        // builtin-built box's pointee) does not
+                        // descend and keeps the strict reading.
                         Value::Enum { fields, .. }
                             if fields.len() > 1
-                                && places.is_some()
+                                && (places.is_some()
+                                    || layered_wrapper_pointer(&fields[0])
+                                        .is_some())
                                 && matches!(
                                     fields[0],
                                     Value::Enum { .. }

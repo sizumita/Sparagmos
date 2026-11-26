@@ -81,6 +81,30 @@ pub(crate) fn ptr_wrapper_pointer(value: &Value) -> Option<Value> {
     }
 }
 
+/// The pointer at the bottom of a pointer-wrapper chain whose
+/// layers may carry sibling fields (a `Box` over its allocator
+/// field, a `Unique` over its `PhantomData` marker): field 0 of
+/// each aggregate layer is the next layer down, and the chain
+/// bottoms out at the stored pointer value. `None` when the
+/// descent ends in anything else — a value stored directly in a
+/// field (a builtin-built box's pointee) is not a wrapper chain,
+/// and only a descent that verifiably ends at a pointer proves
+/// the chain.
+pub(crate) fn layered_wrapper_pointer(value: &Value) -> Option<Value> {
+    let mut cur = value;
+    loop {
+        match cur {
+            p @ (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }) => {
+                return Some(p.clone());
+            }
+            Value::Enum { fields, .. } if !fields.is_empty() => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
