@@ -119,14 +119,22 @@
 //!   call to it; code generation serves a call from its
 //!   generic intrinsic handling first and the backend's own
 //!   shims second, and a call neither serves is the error.
-//!   This backend's shims are the interpreter's builtin
-//!   registry — the dispatch conversion itself performs for
-//!   a body-less callee — so `check_intrinsic_overrides`
-//!   replays that dispatch on the callee's canonical name
-//!   and reports the call when no lookup serves it. An
-//!   intrinsic with a fallback body is never reported: the
-//!   body is the fallback, and leaving it unshimmed is
-//!   legal.
+//!   The shim set that decides the verdict is code
+//!   generation's own name-based dispatch, which is wider
+//!   than this interpreter's builtin registry: the registry
+//!   models the intrinsics the interpreter can execute,
+//!   while code generation also lowers intrinsics the
+//!   interpreter leaves unmodelled (the sized float
+//!   families, the prefetch family, and a handful of
+//!   singletons), whose calls stay ordinary conversion
+//!   skips here. `check_intrinsic_overrides` therefore
+//!   consults both sets — the dispatch conversion itself
+//!   performs for a body-less callee, and the positively
+//!   verified codegen-only list in
+//!   `codegen_served_unmodelled` — and reports the call
+//!   only when neither serves it. An intrinsic with a
+//!   fallback body is never reported: the body is the
+//!   fallback, and leaving it unshimmed is legal.
 //!
 //! - `#[linkage = "common"]` statics with a non-zero
 //!   initializer (the LLVM verifier's "'common' global must
@@ -216,16 +224,22 @@ fn check_override_call(func: &Operand) -> Option<String> {
     // Replay the dispatch conversion performs for a body-less
     // callee (see `mir_convert`'s external-callee chain): the
     // qualified registry lookup, the foreign-helper lookup,
-    // then the intrinsic lookup. A hit is this backend's shim
-    // for the call; no hit is code generation's fallback,
+    // then the intrinsic lookup. A hit in that dispatch is a
+    // shim for the call — and every name it serves is one
+    // code generation shims as well — but code generation's
+    // own dispatch serves further names this interpreter
+    // does not model, so the codegen-only list is consulted
+    // too. No hit in either is code generation's fallback,
     // which for a must-be-overridden intrinsic is the
     // internal error. (The remaining conversion dispatches
     // key on trait methods and format machinery, which an
     // intrinsic definition never names.)
     let canonical = sparagmos_interp::builtins::canonical_name(&def.name());
+    let bare = canonical.rsplit("::").next().unwrap_or(&canonical);
     let served = sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
         || sparagmos_interp::builtins::foreign_helper_lookup(&canonical).is_some()
-        || sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some();
+        || sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some()
+        || codegen_served_unmodelled(bare);
     if served {
         return None;
     }
@@ -234,6 +248,94 @@ fn check_override_call(func: &Operand) -> Option<String> {
          but isn't (no backend shim serves this call)",
         intrinsic.fn_name()
     ))
+}
+
+/// Whether rustc's code generation shims the named intrinsic
+/// even though the interpreter has no model for it. The
+/// verdict in `check_intrinsic_overrides` mirrors code
+/// generation's error, so its served set is code generation's
+/// dispatch, not the interpreter's registry: a name belongs
+/// here only with positive evidence that the pinned
+/// compiler (Rust 1.100.0) lowers it — each name below was
+/// verified by compiling a body-less declaration and call
+/// with the real compiler and observing it accept the
+/// program the interpreter leaves unmodelled. Names code
+/// generation does not shim (`const_deallocate` and its kin)
+/// must never be added: they are the verdict's reason to
+/// exist.
+fn codegen_served_unmodelled(name: &str) -> bool {
+    if matches!(
+        name,
+        // The prefetch family: lowered to the target's
+        // prefetch hint. The interpreter has no cache model,
+        // so the call stays an ordinary conversion skip.
+        "prefetch_read_data"
+            | "prefetch_write_data"
+            | "prefetch_read_instruction"
+            | "prefetch_write_instruction"
+            // The algebraic float family: the interpreter
+            // models the strict and `*_fast` spellings, code
+            // generation lowers the algebraic ones as well.
+            | "fadd_algebraic"
+            | "fsub_algebraic"
+            | "fmul_algebraic"
+            | "fdiv_algebraic"
+            | "frem_algebraic"
+            // Singletons code generation lowers directly:
+            // the single-thread fence (its multi-thread
+            // sibling is modelled), the debug trap, the
+            // hint intrinsics, the vtable queries, and the
+            // offload device count (lowered to the OpenMP
+            // runtime call).
+            | "atomic_singlethreadfence"
+            | "breakpoint"
+            | "cold_path"
+            | "exact_div"
+            | "is_val_statically_known"
+            | "offload_get_num_devices"
+            | "ptr_mask"
+            | "return_address"
+            | "select_unpredictable"
+            | "vtable_align"
+            | "vtable_size"
+    ) {
+        return true;
+    }
+    // The sized float families: for each operation stem
+    // below, code generation lowers the f16 / f32 / f64 /
+    // f128 spellings (the interpreter models only the
+    // generic float operations). The spellings join the
+    // width directly (`sqrtf32`, `fmaf64`) or after an
+    // underscore (`round_ties_even_f32`,
+    // `maximum_number_nsz_f64`); every stem–width
+    // combination was verified against the pinned compiler.
+    let stem = name
+        .strip_suffix("f128")
+        .or_else(|| name.strip_suffix("f16"))
+        .or_else(|| name.strip_suffix("f32"))
+        .or_else(|| name.strip_suffix("f64"))
+        .map(|s| s.strip_suffix('_').unwrap_or(s));
+    match stem {
+        Some(stem) => matches!(
+            stem,
+            "sqrt"
+                | "ceil"
+                | "floor"
+                | "trunc"
+                | "round"
+                | "round_ties_even"
+                | "fma"
+                | "fmuladd"
+                | "pow"
+                | "powi"
+                | "copysign"
+                | "maximum"
+                | "minimum"
+                | "maximum_number_nsz"
+                | "minimum_number_nsz"
+        ),
+        None => false,
+    }
 }
 
 fn check_body(

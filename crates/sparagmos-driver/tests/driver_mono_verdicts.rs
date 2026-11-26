@@ -693,6 +693,43 @@ fn shimmed_must_override_intrinsic_converts() {
 }
 
 #[test]
+fn codegen_only_float_intrinsic_converts() {
+    // `sqrtf32` must be overridden too, and the interpreter
+    // has no model for the sized float spellings — but code
+    // generation lowers them, so the call is shimmed by the
+    // backend the verdict mirrors and converts. (The verdict
+    // originally replayed only the interpreter's registry
+    // and rejected this valid program.)
+    let case = Case::new("sqrtf32-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(core_intrinsics)]\n\
+         fn main() { let _x = unsafe { core::intrinsics::sqrtf32(2.0f32) }; }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn codegen_only_prefetch_intrinsic_converts() {
+    // A locally declared `prefetch_read_data` (the minicore
+    // shape) is likewise served by code generation's prefetch
+    // lowering while the interpreter leaves it unmodelled:
+    // an ordinary conversion skip, not the must-be-overridden
+    // error.
+    let case = Case::new("prefetch-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn prefetch_read_data<T, const LOCALITY: i32>(data: *const T);\n\
+         fn main() { let v: u32 = 0; unsafe { prefetch_read_data::<u32, 0>(&v as *const u32); } }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
 fn fallback_body_intrinsic_converts() {
     // `rotate_left` is declared in core with a fallback body,
     // so it need not be overridden: the method's body calls
