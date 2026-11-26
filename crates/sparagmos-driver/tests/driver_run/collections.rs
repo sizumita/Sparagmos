@@ -2734,3 +2734,53 @@ fn run_mode_flat_map_size_hint() {
         "map=(3, Some(3))\nopt-fresh=(0, Some(3))\nopt-first=Some(1)\nopt-after1=(0, Some(2))\narr=(4, Some(4))\nvec-fresh=(0, None)\nvec-first=Some(1)\nvec-mid=(1, None)\nfl-first=Some(1)\nfl-mid=(1, None)\n"
     );
 }
+
+
+const VEC_DEQUE_ITER_CONSUMERS_SRC: &str = r#"
+use std::collections::VecDeque;
+fn main() {
+    let mut d = VecDeque::new();
+    d.push_back(1); d.push_back(2); d.push_back(3);
+    println!("count {}", d.iter().count());
+    let v: Vec<&i32> = d.iter().collect();
+    println!("collect {:?}", v);
+    let mut seen = 0;
+    let n = d.iter().fold(0, |a, x| { seen += 1; a + x });
+    println!("fold {} {}", n, seen);
+    let mut w = VecDeque::new();
+    for i in 1..=6 { w.push_back(i); }
+    for _ in 0..4 { w.pop_front(); }
+    w.push_back(7); w.push_back(8);
+    println!("wrapped {}", w.iter().count());
+    let mut seen2 = 0;
+    let s = w.iter().fold(0, |a, x| { seen2 += 1; a + x });
+    println!("wrapped fold {} {}", s, seen2);
+    let wv: Vec<&i32> = w.iter().collect();
+    println!("wrapped collect {:?}", wv);
+}
+"#;
+
+#[test]
+fn run_mode_vec_deque_iter_consumers() {
+    // `vec_deque::Iter`'s own `fold` / `try_fold` bodies
+    // forward to the two inner slice iterators with `&mut f`:
+    // the modelled consumer receives a reference to the
+    // closure as its callable operand and must call through
+    // it (the blanket `FnMut` impl for `&mut F`), with the
+    // closure's capture mutations persisting across both
+    // inner folds and back to the caller. The wrapped deque
+    // exercises both slice halves.
+    let dir = temp_dir("vecdequeiterconsumers");
+    let src = fixture(&dir, "vecdequeiterconsumers.rs", VEC_DEQUE_ITER_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "VecDeque iterator consumers must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "count 3\ncollect [1, 2, 3]\nfold 6 3\nwrapped 4\nwrapped fold 26 4\nwrapped collect [5, 6, 7, 8]\n"
+    );
+}

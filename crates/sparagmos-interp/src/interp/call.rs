@@ -1669,6 +1669,7 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let base = frames.len();
         let (callee, env_ref) = self.eval_callable(&frames, body, operand)?;
+        let (callee, env_ref) = self.callable_through_refs(frames, callee, env_ref)?;
         let env_ref = match self.consumed_env_arg(frames, body, operand, &callee)? {
             Some(by_value) => by_value,
             None => env_ref,
@@ -1691,6 +1692,50 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.drive_frames(frames, base)
+    }
+
+    /// Follow a callable operand value that is a reference to a
+    /// callable (`&F` / `&mut F`): the blanket `Fn` / `FnMut`
+    /// impls for references make the pointee the callable, the
+    /// shape std's forwarding bodies pass (a
+    /// `vec_deque::Iter::fold` calls the inner slice iterator's
+    /// `fold` with `&mut f`, and the modelled consumer receives
+    /// that reference as its closure operand). The innermost
+    /// reference -- the one denoting the callable value itself
+    /// -- is the environment reference its body expects, so
+    /// `FnMut` capture mutations persist in the original
+    /// closure place, exactly as through the real shim (the
+    /// deref chain the `CallTrait` dispatch follows for its
+    /// receiver). A value that is not a reference, and a
+    /// reference whose deref chain does not end at a callable,
+    /// come back unchanged with the environment reference
+    /// `eval_callable` computed, so the caller's own judgement
+    /// of the value (and its error) is preserved.
+    pub(crate) fn callable_through_refs(
+        &self,
+        frames: &[Frame],
+        callee: Value,
+        env_ref: Value,
+    ) -> InterpResult<(Value, Value)> {
+        let mut value = callee.clone();
+        while matches!(value, Value::Ref(_) | Value::FatRef { .. }) {
+            let Ok(target) = self.deref_value(frames, &value) else {
+                return Ok((callee, env_ref));
+            };
+            let Ok(pointee) = self.read_resolved(frames, &target) else {
+                return Ok((callee, env_ref));
+            };
+            match pointee {
+                Value::Closure { .. } | Value::FnPtr(_) => {
+                    return Ok((pointee, value));
+                }
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    value = pointee;
+                }
+                _ => return Ok((callee, env_ref)),
+            }
+        }
+        Ok((callee, env_ref))
     }
 }
 
