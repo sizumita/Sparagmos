@@ -1070,6 +1070,30 @@ impl<'a> Interpreter<'a> {
                                     fat_skip = depth;
                                 }
                             }
+                            // A dereference whose formation
+                            // regrouped the storage under the
+                            // pointee's shape: the steps that
+                            // follow price through the pointee,
+                            // so the resolved target records
+                            // the denomination for the consumers
+                            // that meet it without an accessing
+                            // place (see
+                            // `Interpreter::denominate_fat_deref`).
+                            // The wrapper levels a `fat_skip`
+                            // walk consumes keep the sequence's
+                            // own denomination, so they record
+                            // none.
+                            let resolved = if fat_skip == 0 {
+                                match &pointee_ty {
+                                    Some(pointee) => self
+                                        .denominate_fat_deref(
+                                            frames, resolved, pointee,
+                                        ),
+                                    _ => resolved,
+                                }
+                            } else {
+                                resolved
+                            };
                             cur_ty = pointee_ty;
                             cur_variant = 0;
                             resolved

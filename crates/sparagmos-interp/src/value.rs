@@ -88,6 +88,8 @@
 
 use std::fmt;
 
+use crate::ir::Ty;
+
 /// One step of a resolved reference target. Indices are constants:
 /// an `Index` projection through a local is evaluated against the
 /// frame that syntactically contains the place when the reference is
@@ -135,6 +137,22 @@ pub enum RefProj {
     /// error at the use site. A zero displacement never appears;
     /// offset evaluation absorbs or drops it.
     ByteOffset(i128),
+    /// The denomination a dereference recorded for the
+    /// steps that follow it: those steps price
+    /// through this type (the dereference's pointee), not
+    /// through the type of the storage the target's root names,
+    /// because the pointer's formation regrouped the storage's
+    /// elements under the pointee's shape (a `[[u8; 3]; 2]`
+    /// storage ranged over as `[[u8; 2]]`). The step does not
+    /// move the position: it names the type of the value the
+    /// preceding steps denote, and the byte view prices the
+    /// steps after it through that type (see
+    /// `Interpreter::view_span`). It is recorded only where the
+    /// two denominations provably differ (see
+    /// `Interpreter::denominate_fat_deref`); structural
+    /// projections skip it, keeping the birth reading they have
+    /// today for the consumers the byte view does not judge.
+    View(Ty),
 }
 
 /// Where a [`Value::Ref`] points.
@@ -670,6 +688,7 @@ impl fmt::Display for RefTarget {
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                         RefProj::VecLen => write!(f, ".len")?,
+                        RefProj::View(ty) => write!(f, " as view {ty:?}")?,
                     }
                 }
                 Ok(())
@@ -688,6 +707,7 @@ impl fmt::Display for RefTarget {
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                         RefProj::VecLen => write!(f, ".len")?,
+                        RefProj::View(ty) => write!(f, " as view {ty:?}")?,
                     }
                 }
                 Ok(())
@@ -705,6 +725,7 @@ impl fmt::Display for RefTarget {
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                         RefProj::VecLen => write!(f, ".len")?,
+                        RefProj::View(ty) => write!(f, " as view {ty:?}")?,
                     }
                 }
                 Ok(())

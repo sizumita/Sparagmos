@@ -5,6 +5,19 @@ use crate::error::{InterpError, InterpResult};
 
 use crate::value::{RefProj, RefTarget, Value};
 
+/// Whether a target projection denotes the root position
+/// itself: no step of it moves the position. A recorded
+/// denomination (see [`RefProj::View`]) names the type of
+/// the value at the position; it does not move it, so a
+/// projection of denomination steps only is a root
+/// projection for every consumer that asks where a target
+/// points (the byte view's root judgements below).
+fn projection_denotes_root(projection: &[RefProj]) -> bool {
+    projection
+        .iter()
+        .all(|s| matches!(s, RefProj::View(_)))
+}
+
 impl<'a> Interpreter<'a> {
     // ----- byte view of a value's storage ----------------------
     //
@@ -283,6 +296,13 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => return None,
                 },
+                RefProj::View(view) => {
+                    // The recorded denomination (see
+                    // `RefProj::View`): the steps after it
+                    // price through the view's type.
+                    ty = Some(view.clone());
+                    variant = 0;
+                }
                 RefProj::Subslice { offset, len } => match &ty {
                     Some(Ty::Array(elem, _)) => {
                         let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
@@ -1174,9 +1194,29 @@ impl<'a> Interpreter<'a> {
         let Ty::Array(birth_elem, _) = &birth else {
             return None;
         };
-        let [RefProj::Index(k)] = projection else {
+        // A denomination the target's dereference recorded
+        // (see `RefProj::View`) does not move the position:
+        // stripped of it, the step sequence is the element
+        // place this composition prices, and its index
+        // counts in the recorded view's elements -- the
+        // shape the tag names (`access`), so a recorded
+        // sequence view denominating by another element is
+        // not this composition.
+        for step in projection {
+            if let RefProj::View(Ty::Slice(e) | Ty::Array(e, _)) = step {
+                if **e != access {
+                    return None;
+                }
+            }
+        }
+        let mut steps = projection
+            .iter()
+            .filter(|s| !matches!(s, RefProj::View(_)));
+        let (Some(RefProj::Index(k)), None) = (steps.next(), steps.next())
+        else {
             return None;
         };
+        let k = *k;
         if access == **birth_elem {
             return None;
         }
@@ -1624,7 +1664,7 @@ impl<'a> Interpreter<'a> {
         else {
             return false;
         };
-        if !projection.is_empty() {
+        if !projection_denotes_root(projection) {
             return false;
         }
         let root_width = match self.byte_layout_of_ty(&root_ty) {
@@ -1655,7 +1695,7 @@ impl<'a> Interpreter<'a> {
     ) -> Option<Vec<u8>> {
         let (projection, _, root_ty, _, _) =
             self.byte_view_base(frames, target)?;
-        if !projection.is_empty() {
+        if !projection_denotes_root(projection) {
             return None;
         }
         let layout = self.byte_layout_of_ty(&root_ty)?;
@@ -1699,7 +1739,7 @@ impl<'a> Interpreter<'a> {
         else {
             return false;
         };
-        if !projection.is_empty() {
+        if !projection_denotes_root(projection) {
             return false;
         }
         match self.byte_layout_of_ty(&root_ty) {
@@ -1742,7 +1782,7 @@ impl<'a> Interpreter<'a> {
             else {
                 return false;
             };
-            if projection.is_empty() {
+            if projection_denotes_root(projection) {
                 let root_kind = match self.byte_layout_of_ty(&root_ty) {
                     Some(ByteLayout::Scalar(kind)) => kind,
                     _ => return false,
@@ -1783,7 +1823,7 @@ impl<'a> Interpreter<'a> {
         else {
             return false;
         };
-        if !projection.is_empty() {
+        if !projection_denotes_root(projection) {
             return false;
         }
         let root_width = match self.byte_layout_of_ty(&root_ty) {
@@ -2551,6 +2591,20 @@ impl<'a> Interpreter<'a> {
                         ty = Some((**elem).clone());
                     }
                 }
+                RefProj::View(view) => {
+                    // The recorded denomination of the
+                    // dereference this access performs (see
+                    // `RefProj::View`): the steps after it
+                    // price through the view's type, which is
+                    // the accessing type this walk prices by.
+                    // A trailing record denotes the whole
+                    // pointee, whose span is its own size.
+                    ty = Some(view.clone());
+                    variant = 0;
+                    if last {
+                        size = usize::try_from(self.ty_size(view)?).ok()?;
+                    }
+                }
                 _ => return None,
             }
         }
@@ -2589,7 +2643,16 @@ impl<'a> Interpreter<'a> {
             .iter()
             .rposition(|e| matches!(e, ProjectionElem::Deref))
             .map(|p| place.projection.len() - p - 1)?;
-        if projection.len() != tail_len {
+        // A denomination step the target recorded at its
+        // dereference (see `RefProj::View`) is not a step of
+        // the tail: it names the type the tail prices
+        // through, which is the accessing type this span
+        // prices by (see the `View` arm of `access_span`).
+        let step_count = projection
+            .iter()
+            .filter(|s| !matches!(s, RefProj::View(_)))
+            .count();
+        if step_count != tail_len {
             return None;
         }
         let birth_size = usize::try_from(self.ty_size(birth)?).ok()?;
@@ -2973,6 +3036,415 @@ impl<'a> Interpreter<'a> {
         Some((root, ty))
     }
 
+    /// Whether a birth denomination and a pointee of these
+    /// shapes can denominate the same storage at all: the
+    /// sequence and ADT pairs are judged by their own arms,
+    /// and of the rest only same-kind pairs are comparable.
+    /// A mixed pair (a container ADT against the sequence it
+    /// holds, an ADT against a scalar payload, a sequence
+    /// against an ADT view) is a formation the access-side
+    /// machinery already prices -- a `Vec` dereference to its
+    /// slice above all -- not a regrouping of the storage's
+    /// elements, so it records no denomination.
+    fn comparable_shape(a: &Ty, b: &Ty) -> bool {
+        use std::mem::discriminant;
+        discriminant(a) == discriminant(b)
+    }
+
+    /// Record the denomination of a dereference on the
+    /// target it resolved to (see
+    /// [`RefProj::View`]): the steps a walk appends after the
+    /// dereference price through the pointee type, while the
+    /// target's consumers price its steps through the birth
+    /// type of the storage the target's root names -- the two
+    /// agree for an ordinary borrow and differ exactly when
+    /// the pointer's formation regrouped the storage (a raw
+    /// pointer cast, a transmute). The record is appended only
+    /// where the denominations provably differ: the birth
+    /// type at the resolved position is stepped from the
+    /// target's birth root type, and a sequence pointee
+    /// denominates its index steps by its element, any other
+    /// comparable pointee by itself. Two ADT instances over
+    /// one storage (a container against its inner
+    /// representation, a sized value against its unsized
+    /// wrapper) record nothing: their steps are field steps,
+    /// which the tables price from the birth type, and the
+    /// access-side foreign view prices the formation itself;
+    /// a stored record would re-denominate the root storage
+    /// under the pointee's layout, which no consumer prices.
+    /// A position the type tables cannot step to, a storage
+    /// with no byte layout, and a value target (a
+    /// constant's storage has no birth type) record nothing,
+    /// keeping today's targets.
+    pub(crate) fn denominate_fat_deref(
+        &self,
+        frames: &[Frame],
+        resolved: Resolved,
+        pointee: &Ty,
+    ) -> Resolved {
+        let (birth, projection) = match self.target_birth(frames, &resolved) {
+            Some(pair) => pair,
+            None => return resolved,
+        };
+        if self.byte_layout_of_ty(&birth).is_none() {
+            return resolved;
+        }
+        let pos_ty = step_ty_across(
+            Some(self.program()),
+            Some(birth.clone()),
+            projection,
+        );
+        // A stepped empty tuple is the walk's placeholder for
+        // a position whose denomination the tables do not
+        // record (a union field above all): like a position
+        // the tables cannot step to, it records nothing --
+        // the placeholder denominates no storage, so its
+        // difference from the pointee is not a regrouping.
+        if matches!(pos_ty, Some(Ty::Tuple(ref items)) if items.is_empty()) {
+            return resolved;
+        }
+        // The ordinary comparison: sequences by their
+        // elements, comparable shapes by themselves, ADT pairs
+        // and mixed shapes not at all (see the arms).
+        let ordinary = match (pos_ty.as_ref(), pointee) {
+            (
+                Some(Ty::Array(e1, _) | Ty::Slice(e1)),
+                Ty::Array(e2, _) | Ty::Slice(e2),
+            ) => e1 != e2,
+            (Some(Ty::Adt(_)), Ty::Adt(_)) => false,
+            (Some(other), _) => {
+                Self::comparable_shape(other, pointee)
+                    && other != pointee
+            }
+            (None, _) => false,
+        };
+        // One position the ordinary comparison misjudges: a
+        // fat dereference denotes its pointee through the
+        // pointee's first element, so the resolved target can
+        // end in an index step landing on an ELEMENT of the
+        // sequence the dereference denominates -- the stepped
+        // type is then the element type, which the ordinary
+        // comparison cannot set against the sequence. A
+        // sequence pointee denominates by its element, so the
+        // comparison there is element against element. An
+        // index step landing on a nested sequence (a row of a
+        // matrix) is not this position: its stepped type is
+        // the sequence itself, and the ordinary comparison
+        // already judges it.
+        let element_position = matches!(
+            projection.last(),
+            Some(RefProj::Index(_))
+        ) && !matches!(
+            pos_ty,
+            Some(Ty::Array(..) | Ty::Slice(..))
+        );
+        let differ = if element_position {
+            match pointee {
+                Ty::Array(e2, _) | Ty::Slice(e2) => {
+                    // A position the type tables cannot step
+                    // to records nothing, as above.
+                    match pos_ty.as_ref() {
+                        Some(t) => t != e2.as_ref(),
+                        None => false,
+                    }
+                }
+                _ => ordinary,
+            }
+        } else {
+            ordinary
+        };
+        if !differ {
+            return resolved;
+        }
+        let step = RefProj::View(pointee.clone());
+        match resolved {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(step);
+                Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                }
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(step);
+                Resolved::Static { name, projection }
+            }
+            Resolved::Alloc {
+                id,
+                mut projection,
+            } => {
+                projection.push(step);
+                Resolved::Alloc { id, projection }
+            }
+            Resolved::Value(..) => resolved,
+        }
+    }
+
+    /// The byte span a target carrying a recorded denomination
+    /// (see [`RefProj::View`]) denotes within its root
+    /// storage: the (offset, span size, denoted type) the
+    /// target's projection prices to, segment by segment --
+    /// the steps before the first denomination step price
+    /// through the root's birth type, each denomination step
+    /// replaces the pricing type for the steps that follow
+    /// it. `None` when the target carries no denomination
+    /// step, is a value target or an element block (whose
+    /// storage has no birth type to price against), a step's
+    /// span the recorded layouts do not determine, or the
+    /// span runs past the storage. The denoted type is the
+    /// type of the value the whole projection denotes, for
+    /// the caller's construction (read) and byte extraction
+    /// (write).
+    fn view_span(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> Option<(usize, usize, Ty)> {
+        let (birth, projection) = self.target_birth(frames, target)?;
+        if !projection
+            .iter()
+            .any(|s| matches!(s, RefProj::View(_)))
+        {
+            return None;
+        }
+        let birth_size = usize::try_from(self.ty_size(&birth)?).ok()?;
+        let mut ty: Option<Ty> = Some(birth);
+        let mut off: usize = 0;
+        let mut size: Option<usize> = Some(birth_size);
+        let mut variant: usize = 0;
+        for (n, step) in projection.iter().enumerate() {
+            let last = n + 1 == projection.len();
+            match step {
+                RefProj::View(view) => {
+                    // The recorded denomination: the steps
+                    // after it price through the view's type.
+                    // A trailing record denotes the whole
+                    // pointee, whose span is its own size (an
+                    // unsized pointee's span is not recorded
+                    // anywhere, so the walk declines).
+                    ty = Some(view.clone());
+                    variant = 0;
+                    size = if last {
+                        Some(usize::try_from(self.ty_size(view)?).ok()?)
+                    } else {
+                        None
+                    };
+                }
+                RefProj::Field(i) | RefProj::UnionField { idx: i, .. } => {
+                    let union = matches!(step, RefProj::UnionField { .. });
+                    let cur = ty.as_ref()?;
+                    let Ty::Adt(name) = cur else { return None };
+                    let (fo, fs) = if union {
+                        let field_ty = self.instance_field_ty(
+                            name,
+                            cur,
+                            0,
+                            *i,
+                        )?;
+                        let fs = usize::try_from(
+                            self.ty_size(&field_ty)?,
+                        )
+                        .ok()?;
+                        (0u64, fs as u64)
+                    } else {
+                        let layouts = self
+                            .program()
+                            .adt_field_layouts
+                            .get(name)?;
+                        let rows = layouts.get(variant)?;
+                        let row = rows.get(*i)?;
+                        (row.0, row.1)
+                    };
+                    let fty = self.instance_field_ty(
+                        name,
+                        cur,
+                        if union { 0 } else { variant },
+                        *i,
+                    )?;
+                    off = off.checked_add(usize::try_from(fo).ok()?)?;
+                    size = Some(usize::try_from(fs).ok()?);
+                    ty = Some(fty);
+                    variant = 0;
+                }
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                }
+                RefProj::Index(k) => {
+                    let cur = ty.as_ref()?;
+                    let elem = match cur {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => elem,
+                        _ => return None,
+                    };
+                    let es = usize::try_from(self.ty_size(elem)?).ok()?;
+                    off = off.checked_add(k.checked_mul(es)?)?;
+                    size = Some(es);
+                    ty = Some((**elem).clone());
+                    variant = 0;
+                }
+                RefProj::Subslice { offset, len } => {
+                    // A re-slice of a denominated view: the
+                    // step's denomination is the type the
+                    // preceding steps (or the recorded view)
+                    // denote, so the offset prices through
+                    // its element, as the access-side walk
+                    // prices its own.
+                    let cur = ty.as_ref()?;
+                    let elem = match cur {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => elem,
+                        _ => return None,
+                    };
+                    let es = usize::try_from(self.ty_size(elem)?).ok()?;
+                    off = off.checked_add(offset.checked_mul(es)?)?;
+                    size = Some(len.checked_mul(es)?);
+                    ty = Some(match cur {
+                        Ty::Array(..) => Ty::Array(
+                            elem.clone(),
+                            u64::try_from(*len).ok()?,
+                        ),
+                        _ => Ty::Slice(elem.clone()),
+                    });
+                    variant = 0;
+                }
+                _ => return None,
+            }
+        }
+        let size = size?;
+        if size == 0 || off.checked_add(size)? > birth_size {
+            return None;
+        }
+        Some((off, size, ty?))
+    }
+
+    /// Read a target whose projection carries a recorded
+    /// denomination (see [`RefProj::View`]): the stored
+    /// reference's own record of the view its formation
+    /// took, for the consumers that meet the target without
+    /// an accessing place (a format argument's target, a
+    /// dereference of a stored reference). The span's bytes
+    /// come out of the birth value's storage and the result
+    /// is constructed as a value of the denoted type -- the
+    /// stored-target form of [`Self::foreign_read`]. `None`
+    /// when the view does not judge the target; a judged
+    /// uninitialised byte in the span is the read's error,
+    /// as on the foreign path.
+    pub(crate) fn view_read(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> Option<InterpResult<Value>> {
+        let (birth, _) = self.target_birth(frames, target)?;
+        let (off, size, leaf) = self.view_span(frames, target)?;
+        // The span a step sequence prices can be wider than
+        // the denoted value (a field's layout span covers its
+        // padding); the value is its own size's prefix, as on
+        // the foreign path. A slice's span is its elements'.
+        let value_size = match &leaf {
+            Ty::Slice(elem) => {
+                let elem_size =
+                    usize::try_from(self.ty_size(elem)?).ok()?;
+                if elem_size == 0 || size % elem_size != 0 {
+                    return None;
+                }
+                size
+            }
+            _ => usize::try_from(self.ty_size(&leaf)?).ok()?,
+        };
+        if value_size > size {
+            return None;
+        }
+        let size = value_size;
+        let root = self.target_root_value(frames, target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut bytes = Vec::with_capacity(size);
+        for i in 0..size {
+            match self.foreign_byte(&root, &layout, off + i)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => {
+                    let (func, desc) = self.target_desc(frames, target);
+                    return Some(Err(InterpError::UninitializedRead {
+                        func,
+                        place: desc,
+                    }));
+                }
+            }
+        }
+        let built = match &leaf {
+            Ty::Slice(elem) => {
+                let elem_size =
+                    usize::try_from(self.ty_size(elem)?).ok()?;
+                let mut items = Vec::with_capacity(size / elem_size);
+                for chunk in bytes.chunks(elem_size) {
+                    items.push(self.construct_from_bytes(elem, chunk)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            _ => self.construct_from_bytes(&leaf, &bytes),
+        };
+        built.map(Ok)
+    }
+
+    /// The write side of [`Self::view_read`] (see
+    /// [`Self::foreign_write`] for the place-shaped form):
+    /// the value's bytes are spliced into the birth storage
+    /// at the span the recorded denomination prices. A
+    /// projection crossing a union field declines: the union
+    /// crossing machinery composes such writes with the held
+    /// field's bytes, as on the ordinary path.
+    pub(crate) fn view_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: &Value,
+    ) -> Option<InterpResult<()>> {
+        let (birth, projection) = self.target_birth(frames, target)?;
+        if projection
+            .iter()
+            .any(|s| matches!(s, RefProj::UnionField { .. }))
+        {
+            return None;
+        }
+        let (off, size, leaf) = self.view_span(frames, target)?;
+        let value_size = usize::try_from(self.ty_size(&leaf)?).ok()?;
+        if value_size > size {
+            return None;
+        }
+        let size = value_size;
+        let bytes = self.written_value_bytes(value, &leaf, size)?;
+        let root = self.target_root_value(frames, target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut composed = root;
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(b) = b else { continue };
+            match self.splice_storage_byte(
+                &mut composed,
+                &layout,
+                off + i,
+                *b,
+            ) {
+                Some(Ok(())) => {}
+                Some(Err(ByteVerdict::Padding(_))) => {}
+                Some(Err(verdict)) => {
+                    let (func, desc) =
+                        self.target_desc(frames, target);
+                    return Some(Err(self.byte_view_error(
+                        verdict, &func, &desc, false,
+                    )));
+                }
+                None => return None,
+            }
+        }
+        self.store_target_root(frames, target, composed)
+    }
+
     /// Read a place through a foreign view (see the section
     /// comment): the span's bytes come out of the birth
     /// value's storage and the result is constructed as a
@@ -3010,11 +3482,30 @@ impl<'a> Interpreter<'a> {
         };
         let target = self.deref_value(frames, base).ok()?;
         let (birth, projection) = self.target_birth(frames, &target)?;
-        match projection {
+        // The base must denote the storage root. A leading
+        // step that starts at the storage's first byte (a
+        // whole-slice re-slice, a first-element pointer)
+        // leaves it there, and so does a denomination the
+        // base's dereference recorded (see `RefProj::View`),
+        // which does not move the position: the base still
+        // denotes the storage root, under the recorded view.
+        // The composition below denominates by `elem_ty`, so
+        // a recorded sequence view must denominate by the
+        // same element; any other step, or a view of another
+        // shape, is not this composition.
+        let root_position = match projection {
             []
             | [RefProj::Subslice { offset: 0, .. }]
-            | [RefProj::Index(0)] => {}
-            _ => return None,
+            | [RefProj::Index(0)] => true,
+            _ => projection.iter().all(|step| {
+                matches!(
+                    step,
+                    RefProj::View(Ty::Slice(e) | Ty::Array(e, _)) if **e == *elem_ty
+                )
+            }),
+        };
+        if !root_position {
+            return None;
         }
         let Ty::Array(birth_elem, _) = &birth else {
             return None;

@@ -1755,6 +1755,14 @@ impl<'a> Interpreter<'a> {
                     // step falls back.
                     cur = None;
                 }
+                RefProj::View(view) => {
+                    // The recorded denomination (see
+                    // `RefProj::View`) does not move the
+                    // position; it denominates the steps
+                    // after it.
+                    cur = Some(WalkTy::Ty(view.clone()));
+                    variant = 0;
+                }
                 RefProj::VecLen => return None,
             }
         }
@@ -2333,6 +2341,16 @@ impl<'a> Interpreter<'a> {
                     if matches!(step, RefProj::Index(_)) {
                         cur = next;
                     }
+                }
+                RefProj::View(view) => {
+                    // The recorded denomination (see
+                    // `RefProj::View`) is part of the
+                    // target's identity, and denominates the
+                    // steps after it for this walk as it
+                    // does for the byte view.
+                    out.push(step.clone());
+                    cur = Some(WalkTy::Ty(view.clone()));
+                    variant = 0;
                 }
                 RefProj::ByteOffset(_)
                 | RefProj::UnionField { .. }
