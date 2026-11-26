@@ -4847,17 +4847,26 @@ impl<'a> Interpreter<'a> {
                 } else if self_ty_is(self_ty, "std::cell::Ref")
                     || self_ty_is(self_ty, "std::cell::RefMut")
                 {
-                    // A borrow guard: field 0 is the reference to the
-                    // cell's value stored by the borrow builtins.
+                    // A borrow guard: field 0 is the reference to
+                    // the cell's value. The borrow builtins store
+                    // it bare; a guard a converted guest body built
+                    // from core's real layout wraps it in a
+                    // single-field aggregate (`NonNull`), which
+                    // `refcell_guard_ref` peels. A field that does
+                    // not resolve to a reference keeps the stored
+                    // value itself, as before.
                     let guard = self.resolve_value(frames, &vals[0])?;
-                    match guard {
-                        Value::Enum { fields, .. } if fields.len() == 2 => {
-                            Ok(fields.into_iter().next().expect("len checked"))
+                    match crate::interp::refcell_guard_fields(&guard) {
+                        Some(fields) => {
+                            match crate::interp::refcell_guard_ref(&fields[0]) {
+                                Some(target) => Ok(Value::Ref(target.clone())),
+                                None => Ok(fields[0].clone()),
+                            }
                         }
-                        ref other => Err(InterpError::type_mismatch(
+                        None => Err(InterpError::type_mismatch(
                             "RefCell borrow guard",
                             "Ref/RefMut guard aggregate",
-                            other.kind_name(),
+                            guard.kind_name(),
                         )),
                     }
                 } else if self_ty_is(self_ty, "std::sync::MutexGuard")
@@ -7919,17 +7928,20 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if self_ty_is(self_ty, "std::cell::RefMut") {
                     // A mutable borrow guard: field 0 is the
-                    // reference to the cell's value stored by the
-                    // borrow builtins.
+                    // reference to the cell's value, in the same
+                    // two shapes as the shared guard above.
                     let guard = self.resolve_value(frames, &vals[0])?;
-                    match guard {
-                        Value::Enum { fields, .. } if fields.len() == 2 => {
-                            Ok(fields.into_iter().next().expect("len checked"))
+                    match crate::interp::refcell_guard_fields(&guard) {
+                        Some(fields) => {
+                            match crate::interp::refcell_guard_ref(&fields[0]) {
+                                Some(target) => Ok(Value::Ref(target.clone())),
+                                None => Ok(fields[0].clone()),
+                            }
                         }
-                        ref other => Err(InterpError::type_mismatch(
+                        None => Err(InterpError::type_mismatch(
                             "RefCell borrow guard",
                             "RefMut guard aggregate",
-                            other.kind_name(),
+                            guard.kind_name(),
                         )),
                     }
                 } else if self_ty_is(self_ty, "std::sync::MutexGuard")
