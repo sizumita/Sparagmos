@@ -52,6 +52,13 @@ pub(super) struct Converter<'a> {
     pub(super) adt_niches: &'a mir::AdtNiches,
     /// Coroutine storage-slot tables of the program (see `MirProgram`).
     pub(super) coroutine_layouts: &'a mir::CoroutineLayouts,
+    /// Private storage slots for provably zero-sized coroutine
+    /// state fields (see `Converter::coroutine_field_slot`):
+    /// per instance key, the slot given to each zero-sized
+    /// field type. Computed in `Converter::new` from the
+    /// program-wide field-type scan, so every conversion round
+    /// assigns the same slots.
+    pub(super) coroutine_zst_slots: HashMap<String, HashMap<String, u32>>,
     /// ADT instance layouts of the program (see `MirProgram`).
     pub(super) adt_layouts: &'a mir::AdtLayouts,
     /// Per-variant field layouts of the program's ADT
@@ -159,6 +166,7 @@ impl<'a> Converter<'a> {
             scan_body_fields(&mut adt_fields, &f.body);
             scan_body_aggregates(&mut adt_aggregates, &mut adt_fields, &f.body);
         }
+        let coroutine_zst_slots = coroutine_zst_slot_map(program, &adt_fields);
         // A closure body collected through an `Fn`-trait call
         // instance is recorded under the instance's key (the trait
         // method's name), not under the closure's own `DefId`:
@@ -222,6 +230,7 @@ impl<'a> Converter<'a> {
             adt_instance_shapes: &program.adt_instance_shapes,
             adt_niches: &program.adt_niches,
             coroutine_layouts: &program.coroutine_layouts,
+            coroutine_zst_slots,
             adt_layouts: &program.adt_layouts,
             adt_field_layouts: &program.adt_field_layouts,
             tuple_layouts: &program.tuple_layouts,
@@ -1189,4 +1198,86 @@ impl<'a> Converter<'a> {
         Ok(ir::BasicBlockData::new(statements, terminator))
     }
 
+}
+
+/// The private storage slots of one program's provably
+/// zero-sized coroutine state fields (see
+/// `Converter::coroutine_field_slot`): per coroutine instance
+/// key, one slot per zero-sized field type, allocated above
+/// the instance's recorded slot map in field-type order. The
+/// evidence is the program-wide field-type scan: a state field
+/// that is ever projected has its declared type there, keyed
+/// by the same (definition, arguments, variant, field) the
+/// projection carried. A pure function of the program, so
+/// every conversion round computes the same table.
+fn coroutine_zst_slot_map(
+    program: &MirProgram,
+    adt_fields: &AdtFieldTys,
+) -> HashMap<String, HashMap<String, u32>> {
+    let mut by_instance: HashMap<String, std::collections::BTreeSet<String>> =
+        HashMap::new();
+    for (key, field_ty) in &adt_fields.entries {
+        let coroutine_ty = mir::Ty::Coroutine(key.def, key.generic_args.clone());
+        let tag = crate::builtins::ty_tag(&coroutine_ty, &program.fn_names);
+        if !program.coroutine_layouts.contains_key(&tag) {
+            continue;
+        }
+        if !ty_proven_zero_sized(field_ty, &program.adt_layouts, &program.fn_names) {
+            continue;
+        }
+        by_instance
+            .entry(tag)
+            .or_default()
+            .insert(crate::builtins::ty_tag(field_ty, &program.fn_names));
+    }
+    let mut out = HashMap::new();
+    for (tag, field_tys) in by_instance {
+        let slots = &program.coroutine_layouts[&tag];
+        let mut next = slots
+            .variants
+            .iter()
+            .flatten()
+            .max()
+            .map(|max| *max + 1)
+            .unwrap_or(0);
+        let mut inner = HashMap::new();
+        for field_ty in field_tys {
+            inner.insert(field_ty, next);
+            next += 1;
+        }
+        out.insert(tag, inner);
+    }
+    out
+}
+
+/// Whether a type is provably zero-sized from the evidence
+/// conversion keeps: the unit and never types, tuples and
+/// arrays of provably zero-sized elements (an array of a
+/// zero-sized element is zero-sized at any length, and a
+/// length-0 array is zero-sized at any element), function
+/// item types, and ADT / closure / coroutine instances whose
+/// recorded layout size is zero. Anything else -- including
+/// an instance with no recorded layout -- is not proven.
+fn ty_proven_zero_sized(
+    ty: &mir::Ty,
+    adt_layouts: &mir::AdtLayouts,
+    names: &HashMap<mir::DefId, String>,
+) -> bool {
+    match ty {
+        mir::Ty::Never => true,
+        mir::Ty::Tuple(elems) => {
+            elems.iter().all(|elem| ty_proven_zero_sized(elem, adt_layouts, names))
+        }
+        mir::Ty::Pat(inner, _) => ty_proven_zero_sized(inner, adt_layouts, names),
+        mir::Ty::Array(elem, len) => {
+            matches!(len, mir::ArrayLen::Known(0))
+                || ty_proven_zero_sized(elem, adt_layouts, names)
+        }
+        mir::Ty::FnDef(..) => true,
+        mir::Ty::Adt(..) | mir::Ty::Closure(..) | mir::Ty::Coroutine(..) => {
+            let key = crate::builtins::ty_tag(ty, names);
+            matches!(adt_layouts.get(&key), Some((0, _)))
+        }
+        _ => false,
+    }
 }

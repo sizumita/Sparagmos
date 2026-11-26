@@ -224,7 +224,18 @@ pub type AdtTagLayouts = std::collections::HashMap<String, EnumTag>;
 /// variant, though, a zero-sized field shares its offset with
 /// the field after it, and those two are distinct cells: the
 /// offset's slot belongs to the later field, and the zero-sized
-/// field gets a private slot no other variant uses. The driver
+/// field gets a private slot no other variant uses. The map
+/// carries offsets, not field sizes, so it cannot express the
+/// same separation across variants: a zero-sized field can be
+/// the only occupant of its offset in one state while that
+/// offset belongs to a differently-typed field in another
+/// state, and the map then hands it that field's shared slot.
+/// Conversion therefore moves a field its type proves
+/// zero-sized to a private slot of its own (see
+/// `Converter::coroutine_field_slot` in sparagmos-interp): in
+/// the real layout the field's stores write no bytes, so they
+/// must not overwrite the other field's cell in the flat
+/// vector either. The driver
 /// fills one entry per coroutine instance whose layout the
 /// compiler can give; an instance with no entry keeps the
 /// positional projection conversion.
