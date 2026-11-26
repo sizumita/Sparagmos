@@ -84,13 +84,17 @@ impl<'a> Interpreter<'a> {
             return Ok(None);
         };
         check_host_stdio(state)?;
-        let request = process_spawn_request(state, output_captured);
-        match host.0.run(&request) {
-            Ok(outcome) => Ok(Some(Ok(crate::interp::ToolRunOutcome {
-                exit_code: outcome.exit_code,
-                stdout: outcome.stdout,
-                stderr: outcome.stderr,
-            }))),
+        let files = self.stdio_files(state)?;
+        let request = process_spawn_request(state, output_captured, files);
+        match host.0.run(request) {
+            Ok(outcome) => {
+                self.close_wired_stdin(state);
+                Ok(Some(Ok(crate::interp::ToolRunOutcome {
+                    exit_code: outcome.exit_code,
+                    stdout: outcome.stdout,
+                    stderr: outcome.stderr,
+                })))
+            }
             Err(crate::interp::ProcessHostError::Io(e)) => {
                 Ok(Some(Err(host_io_error(&e))))
             }
@@ -112,9 +116,11 @@ impl<'a> Interpreter<'a> {
             return Ok(None);
         };
         check_host_stdio(state)?;
-        let request = process_spawn_request(state, false);
-        match host.0.spawn(&request) {
+        let files = self.stdio_files(state)?;
+        let request = process_spawn_request(state, false, files);
+        match host.0.spawn(request) {
             Ok(spawned) => {
+                self.close_wired_stdin(state);
                 // The child's pipe ends join the file table;
                 // the guest's `Child` value carries a handle
                 // value for each stream it configured piped
@@ -168,6 +174,81 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Resolve the host files a command's file-form stdio
+    /// configurations name: a duplicate of each named
+    /// file-table entry, in stdin/stdout/stderr order, for
+    /// the spawn request to wire into the child (see
+    /// `ProcessStdio::Fd`). A configuration naming a file
+    /// the run does not hold -- a handle closed already, or
+    /// a fabricated descriptor number that names no entry --
+    /// makes the invocation unsupported: running it with a
+    /// guessed wiring would wire the wrong stream.
+    fn stdio_files(
+        &self,
+        state: &crate::interp::CommandState,
+    ) -> InterpResult<[Option<std::fs::File>; 3]> {
+        let mut files = [None, None, None];
+        for (slot, config) in files.iter_mut().zip([
+            state.stdin_stdio,
+            state.stdout_stdio,
+            state.stderr_stdio,
+        ]) {
+            if let Some(crate::interp::StdioConfig::File(id)) = config {
+                *slot = Some(
+                    self.with_file(id, |file| file.try_clone())
+                        .and_then(|result| result.ok())
+                        .ok_or_else(|| {
+                            unsupported(
+                                "a stdio configuration naming a file this run does not hold"
+                                    .to_string(),
+                            )
+                        })?,
+                );
+            }
+        }
+        Ok(files)
+    }
+
+    /// Close the file-table entry a command's stdin
+    /// configuration named, once a spawn has taken the
+    /// wiring: the child holds its own duplicate of the
+    /// descriptor, and the builder's `Stdio` -- the
+    /// parent-side owner, whose drop the model does not
+    /// observe -- must not keep the parent's end open. This
+    /// is what delivers EPIPE to a producer whose stdout
+    /// handle the guest handed to a consumer's stdin: once
+    /// the consumer is spawned and later exits, no reader
+    /// remains and the producer's writes meet a broken
+    /// pipe, as they do natively once the builder is gone.
+    fn close_wired_stdin(&self, state: &crate::interp::CommandState) {
+        if let Some(crate::interp::StdioConfig::File(id)) =
+            state.stdin_stdio
+        {
+            self.file_handle_closed(id);
+        }
+    }
+
+    /// Write bytes a child's stream produced into the file
+    /// its stdio configuration names (see `StdioRoute::File`):
+    /// the stream was redirected to that file, so its bytes
+    /// land there and nowhere else. A file the run no longer
+    /// holds, or a write the host refuses, is not the
+    /// parent's error: a native child's redirected stream
+    /// fails on the child's side, never in the parent's
+    /// wait.
+    pub(super) fn write_stdio_file(
+        &self,
+        config: Option<crate::interp::StdioConfig>,
+        bytes: &[u8],
+    ) {
+        if let Some(crate::interp::StdioConfig::File(id)) = config {
+            self.with_file(id, |file| {
+                use std::io::Write as _;
+                let _ = file.write_all(bytes);
+            });
+        }
+    }
+
     /// Which of the guest `Child` value's stdio slots still
     /// hold their handle (a `Some` slot the guest has not
     /// taken out). The blocking child operations act on the
@@ -201,7 +282,21 @@ impl<'a> Interpreter<'a> {
     /// alongside the child, so a child that fills its pipes
     /// is never starved by a parent blocked in `wait`, as
     /// std's own collection runs alongside.
-    fn child_start_drains(&self, id: u64, slots: (bool, bool, bool)) {
+    ///
+    /// A stream whose source is a regular file -- a
+    /// re-executed child's channelled stderr -- is collected
+    /// only once the child is finished (`child_finished`):
+    /// a regular file does not hold a reader at its current
+    /// end the way a pipe does, so a drain started while the
+    /// writer still runs would gather only the prefix
+    /// written so far and report the stream drained. Once
+    /// the child is finished the file's content is complete.
+    fn child_start_drains(
+        &self,
+        id: u64,
+        slots: (bool, bool, bool),
+        child_finished: bool,
+    ) {
         let Some((out_file, err_file, out_cfg, err_cfg, started)) =
             self.with_child(id, |state| {
                 (
@@ -223,12 +318,24 @@ impl<'a> Interpreter<'a> {
             (false, out_file, out_cfg, slots.1, started.0),
             (true, err_file, err_cfg, slots.2, started.1),
         ] {
-            let wanted = stdio_route(cfg, false) == StdioRoute::Relay
+            let route = stdio_route(cfg, false);
+            let wanted = route == StdioRoute::Relay
+                || route == StdioRoute::File
                 || (cfg == Some(crate::interp::StdioConfig::Piped) && slot);
             if already || !wanted {
                 continue;
             }
             let Some(file_id) = file else { continue };
+            let regular_file = self
+                .with_file(file_id, |file| {
+                    file.metadata()
+                        .map(|meta| meta.file_type().is_file())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if regular_file && !child_finished {
+                continue;
+            }
             let Some(Ok(mut clone)) =
                 self.with_file(file_id, |file| file.try_clone())
             else {
@@ -308,11 +415,19 @@ impl<'a> Interpreter<'a> {
                 (state.stdout.clone(), state.stderr.clone())
             })
             .expect("child entry present");
-        if stdio_route(out_cfg, false) == StdioRoute::Relay {
-            self.push_output(&String::from_utf8_lossy(&stdout));
+        match stdio_route(out_cfg, false) {
+            StdioRoute::Relay => {
+                self.push_output(&String::from_utf8_lossy(&stdout));
+            }
+            StdioRoute::File => self.write_stdio_file(out_cfg, &stdout),
+            _ => {}
         }
-        if stdio_route(err_cfg, false) == StdioRoute::Relay {
-            self.push_error_output(&String::from_utf8_lossy(&stderr));
+        match stdio_route(err_cfg, false) {
+            StdioRoute::Relay => {
+                self.push_error_output(&String::from_utf8_lossy(&stderr));
+            }
+            StdioRoute::File => self.write_stdio_file(err_cfg, &stderr),
+            _ => {}
         }
         self.with_child(id, |state| state.relayed = true);
     }
@@ -351,7 +466,7 @@ impl<'a> Interpreter<'a> {
             }
         }
         if let Some(code) = finished {
-            self.child_start_drains(id, slots);
+            self.child_start_drains(id, slots, true);
             self.child_pump_drains(id, block);
             self.child_relay(id);
             return Ok(ChildWait::Finished(code));
@@ -360,7 +475,7 @@ impl<'a> Interpreter<'a> {
             unsupported("child process without a process host".to_string())
         })?;
         if block {
-            self.child_start_drains(id, slots);
+            self.child_start_drains(id, slots, false);
         }
         let outcome = if block {
             host.0.wait(host_id).map(Some)
@@ -378,7 +493,7 @@ impl<'a> Interpreter<'a> {
             }
         };
         self.with_child(id, |state| state.finished = Some(code));
-        self.child_start_drains(id, slots);
+        self.child_start_drains(id, slots, true);
         self.child_pump_drains(id, block);
         self.child_relay(id);
         Ok(ChildWait::Finished(code))
@@ -770,10 +885,13 @@ pub(super) enum ChildWait {
 fn process_spawn_request(
     state: &crate::interp::CommandState,
     output_captured: bool,
+    stdio_files: [Option<std::fs::File>; 3],
 ) -> crate::interp::ProcessSpawnRequest {
     use crate::interp::ProcessStdio;
+    let [stdin_file, stdout_file, stderr_file] = stdio_files;
     let wire = |config: Option<crate::interp::StdioConfig>,
-                default: ProcessStdio|
+                default: ProcessStdio,
+                file: Option<std::fs::File>|
      -> ProcessStdio {
         match config {
             Some(crate::interp::StdioConfig::Inherit) => {
@@ -781,6 +899,14 @@ fn process_spawn_request(
             }
             Some(crate::interp::StdioConfig::Null) => ProcessStdio::Null,
             Some(crate::interp::StdioConfig::Piped) => ProcessStdio::Piped,
+            Some(crate::interp::StdioConfig::File(_)) => match file {
+                Some(file) => ProcessStdio::Fd(file),
+                // The caller resolves the file of every
+                // file-form configuration before the request
+                // is built and rejects a missing one; inherit
+                // is the neutral wire for one that is absent.
+                None => ProcessStdio::Inherit,
+            },
             // Rejected by the caller's stdio check before the
             // request is built; inherit is the neutral wire.
             Some(crate::interp::StdioConfig::Unmodelled) => {
@@ -807,6 +933,7 @@ fn process_spawn_request(
             } else {
                 ProcessStdio::Inherit
             },
+            stdin_file,
         ),
         stdout: wire(
             state.stdout_stdio,
@@ -815,6 +942,7 @@ fn process_spawn_request(
             } else {
                 ProcessStdio::Inherit
             },
+            stdout_file,
         ),
         stderr: wire(
             state.stderr_stdio,
@@ -823,6 +951,7 @@ fn process_spawn_request(
             } else {
                 ProcessStdio::Inherit
             },
+            stderr_file,
         ),
     }
 }
@@ -842,7 +971,7 @@ fn check_host_stdio(
     ] {
         if config == Some(crate::interp::StdioConfig::Unmodelled) {
             return Err(unsupported(
-                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                "a stdio configuration this run does not model (an unrecognized form)"
                     .to_string(),
             ));
         }
@@ -952,9 +1081,16 @@ pub(super) fn exit_status_value(exit_code: i32) -> Value {
 /// The `Stdio` configuration a stdio argument value
 /// denotes. The public `std::process::Stdio` is a one-field
 /// wrapper over the sys enum (`Inherit` 0, `Null` 1,
-/// `MakePipe` 2, `Fd` 3); the sys-level setter receives the
-/// sys value unwrapped. Anything the model does not decode
-/// -- the `Fd` form included -- is
+/// `MakePipe` 2, `Fd` 3, `StaticFd` 4); the sys-level setter
+/// receives the sys value unwrapped. The `Fd` form denotes
+/// the file its payload handle carries: the payload is a
+/// file handle value (a `File`, a child pipe handle), whose
+/// wrapper chain bottoms out at the file-table id
+/// (`file_handle_id`). The value the conversion hands the
+/// setter may also arrive as that bare chain under the
+/// public wrapper, with no enum layer in between; both
+/// shapes decode to the same configuration. A shape the
+/// model does not decode is
 /// [`StdioConfig::Unmodelled`](crate::interp::StdioConfig::Unmodelled).
 fn stdio_config_of(value: &Value) -> crate::interp::StdioConfig {
     use crate::interp::StdioConfig;
@@ -966,6 +1102,21 @@ fn stdio_config_of(value: &Value) -> crate::interp::StdioConfig {
         Value::Enum { variant: 0, fields } if fields.is_empty() => StdioConfig::Inherit,
         Value::Enum { variant: 1, fields } if fields.is_empty() => StdioConfig::Null,
         Value::Enum { variant: 2, fields } if fields.is_empty() => StdioConfig::Piped,
+        Value::Enum { variant: 3, fields } if fields.len() == 1 => {
+            match crate::interp::file_handle_id(&fields[0]) {
+                Some(id) => StdioConfig::File(id),
+                None => StdioConfig::Unmodelled,
+            }
+        }
+        // The bare handle chain (see the doc above): a
+        // one-field wrapper chain bottoming out at the
+        // file-table id.
+        Value::Enum { variant: 0, fields } if fields.len() == 1 => {
+            match crate::interp::file_handle_id(inner) {
+                Some(id) => StdioConfig::File(id),
+                None => StdioConfig::Unmodelled,
+            }
+        }
         _ => StdioConfig::Unmodelled,
     }
 }
@@ -994,7 +1145,7 @@ pub(super) fn check_stdio_modelled(state: &crate::interp::CommandState) -> Inter
     for config in [state.stdout_stdio, state.stderr_stdio] {
         if config == Some(crate::interp::StdioConfig::Unmodelled) {
             return Err(unsupported(
-                "a stdio configuration this run does not model (a file target or an unrecognized form)"
+                "a stdio configuration this run does not model (an unrecognized form)"
                     .to_string(),
             ));
         }
@@ -1015,6 +1166,12 @@ pub(super) enum StdioRoute {
     Collect,
     Relay,
     Discard,
+    /// The stream's bytes go to the file the configuration
+    /// names (see `StdioConfig::File`): the invocation's
+    /// collected bytes are written into that file-table
+    /// entry, and the stream contributes nothing to the
+    /// guest's own streams or to its `Output`.
+    File,
 }
 
 pub(super) fn stdio_route(
@@ -1023,6 +1180,7 @@ pub(super) fn stdio_route(
 ) -> StdioRoute {
     use crate::interp::StdioConfig;
     match (config, output_captured) {
+        (Some(StdioConfig::File(_)), _) => StdioRoute::File,
         (Some(StdioConfig::Null), _) | (Some(StdioConfig::Unmodelled), _) => {
             StdioRoute::Discard
         }

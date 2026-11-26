@@ -874,6 +874,85 @@ fn run_mode_process_host_self_spawn_stderr() {
     );
 }
 
+const PROCESS_HOST_BROKEN_PIPE_SRC: &str = r#"
+use std::env;
+use std::io::Read;
+use std::process::{Command, Stdio};
+fn main() {
+    let mut args = env::args();
+    let _me = args.next().unwrap();
+    if let Some(arg) = args.next() {
+        if arg == "consume" {
+            // Read exactly one line from stdin, print it, exit:
+            // the producer's pipe then has no reader left.
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = std::io::stdin().read(&mut byte).unwrap();
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            println!("{}", String::from_utf8(line).unwrap());
+            return;
+        }
+        // Producer: print the line until the pipe breaks.
+        for _ in 0..100_000 {
+            println!("{arg}");
+        }
+        unreachable!("the broken pipe must panic first");
+    }
+    let me = env::current_exe().unwrap();
+    let mut producer = Command::new(&me)
+        .arg("this line shall appear exactly once on stdout")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The producer's stdout handle becomes the consumer's
+    // stdin through `Stdio::from(ChildStdout)`.
+    let mut consumer = Command::new(&me)
+        .arg("consume")
+        .stdin(producer.stdout.take().unwrap())
+        .spawn()
+        .unwrap();
+    let consumer_status = consumer.wait().unwrap();
+    assert!(consumer_status.success());
+    let producer_status = producer.wait().unwrap();
+    // The producer's `println!` panics on the broken pipe.
+    assert_eq!(producer_status.code(), Some(101));
+    println!("broken-pipe-stdio-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_stdio_from_child_stdout_broken_pipe() {
+    let dir = temp_dir("proc-host-broken-pipe");
+    let src = fixture(
+        &dir,
+        "process_host_broken_pipe.rs",
+        PROCESS_HOST_BROKEN_PIPE_SRC,
+    );
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "this line shall appear exactly once on stdout\nbroken-pipe-stdio-ok\n"
+    );
+    // The producer's broken-pipe panic report joins the
+    // guest's stderr through the wait relay, located inside
+    // std's `print_to` as a native run reports it.
+    assert!(
+        stderr.contains("failed printing to stdout: Broken pipe (os error 32)"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("library/std/src/io/stdio.rs:1209:9"),
+        "stderr={stderr}"
+    );
+}
+
 const PROCESS_HOST_FAILURE_SRC: &str = r#"
 use std::io::ErrorKind;
 use std::process::Command;
