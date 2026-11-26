@@ -1342,6 +1342,78 @@ sum=6
     );
 }
 
+const STR_SPLIT_PRED_SRC: &str = r#"
+fn show(label: &str, v: Vec<&str>) {
+    println!("{label}={v:?}");
+}
+
+fn is_comma(c: char) -> bool {
+    c == ','
+}
+
+fn main() {
+    show("pred-split", "a b  c".split(|c: char| c == ' ').collect());
+    show("pred-rsplit", "a b  c".rsplit(|c: char| c == ' ').collect());
+    show("pred-term", "a b ".split_terminator(|c: char| c == ' ').collect());
+    show("pred-rterm", "a b ".rsplit_terminator(|c: char| c == ' ').collect());
+    show("pred-incl", "a b  c".split_inclusive(|c: char| c == ' ').collect());
+    show("pred-multi", "\u{3b1},\u{3b2};\u{3b3}".split(|c: char| c == ',' || c == ';').collect());
+    let sep = ';';
+    show("pred-capture", "a;b;c".split(|c: char| c == sep).collect());
+    show("fnptr", "x,y,z".split(is_comma).collect());
+    let mut it = "a b c d".split(|c: char| c == ' ');
+    println!("p1={:?}", it.next());
+    println!("p2={:?}", it.next_back());
+    println!("p3={:?}", it.next());
+    println!("p4={:?}", it.next_back());
+    println!("p5={:?}", it.next_back());
+    let mut it = "a,b,".split_terminator(|c: char| c == ',');
+    println!("t1={:?}", it.next_back());
+    println!("t2={:?}", it.next());
+    println!("t3={:?}", it.next_back());
+    let mut it = "a b c d".split(|c: char| c == ' ');
+    let mut v: Vec<&str> = Vec::new();
+    v.push(it.next().unwrap());
+    v.push(it.next_back().unwrap());
+    println!("v={v:?}");
+    println!("eq={} len={}", v[0] == "a", v[0].len());
+}
+"#;
+
+#[test]
+fn run_mode_str_split_predicate_family() {
+    // The `Split` family over a `char`-predicate pattern
+    // (core's `CharPredicateSearcher`): both directions, the
+    // terminators' trailing-empty rule, inclusive pieces,
+    // multi-byte haystacks and predicates, a capturing
+    // closure and a function-pointer predicate, front/back
+    // interleaving on one state, and the yielded pieces as
+    // string values (their length and equality). Expected
+    // output was produced by the native 1.100.0 toolchain.
+    run_ok(
+        "str-split-predicate-family",
+        STR_SPLIT_PRED_SRC,
+        "pred-split=[\"a\", \"b\", \"\", \"c\"]\n\
+         pred-rsplit=[\"c\", \"\", \"b\", \"a\"]\n\
+         pred-term=[\"a\", \"b\"]\n\
+         pred-rterm=[\"b\", \"a\"]\n\
+         pred-incl=[\"a \", \"b \", \" \", \"c\"]\n\
+         pred-multi=[\"\u{3b1}\", \"\u{3b2}\", \"\u{3b3}\"]\n\
+         pred-capture=[\"a\", \"b\", \"c\"]\n\
+         fnptr=[\"x\", \"y\", \"z\"]\n\
+         p1=Some(\"a\")\n\
+         p2=Some(\"d\")\n\
+         p3=Some(\"b\")\n\
+         p4=Some(\"c\")\n\
+         p5=None\n\
+         t1=Some(\"b\")\n\
+         t2=Some(\"a\")\n\
+         t3=None\n\
+         v=[\"a\", \"d\"]\n\
+         eq=true len=1\n",
+    );
+}
+
 const WRAPPER_DEFAULT_SRC: &str = r#"
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
