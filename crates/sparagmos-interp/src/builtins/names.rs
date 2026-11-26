@@ -219,7 +219,23 @@ fn ty_tag_impl(ty: &mir::Ty, names: &HashMap<mir::DefId, String>, full: bool) ->
             format!("&{r}{m}{}", nested(inner, names, full))
         }
         T::RawPtr(inner, mutability) => {
-            let m = if matches!(mutability, mir::Mutability::Mut) {
+            // A pointer to a foreign (extern-block) type is
+            // spelled `*mut` whatever the source mutability: the
+            // compiler names the pointer's DIE from the pointee's
+            // scope chain, and gdb renders a raw pointer from its
+            // DIE structure rather than from that recorded name,
+            // reporting the mutable spelling (the debuginfo
+            // suite's type-names record pins
+            // `*mut type_names::{extern#0}::ForeignType1` for a
+            // `*const` local). A raw pointer's const/mut
+            // distinction survives only inside composite type
+            // names, and a foreign type reaches a type only as a
+            // thin pointer's pointee, so the tag -- the one
+            // rendering every consumer shares -- carries the
+            // mutable spelling for a foreign pointee.
+            let m = if matches!(mutability, mir::Mutability::Mut)
+                || matches!(inner.as_ref(), T::Foreign(..))
+            {
                 "mut"
             } else {
                 "const"

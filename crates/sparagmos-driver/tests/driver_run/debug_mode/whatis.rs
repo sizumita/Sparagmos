@@ -135,7 +135,12 @@ fn debug_mode_foreign_type_pointers_convert_and_answer_whatis() {
     // session. Conversion used to refuse the type outright
     // ("unsupported type in local ... Foreign (...)"), which
     // held back the debuginfo suite's type-names record at
-    // the session stage.
+    // the session stage. The session names the pointers the
+    // way the compiler's debuginfo does: the recorded name of
+    // the foreign definition runs through its extern block's
+    // scope segment, and a raw pointer to a foreign type is
+    // spelled `*mut` whatever the source mutability (the
+    // record-mirroring test below pins both spellings).
     let dir = temp_dir("debug-foreign-ptr");
     let src = fixture(&dir, "foreign_ptr.rs", DEBUG_FOREIGN_PTR_SRC);
     let out = debug_driver_bootstrapped(
@@ -146,9 +151,61 @@ fn debug_mode_foreign_type_pointers_convert_and_answer_whatis() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "debug session failed: {stdout}");
     for want in [
-        "type = *const foreign_ptr::Opaque",
-        "type = *mut foreign_ptr::Opaque",
+        "type = *mut foreign_ptr::{extern#0}::Opaque",
         "$1 = 0x0",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("*const foreign_ptr::Opaque")
+            && !stdout.contains("type = *mut foreign_ptr::Opaque"),
+        "foreign pointers must carry the extern scope segment: {stdout}"
+    );
+}
+
+const DEBUG_FOREIGN_TYPE_NAMES_SRC: &str = r#"#![feature(extern_types)]
+extern "C" {
+    type ForeignType1;
+}
+mod mod1 {
+    extern "C" {
+        pub type ForeignType2;
+    }
+}
+fn main() {
+    let foreign1 = unsafe { 0 as *const ForeignType1 };
+    let foreign2 = unsafe { 0 as *const mod1::ForeignType2 };
+    zzz();
+    let _ = (foreign1, foreign2);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_foreign_type_names_carry_the_extern_scope() {
+    // The debuginfo suite's type-names record, foreign lines:
+    // a foreign type's recorded name runs through the extern
+    // block's scope segment (`{extern#0}`), at the crate root
+    // and inside a module alike, and a raw pointer to a foreign
+    // type is spelled `*mut` even for a `*const` local -- the
+    // compiler names the pointer's DIE from the pointee's
+    // scope chain, and gdb renders a raw pointer from its DIE
+    // structure rather than from that recorded name.
+    let dir = temp_dir("debug-foreign-type-names");
+    let src = fixture(&dir, "type_names.rs", DEBUG_FOREIGN_TYPE_NAMES_SRC);
+    let out = debug_driver_bootstrapped(
+        &dir,
+        &src,
+        "break 13\nrun\nwhatis foreign1\nwhatis foreign2\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "type = *mut type_names::{extern#0}::ForeignType1",
+        "type = *mut type_names::mod1::{extern#0}::ForeignType2",
     ] {
         assert!(
             stdout.contains(want),
