@@ -364,7 +364,7 @@ pub(super) fn stream_is_stderr(self_ty: &str) -> bool {
 /// standard-stream and `Vec<u8>` receivers (see
 /// `stream_write_receiver`), whose writes the interpreter
 /// models through its captured streams / an in-place append.
-pub(super) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
+pub(crate) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
     match name {
         "std::fs::File::metadata"
         | "std::fs::File::try_clone"

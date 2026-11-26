@@ -4072,3 +4072,26 @@ fn run_mode_fn_ptr_trait_addr_as_ptr_from_ptr() {
     // the synthetic address a function value is exposed at.
     run_ok("fn-ptr-trait", FN_PTR_TRAIT_SRC, "fnptr ok\n");
 }
+
+const NONNULL_ADDR_SRC: &str = r#"
+use std::ptr::NonNull;
+
+fn main() {
+    let mut x = 41u32;
+    let p = NonNull::new(&mut x).unwrap();
+    let a = p.addr();
+    assert!(a.get() != 0);
+    let q = NonNull::new(a.get() as *mut u32).unwrap();
+    unsafe { *q.as_ptr() += 1; }
+    assert_eq!(x, 42);
+    println!("nonnull addr ok");
+}
+"#;
+
+#[test]
+fn run_mode_nonnull_addr_round_trip() {
+    // `NonNull::addr` exposes the pointer's address as a
+    // `NonZero<usize>`; a `NonNull` rebuilt from that address
+    // reaches the same pointee.
+    run_ok("nonnull-addr", NONNULL_ADDR_SRC, "nonnull addr ok\n");
+}
