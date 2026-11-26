@@ -853,7 +853,13 @@ impl<'a> Interpreter<'a> {
                                         pointee_ty.as_ref(),
                                     ) {
                                         Some(resolved) => resolved,
-                                        None => return Err(err),
+                                        None => match self.fn_code_deref(
+                                            &value,
+                                            pointee_ty.as_ref(),
+                                        ) {
+                                            Some(resolved) => resolved,
+                                            None => return Err(err),
+                                        },
                                     }
                                 }
                             };

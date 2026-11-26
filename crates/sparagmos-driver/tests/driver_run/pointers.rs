@@ -3638,3 +3638,62 @@ fn run_mode_transmute_niche_range_wraps_at_shifted_scalar() {
         "2 1 1344\n0 65114\n",
     );
 }
+// ----- Function code bytes (fn pointer read as *const u8) -----
+
+const FN_CODE_SRC: &str = r#"
+fn alpha() -> u32 { 3 }
+fn beta() -> u32 { 3 }
+fn gamma() -> u32 { 4 }
+fn delta() -> u32 { alpha() }
+
+fn code_bytes(f: fn() -> u32) -> [u8; 8] {
+    let base = f as usize;
+    let mut out = [0u8; 8];
+    for i in 0..8 {
+        out[i] = unsafe { *((base + i) as *const u8) };
+    }
+    out
+}
+
+fn code_eq(f: fn() -> u32, g: fn() -> u32) -> bool {
+    let a = code_bytes(f);
+    let b = code_bytes(g);
+    let mut i = 0;
+    while i < 8 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn main() {
+    // Identical bodies share a code image; a different
+    // constant or a call body does not.
+    assert!(code_eq(alpha, beta));
+    assert!(!code_eq(alpha, gamma));
+    assert!(!code_eq(alpha, delta));
+    // The direct first-byte deref (the thin-lto-inlines
+    // shape) and a wider scalar read through the same
+    // pointer.
+    let a = alpha as usize as *const u8;
+    let b = beta as usize as *const u8;
+    assert_eq!(unsafe { *a }, unsafe { *b });
+    let w = alpha as usize as *const u32;
+    assert_eq!(unsafe { *w }, unsafe { *(beta as usize as *const u32) });
+    println!("fn-code-ok");
+}
+"#;
+
+#[test]
+fn run_mode_fn_pointer_code_bytes() {
+    // A function pointer cast through an integer to a data
+    // pointer dereferences to the function's code image: a
+    // deterministic byte stream keyed by the body's canonical
+    // form, so two functions with identical bodies read the
+    // same bytes (the property tests/ui/lto/thin-lto-inlines
+    // asserts of ThinLTO inlining) and different bodies read
+    // different bytes.
+    run_ok("fn-code", FN_CODE_SRC, "fn-code-ok\n");
+}

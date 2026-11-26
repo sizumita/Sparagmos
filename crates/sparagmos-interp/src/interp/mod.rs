@@ -747,6 +747,15 @@ pub struct Interpreter<'a> {
     /// which coerces to a function pointer) are recorded.
     exposed_fn_ptrs:
         std::cell::RefCell<std::collections::HashMap<u64, Value>>,
+    /// Seeds of the functions' code images, keyed by body
+    /// name (see [`Interpreter::fn_code_deref`]): the hash of
+    /// a body's canonical form, from which the deterministic
+    /// byte stream a code read serves is generated. Computed
+    /// lazily and cached: canonicalising a large body is not
+    /// free, and a function's image never changes within a
+    /// run.
+    code_seeds:
+        std::cell::RefCell<std::collections::HashMap<String, u64>>,
     /// The declared type recorded for an allocation at its
     /// creation point (see [`Interpreter::record_alloc_ty`]):
     /// for an ordinary allocation, the pointee type it was
@@ -931,6 +940,9 @@ impl<'a> Interpreter<'a> {
                 std::collections::HashMap::new(),
             ),
             exposed_fn_ptrs: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
+            code_seeds: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             ),
             alloc_tys: std::cell::RefCell::new(HashMap::new()),

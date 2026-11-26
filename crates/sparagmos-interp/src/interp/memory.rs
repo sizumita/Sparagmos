@@ -6,6 +6,33 @@ use crate::error::{InterpError, InterpResult};
 use crate::value::{RefProj, RefTarget, Value};
 use std::borrow::Cow;
 
+/// One byte of a function's code image (see
+/// [`Interpreter::fn_code_deref`]): a splitmix64-style
+/// finaliser over the image seed and the byte's offset, so
+/// the stream is deterministic and position-dependent, and
+/// any byte can be served without materialising the image.
+fn code_byte(seed: u64, offset: usize) -> u8 {
+    let mut z = seed.wrapping_add(
+        0x9E37_79B9_7F4A_7C15u64.wrapping_mul(offset as u64 + 1),
+    );
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) >> 56) as u8
+}
+
+/// The integer a code read of `bits` width assembles: the
+/// image's bytes at `offset`, little-endian, as a native
+/// little-endian load of the same width from the function's
+/// bytes yields.
+fn code_int(seed: u64, offset: usize, bits: u32) -> u128 {
+    let bytes = (bits as usize).div_ceil(8);
+    let mut value: u128 = 0;
+    for i in 0..bytes {
+        value |= u128::from(code_byte(seed, offset + i)) << (8 * i);
+    }
+    value
+}
+
 impl<'a> Interpreter<'a> {
     /// The base value a bulk byte operation reads at `target`:
     /// the resolved value, or -- for a pointer displaced into a
@@ -713,6 +740,103 @@ impl<'a> Interpreter<'a> {
         }
         let single = self.zst_single_value(pointee_ty?)?;
         Some(Resolved::Value(single, Vec::new()))
+    }
+
+    /// The resolution of a dereference of a pointer whose
+    /// address denotes a function: a function pointer exposed
+    /// as an integer (a `PtrToInt` rvalue records the identity
+    /// in `exposed_fn_ptrs`) and rebuilt as a data pointer --
+    /// the `foo as usize as *const u8` shape code-inspection
+    /// code uses to read a function's machine code. The
+    /// pointee is the function's code image: a deterministic
+    /// byte stream keyed by the body's canonical form (see
+    /// [`Self::code_seed`]), shaped here into the pointee
+    /// type -- a scalar integer assembled little-endian from
+    /// the stream, or a byte array's worth of it. Two
+    /// functions whose converted bodies are canonically
+    /// identical share an image, exactly as two functions
+    /// codegen reduces to the same instruction stream share
+    /// their bytes natively; that is the property
+    /// cross-crate-inlining tests read through this shape.
+    /// `None` when the address denotes no recorded function,
+    /// the function has no converted body, or the pointee
+    /// type is not a shape a byte stream can fill.
+    pub(super) fn fn_code_deref(
+        &self,
+        value: &Value,
+        pointee_ty: Option<&Ty>,
+    ) -> Option<Resolved> {
+        let Value::Ref(RefTarget::Address(addr)) = value else {
+            return None;
+        };
+        // A function's synthetic address is its slot base
+        // (see `synthetic_address`): the slot an address
+        // falls in names the function, and the in-slot
+        // displacement is the offset into its code image.
+        let base = addr & !0xFFFFu64;
+        let offset = (addr - base) as usize;
+        let target = self.exposed_fn_ptrs.borrow().get(&base)?.clone();
+        let name = match &target {
+            Value::FnPtr(name) => name.clone(),
+            Value::Closure { def, env } if env.is_empty() => def.clone(),
+            _ => return None,
+        };
+        let seed = self.code_seed(&name)?;
+        let value = match pointee_ty? {
+            Ty::Bool => Value::Bool(code_byte(seed, offset) != 0),
+            Ty::Uint(ty) => {
+                let bits = ty.bits();
+                Value::Uint(wrap_unsigned(code_int(seed, offset, bits), bits))
+            }
+            Ty::Int(ty) => {
+                let bits = ty.bits();
+                Value::Int(wrap_signed(
+                    code_int(seed, offset, bits) as i128,
+                    bits,
+                ))
+            }
+            Ty::Array(elem, n)
+                if matches!(&**elem, Ty::Uint(UintTy::U8)) && *n <= (1 << 20) =>
+            {
+                Value::Bytes(
+                    (0..*n as usize)
+                        .map(|i| code_byte(seed, offset + i))
+                        .collect(),
+                )
+            }
+            _ => return None,
+        };
+        Some(Resolved::Value(value, Vec::new()))
+    }
+
+    /// The seed of a function's code image: an FNV-1a hash
+    /// of the body's canonical form -- its argument count,
+    /// its locals' types and its blocks, the parts that
+    /// determine what the function does. The body's name
+    /// and its source and debug records take no part:
+    /// natively, a function's bytes carry neither its name
+    /// nor its source positions, so two bodies that differ
+    /// only in those share an image here too. `None` when
+    /// the program holds no converted body for the name: a
+    /// builtin-modelled function has no code in this model,
+    /// and a read of its bytes keeps the address-only
+    /// verdict.
+    fn code_seed(&self, name: &str) -> Option<u64> {
+        if let Some(seed) = self.code_seeds.borrow().get(name) {
+            return Some(*seed);
+        }
+        let body = self.program().functions.get(name)?;
+        let canonical = format!(
+            "{}\u{1}{:?}\u{1}{:?}",
+            body.arg_count, body.local_tys, body.blocks
+        );
+        let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in canonical.as_bytes() {
+            seed ^= u64::from(b);
+            seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.code_seeds.borrow_mut().insert(name.to_string(), seed);
+        Some(seed)
     }
 
     /// The single value of a zero-sized type, when the type
