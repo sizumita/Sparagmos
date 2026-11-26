@@ -489,6 +489,7 @@ fn convert_all_with(
     out.union_tables = conv.union_tables.clone();
     out.async_closure_captures = conv.async_closure_captures.clone();
     out.mat_plans = conv.mat_table.clone();
+    out.iter_item_glues = conv.iter_item_glues(program);
     // The ADT field-type table: each definition's declared field
     // types, reduced to the skeletons place-walk type tracking
     // can follow (see `field_ty_skeleton`), keyed by the same

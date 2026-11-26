@@ -2659,6 +2659,21 @@ pub struct Program {
     /// the conversion made materialising carries the index of
     /// its target pointee's plan here.
     pub mat_plans: Vec<MatPlan>,
+    /// Drop glue of the item type of each modelled iterator
+    /// type in the program, keyed by the iterator type's tag
+    /// (the rendering the builtin generic arguments carry, the
+    /// same form the step machinery's `self_ty` carries):
+    /// the modelled adapter steps (`Filter`, `Skip`,
+    /// `SkipWhile`, `StepBy`, ...) discard the items they pull
+    /// and reject, and a consumer like `count` discards every
+    /// item it pulls, so conversion records the item glue here
+    /// (see `mir_convert`'s iterator-item glue scan) and those
+    /// steps run it against each discarded item, exactly as
+    /// core's own loops drop the temporaries they consume.
+    /// An iterator type with no entry has item glue that is
+    /// trivial or could not be accounted for; its discarded
+    /// items are then discarded as before.
+    pub iter_item_glues: std::collections::HashMap<String, DropGlue>,
     /// The program's coverage mapping table, as recorded by the
     /// driver (see `sparagmos_mir::CoverageMapping`): one record
     /// per instrumented function instance, linked to the body

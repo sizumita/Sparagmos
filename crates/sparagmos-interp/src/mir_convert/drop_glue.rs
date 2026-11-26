@@ -1472,3 +1472,143 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         ))
     }
 }
+
+impl<'a> Converter<'a> {
+    /// The item type of an iterator type, when the type's
+    /// shape names it directly: a pass-through adapter
+    /// (`Filter`, `Skip`, ...) has its inner iterator's item,
+    /// `Enumerate` pairs it with the count, `Zip` pairs the
+    /// two sides' items, `Cloned` / `Copied` unwrap the inner
+    /// item's reference, and the base iterators whose first
+    /// generic argument is the item (`IntoIter`, the ranges,
+    /// `Once`, ...) name it themselves. Anything else — a
+    /// `Map`'s or `FilterMap`'s closure output, a reference
+    /// iterator's borrowed item (its glue is trivial), a
+    /// user-defined iterator — names no item here, and the
+    /// caller accounts for no glue for it.
+    pub(super) fn iterator_item_ty(&self, ty: &mir::Ty) -> Option<mir::Ty> {
+        match ty {
+            mir::Ty::Ref(_, inner, _) => self.iterator_item_ty(inner),
+            mir::Ty::Adt(def, args) => {
+                let name = self
+                    .names
+                    .get(def)
+                    .or_else(|| self.def_names.get(def))?;
+                if !(name.starts_with("std::")
+                    || name.starts_with("core::")
+                    || name.starts_with("alloc::"))
+                {
+                    return None;
+                }
+                let short = name.rsplit("::").next().unwrap_or(name);
+                match short {
+                    "Filter" | "Skip" | "SkipWhile" | "Take" | "StepBy" | "Rev"
+                    | "Fuse" | "Peekable" | "Inspect" | "Chain" => {
+                        self.iterator_item_ty(args.first()?)
+                    }
+                    "Enumerate" => {
+                        let item = self.iterator_item_ty(args.first()?)?;
+                        Some(mir::Ty::Tuple(vec![
+                            mir::Ty::Uint(mir::UintTy::Usize),
+                            item,
+                        ]))
+                    }
+                    "Zip" => {
+                        let first = self.iterator_item_ty(args.first()?)?;
+                        let second = self.iterator_item_ty(args.get(1)?)?;
+                        Some(mir::Ty::Tuple(vec![first, second]))
+                    }
+                    "Cloned" | "Copied" => {
+                        match self.iterator_item_ty(args.first()?)? {
+                            mir::Ty::Ref(_, elem, _) => Some((*elem).clone()),
+                            _ => None,
+                        }
+                    }
+                    "IntoIter"
+                        if name.contains("::hash_map::")
+                            || name.contains("::btree_map::") =>
+                    {
+                        Some(mir::Ty::Tuple(vec![
+                            args.first()?.clone(),
+                            args.get(1)?.clone(),
+                        ]))
+                    }
+                    "IntoIter" | "Range" | "RangeInclusive" | "RangeFrom"
+                    | "Empty" | "Once" | "Repeat" | "Drain" | "IntoKeys" => {
+                        args.first().cloned()
+                    }
+                    "IntoValues" => args.get(1).cloned(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The program's iterator-item glue table (see
+    /// [`ir::Program::iter_item_glues`]): every type that
+    /// occurs as a local's type or as a call callee's generic
+    /// argument, in any body of the program, is walked as a
+    /// type tree, and each node that is an iterator type with
+    /// an accountable, non-trivial item glue contributes its
+    /// entry, keyed by the node's own tag — so an adapter and
+    /// every iterator nested inside it are all recorded,
+    /// whether the program steps them directly or only as
+    /// another adapter's inner iterator.
+    pub(super) fn iter_item_glues(
+        &self,
+        program: &super::program::MirProgram,
+    ) -> HashMap<String, ir::DropGlue> {
+        let mut out: HashMap<String, ir::DropGlue> = HashMap::new();
+        let mut stack: Vec<mir::Ty> = Vec::new();
+        for func in &program.functions {
+            stack.extend(func.body.local_decls.iter().map(|decl| decl.ty.clone()));
+            for block in &func.body.basic_blocks {
+                let Some(term) = &block.terminator else {
+                    continue;
+                };
+                let mir::TerminatorKind::Call { func, .. } = &term.kind else {
+                    continue;
+                };
+                let mir::Operand::Constant(c) = func else {
+                    continue;
+                };
+                if let mir::ConstKind::Ty(mir::Ty::FnDef(_, gargs)) = &c.literal {
+                    stack.extend(gargs.iter().cloned());
+                }
+            }
+        }
+        while let Some(ty) = stack.pop() {
+            if let Some(item) = self.iterator_item_ty(&ty) {
+                if let Some(glue) = DropGlueBuilder::build(self, &item) {
+                    if glue.root != ir::DropPlan::Trivial {
+                        out.entry(crate::builtins::ty_tag(&ty, self.names))
+                            .or_insert(glue);
+                    }
+                }
+            }
+            match &ty {
+                mir::Ty::Tuple(ts) => stack.extend(ts.iter().cloned()),
+                mir::Ty::Array(elem, _)
+                | mir::Ty::Slice(elem)
+                | mir::Ty::RawPtr(elem, _)
+                | mir::Ty::Pat(elem, _) => stack.push((**elem).clone()),
+                mir::Ty::Ref(_, elem, _) | mir::Ty::Dynamic(_, elem, _) => {
+                    stack.push((**elem).clone())
+                }
+                mir::Ty::Adt(_, args)
+                | mir::Ty::Closure(_, args)
+                | mir::Ty::Coroutine(_, args)
+                | mir::Ty::CoroutineWitness(_, args)
+                | mir::Ty::Alias(_, _, args)
+                | mir::Ty::FnDef(_, args) => stack.extend(args.iter().cloned()),
+                mir::Ty::FnPtr(sig) => {
+                    stack.extend(sig.inputs.iter().cloned());
+                    stack.push((*sig.output).clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
