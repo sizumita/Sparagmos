@@ -1258,15 +1258,19 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
     /// The drop glue of one coroutine instantiation: the live
     /// state's fields, state by state. The compiler numbers the
     /// states 0 (unresumed), 1 (returned), 2 (panicked) and one per
-    /// suspension point from 3 on, and a state's fields are all
-    /// projected by the body that saves or resumes it - so a state
-    /// with no evidence holds no fields to drop. The plan must
-    /// still *cover* every state the value can be dropped in: the
-    /// three fixed states, plus every state the coroutine's own
-    /// body names in a `SetDiscriminant` (the only way a state tag
-    /// is ever written), even when that state holds no evidenced
-    /// fields - a suspended coroutine with nothing live across the
-    /// suspension point is dropped in exactly such a state.
+    /// suspension point from 3 on. The plan must *cover* every
+    /// state the value can be dropped in: the three fixed states,
+    /// plus every state the coroutine's own body names in a
+    /// `SetDiscriminant` (the only way a state tag is ever
+    /// written), even when that state holds no evidenced fields -
+    /// a suspended coroutine with nothing live across the
+    /// suspension point is dropped in exactly such a state. A
+    /// state with no evidence can still hold live fields, though:
+    /// the transformed body projects a saved field under the
+    /// index of one state that holds it, not under every state's,
+    /// so a field live in several states may be named only under
+    /// the later ones. The slot-map pass below accounts for
+    /// those fields from the other states' plans.
     fn coroutine_plan(
         &mut self,
         def: mir::DefId,
@@ -1362,6 +1366,165 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     steps.reverse();
                     *plan = P::Seq(steps);
                 }
+            }
+            // A saved field is projected by the transformed body
+            // under the index of one state that holds it, not
+            // under every state's, so a state's own evidence can
+            // leave a live field unplanned: an aggregate under
+            // construction across two suspension points is
+            // projected only under the later state's index, and
+            // the earlier state's plan then never mentions the
+            // storage cell the in-progress value sits in. A slot
+            // is one cell in every state that contains it (the
+            // slot map's own invariant), and the value a cell
+            // holds in such a state is the same saved local the
+            // other states' plans drop at that slot. Fill each
+            // state's missing slot steps in from the other
+            // states' rewritten plans - but only where every
+            // state that plans the slot agrees on the plan:
+            // different locals can be packed into one slot in
+            // different states, and where the sightings disagree
+            // the cell's content in this state is not provable,
+            // so it keeps the unplanned treatment rather than a
+            // guessed destructor. The state's own steps keep
+            // their order - the reverse-declaration drop order
+            // the rewrite above established - and a borrowed
+            // step takes the place the donor state's plan
+            // implies for it, relative to the slots both states
+            // plan: two locals live in both states drop in the
+            // same relative order in each.
+            let snapshot = plans.clone();
+            for (v, plan) in plans.iter_mut().enumerate().skip(1) {
+                let Some(vslots) = slots.variants.get(v) else {
+                    continue;
+                };
+                let mut steps: Vec<P> = match plan {
+                    P::Seq(steps) => std::mem::take(steps),
+                    P::Trivial => Vec::new(),
+                    _ => continue,
+                };
+                let mut planned: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for step in steps.iter() {
+                    if let P::At { path, .. } = step {
+                        if let [RefProj::Field(slot)] = path.as_slice() {
+                            planned.insert(*slot);
+                        }
+                    }
+                }
+                let mut missing: Vec<(usize, P, Vec<usize>)> = Vec::new();
+                let mut seen: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for &slot in vslots.iter() {
+                    if !seen.insert(slot) {
+                        continue;
+                    }
+                    let slot = slot as usize;
+                    if planned.contains(&slot) {
+                        continue;
+                    }
+                    let mut found: Option<&P> = None;
+                    let mut donor: Option<Vec<usize>> = None;
+                    let mut ambiguous = false;
+                    for (w, wplan) in snapshot.iter().enumerate().skip(1) {
+                        if w == v {
+                            continue;
+                        }
+                        let P::Seq(wsteps) = wplan else {
+                            continue;
+                        };
+                        for step in wsteps.iter() {
+                            if let P::At { path, plan: sub } = step {
+                                if let [RefProj::Field(s)] = path.as_slice() {
+                                    if *s == slot {
+                                        match found {
+                                            None => {
+                                                found = Some(&**sub);
+                                                donor = Some(
+                                                    wsteps
+                                                        .iter()
+                                                        .filter_map(|st| match st {
+                                                            P::At { path, .. } => {
+                                                                match path.as_slice() {
+                                                                    [RefProj::Field(
+                                                                        ds,
+                                                                    )] => Some(*ds),
+                                                                    _ => None,
+                                                                }
+                                                            }
+                                                            _ => None,
+                                                        })
+                                                        .collect(),
+                                                );
+                                            }
+                                            Some(prev) if prev == &**sub => {}
+                                            Some(_) => ambiguous = true,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !ambiguous {
+                        if let (Some(sub), Some(donor)) = (found, donor) {
+                            missing.push((slot, sub.clone(), donor));
+                        }
+                    }
+                }
+                if missing.is_empty() {
+                    if let P::Seq(orig) = plan {
+                        *orig = steps;
+                    }
+                    continue;
+                }
+                missing.sort_by_key(|(slot, _, donor)| {
+                    donor.iter().position(|d| d == slot).unwrap_or(usize::MAX)
+                });
+                for (slot, sub, donor) in &missing {
+                    let pos = donor
+                        .iter()
+                        .position(|d| d == slot)
+                        .unwrap_or(usize::MAX);
+                    let step_slots: Vec<Option<usize>> = steps
+                        .iter()
+                        .map(|st| match st {
+                            P::At { path, .. } => match path.as_slice() {
+                                [RefProj::Field(s)] => Some(*s),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                    let mut insert_at = steps.len();
+                    let mut anchored = false;
+                    for j in (0..pos).rev() {
+                        if let Some(idx) =
+                            step_slots.iter().position(|s| *s == Some(donor[j]))
+                        {
+                            insert_at = idx + 1;
+                            anchored = true;
+                            break;
+                        }
+                    }
+                    if !anchored {
+                        for j in (pos + 1)..donor.len() {
+                            if let Some(idx) =
+                                step_slots.iter().position(|s| *s == Some(donor[j]))
+                            {
+                                insert_at = idx;
+                                break;
+                            }
+                        }
+                    }
+                    steps.insert(
+                        insert_at,
+                        P::At {
+                            path: vec![RefProj::Field(*slot)],
+                            plan: Box::new(sub.clone()),
+                        },
+                    );
+                }
+                *plan = P::Seq(steps);
             }
         }
         Some(P::Variants { variants: plans })
