@@ -119,6 +119,24 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The `Filter` type a `str::SplitWhitespace` value
+    /// wraps: core defines `SplitWhitespace` as a one-field
+    /// wrapper over exactly this adapter (its `Iterator`
+    /// impl forwards both steps to the field), so stepping
+    /// a `SplitWhitespace` state - in place or by value -
+    /// is stepping the field under this tag. Both callables
+    /// the tag names are zero-sized `Fn` types of core's
+    /// `impl_fn_for_zst!` family, applied by the
+    /// type-directed dispatch in the `Filter` and split
+    /// steps themselves.
+    fn split_whitespace_filter_ty(self_ty: &str) -> Option<&'static str> {
+        if self_ty_is(self_ty, "std::str::SplitWhitespace") {
+            Some("std::iter::Filter<std::str::Split<core::str::IsWhitespace>, core::str::IsNotEmpty>")
+        } else {
+            None
+        }
+    }
+
     /// `Iterator::next` on the iterator stored at `target`:
     /// mutate it in place and return the `Option` value.
     pub(super) fn iterator_next_at(
@@ -130,6 +148,11 @@ impl<'a> Interpreter<'a> {
         if let Some(map_ty) = Self::lines_map_ty(self_ty) {
             if let Some(field) = extend_target(target, RefProj::Field(0)) {
                 return self.iterator_next_at(frames, map_ty, &field);
+            }
+        }
+        if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_at(frames, filter_ty, &field);
             }
         }
         // A `Map` on a place-based state is stepped in place
@@ -402,6 +425,11 @@ impl<'a> Interpreter<'a> {
         if let Some(map_ty) = Self::lines_map_ty(self_ty) {
             if let Some(field) = extend_target(target, RefProj::Field(0)) {
                 return self.iterator_next_back_at(frames, map_ty, &field);
+            }
+        }
+        if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_back_at(frames, filter_ty, &field);
             }
         }
         // A `Map` on a place-based state is stepped in place,
@@ -706,7 +734,7 @@ impl<'a> Interpreter<'a> {
                 None => (new_state, none_value()),
             });
         }
-        if let Some(mut parts) = StrSplitPredParts::decode(state) {
+        if let Some(mut parts) = StrSplitPredParts::decode(state, self_ty) {
             let item = match (back == reversed, inclusive) {
                 (true, false) => parts.next(self, frames)?,
                 (true, true) => parts.next_inclusive(self, frames)?,
@@ -831,6 +859,19 @@ impl<'a> Interpreter<'a> {
             if let Some(step) = self.flatten_step_state(frames, self_ty, &state, true)? {
                 return Ok(step);
             }
+        }
+        if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitWhitespace state",
+                    "[filter]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_filter, result) =
+                self.next_back_on_state(frames, filter_ty, fields[0].clone())?;
+            return Ok((rebuild_state(&state, vec![new_filter]), result));
         }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
@@ -1860,6 +1901,22 @@ impl<'a> Interpreter<'a> {
             let (new_map, result) =
                 self.next_on_state(frames, map_ty, &fields[0])?;
             return Ok((rebuild_state(&state, vec![new_map]), result));
+        }
+        if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            // The value-level step of a `SplitWhitespace`:
+            // step the wrapped `Filter` state and rewrap it
+            // in the one-field state.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitWhitespace state",
+                    "[filter]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_filter, result) =
+                self.next_on_state(frames, filter_ty, &fields[0])?;
+            return Ok((rebuild_state(&state, vec![new_filter]), result));
         }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
@@ -7725,6 +7782,7 @@ struct StrSplitPredParts {
     front: usize,
     back: usize,
     predicate: Value,
+    predicate_ty: String,
     allow_trailing_empty: bool,
     finished: bool,
 }
@@ -7733,12 +7791,15 @@ impl StrSplitPredParts {
     /// Decode the state value, or `None` when it is not the
     /// predicate-searcher split state (another pattern's
     /// searcher, whose step stays unsupported). A predicate
-    /// the modelled call path cannot apply -- anything but a
-    /// closure or a function pointer; a zero-sized `Fn`
-    /// type's value carries no callable identity of its own
-    /// -- also declines, leaving the state to the generic
-    /// unsupported error.
-    fn decode(state: &Value) -> Option<Self> {
+    /// the modelled call path cannot apply also declines,
+    /// leaving the state to the generic unsupported error:
+    /// the applicable shapes are a closure, a function
+    /// pointer, and the empty value of a zero-sized `Fn`
+    /// type (core's `impl_fn_for_zst!` family), which
+    /// carries no callable identity of its own and is
+    /// applied through the type-directed dispatch under
+    /// the pattern type the split's tag names.
+    fn decode(state: &Value, self_ty: &str) -> Option<Self> {
         let outer = iterator_fields(state, "").ok()?;
         if outer.len() != 1 {
             return None;
@@ -7755,7 +7816,13 @@ impl StrSplitPredParts {
         if searcher.len() != 3 {
             return None;
         }
-        if !matches!(searcher[0], Value::Closure { .. } | Value::FnPtr(_)) {
+        let predicate_applicable = match &searcher[0] {
+            Value::Closure { .. } | Value::FnPtr(_) => true,
+            Value::Enum { fields, .. } => fields.is_empty(),
+            Value::Tuple(fields) => fields.is_empty(),
+            _ => false,
+        };
+        if !predicate_applicable {
             return None;
         }
         let Value::Str(haystack) = &searcher[1] else {
@@ -7786,6 +7853,7 @@ impl StrSplitPredParts {
             front,
             back,
             predicate: searcher[0].clone(),
+            predicate_ty: first_generic_arg(self_ty).unwrap_or("").to_string(),
             allow_trailing_empty: internal[3] == Value::Bool(true),
             finished: internal[4] == Value::Bool(true),
         })
@@ -7847,9 +7915,10 @@ impl StrSplitPredParts {
         frames: &mut Vec<Frame>,
         c: char,
     ) -> InterpResult<bool> {
-        match interp.call_callable_sync(
+        match interp.call_callable_sync_typed(
             frames,
             &self.predicate,
+            &self.predicate_ty,
             None,
             vec![Value::Uint(c as u32 as u128)],
         )? {
