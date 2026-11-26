@@ -189,10 +189,14 @@ impl<'a> Interpreter<'a> {
             }
             let tail_offset =
                 align_up_u128(u128::from(desc.prefix_end), eff_align)?;
-            return Some((
-                tail_offset.checked_add(tail_size)?,
-                prefix_align.max(eff_align),
-            ));
+            let align = prefix_align.max(eff_align);
+            // The composed size is padded up to the composed
+            // alignment, as every layout's size is: a
+            // `WT<(u16, [u8])>` of length 3 spans 2 + (2 + 3)
+            // bytes of fields but its size is 8, not 7.
+            let size =
+                align_up_u128(tail_offset.checked_add(tail_size)?, align)?;
+            return Some((size, align));
         }
         if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
             return self.dst_tuple_layout_of(frames, carrier, meta, tag);
@@ -306,10 +310,10 @@ impl<'a> Interpreter<'a> {
             return Some((tail_size, tail_align));
         }
         let tail_offset = align_up_u128(prefix_end, tail_align)?;
-        Some((
-            tail_offset.checked_add(tail_size)?,
-            prefix_align.max(tail_align),
-        ))
+        let align = prefix_align.max(tail_align);
+        let size =
+            align_up_u128(tail_offset.checked_add(tail_size)?, align)?;
+        Some((size, align))
     }
 
     /// `ThinBox<T>` dereference, shared by `Deref` and
