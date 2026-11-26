@@ -6177,3 +6177,103 @@ fn run_mode_vec_many_pushes_realloc_o3() {
         "O3 repeated push growth must run to completion; stderr={stderr}"
     );
 }
+
+const VEC_EXTEND_RANGE_O3_SRC: &str = r#"
+fn main() {
+    let mut v = vec![0];
+    v.extend(1..4);
+    let mut ok = v.len() == 4 && v[0] == 0 && v[1] == 1 && v[2] == 2 && v[3] == 3;
+    let mut w: Vec<i32> = Vec::new();
+    w.extend(1..4);
+    ok = ok && w.len() == 3 && w[0] == 1 && w[2] == 3;
+    let mut u = vec![0, 0];
+    u.extend(1..4);
+    ok = ok && u.len() == 5 && u[4] == 3;
+    v.extend(4..6);
+    ok = ok && v.len() == 6 && v[4] == 4 && v[5] == 5;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// `Vec::extend` over a `Range` at opt-level 3: the vector a
+/// converted body built stands in its real aggregate form, and
+/// the append must write the new elements into the buffer
+/// storage and advance the aggregate's length field. Appending
+/// them as fields of the aggregate itself left the length
+/// reading as the field count (a three-element extend of
+/// `vec![0]` reported length 5) and the buffer aggregate where
+/// the first element belongs.
+#[test]
+fn run_mode_vec_extend_range_o3() {
+    let dir = temp_dir("vec-extend-range-o3");
+    let src = fixture(&dir, "case.rs", VEC_EXTEND_RANGE_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 extend over a Range must keep the length and elements; stderr={stderr}"
+    );
+}
+
+const VEC_EXTEND_SLICE_O3_SRC: &str = r#"
+fn main() {
+    let mut v = vec![0];
+    v.extend([1, 2, 3].iter().copied());
+    let mut ok = v.len() == 4 && v[0] == 0 && v[1] == 1 && v[2] == 2 && v[3] == 3;
+    let mut w = vec![0];
+    w.extend_from_slice(&[1, 2, 3]);
+    ok = ok && w.len() == 4 && w[0] == 0 && w[1] == 1 && w[2] == 2 && w[3] == 3;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// The slice-shaped appends at opt-level 3 (an iterator over a
+/// slice, and `extend_from_slice`) share the extend append's
+/// duty on a real-form vector (see
+/// `run_mode_vec_extend_range_o3`).
+#[test]
+fn run_mode_vec_extend_slice_o3() {
+    let dir = temp_dir("vec-extend-slice-o3");
+    let src = fixture(&dir, "case.rs", VEC_EXTEND_SLICE_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 slice extends must keep the length and elements; stderr={stderr}"
+    );
+}
+
+const VEC_WRITE_FMT_O3_SRC: &str = r#"
+use std::io::Write;
+fn main() {
+    let mut v: Vec<u8> = Vec::new();
+    let _ = write!(v, "hello");
+    let sum: u32 = v.iter().map(|b| *b as u32).sum();
+    let mut ok = v.len() == 5 && sum == 532;
+    let mut w = vec![b'x'];
+    let _ = write!(w, "yz");
+    let wsum: u32 = w.iter().map(|b| *b as u32).sum();
+    ok = ok && w.len() == 3 && wsum == 363;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// `write!` into a `Vec<u8>` at opt-level 3 appends through
+/// the same vector append as `extend` (see
+/// `run_mode_vec_extend_range_o3`): on a real-form vector the
+/// bytes land in the buffer storage and the length advances
+/// by the byte count.
+#[test]
+fn run_mode_vec_write_fmt_o3() {
+    let dir = temp_dir("vec-write-fmt-o3");
+    let src = fixture(&dir, "case.rs", VEC_WRITE_FMT_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 write! into a Vec<u8> must append the bytes; stderr={stderr}"
+    );
+}

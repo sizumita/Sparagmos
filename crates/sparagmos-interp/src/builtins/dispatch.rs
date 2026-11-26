@@ -812,11 +812,29 @@ impl<'a> Interpreter<'a> {
                             .bytes()
                             .map(|b| Value::Uint(b as u128))
                             .collect();
-                        vec_append_in_place(
-                            &mut state,
-                            &items,
-                            "Write::write_fmt for Vec<u8>",
-                        )?;
+                        if vec_real_aggregate_parts(&state).is_some() {
+                            let uninit_elem = uninit_elem_value_for_tag("u8");
+                            vec_ensure_capacity(
+                                self,
+                                &mut state,
+                                items.len(),
+                                false,
+                                &uninit_elem,
+                                1,
+                            );
+                            self.vec_append_real_form(
+                                frames,
+                                &mut state,
+                                &items,
+                                "Write::write_fmt for Vec<u8>",
+                            )?;
+                        } else {
+                            vec_append_in_place(
+                                &mut state,
+                                &items,
+                                "Write::write_fmt for Vec<u8>",
+                            )?;
+                        }
                         self.write_resolved(frames, &target, state)?;
                     }
                     _ => {
@@ -6353,11 +6371,15 @@ impl<'a> Interpreter<'a> {
                 let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
-                self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(self, slot, elems.len(), false, &uninit_elem, elem_size);
-                    vec_append_in_place(slot, &elems, "Vec::extend_from_slice")?;
-                    Ok(Value::Unit)
-                })
+                self.vec_append_resolved(
+                    frames,
+                    &target,
+                    &elems,
+                    "Vec::extend_from_slice",
+                    &uninit_elem,
+                    elem_size,
+                )?;
+                Ok(Value::Unit)
             }
             Builtin::VecPush => {
                 arity(2)?;
@@ -6368,11 +6390,15 @@ impl<'a> Interpreter<'a> {
                 let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
-                self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(self, slot, 1, false, &uninit_elem, elem_size);
-                    vec_append_in_place(slot, &[elem], "Vec::push")?;
-                    Ok(Value::Unit)
-                })
+                self.vec_append_resolved(
+                    frames,
+                    &target,
+                    &[elem],
+                    "Vec::push",
+                    &uninit_elem,
+                    elem_size,
+                )?;
+                Ok(Value::Unit)
             }
             Builtin::VecLen | Builtin::VecIsEmpty => {
                 arity(1)?;
@@ -6711,11 +6737,15 @@ impl<'a> Interpreter<'a> {
                 let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
-                self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(self, slot, items.len(), false, &uninit_elem, elem_size);
-                    vec_append_in_place(slot, &items, "Vec::extend_trusted")?;
-                    Ok(Value::Unit)
-                })
+                self.vec_append_resolved(
+                    frames,
+                    &target,
+                    &items,
+                    "Vec::extend_trusted",
+                    &uninit_elem,
+                    elem_size,
+                )?;
+                Ok(Value::Unit)
             }
             Builtin::VecFromIterNested => {
                 arity(1)?;
