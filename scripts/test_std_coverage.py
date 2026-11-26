@@ -60,8 +60,67 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::RangeInclusiveNew
         }
         _ if canonical.ends_with("::to_uppercase") => Builtin::ToUppercase,
-        _ => return None,
+        _ => return unicode_lookup_slow(canonical).or_else(|| float_method(canonical)),
     })
+}
+
+fn unicode_lookup_slow(canonical: &str) -> Option<Builtin> {
+    let module = canonical.strip_suffix("::lookup_slow")?;
+    let property = match module {
+        "core::unicode::unicode_data::alphabetic" => UnicodeProperty::Alphabetic,
+        "core::unicode::unicode_data::n" => UnicodeProperty::N,
+        _ => return None,
+    };
+    Some(Builtin::UnicodeLookupSlow(property))
+}
+
+fn float_method(canonical: &str) -> Option<Builtin> {
+    if let Some(rest) = canonical
+        .strip_prefix("core::f128::<impl f128>::")
+        .or_else(|| canonical.strip_prefix("std::f128::<impl f128>::"))
+    {
+        return float128_method(rest);
+    }
+    if let Some(rest) = canonical
+        .strip_prefix("core::f16::<impl f16>::")
+        .or_else(|| canonical.strip_prefix("std::f16::<impl f16>::"))
+    {
+        return float_method_named(rest).map(|op| Builtin::Float16Method { op });
+    }
+    let (method, f32) = if let Some(rest) = canonical
+        .strip_prefix("core::f32::<impl f32>::")
+        .or_else(|| canonical.strip_prefix("std::f32::<impl f32>::"))
+    {
+        (rest, true)
+    } else if let Some(rest) = canonical
+        .strip_prefix("core::f64::<impl f64>::")
+        .or_else(|| canonical.strip_prefix("std::f64::<impl f64>::"))
+    {
+        (rest, false)
+    } else {
+        return None;
+    };
+    let op = float_method_named(method)?;
+    Some(Builtin::FloatMethod { f32, op })
+}
+
+fn float_method_named(method: &str) -> Option<FloatOp> {
+    let op = match method {
+        "is_nan" => O::IsNan,
+        "powf" => O::Powf,
+        "to_bits" => O::ToBits,
+        _ => return None,
+    };
+    Some(op)
+}
+
+fn float128_method(method: &str) -> Option<Builtin> {
+    let op = match method {
+        "is_nan" => O::IsNan,
+        "to_bits" => O::ToBits,
+        _ => return None,
+    };
+    Some(Builtin::Float128Method { op })
 }
 '''
 
@@ -76,6 +135,27 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(reg.lookup("std::str::<impl str>::to_uppercase"))
         self.assertFalse(reg.lookup("std::vec::Vec::new"))
         self.assertFalse(reg.lookup("core::panicking::panic"))
+        # The `_ =>` fallback resolvers of `lookup`: float methods
+        # resolve under either the core or the std prefix, each with
+        # its own method table (powf is modelled for f32/f64/f16 but
+        # not for f128), and only the listed unicode_data modules
+        # resolve their `::lookup_slow` callee.
+        self.assertTrue(reg.lookup("core::f64::<impl f64>::to_bits"))
+        self.assertTrue(reg.lookup("std::f32::<impl f32>::powf"))
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::is_nan"))
+        self.assertTrue(reg.lookup("core::f128::<impl f128>::to_bits"))
+        self.assertFalse(reg.lookup("core::f128::<impl f128>::powf"))
+        self.assertFalse(reg.lookup("core::f16::<impl f16>::classify"))
+        self.assertTrue(reg.lookup(
+            "core::unicode::unicode_data::alphabetic::lookup_slow"))
+        self.assertFalse(reg.lookup(
+            "core::unicode::unicode_data::white_space::lookup_slow"))
+        self.assertFalse(reg.lookup(
+            "core::unicode::unicode_data::alphabetic::lookup"))
+        # lookup_qualified strips leading segments; lookup does not.
+        self.assertFalse(reg.lookup("vendor::std::io::_print"))
+        self.assertTrue(reg.lookup_qualified("vendor::std::io::_print"))
+        self.assertFalse(reg.lookup_qualified("std::vec::Vec::new"))
 
     def test_unknown_guard_is_an_error(self):
         bad = FIXTURE_BUILTINS.replace(
@@ -93,6 +173,24 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("std::iter::Iterator::next", reg.exact)
         self.assertTrue(reg.range_inclusive_new)
         self.assertTrue(reg.to_uppercase)
+        # Resolved only through the `lookup` fallback helpers: the
+        # float inherent methods and the unicode skiplist lookups.
+        self.assertTrue(reg.lookup("core::f64::<impl f64>::to_bits"))
+        self.assertTrue(reg.lookup("std::f64::<impl f64>::sqrt"))
+        self.assertTrue(reg.lookup("core::f32::<impl f32>::from_bits"))
+        self.assertTrue(reg.lookup("core::f16::<impl f16>::is_nan"))
+        self.assertTrue(reg.lookup("core::f128::<impl f128>::from_bits"))
+        self.assertTrue(reg.lookup(
+            "core::unicode::unicode_data::grapheme_extend::lookup_slow"))
+        # The unmodelled remainder of the same families stays out:
+        # f16 classify / byte conversions are not in the method
+        # table, f128 has no powf, and white_space is not one of the
+        # modelled unicode_data modules.
+        self.assertFalse(reg.lookup("core::f16::<impl f16>::classify"))
+        self.assertFalse(reg.lookup("core::f16::<impl f16>::to_be_bytes"))
+        self.assertFalse(reg.lookup("core::f128::<impl f128>::powf"))
+        self.assertFalse(reg.lookup(
+            "core::unicode::unicode_data::white_space::lookup_slow"))
 
 
 FIXTURE_DUMP = """sparagmos-mir-dump v0
