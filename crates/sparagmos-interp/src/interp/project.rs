@@ -68,6 +68,71 @@ impl<'a> Interpreter<'a> {
         Ok(value)
     }
 
+    /// Project `value` through `projection` by reference: the
+    /// borrowing form of [`Self::project_value_t`]. The steps
+    /// are exactly those of `project_value_t` -- runs of
+    /// ordinary steps go through [`project_value_ref_ev`], the
+    /// borrowing form of the segment projector, and each union
+    /// step is applied by [`Self::union_field_read`] -- so the
+    /// result and the errors are the owning projection's. The
+    /// difference is cost only: the owning form's caller must
+    /// hand it a clone of the base value, which for a base that
+    /// is a whole allocation (a hash table's bucket array, say)
+    /// copies every element on every read, while this form
+    /// lends the base and clones only the projected result and
+    /// the value a union step is applied to (the union instance
+    /// in hand at that step, not the base around it).
+    pub(crate) fn project_value_ref_t(
+        &self,
+        value: &Value,
+        projection: &[RefProj],
+        func: &str,
+        place: &str,
+        root_ty: Option<Ty>,
+    ) -> InterpResult<Value> {
+        // The value in hand: a borrow of the input tree, or an
+        // owned intermediate (a union step's constructed value,
+        // or a step's materialised result) staged in `stage`.
+        let mut stage: Option<Value> = None;
+        let mut cur: &Value = value;
+        let mut cur_ty = root_ty;
+        let mut i = 0;
+        while i < projection.len() {
+            if let RefProj::UnionField { idx, table } = projection[i] {
+                let next = self.union_field_read(cur.clone(), idx, table, func, place)?;
+                stage = Some(next);
+                cur = stage.as_ref().expect("staged union value");
+                cur_ty = stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, idx);
+                i += 1;
+            } else {
+                let start = i;
+                while i < projection.len()
+                    && !matches!(projection[i], RefProj::UnionField { .. })
+                {
+                    i += 1;
+                }
+                let segment = &projection[start..i];
+                let next = project_value_ref_ev(
+                    Some(self.program()),
+                    cur_ty.clone(),
+                    cur,
+                    segment,
+                    func,
+                    place,
+                )?;
+                cur_ty = step_ty_across(Some(self.program()), cur_ty, segment);
+                match next {
+                    Cow::Borrowed(v) => cur = v,
+                    Cow::Owned(v) => {
+                        stage = Some(v);
+                        cur = stage.as_ref().expect("staged segment value");
+                    }
+                }
+            }
+        }
+        Ok(cur.clone())
+    }
+
     /// Read field `idx` of a union `value`. The value holds one
     /// field's value — the last one written; every other slot is
     /// uninitialized (see the union arm of aggregate evaluation

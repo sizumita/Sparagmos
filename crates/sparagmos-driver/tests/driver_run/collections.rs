@@ -1229,6 +1229,72 @@ fn run_mode_hashmap_new_uses_modelled_random_keys() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const HASHSET_FLOOD_FILL_SRC: &str = r#"
+use std::collections::HashSet;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct XYZ {
+    x: isize,
+    y: isize,
+    z: isize,
+}
+
+fn inside(x: isize, y: isize, z: isize) -> bool {
+    x * x + 2 * y * y + 3 * z * z <= 60
+}
+
+fn main() {
+    let mut connected = HashSet::new();
+    let mut todo = HashSet::new();
+    let origin = XYZ { x: 0, y: 0, z: 0 };
+    connected.insert(origin.clone());
+    todo.insert(origin);
+    while connected.len() < 120 {
+        let current = todo.iter().next().unwrap().clone();
+        todo.remove(&current);
+        let deltas = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ];
+        for d in deltas {
+            let next = XYZ {
+                x: current.x + d.0,
+                y: current.y + d.1,
+                z: current.z + d.2,
+            };
+            if inside(next.x, next.y, next.z) && !connected.contains(&next) {
+                connected.insert(next.clone());
+                todo.insert(next);
+            }
+        }
+    }
+    assert!(connected.len() >= 120);
+    assert!(connected.contains(&XYZ { x: 0, y: 0, z: 0 }));
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashset_flood_fill() {
+    // A flood fill over two growing `HashSet`s: insert /
+    // contains / remove / iterate through the collected
+    // hashbrown bodies, reading bucket arrays that live in
+    // allocations. Guards the borrowing read projection the
+    // sets' per-operation cost now rests on: a read that
+    // projected the wrong bucket would fail the membership
+    // assertions in the guest.
+    let dir = temp_dir("hashset-flood-fill");
+    let src = fixture(&dir, "hashset_flood_fill.rs", HASHSET_FLOOD_FILL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
 const RANDOM_STATE_DEFAULT_SRC: &str = r#"
 use std::collections::HashMap;
 use std::hash::RandomState;
