@@ -1,4 +1,4 @@
-//! The `sigaction` / `raise` / `atexit` builtin bodies:
+//! The `sigaction` / `signal` / `raise` / `atexit` builtin bodies:
 //! the argument decoding around the interpreter's signal
 //! model (the state and the delivery live with the
 //! interpreter, in `interp`'s signal module).
@@ -24,6 +24,10 @@ use super::*;
 /// `struct sigaction` (after the 8-byte handler and the
 /// 128-byte `sa_mask`).
 const SA_FLAGS_OFFSET: usize = 136;
+
+/// The `SA_RESTART` flag word: the one flag the
+/// platform's `signal` installs its handlers with.
+const SA_RESTART: i64 = 0x1000_0000;
 
 impl<'a> Interpreter<'a> {
     /// `libc::sigaction(signum, act, oldact) -> c_int`:
@@ -99,6 +103,50 @@ impl<'a> Interpreter<'a> {
             self.write_resolved(frames, &target, previous_value)?;
         }
         Ok(Value::Int(0))
+    }
+
+    /// `libc::signal(signum, handler) -> sighandler_t`:
+    /// install `handler` as the disposition of `signum`
+    /// and answer the handler it replaces — the previously
+    /// installed action's handler field, or `SIG_DFL` when
+    /// no action was ever installed. The platform's
+    /// `signal` is the BSD form: the recorded action
+    /// carries the `SA_RESTART` flag, an empty mask and no
+    /// restorer, and the handler stays installed across
+    /// delivery (delivery in this model never uninstalls,
+    /// so the persistence needs no extra state). Signal
+    /// numbers outside `1..=64`, and the two uncatchable
+    /// signals (`SIGKILL`, `SIGSTOP`), answer `SIG_ERR`,
+    /// as the host call fails for them.
+    pub(super) fn exec_libc_signal(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        name: &str,
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        let _ = frames;
+        let signum = signal_number_arg(name, &vals[0])?;
+        if !(1..=64).contains(&signum) || signum == 9 || signum == 19 {
+            return Ok(Value::Uint(u64::MAX as u128));
+        }
+        // A null function pointer names the default
+        // disposition: record it in the sentinel-integer
+        // form delivery consults.
+        let handler = match &vals[1] {
+            Value::Ref(RefTarget::Null) => Value::Uint(0),
+            other => other.clone(),
+        };
+        let action = SignalAction {
+            handler: handler.clone(),
+            flags: SA_RESTART,
+            act: signal_action_structure(&handler),
+            runtime_init: false,
+        };
+        let previous = self.signal_install(signum, Some(action));
+        Ok(match previous {
+            Some(previous) => previous.handler,
+            None => Value::Uint(0),
+        })
     }
 
     /// `libc::raise(sig) -> c_int`: deliver the signal to
@@ -250,6 +298,29 @@ fn parse_sigaction(name: &str, act: &Value) -> InterpResult<SignalAction> {
         act: act.clone(),
         runtime_init: false,
     })
+}
+
+/// The `sigaction` structure value a `signal` install
+/// records: the handler, an empty `sigset_t` mask (the
+/// sixteen zero words of the set, in their wrapper
+/// structure), the `SA_RESTART` flags word `signal`
+/// installs with, and no restorer. A later `sigaction`
+/// call's `oldact` write-back hands this back verbatim,
+/// as it hands back a structure the guest itself
+/// installed.
+fn signal_action_structure(handler: &Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            handler.clone(),
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Tuple(vec![Value::Uint(0); 16])],
+            },
+            Value::Int(SA_RESTART as i128),
+            Value::Ref(RefTarget::Null),
+        ],
+    }
 }
 
 /// The all-zero twin of a structure value: every scalar

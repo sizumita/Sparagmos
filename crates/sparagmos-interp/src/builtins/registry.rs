@@ -1692,6 +1692,16 @@ pub enum Builtin {
     /// and its `SA_SIGINFO` flag (see the signal model in
     /// `interp`).
     LibcSigaction,
+    /// `libc::signal(signum, handler) -> sighandler_t`:
+    /// install `handler` as the disposition of `signum`
+    /// in the interpreter's signal table and answer the
+    /// handler it replaces (`SIG_DFL` when none was
+    /// installed), or `SIG_ERR` for a signal number the
+    /// host call refuses. The platform's `signal` is the
+    /// BSD form: the recorded action carries the
+    /// `SA_RESTART` flag and an empty mask (see
+    /// `exec_libc_signal` in `builtins::signals`).
+    LibcSignal,
     /// `libc::raise(sig) -> c_int`: deliver the signal to
     /// the guest itself, synchronously — the installed
     /// handler runs to completion before the call returns,
