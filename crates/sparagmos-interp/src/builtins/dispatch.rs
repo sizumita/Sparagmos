@@ -6013,6 +6013,10 @@ impl<'a> Interpreter<'a> {
                     let lhs = self.path_cmp_bytes(frames, &vals[0])?;
                     let rhs = self.path_cmp_bytes(frames, &vals[1])?;
                     path_components(&lhs) == path_components(&rhs)
+                } else if let Some(eq) =
+                    self.raw_pointer_equal(frames, generic_args, &vals[0], &vals[1])
+                {
+                    eq
                 } else if let Some(eq) = self.regrouped_slice_equal(
                     frames,
                     generic_args,
@@ -6035,6 +6039,10 @@ impl<'a> Interpreter<'a> {
                     let lhs = self.path_cmp_bytes(frames, &vals[0])?;
                     let rhs = self.path_cmp_bytes(frames, &vals[1])?;
                     Some(path_ordering(&lhs, &rhs))
+                } else if let Some(ord) =
+                    self.raw_pointer_cmp(frames, generic_args, &vals[0], &vals[1])
+                {
+                    ord
                 } else if let Some(ord) = self.regrouped_slice_cmp(
                     frames,
                     generic_args,
@@ -6063,6 +6071,10 @@ impl<'a> Interpreter<'a> {
                     let lhs = self.path_cmp_bytes(frames, &vals[0])?;
                     let rhs = self.path_cmp_bytes(frames, &vals[1])?;
                     Some(path_ordering(&lhs, &rhs))
+                } else if let Some(ord) =
+                    self.raw_pointer_cmp(frames, generic_args, &vals[0], &vals[1])
+                {
+                    ord
                 } else if let Some(ord) = self.regrouped_slice_cmp(
                     frames,
                     generic_args,
@@ -6092,6 +6104,10 @@ impl<'a> Interpreter<'a> {
                     let lhs = self.path_cmp_bytes(frames, &vals[0])?;
                     let rhs = self.path_cmp_bytes(frames, &vals[1])?;
                     Some(path_ordering(&lhs, &rhs))
+                } else if let Some(ord) =
+                    self.raw_pointer_cmp(frames, generic_args, &vals[0], &vals[1])
+                {
+                    ord
                 } else if let Some(ord) = self.regrouped_slice_cmp(
                     frames,
                     generic_args,

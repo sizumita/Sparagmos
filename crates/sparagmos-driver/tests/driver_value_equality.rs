@@ -30,6 +30,14 @@
 //!   not element-per-byte (which walks into the buffer
 //!   block's uninitialised spare-capacity slots, or past the
 //!   end of a constant array).
+//! * A raw pointer compared through its own `PartialEq` /
+//!   `PartialOrd` / `Ord` impls (including the mixed
+//!   `*const T == &T` form): the native impls compare
+//!   addresses, so the comparison builtins must price both
+//!   operands as addresses instead of resolving them to
+//!   their pointees -- resolving also recurses without
+//!   bound on a self-referential pointee (a stored pointer
+//!   denoting the very aggregate that holds it).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -301,5 +309,85 @@ fn main() {
 }
 "#,
         "slice-cmp-o3 ok",
+    );
+}
+
+#[test]
+fn mixed_raw_pointer_ref_equality_compares_addresses() {
+    assert_runs(
+        "mixed-ptr-eq",
+        r#"
+struct P { x: u32 }
+fn main() {
+    let a = P { x: 5 };
+    let b = P { x: 5 };
+    let pa = &a as *const P;
+    let pb = &b as *const P;
+    // Same-type binop control (lowers to BinOp::Eq).
+    assert!(pa != pb);
+    assert!(pa == pa);
+    // Mixed raw pointer / reference operands reach the
+    // `PartialEq` trait call; the pointees are equal, so a
+    // pointee comparison would wrongly report equality.
+    assert!(pa != &b);
+    assert!(pa == &a);
+    assert!(!(pa == &b));
+    // The explicit trait-call form of the same comparison.
+    assert!(!std::cmp::PartialEq::eq(&pa, &pb));
+    assert!(std::cmp::PartialEq::eq(&pa, &pa));
+    assert!(std::cmp::PartialEq::ne(&pa, &pb));
+    println!("mixed-ptr-eq ok");
+}
+"#,
+        "mixed-ptr-eq ok",
+    );
+}
+
+#[test]
+fn self_referential_pointer_equality_terminates() {
+    assert_runs(
+        "selfref-ptr-eq",
+        r#"
+use std::cell::Cell;
+struct Foo<'a> { p: Cell<Option<*const Foo<'a>>> }
+fn main() {
+    // The tls-dont-move-after-init shape: the stored
+    // pointer denotes the very aggregate that holds it, so
+    // a pointee comparison recurses without bound.
+    let f = Foo { p: Cell::new(None) };
+    f.p.set(Some(&f as *const Foo));
+    let q = f.p.get().unwrap();
+    assert!(q == &f);
+    assert!(std::cmp::PartialEq::eq(&q, &(&f as *const Foo)));
+    println!("selfref-ptr-eq ok");
+}
+"#,
+        "selfref-ptr-eq ok",
+    );
+}
+
+#[test]
+fn raw_pointer_trait_ordering_compares_addresses() {
+    assert_runs(
+        "ptr-trait-ord",
+        r#"
+use std::cmp::Ordering;
+struct P { x: u32 }
+fn main() {
+    let arr = [P { x: 30 }, P { x: 10 }, P { x: 20 }];
+    let p0 = &arr[0] as *const P;
+    let p1 = &arr[1] as *const P;
+    // Address order: p0 < p1. Pointee-value order: p1 < p0.
+    assert_eq!(std::cmp::Ord::cmp(&p0, &p1), Ordering::Less);
+    assert_eq!(std::cmp::Ord::cmp(&p1, &p0), Ordering::Greater);
+    assert_eq!(std::cmp::Ord::cmp(&p0, &p0), Ordering::Equal);
+    assert_eq!(std::cmp::PartialOrd::partial_cmp(&p0, &p1), Some(Ordering::Less));
+    assert!(!std::cmp::PartialOrd::lt(&p1, &p0));
+    assert!(std::cmp::PartialOrd::gt(&p1, &p0));
+    assert!(std::cmp::PartialOrd::le(&p0, &p0));
+    println!("ptr-trait-ord ok");
+}
+"#,
+        "ptr-trait-ord ok",
     );
 }

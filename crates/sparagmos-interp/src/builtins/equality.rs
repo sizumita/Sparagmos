@@ -45,6 +45,41 @@ fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
     }
 }
 
+
+/// Whether a comparison call's own type tags name a thin raw
+/// pointer as the comparison's subject: the `Self` tag (the
+/// first generic argument), with one leading reference layer
+/// stripped, opens with `*const ` / `*mut `. Core's cross
+/// impls put the raw pointer on the `Self` side (a
+/// `&T == *const T` comparison has no impl), and the `Rhs`
+/// tag is not consulted. A fat pointee (a slice, `str`, a
+/// `dyn` type) makes the pointer an (address, metadata)
+/// pair whose native equality also weighs the metadata, so
+/// those keep the ordinary path; a sized array pointee
+/// (`[T; N]`) is thin, like every other sized pointee. A raw
+/// pointer nested inside an aggregate tag
+/// (`Option<*const T>`) is a field comparison, which the
+/// structural recursion in `values_equal` judges, not this
+/// dispatch.
+fn comparison_subject_is_raw_pointer(generic_args: &[String]) -> bool {
+    let Some(tag) = generic_args.first() else {
+        return false;
+    };
+    let tag = tag
+        .strip_prefix("&mut ")
+        .or_else(|| tag.strip_prefix('&'))
+        .unwrap_or(tag);
+    let Some(pointee) = tag
+        .strip_prefix("*const ")
+        .or_else(|| tag.strip_prefix("*mut "))
+    else {
+        return false;
+    };
+    !(pointee.starts_with("dyn ")
+        || pointee == "str"
+        || (pointee.starts_with('[') && !pointee.contains(';')))
+}
+
 impl<'a> Interpreter<'a> {
     /// The element lists of a slice comparison's two
     /// operands when a side's fat pointer regroups its
@@ -128,6 +163,70 @@ impl<'a> Interpreter<'a> {
             }
             Ok(Some(ea.len().cmp(&eb.len())))
         })())
+    }
+
+    /// The address one operand of a raw-pointer comparison
+    /// denotes: the call passes a reference to the compared
+    /// value, so one dereference layer reaches the pointer
+    /// value itself, and `pointer_address` prices it in the
+    /// same model every other pointer identity uses. `None`
+    /// when the layer cannot be read or no address can be
+    /// derived, leaving the ordinary comparison in charge.
+    fn raw_pointer_operand_address(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<u128> {
+        let compared = match value {
+            Value::Ref(_) | Value::FatRef { .. } => {
+                let target = self.deref_value(frames, value).ok()?;
+                self.read_resolved(frames, &target).ok()?
+            }
+            _ => value.clone(),
+        };
+        self.pointer_address(frames, &compared, None)
+    }
+
+    /// Raw-pointer equality under the type's own `PartialEq`
+    /// (see `comparison_subject_is_raw_pointer`): the native
+    /// impls compare addresses, never the pointees the
+    /// structural comparison in `values_equal` would resolve
+    /// to -- which also makes a self-referential pointee (a
+    /// stored pointer denoting the very aggregate that holds
+    /// it) recurse without bound there. `None` when the
+    /// comparison is not a thin raw-pointer one or an
+    /// operand's address cannot be derived.
+    pub(crate) fn raw_pointer_equal(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<bool> {
+        if !comparison_subject_is_raw_pointer(generic_args) {
+            return None;
+        }
+        let x = self.raw_pointer_operand_address(frames, a)?;
+        let y = self.raw_pointer_operand_address(frames, b)?;
+        Some(x == y)
+    }
+
+    /// Raw-pointer ordering, the `PartialOrd` / `Ord`
+    /// counterpart of `raw_pointer_equal`: addresses order
+    /// as integers.
+    pub(crate) fn raw_pointer_cmp(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<Option<Ordering>> {
+        if !comparison_subject_is_raw_pointer(generic_args) {
+            return None;
+        }
+        let x = self.raw_pointer_operand_address(frames, a)?;
+        let y = self.raw_pointer_operand_address(frames, b)?;
+        Some(Some(x.cmp(&y)))
     }
 
     pub(crate) fn values_equal(
