@@ -30,6 +30,25 @@ def header(text):
     return run.Header(text)
 
 
+def _process_terminated(pid):
+    """Whether a process has terminated, zombie included.
+
+    A terminated process whose parent has not reaped it stays in
+    /proc as a zombie (state Z). Orphans reparented to an init
+    that never reaps keep that entry forever, so disappearance
+    from /proc is not a portable termination signal (Issue #486).
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    # Field 2 (comm) is parenthesised and may itself contain
+    # spaces or parens; the state letter is the first field after
+    # the closing paren.
+    fields = stat.rpartition(")")[2].split()
+    return bool(fields) and fields[0] == "Z"
+
+
 class HeaderTests(unittest.TestCase):
     def test_unscoped_and_scoped(self):
         h = header("//@ run-pass\n//@[rev1] check-pass\nfn main() {}\n")
@@ -1644,10 +1663,40 @@ class RunCmdMemoryLimitTests(unittest.TestCase):
         self.assertFalse(res["timeout"])
         child_pid = int(res["stdout"].strip())
         deadline = time.monotonic() + 5
-        while (Path(f"/proc/{child_pid}").exists()
+        while (not _process_terminated(child_pid)
                and time.monotonic() < deadline):
             time.sleep(0.1)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        # Terminated, not necessarily gone from /proc: once the
+        # root dies the child is reparented to PID 1, and an init
+        # that does not reap orphans leaves the killed child as a
+        # zombie indefinitely (Issue #486).
+        self.assertTrue(_process_terminated(child_pid))
+
+    def test_process_terminated_covers_zombies(self):
+        # A killed-but-unreaped child is a zombie: still in /proc,
+        # but terminated. A live child is not terminated, and a
+        # reaped (or never-existent) pid counts as terminated
+        # because its /proc entry is gone (Issue #486).
+        import subprocess
+        live = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"])
+        try:
+            self.assertFalse(_process_terminated(live.pid))
+            live.kill()
+            deadline = time.monotonic() + 5
+            while (not _process_terminated(live.pid)
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+            self.assertTrue(_process_terminated(live.pid))
+            # The child is our own and still unreaped here, so the
+            # True above can only have come from the zombie state.
+            self.assertTrue(Path(f"/proc/{live.pid}").exists())
+        finally:
+            if live.poll() is None:
+                live.kill()
+            live.wait()
+        self.assertTrue(_process_terminated(live.pid))
+        self.assertTrue(_process_terminated(999_999_999))
 
     def test_timeout_still_reported_with_the_bound_set(self):
         res = run.run_cmd(
