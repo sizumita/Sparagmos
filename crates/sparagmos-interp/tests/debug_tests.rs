@@ -1894,9 +1894,13 @@ fn union_print_degrades_an_unreadable_struct_sibling() {
 #[test]
 fn union_print_reads_a_fat_sibling_from_scalar_storage() {
     // A slice field read out of a written integer field's
-    // storage is the fat pointer those words name; in this
-    // dialect a fat pointer prints as its address, like the
-    // same value printed standalone.
+    // storage is the fat pointer those words name: the data
+    // word (5) as the pointer, the unwritten second word as
+    // length 0. The field's declared type is part of the
+    // union's debug shape, so the value carries its descriptor
+    // and renders in the dialect's fat-pointer form -- the
+    // DWARF struct form -- like the same value printed
+    // standalone.
     let mut s = session(union_written_program(
         vec![("bits", "u128"), ("s", "&[u8]")],
         vec![(None, 5)],
@@ -1908,14 +1912,17 @@ fn union_print_reads_a_fat_sibling_from_scalar_storage() {
     );
     assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
     assert!(
-        run.transcript
-            .iter()
-            .any(|l| l.starts_with("$1 = test::U {bits: 5, s: 0x")),
+        run.transcript.iter().any(|l| {
+            l.starts_with("$1 = test::U {bits: 5, s: &[u8] {data_ptr: 0x")
+                && l.ends_with(", length: 0}}")
+        }),
         "missing fat-sibling whole print in {:?}",
         run.transcript
     );
     assert!(
-        run.transcript.iter().any(|l| l.starts_with("$2 = 0x")),
+        run.transcript
+            .iter()
+            .any(|l| l.starts_with("$2 = &[u8] {data_ptr: 0x")),
         "missing fat-sibling field print in {:?}",
         run.transcript
     );
