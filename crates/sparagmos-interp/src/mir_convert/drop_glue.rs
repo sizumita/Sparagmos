@@ -845,11 +845,14 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 return Some(collapse_fields(vec![bound], true));
             }
             "std::ops::RangeFull" => return Some(P::Trivial),
-            "std::array::IntoIter" | "core::array::IntoIter" => {
+            "std::array::IntoIter" | "core::array::IntoIter"
+            | "std::boxed::BoxedArrayIntoIter" => {
                 // The modelled state holds the buffer's elements
                 // in a tuple with yielded slots marked `Uninit`,
                 // so the elements' glue is exact (see
-                // `owned_iter_plan`).
+                // `owned_iter_plan`). (`BoxedArrayIntoIter`'s
+                // modelled state is the same [items, next index]
+                // pair its `into_iter` builds.)
                 let elem = self.plan(args.first()?)?;
                 return Some(owned_iter_plan(elem));
             }
