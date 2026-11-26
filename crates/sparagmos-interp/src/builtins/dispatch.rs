@@ -6156,7 +6156,7 @@ impl<'a> Interpreter<'a> {
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(slot, elems.len(), false, &uninit_elem, elem_size);
+                    vec_ensure_capacity(self, slot, elems.len(), false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &elems, "Vec::extend_from_slice")?;
                     Ok(Value::Unit)
                 })
@@ -6171,7 +6171,7 @@ impl<'a> Interpreter<'a> {
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(slot, 1, false, &uninit_elem, elem_size);
+                    vec_ensure_capacity(self, slot, 1, false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &[elem], "Vec::push")?;
                     Ok(Value::Unit)
                 })
@@ -6301,7 +6301,7 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 let exact = name.ends_with("reserve_exact");
                 self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(slot, additional, exact, &uninit_elem, elem_size);
+                    vec_ensure_capacity(self, slot, additional, exact, &uninit_elem, elem_size);
                     Ok(Value::Unit)
                 })
             }
@@ -6364,6 +6364,7 @@ impl<'a> Interpreter<'a> {
                     let exact = name.ends_with("try_reserve_exact");
                     self.modify_resolved(frames, &target, |slot| {
                         vec_ensure_capacity(
+                            self,
                             slot,
                             additional,
                             exact,
@@ -6513,7 +6514,7 @@ impl<'a> Interpreter<'a> {
                 let uninit_elem = uninit_elem_value_for_tag(elem_tag);
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
-                    vec_ensure_capacity(slot, items.len(), false, &uninit_elem, elem_size);
+                    vec_ensure_capacity(self, slot, items.len(), false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &items, "Vec::extend_trusted")?;
                     Ok(Value::Unit)
                 })
@@ -8110,6 +8111,22 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VolatileLoad => {
                 arity(1)?;
+                // A zero-sized pointee has a single value and no
+                // storage: loading it through a storage-less
+                // pointer (the null pointer a read_volatile of a
+                // zero-sized type passes) fabricates that value
+                // instead of dereferencing, mirroring the
+                // zero-sized volatile store's early return below.
+                if let Some(ty) = args
+                    .first()
+                    .and_then(|a| crate::interp::operand_pointee_ty(body, a))
+                {
+                    if let Some(resolved) =
+                        self.storage_less_zst_deref(&vals[0], Some(&ty))
+                    {
+                        return self.read_resolved(frames, &resolved);
+                    }
+                }
                 let target = self.deref_value(frames, &vals[0])?;
                 // As with the atomic load: a wider-than-byte
                 // access into byte storage composes the bytes.

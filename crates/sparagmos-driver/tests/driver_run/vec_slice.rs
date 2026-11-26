@@ -5705,3 +5705,37 @@ fn run_mode_offset_from_wrapper_denominated_pointer() {
         "dist 16\ndist2 -16\n",
     );
 }
+
+
+const VEC_RESIZE_OPT_SRC: &str = r#"
+fn main() {
+    // At opt-level 3 the reserve and the element writes are
+    // inlined into one body: the vector value the guest built
+    // is the real RawVec aggregate, whose buffer pointer
+    // field still holds the dangling pointer after the
+    // capacity grows -- the growth must install storage
+    // behind it for the writes in extend_with to land (the
+    // shape tests/ui/moves/bycopy_untupled.rs exercises in
+    // its opt revision).
+    let mut v: Vec<usize> = Vec::new();
+    v.resize(2, 1);
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0], 1);
+    assert_eq!(v[1], 1);
+    println!("vec-resize-opt-ok");
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_opt_level_3() {
+    let dir = temp_dir("vec-resize-opt");
+    let src = fixture(&dir, "vec_resize_opt.rs", VEC_RESIZE_OPT_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec resize at opt-level 3 must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "vec-resize-opt-ok\n");
+}

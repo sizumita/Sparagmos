@@ -452,6 +452,93 @@ fn set_real_vec_cap(slot: &mut Value, cap: usize) {
     }
 }
 
+/// Materialise the element storage of a real-aggregate vector
+/// value whose buffer pointer denotes no storage -- a null
+/// pointer, or an address no allocation owns (the dangling
+/// pointer std serves a fresh vector with): a fresh element
+/// block of `count` uninitialised elements, with the buffer
+/// pointer field rewritten to denote it, as a reallocation
+/// installs the new allocation's address in the field. A
+/// pointer that already denotes storage (an allocation, a
+/// place, a static, a registered address) is left exactly as
+/// it stands: the storage behind it grows on the writes that
+/// use it.
+fn ensure_real_vec_buffer_storage(
+    interp: &Interpreter,
+    slot: &mut Value,
+    count: usize,
+    uninit_elem: &Value,
+) {
+    let Some(ptr) = Interpreter::real_vec_buffer_ptr(slot) else {
+        return;
+    };
+    let storage_less = match &ptr {
+        Value::Ref(RefTarget::Null) => true,
+        Value::Ref(RefTarget::Address(addr)) => {
+            interp.address_owner(*addr).is_none()
+        }
+        _ => false,
+    };
+    if !storage_less {
+        return;
+    }
+    let id = interp.alloc_insert(Value::Tuple(vec![
+        uninit_elem.clone();
+        count
+    ]));
+    interp.mark_elem_block(id);
+    set_real_vec_buffer_ptr(
+        slot,
+        Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        }),
+    );
+}
+
+/// Rewrite the buffer pointer slot of a real-aggregate vector
+/// value (see `vec_real_aggregate_parts`) to `ptr`: the
+/// navigation mirrors `Interpreter::real_vec_buffer_ptr`,
+/// writing through the one-field wrapper when the slot holds
+/// one. A value whose chain does not have the recorded shape
+/// is left as it stands.
+fn set_real_vec_buffer_ptr(slot: &mut Value, ptr: Value) {
+    let Value::Enum { fields, .. } = slot else {
+        return;
+    };
+    let Some(buf) = fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: buf_fields, ..
+    } = buf
+    else {
+        return;
+    };
+    let Some(inner) = buf_fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: inner_fields,
+        ..
+    } = inner
+    else {
+        return;
+    };
+    let Some(first) = inner_fields.first_mut() else {
+        return;
+    };
+    match first {
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            if matches!(fields[0], Value::Ref(_) | Value::FatRef { .. }) {
+                fields[0] = ptr;
+            }
+        }
+        v @ (Value::Ref(_) | Value::FatRef { .. }) => *v = ptr,
+        _ => {}
+    }
+}
+
 /// Ensure the vector value in `slot` holds storage for
 /// `additional` elements past its declared length, growing the
 /// storage the way RawVec grows the allocation: amortized
@@ -462,6 +549,7 @@ fn set_real_vec_cap(slot: &mut Value, cap: usize) {
 /// takes toward a capacity past the limit: the storage the
 /// model can hold is the allocation it reports.
 pub(super) fn vec_ensure_capacity(
+    interp: &Interpreter,
     slot: &mut Value,
     additional: usize,
     exact: bool,
@@ -478,26 +566,35 @@ pub(super) fn vec_ensure_capacity(
     // reallocation's bookkeeping: the capacity slot moves to the
     // reached capacity, and the element storage behind the
     // buffer pointer grows on the writes that use it, as
-    // allocation storage does. A capacity the chain does not
-    // expose leaves the value as it stands.
+    // allocation storage does. A buffer pointer that denotes no
+    // storage at all is the exception: it has nothing for those
+    // writes to grow, so the storage is materialised and the
+    // field repointed (see `ensure_real_vec_buffer_storage`).
+    // A capacity the chain does not expose leaves the value as
+    // it stands.
     if let Some((_, agg_len)) = vec_real_aggregate_parts(slot) {
         let Some(cap) = Interpreter::real_vec_cap(slot) else {
             return;
         };
         let cap = usize::try_from(cap).unwrap_or(usize::MAX);
         let required = agg_len.saturating_add(additional);
-        if required <= cap {
-            return;
-        }
-        let target = if exact {
-            required
+        let reached = if required <= cap {
+            cap
         } else {
-            rawvec_amortized_capacity(cap, required, elem_size)
+            let target = if exact {
+                required
+            } else {
+                rawvec_amortized_capacity(cap, required, elem_size)
+            };
+            if target > MAX_VEC_SET_LEN_ELEMENTS {
+                return;
+            }
+            set_real_vec_cap(slot, target);
+            target
         };
-        if target > MAX_VEC_SET_LEN_ELEMENTS {
-            return;
+        if reached > 0 {
+            ensure_real_vec_buffer_storage(interp, slot, reached, uninit_elem);
         }
-        set_real_vec_cap(slot, target);
         return;
     }
     let (len, cap) = match &*slot {
