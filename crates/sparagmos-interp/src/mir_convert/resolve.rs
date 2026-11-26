@@ -545,6 +545,7 @@ fn convert_all_with(
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
+    out.adt_dst_layouts = program.adt_dst_layouts.clone();
     // The vtable identities the driver recorded as it minted
     // vtable-pointer constants, with each concrete type's name
     // rendered and its drop glue built the way a

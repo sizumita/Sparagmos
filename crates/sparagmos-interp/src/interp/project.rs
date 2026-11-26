@@ -1418,6 +1418,56 @@ impl<'a> Interpreter<'a> {
                 }
                 _ => None,
             },
+            // A `(data pointer, length)` tuple
+            // reinterpreted as a fat pointer (and the
+            // reverse): the tuple's two words ARE the fat
+            // pointer's two words, and the data word is a
+            // pointer value in this model, not a bit
+            // pattern — flattening it to its synthetic
+            // address and constructing an address-only
+            // pointer back severs the fat pointer from the
+            // place the data pointer denotes (the
+            // `PackedSized::unsize` transmute building a
+            // `&PackedUnsized` from `(self, len)`). Carry
+            // the pointer across as the value it is. The
+            // shape guard is the conversion side's own
+            // fat-words layout: a `Ptr` leaf at offset 0
+            // and a 64-bit integer leaf at offset 64. A
+            // `dyn` metadata word is an opaque identity
+            // this walk cannot rebuild, so the `Vtable`
+            // crossing keeps the bit path.
+            (
+                ScalarShape::Fields { fields, .. },
+                ScalarShape::FatPtr(crate::ir::FatMeta::Len),
+            ) if fat_words_layout(fields) => match value {
+                Value::Tuple(items) if items.len() == 2 => {
+                    let len = match &items[1] {
+                        Value::Uint(v) => Some(*v),
+                        Value::Int(v) => Some(*v as u64 as u128),
+                        _ => None,
+                    }?;
+                    match &items[0] {
+                        Value::Ref(_)
+                        | Value::FatRef { .. }
+                        | Value::DynRef { .. } => Some(Value::FatRef {
+                            base: Box::new(items[0].clone()),
+                            len,
+                        }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            (
+                ScalarShape::FatPtr(crate::ir::FatMeta::Len),
+                ScalarShape::Fields { fields, .. },
+            ) if fat_words_layout(fields) => match value {
+                Value::FatRef { base, len } => Some(Value::Tuple(vec![
+                    (**base).clone(),
+                    Value::Uint(*len),
+                ])),
+                _ => None,
+            },
             (
                 ScalarShape::AdtField {
                     index: si,
@@ -4419,3 +4469,16 @@ pub(crate) fn navigate_mut_grow<'x>(
         },
     }
 }
+
+/// Whether a `Fields` shape is a fat pointer's two words:
+/// a pointer leaf at bit offset 0 and a 64-bit integer
+/// leaf at bit offset 64 (the runtime mirror of the
+/// conversion side's `fat_words_fields`).
+fn fat_words_layout(fields: &[(u32, ScalarShape)]) -> bool {
+    fields.len() == 2
+        && fields[0].0 == 0
+        && fields[0].1 == ScalarShape::Ptr
+        && fields[1].0 == 64
+        && matches!(fields[1].1, ScalarShape::Int { bits: 64, .. })
+}
+

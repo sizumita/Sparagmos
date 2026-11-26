@@ -307,6 +307,7 @@ impl Converter {
         // driver's panic-capture hook, which is installed while
         // the compiler runs.)
         if adt_sizedness(def, args, 0) == Sizedness::Unsized {
+            self.record_dst_layout(def, args, &key);
             return;
         }
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
@@ -323,6 +324,123 @@ impl Converter {
         );
         self.record_field_layouts(def, args, &shape, &key);
         self.record_tag_layout(def, &shape, &key);
+    }
+
+    /// Record the runtime layout descriptor of one genuinely
+    /// unsized ADT instance (see `sm::AdtDstLayout`): the sized
+    /// prefix's extent and the one unsized field, from which
+    /// the interpreter composes the instance's dynamic layout.
+    /// The instance's own layout is never queried -- a proven
+    /// unsized instance is ill-formed for the layout query (see
+    /// `record_layout`) -- so the prefix is computed here from
+    /// the sized fields' own contained layout queries, laid out
+    /// the way the compiler lays them out among themselves: in
+    /// declaration order with alignment padding for a `repr(C)`
+    /// struct, and as a plain sum for the default
+    /// representation (whose layout orders the sized fields by
+    /// decreasing alignment, which inserts no padding between
+    /// them), each field's alignment capped by the repr's pack.
+    /// Only a struct or union with exactly one unsized field
+    /// gets a descriptor; every other shape stays unsupported.
+    fn record_dst_layout(
+        &mut self,
+        def: &AdtDef,
+        args: &rustc_public::ty::GenericArgs,
+        key: &str,
+    ) {
+        use rustc_public::ty::AdtKind;
+        let kind = def.kind();
+        if kind != AdtKind::Struct && kind != AdtKind::Union {
+            return;
+        }
+        if def.num_variants() != 1 {
+            return;
+        }
+        let Some(variant) =
+            def.variant(rustc_public::ty::VariantIdx::to_val(0))
+        else {
+            return;
+        };
+        let fields = variant.fields();
+        let repr = def.repr();
+        if repr.flags.is_simd {
+            return;
+        }
+        let pack = repr.pack;
+        let mut prefix_end: u64 = 0;
+        let mut prefix_align: u64 = 1;
+        let mut tail: Option<(usize, rustc_public::ty::Ty)> = None;
+        for (index, field) in fields.iter().enumerate() {
+            let fty = field.ty_with_args(args);
+            // Convert the field type as well: its own recording
+            // hooks (a nested DST instance's descriptor among
+            // them) hang off the conversion.
+            let _ = self.ty(&fty);
+            match ty_sizedness(&field.ty(), Some(args), 1) {
+                Sizedness::Unsized => {
+                    if tail.is_some() {
+                        return;
+                    }
+                    tail = Some((index, fty));
+                }
+                Sizedness::Sized => {
+                    // The same coroutine screen as
+                    // `record_field_layouts`: such a field's
+                    // layout query is not total.
+                    if ty_mentions_coroutine(&fty) {
+                        return;
+                    }
+                    let queried = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| fty.layout()),
+                    );
+                    let Ok(Ok(layout)) = queried else {
+                        return;
+                    };
+                    let shape = layout.shape();
+                    if shape.is_unsized() {
+                        return;
+                    }
+                    let size = shape.size.bytes() as u64;
+                    let eff_align = match pack {
+                        Some(cap) => shape.abi_align.min(cap),
+                        None => shape.abi_align,
+                    };
+                    prefix_align = prefix_align.max(eff_align);
+                    if kind == AdtKind::Union {
+                        prefix_end = prefix_end.max(size);
+                    } else if repr.flags.is_c {
+                        prefix_end =
+                            (prefix_end + eff_align - 1) & !(eff_align - 1);
+                        prefix_end += size;
+                    } else {
+                        prefix_end += size;
+                    }
+                }
+                Sizedness::Unknown => return,
+            }
+        }
+        let Some((tail_index, tail_ty)) = tail else {
+            return;
+        };
+        if kind == AdtKind::Struct && tail_index + 1 != fields.len() {
+            return;
+        }
+        if let Some(align) = repr.align {
+            prefix_align = prefix_align.max(align);
+        }
+        let tail_converted = self.ty(&tail_ty);
+        let tail_tag = self.layout_key(&tail_converted);
+        self.adt_dst_layouts.insert(
+            key.to_string(),
+            sm::AdtDstLayout {
+                prefix_end,
+                prefix_align,
+                pack,
+                tail_field: tail_index as u32,
+                tail_ty: tail_tag,
+                union: kind == AdtKind::Union,
+            },
+        );
     }
 
     /// Record the per-variant field byte layout of one ADT

@@ -17,6 +17,7 @@ impl Converter {
             vtable_demand: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
+            adt_dst_layouts: sm::AdtDstLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
             tuple_layouts: sm::TupleLayouts::new(),
             adt_tag_layouts: sm::AdtTagLayouts::new(),

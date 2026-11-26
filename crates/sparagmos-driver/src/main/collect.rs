@@ -1482,6 +1482,7 @@ fn collect() -> ControlFlow<()> {
         adt_discriminants: conv.adt_discriminants.clone(),
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),
+        adt_dst_layouts: conv.adt_dst_layouts.clone(),
         adt_field_layouts: conv.adt_field_layouts.clone(),
         tuple_layouts: conv.tuple_layouts.clone(),
         adt_tag_layouts: conv.adt_tag_layouts.clone(),
