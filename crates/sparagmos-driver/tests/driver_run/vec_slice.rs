@@ -4174,6 +4174,69 @@ fn run_mode_windows_displaced_slice_reads_elements() {
     );
 }
 
+const WINDOWS_NESTED_VEC_SRC: &str = r#"
+fn main() {
+    let v: Vec<Vec<usize>> = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]];
+    for w in v.windows(2) {
+        println!("w {} {} {} {}", w[0][0], w[1][0], w[0].len(), w[1].len());
+    }
+    let u: Vec<Vec<usize>> = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+    let w = u.windows(2).next().unwrap();
+    println!("c {} {}", w[0][1], w[1][0]);
+    let a: Vec<[u8; 2]> = vec![[1, 2], [3, 4], [5, 6]];
+    let w = a.windows(2).next().unwrap();
+    println!("a {}", w[0][1]);
+}
+"#;
+
+#[test]
+fn run_mode_windows_over_vec_of_vecs_index_reads() {
+    // A window the `Windows` step yields is a snapshot over
+    // the elements it materialised: indexing the window reads
+    // the window's elements themselves. The step used to
+    // denominate the snapshot's base as an element position
+    // inside its own element tuple, so an index step through
+    // the window composed onto that position and landed
+    // inside the first element whenever the element was
+    // itself a sequence: `w[0]` over a `Vec<Vec<usize>>`
+    // handed back the inner vector's first element (and
+    // `w[0].len()` died on the integer it found), for every
+    // inner-length shape -- the ones whose length equals the
+    // window size included. The outputs below are native
+    // rustc 1.100.0's.
+    run_ok(
+        "windows-nested-vec",
+        WINDOWS_NESTED_VEC_SRC,
+        "w 1 4 3 2\nw 4 6 2 4\nc 2 3\na 2\n",
+    );
+}
+
+const CHUNKS_NESTED_VEC_SRC: &str = r#"
+fn main() {
+    let v: Vec<Vec<usize>> = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9], vec![10]];
+    for c in v.chunks(2) {
+        println!("chunk {} {}", c[0][0], c[1][0]);
+    }
+    for c in v.rchunks(2) {
+        println!("rchunk {} {}", c[0][0], c[1][0]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_chunks_over_vec_of_vecs_index_reads() {
+    // The chunk family's yielded sub-slices are snapshots
+    // denominated exactly as the `Windows` step's windows
+    // are (see `run_mode_windows_over_vec_of_vecs_index_reads`):
+    // indexing a chunk of a `Vec<Vec<usize>>` reads the
+    // chunk's elements, not the inside of its first element.
+    run_ok(
+        "chunks-nested-vec",
+        CHUNKS_NESTED_VEC_SRC,
+        "chunk 1 4\nchunk 6 10\nrchunk 6 10\nrchunk 1 4\n",
+    );
+}
+
 const CHUNKS_WINDOWS_LEN_SRC: &str = r#"
 use std::iter::ExactSizeIterator;
 fn main() {
