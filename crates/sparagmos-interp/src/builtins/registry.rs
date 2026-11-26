@@ -544,6 +544,48 @@ pub enum Builtin {
     /// point where the remaining parties run (see
     /// `Interpreter::drain_threads`).
     BarrierWait,
+    /// `std::sys::sync::mutex::futex::Mutex::lock_contended`:
+    /// the sys mutex's contended acquisition: wait on the
+    /// cooperative scheduler until the holder releases the
+    /// lock, then take it (see
+    /// `Interpreter::sys_mutex_lock_contended`).
+    SysMutexLockContended,
+    /// `std::sys::sync::mutex::futex::Mutex::wake`: the wake
+    /// half of the sys mutex's unlock. The caller's swap has
+    /// already published the unlocked word; in the cooperative
+    /// model a waiter observes the word at its next activation,
+    /// so there is no wait queue to notify and the call does
+    /// nothing.
+    SysMutexWake,
+    /// `std::sys::sync::rwlock::futex::RwLock::read_contended`:
+    /// the sys rwlock's contended read acquisition (see
+    /// `Interpreter::sys_rwlock_read_contended`).
+    SysRwLockReadContended,
+    /// `std::sys::sync::rwlock::futex::RwLock::write_contended`:
+    /// the sys rwlock's contended write acquisition (see
+    /// `Interpreter::sys_rwlock_write_contended`).
+    SysRwLockWriteContended,
+    /// `std::sys::sync::rwlock::futex::RwLock::wake_writer_or_readers`:
+    /// the sys rwlock's post-unlock wake routing: clear the
+    /// waiting bits the caller left, handing the lock to a
+    /// waiting writer (through the writer-notify word) or to
+    /// the waiting readers (see
+    /// `Interpreter::sys_rwlock_wake_writer_or_readers`).
+    SysRwLockWakeWriterOrReaders,
+    /// `std::sys::sync::futex::unix::futex_wait`: the futex
+    /// wait the sys locks, `Once`, the condvar and the thread
+    /// parker sleep on: wait until the word differs from the
+    /// expected value (see `Interpreter::futex_wait`).
+    FutexWait,
+    /// `std::sys::sync::futex::unix::futex_wake`: wake one
+    /// futex waiter. A waiter in this model observes the word
+    /// at its next activation, so there is no wait queue to
+    /// notify; the result reports that none was woken, which
+    /// some platforms always report as well.
+    FutexWake,
+    /// `std::sys::sync::futex::unix::futex_wake_all`: wake
+    /// every futex waiter (see `Builtin::FutexWake`).
+    FutexWakeAll,
     /// `std::backtrace::Backtrace::capture()`: a backtrace of
     /// the current call stack when the run's backtrace
     /// settings enable capture, a disabled one otherwise

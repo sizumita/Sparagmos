@@ -2407,6 +2407,70 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
+            Builtin::SysMutexLockContended => {
+                arity(1)?;
+                self.sys_mutex_lock_contended(frames, &vals[0], name)
+            }
+            Builtin::SysMutexWake => {
+                arity(1)?;
+                // The caller's swap has already published the
+                // unlocked word; a waiter in this model
+                // observes the word at its next activation, so
+                // there is no wait queue to notify.
+                Ok(Value::Unit)
+            }
+            Builtin::SysRwLockReadContended => {
+                arity(1)?;
+                self.sys_rwlock_read_contended(frames, &vals[0], name)
+            }
+            Builtin::SysRwLockWriteContended => {
+                arity(1)?;
+                self.sys_rwlock_write_contended(frames, &vals[0], name)
+            }
+            Builtin::SysRwLockWakeWriterOrReaders => {
+                arity(2)?;
+                let state = match self.resolve_value(frames, &vals[1])? {
+                    Value::Uint(n) => n as u32,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "an rwlock state word",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                self.sys_rwlock_wake_writer_or_readers(frames, &vals[0], state, name)
+            }
+            Builtin::FutexWait => {
+                arity(3)?;
+                let expected = match self.resolve_value(frames, &vals[1])? {
+                    Value::Uint(n) => n as u32,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "a futex expected word",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let has_timeout = matches!(
+                    self.resolve_value(frames, &vals[2])?,
+                    Value::Enum { variant: 1, .. }
+                );
+                self.futex_wait(frames, &vals[0], expected, has_timeout, name)
+            }
+            Builtin::FutexWake => {
+                arity(1)?;
+                // A waiter in this model observes the word at
+                // its next activation, so there is no wait
+                // queue to notify; some platforms always
+                // report that none was woken, as this does.
+                Ok(Value::Bool(false))
+            }
+            Builtin::FutexWakeAll => {
+                arity(1)?;
+                Ok(Value::Unit)
+            }
             Builtin::BacktraceCapture => {
                 arity(0)?;
                 Ok(backtrace_value(frames, false))
