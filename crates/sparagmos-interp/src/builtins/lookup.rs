@@ -1605,6 +1605,15 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
+        "std::ops::FnPtr::addr" | "core::ops::FnPtr::addr" => {
+            Builtin::FnPtrAddr
+        }
+        "std::ops::FnPtr::as_ptr" | "core::ops::FnPtr::as_ptr" => {
+            Builtin::FnPtrAsPtr
+        }
+        "std::ops::FnPtr::from_ptr" | "core::ops::FnPtr::from_ptr" => {
+            Builtin::FnPtrFromPtr
+        }
         "std::ptr::copy_nonoverlapping" | "std::ptr::copy" => Builtin::PtrCopy,
         "std::intrinsics::compare_bytes" | "core::intrinsics::compare_bytes" => {
             Builtin::CompareBytes

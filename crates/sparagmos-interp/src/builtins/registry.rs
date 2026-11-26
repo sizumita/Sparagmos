@@ -1194,6 +1194,29 @@ pub enum Builtin {
     /// here; the buffer chain's capacity slot in place
     /// resolution gives the same answer.
     VecCapacity,
+    /// `std::ops::FnPtr::addr`: the function pointer's
+    /// address as an integer. `addr` has a default body in
+    /// core (`self.as_ptr().addr().get()`), but its callees
+    /// are the lang-item methods below, which have no bodies
+    /// at all, so the entry point is modelled directly with
+    /// the same meaning: the synthetic address every other
+    /// exposure of the same function value agrees on.
+    FnPtrAddr,
+    /// `std::ops::FnPtr::as_ptr` (`#[lang = "fn_ptr_as_ptr"]`):
+    /// the function pointer as a raw code pointer. The
+    /// compiler provides this method; it has no MIR body.
+    /// The result is the address-only reference the
+    /// `FnPtrToPtr` cast produces, in the `NonNull` scalar
+    /// shape (a bare pointer in this model).
+    FnPtrAsPtr,
+    /// `std::ops::FnPtr::from_ptr`
+    /// (`#[lang = "fn_ptr_from_ptr"]`): rebuild the function
+    /// pointer value a code pointer denotes. The compiler
+    /// provides this method; it has no MIR body. The
+    /// pointer's address must be one a function pointer was
+    /// exposed at in this run -- the round trip the method's
+    /// safety contract requires.
+    FnPtrFromPtr,
     /// `core::slice::<impl [T]>::iter(&slice)`: a slice iterator state
     /// (element snapshot + next index), the shape `Iterator::next`
     /// consumes for `std::slice::Iter`.

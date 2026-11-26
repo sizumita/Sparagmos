@@ -1357,7 +1357,9 @@ impl<'a> Interpreter<'a> {
             .chain(self.program.unconverted.keys())
         {
             let base = key.split('#').next().unwrap_or(key.as_str());
-            let Some((self_part, trait_base, key_method)) = parse_impl_key(base) else {
+            let Some((self_part, trait_base, key_method)) =
+                parse_impl_key(base).or_else(|| parse_impl_block_key(base))
+            else {
                 continue;
             };
             if key_method != method
@@ -1928,6 +1930,36 @@ fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
     }
     let inner = head.strip_prefix('<')?;
     let (self_part, trait_part) = inner.split_once(" as ")?;
+    if self_part.is_empty() || trait_part.is_empty() {
+        return None;
+    }
+    let trait_base = trait_part.split('<').next().unwrap_or(trait_part);
+    Some((
+        self_part.to_string(),
+        trait_base.to_string(),
+        method.to_string(),
+    ))
+}
+
+/// Parse an impl body key in the impl-block path form the
+/// driver records for impls inside a module (foreign crates in
+/// particular): `some::module::<impl Trait<..> for Self>::method`.
+/// Returns the `Self` section, the trait path without generic
+/// arguments, and the method name, as [`parse_impl_key`] does
+/// for the `<Self as Trait>::method` form. Mirrors the
+/// conversion-side parser of the same name in
+/// `mir_convert::helpers`, which resolves the same keys when a
+/// call is converted.
+fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
+    let (head, method) = base.rsplit_once(">::")?;
+    if method.is_empty() || method.contains("::") {
+        return None;
+    }
+    // The `>::` separator consumed the impl's closing `>`, so
+    // `head` ends with the `Self` section itself.
+    let marker = head.rfind("::<impl ")?;
+    let inner = &head[marker + "::<impl ".len()..];
+    let (trait_part, self_part) = inner.split_once(" for ")?;
     if self_part.is_empty() || trait_part.is_empty() {
         return None;
     }

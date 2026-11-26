@@ -4015,3 +4015,27 @@ fn foo() { }
 fn run_mode_cast_rfc0401_full_record() {
     run_ok("cast-rfc0401-full", CAST_RFC0401_SRC, "");
 }
+
+const FN_PTR_TRAIT_SRC: &str = r#"
+#![feature(fn_static)]
+use std::ops::FnPtr;
+
+fn bar(x: u64) -> u64 { x + 1 }
+
+fn main() {
+    let b = bar as fn(u64) -> u64;
+    assert_eq!(b.addr(), bar as *const () as usize);
+    let f = unsafe { <fn(u64) -> u64 as FnPtr>::from_ptr(b.as_ptr()) };
+    assert_eq!(f(42), b(42));
+    println!("fnptr ok");
+}
+"#;
+
+#[test]
+fn run_mode_fn_ptr_trait_addr_as_ptr_from_ptr() {
+    // `FnPtr::as_ptr` / `from_ptr` are lang items the compiler
+    // provides (no MIR body exists), and `addr` is defined in
+    // terms of them; all three are interpreter builtins over
+    // the synthetic address a function value is exposed at.
+    run_ok("fn-ptr-trait", FN_PTR_TRAIT_SRC, "fnptr ok\n");
+}
