@@ -253,6 +253,22 @@ impl<'a> Converter<'a> {
                             } else {
                                 ir::Rvalue::PtrField(v, depth)
                             }
+                        } else if let Some(depth) = ctx
+                            .as_ref()
+                            .filter(|src| {
+                                self.cast_crosses_prefix_field(src, target)
+                            })
+                            .and_then(|src| self.cast_exit_depth(src, target))
+                        {
+                            // The reverse of the entry above: a
+                            // cast from a struct's first field back
+                            // to the struct itself (a prefix field
+                            // read back as the whole aggregate)
+                            // denotes the enclosing value again, so
+                            // the field-0 entries the pointer
+                            // carries come off (see
+                            // `cast_exit_depth`).
+                            ir::Rvalue::PtrFieldBase(v, depth)
                         } else if ctx.as_ref().is_some_and(|src| {
                             self.cast_enters_first_element(src, target)
                         }) {
@@ -572,6 +588,7 @@ impl<'a> Converter<'a> {
                         operands: fields,
                         field_index: *field_index,
                         units_from: None,
+                        payload_entry: None,
                     }
                 }
                 mir::AggregateKind::Closure { def, generic_args } => {

@@ -237,8 +237,170 @@ impl<'a> Converter<'a> {
         self.wrapper_peel(current, target)
     }
 
-    /// Peel wrapper layers (`UnsafeCell` / `MaybeUninit`, and
-    /// single-field array structs) off `current` until it matches
+    /// The retargeting a pointer cast from `source` to `target`
+    /// denotes when it is the reverse of a field-0 entry (see
+    /// [`Self::cast_entry_depth`]): the target pointee is an
+    /// aggregate whose field-0 peel lands exactly on the source
+    /// pointee, so the cast removes that many field-0 entries
+    /// from the pointer's projection and the result denotes the
+    /// enclosing aggregate again. This is the cast std's B-tree
+    /// node code performs when it reads an internal node back out
+    /// of the leaf-typed node pointer (`node.as_ptr() as *mut
+    /// InternalNode`). `None` when the target's peel never lands
+    /// on the source pointee.
+    pub(super) fn cast_exit_depth(
+        &self,
+        source: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<u32> {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let source = pointee(source)?;
+        let mut current = pointee(target)?.clone();
+        let mut depth = 0u32;
+        loop {
+            let (next, _) = self.peel_step(&current)?;
+            depth += 1;
+            if Self::cast_ty_matches(&next, source) {
+                return Some(depth);
+            }
+            current = next;
+        }
+    }
+
+    /// One step of the field-0 peel (see [`Self::wrapper_peel`]):
+    /// the type a field-0 entry into a value of type `current`
+    /// denotes, when `current` is a shape such an entry crosses.
+    /// Both wrapper kinds are one-field aggregates in the value
+    /// model -- `UnsafeCell` by its declared shape, and
+    /// `MaybeUninit` by the field-0 convention its pointer
+    /// accesses use (`MaybeUninit::new` constructions store the
+    /// payload at field 0 of the union value) -- so entering
+    /// either appends a field-0 projection. A single-field struct
+    /// whose only field is an array is entered the same way (the
+    /// `as_array` idiom). A struct with at least two fields whose
+    /// first field is an aggregate is a prefix struct: its first
+    /// field is stored as a real sub-aggregate at the head of the
+    /// value, so a cast to the first field's type denotes that
+    /// field exactly as a wrapper entry denotes a wrapper's only
+    /// field. `None` when no field-0 entry is denoted.
+    /// The step also reports whether it was a prefix-field step
+    /// (crossing a prefix struct's first field, as opposed to a
+    /// transparent wrapper or a single-field array struct): the
+    /// crossing that changes what a pointer denotes beyond the
+    /// wrapper conventions the access points already reconcile,
+    /// which the transmute decisions below key on.
+    fn peel_step(&self, current: &mir::Ty) -> Option<(mir::Ty, bool)> {
+        let mir::Ty::Adt(def, args) = current else {
+            return None;
+        };
+        let name = self.def_display_name(def);
+        let is_wrapper = matches!(
+            name.as_str(),
+            "std::cell::UnsafeCell"
+                | "core::cell::UnsafeCell"
+                | "std::mem::MaybeUninit"
+                | "core::mem::MaybeUninit"
+        );
+        if is_wrapper && args.len() == 1 {
+            return Some((args[0].clone(), false));
+        }
+        if let Some(field) = self
+            .single_field_ty(def, args)
+            .filter(|field| matches!(field, mir::Ty::Array(..)))
+        {
+            // The restriction to array fields is load-bearing:
+            // scalar-field wrappers include representation
+            // wrappers over values this model stores bare (the
+            // atomics' alignment wrappers), where a field
+            // projection would address storage that is not there.
+            return Some((field, false));
+        }
+        self.prefix_field_ty(def, args).map(|ty| (ty, true))
+    }
+
+    /// Peel `from`'s field-0 layers (see [`Self::peel_step`])
+    /// looking for an exact landing on `to`: `Some(crossed)` --
+    /// whether any step crossed a prefix struct's first field --
+    /// when the peel lands, `None` when it does not.
+    fn peel_lands_on(&self, from: &mir::Ty, to: &mir::Ty) -> Option<bool> {
+        let mut current = from.clone();
+        let mut crossed = false;
+        loop {
+            let (next, is_prefix) = self.peel_step(&current)?;
+            crossed |= is_prefix;
+            if Self::cast_ty_matches(&next, to) {
+                return Some(crossed);
+            }
+            current = next;
+        }
+    }
+
+    /// Whether a cast or transmute between the pointer types
+    /// `source` and `target` retargets the pointer across a
+    /// prefix struct's first field, in either direction (the
+    /// target pointee is reached from the source pointee by a
+    /// field-0 peel that crosses a prefix struct, or the
+    /// reverse). A crossing of only transparent wrappers returns
+    /// false: those denotations the model's access points
+    /// already reconcile, and their established handling does
+    /// not change.
+    pub(super) fn cast_crosses_prefix_field(
+        &self,
+        source: &mir::Ty,
+        target: &mir::Ty,
+    ) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let (Some(sp), Some(tp)) = (pointee(source), pointee(target)) else {
+            return false;
+        };
+        matches!(self.peel_lands_on(sp, tp), Some(true))
+            || matches!(self.peel_lands_on(tp, sp), Some(true))
+    }
+
+    /// The field-0 retarget a pointer of type `from` undergoes
+    /// when it is reinterpreted as a pointer of type `to` across
+    /// a prefix struct's first field (see
+    /// [`Self::cast_crosses_prefix_field`]): `Some((true, depth))`
+    /// for an entry (the `to` pointee is the `from` pointee's
+    /// first field, reached by `depth` field-0 entries) and
+    /// `Some((false, depth))` for the reverse exit. `None` when
+    /// the two pointer types stand in no prefix relation (or in
+    /// a wrapper-only one, whose denotations the access points
+    /// already reconcile), so the pointer carries over with its
+    /// denotation unchanged. The array-element continuation of
+    /// an entry peel has no whole-pointee counterpart and does
+    /// not count as a retarget.
+    pub(super) fn prefix_retarget(
+        &self,
+        from: &mir::Ty,
+        to: &mir::Ty,
+    ) -> Option<(bool, u32)> {
+        if !self.cast_crosses_prefix_field(from, to) {
+            return None;
+        }
+        match (
+            self.cast_entry_depth(from, to),
+            self.cast_exit_depth(from, to),
+        ) {
+            (Some((depth, false)), _) => Some((true, depth)),
+            (_, Some(depth)) => Some((false, depth)),
+            _ => None,
+        }
+    }
+
+    /// Peel field-0 layers (transparent wrappers, single-field
+    /// array structs, and prefix structs; see
+    /// [`Self::peel_step`]) off `current` until it matches
     /// `target`, returning the number of field-0 entries the peel
     /// denotes -- and, when the innermost peeled layer is an
     /// array (or slice) whose element type is exactly `target`,
@@ -252,45 +414,9 @@ impl<'a> Converter<'a> {
     ) -> Option<(u32, bool)> {
         let mut depth = 0u32;
         loop {
-            let mir::Ty::Adt(def, args) = &current else {
-                return None;
-            };
-            // Both wrapper kinds are one-field aggregates in the
-            // value model -- `UnsafeCell` by its declared shape, and
-            // `MaybeUninit` by the field-0 convention its pointer
-            // accesses use (`MaybeUninit::new` constructions store
-            // the payload at field 0 of the union value) -- so
-            // entering either appends a field-0 projection. The
-            // layers must be peeled to know whether the cast lands
-            // exactly on the target pointee.
-            let name = self.def_display_name(def);
-            let is_wrapper = matches!(
-                name.as_str(),
-                "std::cell::UnsafeCell"
-                    | "core::cell::UnsafeCell"
-                    | "std::mem::MaybeUninit"
-                    | "core::mem::MaybeUninit"
-            );
-            let next = if is_wrapper && args.len() == 1 {
-                args[0].clone()
-            } else if let Some(field) = self.single_field_ty(def, args)
-                .filter(|field| matches!(field, mir::Ty::Array(..)))
-            {
-                // A single-field struct whose only field is an
-                // array is entered the same way when the cast's
-                // target is exactly the field's type: the
-                // `as_array` idiom (`&*p.cast::<[T; N]>()` on a
-                // `Simd([T; N])` or an array newtype) denotes the
-                // field, not the aggregate. The restriction to
-                // array fields is load-bearing: scalar-field
-                // wrappers include representation wrappers over
-                // values this model stores bare (the atomics'
-                // alignment wrappers), where a field projection
-                // would address storage that is not there.
-                field
-            } else {
-                return None;
-            };
+            // The layers must be peeled to know whether the cast
+            // lands exactly on the target pointee.
+            let (next, _) = self.peel_step(&current)?;
             depth += 1;
             if Self::cast_ty_matches(&next, target) {
                 return Some((depth, false));

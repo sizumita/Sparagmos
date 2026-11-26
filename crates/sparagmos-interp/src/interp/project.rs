@@ -2713,10 +2713,13 @@ fn wrapper_descent_sanctioned(
     // tuple root: a tuple materialised field by field has the
     // same one-field stored form as a struct): the stored
     // form is a value of that variant, and the step addresses
-    // its fields. Declaring at most one field leaves the
+    // its fields. Declaring exactly one field leaves the
     // descent standing. Declaring more fields makes the
     // one-field stored form that variant's own partially
     // materialised value, and the completeness check decides.
+    // Declaring no fields at all refutes the descent: such a
+    // type has no interior for the step to address and no
+    // one-field stored form of its own.
     let (declared_len, slot_ty) = match ty {
         Ty::Adt(name) => {
             let Some(variants) = adt_field_tys_of(program, name) else {
@@ -2743,7 +2746,20 @@ fn wrapper_descent_sanctioned(
         Ty::Tuple(ts) => (ts.len(), Ty::Tuple(ts.clone())),
         _ => return true,
     };
-    if declared_len <= 1 {
+    if declared_len == 0 {
+        // A type declaring no fields has no sole field whose
+        // interior the step could address, and its own value is
+        // a unit, never a one-field aggregate: the evidence
+        // cannot describe this slot. That is the shape a type
+        // walk produces when it steps through a union's
+        // unit-typed field (a `MaybeUninit`'s `uninit` field)
+        // while the value walk selects the union's payload --
+        // the two walks have parted, and the step belongs to
+        // the slot's own stored fields, which the ordinary
+        // field arm grows into place.
+        return false;
+    }
+    if declared_len == 1 {
         return true;
     }
     value_complete_for_ty(program, &fields[0], &slot_ty)

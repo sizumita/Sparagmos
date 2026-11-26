@@ -94,6 +94,25 @@ impl<'a> Converter<'a> {
         self.ptr_chain_operand(body, &next_operand, &field_v, fdef, fargs)
     }
 
+    /// The thin pointer type at the bottom of the ADT's pointer
+    /// chain (see [`Self::ptr_chain_operand`]): the type of the
+    /// pointer the chain's fields ultimately hold. `None` when
+    /// the chain does not bottom out at a thin pointer.
+    fn ptr_chain_bottom_ty(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<mir::Ty> {
+        let (_, field_ty) = self.chain_field(def, args)?;
+        if is_thin_ptr_ty(&field_ty) {
+            return Some(field_ty);
+        }
+        let mir::Ty::Adt(fdef, fargs) = &field_ty else {
+            return None;
+        };
+        self.ptr_chain_bottom_ty(fdef, fargs)
+    }
+
     /// The field index at which the pointer chain of the
     /// ADT `def` (see [`Self::chain_field`]) enters its first
     /// layer, when a thin pointer transmuted into the ADT
@@ -586,7 +605,7 @@ impl<'a> Converter<'a> {
                 from == to && scalar_shape_has_ptr_leaf(from)
             }
             _ => false,
-        };
+        } && !self.payload_prefix_crossing(&src, target);
         let generic = {
             let to = shape_to.clone();
             let from = shape_from.clone();
@@ -623,7 +642,14 @@ impl<'a> Converter<'a> {
                         || (target_bare_ptr
                             && matches!(src, Some(mir::Ty::Adt(..)))
                             && !matches!(from, ir::ScalarShape::NicheEnum { .. }));
-                    if identity_pair {
+                    if identity_pair || self.payload_prefix_crossing(&src, target) {
+                        // A wrapper pair whose payload pointer
+                        // crosses a prefix struct's first field
+                        // also stays with the specialised arms:
+                        // a bit reinterpretation would carry the
+                        // payload across verbatim, leaving it
+                        // denoting the wrong sub-value (see
+                        // `payload_prefix_crossing`).
                         None
                     } else {
                         Some(ir::Rvalue::Reinterpret(v.clone(), from, to))
@@ -762,15 +788,33 @@ let inner = match (&src, target) {
                         .expect("guard checked"),
                 )
             }
+            // Thin pointer -> thin pointer crossing a prefix
+            // boundary in the exiting direction (a struct's
+            // first field -> the struct itself): the pointer
+            // must come to denote the enclosing aggregate again
+            // -- the field-exiting counterpart of the entry arm
+            // above (see `cast_exit_depth`).
+            (Some(s), t)
+                if is_thin_ptr_ty(s)
+                    && is_thin_ptr_ty(t)
+                    && self.cast_crosses_prefix_field(s, t)
+                    && self.cast_exit_depth(s, t).is_some() =>
+            {
+                ir::Rvalue::PtrFieldBase(
+                    v.clone(),
+                    self.cast_exit_depth(s, t).expect("guard checked"),
+                )
+            }
             // Thin pointer -> thin pointer: the value itself.
             // The one crossing still excluded here is the
-            // exiting direction (the wrapped type -> the
-            // wrapper; see `pointee_crosses_cell_wrapper`): the
-            // pointer would have to come to denote a wrapper
-            // aggregate around the field it points into, and
-            // there is no field-exiting counterpart to
-            // `PtrField`, so those stay unsupported instead of
-            // silently pointing at the field.
+            // cell-wrapper exiting direction (the wrapped type
+            // -> the wrapper; see
+            // `pointee_crosses_cell_wrapper`): the pointer would
+            // have to come to denote a wrapper aggregate around
+            // the field it points into, and a cell wrapper's
+            // field is not storage this model can re-enter from
+            // the field side, so those stay unsupported instead
+            // of silently pointing at the field.
             (Some(s), t)
                 if is_thin_ptr_ty(s)
                     && is_thin_ptr_ty(t)
@@ -969,7 +1013,23 @@ let inner = match (&src, target) {
                 let op = self
                     .ptr_chain_operand(body, operand, v, def, args)
                     .expect("guard checked");
-                ir::Rvalue::Use(op)
+                // The extracted pointer may be retargeted by
+                // the transmute itself: a chain holding a
+                // pointer to a prefix struct's first field, read
+                // back out as a pointer to the struct (or the
+                // reverse), denotes the field (or the whole
+                // again), not the position it denoted inside
+                // the wrapper (see `prefix_retarget`).
+                match self
+                    .ptr_chain_bottom_ty(def, args)
+                    .and_then(|bottom| self.prefix_retarget(&bottom, t))
+                {
+                    Some((true, depth)) => ir::Rvalue::PtrField(op, depth),
+                    Some((false, depth)) => {
+                        ir::Rvalue::PtrFieldBase(op, depth)
+                    }
+                    None => ir::Rvalue::Use(op),
+                }
             }
             // Fieldless enum -> integer: the discriminant value.
             // Single-field struct -> integer of exactly the
@@ -1075,6 +1135,7 @@ let inner = match (&src, target) {
                             operands: vec![v.clone()],
                             field_index: None,
                             units_from: None,
+                            payload_entry: None,
                         }
                     } else {
                         unsupported()
@@ -1157,6 +1218,7 @@ let inner = match (&src, target) {
                         operands: vec![v.clone()],
                         field_index: None,
                         units_from: None,
+                        payload_entry: None,
                     }
                 } else {
                     let fields = match self.instantiated_field_tys(def, args, 0) {
@@ -1180,6 +1242,7 @@ let inner = match (&src, target) {
                         operands,
                         field_index: None,
                         units_from: None,
+                        payload_entry: None,
                     }
                 }
             }
@@ -1216,11 +1279,25 @@ let inner = match (&src, target) {
                                 }
                             }
                         }
+                        // The pointer being wrapped may itself
+                        // be retargeted by the wrap: a bare
+                        // pointer to a prefix struct wrapped as a
+                        // pointer to its first field (the
+                        // `NonNull::new_unchecked(ptr).cast()`
+                        // sequence std's B-tree node code
+                        // inlines to) denotes the field, not the
+                        // whole (see `prefix_retarget`).
+                        let payload_entry = self
+                            .prefix_retarget(s, &shape.payload_ty)
+                            .map(|(enter, depth)| {
+                                (enter, depth, shape.payload_index)
+                            });
                         ir::Rvalue::AggregateAdt {
                             variant: 0,
                             operands,
                             field_index: None,
                             units_from: None,
+                            payload_entry,
                         }
                     }
                     None => unsupported(),
@@ -1240,7 +1317,26 @@ let inner = match (&src, target) {
                     self.wrapper_shape(def, args)
                 };
                 match shape {
-                    Some(shape) => self.unwrap_wrapper(body, operand, v, &shape),
+                    Some(shape) => {
+                        let rv = self.unwrap_wrapper(body, operand, v, &shape);
+                        // The reverse of the wrap above: a
+                        // payload read back out under a pointer
+                        // type across a prefix boundary denotes
+                        // the field (or the whole again), not the
+                        // position it denoted inside the wrapper.
+                        match (
+                            rv,
+                            self.prefix_retarget(&shape.payload_ty, t),
+                        ) {
+                            (ir::Rvalue::Use(op), Some((true, depth))) => {
+                                ir::Rvalue::PtrField(op, depth)
+                            }
+                            (ir::Rvalue::Use(op), Some((false, depth))) => {
+                                ir::Rvalue::PtrFieldBase(op, depth)
+                            }
+                            (rv, _) => rv,
+                        }
+                    }
                     None => unsupported(),
                 }
             }
@@ -1308,11 +1404,34 @@ let inner = match (&src, target) {
                             }
                             _ => None,
                         };
+                        // A retarget between pointees in a prefix
+                        // relation (the target pointee is the
+                        // source pointee's first field, or the
+                        // reverse -- a B-tree internal node and the
+                        // leaf node it starts with) changes what
+                        // the payload pointer denotes, exactly as
+                        // the same cast on a bare pointer does:
+                        // the payload field has the entry's field-0
+                        // steps appended (or the exit's removed)
+                        // as the wrapper is built (see
+                        // `cast_entry_depth` / `cast_exit_depth`).
+                        // The array-element continuation of an
+                        // entry has no payload counterpart and
+                        // keeps the verbatim carry.
+                        let payload_entry = self
+                            .prefix_retarget(
+                                &src_shape.payload_ty,
+                                &dst_shape.payload_ty,
+                            )
+                            .map(|(enter, depth)| {
+                                (enter, depth, dst_shape.payload_index)
+                            });
                         ir::Rvalue::AggregateAdt {
                             variant: 0,
                             operands,
                             field_index: None,
                             units_from,
+                            payload_entry,
                         }
                     }
                     None => unsupported(),
@@ -1417,6 +1536,7 @@ let inner = match (&src, target) {
                             operands: vec![v.clone()],
                             field_index: None,
                             units_from: None,
+                            payload_entry: None,
                         }
                     }
                     // The reverse direction: the one-field
@@ -1655,6 +1775,7 @@ let inner = match (&src, target) {
             operands: vec![v.clone()],
             field_index,
             units_from: None,
+            payload_entry: None,
         })
     }
 
@@ -2215,6 +2336,39 @@ let inner = match (&src, target) {
     /// direction (wrapped type -> wrapper), which has no
     /// field-exiting rvalue and stays explicit unsupported
     /// instead of silently pointing at the field.
+    /// Whether a transmute between two pointer-wrapper ADTs
+    /// retargets the payload pointer across a prefix struct's
+    /// first field (see
+    /// [`Self::cast_crosses_prefix_field`]): the retarget under
+    /// which carrying the wrapper value over unchanged would
+    /// leave the payload pointer denoting the wrong sub-value.
+    /// Either side lacking a wrapper shape names no payload
+    /// pointer to retarget, and the pair keeps its established
+    /// reading.
+    fn payload_prefix_crossing(
+        &self,
+        src: &Option<mir::Ty>,
+        target: &mir::Ty,
+    ) -> bool {
+        let (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, targs)) =
+            (src, target)
+        else {
+            return false;
+        };
+        let (Some(src_shape), Some(dst_shape)) = (
+            self.wrapper_shape(def, args)
+                .or_else(|| self.fat_wrapper_shape(def, args)),
+            self.wrapper_shape(tdef, targs)
+                .or_else(|| self.fat_wrapper_shape(tdef, targs)),
+        ) else {
+            return false;
+        };
+        self.cast_crosses_prefix_field(
+            &src_shape.payload_ty,
+            &dst_shape.payload_ty,
+        )
+    }
+
     fn pointee_crosses_cell_wrapper(
         &self,
         src: &mir::Ty,
@@ -2265,6 +2419,43 @@ let inner = match (&src, target) {
         let fields = self.instantiated_field_tys(def, args, 0)?;
         if fields.len() == 1 {
             fields.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// The instantiated type of the first field of a struct with
+    /// at least two fields, when that field's type is an aggregate
+    /// (an ADT, a tuple or an array): the prefix-struct shape,
+    /// whose first field is stored as a real sub-aggregate at the
+    /// head of the value (std's B-tree `InternalNode`, whose
+    /// `data` field is the `LeafNode` the node is also addressed
+    /// as). A scalar first field is excluded for the reason the
+    /// single-field restriction in `wrapper_peel` states: values
+    /// this model stores bare have no field storage for a field
+    /// projection to address, while an aggregate first field of a
+    /// multi-field struct is always stored as its own sub-value.
+    /// `None` for any other ADT.
+    pub(super) fn prefix_field_ty(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<mir::Ty> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1
+        {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        if fields.len() < 2 {
+            return None;
+        }
+        let first = fields.into_iter().next()?;
+        if matches!(
+            first,
+            mir::Ty::Adt(..) | mir::Ty::Tuple(_) | mir::Ty::Array(..)
+        ) {
+            Some(first)
         } else {
             None
         }

@@ -391,6 +391,7 @@ fn rvalue_liveness(rv: &Rvalue, uses: &mut [u64], n: usize) {
         | Rvalue::PtrCastUnits(op, _)
         | Rvalue::PtrFirstElem(op)
         | Rvalue::PtrArrayBase(op)
+        | Rvalue::PtrFieldBase(op, _)
         | Rvalue::WrapArrayElems(op)
         | Rvalue::UnwrapArrayElems(op)
         | Rvalue::UnwrapSliceElems(op)

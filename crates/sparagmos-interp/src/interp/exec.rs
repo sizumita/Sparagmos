@@ -2242,6 +2242,7 @@ impl<'a> Interpreter<'a> {
                 operands,
                 field_index,
                 units_from,
+                payload_entry,
             } => {
                 // A union aggregate's single operand initializes the
                 // active field; the slots before it stay
@@ -2266,6 +2267,16 @@ impl<'a> Interpreter<'a> {
                             *from_size,
                             &|id| self.alloc_index_is_typed(id),
                         );
+                    }
+                }
+                if let Some((enter, depth, payload_pos)) = payload_entry {
+                    if let Some(field) = fields.get_mut(*payload_pos) {
+                        let taken = std::mem::replace(field, Value::Unit);
+                        *field = if *enter {
+                            self.ptr_field_value(frames, body, taken, *depth)?
+                        } else {
+                            self.ptr_field_base_value(taken, *depth)?
+                        };
                     }
                 }
                 // A `MaybeUninit::new(v)` construction (the union's
@@ -2405,6 +2416,10 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrArrayBase(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_array_base_value(value)
+            }
+            Rvalue::PtrFieldBase(operand, depth) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.ptr_field_base_value(value, *depth)
             }
             Rvalue::WrapArrayElems(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;

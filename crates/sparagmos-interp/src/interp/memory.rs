@@ -1431,6 +1431,58 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The pointer a prefix-field exit cast produces (see
+    /// [`Rvalue::PtrFieldBase`]): the operand pointer with the
+    /// `depth` trailing field-0 projections a field-0 entry cast
+    /// (see [`Rvalue::PtrField`]) left on it removed, so it
+    /// denotes the enclosing aggregate again. A projection that
+    /// does not end in that many field-0 steps does not carry
+    /// the entry and passes through unchanged.
+    pub(crate) fn ptr_field_base_value(
+        &self,
+        value: Value,
+        depth: u32,
+    ) -> InterpResult<Value> {
+        fn exited(mut projection: Vec<RefProj>, depth: u32) -> Vec<RefProj> {
+            let n = depth as usize;
+            if projection.len() >= n
+                && projection[projection.len() - n..]
+                    .iter()
+                    .all(|s| matches!(s, RefProj::Field(0)))
+            {
+                projection.truncate(projection.len() - n);
+            }
+            projection
+        }
+        match value {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            }) => Ok(Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection: exited(projection, depth),
+            })),
+            Value::Ref(RefTarget::Static { name, projection }) => {
+                Ok(Value::Ref(RefTarget::Static {
+                    name,
+                    projection: exited(projection, depth),
+                }))
+            }
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: exited(projection, depth),
+                }))
+            }
+            Value::Ref(RefTarget::Value(v, projection)) => Ok(Value::Ref(
+                RefTarget::Value(v, exited(projection, depth)),
+            )),
+            other => Ok(other),
+        }
+    }
+
     /// The borrowing form of [`read_resolved`]: a place read lends
     /// the projected value out of the frame's storage instead of
     /// cloning it, for consumers that only inspect the value (or

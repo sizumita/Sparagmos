@@ -188,6 +188,7 @@ pub(crate) enum DRvalue {
         operands: Box<[DSrc]>,
         field_index: Option<u32>,
         units_from: Option<(u64, usize)>,
+        payload_entry: Option<(bool, u32, usize)>,
     },
     ClosureAggregate {
         def: String,
@@ -423,11 +424,15 @@ impl<'a> Interpreter<'a> {
                 operands,
                 field_index,
                 units_from,
-            } => DRvalue::AggregateAdt {
-                variant: *variant,
-                operands: operands.iter().map(|o| self.decode_src(o)).collect(),
-                field_index: *field_index,
-                units_from: *units_from,
+                payload_entry,
+            } => {
+                DRvalue::AggregateAdt {
+                    variant: *variant,
+                    operands: operands.iter().map(|o| self.decode_src(o)).collect(),
+                    field_index: *field_index,
+                    units_from: *units_from,
+                    payload_entry: *payload_entry,
+                }
             },
             Rvalue::ClosureAggregate { def, operands } => DRvalue::ClosureAggregate {
                 def: def.clone(),
@@ -867,6 +872,7 @@ impl<'a> Interpreter<'a> {
                 operands,
                 field_index,
                 units_from,
+                payload_entry,
             } => {
                 let mut fields = match field_index {
                     Some(active) => vec![Value::Uninit; *active as usize],
@@ -883,6 +889,16 @@ impl<'a> Interpreter<'a> {
                             *from_size,
                             &|id| self.alloc_index_is_typed(id),
                         );
+                    }
+                }
+                if let Some((enter, depth, payload_pos)) = payload_entry {
+                    if let Some(field) = fields.get_mut(*payload_pos) {
+                        let taken = std::mem::replace(field, Value::Unit);
+                        *field = if *enter {
+                            self.ptr_field_value(frames, body, taken, *depth)?
+                        } else {
+                            self.ptr_field_base_value(taken, *depth)?
+                        };
                     }
                 }
                 // The `MaybeUninit::new(v)` normalization the

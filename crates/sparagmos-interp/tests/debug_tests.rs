@@ -204,6 +204,7 @@ fn aggregate_program() -> Program {
             operands,
             field_index: None,
             units_from: None,
+            payload_entry: None,
         }
     }
     let debug_vars = vec![
@@ -1022,6 +1023,7 @@ fn named_length_program() -> Program {
                         ],
                         field_index: None,
                         units_from: None,
+                        payload_entry: None,
                     },
                 )],
                 TerminatorKind::Goto { target: BasicBlock(1) },
@@ -1141,6 +1143,7 @@ fn union_program() -> Program {
                         operands: vec![Operand::const_uint(1065353216)],
                         field_index: None,
                         units_from: None,
+                        payload_entry: None,
                     },
                 )],
                 TerminatorKind::Goto { target: BasicBlock(1) },
