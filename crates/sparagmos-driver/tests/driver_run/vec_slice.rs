@@ -3546,6 +3546,81 @@ fn run_mode_slice_iter_enumerate_const_ptr_o3() {
     assert_eq!(stdout, "done\n", "stdout={stdout}");
 }
 
+const VEC_DEBUG_O3_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3];
+    println!("{:?}", v);
+    println!("{:#?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_vec_debug_o3() {
+    // At opt-level 3 the inlined construction leaves the
+    // vector in its real aggregate form ([RawVec, len]); its
+    // `Debug` rendering must read the elements back through
+    // the buffer pointer instead of treating the fields as
+    // the element list.
+    let dir = temp_dir("vec-debug-o3");
+    let src = fixture(&dir, "case.rs", VEC_DEBUG_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "[1, 2, 3]\n[\n    1,\n    2,\n    3,\n]\n", "stdout={stdout}");
+}
+
+const VEC_DEBUG_STRING_O3_SRC: &str = r#"
+fn main() {
+    let v = vec![String::from("a"), String::from("bb")];
+    println!("{:?}", v);
+    println!("{:#?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_vec_debug_string_elements_o3() {
+    // The elements of a real-form vector of `String`s are
+    // themselves aggregates in the buffer's storage; the
+    // typed element read must rebuild them (a bulk snapshot
+    // of the storage flattens their fields instead).
+    let dir = temp_dir("vec-debug-string-o3");
+    let src = fixture(&dir, "case.rs", VEC_DEBUG_STRING_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "[\"a\", \"bb\"]\n[\n    \"a\",\n    \"bb\",\n]\n",
+        "stdout={stdout}"
+    );
+}
+
+const VEC_DEBUG_NESTED_O3_SRC: &str = r#"
+fn main() {
+    let v = vec![vec![1, 2], vec![3]];
+    println!("{:?}", v);
+    let e: Vec<i32> = Vec::new();
+    println!("{:?}", e);
+}
+"#;
+
+#[test]
+fn run_mode_vec_debug_nested_and_empty_o3() {
+    // A real-form vector of vectors: each element read back
+    // is itself a real-form vector and renders through the
+    // same path. An empty vector's dangling buffer pointer
+    // denotes no elements.
+    let dir = temp_dir("vec-debug-nested-o3");
+    let src = fixture(&dir, "case.rs", VEC_DEBUG_NESTED_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "[[1, 2], [3]]\n[]\n", "stdout={stdout}");
+}
+
 const SLICE_SCALAR_BACKED_BOOL_SRC: &str = r#"
 fn main() {
     let t = true;

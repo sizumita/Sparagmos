@@ -3338,6 +3338,46 @@ impl<'a> Interpreter<'a> {
         )
     }
 
+    /// The elements of a `Vec` value in its real aggregate
+    /// form ([RawVec, len]), read back through the buffer
+    /// pointer with the element type the container's tag
+    /// names: the typed read rebuilds each element from the
+    /// buffer's storage, where a bulk snapshot of the storage
+    /// hands back an aggregate element's fields flattened
+    /// into the element list instead. `None` when the value
+    /// is not in the real form, when its declared length is
+    /// past the materialisation limit, or when its buffer
+    /// cannot be read back.
+    fn real_vec_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_tag: &str,
+    ) -> Option<Vec<Value>> {
+        let (_, len) = vec_real_aggregate_parts(value)?;
+        if len > MAX_VEC_SET_LEN_ELEMENTS {
+            return None;
+        }
+        // An empty vector's elements are no elements, whatever
+        // its buffer pointer denotes (a dangling address-only
+        // pointer an allocator model hands out has no pointee
+        // to read).
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let ptr = Self::real_vec_buffer_ptr(value)?;
+        let target = self.deref_value(frames, &ptr).ok()?;
+        let elem_ty = ty_from_tag(elem_tag);
+        let mut elements = Vec::with_capacity(len);
+        for i in 0..len {
+            elements.push(
+                self.read_seq_at_with_elem(frames, &target, i, elem_ty.as_ref())
+                    .ok()?,
+            );
+        }
+        Some(elements)
+    }
+
     /// Derived-`Debug` formatting of an ADT value (`{:?}` /
     /// `{:#?}` of a struct or enum): the shape the driver recorded
     /// for the value's type tag supplies the variant name, the
@@ -3369,6 +3409,26 @@ impl<'a> Interpreter<'a> {
         match tag_base_name(tag) {
             "Vec" => {
                 let elem = first_generic_arg(tag).unwrap_or("");
+                // A vector in its real aggregate form ([RawVec,
+                // len]) -- the shape inlined construction builds
+                // at higher opt levels -- holds its elements
+                // behind the buffer pointer, not as the fields:
+                // read them back through the pointer and format
+                // those. A buffer the model cannot read back
+                // keeps the field-list rendering below.
+                let aggregate = Value::Enum {
+                    variant,
+                    fields: fields.to_vec(),
+                };
+                if let Some(elements) =
+                    self.real_vec_elements(frames, &aggregate, elem)
+                {
+                    let tys: Vec<&str> =
+                        elements.iter().map(|_| elem).collect();
+                    return self.format_debug_seq_items(
+                        frames, &elements, options, indent, '[', ']', &tys,
+                    );
+                }
                 let tys: Vec<&str> = fields.iter().map(|_| elem).collect();
                 return self.format_debug_seq_items(
                     frames, fields, options, indent, '[', ']', &tys,
