@@ -202,14 +202,157 @@ def _leading_segment_end(name):
     return None
 
 
+_GUARD_METHODS = ("contains", "ends_with", "starts_with")
+
+
+def _tokenize_guard(text):
+    """Tokens of one `lookup` guard condition: the boolean operators,
+    parentheses, string literals and dotted `canonical...` atoms."""
+    tokens = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif text.startswith("&&", i) or text.startswith("||", i) \
+                or text.startswith("==", i):
+            tokens.append(text[i:i + 2])
+            i += 2
+        elif ch in "()":
+            tokens.append(ch)
+            i += 1
+        elif ch == '"':
+            j = i + 1
+            buf = []
+            while j < len(text) and text[j] != '"':
+                if text[j] == "\\" and j + 1 < len(text):
+                    buf.append(text[j + 1])
+                    j += 2
+                else:
+                    buf.append(text[j])
+                    j += 1
+            if j >= len(text):
+                raise ValueError(
+                    f"builtins: unterminated string in lookup guard: {text}")
+            tokens.append(("str", "".join(buf)))
+            i = j + 1
+        elif ch.isalpha() or ch == "_":
+            j = i
+            while j < len(text) and (text[j].isalnum()
+                                     or text[j] in "_:."):
+                j += 1
+            tokens.append(("ident", text[i:j]))
+            i = j
+        else:
+            raise ValueError(
+                f"builtins: unknown lookup guard character: {ch!r} "
+                f"in {text}")
+    return tokens
+
+
+class _GuardParser:
+    """A `lookup` guard condition as a boolean expression over the
+    term atoms, expanded to disjunctive normal form: a list of
+    conjunctions, each a list of `(op, arg)` terms with op one of
+    `eq`, `contains`, `ends_with`, `starts_with`."""
+
+    def __init__(self, tokens, text):
+        self.tokens = tokens
+        self.text = text
+        self.pos = 0
+
+    def _fail(self):
+        raise ValueError(f"builtins: unknown lookup guard: {self.text}")
+
+    def _peek(self):
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def parse(self):
+        dnf = self._parse_or()
+        if self.pos != len(self.tokens):
+            self._fail()
+        return dnf
+
+    def _parse_or(self):
+        dnf = self._parse_and()
+        while self._peek() == "||":
+            self.pos += 1
+            dnf = dnf + self._parse_and()
+        return dnf
+
+    def _parse_and(self):
+        dnf = self._parse_atom()
+        while self._peek() == "&&":
+            self.pos += 1
+            rhs = self._parse_atom()
+            dnf = [a + b for a in dnf for b in rhs]
+        return dnf
+
+    def _parse_atom(self):
+        tok = self._peek()
+        if tok == "(":
+            self.pos += 1
+            dnf = self._parse_or()
+            if self._peek() != ")":
+                self._fail()
+            self.pos += 1
+            return dnf
+        if not (isinstance(tok, tuple) and tok[0] == "ident"):
+            self._fail()
+        self.pos += 1
+        head = tok[1]
+        if head == "canonical":
+            if self._peek() != "==":
+                self._fail()
+            self.pos += 1
+            lit = self._peek()
+            if not (isinstance(lit, tuple) and lit[0] == "str"):
+                self._fail()
+            self.pos += 1
+            return [[("eq", lit[1])]]
+        prefix = "canonical."
+        if not head.startswith(prefix):
+            self._fail()
+        method = head[len(prefix):]
+        if method not in _GUARD_METHODS:
+            self._fail()
+        if self._peek() != "(":
+            self._fail()
+        self.pos += 1
+        lit = self._peek()
+        if not (isinstance(lit, tuple) and lit[0] == "str"):
+            self._fail()
+        self.pos += 1
+        if self._peek() != ")":
+            self._fail()
+        self.pos += 1
+        return [[(method, lit[1])]]
+
+
+def _parse_lookup_guards(body):
+    """Every guard arm of `lookup`, each expanded to its DNF entries.
+    An arm's condition may span several lines; it ends at the arm's
+    `=>`. Any shape outside the modelled grammar is a hard error."""
+    guards = []
+    for text in re.findall(r"(?m)^\s*_ if (.*?)\s*=>", body, re.S):
+        tokens = _tokenize_guard(text)
+        guards.extend(_GuardParser(tokens, text).parse())
+    return guards
+
+
 class BuiltinRegistry:
     """The interpreter's builtin support, read from the builtins module.
 
     Exact names come from the match arms of `lookup`; every guard arm
     (`_ if <cond> =>`) is interpreted generically: the condition must
-    be a conjunction of `canonical.contains("..")`,
-    `canonical.ends_with("..")` and `canonical.starts_with("..")`
-    terms. The final `_ =>` arm of `lookup` delegates to two helper
+    be a boolean expression over `canonical.contains("..")`,
+    `canonical.ends_with("..")`, `canonical.starts_with("..")` and
+    `canonical == ".."` terms, combined with `&&`, `||` and
+    parentheses, and is expanded to disjunctive normal form (each
+    disjunct is one guard entry). Guard arms may span several lines.
+    The final `_ =>` arm of `lookup` delegates to two helper
     resolvers, modelled here from their own tables:
     `unicode_lookup_slow` (an exact set of `unicode_data` modules
     whose `::lookup_slow` callee is modelled) and `float_method`
@@ -223,9 +366,6 @@ class BuiltinRegistry:
     silently drift this tool.
     """
 
-    _TERM = re.compile(
-        r'canonical\.(contains|ends_with|starts_with)\("([^"]*)"\)')
-
     def __init__(self, source):
         start = source.find("pub fn lookup")
         if start == -1:
@@ -237,16 +377,7 @@ class BuiltinRegistry:
         self.exact = set(re.findall(r'"([^"\n]+)"\s*(?:\||=>)', body))
         if not self.exact:
             raise ValueError("builtins: no exact builtin names found")
-        self.guards = []
-        for g in re.findall(r"^\s*_ if (.+?) =>", body, re.M):
-            terms = []
-            for term in g.split("&&"):
-                m = self._TERM.fullmatch(term.strip())
-                if m is None:
-                    raise ValueError(
-                        f"builtins: unknown lookup guard: {g}")
-                terms.append((m.group(1), m.group(2)))
-            self.guards.append(terms)
+        self.guards = _parse_lookup_guards(body)
         if not self.guards:
             raise ValueError("builtins: no lookup guards found")
         # Derived flags for the two historical special cases, kept for
@@ -289,6 +420,9 @@ class BuiltinRegistry:
         for terms in self.guards:
             ok = True
             for op, arg in terms:
+                if op == "eq" and canonical != arg:
+                    ok = False
+                    break
                 if op == "contains" and arg not in canonical:
                     ok = False
                     break

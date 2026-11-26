@@ -401,3 +401,31 @@ fn run_mode_guest_reads_its_own_stdin() {
     );
     assert_eq!(stdout, "got 6: hello\n");
 }
+
+const DYN_WRITE_SRC: &str = r#"
+use std::io::Write;
+
+fn sink(w: &mut dyn Write) -> std::io::Result<()> {
+    w.write_all(b"ok")?;
+    w.flush()
+}
+
+fn main() {
+    let mut boxed: Box<dyn Write> = Box::new(Vec::<u8>::new());
+    boxed.write_all(b"box").unwrap();
+    boxed.flush().unwrap();
+    let mut v: Vec<u8> = Vec::new();
+    sink(&mut v).unwrap();
+    println!("{}", String::from_utf8(v).unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_dyn_write_to_vec_receiver() {
+    // Dynamic dispatch into std's impl-block bodies: the
+    // `Write` impl for `Vec<u8>` is stored under the impl-block
+    // path spelling (`alloc::io::impls::<impl Write for
+    // Vec<u8>>::write_all`), which the virtual-call scan must
+    // accept alongside the `<Self as Trait>::method` spelling.
+    run_ok("dyn-write-vec", DYN_WRITE_SRC, "ok\n");
+}

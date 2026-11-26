@@ -8287,6 +8287,70 @@ impl<'a> Interpreter<'a> {
                 // no meaning in the value model.
                 Ok(Value::Ref(RefTarget::Null))
             }
+            Builtin::FnPtrAddr => {
+                arity(1)?;
+                // The synthetic address every other exposure
+                // of the same function value agrees on (the
+                // `FnPtrToPtr` cast, a pointer-to-integer
+                // transmute); recording it lets a later
+                // `from_ptr` recover the callable.
+                let addr = synthetic_address(&vals[0]).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "FnPtr::addr",
+                        "a function pointer value",
+                        vals[0].kind_name(),
+                    )
+                })?;
+                self.note_exposed_target(addr as u64, &vals[0]);
+                Ok(Value::Uint(addr))
+            }
+            Builtin::FnPtrAsPtr => {
+                arity(1)?;
+                // The address-only reference the `FnPtrToPtr`
+                // cast produces for the same value.
+                let addr = synthetic_address(&vals[0]).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "FnPtr::as_ptr",
+                        "a function pointer value",
+                        vals[0].kind_name(),
+                    )
+                })?;
+                self.note_exposed_target(addr as u64, &vals[0]);
+                Ok(Value::Ref(RefTarget::Address(addr as u64)))
+            }
+            Builtin::FnPtrFromPtr => {
+                arity(1)?;
+                // The argument is a `NonNull<Code>`: its scalar
+                // shape is the bare pointer, but a value a
+                // converted body built may still carry the
+                // one-field wrapper, so unwrap to the pointer.
+                let mut cursor = &vals[0];
+                loop {
+                    match cursor {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            cursor = &fields[0];
+                        }
+                        Value::Tuple(items) if items.len() == 1 => {
+                            cursor = &items[0];
+                        }
+                        _ => break,
+                    }
+                }
+                let addr = synthetic_address(cursor).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "FnPtr::from_ptr",
+                        "a code pointer value",
+                        vals[0].kind_name(),
+                    )
+                })?;
+                self.exposed_callable(&Value::Uint(addr)).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "FnPtr::from_ptr",
+                        "a pointer obtained from FnPtr::as_ptr",
+                        format!("address {addr:#x}"),
+                    )
+                })
+            }
             Builtin::PtrOffsetFrom { unsigned } => {
                 arity(2)?;
                 // Two address-only pointers have no pointee to

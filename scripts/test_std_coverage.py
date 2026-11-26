@@ -157,6 +157,30 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(reg.lookup_qualified("vendor::std::io::_print"))
         self.assertFalse(reg.lookup_qualified("std::vec::Vec::new"))
 
+    def test_multiline_and_disjunctive_guards(self):
+        src = FIXTURE_BUILTINS.replace(
+            '        _ => return unicode_lookup_slow(canonical)',
+            '''        _ if canonical == "std::vec::Vec::<T, A>::with_capacity"
+            || canonical == "std::vec::Vec::<T, A>::with_capacity_in" => {
+            Builtin::VecWithCapacity
+        }
+        _ if canonical.ends_with("::from_raw")
+            && (canonical.starts_with("std::sync::Weak::<T>::")
+                || canonical.starts_with("std::rc::Weak::<T>::")) => {
+            Builtin::WeakFromRaw
+        }
+        _ => return unicode_lookup_slow(canonical)''')
+        reg = cov.BuiltinRegistry(src)
+        self.assertTrue(reg.lookup("std::vec::Vec::<T, A>::with_capacity"))
+        self.assertTrue(
+            reg.lookup("std::vec::Vec::<T, A>::with_capacity_in"))
+        self.assertFalse(
+            reg.lookup("std::vec::Vec::<T, A>::with_capacity_x"))
+        self.assertTrue(reg.lookup("std::sync::Weak::<T>::from_raw"))
+        self.assertTrue(reg.lookup("std::rc::Weak::<T>::from_raw"))
+        self.assertFalse(reg.lookup("std::sync::Arc::<T>::from_raw"))
+        self.assertFalse(reg.lookup("std::sync::Weak::<T>::into_raw"))
+
     def test_unknown_guard_is_an_error(self):
         bad = FIXTURE_BUILTINS.replace(
             'canonical.ends_with("::to_uppercase")',
@@ -173,6 +197,14 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("std::iter::Iterator::next", reg.exact)
         self.assertTrue(reg.range_inclusive_new)
         self.assertTrue(reg.to_uppercase)
+        # Multi-line and disjunctive guard arms are extracted
+        # too: the BTree iterator entries and the Vec capacity
+        # family live in arms a line-based reader drops.
+        self.assertTrue(
+            reg.lookup("std::collections::BTreeMap<K, V>::iter"))
+        self.assertTrue(reg.lookup("std::vec::Vec::<T, A>::with_capacity"))
+        self.assertTrue(
+            reg.lookup("std::vec::Vec::<T, A>::extend_from_slice"))
         # Resolved only through the `lookup` fallback helpers: the
         # float inherent methods and the unicode skiplist lookups.
         self.assertTrue(reg.lookup("core::f64::<impl f64>::to_bits"))
