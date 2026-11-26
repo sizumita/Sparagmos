@@ -516,6 +516,11 @@ pub(super) fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
 /// method)`. `None` for any other key shape.
 pub(super) fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
     let (head, method) = base.rsplit_once(">::")?;
+    // An instance key spells the method's own generic arguments
+    // as a trailing `::<...>` segment (`bar::<'_>` for a method
+    // with lifetime parameters); the method a call names is the
+    // segment-free name.
+    let method = method.split("::<").next().unwrap_or(method);
     if method.is_empty() || method.contains("::") {
         return None;
     }
@@ -540,6 +545,11 @@ pub(super) fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
 /// for the `<Self as Trait>::method` form.
 pub(super) fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
     let (head, method) = base.rsplit_once(">::")?;
+    // An instance key spells the method's own generic arguments
+    // as a trailing `::<...>` segment (`bar::<'_>` for a method
+    // with lifetime parameters); the method a call names is the
+    // segment-free name.
+    let method = method.split("::<").next().unwrap_or(method);
     if method.is_empty() || method.contains("::") {
         return None;
     }
@@ -567,6 +577,12 @@ pub(super) fn parse_impl_block_key(base: &str) -> Option<(String, String, String
 /// the definition's parameter list). The crate prefix may be
 /// present on either side or on neither.
 pub(super) fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
+    // The section and the queried name can be the very same
+    // rendering (a `Self` that is itself an impl-path type,
+    // whose base the `<` split below cannot recover).
+    if self_part == self_name {
+        return true;
+    }
     let self_base = self_part.split('<').next().unwrap_or(self_part);
     // The queried name may itself carry a generic argument list
     // (a fully rendered concrete type); only its base takes part

@@ -644,8 +644,14 @@ impl Converter {
             .unwrap_or_default();
         self.vtable_identities.insert(id, (concrete, traits));
         if let Some(binder) = trait_ref {
-            self.vtable_demand
-                .push(binder.value.with_self_ty(*vty));
+            // As in `dyn_trait_refs`: erase the existential
+            // arguments' binder regions so the demanded
+            // reference can be asked for its vtable.
+            let erased = ExistentialTraitRef {
+                def_id: binder.value.def_id,
+                generic_args: erase_bound_regions_args(&binder.value.generic_args),
+            };
+            self.vtable_demand.push(erased.with_self_ty(*vty));
         }
     }
 
