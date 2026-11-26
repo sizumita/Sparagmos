@@ -1386,42 +1386,45 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // different states, and where the sightings disagree
             // the cell's content in this state is not provable,
             // so it keeps the unplanned treatment rather than a
-            // guessed destructor.
+            // guessed destructor. The state's own steps keep
+            // their order - the reverse-declaration drop order
+            // the rewrite above established - and a borrowed
+            // step takes the place the donor state's plan
+            // implies for it, relative to the slots both states
+            // plan: two locals live in both states drop in the
+            // same relative order in each.
             let snapshot = plans.clone();
             for (v, plan) in plans.iter_mut().enumerate().skip(1) {
                 let Some(vslots) = slots.variants.get(v) else {
                     continue;
                 };
-                let mut own: std::collections::HashMap<usize, P> =
-                    std::collections::HashMap::new();
-                match plan {
-                    P::Seq(steps) => {
-                        for step in steps.iter() {
-                            if let P::At { path, plan: sub } = step {
-                                if let [RefProj::Field(slot)] = path.as_slice() {
-                                    own.insert(*slot, (**sub).clone());
-                                }
-                            }
+                let mut steps: Vec<P> = match plan {
+                    P::Seq(steps) => std::mem::take(steps),
+                    P::Trivial => Vec::new(),
+                    _ => continue,
+                };
+                let mut planned: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for step in steps.iter() {
+                    if let P::At { path, .. } = step {
+                        if let [RefProj::Field(slot)] = path.as_slice() {
+                            planned.insert(*slot);
                         }
                     }
-                    P::Trivial => {}
-                    _ => continue,
                 }
-                let mut steps: Vec<P> = Vec::new();
+                let mut missing: Vec<(usize, P, Vec<usize>)> = Vec::new();
                 let mut seen: std::collections::HashSet<u32> =
                     std::collections::HashSet::new();
                 for &slot in vslots.iter() {
                     if !seen.insert(slot) {
                         continue;
                     }
-                    if let Some(sub) = own.get(&(slot as usize)) {
-                        steps.push(P::At {
-                            path: vec![RefProj::Field(slot as usize)],
-                            plan: Box::new(sub.clone()),
-                        });
+                    let slot = slot as usize;
+                    if planned.contains(&slot) {
                         continue;
                     }
                     let mut found: Option<&P> = None;
+                    let mut donor: Option<Vec<usize>> = None;
                     let mut ambiguous = false;
                     for (w, wplan) in snapshot.iter().enumerate().skip(1) {
                         if w == v {
@@ -1433,9 +1436,27 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                         for step in wsteps.iter() {
                             if let P::At { path, plan: sub } = step {
                                 if let [RefProj::Field(s)] = path.as_slice() {
-                                    if *s == slot as usize {
+                                    if *s == slot {
                                         match found {
-                                            None => found = Some(&**sub),
+                                            None => {
+                                                found = Some(&**sub);
+                                                donor = Some(
+                                                    wsteps
+                                                        .iter()
+                                                        .filter_map(|st| match st {
+                                                            P::At { path, .. } => {
+                                                                match path.as_slice() {
+                                                                    [RefProj::Field(
+                                                                        ds,
+                                                                    )] => Some(*ds),
+                                                                    _ => None,
+                                                                }
+                                                            }
+                                                            _ => None,
+                                                        })
+                                                        .collect(),
+                                                );
+                                            }
                                             Some(prev) if prev == &**sub => {}
                                             Some(_) => ambiguous = true,
                                         }
@@ -1445,17 +1466,65 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                         }
                     }
                     if !ambiguous {
-                        if let Some(sub) = found {
-                            steps.push(P::At {
-                                path: vec![RefProj::Field(slot as usize)],
-                                plan: Box::new(sub.clone()),
-                            });
+                        if let (Some(sub), Some(donor)) = (found, donor) {
+                            missing.push((slot, sub.clone(), donor));
                         }
                     }
                 }
-                if !steps.is_empty() {
-                    *plan = P::Seq(steps);
+                if missing.is_empty() {
+                    if let P::Seq(orig) = plan {
+                        *orig = steps;
+                    }
+                    continue;
                 }
+                missing.sort_by_key(|(slot, _, donor)| {
+                    donor.iter().position(|d| d == slot).unwrap_or(usize::MAX)
+                });
+                for (slot, sub, donor) in &missing {
+                    let pos = donor
+                        .iter()
+                        .position(|d| d == slot)
+                        .unwrap_or(usize::MAX);
+                    let step_slots: Vec<Option<usize>> = steps
+                        .iter()
+                        .map(|st| match st {
+                            P::At { path, .. } => match path.as_slice() {
+                                [RefProj::Field(s)] => Some(*s),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                    let mut insert_at = steps.len();
+                    let mut anchored = false;
+                    for j in (0..pos).rev() {
+                        if let Some(idx) =
+                            step_slots.iter().position(|s| *s == Some(donor[j]))
+                        {
+                            insert_at = idx + 1;
+                            anchored = true;
+                            break;
+                        }
+                    }
+                    if !anchored {
+                        for j in (pos + 1)..donor.len() {
+                            if let Some(idx) =
+                                step_slots.iter().position(|s| *s == Some(donor[j]))
+                            {
+                                insert_at = idx;
+                                break;
+                            }
+                        }
+                    }
+                    steps.insert(
+                        insert_at,
+                        P::At {
+                            path: vec![RefProj::Field(*slot)],
+                            plan: Box::new(sub.clone()),
+                        },
+                    );
+                }
+                *plan = P::Seq(steps);
             }
         }
         Some(P::Variants { variants: plans })
