@@ -3313,6 +3313,32 @@ impl<'a> Interpreter<'a> {
                     });
                     variant = 0;
                 }
+                RefProj::ByteOffset(disp) => {
+                    // A byte displacement on top of the
+                    // denominated position: the pointer
+                    // arithmetic that formed the target (an
+                    // iterator step's advance over the view's
+                    // elements above all) moved the pointer
+                    // this many bytes from the position the
+                    // preceding steps denote. The displaced
+                    // pointer denotes a value of the same type
+                    // at the displaced position -- a pointer
+                    // to the view's element advanced by one
+                    // element denotes the next element -- so
+                    // the walk moves the offset and keeps the
+                    // denomination and the span the preceding
+                    // steps priced. A span the walk has not
+                    // priced (a displaced whole slice) keeps
+                    // the final size check declining, and a
+                    // displacement that runs the position
+                    // before the storage or the span past it
+                    // declines there as well.
+                    if *disp >= 0 {
+                        off = off.checked_add(usize::try_from(*disp).ok()?)?;
+                    } else {
+                        off = off.checked_sub(usize::try_from(disp.checked_neg()?).ok()?)?;
+                    }
+                }
                 _ => return None,
             }
         }
