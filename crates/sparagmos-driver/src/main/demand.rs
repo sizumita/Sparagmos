@@ -1,4 +1,4 @@
-//! Demand-driven body acquisition: drop, clone, wake and dyn instances demanded by converted bodies.
+//! Demand-driven body acquisition: drop, clone, wake, dyn and iterator-next instances demanded by converted bodies.
 
 use super::*;
 
@@ -1037,6 +1037,264 @@ pub(crate) fn demand_drop_instances(
         }
     }
     (credited, failures, dtor_bodies)
+}
+
+/// Cap on `Iterator::next` bodies demanded per program,
+/// mirroring the drop demand's cap.
+const MAX_DEMANDED_NEXT_BODIES: usize = 256;
+
+/// The local crate's `Iterator::next` impl methods, keyed by
+/// the self type's path without its parameter list (see
+/// `next_impl_methods`).
+fn local_next_impl_methods() -> std::collections::HashMap<String, rustc_public::ty::FnDef> {
+    next_impl_methods(rustc_public::local_crate().fn_defs())
+}
+
+/// The `Iterator::next` methods of one crate's function
+/// definitions, keyed by the self type's path without its
+/// parameter list (see `drop_type_key`), under either the
+/// `std::` or the `core::` spelling of the trait path.
+fn next_impl_methods(
+    fn_defs: Vec<rustc_public::ty::FnDef>,
+) -> std::collections::HashMap<String, rustc_public::ty::FnDef> {
+    let mut out = std::collections::HashMap::new();
+    for f in fn_defs {
+        let name = f.name();
+        if !(name.ends_with(" as std::iter::Iterator>::next")
+            || name.ends_with(" as core::iter::Iterator>::next"))
+        {
+            continue;
+        }
+        // `<SELF as ...::Iterator>::next`: the key is the self
+        // type's canonical path -- the part of the leading
+        // balanced group before its top-level ` as ` separator
+        // (see `drop_impl_methods` for why the split is not at
+        // the first ` as ` in the raw name).
+        let Some(inner_end) = balanced_group_end(&name, 0) else {
+            continue;
+        };
+        let inner = &name[1..inner_end];
+        let Some(as_pos) = top_level_as_pos(inner) else {
+            continue;
+        };
+        let base = drop_type_key(&inner[..as_pos]);
+        out.entry(base).or_insert(f);
+    }
+    out
+}
+
+/// Demand a converted body for the `Iterator::next` instance
+/// of every guest-stepped iterator type the converted bodies
+/// hand to a modelled consumer (see `consumer_iterator_ty`).
+/// The consumer entries are interpreter builtins, so the
+/// call-graph collection stops at them, and a generic guest
+/// impl has no monomorphic instance as an item either: the
+/// instance exists nowhere until something demands it, while
+/// the builtin's drain steps the source through the modelled
+/// `next` machine, whose unclaimed-tag fallback runs exactly
+/// this body. Each demanded body is converted like a local
+/// item and added to the seed bodies, so the reachability
+/// collection walks its callees too; demanded bodies are
+/// scanned for further consumer calls in turn.
+///
+/// The returned accounting credits each converted instance
+/// to its impl method's definition (instance count and the
+/// first instance's shape) and records each failed conversion
+/// under the same definition, exactly as the drop demand's
+/// accounting does, so the caller can fold both into the
+/// demand accounting: a generic impl is itself a deferred
+/// definition, and without the credit its placeholder entry
+/// would stand against the conversion even though the
+/// demanded instance was converted here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn demand_iterator_next_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+) -> (
+    std::collections::HashMap<rustc_public::DefId, (usize, (usize, usize, usize))>,
+    std::collections::HashMap<rustc_public::DefId, BTreeMap<String, usize>>,
+) {
+    let local_crate = rustc_public::local_crate();
+    let local_crate_name = local_crate.name.as_str();
+    let impl_methods = local_next_impl_methods();
+    // `Iterator` impls of foreign crates, built once on first
+    // use, over every external crate for the same reason as
+    // the drop demand's foreign scan: an impl lives in its
+    // self type's defining crate, but facade crates re-export
+    // types under their own paths, and the keys are full
+    // rendered paths, unique per type.
+    let mut foreign_impl_methods: Option<
+        std::collections::HashMap<String, rustc_public::ty::FnDef>,
+    > = None;
+    let mut credited: std::collections::HashMap<
+        rustc_public::DefId,
+        (usize, (usize, usize, usize)),
+    > = std::collections::HashMap::new();
+    let mut failures: std::collections::HashMap<
+        rustc_public::DefId,
+        BTreeMap<String, usize>,
+    > = std::collections::HashMap::new();
+    if impl_methods.is_empty() && seed_bodies.is_empty() {
+        return (credited, failures);
+    }
+    let mut seen_candidates: std::collections::HashSet<Ty> = Default::default();
+    let mut demanded = 0usize;
+    let mut scan_from = 0usize;
+    while scan_from < seed_bodies.len() {
+        let batch: Vec<rustc_public::mir::Body> = seed_bodies[scan_from..].to_vec();
+        scan_from = seed_bodies.len();
+        let mut candidates: Vec<(
+            Ty,
+            rustc_public::ty::AdtDef,
+            rustc_public::ty::GenericArgs,
+        )> = Vec::new();
+        let mut seen: std::collections::HashSet<Ty> = Default::default();
+        for body in &batch {
+            for (def, args) in sparagmos_driver::reach::call_targets(body) {
+                let Some(ty) = consumer_iterator_ty(&def, &args) else {
+                    continue;
+                };
+                if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty) {
+                    continue;
+                }
+                // A reference names the blanket impl, whose
+                // step is the pointee's: the candidate is the
+                // ADT instantiation behind the references.
+                let mut peeled = ty;
+                while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
+                    sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                {
+                    peeled = inner;
+                }
+                let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
+                    sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                else {
+                    continue;
+                };
+                if seen.insert(peeled) {
+                    candidates.push((peeled, adt_def, adt_args));
+                }
+            }
+        }
+        // Local types first, as in the drop demand: the shared
+        // cap must not let a foreign impl crowd out the entry
+        // crate's own.
+        candidates.sort_by_key(|(_, def, _)| {
+            def.name().split("::").next() != Some(local_crate_name)
+        });
+        let mut added = false;
+        for (cand_ty, def, args) in candidates {
+            if demanded >= MAX_DEMANDED_NEXT_BODIES {
+                break;
+            }
+            if !seen_candidates.insert(cand_ty) {
+                continue;
+            }
+            if args_mention_params(&args) {
+                continue;
+            }
+            let def_name = def.name();
+            let type_key = drop_type_key(&def_name);
+            let type_crate = type_key.split("::").next().unwrap_or("");
+            let impl_fn = if type_crate == local_crate_name {
+                impl_methods.get(&type_key)
+            } else {
+                let methods = foreign_impl_methods.get_or_insert_with(|| {
+                    let mut defs = Vec::new();
+                    for krate in rustc_public::external_crates() {
+                        if !krate.is_local {
+                            defs.extend(foreign_fn_defs(&krate));
+                        }
+                    }
+                    next_impl_methods(defs)
+                });
+                methods.get(&type_key)
+            };
+            let Some(impl_fn) = impl_fn else {
+                continue;
+            };
+            // The impl's generic arguments are recovered from
+            // the self type by unification (see
+            // `resolve_drop_instance`, whose question is the
+            // same for any trait method); a resolution failure
+            // simply means the shape differs or this ADT has no
+            // applicable impl, and a compiler panic on an odd
+            // instantiation must not take the whole conversion
+            // down with it.
+            let impl_fn = *impl_fn;
+            let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolve_drop_instance(&impl_fn, &cand_ty, &args)
+                    .filter(|inst| inst.has_body())
+                    .and_then(|inst| {
+                        sparagmos_driver::convert::with_body_materialization(
+                            &inst.name(),
+                            || inst.body(),
+                        )
+                        .map(|body| (inst, body))
+                    })
+            }));
+            let Ok(Some((inst, sm_body))) = resolved else {
+                continue;
+            };
+            // Identity, not spelling, as in the drop demand:
+            // an already-converted instance is skipped by its
+            // DefId, so the interpreter's impl scan never sees
+            // two candidates for one instance.
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
+            let name = inst.name().to_string();
+            if bodies.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            let before = bodies.len();
+            let report_before = report.functions.len();
+            convert_item(
+                conv,
+                report,
+                bodies,
+                body_def_ids,
+                body_def_names,
+                name,
+                def_id,
+                Ok(Some(sm_body.clone())),
+            );
+            if bodies.len() > before {
+                seed_bodies.push(sm_body);
+                demanded += 1;
+                added = true;
+                if let Some(entry) = report.functions.last() {
+                    let counts = (entry.blocks, entry.locals, entry.arg_count);
+                    let slot = credited
+                        .entry(inst.def.def_id())
+                        .or_insert((0, counts));
+                    slot.0 += 1;
+                }
+            } else if report.functions.len() > report_before {
+                // The demanded instance could not be converted:
+                // the failure stands against the impl
+                // definition, exactly as a call-graph demand
+                // failure would.
+                if let Some(FnOutcome::Skipped { reasons }) =
+                    report.functions.last().map(|e| &e.outcome)
+                {
+                    let slot = failures.entry(inst.def.def_id()).or_default();
+                    for (k, v) in reasons {
+                        *slot.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    (credited, failures)
 }
 
 /// Cap on tuple/array `Clone` bodies demanded per program,

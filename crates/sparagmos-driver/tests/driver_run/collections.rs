@@ -227,6 +227,59 @@ fn run_mode_filter_zip_cloned_over_vec_into_iter_collect() {
     );
 }
 
+const GUEST_ITERATOR_COLLECT_SRC: &str = r#"
+struct Counter { n: u32, max: u32 }
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.n < self.max { self.n += 1; Some(self.n) } else { None }
+    }
+}
+struct Wrap<M> { inner: M }
+impl<M: Iterator> Iterator for Wrap<M> {
+    type Item = M::Item;
+    fn next(&mut self) -> Option<M::Item> { self.inner.next() }
+}
+fn main() {
+    let v: Vec<u32> = Counter { n: 0, max: 3 }.collect();
+    println!("direct {v:?}");
+    let m: Vec<u32> = Counter { n: 0, max: 3 }.map(|x| x * 10).collect();
+    println!("map {m:?}");
+    let w: Vec<u32> = Wrap { inner: Counter { n: 0, max: 2 } }.collect();
+    println!("wrap {w:?}");
+    let mut c = Counter { n: 0, max: 2 };
+    let mut seen = Vec::new();
+    for x in &mut c { seen.push(x); }
+    println!("byref {seen:?} after {}", c.n);
+}
+"#;
+
+#[test]
+fn run_mode_guest_iterator_collect_and_adapters() {
+    // A user-defined iterator is not a type the modelled
+    // `next` state machine serves, so the builtin consumers'
+    // drain reaches the machine with a tag no arm claims; the
+    // step is the type's own collected `next` body, run on the
+    // state parked in an allocation so its mutations stick
+    // (the `byref` line's counter is the witness). The generic
+    // `Wrap` impl has no monomorphic instance as an item and
+    // no call edge names it -- the consumer's call is
+    // builtin-served -- so its instance is brought in by the
+    // iterator-next demand pass, like the generic `Drop` impls
+    // the drop demand brings in.
+    let dir = temp_dir("guest-iterator-collect");
+    let src = fixture(&dir, "guestiter.rs", GUEST_ITERATOR_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "direct [1, 2, 3]\nmap [10, 20, 30]\nwrap [1, 2]\nbyref [1, 2] after 2\n",
+        "stdout={stdout}"
+    );
+}
+
 const ITER_COUNT_SRC: &str = r#"
 fn main() {
     let a = [10, 20, 30];

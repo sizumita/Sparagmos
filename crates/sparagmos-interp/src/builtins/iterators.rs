@@ -4299,6 +4299,16 @@ impl<'a> Interpreter<'a> {
                 }
             }
         } else {
+            // No arm claims this tag: the type is not one the
+            // modelled machine serves. When the program holds
+            // the type's own collected `next` body -- a
+            // user-defined iterator reached as the leaf of a
+            // modelled composition (an adapter chain, a
+            // consumer's drain, the `&mut I` blanket
+            // forwarding) -- that body is the faithful step.
+            if let Some(stepped) = self.impl_body_next_step(frames, self_ty, state)? {
+                return Ok(stepped);
+            }
             return Err(unsupported(format!(
                 "Iterator::next for {self_ty} is not runtime-supported"
             )));
@@ -4348,6 +4358,46 @@ impl<'a> Interpreter<'a> {
         }
         let final_state = self.alloc_value(id).unwrap_or(Value::Uninit);
         Ok((items, final_state))
+    }
+
+    /// One front step of an iterator whose type the modelled
+    /// state machine does not serve, executed by the type's
+    /// own collected `Iterator::next` body. The machine's
+    /// consumers and adapters compose steps by tag, so a
+    /// user-defined iterator at the leaf of such a composition
+    /// reaches the machine with a tag no arm claims, while the
+    /// program can hold the very impl body the direct call
+    /// sites run. The state is parked in a fresh allocation --
+    /// the arrangement [`Self::drain_iterator`] uses -- so the
+    /// body steps it in place through the allocation
+    /// reference, and the final state is read back from the
+    /// allocation. `Ok(None)` when the program holds no
+    /// converted body for the type's `next`: the scan must
+    /// name exactly one impl, and a body that was demanded but
+    /// not converted is not a dispatch target, as in
+    /// `call_callable_sync_typed`. The caller then reports the
+    /// type as not runtime-supported, as before.
+    fn impl_body_next_step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: &Value,
+    ) -> InterpResult<Option<(Value, Value)>> {
+        let Some(impl_name) = self.scan_virtual_impl(self_ty, "std::iter::Iterator", "next")
+        else {
+            return Ok(None);
+        };
+        if self.program().get(&impl_name).is_none() {
+            return Ok(None);
+        }
+        let id = self.alloc_insert(state.clone());
+        let receiver = Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        });
+        let item = self.call_sync(frames, &impl_name, vec![receiver])?;
+        let new_state = self.alloc_value(id).unwrap_or(Value::Uninit);
+        Ok(Some((new_state, item)))
     }
 
     /// The `(lower, upper)` bounds of an inner iterator
