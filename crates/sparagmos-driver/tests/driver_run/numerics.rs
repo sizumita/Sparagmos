@@ -61,6 +61,77 @@ fn run_mode_overflow_asserts_follow_the_session_setting() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const OVERFLOW_AUX_YES_SRC: &str = r#"
+//@ compile-flags: -C overflow-checks=yes
+#![crate_type = "lib"]
+use std::ops::Add;
+pub fn add_one(x: u8) -> u8 { u8::add(x, 1) }
+pub fn inc(x: u8) -> u8 { x + 1 }
+"#;
+
+const OVERFLOW_AUX_NO_SRC: &str = r#"
+//@ compile-flags: -C overflow-checks=no
+#![crate_type = "lib"]
+use std::ops::Add;
+pub fn add_one(x: u8) -> u8 { u8::add(x, 1) }
+pub fn inc(x: u8) -> u8 { x + 1 }
+"#;
+
+const OVERFLOW_PER_CRATE_MAIN_SRC: &str = r#"
+extern crate ocyes;
+extern crate ocno;
+fn main() {
+    // The checked core operation (`u8::add`, an
+    // `#[rustc_inherit_overflow_checks]` body) follows the
+    // crate that instantiates it, not the main session.
+    assert_eq!(ocno::add_one(255), 0);
+    assert!(std::panic::catch_unwind(|| ocyes::add_one(255)).is_err());
+    // The auxiliary bodies' own checked operations follow
+    // their own crate's setting the same way.
+    assert_eq!(ocno::inc(255), 0);
+    assert!(std::panic::catch_unwind(|| ocyes::inc(255)).is_err());
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_overflow_checks_follow_the_instantiating_crate() {
+    // Overflow checks are a per-crate codegen setting: two
+    // auxiliary crates built with opposite `-C
+    // overflow-checks` step the same checked operations, and
+    // each follows its own crate's setting -- under both
+    // session configurations of the main compilation. (The
+    // suite shape that needs this is
+    // tests/ui/iterators/rangefrom-overflow-2crates.rs, whose
+    // two auxiliaries step one `RangeFromIter` in turn.)
+    let dir = temp_dir("overflow-per-crate");
+    let yes = fixture(&dir, "ocyes.rs", OVERFLOW_AUX_YES_SRC);
+    let no = fixture(&dir, "ocno.rs", OVERFLOW_AUX_NO_SRC);
+    let src = fixture(&dir, "main.rs", OVERFLOW_PER_CRATE_MAIN_SRC);
+    let yes_arg = format!("ocyes={}", yes.display());
+    let no_arg = format!("ocno={}", no.display());
+    let out = run_driver_extra(&src, &["--aux", &yes_arg, "--aux", &no_arg]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--aux",
+            &yes_arg,
+            "--aux",
+            &no_arg,
+            "--rustc-arg",
+            "-C",
+            "--rustc-arg",
+            "overflow-checks=off",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
 const LITERAL_CMP_SRC: &str = r#"
 fn main() {
     let a: u8 = 0;

@@ -1595,6 +1595,7 @@ fn collect() -> ControlFlow<()> {
         source_files: conv.source_files.clone(),
         coverage,
         fn_display_names: sparagmos_driver::convert::drain_fn_display_names(),
+        crate_overflow_checks: aux_overflow_checks().to_vec(),
     });
     // A compilation the verdict chain has rejected stops the
     // session here, the way rustc's own start-of-codegen gate

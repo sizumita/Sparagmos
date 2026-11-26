@@ -3127,12 +3127,12 @@ impl<'a> Interpreter<'a> {
                 let mut vals = vals.into_iter();
                 let lhs = vals.next().expect("arity checked");
                 let rhs = vals.next().expect("arity checked");
-                self.exec_primitive_binop(name, op, &lhs, &rhs)
+                self.exec_primitive_binop(frames, name, op, &lhs, &rhs)
             }
             Builtin::PrimitiveUnOp(op) => {
                 arity(1)?;
                 let value = vals.into_iter().next().expect("arity checked");
-                self.exec_primitive_unop(name, op, &value)
+                self.exec_primitive_unop(frames, name, op, &value)
             }
             Builtin::EnvCurrentExe => {
                 arity(0)?;
@@ -8307,7 +8307,7 @@ impl<'a> Interpreter<'a> {
                         overflowed |= over;
                     }
                 }
-                if overflowed && self.overflow_checks() {
+                if overflowed && self.overflow_checks_at(frames) {
                     return Err(InterpError::panic(
                         "attempt to exponentiate with overflow",
                     ));

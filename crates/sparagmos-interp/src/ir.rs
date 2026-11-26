@@ -2116,13 +2116,17 @@ pub enum TerminatorKind {
         /// The assertion guards an arithmetic overflow (a MIR
         /// `AssertMessage::Overflow` / `OverflowNeg`): the kind of
         /// assertion a checked build emits after a
-        /// `CheckedBinaryOp`. Whether it fires is the *session's*
-        /// overflow-checks decision, not the body's: bodies marked
-        /// `#[rustc_inherit_overflow_checks]` carry the assertion
-        /// in their MIR regardless of the session flag, and native
-        /// codegen drops it when the session has checks off. The
-        /// interpreter does the same at run time (see
-        /// `InterpConfig::overflow_checks`).
+        /// `CheckedBinaryOp`. Whether it fires is the compiling
+        /// crate's overflow-checks decision, not the body's:
+        /// bodies marked `#[rustc_inherit_overflow_checks]` carry
+        /// the assertion in their MIR regardless of the flag, and
+        /// native codegen drops it when the crate that
+        /// instantiates the body was compiled with checks off.
+        /// The interpreter resolves that crate at run time from
+        /// the call stack (see `Interpreter::overflow_checks_at`:
+        /// the nearest frame whose crate has a recorded setting
+        /// in `Program::crate_overflow_checks`, falling back to
+        /// the session's `InterpConfig::overflow_checks`).
         overflow: bool,
     },
     /// An inline-assembly block of the evaluable class
@@ -2485,6 +2489,19 @@ pub struct Program {
     /// programs and for programs collected outside a debug
     /// session.
     pub fn_display_names: Vec<(String, String)>,
+    /// Resolved overflow-checks settings of the guest crates
+    /// the driver compiled separately (its `--aux` crates),
+    /// keyed by crate name (a `::` segment of a body name:
+    /// body names are rooted at the main crate, so an
+    /// auxiliary crate's bodies appear as `main::<aux>::<fn>`):
+    /// `true` when that crate was built with overflow
+    /// checks on. The main compilation's own setting is the
+    /// interpreter session's (`InterpConfig::overflow_checks`);
+    /// a crate absent here was built under it too, which is
+    /// also the case for the prebuilt libraries the harness
+    /// hands over (the driver records the session value for
+    /// those). Empty for hand-built programs.
+    pub crate_overflow_checks: Vec<(String, bool)>,
     /// Per-field scalar shapes of the program's union instances,
     /// indexed by the `table` of [`ProjectionElem::UnionField`]:
     /// entry `t` is one union instance's field list, in field
