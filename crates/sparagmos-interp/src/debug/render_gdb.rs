@@ -2,8 +2,11 @@
 
 use crate::interp::{Frame, Interpreter};
 use crate::value::Value;
-use super::desc::{Desc, dwarf_type_name, split_top_level};
-use super::printers::render_gdb_any;
+use super::desc::{
+    Desc, dwarf_type_name, first_generic_arg, path_text, split_top_level,
+    tag_base_name,
+};
+use super::printers::{render_gdb_any, sequence_values};
 use super::queries::{desc_type_name, nonzero_scalar};
 use super::render_lldb::{
     escape_str, render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width,
@@ -173,6 +176,37 @@ fn render_gdb_mode(
             elements,
         );
     }
+    if let Some(Desc::Adt(tag)) = desc {
+        let dwarf = dwarf_type_name(tag);
+        // A `String` value in this model is its text (bare, or
+        // wrapped in the single-field layers `path_text`
+        // reads), not the library's buffer aggregate; gdb's
+        // raw form is that aggregate's structural expansion,
+        // synthesised from the text (see
+        // `string_structural_fields`). The pretty mode leaves
+        // the value to its provider's quoted form.
+        if !pretty && tag_base_name(&dwarf) == "String" {
+            if let Some(text) = string_text(value) {
+                let shape = interp.program().adt_debug_shapes.get(tag)?;
+                let fields = string_structural_fields(&text);
+                return render_adt_gdb(
+                    interp, tag, shape, 0, &fields, depth, frames, pretty,
+                    elements,
+                );
+            }
+        }
+        // A `Box` over an unsized pointee prints as the
+        // pointee's own form under the box's name (see
+        // `render_box_gdb`); a sized pointee keeps the
+        // aggregate form of the match below.
+        if tag_base_name(&dwarf) == "Box" {
+            if let Some(rendered) =
+                render_box_gdb(interp, frames, value, tag, depth, pretty, elements)
+            {
+                return Some(rendered);
+            }
+        }
+    }
     match value {
         Value::Bool(_)
         | Value::Unit
@@ -272,13 +306,26 @@ fn render_gdb_mode(
                 None
             }
         }
-        Value::FatRef { base, len } => {
-            render_fat_ref_gdb(value, base, *len, desc)
-        }
+        Value::FatRef { base, len } => render_fat_ref_gdb(
+            interp, frames, value, base, *len, desc, depth, pretty, elements,
+        ),
         Value::DynRef {
             concrete, traits, ..
         } => render_dyn_ref_gdb(value, concrete, traits, desc),
         Value::Ref(_) | Value::FnPtr(_) => {
+            // A raw pointer to a dynamically sized ADT prints
+            // the pointee struct itself (see
+            // `render_dst_pointee_gdb`); a sized pointee, and
+            // every reference, keeps the address form below.
+            if let Some(Desc::PtrConst(inner) | Desc::PtrMut(inner)) = desc {
+                if let Desc::Adt(pointee) = inner.as_ref() {
+                    if let Some(rendered) = render_dst_pointee_gdb(
+                        interp, frames, value, pointee, depth, pretty, elements,
+                    ) {
+                        return Some(rendered);
+                    }
+                }
+            }
             let addr = crate::interp::synthetic_address(value)?;
             // A pointer to the unit type prints with its type
             // in cast form (`(*mut ()) 0x...`): the unit type
@@ -371,12 +418,46 @@ pub(super) fn fat_base_text(base: &Value) -> Option<String> {
 /// snapshot carries when it carries it at all; a base the
 /// renderer cannot read keeps the bare-address form. The
 /// struct form needs no read, so it is unconditional.
+#[allow(clippy::too_many_arguments)]
 fn render_fat_ref_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
     value: &Value,
     base: &Value,
     len: u128,
     desc: Option<&Desc>,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
 ) -> Option<String> {
+    // A fat raw pointer prints its pointee, not the metadata
+    // struct: a slice pointee as the pointer's name over the
+    // elements, a dynamically sized struct pointee as the
+    // struct itself. A fat reference keeps the metadata form
+    // below; only the raw-pointer descriptors divert.
+    if let Some(Desc::PtrConst(inner) | Desc::PtrMut(inner)) = desc {
+        match inner.as_ref() {
+            Desc::Adt(pointee) => {
+                if let Some(rendered) = render_dst_pointee_gdb(
+                    interp, frames, value, pointee, depth, pretty, elements,
+                ) {
+                    return Some(rendered);
+                }
+            }
+            Desc::Slice(elem) => {
+                if let Some(rendered) = slice_elements_gdb(
+                    interp, frames, base, len, elem, depth, pretty, elements,
+                ) {
+                    return Some(format!(
+                        "{} {}",
+                        desc_type_name(desc?)?,
+                        rendered
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
     let addr = crate::interp::synthetic_address(value)?;
     if str_place_desc(desc) {
         return match fat_base_text(base) {
@@ -393,6 +474,418 @@ fn render_fat_ref_gdb(
         Some(name) => Some(format!("{name} {{data_ptr: 0x{addr:x}, length: {len}}}")),
         None => Some(format!("0x{addr:x}")),
     }
+}
+
+/// The text of a `String`-described value: the bare string
+/// form, or the wrapped form `path_text` reads (a real buffer
+/// aggregate does not yield a text here, and keeps the
+/// structural rendering the shape table drives).
+fn string_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Str(s) => Some(s.clone()),
+        Value::Enum { .. } => path_text(value),
+        _ => None,
+    }
+}
+
+/// The field values of a `String`'s library aggregate
+/// (`String { vec: Vec { buf: RawVec { inner: RawVecInner {
+/// ptr, cap, alloc }, _marker }, len } }`) synthesised from
+/// its text: the buffer pointer denotes the text itself, and
+/// the capacity is the text's length (the model's string
+/// form carries no separate capacity; the interpreter's own
+/// structural projections read the same value for it).
+fn string_structural_fields(text: &str) -> Vec<Value> {
+    let len = text.len() as u128;
+    let ptr = Value::Ref(crate::value::RefTarget::value(Value::Str(
+        text.to_string(),
+    )));
+    let inner = Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![ptr],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(len)],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    };
+    let buf = Value::Enum {
+        variant: 0,
+        fields: vec![
+            inner,
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    };
+    let vec = Value::Enum {
+        variant: 0,
+        fields: vec![buf, Value::Uint(len)],
+    };
+    vec![vec]
+}
+
+/// Read the value a pointer denotes, through the session's
+/// frames: the resolved target's contents.
+fn read_pointee(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+) -> Option<Value> {
+    let resolved = interp.deref_value(frames, value).ok()?;
+    interp.read_resolved(frames, &resolved).ok()
+}
+
+/// Whether a field type is unsized, judged from its tag:
+/// `str`, a slice, a trait object, or a struct whose own
+/// tail is unsized.
+fn type_unsized(interp: &Interpreter, ty: &str, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match Desc::from_tag(ty) {
+        Desc::Str | Desc::Slice(_) | Desc::Unknown => true,
+        Desc::Adt(tag) => dst_struct_fields(interp, &tag, depth + 1).is_some(),
+        _ => false,
+    }
+}
+
+/// The fields of a dynamically sized struct instance: the
+/// shape's fields, when the type is a struct whose last
+/// field's type is unsized. A sized struct and an enum
+/// have no such fields.
+fn dst_struct_fields(
+    interp: &Interpreter,
+    tag: &str,
+    depth: usize,
+) -> Option<Vec<sparagmos_mir::AdtDebugField>> {
+    let shape = interp.program().adt_debug_shapes.get(tag)?;
+    if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Struct) {
+        return None;
+    }
+    let variant = shape.variants.first()?;
+    let last = variant.fields.last()?;
+    if type_unsized(interp, &last.ty, depth) {
+        Some(variant.fields.clone())
+    } else {
+        None
+    }
+}
+
+/// Render one nested value (an aggregate field, a slice
+/// element) in gdb form, in the caller's rendering mode.
+fn render_nested_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: &Desc,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
+    if pretty {
+        render_gdb_any(interp, frames, value, Some(desc), depth, elements)
+    } else {
+        render_gdb_mode(
+            interp, frames, value, Some(desc), false, None, depth, false,
+            elements,
+        )
+    }
+}
+
+/// Render the struct a pointer to a dynamically sized type
+/// denotes, the way gdb prints it: the struct's own form,
+/// sized fields by value and the unsized tail field as an
+/// address. The address is the pointer's own: the debug
+/// shapes carry no field offsets, so the tail prints at the
+/// allocation's address rather than at the offset gdb
+/// computes for it.
+#[allow(clippy::too_many_arguments)]
+fn render_dst_pointee_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    pointee_tag: &str,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
+    let shape_fields = dst_struct_fields(interp, pointee_tag, 0)?;
+    let pointee = read_pointee(interp, frames, value)?;
+    let Value::Enum { fields, .. } = &pointee else {
+        return None;
+    };
+    if fields.len() != shape_fields.len() {
+        return None;
+    }
+    let last = shape_fields.len() - 1;
+    // A trait-object tail has no described struct to
+    // expand: the concrete pointee is a different type,
+    // and the fat pointer keeps its metadata form.
+    if matches!(Desc::from_tag(&shape_fields[last].ty), Desc::Unknown) {
+        return None;
+    }
+    let addr = crate::interp::synthetic_address(value)?;
+    let name = dwarf_type_name(pointee_tag);
+    let named = shape_fields.iter().all(|f| f.name.is_some());
+    let mut parts = Vec::with_capacity(shape_fields.len());
+    for (i, field) in shape_fields.iter().enumerate() {
+        let rendered = if i == last {
+            // A slice tail renders its elements through the
+            // fat pointer's own base and length; any other
+            // unsized tail (`str`, a trait object) has no
+            // value of its own in the struct, and gdb shows
+            // the data address the fat pointer carries.
+            match &Desc::from_tag(&field.ty) {
+                Desc::Slice(..) => render_nested_gdb(
+                    interp,
+                    frames,
+                    &fields[i],
+                    &Desc::from_tag(&field.ty),
+                    depth + 1,
+                    pretty,
+                    elements,
+                )
+                .unwrap_or_else(|| format!("0x{addr:x}")),
+                _ => format!("0x{addr:x}"),
+            }
+        } else {
+            render_nested_gdb(
+                interp,
+                frames,
+                &fields[i],
+                &Desc::from_tag(&field.ty),
+                depth + 1,
+                pretty,
+                elements,
+            )?
+        };
+        if named {
+            parts.push(format!("{}: {rendered}", field.name.as_deref()?));
+        } else {
+            parts.push(rendered);
+        }
+    }
+    if named {
+        Some(format!("{name} {{{}}}", parts.join(", ")))
+    } else {
+        Some(format!("{name} ({})", parts.join(", ")))
+    }
+}
+
+/// The `[elements]` body of a slice print: the elements of
+/// the fat pointer's base, rendered one by one. The base
+/// must resolve to the element sequence and hold exactly
+/// the pointer's length; anything else stays with the
+/// metadata form.
+#[allow(clippy::too_many_arguments)]
+fn slice_elements_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    base: &Value,
+    len: u128,
+    elem: &Desc,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
+    let stored = match base {
+        Value::Ref(_) => read_pointee(interp, frames, base)?,
+        other => other.clone(),
+    };
+    let values = sequence_values(&stored)?;
+    if values.len() as u128 != len {
+        return None;
+    }
+    let mut rendered = Vec::with_capacity(values.len());
+    for element in &values {
+        rendered.push(render_nested_gdb(
+            interp, frames, element, elem, depth + 1, pretty, elements,
+        )?);
+    }
+    Some(format!("[{}]", compress_repeats(&rendered)))
+}
+
+/// The pointer a box value holds: its first field, or the
+/// value itself when it already is the pointer.
+fn box_pointer_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Enum { fields, .. } => fields.first().cloned(),
+        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The fat pointer a box's pointee is read through: the
+/// box's pointer field dereferenced, or the value itself
+/// when it already is the fat pointer.
+fn box_fat_pointer(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+) -> Option<(Value, u128)> {
+    let mut current = box_pointer_value(value)?;
+    for _ in 0..4 {
+        match current {
+            Value::FatRef { base, len } => return Some((*base, len)),
+            Value::Ref(_) => current = read_pointee(interp, frames, &current)?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The text of a box's `str` pointee, reached through the
+/// box's pointer and the fat pointer behind it.
+fn box_pointee_text(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+) -> Option<String> {
+    fn text_of(
+        interp: &Interpreter,
+        frames: &[Frame],
+        value: &Value,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 6 {
+            return None;
+        }
+        match value {
+            Value::Str(text) => Some(text.clone()),
+            Value::Bytes(bytes) => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Value::FatRef { base, .. } => fat_base_text(base)
+                .or_else(|| text_of(interp, frames, base, depth + 1)),
+            Value::Ref(_) => {
+                let pointee = read_pointee(interp, frames, value)?;
+                text_of(interp, frames, &pointee, depth + 1)
+            }
+            Value::Enum { fields, .. } => {
+                text_of(interp, frames, fields.first()?, depth + 1)
+            }
+            _ => None,
+        }
+    }
+    text_of(interp, frames, value, 0)
+}
+
+/// The `[elements]` body of a box's slice pointee. The
+/// pointee is read through the box's fat pointer when the
+/// pointer carries one; a box built over an array stores
+/// the elements themselves behind a thin pointer, and the
+/// pointee value is then the element sequence.
+#[allow(clippy::too_many_arguments)]
+fn box_slice_elements(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    elem: &Desc,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
+    if let Some((base, len)) = box_fat_pointer(interp, frames, value) {
+        if let Some(rendered) = slice_elements_gdb(
+            interp, frames, &base, len, elem, depth, pretty, elements,
+        ) {
+            return Some(rendered);
+        }
+    }
+    let pointer = box_pointer_value(value)?;
+    let pointee = match &pointer {
+        Value::Ref(_) => read_pointee(interp, frames, &pointer)?,
+        other => other.clone(),
+    };
+    if let Value::SparseVec { elems, len, .. } = &pointee {
+        // A sparse pointee's stored elements are not the
+        // whole slice; the declared length has no element
+        // values to print here.
+        if elems.len() as u128 != *len {
+            return None;
+        }
+    }
+    let values = sequence_values(&pointee)?;
+    let mut rendered = Vec::with_capacity(values.len());
+    for element in &values {
+        rendered.push(render_nested_gdb(
+            interp, frames, element, elem, depth + 1, pretty, elements,
+        )?);
+    }
+    Some(format!("[{}]", compress_repeats(&rendered)))
+}
+
+/// The gdb forms of a `Box` over an unsized pointee: a
+/// `str` pointee prints as the box's name over the text's
+/// bytes, a slice pointee as the box's name over the
+/// elements, and a dynamically sized struct pointee as the
+/// struct itself, exactly as gdb prints them. A sized
+/// pointee keeps the aggregate form.
+#[allow(clippy::too_many_arguments)]
+fn render_box_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    tag: &str,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
+    if tag_base_name(tag) != "Box" {
+        return None;
+    }
+    let pointee_ty = first_generic_arg(tag)?;
+    match Desc::from_tag(&pointee_ty) {
+        Desc::Str => {
+            let text = box_pointee_text(interp, frames, value)?;
+            let bytes: Vec<String> =
+                text.bytes().map(|b| b.to_string()).collect();
+            Some(format!(
+                "{} [{}]",
+                dwarf_type_name(tag),
+                compress_repeats(&bytes)
+            ))
+        }
+        Desc::Slice(elem) => {
+            let rendered = box_slice_elements(
+                interp, frames, value, &elem, depth, pretty, elements,
+            )?;
+            Some(format!("{} {}", dwarf_type_name(tag), rendered))
+        }
+        Desc::Adt(pointee_tag) => {
+            let pointer = box_pointer_value(value)?;
+            let rendered = render_dst_pointee_gdb(
+                interp, frames, &pointer, &pointee_tag, depth, pretty,
+                elements,
+            )?;
+            Some(format!("{} {}", dwarf_type_name(tag), rendered))
+        }
+        _ => None,
+    }
+}
+
+/// The data address a bare `str` field of an aggregate
+/// prints as: the field's own address when it is a pointer
+/// form; a bare string value denotes its data through the
+/// address of a reference to it.
+fn str_field_address(field: &Value) -> Option<u128> {
+    crate::interp::synthetic_address(field).or_else(|| {
+        crate::interp::synthetic_address(&Value::Ref(
+            crate::value::RefTarget::value(field.clone()),
+        ))
+    })
 }
 
 /// Render a trait-object fat pointer in gdb's form: the
@@ -1148,6 +1641,16 @@ fn render_adt_gdb(
         let mut parts = Vec::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
             let name = vshape.fields[i].name.as_deref()?;
+            // A field of bare `str` type (an unsized tail
+            // field, as in `RcInner<str>`) has no value form
+            // of its own in the aggregate print: gdb shows
+            // the field's data address.
+            if matches!(descs[i], Desc::Str) {
+                if let Some(addr) = str_field_address(field) {
+                    parts.push(format!("{name}: 0x{addr:x}"));
+                    continue;
+                }
+            }
             let v = if pretty {
                 render_gdb_any(
                     interp,
