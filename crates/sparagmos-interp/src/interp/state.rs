@@ -211,8 +211,12 @@ pub(crate) enum StdioConfig {
     Inherit,
     Null,
     Piped,
-    /// A configuration the value model does not decode (the
-    /// file-descriptor form and anything unrecognized): an
+    /// The file-descriptor form (`Stdio::from(..)` over a
+    /// file handle -- a `File`, a child pipe handle): the
+    /// stream is wired to the file-table entry the handle
+    /// carried, whose id this is.
+    File(u64),
+    /// A configuration the value model does not decode: an
     /// invocation carrying one is reported unsupported
     /// rather than run with a guessed routing.
     Unmodelled,

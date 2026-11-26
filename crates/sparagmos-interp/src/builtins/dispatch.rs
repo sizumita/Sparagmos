@@ -191,8 +191,29 @@ impl<'a> Interpreter<'a> {
         let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
                 // std's `print_to` panics when the write
                 // fails; a write-through sink's error is
-                // that failure (see `write_stdout`).
+                // that failure (see `write_stdout`). The
+                // panic is std's own, raised at a fixed
+                // position in `std::io::stdio` pinned to
+                // the toolchain build (the `panic!` at
+                // std/src/io/stdio.rs:1209:9 in the pinned
+                // 1.100.0 build), not at the guest's print
+                // call site: stamp it with std's location,
+                // as the runtime's other fixed library
+                // positions are stamped.
                 if let Err(error) = self.write_stdout(text.as_bytes()) {
+                    self.note_panic_stamp(Value::Ref(RefTarget::value(
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Str(
+                                    "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/std/src/io/stdio.rs"
+                                        .to_string(),
+                                ),
+                                Value::Uint(1209),
+                                Value::Uint(9),
+                            ],
+                        },
+                    )));
                     return Err(InterpError::Panic {
                         message: format!("failed printing to stdout: {error}"),
                         payload: None,
@@ -2017,23 +2038,37 @@ impl<'a> Interpreter<'a> {
                                     // is not the guest's own, and
                                     // its bytes go nowhere
                                     // observable.
-                                    if stdio_route(state.stdout_stdio, false)
-                                        == StdioRoute::Relay
-                                    {
-                                        self.push_output(
-                                            &String::from_utf8_lossy(
+                                    match stdio_route(state.stdout_stdio, false) {
+                                        StdioRoute::Relay => {
+                                            self.push_output(
+                                                &String::from_utf8_lossy(
+                                                    &outcome.stdout,
+                                                ),
+                                            );
+                                        }
+                                        StdioRoute::File => {
+                                            self.write_stdio_file(
+                                                state.stdout_stdio,
                                                 &outcome.stdout,
-                                            ),
-                                        );
+                                            );
+                                        }
+                                        _ => {}
                                     }
-                                    if stdio_route(state.stderr_stdio, false)
-                                        == StdioRoute::Relay
-                                    {
-                                        self.push_error_output(
-                                            &String::from_utf8_lossy(
+                                    match stdio_route(state.stderr_stdio, false) {
+                                        StdioRoute::Relay => {
+                                            self.push_error_output(
+                                                &String::from_utf8_lossy(
+                                                    &outcome.stderr,
+                                                ),
+                                            );
+                                        }
+                                        StdioRoute::File => {
+                                            self.write_stdio_file(
+                                                state.stderr_stdio,
                                                 &outcome.stderr,
-                                            ),
-                                        );
+                                            );
+                                        }
+                                        _ => {}
                                     }
                                     return Ok(ok_result(exit_status_value(
                                         outcome.exit_code,
@@ -2168,6 +2203,13 @@ impl<'a> Interpreter<'a> {
                                         ));
                                         Vec::new()
                                     }
+                                    StdioRoute::File => {
+                                        self.write_stdio_file(
+                                            state.stdout_stdio,
+                                            &outcome.stdout,
+                                        );
+                                        Vec::new()
+                                    }
                                     StdioRoute::Discard => Vec::new(),
                                 };
                                 let stderr = match stdio_route(state.stderr_stdio, true) {
@@ -2176,6 +2218,13 @@ impl<'a> Interpreter<'a> {
                                         self.push_error_output(&String::from_utf8_lossy(
                                             &outcome.stderr,
                                         ));
+                                        Vec::new()
+                                    }
+                                    StdioRoute::File => {
+                                        self.write_stdio_file(
+                                            state.stderr_stdio,
+                                            &outcome.stderr,
+                                        );
                                         Vec::new()
                                     }
                                     StdioRoute::Discard => Vec::new(),

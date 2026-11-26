@@ -105,11 +105,17 @@ pub struct ToolInterception {
 /// How one stdio stream of a spawned child is wired, as the
 /// command's recorded configuration prescribes (see
 /// [`ProcessSpawnRequest`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ProcessStdio {
     Inherit,
     Null,
     Piped,
+    /// The stream is wired to the given host file: a
+    /// duplicate of the file-table entry the guest's
+    /// file-descriptor-form `Stdio` named, owned by the
+    /// request (a spawn dup's it into the child, as a
+    /// native spawn dup's the descriptor it is given).
+    Fd(std::fs::File),
 }
 
 /// A request to start one child process, handed from the
@@ -124,7 +130,7 @@ pub enum ProcessStdio {
 /// spelled `program`, resolved by the host under the child's
 /// working directory and environment, as a native spawn
 /// resolves it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ProcessSpawnRequest {
     pub program: Vec<u8>,
     pub args: Vec<Vec<u8>>,
@@ -195,7 +201,7 @@ pub trait ProcessHostOps: Send + Sync {
     /// the returned files.
     fn spawn(
         &self,
-        request: &ProcessSpawnRequest,
+        request: ProcessSpawnRequest,
     ) -> Result<ProcessSpawned, ProcessHostError>;
     /// Run the child the request describes to completion and
     /// collect its outcome: the spawn-and-collect path behind
@@ -204,7 +210,7 @@ pub trait ProcessHostOps: Send + Sync {
     /// while the child runs, as std's collection does.
     fn run(
         &self,
-        request: &ProcessSpawnRequest,
+        request: ProcessSpawnRequest,
     ) -> Result<ProcessChildOutcome, ProcessHostError>;
     /// Wait for the child to end; returns its exit code (the
     /// [`ProcessChildOutcome`] convention: negative when the

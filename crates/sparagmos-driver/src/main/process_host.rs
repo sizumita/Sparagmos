@@ -307,6 +307,9 @@ fn wire_stdio(
         sparagmos_interp::ProcessStdio::Piped => {
             std::process::Stdio::piped()
         }
+        sparagmos_interp::ProcessStdio::Fd(file) => {
+            std::process::Stdio::from(file)
+        }
     }
 }
 
@@ -476,14 +479,14 @@ impl DriverProcessHost {
 impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
     fn spawn(
         &self,
-        request: &sparagmos_interp::ProcessSpawnRequest,
+        request: sparagmos_interp::ProcessSpawnRequest,
     ) -> Result<
         sparagmos_interp::ProcessSpawned,
         sparagmos_interp::ProcessHostError,
     > {
         use sparagmos_interp::ProcessHostError as HostErr;
         let (mut cmd, self_run, stderr_file) =
-            self.assemble(request)?;
+            self.assemble(&request)?;
         cmd.stdin(wire_stdio(request.stdin))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -552,14 +555,14 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
 
     fn run(
         &self,
-        request: &sparagmos_interp::ProcessSpawnRequest,
+        request: sparagmos_interp::ProcessSpawnRequest,
     ) -> Result<
         sparagmos_interp::ProcessChildOutcome,
         sparagmos_interp::ProcessHostError,
     > {
         use sparagmos_interp::ProcessHostError as HostErr;
         let (mut cmd, self_run, stderr_file) =
-            self.assemble(request)?;
+            self.assemble(&request)?;
         cmd.stdin(wire_stdio(request.stdin))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
