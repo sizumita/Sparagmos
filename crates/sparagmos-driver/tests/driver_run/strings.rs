@@ -2572,3 +2572,123 @@ fn run_mode_str_lines_zst_fn_composed() {
         "[\"THREE\", \"FOUR\"]\nsum=3\n",
     );
 }
+const CHAR_ESCAPE_SRC: &str = r#"
+fn main() {
+    println!("debug-lit={}", 'a'.escape_debug().collect::<String>());
+    println!("debug-lit2={}", 'Z'.escape_debug().collect::<String>());
+    println!("debug-nl={}", '\n'.escape_debug().collect::<String>());
+    println!("debug-tab={}", '\t'.escape_debug().collect::<String>());
+    println!("debug-cr={}", '\r'.escape_debug().collect::<String>());
+    println!("debug-nul={}", '\0'.escape_debug().collect::<String>());
+    println!("debug-bs={}", '\\'.escape_debug().collect::<String>());
+    println!("debug-dq={}", '"'.escape_debug().collect::<String>());
+    println!("debug-sq={}", '\''.escape_debug().collect::<String>());
+    println!("default-nl={}", '\n'.escape_default().collect::<String>());
+    println!("default-bs={}", '\\'.escape_default().collect::<String>());
+    println!("default-lit={}", 'a'.escape_default().collect::<String>());
+    println!("default-del={}", '\u{7f}'.escape_default().collect::<String>());
+    println!("default-01={}", '\u{1}'.escape_default().collect::<String>());
+    println!("unicode-a={}", 'a'.escape_unicode().collect::<String>());
+    println!("unicode-e9={}", '\u{e9}'.escape_unicode().collect::<String>());
+    println!("default-e9={}", '\u{e9}'.escape_default().collect::<String>());
+    println!("unicode-heart={}", '\u{2764}'.escape_unicode().collect::<String>());
+    let mut it = 'q'.escape_debug();
+    println!("step1={:?}", it.next());
+    println!("step2={:?}", it.next());
+    let mut it = '\n'.escape_default();
+    println!("step3={:?}", it.next());
+    println!("step4={:?}", it.next());
+    println!("step5={:?}", it.next());
+}
+"#;
+
+#[test]
+fn run_mode_char_escape_iterators() {
+    // The `char` escape iterators (`EscapeDebug` /
+    // `EscapeDefault` / `EscapeUnicode`) stepped through
+    // core's `EscapeIterInner` buffer state machine: the
+    // literal form (a printable char stored as the union's
+    // literal payload), the backslash forms, the `\xNN` /
+    // `\u{...}` buffer forms, and manual stepping to
+    // exhaustion. Expected output was produced by the
+    // native 1.100.0 toolchain.
+    run_ok(
+        "char-escape-iterators",
+        CHAR_ESCAPE_SRC,
+        "debug-lit=a\n\
+         debug-lit2=Z\n\
+         debug-nl=\\n\n\
+         debug-tab=\\t\n\
+         debug-cr=\\r\n\
+         debug-nul=\\0\n\
+         debug-bs=\\\\\n\
+         debug-dq=\\\"\n\
+         debug-sq=\\'\n\
+         default-nl=\\n\n\
+         default-bs=\\\\\n\
+         default-lit=a\n\
+         default-del=\\u{7f}\n\
+         default-01=\\u{1}\n\
+         unicode-a=\\u{61}\n\
+         unicode-e9=\\u{e9}\n\
+         default-e9=\\u{e9}\n\
+         unicode-heart=\\u{2764}\n\
+         step1=Some('q')\n\
+         step2=None\n\
+         step3=Some('\\\\')\n\
+         step4=Some('n')\n\
+         step5=None\n",
+    );
+}
+
+const CHAR_ESCAPE_CONSUMERS_SRC: &str = r#"
+fn main() {
+    let it = '\n'.escape_debug();
+    println!("hint={:?} len={}", it.size_hint(), it.len());
+    println!("count={}", '\n'.escape_debug().count());
+    println!("nth={:?}", 'a'.escape_unicode().nth(3));
+    println!("last={:?}", 'a'.escape_default().last());
+    println!("last2={:?}", '\n'.escape_unicode().last());
+    let mut it = 'x'.escape_unicode();
+    println!("first={:?}", it.next());
+    println!("hint-after={:?} len-after={}", it.size_hint(), it.len());
+    println!("rest={}", it.collect::<String>());
+    let upper: String = 'a'.escape_unicode().map(|c| c.to_ascii_uppercase()).collect();
+    println!("upper={}", upper);
+    let taken: String = '\n'.escape_debug().take(1).collect();
+    println!("taken={}", taken);
+    let vec: Vec<char> = '\\'.escape_default().collect();
+    println!("vec={:?}", vec);
+    let mut total = 0usize;
+    for c in '\u{7f}'.escape_default() {
+        total += c.len_utf8();
+    }
+    println!("total={}", total);
+}
+"#;
+
+#[test]
+fn run_mode_char_escape_iterator_consumers() {
+    // The modelled consumers and adapters over the escape
+    // iterators: exact size accounting (`size_hint` /
+    // `len`) before and after a step, `count`, `nth`,
+    // `last`, `Map` / `Take` composition, a by-value
+    // `Vec<char>` collect and a `for` loop. Expected output
+    // was produced by the native 1.100.0 toolchain.
+    run_ok(
+        "char-escape-iterator-consumers",
+        CHAR_ESCAPE_CONSUMERS_SRC,
+        "hint=(2, Some(2)) len=2\n\
+         count=2\n\
+         nth=Some('6')\n\
+         last=Some('a')\n\
+         last2=Some('}')\n\
+         first=Some('\\\\')\n\
+         hint-after=(5, Some(5)) len-after=5\n\
+         rest=u{78}\n\
+         upper=\\U{61}\n\
+         taken=\\\n\
+         vec=['\\\\', '\\\\']\n\
+         total=6\n",
+    );
+}
