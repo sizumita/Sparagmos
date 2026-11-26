@@ -278,18 +278,51 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             .clone();
         // A union's fields are never dropped: the language
         // requires them to be `Copy` or wrapped in
-        // `ManuallyDrop`, and a union has no `Drop` impl of
-        // its own, so its glue is empty whatever its fields
-        // declare. Planning the fields like a struct's would
-        // both over-drop (the fields alias one storage) and
-        // mismatch the stored value, which holds the one
-        // written field.
+        // `ManuallyDrop`, so no field walk ever applies -- the
+        // fields alias one storage, and the stored value holds
+        // the one written field, which a struct-style walk
+        // mismatches. The union type itself may still carry a
+        // `Drop` impl, and then that destructor is the whole
+        // glue: it runs on an explicit `mem::drop` and on
+        // overwrite, exactly as for any other type.
         if conv
             .adt_shapes
             .get(&def)
             .is_some_and(|shape| shape.kind == mir::AdtShapeKind::Union)
         {
-            return Some(P::Trivial);
+            let ty_key = format!("{:?}", mir::Ty::Adt(def, args.to_vec()));
+            let dtor = conv
+                .dtor_bodies
+                .get(&ty_key)
+                .cloned()
+                .or_else(|| conv.dtor_body(&name, args));
+            if let Some(func) = dtor {
+                return Some(P::CallDtor { func });
+            }
+            if conv.drop_trivial_adts.contains(&ty_key)
+                || conv.drop_no_impl_adts.contains(&ty_key)
+            {
+                // The compiler certifies this instantiation's
+                // glue empty, or the driver certifies the type
+                // has no `Drop` impl in its own crate; with no
+                // field glue either, the plan is trivial.
+                return Some(P::Trivial);
+            }
+            if conv.dtor_impl_known(&name) {
+                // The impl exists but has no converted body for
+                // this instantiation: its effects can neither be
+                // executed nor ruled out.
+                return None;
+            }
+            if conv.is_local_type(&name) {
+                // The entry crate's name table is complete, so
+                // no recorded impl means there is none.
+                return Some(P::Trivial);
+            }
+            // A foreign union no certification covers: fall
+            // through to the modelled-type table and the
+            // generic path below, which refuse what they
+            // cannot rule out.
         }
         // Modelled std types: their glue shape is fixed by the value
         // model, not by a converted body.
