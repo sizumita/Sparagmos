@@ -2821,3 +2821,85 @@ fn run_mode_backtrace_capture_follows_the_environment() {
     assert_eq!(disabled.status.code(), Some(0), "stdout={stdout}");
     assert_eq!(stdout, "disabled backtrace\n");
 }
+
+const DOUBLE_FAIL_SRC: &str = r#"fn main() {
+    struct Double;
+
+    impl Drop for Double {
+        fn drop(&mut self) {
+            panic!("twice")
+        }
+    }
+
+    let _d = Double;
+
+    panic!("once");
+}
+"#;
+
+#[test]
+fn run_mode_double_fail_reports_destructor_during_cleanup() {
+    // A destructor that panics while an earlier panic unwinds
+    // through its owner (the `double-fail` child of
+    // tests/ui/backtrace/backtrace.rs): the second panic's own
+    // report carries the run's one backtrace (the panic-count
+    // rule forces it), and the abort panic codegen raises for
+    // the cleanup block is `panic_in_cleanup` — "panic in a
+    // destructor during cleanup" at panicking.rs:233:5, with no
+    // backtrace of its own — not the `panic_cannot_unwind`
+    // report a nounwind boundary in ordinary code gets.
+    let dir = temp_dir("double-fail");
+    let src = fixture(&dir, "double_fail.rs", DOUBLE_FAIL_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(134), "double panic aborts");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "\nthread 'main' (1) panicked at {0}:12:5:\nonce\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+             \nthread 'main' (1) panicked at {0}:6:13:\ntwice\nstack backtrace:\n\
+             \u{20}  0:     0x555555554000 - __rustc::rust_begin_unwind\n\
+             \u{20}  1:     0x555555554010 - core::panicking::panic_fmt\n\
+             \u{20}  2:     0x555555554020 - <double_fail::main::Double as std::ops::Drop>::drop\n\
+             \u{20}  3:     0x555555554030 - double_fail::main\n\
+             \nthread 'main' (1) panicked at /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs:233:5:\n\
+             panic in a destructor during cleanup\n\
+             thread caused non-unwinding panic. aborting.\n\
+             sparagmos-driver run: guest crashed: abort\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
+
+const NOUNWIND_SRC: &str = r#"extern "C" fn boom() {
+    panic!("in nounwind");
+}
+fn main() {
+    boom();
+}
+"#;
+
+#[test]
+fn run_mode_nounwind_panic_reports_cannot_unwind() {
+    // The other `Terminate` reason: a panic crossing a nounwind
+    // boundary in ordinary code (no cleanup in progress) is
+    // `panic_cannot_unwind` — "panic in a function that cannot
+    // unwind" at panicking.rs:225:5, with a backtrace.
+    let dir = temp_dir("nounwind");
+    let src = fixture(&dir, "nounwind.rs", NOUNWIND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(134), "nounwind panic aborts: {stderr}");
+    assert!(
+        stderr.contains("library/core/src/panicking.rs:225:5"),
+        "cannot-unwind location: {stderr}"
+    );
+    assert!(
+        stderr.contains("panic in a function that cannot unwind"),
+        "cannot-unwind message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panic in a destructor during cleanup"),
+        "not the cleanup report: {stderr}"
+    );
+}

@@ -16,7 +16,16 @@ pub(super) fn convert_unwind_action(action: &mir::UnwindAction) -> ir::UnwindAct
             ir::UnwindAction::Cleanup(ir::BasicBlock(bb.index()))
         }
         mir::UnwindAction::Continue => ir::UnwindAction::Continue,
-        mir::UnwindAction::Terminate(_) => ir::UnwindAction::Terminate,
+        mir::UnwindAction::Terminate(reason) => {
+            ir::UnwindAction::Terminate(match reason {
+                mir::UnwindTerminateReason::InCleanup => {
+                    ir::UnwindTerminateReason::InCleanup
+                }
+                mir::UnwindTerminateReason::Generic => {
+                    ir::UnwindTerminateReason::CannotUnwind
+                }
+            })
+        }
         mir::UnwindAction::Unreachable => ir::UnwindAction::Unreachable,
     }
 }
