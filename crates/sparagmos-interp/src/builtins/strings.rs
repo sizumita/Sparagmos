@@ -6,7 +6,7 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter, Resolved,
 };
-use crate::ir::{Body, Operand};
+use crate::ir::{Body, Operand, Ty};
 use crate::value::{FmtArguments, RefProj, RefTarget, Value};
 
 use super::*;
@@ -55,14 +55,188 @@ impl<'a> Interpreter<'a> {
     /// when it is already a fat reference, or over a snapshot of
     /// the bytes when the receiver is the string data itself (the
     /// shape of a byte-slice constant).
+    /// The two `n`-byte ranges of a `compare_bytes` call,
+    /// settled jointly: each side's element width is judged
+    /// from its own evidence (see [`Self::byte_range_width`])
+    /// and the two judgements combined (see
+    /// `compare_byte_widths`) before either range is read, so
+    /// a side whose storage records no element type (a `Vec`
+    /// buffer block, a constant aggregate) is still read at
+    /// the width the other side's type records.
+    pub(super) fn read_compare_ranges(
+        &self,
+        frames: &[Frame],
+        a_ptr: &Value,
+        b_ptr: &Value,
+        n: usize,
+    ) -> InterpResult<(Vec<u8>, Vec<u8>)> {
+        let a_evidence = self.byte_range_width(frames, a_ptr, n);
+        let b_evidence = self.byte_range_width(frames, b_ptr, n);
+        let (a_width, b_width) = compare_byte_widths(a_evidence, b_evidence);
+        let a = self.read_byte_range(frames, a_ptr, n, a_width)?;
+        let b = self.read_byte_range(frames, b_ptr, n, b_width)?;
+        Ok((a, b))
+    }
+
+    /// The element width evidence for a `compare_bytes` range
+    /// over `ptr`, as a `(recorded, derived)` pair (see
+    /// [`Self::recorded_seq_elem_width`] and
+    /// [`Self::derived_seq_elem_width`]). Either is `None`
+    /// when its evidence is unavailable -- including when the
+    /// pointer does not resolve at all, which the range read
+    /// itself then reports.
+    fn byte_range_width(
+        &self,
+        frames: &[Frame],
+        ptr: &Value,
+        n: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        let Ok(target) = self.deref_value(frames, ptr) else {
+            return (None, None);
+        };
+        let recorded = self.recorded_seq_elem_width(frames, &target);
+        let derived = self.derived_seq_elem_width(frames, &target, n);
+        (recorded, derived)
+    }
+
+    /// The element width of the sequence `target` denotes an
+    /// element of, from the type recorded for the target's
+    /// root (a place's local type, a static's declared type,
+    /// an allocation's declared type), walked through the
+    /// projection prefix that denotes the sequence itself --
+    /// the whole projection, minus a trailing index or
+    /// subslice step that denotes the element the target
+    /// points at. `Some` only when the walk ends at an array
+    /// or slice of scalar elements of known size. A constant
+    /// target records no type, and ADT field steps are not
+    /// followed (the limits `sequence_elem_width` also has).
+    fn recorded_seq_elem_width(&self, frames: &[Frame], target: &Resolved) -> Option<usize> {
+        let (root, projection): (Ty, &[RefProj]) = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let body = self.program().functions.get(&frame.func)?;
+                (body.local_tys.get(*local)?.clone(), projection)
+            }
+            Resolved::Static { name, projection } => {
+                (self.program().static_tys.get(name)?.clone(), projection)
+            }
+            Resolved::Alloc { id, projection } => (self.alloc_ty(*id)?, projection),
+            Resolved::Value(..) => return None,
+        };
+        let prefix = match projection.last() {
+            Some(RefProj::Index(_)) | Some(RefProj::Subslice { .. }) => {
+                &projection[..projection.len() - 1]
+            }
+            _ => projection,
+        };
+        let mut cur = root;
+        for step in prefix {
+            cur = match step {
+                RefProj::Field(k) => match cur {
+                    Ty::Tuple(ts) => ts.get(*k)?.clone(),
+                    _ => return None,
+                },
+                RefProj::Index(_) => match cur {
+                    Ty::Array(elem, _) | Ty::Slice(elem) => *elem,
+                    _ => return None,
+                },
+                RefProj::Subslice { .. } => match cur {
+                    Ty::Array(..) | Ty::Slice(..) => cur,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+        }
+        match cur {
+            Ty::Array(elem, _) | Ty::Slice(elem) => match *elem {
+                Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) | Ty::Bool => self
+                    .ty_size(&elem)
+                    .map(|size| size as usize)
+                    .filter(|size| *size > 0),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The element width of the sequence `target` denotes,
+    /// derived from the range itself: the sequence holds
+    /// `count` elements from the denoted position, so a byte
+    /// range of `n` covering exactly those elements has
+    /// elements of `n / count` bytes. `Some` only when the
+    /// count is positive, divides `n`, yields a plausible
+    /// scalar width, and the first element actually reads as
+    /// a scalar: a sequence of aggregates never derives a
+    /// width, and neither does a range that stops partway
+    /// through its sequence (a prefix range over a longer
+    /// sequence keeps the plain byte read, and its error).
+    fn derived_seq_elem_width(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        n: usize,
+    ) -> Option<usize> {
+        if n == 0 {
+            return None;
+        }
+        let (seq_target, start, exact) = seq_head_target(target);
+        let count = match exact {
+            Some(len) => len,
+            None => {
+                let seq = self.read_resolved(frames, &seq_target).ok()?;
+                let total = usize::try_from(seq.len()?).ok()?;
+                total.checked_sub(start)?
+            }
+        };
+        if count == 0 || n % count != 0 {
+            return None;
+        }
+        let width = n / count;
+        match self.read_seq_at(frames, target, 0) {
+            // A width of 1 needs no derivation for integer
+            // elements (the plain byte read already serves
+            // them); it is derived only for boolean elements,
+            // whose values the byte read cannot serialise.
+            Ok(Value::Bool(_)) => {
+                if width == 1 {
+                    Some(width)
+                } else {
+                    None
+                }
+            }
+            Ok(Value::Int(_) | Value::Uint(_) | Value::Float(_))
+                if matches!(width, 2 | 4 | 8 | 16) =>
+            {
+                Some(width)
+            }
+            _ => None,
+        }
+    }
+
     /// The `n` bytes starting at a raw byte pointer, for
     /// `compare_bytes`: string and byte data read directly, any
-    /// other aggregate element by element.
+    /// other aggregate element by element. The intrinsic's
+    /// pointers are byte-denominated (`*const u8`) whatever
+    /// storage they denote, so a range over a sequence of
+    /// wider elements is read element by element at the
+    /// settled `width`, each element serialised to its
+    /// little-endian bytes: reading element `i` for byte `i`
+    /// instead walks off the end of a short wider-element
+    /// sequence (the uninitialised spare-capacity slots of a
+    /// `Vec` buffer block, or past the end of a constant
+    /// array). Without a settled width the elements are read
+    /// as bytes, the behaviour byte-denominated storage has
+    /// always had.
     pub(super) fn read_byte_range(
         &self,
         frames: &[Frame],
         ptr: &Value,
         n: usize,
+        width: Option<usize>,
     ) -> InterpResult<Vec<u8>> {
         if n == 0 {
             return Ok(Vec::new());
@@ -83,6 +257,14 @@ impl<'a> Interpreter<'a> {
                 ));
             }
             return Ok(bytes[..n].to_vec());
+        }
+        if let Some(w) = width.filter(|w| *w > 0 && n % *w == 0) {
+            let mut out = Vec::with_capacity(n);
+            for e in 0..(n / w) {
+                let elem = self.read_seq_at(frames, &target, e)?;
+                out.extend_from_slice(&compare_element_bytes(&elem, w)?);
+            }
+            return Ok(out);
         }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -894,4 +1076,162 @@ fn reverse_maximal_suffix(arr: &[u8], known_period: usize, order_greater: bool) 
         }
     }
     left
+}
+
+/// The target denoting the sequence `target` denotes an
+/// element of, the index of that element in it, and the
+/// element count from that index when a step records it
+/// exactly (a subslice step carries its own length). A
+/// target whose projection ends in neither an index nor a
+/// subslice step denotes the sequence itself, at index 0.
+fn seq_head_target(target: &Resolved) -> (Resolved, usize, Option<usize>) {
+    fn stepped(projection: &[RefProj]) -> Option<(Vec<RefProj>, usize, Option<usize>)> {
+        match projection.last() {
+            Some(RefProj::Index(k)) => {
+                Some((projection[..projection.len() - 1].to_vec(), *k, None))
+            }
+            Some(RefProj::Subslice { offset, len }) => Some((
+                projection[..projection.len() - 1].to_vec(),
+                *offset,
+                Some(*len),
+            )),
+            _ => None,
+        }
+    }
+    match target {
+        Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        } => match stepped(projection) {
+            Some((head, start, exact)) => (
+                Resolved::Place {
+                    frame_pos: *frame_pos,
+                    local: *local,
+                    projection: head,
+                },
+                start,
+                exact,
+            ),
+            None => (target.clone(), 0, None),
+        },
+        Resolved::Static { name, projection } => match stepped(projection) {
+            Some((head, start, exact)) => (
+                Resolved::Static {
+                    name: name.clone(),
+                    projection: head,
+                },
+                start,
+                exact,
+            ),
+            None => (target.clone(), 0, None),
+        },
+        Resolved::Alloc { id, projection } => match stepped(projection) {
+            Some((head, start, exact)) => (
+                Resolved::Alloc {
+                    id: *id,
+                    projection: head,
+                },
+                start,
+                exact,
+            ),
+            None => (target.clone(), 0, None),
+        },
+        Resolved::Value(base, projection) => match stepped(projection) {
+            Some((head, start, exact)) => (Resolved::Value(base.clone(), head), start, exact),
+            None => (target.clone(), 0, None),
+        },
+    }
+}
+
+/// Settle the element widths of a `compare_bytes` call's two
+/// ranges from each side's `(recorded, derived)` evidence: a
+/// recorded width is the storage's own denomination and wins
+/// for its side; a side with no recorded width takes the
+/// other side's recorded width unless its own derivation
+/// disagrees, because the call compares two ranges of one
+/// element type (slice equality is the caller that produces
+/// these ranges) while a derivation is only as strong as the
+/// sequence it counted. With no recorded width on either
+/// side, a derived width settles both sides when the two
+/// derivations agree or only one side derives one; a
+/// disagreement leaves both sides unsettled, on the plain
+/// byte read.
+fn compare_byte_widths(
+    a: (Option<usize>, Option<usize>),
+    b: (Option<usize>, Option<usize>),
+) -> (Option<usize>, Option<usize>) {
+    let (a_rec, a_der) = a;
+    let (b_rec, b_der) = b;
+    match (a_rec, b_rec) {
+        (Some(x), Some(y)) => (Some(x), Some(y)),
+        (Some(x), None) => (
+            Some(x),
+            match b_der {
+                Some(d) if d != x => Some(d),
+                _ => Some(x),
+            },
+        ),
+        (None, Some(y)) => (
+            match a_der {
+                Some(d) if d != y => Some(d),
+                _ => Some(y),
+            },
+            Some(y),
+        ),
+        (None, None) => match (a_der, b_der) {
+            (Some(x), Some(y)) if x == y => (Some(x), Some(y)),
+            (Some(x), None) => (Some(x), Some(x)),
+            (None, Some(y)) => (Some(y), Some(y)),
+            _ => (None, None),
+        },
+    }
+}
+
+/// The little-endian bytes of one scalar element of a
+/// `compare_bytes` range, at the element width the range is
+/// denominated in: an integer contributes the low `width`
+/// bytes of its two's-complement word, a float its bit
+/// pattern at its own width (the model holds floats widened
+/// to `f64`, so a width-4 element narrows back), a boolean
+/// its single byte. Anything else is not an element a byte
+/// comparison can serialise.
+fn compare_element_bytes(value: &Value, width: usize) -> InterpResult<Vec<u8>> {
+    match value {
+        Value::Int(v) => {
+            if width > 16 {
+                return Err(InterpError::type_mismatch(
+                    "compare_bytes element",
+                    "integer element of width at most 16",
+                    format!("width {width}"),
+                ));
+            }
+            Ok((*v as u128).to_le_bytes()[..width].to_vec())
+        }
+        Value::Uint(v) => {
+            if width > 16 {
+                return Err(InterpError::type_mismatch(
+                    "compare_bytes element",
+                    "integer element of width at most 16",
+                    format!("width {width}"),
+                ));
+            }
+            Ok(v.to_le_bytes()[..width].to_vec())
+        }
+        Value::Float(v) => match width {
+            4 => Ok((*v as f32).to_bits().to_le_bytes().to_vec()),
+            8 => Ok(v.to_bits().to_le_bytes().to_vec()),
+            _ => Err(InterpError::type_mismatch(
+                "compare_bytes element",
+                "float element of width 4 or 8",
+                format!("width {width}"),
+            )),
+        },
+        Value::Bool(b) if width == 1 => Ok(vec![u8::from(*b)]),
+        other => Err(InterpError::type_mismatch(
+            "compare_bytes element",
+            "scalar element",
+            other.kind_name(),
+        )),
+    }
 }
