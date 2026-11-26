@@ -3454,16 +3454,59 @@ def debugger_check_output(check_lines, output_lines):
 
 # A print expression within the attempted scope: the grammar
 # the debugger interface's expression evaluator speaks —
-# leading dereferences, a base name (a plain variable name, or
-# a `::` path naming a static) or a parenthesised sub-expression
+# leading dereferences, a base name (a plain variable name, a
+# `::` path naming a static, or a `$N` history reference to an
+# earlier print's value) or a parenthesised sub-expression
 # (optionally a cast, `<expr> as <type>`), then numeric or
-# named field steps and index steps.
+# named field steps and index steps. A whole print expression
+# may also be one top-level `==` / `!=` comparison between two
+# such expressions (the form the debuginfo suite's history
+# checks use: `print $1 == $2`).
 _DEBUGGER_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+def _split_debugger_comparison(s):
+    """Split a print expression at its top-level `==` or `!=`
+    (outside any parenthesis or bracket), returning (lhs, rhs),
+    or None when there is none. Mirrors the evaluator's own
+    split: exactly one comparison, at the top level — a
+    parenthesised comparison is outside the attempted scope,
+    as it is for the evaluator."""
+    depth = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and s[i:i + 2] in ("==", "!="):
+            return s[:i], s[i + 2:]
+        i += 1
+    return None
 
 
 def _debugger_expr_ok(expr):
     """Whether `expr` stays within the print-expression grammar
-    (see the note above)."""
+    (see the note above): a value expression, or one top-level
+    comparison between two value expressions."""
+    s = expr.strip()
+    split = _split_debugger_comparison(s)
+    if split is not None:
+        lhs, rhs = split
+        if not lhs.strip() or not rhs.strip():
+            return False
+        return (_debugger_value_expr_ok(lhs)
+                and _debugger_value_expr_ok(rhs))
+    return _debugger_value_expr_ok(s)
+
+
+def _debugger_value_expr_ok(expr):
+    """Whether `expr` is a value expression of the
+    print-expression grammar (see the note above): no
+    comparison — the comparison form is `_debugger_expr_ok`'s
+    outer layer, so a parenthesised sub-expression cannot
+    smuggle one in."""
     s = expr.strip()
     while s.startswith("*"):
         s = s[1:].lstrip()
@@ -3483,13 +3526,14 @@ def _debugger_expr_ok(expr):
         inner = s[1:close]
         if " as " in inner:
             lhs, _, ty = inner.partition(" as ")
-            if not ty.strip() or not _debugger_expr_ok(lhs):
+            if not ty.strip() or not _debugger_value_expr_ok(lhs):
                 return False
-        elif not _debugger_expr_ok(inner):
+        elif not _debugger_value_expr_ok(inner):
             return False
         s = s[close + 1:]
     else:
-        m = re.match(_DEBUGGER_IDENT + r"(?:::" + _DEBUGGER_IDENT + r")*", s)
+        m = re.match(r"\$\d+|" + _DEBUGGER_IDENT
+                     + r"(?:::" + _DEBUGGER_IDENT + r")*", s)
         if not m:
             return False
         s = s[m.end():]

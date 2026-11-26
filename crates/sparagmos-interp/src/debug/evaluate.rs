@@ -3,7 +3,7 @@
 use crate::interp::{Frame, Interpreter};
 use crate::value::{RefProj, Value};
 use super::desc::{Desc, field_desc, path_text, smart_pointer_pointee, tag_base_name};
-use super::parse::{ExprStep, ParsedExpr, parse_expr};
+use super::parse::{ExprStep, ParsedExpr, parse_expr, split_comparison};
 use super::printers::{render_lldb_provider_line, render_pretty_gdb};
 use super::queries::{desc_type_name, expr_type_name, lldb_command_format_scalar, lldb_format_scalar, pointer_pointee};
 use super::render_gdb::{render_gdb, union_projected_field};
@@ -17,34 +17,51 @@ use super::session::{DebugControl, DebugDialect, DebugPrint};
 /// that dialect.
 pub(super) fn render_print(
     interp: &Interpreter,
-    ctl: &DebugControl,
+    ctl: &mut DebugControl,
     frames: &[Frame],
     print: &DebugPrint,
 ) -> Vec<String> {
-    let err_line = |e: &str| match ctl.dialect {
+    let dialect = ctl.dialect;
+    let next_no = ctl.print_count + 1;
+    let err_line = |e: &str| match dialect {
         DebugDialect::Gdb => {
-            vec![format!("${} = <error: {e}>", ctl.print_count + 1)]
+            vec![format!("${} = <error: {e}>", next_no)]
         }
         DebugDialect::Lldb => vec![format!("= <error: {e}>")],
     };
     match evaluate_print(interp, ctl, frames, print) {
-        Ok(evaluated) => match ctl.dialect {
-            DebugDialect::Gdb => match evaluated.gdb {
-                Some(gdb) => vec![format!("${} = {gdb}", ctl.print_count + 1)],
-                None => err_line(&format!(
-                    "`{}` could not be rendered",
-                    print.expr
-                )),
-            },
-            DebugDialect::Lldb => {
-                if evaluated.lldb.is_empty() {
-                    err_line(&format!("`{}` could not be rendered", print.expr))
-                } else {
-                    evaluated.lldb
+        Ok(evaluated) => {
+            // The print produced a value: it joins the
+            // session's history, where a later `$N` expression
+            // reads it back (see `DebugControl::history`).
+            ctl.history.push(Some(evaluated.value.clone()));
+            match ctl.dialect {
+                DebugDialect::Gdb => match evaluated.gdb {
+                    Some(gdb) => vec![format!("${} = {gdb}", ctl.print_count + 1)],
+                    None => err_line(&format!(
+                        "`{}` could not be rendered",
+                        print.expr
+                    )),
+                },
+                DebugDialect::Lldb => {
+                    if evaluated.lldb.is_empty() {
+                        err_line(&format!(
+                            "`{}` could not be rendered",
+                            print.expr
+                        ))
+                    } else {
+                        evaluated.lldb
+                    }
                 }
             }
-        },
-        Err(e) => err_line(&e),
+        }
+        Err(e) => {
+            // A failed print still occupies its history slot,
+            // so the `$N` numbering stays aligned with the
+            // transcript's labels (see `DebugControl::history`).
+            ctl.history.push(None);
+            err_line(&e)
+        }
     }
 }
 
@@ -55,12 +72,17 @@ pub(super) fn render_print(
 pub(super) struct EvaluatedPrint {
     pub(super) gdb: Option<String>,
     pub(super) lldb: Vec<String>,
+    /// The value the expression evaluated to, before any
+    /// rendering: the form the session's print history keeps
+    /// (see `DebugControl::history`).
+    pub(super) value: EvaluatedValue,
 }
 
 /// A print expression evaluated to a value: the value itself,
 /// its rendering descriptor, its `char` fact, and its declared
 /// type tag when the conversion recorded one (the form the
 /// pretty printers key on and the type queries print).
+#[derive(Clone)]
 pub(super) struct EvaluatedValue {
     pub(super) value: Value,
     pub(super) desc: Option<Desc>,
@@ -103,6 +125,30 @@ pub(super) fn resolve_base(
     frames: &[Frame],
     expr: &ParsedExpr,
 ) -> Result<EvaluatedValue, String> {
+    // A history reference names the value an earlier print of
+    // this session produced: gdb numbers the prints from $1,
+    // lldb from $0 — the numbering each dialect's own result
+    // variables use.
+    if let Some(num) = expr.base.strip_prefix('$') {
+        let n: usize = num
+            .parse()
+            .map_err(|_| format!("bad history reference `{}`", expr.base))?;
+        let index = match ctl.dialect {
+            DebugDialect::Gdb => n.checked_sub(1),
+            DebugDialect::Lldb => Some(n),
+        };
+        let Some(index) = index else {
+            return Err(format!("no history value `{}`", expr.base));
+        };
+        return match ctl.history.get(index) {
+            Some(Some(ev)) => Ok(ev.clone()),
+            Some(None) => Err(format!(
+                "history value `{}` has no value (its print failed)",
+                expr.base
+            )),
+            None => Err(format!("no history value `{}`", expr.base)),
+        };
+    }
     // A path-qualified name can only name a static: debug
     // variable entries carry plain identifiers.
     if !expr.base.contains("::") && !frames.is_empty() {
@@ -1006,6 +1052,27 @@ pub(super) fn evaluate_expr(
     frames: &[Frame],
     expr_text: &str,
 ) -> Result<EvaluatedValue, String> {
+    // A top-level comparison (the form the suite's history
+    // checks print, `$1 == $2`): both sides are print
+    // expressions of the ordinary grammar, and the result is
+    // the boolean of their values' equality — the value
+    // model's own equality, under which a reference compares
+    // by its target identity (the reading a debugger's
+    // pointer comparison makes) and an aggregate by its
+    // fields.
+    if let Some((lhs, equal, rhs)) = split_comparison(expr_text) {
+        let lhs = evaluate_expr(interp, ctl, frames, lhs)?;
+        let rhs = evaluate_expr(interp, ctl, frames, rhs)?;
+        return Ok(EvaluatedValue {
+            value: Value::Bool((lhs.value == rhs.value) == equal),
+            desc: Some(Desc::Bool),
+            char: false,
+            tag: Some("bool".to_string()),
+            cast_type: None,
+            pending_cast: None,
+            pending_array_view: None,
+        });
+    }
     let expr = parse_expr(expr_text)?;
     let mut ev = resolve_base(interp, ctl, frames, &expr)?;
     for step in &expr.steps {
@@ -1289,6 +1356,7 @@ pub(super) fn evaluate_print(
     print: &DebugPrint,
 ) -> Result<EvaluatedPrint, String> {
     let ev = evaluate_expr(interp, ctl, frames, &print.expr)?;
+    let snapshot = ev.clone();
     let tyname = expr_type_name(&ev);
     let (value, desc, char) = (ev.value, ev.desc, ev.char);
     // The lldb synthetic-child providers' summary lines for
@@ -1399,6 +1467,7 @@ pub(super) fn evaluate_print(
         }
     }
     Ok(EvaluatedPrint {
+        value: snapshot,
         gdb: if ctl.pretty_printers && print.format.is_none() {
             render_pretty_gdb(
                 interp,

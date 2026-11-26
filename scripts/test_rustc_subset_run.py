@@ -3114,6 +3114,42 @@ class HostProfileTests(unittest.TestCase):
             run.select_host_profile("riscv64gc-unknown-linux-gnu")
 
 
+
+class DebuggerCommandTranslationTests(unittest.TestCase):
+    """The session-script translation of debugger commands:
+    history references and their comparisons are within the
+    attempted scope; malformed comparisons are not."""
+
+    def test_history_comparison_translates(self):
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print $1 == $2"),
+            "print $1 == $2")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print $1 != $2"),
+            "print $1 != $2")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "print $0 == $1"),
+            "v $0 == $1")
+
+    def test_history_reference_translates(self):
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print $1"),
+            "print $1")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print $12.field"),
+            "print $12.field")
+
+    def test_parenthesised_comparison_stays_outside_scope(self):
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", "print ($1 == $2)"))
+
+    def test_dangling_comparison_stays_outside_scope(self):
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", "print $1 =="))
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", "print == $2"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
