@@ -3454,3 +3454,31 @@ fn run_mode_str_splitn_family() {
          x=[\"q\", \"r\"] [\"q\", \"r\"]\n",
     );
 }
+
+const STRING_FROM_MUT_STR_SRC: &str = r#"
+fn via_ref(s: &mut str) -> String { s.into() }
+fn main() {
+    let mut buf = [0u8; 4];
+    let s: String = '\u{1F603}'.encode_utf8(&mut buf).into();
+    println!("{} {}", s, s.len());
+    let mut owned = String::from("xy");
+    let t = via_ref(&mut owned);
+    println!("{t}");
+}
+"#;
+
+#[test]
+fn run_mode_string_from_mut_str() {
+    // `String: From<&mut str>` copies the text; a `str`
+    // place over byte storage (the `encode_utf8` window
+    // over a byte array) does not resolve to the text
+    // value, so the conversion reads its bytes as a byte
+    // slice.
+    let dir = temp_dir("string-from-mut-str");
+    let src = fixture(&dir, "stringfrommut.rs", STRING_FROM_MUT_STR_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "\u{1F603} 4\nxy\n", "stdout={stdout}");
+}

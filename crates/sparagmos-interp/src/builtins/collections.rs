@@ -246,6 +246,106 @@ impl<'a> Interpreter<'a> {
         );
         Ok(vec_deque_value(buf, len))
     }
+
+    /// `BinaryHeap<T>: From<Vec<T>>` (the `FromFrom`
+    /// dispatch): std moves the vector's buffer into the
+    /// heap's single `data` field and rebuilds the heap
+    /// order in place (`BinaryHeap::rebuild`). The model
+    /// extracts the source's elements, rebuilds the heap
+    /// order over them (Floyd's sift-down pass: any valid
+    /// heap arrangement pops in the same descending order
+    /// std's arrangement does), and builds the heap's real
+    /// aggregate over a fresh element block at exact-fit
+    /// capacity, the construction `vec_deque_from_value`
+    /// uses for the deque.
+    pub(super) fn binary_heap_from_vec(
+        &self,
+        frames: &[Frame],
+        value: Value,
+    ) -> InterpResult<Value> {
+        let resolved = self.resolve_value(frames, &value)?;
+        let resolved = match self.vec_from_real_form(frames, &resolved) {
+            Some(r) => r?,
+            None => resolved,
+        };
+        let mut elements = match resolved {
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(items) => items,
+            v @ Value::SparseVec { .. } => value_elements(&v)?,
+            Value::FatRef { base, .. } => match *base {
+                Value::Tuple(items) => items,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "From::from to BinaryHeap",
+                        "slice value over an element tuple",
+                        other.kind_name(),
+                    ));
+                }
+            },
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "From::from to BinaryHeap",
+                    "vector value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let len = elements.len();
+        for start in (0..len / 2).rev() {
+            let mut i = start;
+            loop {
+                let left = 2 * i + 1;
+                let right = left + 1;
+                let mut largest = i;
+                if left < len {
+                    match self.values_cmp(frames, &elements[left], &elements[largest], None)? {
+                        Some(std::cmp::Ordering::Greater) => largest = left,
+                        Some(_) => {}
+                        None => {
+                            return Err(unsupported(
+                                "From::from to BinaryHeap: element comparison is unordered"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                if right < len {
+                    match self.values_cmp(frames, &elements[right], &elements[largest], None)? {
+                        Some(std::cmp::Ordering::Greater) => largest = right,
+                        Some(_) => {}
+                        None => {
+                            return Err(unsupported(
+                                "From::from to BinaryHeap: element comparison is unordered"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                if largest == i {
+                    break;
+                }
+                elements.swap(i, largest);
+                i = largest;
+            }
+        }
+        let id = self.alloc_insert(Value::Tuple(elements));
+        self.mark_elem_block(id);
+        let buf = raw_vec_value(
+            Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            }),
+            len,
+        );
+        let vec_value = Value::Enum {
+            variant: 0,
+            fields: vec![buf, Value::Uint(len as u128)],
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![vec_value],
+        })
+    }
 }
 
 /// The `ErrorKind::InvalidInput` discriminant.
