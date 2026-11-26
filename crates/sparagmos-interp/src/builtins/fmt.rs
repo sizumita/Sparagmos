@@ -3422,6 +3422,23 @@ impl<'a> Interpreter<'a> {
         indent: usize,
     ) -> InterpResult<String> {
         let tag = pointee_tag(ty);
+        // The std map/set collections' `Debug` impls are
+        // handwritten: a map prints as the `debug_map` of its
+        // entries (`{k: v, ...}`), a set as the `debug_set` of
+        // its elements (`{a, b, ...}`) -- neither is the derived
+        // form of the storage aggregate the value model holds
+        // (a hash collection's raw table, a B-tree's root and
+        // length), and no guest body serves a std Self type, so
+        // the structural engine composes the form from the
+        // entries the storage walks read back (see
+        // `format_debug_collection`). A value whose entries
+        // cannot be read back keeps the recorded-shape
+        // rendering below.
+        if let Some(text) =
+            self.format_debug_collection(frames, variant, fields, tag, options, indent)?
+        {
+            return Ok(text);
+        }
         match tag_base_name(tag) {
             "Vec" => {
                 let elem = first_generic_arg(tag).unwrap_or("");
@@ -3734,6 +3751,132 @@ impl<'a> Interpreter<'a> {
             format!("{name}({})", parts.join(", "))
         };
         Ok(pad_width(&body, options))
+    }
+
+    /// `Debug` for a std map/set collection value, composed
+    /// from the entries its storage walk reads back: a map's
+    /// entries as `{k: v, ...}`, a set's elements as
+    /// `{a, b, ...}` (the forms std's handwritten impls produce
+    /// through `debug_map` / `debug_set`). The hash collections'
+    /// entries come from the raw-table walk, the B-tree
+    /// collections' from the node walk the iteration builtins
+    /// share. `None` when the tag names no such collection, or
+    /// the value's entries cannot be read back, so the caller
+    /// keeps the recorded-shape rendering.
+    fn format_debug_collection(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        variant: u32,
+        fields: &[Value],
+        tag: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let head = tag.split('<').next().unwrap_or(tag).trim();
+        let aggregate = Value::Enum {
+            variant,
+            fields: fields.to_vec(),
+        };
+        match head {
+            "std::collections::HashMap" | "alloc::collections::HashMap" => {
+                let Some(entries) = self.hash_map_entries(&aggregate, false) else {
+                    return Ok(None);
+                };
+                let key_ty = first_generic_arg(tag).unwrap_or("");
+                let val_ty = second_generic_arg(tag).unwrap_or("");
+                Ok(Some(self.format_debug_map_entries(
+                    frames, &entries, key_ty, val_ty, options, indent,
+                )?))
+            }
+            "std::collections::HashSet" | "alloc::collections::HashSet" => {
+                let Some(entries) = self.hash_map_entries(&aggregate, true) else {
+                    return Ok(None);
+                };
+                let elem = first_generic_arg(tag).unwrap_or("");
+                let keys: Vec<Value> =
+                    entries.into_iter().map(|(key, _)| key).collect();
+                let tys: Vec<&str> = keys.iter().map(|_| elem).collect();
+                Ok(Some(self.format_debug_seq_items(
+                    frames, &keys, options, indent, '{', '}', &tys,
+                )?))
+            }
+            "std::collections::BTreeMap" | "alloc::collections::BTreeMap" => {
+                let Ok(entries) = self.btree_map_pairs(frames, &aggregate) else {
+                    return Ok(None);
+                };
+                let key_ty = first_generic_arg(tag).unwrap_or("");
+                let val_ty = second_generic_arg(tag).unwrap_or("");
+                Ok(Some(self.format_debug_map_entries(
+                    frames, &entries, key_ty, val_ty, options, indent,
+                )?))
+            }
+            "std::collections::BTreeSet" | "alloc::collections::BTreeSet" => {
+                let Ok(elements) = self.btree_set_elements(frames, &aggregate) else {
+                    return Ok(None);
+                };
+                let elem = first_generic_arg(tag).unwrap_or("");
+                let tys: Vec<&str> = elements.iter().map(|_| elem).collect();
+                Ok(Some(self.format_debug_seq_items(
+                    frames, &elements, options, indent, '{', '}', &tys,
+                )?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Debug formatting of a map's entries: `{k: v, ...}`, or
+    /// the multi-line form under `{:#?}` -- the `DebugMap`
+    /// builder's output the std map `Debug` impls produce.
+    fn format_debug_map_entries(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        entries: &[(Value, Value)],
+        key_ty: &str,
+        val_ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<String> {
+        if options.alternate() {
+            if entries.is_empty() {
+                return Ok("{}".to_string());
+            }
+            let inner = indent + 4;
+            let mut out = String::new();
+            out.push('{');
+            out.push('\n');
+            for (key, value) in entries {
+                out.push_str(&" ".repeat(inner));
+                let key_text =
+                    self.format_value(frames, key, FmtTrait::Debug, key_ty, options, inner)?;
+                let value_text =
+                    self.format_value(frames, value, FmtTrait::Debug, val_ty, options, inner)?;
+                out.push_str(&format!("{key_text}: {value_text},\n"));
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push('}');
+            return Ok(out);
+        }
+        let mut parts = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let key_text = self.format_value(
+                frames,
+                key,
+                FmtTrait::Debug,
+                key_ty,
+                &FmtOptions::new(),
+                indent,
+            )?;
+            let value_text = self.format_value(
+                frames,
+                value,
+                FmtTrait::Debug,
+                val_ty,
+                &FmtOptions::new(),
+                indent,
+            )?;
+            parts.push(format!("{key_text}: {value_text}"));
+        }
+        Ok(pad_width(&format!("{{{}}}", parts.join(", ")), options))
     }
 
     /// Debug formatting of a tuple or slice value: `(a, b)` / `[a, b]`,

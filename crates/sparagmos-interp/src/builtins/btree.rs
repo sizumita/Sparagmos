@@ -101,7 +101,7 @@ impl<'a> Interpreter<'a> {
     /// error rather than a guessed element. A node pointer that
     /// does not name an allocation is such an error: the elements
     /// behind it are unreachable in this model, never fabricated.
-    fn btree_map_pairs(
+    pub(super) fn btree_map_pairs(
         &self,
         frames: &[Frame],
         map: &Value,
