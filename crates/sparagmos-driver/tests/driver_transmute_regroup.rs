@@ -8,7 +8,9 @@
 //! wrapped-array and `Simd<T, N>` storage crossings, the
 //! fat-pointer <-> DST-wrapper-struct identity, the
 //! (pointer, length) tuple <-> fat reference crossing, and
-//! the thin pointer <-> union crossing.
+//! the thin pointer <-> union crossing, and the raw-pointer
+//! cast regrouping of a slice's elements (a `[[u8; 3]; 2]`
+//! storage ranged over as `[[u8; 2]]`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -364,4 +366,70 @@ fn main() {
 "#,
     );
     assert_eq!(stdout, "7 9\n3 4\n");
+}
+
+/// A raw-pointer cast regroups a slice's elements across
+/// the storage's inner array boundary: the `[[u8; 3]; 2]`
+/// storage ranged over as `[[u8; 2]]` reads as the byte
+/// stream re-chunked into pairs, for the element reads, the
+/// slice equality, and the slice comparison alike (the
+/// `tests/ui/cast/cast-rfc0401.rs` shape).
+#[test]
+fn cast_slice_regroups_elements() {
+    let stdout = run_ok(
+        "cast-regroup",
+        "cast_regroup.rs",
+        r#"
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let p: *const [[u8; 3]] = &l;
+    let p: &[[u8; 2]] = unsafe { &*(p as *const [[u8; 2]]) };
+    assert_eq!(p, [[3, 2], [6, 4]]);
+    let e0 = p[0];
+    let e1 = p[1];
+    assert_eq!(e0, [3, 2]);
+    assert_eq!(e1, [6, 4]);
+    assert!(p != &[[3u8, 2], [6, 5]][..]);
+    assert_eq!(
+        p.partial_cmp(&[[3u8, 2], [6, 5]][..]),
+        Some(std::cmp::Ordering::Less)
+    );
+    assert_eq!(
+        p.partial_cmp(&[[3u8, 2], [6, 4]][..]),
+        Some(std::cmp::Ordering::Equal)
+    );
+    println!("regroup-ok");
+}
+"#,
+    );
+    assert_eq!(stdout, "regroup-ok\n");
+}
+
+/// The regrouped comparison genuinely judges the regrouped
+/// bytes: an expectation that differs in the regrouped
+/// second element (the byte past the storage's inner array
+/// boundary) fails the assertion.
+#[test]
+fn cast_slice_regroup_mismatch_panics() {
+    let dir = temp_dir("cast-regroup-neg");
+    let path = fixture(
+        &dir,
+        "cast_regroup_neg.rs",
+        r#"
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let p: *const [[u8; 3]] = &l;
+    let p: &[[u8; 2]] = unsafe { &*(p as *const [[u8; 2]]) };
+    assert_eq!(p, [[3, 2], [6, 5]]);
+    println!("must-not-print");
+}
+"#,
+    );
+    let out = run_driver(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a mismatching regrouped expectation must panic; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

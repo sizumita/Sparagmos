@@ -2150,7 +2150,14 @@ impl<'a> Interpreter<'a> {
     // with the span its stored prefix denotes in the birth
     // storage; anything the view cannot price or move
     // declines to the ordinary paths, which keep their
-    // current behaviour there.
+    // current behaviour there. The same view serves a
+    // sequence root on both sides — a pointer cast that
+    // regroups an array storage's elements under a wider or
+    // narrower element shape (the `[[u8; 3]; 2]` storage read
+    // as `[[u8; 2]]` that RFC 0401 blesses): the birth side
+    // is the array the storage was born as, the accessing
+    // side the array or slice the cast names, and the span
+    // prices through the accessing side's element size.
 
     /// The declared (birth) root type of a resolved target and
     /// its root-relative projection, for the foreign view's
@@ -2228,35 +2235,25 @@ impl<'a> Interpreter<'a> {
 
     /// The birth root type of a foreign access (see the
     /// section comment): the accessing root type and the
-    /// target's birth root type are different ADT instances,
-    /// and the target's projection contains no step whose
-    /// span the layouts do not determine (a byte displacement
-    /// is the displaced view's own case, a sub-slice has no
-    /// single span, the vector length slot is not storage).
-    /// The extent agreement the access needs — the two roots'
-    /// sizes equal, the reference denoting the whole storage —
-    /// is [`Self::foreign_span`]'s check, not this one's.
+    /// target's birth root type denominate the storage
+    /// differently — different ADT instances, or sequence
+    /// roots (an array birth read as an array or slice of a
+    /// differently-shaped element) — and the target's
+    /// projection contains no step whose span the layouts do
+    /// not determine (a byte displacement is the displaced
+    /// view's own case, a sub-slice has no single span, the
+    /// vector length slot is not storage). The extent
+    /// agreement the access needs — an ADT view denoting the
+    /// whole storage, a sequence view's bytes covered by the
+    /// birth storage — is [`Self::foreign_span`]'s check, not
+    /// this one's.
     fn foreign_birth_ty(
         &self,
         frames: &[Frame],
         target: &Resolved,
         access_root: &Ty,
     ) -> Option<Ty> {
-        let Ty::Adt(access_name) = access_root else {
-            return None;
-        };
         let (birth, projection) = self.target_birth(frames, target)?;
-        let Ty::Adt(birth_name) = &birth else {
-            return None;
-        };
-        if access_name == birth_name {
-            return None;
-        }
-        if !self.program().adt_layouts.contains_key(access_name)
-            || !self.program().adt_layouts.contains_key(birth_name)
-        {
-            return None;
-        }
         if projection.iter().any(|s| {
             matches!(
                 s,
@@ -2266,6 +2263,28 @@ impl<'a> Interpreter<'a> {
             )
         }) {
             return None;
+        }
+        // The same type on both sides is the ordinary path's
+        // own access, not a view over the storage.
+        if access_root == &birth {
+            return None;
+        }
+        match (access_root, &birth) {
+            (Ty::Adt(access_name), Ty::Adt(birth_name)) => {
+                if !self.program().adt_layouts.contains_key(access_name)
+                    || !self.program().adt_layouts.contains_key(birth_name)
+                {
+                    return None;
+                }
+            }
+            // A sequence root on both sides (see the section
+            // comment): the birth side is the sized array the
+            // storage was born as — a slice is never storage's
+            // own type — and its bytes must be extractable.
+            (Ty::Array(..) | Ty::Slice(_), Ty::Array(..)) => {
+                self.byte_layout_of_ty(&birth)?;
+            }
+            _ => return None,
         }
         Some(birth)
     }
@@ -2285,10 +2304,11 @@ impl<'a> Interpreter<'a> {
         &self,
         root_ty: &Ty,
         projection: &[RefProj],
+        root_extent: usize,
     ) -> Option<(usize, usize)> {
         let mut ty: Option<Ty> = Some(root_ty.clone());
         let mut off: usize = 0;
-        let mut size: usize = usize::try_from(self.ty_size(root_ty)?).ok()?;
+        let mut size: usize = root_extent;
         let mut variant: usize = 0;
         for (n, step) in projection.iter().enumerate() {
             let last = n + 1 == projection.len();
@@ -2345,8 +2365,9 @@ impl<'a> Interpreter<'a> {
                 }
                 RefProj::Index(k) => {
                     let cur = ty.as_ref()?;
-                    let Ty::Array(elem, _) = cur else {
-                        return None;
+                    let elem = match cur {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => elem,
+                        _ => return None,
                     };
                     let es = usize::try_from(self.ty_size(elem)?).ok()?;
                     off = off.checked_add(k.checked_mul(es)?)?;
@@ -2381,6 +2402,7 @@ impl<'a> Interpreter<'a> {
     fn foreign_span(
         &self,
         frames: &[Frame],
+        body: &Body,
         target: &Resolved,
         access_root: &Ty,
         birth: &Ty,
@@ -2395,16 +2417,50 @@ impl<'a> Interpreter<'a> {
         if projection.len() != tail_len {
             return None;
         }
-        let access_size =
-            usize::try_from(self.program().adt_layouts.get(match access_root {
-                Ty::Adt(name) => name,
-                _ => return None,
-            })?.0)
-            .ok()?;
-        if usize::try_from(self.ty_size(birth)?).ok()? != access_size {
+        let birth_size = usize::try_from(self.ty_size(birth)?).ok()?;
+        // The extent of the storage the accessing root ranges
+        // over, and the agreement it keeps with the birth
+        // storage: an ADT view denotes the whole storage, so
+        // the two sizes are equal; a sequence view denotes its
+        // elements' bytes — an array's own size, a slice's fat
+        // length times its element size — which the birth
+        // storage must cover (a cast may regroup a prefix of
+        // the storage it points into).
+        let access_extent = match access_root {
+            Ty::Adt(name) => {
+                let size =
+                    usize::try_from(self.program().adt_layouts.get(name)?.0)
+                        .ok()?;
+                if size != birth_size {
+                    return None;
+                }
+                size
+            }
+            Ty::Array(..) => {
+                let size = usize::try_from(self.ty_size(access_root)?).ok()?;
+                if size > birth_size {
+                    return None;
+                }
+                size
+            }
+            Ty::Slice(elem) => {
+                let fat_len = self.fat_prefix_deref_len(frames, body, place)?;
+                let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                let size = usize::try_from(fat_len)
+                    .ok()?
+                    .checked_mul(elem_size)?;
+                if size > birth_size {
+                    return None;
+                }
+                size
+            }
+            _ => return None,
+        };
+        let (off, size) = self.access_span(access_root, projection, access_extent)?;
+        if off.checked_add(size)? > access_extent {
             return None;
         }
-        self.access_span(access_root, projection)
+        Some((off, size))
     }
 
     /// One byte of a value's storage, for the foreign view
@@ -2749,6 +2805,65 @@ impl<'a> Interpreter<'a> {
     /// the access is not foreign or the view cannot judge it;
     /// a judged uninitialised byte in the span is the read's
     /// error, as on the ordinary path.
+    /// The elements of a fat pointer whose base denotes the
+    /// root of a storage born as an array of a differently-
+    /// shaped element: the pointer's formation regrouped the
+    /// storage's bytes under `elem_ty` (the `[[u8; 3]; 2]`
+    /// storage a `*const [[u8; 2]]` ranges over), so the
+    /// elements are constructed from the storage's bytes
+    /// under that type, `len` of them from the storage's
+    /// start. `None` when the base does not denote such a
+    /// storage root (a stored projection, a value target, an
+    /// allocation element block), the storage's own element
+    /// already is `elem_ty` (the ordinary element readings
+    /// denominate it correctly), the regrouped extent runs
+    /// past the storage, or a byte cannot be judged.
+    pub(crate) fn foreign_slice_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_ty: &Ty,
+    ) -> Option<Vec<Value>> {
+        let Value::FatRef { base, len } = value else {
+            return None;
+        };
+        let target = self.deref_value(frames, base).ok()?;
+        let (birth, projection) = self.target_birth(frames, &target)?;
+        if !projection.is_empty() {
+            return None;
+        }
+        let Ty::Array(birth_elem, _) = &birth else {
+            return None;
+        };
+        if **birth_elem == *elem_ty {
+            return None;
+        }
+        let elem_size = usize::try_from(self.ty_size(elem_ty)?).ok()?;
+        if elem_size == 0 {
+            return None;
+        }
+        let count = usize::try_from(*len).ok()?;
+        let extent = count.checked_mul(elem_size)?;
+        if extent > usize::try_from(self.ty_size(&birth)?).ok()? {
+            return None;
+        }
+        let root = self.target_root_value(frames, &target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut bytes = Vec::with_capacity(extent);
+        for i in 0..extent {
+            match self.foreign_byte(&root, &layout, i)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => return None,
+            }
+        }
+        let mut items = Vec::with_capacity(count);
+        for chunk in bytes.chunks(elem_size) {
+            items.push(self.construct_from_bytes(elem_ty, chunk)?);
+        }
+        Some(items)
+    }
+
     pub(crate) fn foreign_read(
         &self,
         frames: &[Frame],
@@ -2759,15 +2874,26 @@ impl<'a> Interpreter<'a> {
         let access_root = self.foreign_access_root(body, place)?;
         let birth = self.foreign_birth_ty(frames, target, &access_root)?;
         let (off, size) =
-            self.foreign_span(frames, target, &access_root, &birth, place)?;
+            self.foreign_span(frames, body, target, &access_root, &birth, place)?;
         if size == 0 {
             return None;
         }
         let place_ty = self.foreign_place_ty(body, place)?;
         // As on the write path, the span can carry the slot's
         // tail padding past the value's own extent; the value
-        // read back is the value's extent.
-        let value_size = usize::try_from(self.ty_size(&place_ty)?).ok()?;
+        // read back is the value's extent. A slice value's
+        // extent is its span: the fat length times the element
+        // size, which the span priced as the whole access.
+        let value_size = match &place_ty {
+            Ty::Slice(elem) => {
+                let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                if elem_size == 0 || size % elem_size != 0 {
+                    return None;
+                }
+                size
+            }
+            _ => usize::try_from(self.ty_size(&place_ty)?).ok()?,
+        };
         if value_size > size {
             return None;
         }
@@ -2788,7 +2914,21 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        let built = self.construct_from_bytes(&place_ty, &bytes);
+        let built = match &place_ty {
+            Ty::Slice(elem) => {
+                // A slice value is its element tuple: each
+                // element is constructed from its own byte
+                // chunk of the span.
+                let elem_size =
+                    usize::try_from(self.ty_size(elem)?).ok()?;
+                let mut items = Vec::with_capacity(size / elem_size);
+                for chunk in bytes.chunks(elem_size) {
+                    items.push(self.construct_from_bytes(elem, chunk)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            _ => self.construct_from_bytes(&place_ty, &bytes),
+        };
         built.map(Ok)
     }
 
@@ -2816,7 +2956,7 @@ impl<'a> Interpreter<'a> {
         let access_root = self.foreign_access_root(body, place)?;
         let birth = self.foreign_birth_ty(frames, target, &access_root)?;
         let (off, _size) =
-            self.foreign_span(frames, target, &access_root, &birth, place)?;
+            self.foreign_span(frames, body, target, &access_root, &birth, place)?;
         let place_ty = self.foreign_place_ty(body, place)?;
         let Ty::Adt(name) = &place_ty else {
             return None;
@@ -2888,7 +3028,7 @@ impl<'a> Interpreter<'a> {
         let access_root = self.foreign_access_root(body, place)?;
         let birth = self.foreign_birth_ty(frames, target, &access_root)?;
         let (off, size) =
-            self.foreign_span(frames, target, &access_root, &birth, place)?;
+            self.foreign_span(frames, body, target, &access_root, &birth, place)?;
         if size == 0 {
             return None;
         }
