@@ -10,7 +10,9 @@
 //! (pointer, length) tuple <-> fat reference crossing, and
 //! the thin pointer <-> union crossing, and the raw-pointer
 //! cast regrouping of a slice's elements (a `[[u8; 3]; 2]`
-//! storage ranged over as `[[u8; 2]]`).
+//! storage ranged over as `[[u8; 2]]`), for the element
+//! reads, the comparisons, and the `Debug` formatting of
+//! the regrouped view alike.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -431,5 +433,73 @@ fn main() {
         Some(101),
         "a mismatching regrouped expectation must panic; stderr={}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The `Debug` formatting of a regrouped slice view renders
+/// the access-side element shape, not the storage's birth
+/// shape: the byte view rebuilds the elements under the
+/// formatting tag's element type, on every route a slice
+/// value reaches the formatter through (a direct argument, a
+/// double reference, a tuple or array element, a `Vec`
+/// entry, a derived-`Debug` struct field, the alternate
+/// pretty form), and an element argument reached through
+/// the cast is composed at the access-side offset. The
+/// non-regrouped control keeps the birth shape, and a
+/// `[u16; 2]` storage ranged over as bytes reads back as
+/// its byte stream.
+#[test]
+fn cast_slice_regroup_debug_output() {
+    let stdout = run_ok(
+        "cast-regroup-debug",
+        "cast_regroup_debug.rs",
+        r#"
+#[derive(Debug)]
+struct Wrap<'a> { s: &'a [[u8; 2]] }
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let p: *const [[u8; 3]] = &l;
+    let p: &[[u8; 2]] = unsafe { &*(p as *const [[u8; 2]]) };
+    println!("direct: {:?}", p);
+    println!("elem: {:?}", p[0]);
+    println!("tuple: {:?}", (p, 7u8));
+    let q: &[[u8; 3]] = &l;
+    println!("control: {:?}", q);
+    println!("deref-ref: {:?}", &p);
+    println!("arr-of-ref: {:?}", [p]);
+    let v: Vec<&[[u8; 2]]> = vec![p];
+    println!("vec: {:?}", v);
+    println!("pretty: {:#?}", p);
+    println!("wrap: {:?}", Wrap { s: p });
+    let m: [u16; 2] = [0x0201, 0x0403];
+    let b: &[u8] = unsafe { &*(&m as *const [u16; 2] as *const [u8; 4] as *const [u8]) };
+    println!("bytes-of-u16: {:?}", b);
+    let back: &[u16] = unsafe { &*(&m as *const [u16; 2] as *const [u16]) };
+    println!("u16-slice: {:?}", back);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "direct: [[3, 2], [6, 4]]\n\
+         elem: [3, 2]\n\
+         tuple: ([[3, 2], [6, 4]], 7)\n\
+         control: [[3, 2, 6], [4, 5, 1]]\n\
+         deref-ref: [[3, 2], [6, 4]]\n\
+         arr-of-ref: [[[3, 2], [6, 4]]]\n\
+         vec: [[[3, 2], [6, 4]]]\n\
+         pretty: [\n\
+         \u{20}   [\n\
+         \u{20}       3,\n\
+         \u{20}       2,\n\
+         \u{20}   ],\n\
+         \u{20}   [\n\
+         \u{20}       6,\n\
+         \u{20}       4,\n\
+         \u{20}   ],\n\
+         ]\n\
+         wrap: Wrap { s: [[3, 2], [6, 4]] }\n\
+         bytes-of-u16: [1, 2, 3, 4]\n\
+         u16-slice: [513, 1027]\n"
     );
 }

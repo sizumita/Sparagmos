@@ -1027,6 +1027,79 @@ impl<'a> Interpreter<'a> {
             .or_else(|| self.byte_view_compose(frames, &resolved, &shape))
     }
 
+    /// The pointee a format argument of array type `ty` (the
+    /// argument's rendered type tag) denotes through a fat
+    /// pointer cast that regrouped the storage's elements:
+    /// the argument's target is an element place of the birth
+    /// storage (a `[[u8; 3]; 2]` array) while the tag names
+    /// the element under the cast's shape (`[u8; 2]`), so the
+    /// element is composed from the storage's bytes at the
+    /// access-side offset -- the same composition a body place
+    /// read through the cast performs (see
+    /// [`Self::foreign_read`]). `None` when the tag names no
+    /// array type, the target is not a single index step over
+    /// an array birth, the tag's shape is the birth element's
+    /// own (the ordinary resolution already reads the
+    /// access-side value), the span runs past the storage, or
+    /// a byte cannot be judged.
+    pub(crate) fn regrouped_fmt_arg(
+        &self,
+        frames: &[Frame],
+        target: &Value,
+        ty: &str,
+    ) -> Option<InterpResult<Value>> {
+        let mut tag = ty;
+        loop {
+            tag = tag.trim_start();
+            if let Some(rest) = tag.strip_prefix("&mut ") {
+                tag = rest;
+            } else if let Some(rest) = tag.strip_prefix('&') {
+                tag = rest;
+            } else if let Some(rest) = tag.strip_prefix("*const ") {
+                tag = rest;
+            } else if let Some(rest) = tag.strip_prefix("*mut ") {
+                tag = rest;
+            } else {
+                break;
+            }
+        }
+        let access = crate::builtins::ty_from_tag(tag)?;
+        if !matches!(access, Ty::Array(..)) {
+            return None;
+        }
+        let resolved = self.deref_value(frames, target).ok()?;
+        let (birth, projection) = self.target_birth(frames, &resolved)?;
+        let Ty::Array(birth_elem, _) = &birth else {
+            return None;
+        };
+        let [RefProj::Index(k)] = projection else {
+            return None;
+        };
+        if access == **birth_elem {
+            return None;
+        }
+        let elem_size = usize::try_from(self.ty_size(&access)?).ok()?;
+        if elem_size == 0 {
+            return None;
+        }
+        let off = k.checked_mul(elem_size)?;
+        let birth_size = usize::try_from(self.ty_size(&birth)?).ok()?;
+        if off.checked_add(elem_size)? > birth_size {
+            return None;
+        }
+        let root = self.target_root_value(frames, &resolved)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut bytes = Vec::with_capacity(elem_size);
+        for i in 0..elem_size {
+            match self.foreign_byte(&root, &layout, off + i)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => return None,
+            }
+        }
+        self.construct_from_bytes(&access, &bytes).map(Ok)
+    }
+
     /// A shaped whole-pointee store through a byte-displaced
     /// target (see [`Self::shaped_store`]): the value's bytes
     /// are spliced into a clone of the base value through the
