@@ -1350,20 +1350,26 @@ class MinicoreTests(unittest.TestCase):
                                         None)
         self.addCleanup(setattr, run, "minicore_rlib", orig)
         h = header("//@ add-minicore\n")
-        args, err = run.minicore_test_args(h.view(None), self.tmp,
-                                           "2021", [])
+        args, libs, err = run.minicore_test_args(
+            h.view(None), self.tmp, "2021", [])
         self.assertIsNone(err)
         self.assertEqual(args, ["-Cpanic=abort",
                                 "-Cforce-unwind-tables=yes",
                                 "--extern",
                                 "minicore=/fake/libminicore.rlib"])
+        # The rlib also travels as a prebuilt auxiliary (not
+        # collected), so an auxiliary build that declares
+        # minicore binds it during its own build too.
+        self.assertEqual(libs, [("minicore",
+                                 Path("/fake/libminicore.rlib"), False)])
 
     def test_test_args_edition_in_minicore_flags_rejected(self):
         h = header("//@ add-minicore\n"
                    "//@ minicore-compile-flags: --edition 2021\n")
-        args, err = run.minicore_test_args(h.view(None), self.tmp,
-                                           "2021", [])
+        args, libs, err = run.minicore_test_args(
+            h.view(None), self.tmp, "2021", [])
         self.assertIsNone(args)
+        self.assertIsNone(libs)
         self.assertIn("--edition", err)
 
     def test_test_args_build_failure_propagates(self):
@@ -1371,9 +1377,10 @@ class MinicoreTests(unittest.TestCase):
         run.minicore_rlib = lambda *a: (None, "minicore build failed: x")
         self.addCleanup(setattr, run, "minicore_rlib", orig)
         h = header("//@ add-minicore\n")
-        args, err = run.minicore_test_args(h.view(None), self.tmp,
-                                           "2021", [])
+        args, libs, err = run.minicore_test_args(
+            h.view(None), self.tmp, "2021", [])
         self.assertIsNone(args)
+        self.assertIsNone(libs)
         self.assertIn("minicore build failed", err)
 
 
