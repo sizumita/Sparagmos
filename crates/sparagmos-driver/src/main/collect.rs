@@ -26,9 +26,12 @@ impl ConversionCallbacks {
             });
         match (compiler_result, self.result.take()) {
             (Ok(Ok(())), Some(std::ops::ControlFlow::Continue(value))) => Ok(value),
-            (Ok(Ok(())), Some(std::ops::ControlFlow::Break(value))) => {
-                Err(rustc_public::CompilerError::Interrupted(value))
-            }
+            // `collect` breaks the flow when the verdict chain
+            // has rejected the compilation: the results are
+            // stashed and the session was stopped before the
+            // phases past analysis, so the run completed --
+            // the caller reports the verdict from the stash.
+            (Ok(Ok(())), Some(std::ops::ControlFlow::Break(value))) => Ok(value),
             (Ok(Ok(_)), None) => Err(rustc_public::CompilerError::Skipped),
             (Ok(Err(_)), _) | (Err(_), _) => Err(rustc_public::CompilerError::Failed),
         }
@@ -1469,6 +1472,8 @@ fn collect() -> ControlFlow<()> {
         conv.note_unicode_data_tables();
     }
 
+    let verdict_failed = compile_error.is_some();
+
     let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
 
     // Certify the dropped types whose drop glue the compiler
@@ -1518,5 +1523,21 @@ fn collect() -> ControlFlow<()> {
         coverage,
         fn_display_names: sparagmos_driver::convert::drain_fn_display_names(),
     });
-    ControlFlow::Continue(())
+    // A compilation the verdict chain has rejected stops the
+    // session here, the way rustc's own start-of-codegen gate
+    // refuses to codegen a session that has errors: the
+    // diagnostics behind the verdict were discounted at their
+    // fetches (their error count reset, so the compiler's gate
+    // cannot see them), and the phases past analysis would run
+    // on a program the compilation has already failed -- code
+    // generation evaluates the very constants such a verdict
+    // rests on and panics on them ("erroneous constant missed
+    // by mono item collection"), masking the rejection as a
+    // compiler crash. The verdict itself is reported by the
+    // caller from the results stashed above.
+    if verdict_failed {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    }
 }
