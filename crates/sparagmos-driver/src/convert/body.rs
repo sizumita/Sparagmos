@@ -488,6 +488,7 @@ impl Converter {
                 block
             })
             .collect();
+        Self::mark_cleanup_region(&mut blocks);
         // The line extent of each source scope in this body,
         // from the resolved lines of the statements and
         // terminators stated directly in it (same-file positions
@@ -537,6 +538,104 @@ impl Converter {
             Ok(b)
         } else {
             Err(std::mem::take(&mut self.errors))
+        }
+    }
+
+    /// Recover the body's cleanup region, which Stable MIR does
+    /// not state: it exposes neither `BasicBlockData::is_cleanup`
+    /// nor the reason of an `UnwindAction::Terminate`. Both are
+    /// structural. A cleanup region is entered only through
+    /// `UnwindAction::Cleanup` edges and never branches back into
+    /// the body's normal blocks, so the region is exactly the set
+    /// of blocks reachable from those edges' targets, less the
+    /// blocks reachable from the entry without crossing a cleanup
+    /// edge (a block on a normal path is not a cleanup block).
+    /// Blocks of the region are marked `is_cleanup`, and a
+    /// `Terminate` action stated in the region takes the
+    /// `InCleanup` reason — the distinction rustc's own MIR
+    /// states directly, and the one codegen uses to choose
+    /// between `panic_in_cleanup` ("panic in a destructor during
+    /// cleanup") and `panic_cannot_unwind` ("panic in a function
+    /// that cannot unwind").
+    fn mark_cleanup_region(blocks: &mut [sm::BasicBlockData]) {
+        fn unwind_of(kind: &sm::TerminatorKind) -> Option<&sm::UnwindAction> {
+            match kind {
+                sm::TerminatorKind::Drop { unwind, .. }
+                | sm::TerminatorKind::Call { unwind, .. }
+                | sm::TerminatorKind::Assert { unwind, .. }
+                | sm::TerminatorKind::FalseUnwind { unwind, .. }
+                | sm::TerminatorKind::InlineAsm { unwind, .. } => Some(unwind),
+                _ => None,
+            }
+        }
+        // Blocks reachable from the entry over normal edges only:
+        // a terminator's successors less its cleanup target.
+        let mut normal = vec![false; blocks.len()];
+        if !blocks.is_empty() {
+            let mut stack = vec![0usize];
+            while let Some(i) = stack.pop() {
+                if i >= blocks.len() || normal[i] {
+                    continue;
+                }
+                normal[i] = true;
+                let cleanup_target = blocks[i]
+                    .terminator
+                    .as_ref()
+                    .and_then(|t| unwind_of(&t.kind))
+                    .and_then(|u| u.cleanup_block());
+                for s in blocks[i].successors() {
+                    if Some(s) != cleanup_target {
+                        stack.push(s.index());
+                    }
+                }
+            }
+        }
+        // The cleanup region: everything reachable from a cleanup
+        // edge's target (through normal and cleanup edges alike —
+        // both stay inside the region), minus the normal blocks.
+        let mut cleanup = vec![false; blocks.len()];
+        let mut stack: Vec<usize> = Vec::new();
+        for data in blocks.iter() {
+            if let Some(t) = data
+                .terminator
+                .as_ref()
+                .and_then(|t| unwind_of(&t.kind))
+                .and_then(|u| u.cleanup_block())
+            {
+                stack.push(t.index());
+            }
+        }
+        while let Some(i) = stack.pop() {
+            if i >= blocks.len() || cleanup[i] || normal[i] {
+                continue;
+            }
+            cleanup[i] = true;
+            for s in blocks[i].successors() {
+                stack.push(s.index());
+            }
+        }
+        for (i, data) in blocks.iter_mut().enumerate() {
+            if !cleanup[i] {
+                continue;
+            }
+            data.is_cleanup = true;
+            let Some(term) = data.terminator.as_mut() else {
+                continue;
+            };
+            let unwind = match &mut term.kind {
+                sm::TerminatorKind::Drop { unwind, .. }
+                | sm::TerminatorKind::Call { unwind, .. }
+                | sm::TerminatorKind::Assert { unwind, .. }
+                | sm::TerminatorKind::FalseUnwind { unwind, .. }
+                | sm::TerminatorKind::InlineAsm { unwind, .. } => Some(unwind),
+                _ => None,
+            };
+            if let Some(unwind) = unwind {
+                if matches!(unwind, sm::UnwindAction::Terminate(_)) {
+                    *unwind =
+                        sm::UnwindAction::Terminate(sm::UnwindTerminateReason::InCleanup);
+                }
+            }
         }
     }
 
@@ -736,7 +835,9 @@ impl Converter {
         let terminator = self.terminator_kind(body, &bb.terminator);
         let mut data = sm::BasicBlockData::new(sm::Terminator::new(terminator));
         data.statements = statements;
-        // Stable MIR (1.100.0) does not expose `is_cleanup`; see module docs.
+        // Stable MIR (1.100.0) does not expose `is_cleanup`; the
+        // cleanup region is recovered structurally in
+        // `convert_body` (see `mark_cleanup_region`).
         data.is_cleanup = false;
         (data, lines)
     }

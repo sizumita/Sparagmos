@@ -1652,11 +1652,29 @@ pub enum UnwindAction {
     /// in the caller.
     Continue,
     /// The panic may not unwind past this point (a panic in a
-    /// cleanup, or a `nounwind` boundary): the run aborts.
-    Terminate,
+    /// cleanup, or a `nounwind` boundary): the run aborts. The
+    /// reason selects which of core's nounwind abort panics the
+    /// codegen backend raises for the block.
+    Terminate(UnwindTerminateReason),
     /// The callee was assumed never to unwind; that it did is an
     /// abort, exactly as for [`UnwindAction::Terminate`].
     Unreachable,
+}
+
+/// Why a block's unwind action is [`UnwindAction::Terminate`]:
+/// the distinction rustc states in MIR between a panic escaping
+/// a destructor during cleanup and a panic crossing a `nounwind`
+/// boundary in ordinary code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindTerminateReason {
+    /// The block belongs to the body's cleanup region: codegen
+    /// raises `panic_in_cleanup` ("panic in a destructor during
+    /// cleanup", no backtrace).
+    InCleanup,
+    /// The block is an ordinary block of a `nounwind` context:
+    /// codegen raises `panic_cannot_unwind` ("panic in a function
+    /// that cannot unwind").
+    CannotUnwind,
 }
 
 /// The drop glue of one `Drop` terminator: the plan for the dropped

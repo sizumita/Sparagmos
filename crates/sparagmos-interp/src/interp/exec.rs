@@ -425,45 +425,84 @@ impl<'a> Interpreter<'a> {
                                 direct = false;
                                 continue;
                             }
-                            crate::ir::UnwindAction::Terminate
+                            crate::ir::UnwindAction::Terminate(_)
                             | crate::ir::UnwindAction::Unreachable => {
                                 let InterpError::Panic { message, .. } = &panic else {
                                     unreachable!("panic is a Panic")
                                 };
+                                // Which of core's nounwind abort
+                                // panics codegen raises here is a
+                                // property of the block (the MIR
+                                // `UnwindTerminateReason`): a
+                                // `Terminate` in a cleanup block is
+                                // a panic escaping the cleanup of
+                                // an earlier panic, answered by
+                                // `panic_in_cleanup` — the
+                                // `panic_nounwind_nobacktrace` call
+                                // at core/src/panicking.rs:233:5 in
+                                // the pinned 1.100.0 build, a `&str`
+                                // payload with no backtrace — while
+                                // a `Terminate` in an ordinary block
+                                // is a panic crossing a nounwind
+                                // boundary, answered by
+                                // `panic_cannot_unwind` — the
+                                // `panic_nounwind_fmt` call inside
+                                // `panic_nounwind` at
+                                // core/src/panicking.rs:225:5, a
+                                // `&str` payload whose report may
+                                // carry a backtrace. In both cases
+                                // the abort panic's report and the
+                                // non-unwinding line precede the
+                                // abort. Under `-C panic=abort` the
+                                // panic's own report is all that
+                                // prints: the strategy aborts in
+                                // the personality, with no second
+                                // panic.
+                                let in_cleanup = matches!(
+                                    action,
+                                    crate::ir::UnwindAction::Terminate(
+                                        crate::ir::UnwindTerminateReason::InCleanup
+                                    )
+                                );
                                 if !self.config.panic_abort {
-                                    // A panic crossing a nounwind
-                                    // boundary: std raises
-                                    // `panic_cannot_unwind` there
-                                    // (a fixed location in core —
-                                    // the `panic_nounwind_fmt` call
-                                    // inside `panic_nounwind` at
-                                    // core/src/panicking.rs:225:5
-                                    // in the pinned 1.100.0 build —
-                                    // a `&str` payload), whose
-                                    // report and the non-unwinding
-                                    // line precede the abort. Under
-                                    // `-C panic=abort` the panic's
-                                    // own report is all that
-                                    // prints: the strategy aborts
-                                    // in the personality, with no
-                                    // second panic.
-                                    self.fire_nounwind_abort_panic(
-                                        frames,
-                                        (
-                                            "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
-                                                .to_string(),
-                                            225,
-                                            5,
-                                        ),
-                                        "panic in a function that cannot unwind",
-                                        false,
-                                    );
+                                    if in_cleanup {
+                                        self.fire_nounwind_abort_panic(
+                                            frames,
+                                            (
+                                                "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                                    .to_string(),
+                                                233,
+                                                5,
+                                            ),
+                                            "panic in a destructor during cleanup",
+                                            true,
+                                        );
+                                    } else {
+                                        self.fire_nounwind_abort_panic(
+                                            frames,
+                                            (
+                                                "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                                                    .to_string(),
+                                                225,
+                                                5,
+                                            ),
+                                            "panic in a function that cannot unwind",
+                                            false,
+                                        );
+                                    }
                                 }
                                 return Err(InterpError::Abort {
-                                    message: format!(
-                                        "panic `{message}` may not unwind past `{func}`: \
-                                         the run aborts"
-                                    ),
+                                    message: if in_cleanup {
+                                        format!(
+                                            "panic `{message}` raised in a cleanup of `{func}`: \
+                                             panicking while unwinding aborts the run"
+                                        )
+                                    } else {
+                                        format!(
+                                            "panic `{message}` may not unwind past `{func}`: \
+                                             the run aborts"
+                                        )
+                                    },
                                 });
                             }
                         }

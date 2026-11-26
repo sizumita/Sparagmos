@@ -506,6 +506,9 @@ impl Converter {
         match action {
             U::Continue => sm::UnwindAction::Continue,
             U::Unreachable => sm::UnwindAction::Unreachable,
+            // Provisional: `mark_cleanup_region` (convert/body.rs)
+            // refines the reason of `Terminate` actions stated in
+            // cleanup blocks to `InCleanup`; Stable MIR states none.
             U::Terminate => sm::UnwindAction::Terminate(sm::UnwindTerminateReason::Generic),
             U::Cleanup(t) => sm::UnwindAction::Cleanup(bb(*t)),
         }

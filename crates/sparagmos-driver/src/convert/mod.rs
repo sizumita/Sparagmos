@@ -11,9 +11,10 @@
 //! - `TerminatorKind` exposes 10 variants (no Yield/FalseEdge/TailCall).
 //! - `BinOp` has no `*WithOverflow` variants; overflow is expressed with
 //!   plain ops plus `Assert` terminators in this MIR form.
-//! - `BasicBlock` does not expose `is_cleanup`, so converted bodies
-//!   always carry `is_cleanup: false` (a Stable MIR limitation, not a
-//!   conversion choice).
+//! - `BasicBlock` does not expose `is_cleanup`, and `UnwindAction`
+//!   states no `Terminate` reason; both are recovered structurally
+//!   from the body's `Cleanup` edges after conversion (see
+//!   `mark_cleanup_region` in convert/body.rs).
 //! - Constants are allocation-based (`ConstantKind::Allocated` /
 //!   `TyConstKind::Value`); scalar values are read out of the allocation
 //!   bytes using the constant's own type, so sizes are exact.
