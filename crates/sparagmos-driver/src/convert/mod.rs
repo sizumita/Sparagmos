@@ -52,48 +52,31 @@ mod ref_decode;
 mod types;
 mod helpers;
 
-// The glob re-exports below keep every pre-split `crate::convert::*`
-// path working. Some of them re-export nothing at `pub(crate)`
-// visibility, and some are not referenced through this facade; both
-// are intentional, so the unused-imports lint is allowed here.
-pub(crate) use self::guard::*;
-pub(crate) use self::display_names::*;
-pub(crate) use self::statics::*;
-pub(crate) use self::subst::*;
-pub(crate) use self::screen::*;
-pub(crate) use self::panic::*;
+// The facade below keeps every pre-split `crate::convert::*` path
+// working. Each submodule owns its own surface: an item a submodule
+// declares `pub` is re-exported here at full visibility, and an item
+// it declares `pub(crate)` joins the facade at crate visibility only
+// (a glob re-export never widens an item past its declared
+// visibility). Adding or removing an exported item is therefore an
+// edit to the owning submodule alone; this file changes only when a
+// submodule itself is added or removed. The submodules listed at
+// `pub(crate)` export nothing outside the crate -- their conversion
+// items live in `impl Converter` blocks -- and some of the globs are
+// not referenced through this facade at all; both are intentional,
+// so the unused-imports lint is allowed at the top of this file.
+pub use self::guard::*;
+pub use self::display_names::*;
+pub use self::statics::*;
+pub use self::subst::*;
+pub use self::screen::*;
+pub use self::panic::*;
 pub(crate) use self::body::*;
 pub(crate) use self::stmt::*;
 pub(crate) use self::rvalue::*;
 pub(crate) use self::const_decode::*;
 pub(crate) use self::ref_decode::*;
 pub(crate) use self::types::*;
-pub(crate) use self::helpers::*;
-
-pub use self::guard::{
-    compiler_tcx, drop_glue_lang_item_defined, materialization_emitted, materialization_lint,
-    panic_handler_def, resolution_emitted, resolve_closure_guarded, resolve_instance_guarded,
-    set_compiler_tcx, with_body_materialization,
-};
-pub use self::display_names::{drain_fn_display_names, set_debug_session};
-pub use self::helpers::{
-    args_mention_params, closure_kind, coroutine_closure_args, def_fn_abi, instance_fn_abi,
-};
-pub use self::panic::{
-    captured_panic_is_mir_validator_fail, captured_panic_is_normalize_overflow,
-    clear_captured_panic, generated_simd_impl_method, guarded_ty_kind,
-    is_coroutine_closure_panic, is_instance_const_panic,
-    is_unsafe_binder_panic, peek_captured_panic, record_captured_panic, stable_mir_panic_reason,
-    take_captured_panic, CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON, INSTANCE_CONST_REASON,
-    BODY_FETCH_NORMALIZE_OVERFLOW, BODY_FETCH_SIMD_VALIDATOR, TAIL_CALL_REASON,
-    UNSAFE_BINDER_REASON,
-};
-pub use self::screen::{
-    unnormalizable_projection_in_body, unnormalizable_projection_in_instance,
-    UNNORMALIZABLE_PROJECTION_REASON,
-};
-pub use self::statics::eii_impl_instance;
-pub use self::subst::erase_bound_regions_args;
+pub use self::helpers::*;
 
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
