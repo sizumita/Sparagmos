@@ -1880,6 +1880,37 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::sys::io::error::unix::errno_location"
         | "libc::__errno_location"
         | "libc::unix::__errno_location" => Builtin::ErrnoLocation,
+        // The `f16` inherent methods that have neither a collected
+        // body nor an entry in the shared float table
+        // (`float_method_named`): adding them to that table would
+        // also resolve their `f32` / `f64` namesakes to builtins
+        // and suppress the collected bodies those types execute,
+        // so they are registered here for `f16` only and executed
+        // by the `f16` executor (see `builtins::floats`).
+        "core::f16::<impl f16>::is_normal" | "std::f16::<impl f16>::is_normal" => {
+            Builtin::Float16Method { op: FloatOp::IsNormal }
+        }
+        "core::f16::<impl f16>::classify" | "std::f16::<impl f16>::classify" => {
+            Builtin::Float16Method { op: FloatOp::Classify }
+        }
+        "core::f16::<impl f16>::to_be_bytes" | "std::f16::<impl f16>::to_be_bytes" => {
+            Builtin::Float16Method { op: FloatOp::ToBeBytes }
+        }
+        "core::f16::<impl f16>::to_le_bytes" | "std::f16::<impl f16>::to_le_bytes" => {
+            Builtin::Float16Method { op: FloatOp::ToLeBytes }
+        }
+        "core::f16::<impl f16>::to_ne_bytes" | "std::f16::<impl f16>::to_ne_bytes" => {
+            Builtin::Float16Method { op: FloatOp::ToNeBytes }
+        }
+        "core::f16::<impl f16>::from_be_bytes" | "std::f16::<impl f16>::from_be_bytes" => {
+            Builtin::Float16Method { op: FloatOp::FromBeBytes }
+        }
+        "core::f16::<impl f16>::from_le_bytes" | "std::f16::<impl f16>::from_le_bytes" => {
+            Builtin::Float16Method { op: FloatOp::FromLeBytes }
+        }
+        "core::f16::<impl f16>::from_ne_bytes" | "std::f16::<impl f16>::from_ne_bytes" => {
+            Builtin::Float16Method { op: FloatOp::FromNeBytes }
+        }
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }
