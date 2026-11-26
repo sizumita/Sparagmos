@@ -3081,6 +3081,107 @@ fn run_mode_str_escape_display() {
     );
 }
 
+const STR_ESCAPE_SIZE_HINT_SRC: &str = r#"
+fn main() {
+    // Fresh iterators (no char pulled yet).
+    println!("fresh-debug={:?}", "ab".escape_debug().size_hint());
+    println!("fresh-default={:?}", "ab".escape_default().size_hint());
+    println!("fresh-unicode={:?}", "ab".escape_unicode().size_hint());
+    println!("fresh-empty={:?}", "".escape_debug().size_hint());
+    println!("fresh-nl={:?}", "\n".escape_debug().size_hint());
+    println!("fresh-wide={:?}", "\u{10ffff}x".escape_unicode().size_hint());
+
+    // After one next(): the first char's escape is open.
+    let mut it = "\n".escape_debug();
+    println!("nl-first={:?}", it.next());
+    println!("nl-after1={:?}", it.size_hint());
+    println!("nl-second={:?}", it.next());
+    println!("nl-done={:?}", it.size_hint());
+    println!("nl-third={:?}", it.next());
+    println!("nl-after-end={:?}", it.size_hint());
+
+    // Plain char first (escape length 1), more chars behind.
+    let mut it2 = "ab".escape_debug();
+    println!("ab-first={:?}", it2.next());
+    println!("ab-after1={:?}", it2.size_hint());
+    println!("ab-second={:?}", it2.next());
+    println!("ab-done={:?}", it2.size_hint());
+
+    // Multi-char escape in the middle: front open, chars remain.
+    let mut it3 = "\u{1}z".escape_default();
+    println!("ctl-first={:?}", it3.next());
+    println!("ctl-mid={:?}", it3.size_hint());
+    println!("ctl-rest={}", it3.clone().collect::<String>());
+    println!("ctl-mid2={:?}", it3.size_hint());
+
+    // Escape unicode of a max char: 10 output chars.
+    let mut it4 = "\u{10ffff}".escape_unicode();
+    println!("max-first={:?}", it4.next());
+    println!("max-mid={:?}", it4.size_hint());
+    let mut n = 0;
+    while it4.next().is_some() {
+        n += 1;
+    }
+    println!("max-rest-count={n}");
+    println!("max-done={:?}", it4.size_hint());
+
+    // Default escape of DEL (4 chars: \u{7f}).
+    let mut it5 = "\u{7f}".escape_default();
+    println!("del-first={:?}", it5.next());
+    println!("del-mid={:?}", it5.size_hint());
+
+    // Debug escape of a quote (2 chars) with a trailing char.
+    let mut it6 = "\"a".escape_debug();
+    println!("dq-first={:?}", it6.next());
+    println!("dq-mid={:?}", it6.size_hint());
+}
+"#;
+
+#[test]
+fn run_mode_str_escape_size_hint() {
+    // `size_hint` of the `str` escape iterators:
+    // core's impls forward to the wrapped `FlatMap`,
+    // whose `FlattenCompat::size_hint` the builtin
+    // replays on the modelled state -- the open inner
+    // escape's exact remaining count is the lower
+    // bound while chars remain, and the hint turns
+    // exact once the `Chars` is spent. Expected
+    // output was produced by the native 1.100.0
+    // toolchain.
+    run_ok(
+        "str-escape-size-hint",
+        STR_ESCAPE_SIZE_HINT_SRC,
+        "fresh-debug=(0, None)\n\
+         fresh-default=(0, None)\n\
+         fresh-unicode=(0, None)\n\
+         fresh-empty=(0, Some(0))\n\
+         fresh-nl=(0, None)\n\
+         fresh-wide=(0, None)\n\
+         nl-first=Some('\\\\')\n\
+         nl-after1=(1, Some(1))\n\
+         nl-second=Some('n')\n\
+         nl-done=(0, Some(0))\n\
+         nl-third=None\n\
+         nl-after-end=(0, Some(0))\n\
+         ab-first=Some('a')\n\
+         ab-after1=(0, None)\n\
+         ab-second=Some('b')\n\
+         ab-done=(0, Some(0))\n\
+         ctl-first=Some('\\\\')\n\
+         ctl-mid=(4, None)\n\
+         ctl-rest=u{1}z\n\
+         ctl-mid2=(4, None)\n\
+         max-first=Some('\\\\')\n\
+         max-mid=(9, Some(9))\n\
+         max-rest-count=9\n\
+         max-done=(0, Some(0))\n\
+         del-first=Some('\\\\')\n\
+         del-mid=(5, Some(5))\n\
+         dq-first=Some('\\\\')\n\
+         dq-mid=(1, None)\n",
+    );
+}
+
 #[test]
 fn run_mode_str_searcher_pattern_family() {
     // The `Matches` / `MatchIndices` and split families over

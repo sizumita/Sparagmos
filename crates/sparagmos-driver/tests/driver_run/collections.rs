@@ -2688,3 +2688,49 @@ fn run_mode_collection_iterator_size_hint_is_exact() {
         "hint (3, Some(3))\nhint (2, Some(2))\nlen 3\nhint (2, Some(2))\n"
     );
 }
+
+const FLAT_MAP_SIZE_HINT_SRC: &str = r#"
+fn main() {
+    println!("map={:?}", (0..3).map(|x| x * 2).size_hint());
+    let mut fm1 = vec![1, 2, 3].into_iter().flat_map(|x| Some(x));
+    println!("opt-fresh={:?}", fm1.size_hint());
+    println!("opt-first={:?}", fm1.next());
+    println!("opt-after1={:?}", fm1.size_hint());
+    let fm2 = vec![1, 2].into_iter().flat_map(|x| [x, x]);
+    println!("arr={:?}", fm2.size_hint());
+    let mut fm3 = vec![1, 2].into_iter().flat_map(|x| vec![x, x]);
+    println!("vec-fresh={:?}", fm3.size_hint());
+    println!("vec-first={:?}", fm3.next());
+    println!("vec-mid={:?}", fm3.size_hint());
+    let mut fl = vec![vec![1, 2], vec![3]].into_iter().flatten();
+    println!("fl-first={:?}", fl.next());
+    println!("fl-mid={:?}", fl.size_hint());
+}
+"#;
+
+#[test]
+fn run_mode_flat_map_size_hint() {
+    // `size_hint` of `Map` and the flatten
+    // compositions: `Map` forwards its inner
+    // iterator's hint unchanged, and
+    // `FlattenCompat::size_hint` is replayed on the
+    // modelled state -- including the one-shot
+    // specialisation (an `Option` inner's hint
+    // ignores the front iterator) and the
+    // fixed-size scaling of an array inner.
+    // Expected output was produced by the native
+    // 1.100.0 toolchain.
+    let dir = temp_dir("flatmapsizehint");
+    let src = fixture(&dir, "flatmapsizehint.rs", FLAT_MAP_SIZE_HINT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "size_hint of Map / FlatMap / Flatten must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "map=(3, Some(3))\nopt-fresh=(0, Some(3))\nopt-first=Some(1)\nopt-after1=(0, Some(2))\narr=(4, Some(4))\nvec-fresh=(0, None)\nvec-first=Some(1)\nvec-mid=(1, None)\nfl-first=Some(1)\nfl-mid=(1, None)\n"
+    );
+}
