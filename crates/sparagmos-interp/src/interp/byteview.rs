@@ -2272,23 +2272,23 @@ impl<'a> Interpreter<'a> {
         guard: &Value,
         mutable: bool,
     ) -> InterpResult<()> {
-        let flag_ref = match guard {
-            Value::Enum { fields, .. } if fields.len() == 2 => &fields[1],
-            other => {
+        let fields = match refcell_guard_fields(guard) {
+            Some(fields) => fields,
+            None => {
                 return Err(InterpError::type_mismatch(
                     "RefCell guard drop",
                     "Ref/RefMut guard aggregate",
-                    other.kind_name(),
+                    guard.kind_name(),
                 ))
             }
         };
-        let flag_target = match flag_ref {
-            Value::Ref(target) => target.clone(),
-            other => {
+        let flag_target = match refcell_guard_ref(&fields[1]) {
+            Some(target) => target.clone(),
+            None => {
                 return Err(InterpError::type_mismatch(
                     "RefCell guard drop",
                     "reference to the borrow-flag Cell",
-                    other.kind_name(),
+                    fields[1].kind_name(),
                 ))
             }
         };
@@ -3950,6 +3950,41 @@ pub(crate) fn splice_scalar_storage_byte_as(
             true
         }
         _ => splice_scalar_storage_byte(slot, idx, byte),
+    }
+}
+
+/// The field values of a `Ref` / `RefMut` guard value: field 0
+/// is the reference to the cell's value, field 1 the reference
+/// to the borrow-flag `Cell`. Both guard shapes in circulation
+/// are accepted — the modelled two-field aggregate the borrow
+/// builtins build (`refcell_guard`), and core's real layout,
+/// whose `RefMut` form carries a trailing `PhantomData` marker
+/// field past the two reference fields. The marker holds no
+/// borrow state, so fields past the first two are ignored.
+pub(crate) fn refcell_guard_fields(guard: &Value) -> Option<&[Value]> {
+    match guard {
+        Value::Enum { fields, .. } if fields.len() >= 2 => Some(fields),
+        _ => None,
+    }
+}
+
+/// The reference a `Ref` / `RefMut` guard field holds, peeling
+/// the single-field wrapper aggregates core's real layout stores
+/// it under: the guard the borrow builtins build holds each
+/// reference bare, but a guard a converted guest body built from
+/// core's own definitions wraps the value reference in
+/// `NonNull<T>` and the borrow-flag reference in
+/// `BorrowRef` / `BorrowRefMut`, each a one-field struct in this
+/// value model. (The fmt engine applies the same descent to a
+/// guard's first field.)
+pub(crate) fn refcell_guard_ref(field: &Value) -> Option<&RefTarget> {
+    let mut cur = field;
+    loop {
+        match cur {
+            Value::Ref(target) => return Some(target),
+            Value::Enum { fields, .. } if fields.len() == 1 => cur = &fields[0],
+            _ => return None,
+        }
     }
 }
 

@@ -193,6 +193,11 @@ const TOUCH_FN: mir::DefId = mir::DefId::new(0, 317);
 const BORROW_ERROR_TY: mir::DefId = mir::DefId::new(0, 318);
 const BORROW_MUT_ERROR_TY: mir::DefId = mir::DefId::new(0, 319);
 const D_TY: mir::DefId = mir::DefId::new(0, 320);
+const NONNULL_TY: mir::DefId = mir::DefId::new(0, 321);
+const BORROW_REF_MUT_TY: mir::DefId = mir::DefId::new(0, 322);
+const PHANTOM_TY: mir::DefId = mir::DefId::new(0, 323);
+const CELL_TY: mir::DefId = mir::DefId::new(0, 324);
+const UNSAFECELL_TY: mir::DefId = mir::DefId::new(0, 325);
 
 const D_DROP_NAME: &str = "<probe::D as std::ops::Drop>::drop";
 
@@ -234,6 +239,11 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (BORROW_ERROR_TY, "std::cell::BorrowError".to_string()),
         (BORROW_MUT_ERROR_TY, "std::cell::BorrowMutError".to_string()),
         (D_TY, "probe::D".to_string()),
+        (NONNULL_TY, "core::ptr::NonNull".to_string()),
+        (BORROW_REF_MUT_TY, "core::cell::BorrowRefMut".to_string()),
+        (PHANTOM_TY, "core::marker::PhantomData".to_string()),
+        (CELL_TY, "std::cell::Cell".to_string()),
+        (UNSAFECELL_TY, "std::cell::UnsafeCell".to_string()),
     ])
 }
 
@@ -1237,4 +1247,171 @@ fn borrow_of_a_constant_aggregate_cell_is_an_explicit_error() {
         }
         other => panic!("expected the explicit constant-aggregate error, got {other:?}"),
     }
+}
+
+fn isize_ty() -> mir::Ty {
+    mir::Ty::Int(mir::IntTy::Isize)
+}
+
+fn cell_isize() -> mir::Ty {
+    mir::Ty::Adt(CELL_TY, vec![isize_ty()])
+}
+
+fn unsafe_cell_i32() -> mir::Ty {
+    mir::Ty::Adt(UNSAFECELL_TY, vec![i32_ty()])
+}
+
+fn proj_place(idx: u32, fields: &[(u32, mir::Ty)]) -> mir::Place {
+    mir::Place {
+        local: mir::Local(idx),
+        projection: fields
+            .iter()
+            .map(|(i, ty)| mir::PlaceElem::Field(*i, ty.clone()))
+            .collect(),
+    }
+}
+
+fn ref_proj_rvalue(idx: u32, fields: &[(u32, mir::Ty)], mutable: bool) -> mir::Rvalue {
+    let kind = if mutable {
+        mir::BorrowKind::Mut {
+            allow_two_phase_borrow: false,
+        }
+    } else {
+        mir::BorrowKind::Shared
+    };
+    mir::Rvalue::Ref(mir::Region::Erased, kind, proj_place(idx, fields))
+}
+
+#[test]
+fn real_layout_refmut_guard_deref_and_drop_release_the_borrow() {
+    // A guard a converted guest body built from core's real
+    // `RefMut` layout, rather than by the borrow builtins:
+    // field 0 is the value reference wrapped in `NonNull`,
+    // field 1 the borrow-flag reference wrapped in
+    // `BorrowRefMut`, and a trailing `PhantomData` marker field
+    // follows. Dereferencing the guard and dropping it must
+    // behave exactly as for the modelled two-field guard.
+    //
+    //   _1 = RefCell::new(41);
+    //   _3 = RefCell::borrow_mut(&_1);       // flag = -1
+    //   _4 = &mut _1.1.0;                    // the cell's value
+    //   _5 = &mut _1.0;                      // the flag Cell
+    //   _6 = NonNull { _4 };
+    //   _7 = BorrowRefMut { _5 };
+    //   _8 = PhantomData;
+    //   _9 = RefMut { _6, _7, _8 };          // real-layout guard
+    //   *_11 = 7  where _11 = DerefMut::deref_mut(&_9);
+    //   drop(_9);                            // releases the borrow
+    //   _13 = RefCell::borrow(&_1);          // panics if flag != 0
+    //   _0 = *Deref::deref(&_13);            // 7
+    //   drop(_13); drop(_3);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                          // _0
+            refcell_i32(),                     // _1 cell
+            ref_ty(refcell_i32(), false),      // _2
+            refmut_i32(),                      // _3 modelled guard
+            ref_ty(i32_ty(), true),            // _4 value ref
+            ref_ty(cell_isize(), true),        // _5 flag ref
+            mir::Ty::Adt(NONNULL_TY, vec![i32_ty()]), // _6
+            mir::Ty::Adt(BORROW_REF_MUT_TY, vec![]),  // _7
+            mir::Ty::Adt(PHANTOM_TY, vec![ref_ty(i32_ty(), true)]), // _8
+            refmut_i32(),                      // _9 real-layout guard
+            ref_ty(refmut_i32(), true),        // _10
+            ref_ty(i32_ty(), true),            // _11
+            ref_ty(refcell_i32(), false),      // _12
+            ref_i32(),                         // _13
+            ref_ty(ref_i32(), false),          // _14
+            ref_ty(i32_ty(), false),           // _15
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(REFCELL_NEW, vec![i32_ty()]), vec![const_i32(41)], 1, 1),
+            ),
+            block(
+                vec![assign(place(2), ref_rvalue(1, false))],
+                call(fndef(REFCELL_BORROW_MUT, vec![i32_ty()]), vec![move_(2)], 3, 2),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(4),
+                        ref_proj_rvalue(
+                            1,
+                            &[(1, unsafe_cell_i32()), (0, i32_ty())],
+                            true,
+                        ),
+                    ),
+                    assign(
+                        place(5),
+                        ref_proj_rvalue(1, &[(0, cell_isize())], true),
+                    ),
+                ],
+                goto(3),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(6),
+                        adt_aggregate(NONNULL_TY, 0, vec![i32_ty()], vec![move_(4)]),
+                    ),
+                    assign(
+                        place(7),
+                        adt_aggregate(BORROW_REF_MUT_TY, 0, vec![], vec![move_(5)]),
+                    ),
+                    assign(
+                        place(8),
+                        adt_aggregate(
+                            PHANTOM_TY,
+                            0,
+                            vec![ref_ty(i32_ty(), true)],
+                            vec![],
+                        ),
+                    ),
+                    assign(
+                        place(9),
+                        adt_aggregate(
+                            REFMUT_TY,
+                            0,
+                            vec![i32_ty()],
+                            vec![move_(6), move_(7), move_(8)],
+                        ),
+                    ),
+                ],
+                goto(4),
+            ),
+            block(
+                vec![assign(place(10), ref_rvalue(9, true))],
+                call(fndef(DEREF_MUT, vec![refmut_i32()]), vec![move_(10)], 11, 5),
+            ),
+            block(
+                vec![assign(
+                    deref_place(11),
+                    mir::Rvalue::Use(const_i32(7)),
+                )],
+                drop(place(9), 6),
+            ),
+            block(
+                vec![assign(place(12), ref_rvalue(1, false))],
+                call(fndef(REFCELL_BORROW, vec![i32_ty()]), vec![move_(12)], 13, 7),
+            ),
+            block(
+                vec![assign(place(14), ref_rvalue(13, false))],
+                call(fndef(DEREF, vec![ref_i32()]), vec![move_(14)], 15, 8),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(15))),
+                )],
+                drop(place(13), 9),
+            ),
+            block(vec![], drop(place(3), 10)),
+            block(vec![], ret()),
+        ],
+    );
+    let value = run(body).expect("run");
+    assert_eq!(value, Value::Int(7));
 }
