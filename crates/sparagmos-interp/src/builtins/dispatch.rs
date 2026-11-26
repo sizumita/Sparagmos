@@ -68,6 +68,22 @@ impl<'a> Interpreter<'a> {
                 self.note_forwarded_panic_stamp(frames, stamp);
             }
             let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+            if name == "std::ops::Add::add"
+                && (self_ty == "std::string::String" || self_ty == "alloc::string::String")
+            {
+                // `String + &str` (and the `&String` / `String`
+                // right-hand sides): the collected `add` body
+                // has `push_str` inlined into it and walks the
+                // vector's raw parts, which the string model
+                // cannot serve; the concatenation itself is
+                // exact on the model's strings, through the
+                // readers' coercions for both operands (see
+                // `string_add_terminator` in `mir_convert`).
+                let mut out = self.resolve_string(frames, &vals[0])?;
+                let rhs = self.resolve_string(frames, &vals[1])?;
+                out.push_str(&rhs);
+                return Ok(Value::Str(out));
+            }
             return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
         }
         // `Read` / `Write` / `Seek` on `std::fs::File`, the
@@ -118,6 +134,11 @@ impl<'a> Interpreter<'a> {
         }
         if matches!(kind, Builtin::IteratorTryFold) {
             return self.exec_iterator_try_fold(frames, body, generic_args, args);
+        }
+        // `String::retain` likewise evaluates its predicate
+        // operand itself (see `exec_string_retain`).
+        if matches!(kind, Builtin::StringRetain) {
+            return self.exec_string_retain(frames, body, args);
         }
         let mut vals = Vec::with_capacity(args.len());
         for arg in args {
@@ -5046,6 +5067,233 @@ impl<'a> Interpreter<'a> {
                 self.modify_string(frames, &target, "String::push", |text| {
                     text.push(c);
                     Ok(Value::Unit)
+                })
+            }
+            Builtin::StringInsert => {
+                arity(3)?;
+                let idx = expect_index(&vals[1], "String::insert")?;
+                let c = match vals[2] {
+                    Value::Uint(v) => u32::try_from(v)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "String::insert",
+                                "char",
+                                "invalid code point",
+                            )
+                        })?,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "String::insert",
+                            "char",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::insert", |text| {
+                    // std's body opens with this assert (its
+                    // message covers the out-of-range case too:
+                    // `is_char_boundary` is false there).
+                    if !text.is_char_boundary(idx) {
+                        return Err(InterpError::panic(
+                            "assertion failed: self.is_char_boundary(idx)".to_string(),
+                        ));
+                    }
+                    text.insert(idx, c);
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::StringInsertStr => {
+                arity(3)?;
+                let idx = expect_index(&vals[1], "String::insert_str")?;
+                let suffix = self.resolve_string(frames, &vals[2])?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::insert_str", |text| {
+                    if !text.is_char_boundary(idx) {
+                        return Err(InterpError::panic(
+                            "assertion failed: self.is_char_boundary(idx)".to_string(),
+                        ));
+                    }
+                    text.insert_str(idx, &suffix);
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::StringRemove => {
+                arity(2)?;
+                let idx = expect_index(&vals[1], "String::remove")?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::remove", |text| {
+                    // std's body reads the char through
+                    // `self[idx..]`: the three failure shapes
+                    // are that indexing's and the end-of-string
+                    // case's own panic messages.
+                    if idx >= text.len() {
+                        if idx == text.len() {
+                            return Err(InterpError::panic(
+                                "cannot remove a char from the end of a string"
+                                    .to_string(),
+                            ));
+                        }
+                        return Err(InterpError::panic(format!(
+                            "start byte index {idx} is out of bounds for string of length {}",
+                            text.len()
+                        )));
+                    }
+                    if !text.is_char_boundary(idx) {
+                        let lo = text
+                            .char_indices()
+                            .take_while(|(i, _)| *i < idx)
+                            .last()
+                            .map_or(0, |(i, _)| i);
+                        let ch = text[lo..].chars().next().expect("char at boundary");
+                        let hi = lo + ch.len_utf8();
+                        return Err(InterpError::panic(format!(
+                            "start byte index {idx} is not a char boundary; \
+                             it is inside {ch:?} (bytes {lo}..{hi} of string)"
+                        )));
+                    }
+                    Ok(Value::Uint(u128::from(text.remove(idx) as u32)))
+                })
+            }
+            Builtin::StringTruncate => {
+                arity(2)?;
+                let new_len = expect_index(&vals[1], "String::truncate")?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::truncate", |text| {
+                    if new_len <= text.len() {
+                        if !text.is_char_boundary(new_len) {
+                            return Err(InterpError::panic(
+                                "assertion failed: self.is_char_boundary(new_len)"
+                                    .to_string(),
+                            ));
+                        }
+                        text.truncate(new_len);
+                    }
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::StringPop => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::pop", |text| {
+                    Ok(match text.pop() {
+                        Some(c) => some_value(Value::Uint(u128::from(c as u32))),
+                        None => none_value(),
+                    })
+                })
+            }
+            Builtin::StringClear => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::clear", |text| {
+                    text.clear();
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::StringRetain => {
+                // Dispatched before the generic argument
+                // evaluation (see `exec_string_retain`).
+                Err(unsupported(
+                    "String::retain reached the generic builtin dispatch",
+                ))
+            }
+            Builtin::StringReplaceRange => {
+                arity(3)?;
+                let replacement = self.resolve_string(frames, &vals[2])?;
+                // The range's bounds as stored in its value,
+                // and its kind from the call's generic arguments
+                // (the `R` the guest chose), decoded exactly as
+                // the slice-index builtin decodes its range (see
+                // `index_range` in `builtins::views`).
+                let fields: Vec<Value> = match &vals[1] {
+                    Value::Enum { fields, .. } => fields.clone(),
+                    Value::Tuple(fields) => fields.clone(),
+                    Value::Unit => Vec::new(),
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "builtin String::replace_range",
+                            "range value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let idx_tag = generic_args
+                    .iter()
+                    .find(|t| t.contains("Range"))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let kind = if idx_tag.contains("RangeFull") {
+                    RangeKindForIndex::Full
+                } else if idx_tag.contains("RangeToInclusive") {
+                    RangeKindForIndex::ToInclusive
+                } else if idx_tag.contains("RangeInclusive") {
+                    RangeKindForIndex::Inclusive
+                } else if idx_tag.contains("RangeFrom") {
+                    RangeKindForIndex::From
+                } else if idx_tag.contains("RangeTo") {
+                    RangeKindForIndex::To
+                } else {
+                    RangeKindForIndex::Range
+                };
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::replace_range", |text| {
+                    let bound = |i: usize| -> InterpResult<usize> {
+                        match fields.get(i) {
+                            Some(v) => expect_index(v, "String::replace_range"),
+                            None => Err(InterpError::type_mismatch(
+                                "builtin String::replace_range",
+                                "range value with bounds",
+                                "boundless range value",
+                            )),
+                        }
+                    };
+                    // `slice::range`'s own checks, in its own
+                    // messages (see `range_bounds`).
+                    let (start, end) = range_bounds(&kind, &bound, text.len())?;
+                    if !text.is_char_boundary(start) {
+                        return Err(InterpError::panic(
+                            "start of range should be a character boundary".to_string(),
+                        ));
+                    }
+                    if !text.is_char_boundary(end) {
+                        return Err(InterpError::panic(
+                            "end of range should be a character boundary".to_string(),
+                        ));
+                    }
+                    text.replace_range(start..end, &replacement);
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::StringSplitOff => {
+                arity(2)?;
+                let at = expect_index(&vals[1], "String::split_off")?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_string(frames, &target, "String::split_off", |text| {
+                    if !text.is_char_boundary(at) {
+                        return Err(InterpError::panic(
+                            "assertion failed: self.is_char_boundary(at)".to_string(),
+                        ));
+                    }
+                    Ok(Value::Str(text.split_off(at)))
+                })
+            }
+            Builtin::StringReserve => {
+                arity(2)?;
+                // Capacity is not tracked by the abstract
+                // string model (see `StringCapacity`), so
+                // reserving has no observable effect, exactly
+                // as a `VecReserve` no-op.
+                Ok(Value::Unit)
+            }
+            Builtin::StringTryReserve => {
+                arity(2)?;
+                // With no capacity to allocate, the fallible
+                // reserve always succeeds.
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Unit],
                 })
             }
             Builtin::StrChars => {

@@ -6,6 +6,7 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter, Resolved,
 };
+use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, RefProj, RefTarget, Value};
 
 use super::*;
@@ -229,6 +230,143 @@ impl<'a> Interpreter<'a> {
         let result = f(&mut text)?;
         self.write_resolved(frames, target, Value::Str(text))?;
         Ok(result)
+    }
+
+    /// The text of the string stored at `target`, read through
+    /// the same coercions `modify_string` applies (the abstract
+    /// form as-is, an aggregate form through the string
+    /// readers). The store is not changed.
+    pub(super) fn string_text_at(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        name: &str,
+    ) -> InterpResult<String> {
+        let stored = self.read_resolved(frames, target)?;
+        if let Value::Str(text) = stored {
+            return Ok(text);
+        }
+        let text = match self.string_from_real_aggregate(frames, &stored)? {
+            Some(text) => Some(text),
+            None => string_aggregate_bytes(&stored)
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+        };
+        text.ok_or_else(|| {
+            InterpError::type_mismatch(name, "string value", stored.kind_name())
+        })
+    }
+
+    /// `String::retain(&mut String, F)`: keep the chars the
+    /// predicate accepts, calling it once per char in order.
+    /// The predicate operand is evaluated in place (never
+    /// moved out of its place), exactly as the iterator
+    /// consumers evaluate theirs, so an `FnMut` predicate's
+    /// captures persist across the calls. The write-back
+    /// mirrors std's two phases: until the first rejected
+    /// char nothing is written (a predicate panic there
+    /// leaves the string unchanged, as std's read-only scan
+    /// does); from the first rejection on, the retained
+    /// prefix is committed even when the predicate panics
+    /// (std's panic guard truncates to exactly that prefix).
+    pub(super) fn exec_string_retain(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        args: &[Operand],
+    ) -> InterpResult<Value> {
+        if args.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                "builtin String::retain",
+                "2 argument(s)",
+                format!("{} argument(s)", args.len()),
+            ));
+        }
+        let self_ref = self.eval_operand(frames, body, &args[0])?;
+        let target = self.deref_value(frames, &self_ref)?;
+        let text = self.string_text_at(frames, &target, "String::retain")?;
+        let mut kept = String::new();
+        let mut rejected = false;
+        let mut failure: Option<InterpError> = None;
+        for c in text.chars() {
+            self.tick_step()?;
+            match self.call_callable_operand_to_completion(
+                frames,
+                body,
+                &args[1],
+                vec![Value::Uint(u128::from(c as u32))],
+            ) {
+                Ok(Value::Bool(true)) => kept.push(c),
+                Ok(Value::Bool(false)) => rejected = true,
+                Ok(other) => {
+                    return Err(InterpError::type_mismatch(
+                        "String::retain predicate result",
+                        "a boolean",
+                        other.kind_name(),
+                    ));
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => {
+                self.write_resolved(frames, &target, Value::Str(kept))?;
+                Ok(Value::Unit)
+            }
+            Some(e) => {
+                if rejected {
+                    let _ = self.write_resolved(frames, &target, Value::Str(kept));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The effect of dropping a `std::string::Drain` value
+    /// (the `StringDrainDrop` drop plan): remove the drain's
+    /// byte range from the string its first field points at.
+    /// std's destructor performs the removal with a
+    /// `Vec::drain` over the range, guarded by
+    /// `start <= end <= len` against the string's current
+    /// length; here the removal is the same range deletion
+    /// on the model's string, through the mutators' coercions.
+    /// The remaining fields have no drop effect (the `Chars`
+    /// state iterates a snapshot; the bounds are scalars).
+    pub(crate) fn drop_string_drain(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+    ) -> InterpResult<()> {
+        let fields = match value {
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(fields) => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "string Drain drop glue",
+                    "the drain's field layout",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if fields.len() != 4 {
+            return Err(InterpError::type_mismatch(
+                "string Drain drop glue",
+                "[string, start, end, iter]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let start = expect_index(&fields[1], "String::drain")?;
+        let end = expect_index(&fields[2], "String::drain")?;
+        let target = self.deref_value(frames, &fields[0])?;
+        self.modify_string(frames, &target, "String::drain", |text| {
+            if start <= end && end <= text.len() {
+                text.replace_range(start..end, "");
+            }
+            Ok(Value::Unit)
+        })?;
+        Ok(())
     }
 
     pub(super) fn resolve_string(&self, frames: &[Frame], value: &Value) -> InterpResult<String> {

@@ -1567,6 +1567,18 @@ pub enum DropPlan {
     /// host socket exactly as the real descriptor's close
     /// does. A moved-out handle has no socket to close.
     SocketHandleDrop,
+    /// Remove a `std::string::Drain`'s byte range from the
+    /// string it points at (the interpreter's string model,
+    /// see `drop_string_drain` in `builtins`): the value is
+    /// the drain's real layout `[string, start, end, iter]`,
+    /// whose first field is a raw pointer to the string, and
+    /// the destructor's only observable effect -- deleting
+    /// the `start..end` byte range from that string, exactly
+    /// the `Vec::drain` std's own destructor runs -- is this
+    /// plan. The `Chars` field iterates a snapshot and has
+    /// no drop effect. A moved-out drain has no string to
+    /// remove from.
+    StringDrainDrop,
     /// Drop one strong handle of a reference-counted allocation
     /// (the `Rc` / `Arc` destructor in the interpreter's allocation
     /// model, see `RefTarget::Alloc`): decrement the allocation's

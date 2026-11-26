@@ -460,6 +460,50 @@ pub enum Builtin {
     StringPushStr,
     /// `String::push(&mut String, char)`.
     StringPush,
+    /// `String::insert(&mut String, usize, char)`: insert a
+    /// char at a byte position. The collected body walks the
+    /// vector's raw parts (reserve, pointer copies, `set_len`),
+    /// which the string model cannot serve; the insertion
+    /// itself is exact on the model's string, through the same
+    /// coercions as `String::push_str` (see `modify_string`).
+    StringInsert,
+    /// `String::insert_str(&mut String, usize, &str)`: the
+    /// string-slice counterpart of `StringInsert`.
+    StringInsertStr,
+    /// `String::remove(&mut String, usize) -> char`: remove
+    /// and return the char at a byte position.
+    StringRemove,
+    /// `String::truncate(&mut String, usize)`: shorten to a
+    /// byte length (a no-op past the current length).
+    StringTruncate,
+    /// `String::pop(&mut String) -> Option<char>`: remove and
+    /// return the last char.
+    StringPop,
+    /// `String::clear(&mut String)`: empty the string.
+    StringClear,
+    /// `String::retain(&mut String, F)`: keep the chars the
+    /// predicate accepts, calling it once per char in order.
+    /// Dispatched before the generic argument evaluation (the
+    /// predicate operand is evaluated in place, like the
+    /// iterator consumers'), see `exec_string_retain`.
+    StringRetain,
+    /// `String::replace_range(&mut String, R, &str)`: replace
+    /// a byte range with a string slice.
+    StringReplaceRange,
+    /// `String::split_off(&mut String, usize) -> String`:
+    /// split at a byte position; the tail is the result.
+    StringSplitOff,
+    /// `String::reserve(&mut String, usize)` /
+    /// `String::reserve_exact(&mut String, usize)`: capacity
+    /// is not tracked by the abstract string model (see
+    /// `StringCapacity`), so reserving is a no-op, exactly as
+    /// `VecReserve` treats a vector's growth.
+    StringReserve,
+    /// `String::try_reserve(&mut String, usize)` /
+    /// `String::try_reserve_exact(&mut String, usize)`:
+    /// the fallible counterparts of `StringReserve`; with no
+    /// capacity to allocate they always succeed.
+    StringTryReserve,
     /// `str::len(&str)`: the byte length of the string data.
     StrLen,
     /// `str::is_empty(&str)`.

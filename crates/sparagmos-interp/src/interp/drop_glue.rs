@@ -926,6 +926,17 @@ impl<'a> Interpreter<'a> {
                         };
                         self.socket_handle_closed(id);
                     }
+                    P::StringDrainDrop => {
+                        // A moved-out / never-written drain has
+                        // no string to remove from, exactly like
+                        // drop flags in real MIR.
+                        let Some(value) =
+                            self.read_at(frames, &active.root, &path)?
+                        else {
+                            continue;
+                        };
+                        self.drop_string_drain(frames, &value)?;
+                    }
                     P::RcHandleDrop { value } => {
                         // A moved-out / never-written handle has no
                         // count to decrement, exactly like drop
