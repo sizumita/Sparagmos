@@ -8,7 +8,7 @@ test-subset stage-1 candidates (exec, single-file, ui / ui-fulldeps,
 3,699 files at tag 1.100.0). A path counts as covered when a call to it
 is executable by the interpreter: the converted program contains a body
 for it, or the interpreter resolves it as a builtin
-(crates/sparagmos-interp/src/builtins/ `lookup`).
+(crates/sparagmos-interp/src/builtins/ `lookup_qualified`).
 
 For every input file the tool runs the driver in dump mode
 (`sparagmos-driver <file.rs> --dump <path> --edition <ed>`, the edition
@@ -129,6 +129,79 @@ def read_builtins_source(path):
     return path.read_text()
 
 
+def _fn_body(source, sig):
+    """The text of the function whose signature starts with `sig`,
+    up to its closing brace at column 0 (the same convention the
+    `lookup` extraction in `BuiltinRegistry` uses)."""
+    start = source.find(sig)
+    if start == -1:
+        raise ValueError(f"builtins: {sig} not found")
+    end = source.find("\n}\n", start)
+    if end == -1:
+        raise ValueError(f"builtins: end of {sig} not found")
+    return source[start:end]
+
+
+_FLOAT_PREFIXES = {
+    "core::f128::<impl f128>::", "std::f128::<impl f128>::",
+    "core::f16::<impl f16>::", "std::f16::<impl f16>::",
+    "core::f32::<impl f32>::", "std::f32::<impl f32>::",
+    "core::f64::<impl f64>::", "std::f64::<impl f64>::",
+}
+
+
+def _float_prefixes(body, named, f128):
+    """The (prefix, method table) pairs of `float_method`, in source
+    order. Each `strip_prefix` literal is served by the next resolver
+    call that follows it in the body (`float128_method(` for the
+    f128 prefixes, `float_method_named(` for the rest), and the
+    literal set itself must be exactly the eight
+    `{core,std}::fN::<impl fN>::` prefixes, so a new prefix shape is
+    a hard error."""
+    events = []
+    for m in re.finditer(r'strip_prefix\("([^"]+)"\)', body):
+        events.append((m.start(), "prefix", m.group(1)))
+    for m in re.finditer(r"float128_method\(", body):
+        events.append((m.start(), "table", f128))
+    for m in re.finditer(r"float_method_named\(", body):
+        events.append((m.start(), "table", named))
+    events.sort()
+    prefixes = []
+    pending = []
+    for _pos, kind, val in events:
+        if kind == "prefix":
+            pending.append(val)
+        else:
+            prefixes.extend((pfx, val) for pfx in pending)
+            pending = []
+    if pending:
+        raise ValueError("builtins: float_method prefixes with no resolver")
+    if {pfx for pfx, _t in prefixes} != _FLOAT_PREFIXES:
+        raise ValueError("builtins: float_method prefix set changed")
+    return prefixes
+
+
+def _leading_segment_end(name):
+    """Index just past the first `::` at angle-bracket depth 0, or
+    None (mirrors `leading_segment_end` in the builtins module: a
+    name starting with `<` has no strippable leading segment)."""
+    if name.startswith("<"):
+        return None
+    depth = 0
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif ch == ":" and depth == 0 \
+                and i + 1 < len(name) and name[i + 1] == ":":
+            return i + 2
+        i += 1
+    return None
+
+
 class BuiltinRegistry:
     """The interpreter's builtin support, read from the builtins module.
 
@@ -136,8 +209,18 @@ class BuiltinRegistry:
     (`_ if <cond> =>`) is interpreted generically: the condition must
     be a conjunction of `canonical.contains("..")`,
     `canonical.ends_with("..")` and `canonical.starts_with("..")`
-    terms. Any other guard shape is a hard error so a future change
-    to the builtins module cannot silently drift this tool.
+    terms. The final `_ =>` arm of `lookup` delegates to two helper
+    resolvers, modelled here from their own tables:
+    `unicode_lookup_slow` (an exact set of `unicode_data` modules
+    whose `::lookup_slow` callee is modelled) and `float_method`
+    (the `{core,std}::f{16,32,64,128}::<impl fN>::` prefixes, each
+    served by the method-name table of `float_method_named`, or of
+    `float128_method` for f128). `lookup_qualified` additionally
+    retries `lookup` with leading path segments stripped one at a
+    time, exactly like the interpreter. Any other guard shape, or a
+    helper whose shape no longer matches these expectations, is a
+    hard error so a future change to the builtins module cannot
+    silently drift this tool.
     """
 
     _TERM = re.compile(
@@ -173,6 +256,32 @@ class BuiltinRegistry:
                        ("ends_with", "::new")} for t in self.guards)
         self.to_uppercase = any(
             t == [("ends_with", "::to_uppercase")] for t in self.guards)
+        # The `_ =>` fallback of `lookup` delegates to the two helper
+        # resolvers; both call sites must be present in that shape.
+        if "unicode_lookup_slow(canonical)" not in body \
+                or "float_method(canonical)" not in body:
+            raise ValueError(
+                "builtins: lookup does not end in the modelled "
+                "unicode/float fallback")
+        self.unicode_modules = set(re.findall(
+            r'"(core::unicode::unicode_data::[^"]+)"\s*=>',
+            _fn_body(source, "fn unicode_lookup_slow(canonical")))
+        if not self.unicode_modules:
+            raise ValueError(
+                "builtins: no unicode_lookup_slow modules found")
+        self.float_methods = set(re.findall(
+            r'"([^"\n]+)"\s*=>',
+            _fn_body(source, "fn float_method_named(method")))
+        if not self.float_methods:
+            raise ValueError("builtins: no float_method_named names found")
+        self.float128_methods = set(re.findall(
+            r'"([^"\n]+)"\s*=>',
+            _fn_body(source, "fn float128_method(method")))
+        if not self.float128_methods:
+            raise ValueError("builtins: no float128_method names found")
+        self.float_prefixes = _float_prefixes(
+            _fn_body(source, "fn float_method(canonical"),
+            self.float_methods, self.float128_methods)
 
     def lookup(self, canonical):
         if canonical in self.exact:
@@ -191,7 +300,33 @@ class BuiltinRegistry:
                     break
             if ok:
                 return True
+        return self._unicode_lookup_slow(canonical) \
+            or self._float_method(canonical)
+
+    def _unicode_lookup_slow(self, canonical):
+        if not canonical.endswith("::lookup_slow"):
+            return False
+        return canonical[:-len("::lookup_slow")] in self.unicode_modules
+
+    def _float_method(self, canonical):
+        for prefix, table in self.float_prefixes:
+            if canonical.startswith(prefix):
+                return canonical[len(prefix):] in table
         return False
+
+    def lookup_qualified(self, canonical):
+        """`lookup` retried with leading path segments stripped one
+        at a time (the interpreter's `lookup_qualified`)."""
+        if self.lookup(canonical):
+            return True
+        rest = canonical
+        while True:
+            pos = _leading_segment_end(rest)
+            if pos is None:
+                return False
+            rest = rest[pos:]
+            if self.lookup(rest):
+                return True
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +446,7 @@ def aggregate(records, registry):
             agg = paths.setdefault(name, {"path": name, "programs": 0,
                                           "call_sites": 0,
                                           "body_programs": 0,
-                                          "builtin": registry.lookup(name)})
+                                          "builtin": registry.lookup_qualified(name)})
             agg["programs"] += 1
             agg["call_sites"] += info["sites"]
             if info["body"]:
@@ -401,6 +536,9 @@ def main(argv=None):
         tasks = [t for t in tasks if any(s in t[0] for s in keep)]
     print(f"files: {len(tasks)} "
           f"(builtin exact names: {len(registry.exact)}, "
+          f"float methods: {len(registry.float_methods)}/"
+          f"{len(registry.float128_methods)}, "
+          f"unicode modules: {len(registry.unicode_modules)}, "
           f"guards: range_inclusive_new={registry.range_inclusive_new}, "
           f"to_uppercase={registry.to_uppercase})")
 
