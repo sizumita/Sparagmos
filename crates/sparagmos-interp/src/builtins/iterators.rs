@@ -92,6 +92,31 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// Drop one item a modelled iterator step (or a consumer
+    /// driving one) pulled and discards: an adapter that
+    /// rejects or skips the item, a `Zip` whose other side ran
+    /// out, a `count` that consumes what it counts. Core's own
+    /// loops drop the temporary each such pull yields, so the
+    /// step runs the item type's glue — the one conversion
+    /// recorded for this iterator type in the program's
+    /// iterator-item glue table (see
+    /// `ir::Program::iter_item_glues`) — against the item
+    /// before stepping on. An iterator type with no recorded
+    /// glue has trivial or unaccountable item glue, and the
+    /// item is discarded as before.
+    pub(super) fn drop_discarded_item(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        iter_ty: &str,
+        item: Value,
+    ) -> InterpResult<()> {
+        let glue = self.program().iter_item_glues.get(iter_ty).cloned();
+        if let Some(glue) = glue {
+            self.drop_value_sync(frames, item, &glue)?;
+        }
+        Ok(())
+    }
+
     /// `Iterator::next`: mutate the iterator in place through the
     /// `&mut` argument and return the `Option` value.
     pub(super) fn iterator_next(
@@ -599,7 +624,10 @@ impl<'a> Interpreter<'a> {
             )?;
             match keep {
                 Value::Bool(true) => return Ok(Some(some_value(item))),
-                Value::Bool(false) => continue,
+                Value::Bool(false) => {
+                    self.drop_discarded_item(frames, self_ty, item)?;
+                    continue;
+                }
                 other => {
                     return Err(InterpError::type_mismatch(
                         "Filter predicate result",
@@ -643,7 +671,10 @@ impl<'a> Interpreter<'a> {
             )?;
             match keep {
                 Value::Bool(true) => return Ok(Some(some_value(item))),
-                Value::Bool(false) => continue,
+                Value::Bool(false) => {
+                    self.drop_discarded_item(frames, self_ty, item)?;
+                    continue;
+                }
                 other => {
                     return Err(InterpError::type_mismatch(
                         "Filter predicate result",
@@ -1464,7 +1495,10 @@ impl<'a> Interpreter<'a> {
                             some_value(x),
                         ));
                     }
-                    Value::Bool(false) => continue,
+                    Value::Bool(false) => {
+                        self.drop_discarded_item(frames, self_ty, x)?;
+                        continue;
+                    }
                     other => {
                         return Err(InterpError::type_mismatch(
                             "Filter predicate result",
@@ -3241,7 +3275,10 @@ impl<'a> Interpreter<'a> {
                 vec![arg],
             )?;
             match keep {
-                Value::Bool(true) => continue,
+                Value::Bool(true) => {
+                    self.drop_discarded_item(frames, self_ty, item)?;
+                    continue;
+                }
                 Value::Bool(false) => {
                     self.write_resolved(frames, &flag_target, Value::Bool(true))?;
                     return Ok(Some(some_value(item)));
@@ -4206,7 +4243,10 @@ impl<'a> Interpreter<'a> {
                         result = some_value(x);
                         break;
                     }
-                    Value::Bool(false) => continue,
+                    Value::Bool(false) => {
+                        self.drop_discarded_item(frames, self_ty, x)?;
+                        continue;
+                    }
                     other => {
                         return Err(InterpError::type_mismatch(
                             "Filter predicate result",
@@ -4298,7 +4338,10 @@ impl<'a> Interpreter<'a> {
                     vec![arg],
                 )?;
                 match keep {
-                    Value::Bool(true) => continue,
+                    Value::Bool(true) => {
+                        self.drop_discarded_item(frames, self_ty, x)?;
+                        continue;
+                    }
                     Value::Bool(false) => {
                         done = true;
                         result = some_value(x);
@@ -4481,6 +4524,7 @@ impl<'a> Interpreter<'a> {
                     };
                     if to_skip > 0 {
                         to_skip -= 1;
+                        self.drop_discarded_item(frames, self_ty, x)?;
                         continue;
                     }
                     result = some_value(x);
@@ -4529,6 +4573,7 @@ impl<'a> Interpreter<'a> {
                 };
                 if to_skip > 0 {
                     to_skip -= 1;
+                    self.drop_discarded_item(frames, self_ty, x)?;
                     continue;
                 }
                 result = some_value(x);
@@ -4644,10 +4689,13 @@ impl<'a> Interpreter<'a> {
                     let (new_second, second_item) =
                         self.next_on_state(frames, second_ty, &fields[1])?;
                     match option_payload_opt(second_item) {
-                        None => (
-                            [vec![new_first, new_second], counters].concat(),
-                            none_value(),
-                        ),
+                        None => {
+                            self.drop_discarded_item(frames, first_ty, x)?;
+                            (
+                                [vec![new_first, new_second], counters].concat(),
+                                none_value(),
+                            )
+                        }
                         Some(y) => (
                             [vec![new_first, new_second], counters].concat(),
                             some_value(Value::Tuple(vec![x, y])),

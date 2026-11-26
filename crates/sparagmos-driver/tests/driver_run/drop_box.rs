@@ -4477,3 +4477,93 @@ fn main() {
 fn run_mode_needs_drop_guest_verdicts() {
     run_ok("needs-drop-guest", NEEDS_DROP_GUEST_SRC, "needs-drop-guest-ok\n");
 }
+
+
+const ADAPTER_DISCARD_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct Fragment;
+
+impl Drop for Fragment {
+    fn drop(&mut self) {
+        DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    // The shape of tests/ui/drop/drop-count-assertion-16151.rs
+    // (and its same-alloca sibling): every element is pulled
+    // and discarded by the adapter's own step, so all three
+    // drops must happen inside `collect`'s drain of the
+    // `SkipWhile`, before the collected (empty) Vec drops.
+    {
+        let fragments = vec![Fragment, Fragment, Fragment];
+        let _new: Vec<Fragment> = fragments
+            .into_iter()
+            .skip_while(|_fragment| true)
+            .collect();
+    }
+    assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+    println!("adapter discard drop ok");
+}
+"#;
+
+#[test]
+fn run_mode_skip_while_discarded_items_drop() {
+    run_ok(
+        "adapter-discard-drop",
+        ADAPTER_DISCARD_DROP_SRC,
+        "adapter discard drop ok\n",
+    );
+}
+
+const ADAPTER_STEP_DROP_COUNTS_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct E(u32);
+
+impl Drop for E {
+    fn drop(&mut self) {
+        DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn count() -> usize {
+    DROP_COUNT.load(Ordering::SeqCst)
+}
+
+fn main() {
+    // A `Filter` step drops each rejected item as it pulls
+    // it; the kept items drop as the loop binding does.
+    let v = vec![E(0), E(1), E(2), E(3)];
+    for _x in v.into_iter().filter(|e| e.0 % 2 == 0) {}
+    println!("filter {}", count());
+    // A `Skip` first step drops the skipped items, and
+    // `count` drops the items it pulls and counts.
+    let v = vec![E(0), E(1), E(2), E(3), E(4)];
+    let k = v.into_iter().skip(2).count();
+    println!("count {} {}", k, count());
+    // Direct `next` on a `Filter` (the place-based step)
+    // drops the rejected items it pulls past.
+    let v = vec![E(0), E(1), E(2)];
+    let mut it = v.into_iter().filter(|e| e.0 == 2);
+    let x = it.next();
+    println!("next {:?} {}", x.as_ref().map(|e| e.0), count());
+    drop(x);
+    drop(it);
+    println!("done {}", count());
+}
+"#;
+
+#[test]
+fn run_mode_adapter_step_drop_counts() {
+    run_ok(
+        "adapter-step-drop-counts",
+        ADAPTER_STEP_DROP_COUNTS_SRC,
+        "filter 4\ncount 3 9\nnext Some(2) 11\ndone 12\n",
+    );
+}

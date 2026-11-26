@@ -3070,7 +3070,14 @@ impl<'a> Interpreter<'a> {
                     state = next_state;
                     match option_payload(item)? {
                         None => break,
-                        Some(_) => count += 1,
+                        Some(item) => {
+                            // `count` consumes the items it
+                            // pulls: each one drops as the
+                            // loop's temporary would in core's
+                            // own body.
+                            self.drop_discarded_item(frames, self_ty, item)?;
+                            count += 1;
+                        }
                     }
                 }
                 self.note_consumed_iter_final(state);
