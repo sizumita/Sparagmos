@@ -1470,8 +1470,8 @@ fn step_over_the_last_statement_lands_on_the_closing_brace_not_the_signature() {
 fn temp_store_program() -> Program {
     let mut helper = Body::new(
         "helper",
-        0,
-        vec![Ty::Unit],
+        1,
+        vec![Ty::Unit, Ty::i64()],
         vec![BasicBlockData::new(vec![], TerminatorKind::Return)],
     );
     helper.source_lines =
