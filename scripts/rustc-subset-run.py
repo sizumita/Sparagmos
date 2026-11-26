@@ -2179,7 +2179,7 @@ def stamp_revision_cfg(aux_specs, revision):
     """
     if revision is None:
         return aux_specs
-    return [as_aux_spec(spec)._replace(cfg=revision)
+    return [as_aux_spec(spec)._replace(cfg=normalize_revision(revision))
             for spec in aux_specs]
 
 

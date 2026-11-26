@@ -2520,6 +2520,12 @@ class ConvertSideTests(unittest.TestCase):
         # attempt passes its specs through unchanged.
         self.assertIsNone(specs[0].cfg)
         self.assertIs(run.stamp_revision_cfg(specs, None), specs)
+        # A hyphenated revision is stamped with the cfg name
+        # compiletest derives from it, not the raw revision name:
+        # rustc rejects the raw form as an invalid --cfg argument.
+        stamped = run.stamp_revision_cfg(specs, "with-diag-in-deps")
+        self.assertEqual([sp.cfg for sp in stamped],
+                         ["with_diag_in_deps", "with_diag_in_deps"])
 
 
 class ProcessStage2AuxTests(unittest.TestCase):
