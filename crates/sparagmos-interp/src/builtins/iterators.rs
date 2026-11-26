@@ -137,6 +137,48 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The `Map` type a `str::SplitAsciiWhitespace` value
+    /// wraps: core defines `SplitAsciiWhitespace` as a
+    /// one-field wrapper over exactly this adapter (the
+    /// slice type's `Filter` composed through
+    /// `UnsafeBytesToStr` by `map`), and its `Iterator`
+    /// impl forwards both steps to the field, so stepping
+    /// a `SplitAsciiWhitespace` state - in place or by
+    /// value - is stepping the field under this tag. The
+    /// callables the tag names are zero-sized `Fn` types
+    /// of core's `impl_fn_for_zst!` family, applied by the
+    /// type-directed dispatch in the `Map`, `Filter` and
+    /// split steps themselves.
+    fn split_ascii_whitespace_map_ty(self_ty: &str) -> Option<&'static str> {
+        if self_ty_is(self_ty, "std::str::SplitAsciiWhitespace") {
+            Some(concat!(
+                "std::iter::Map<std::iter::Filter<core::slice::Split<u8, ",
+                "core::str::IsAsciiWhitespace>, core::str::BytesIsNotEmpty>, ",
+                "core::str::UnsafeBytesToStr>"
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// The `Filter` type a `slice::SplitAsciiWhitespace`
+    /// value wraps: core defines the slice type as a
+    /// one-field wrapper over exactly this adapter, and
+    /// its `Iterator` impl forwards both steps to the
+    /// field, so stepping a `slice::SplitAsciiWhitespace`
+    /// state - in place or by value - is stepping the
+    /// field under this tag.
+    fn slice_split_ascii_whitespace_filter_ty(self_ty: &str) -> Option<&'static str> {
+        if self_ty_is(self_ty, "core::slice::SplitAsciiWhitespace") {
+            Some(concat!(
+                "std::iter::Filter<core::slice::Split<u8, ",
+                "core::str::IsAsciiWhitespace>, core::str::BytesIsNotEmpty>"
+            ))
+        } else {
+            None
+        }
+    }
+
     /// The `FlatMap` type a `str` escape iterator value
     /// wraps: core defines `str::EscapeDebug` /
     /// `EscapeDefault` / `EscapeUnicode` as one-field
@@ -181,6 +223,16 @@ impl<'a> Interpreter<'a> {
             }
         }
         if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_at(frames, filter_ty, &field);
+            }
+        }
+        if let Some(map_ty) = Self::split_ascii_whitespace_map_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_at(frames, map_ty, &field);
+            }
+        }
+        if let Some(filter_ty) = Self::slice_split_ascii_whitespace_filter_ty(self_ty) {
             if let Some(field) = extend_target(target, RefProj::Field(0)) {
                 return self.iterator_next_at(frames, filter_ty, &field);
             }
@@ -463,6 +515,16 @@ impl<'a> Interpreter<'a> {
             }
         }
         if let Some(filter_ty) = Self::split_whitespace_filter_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_back_at(frames, filter_ty, &field);
+            }
+        }
+        if let Some(map_ty) = Self::split_ascii_whitespace_map_ty(self_ty) {
+            if let Some(field) = extend_target(target, RefProj::Field(0)) {
+                return self.iterator_next_back_at(frames, map_ty, &field);
+            }
+        }
+        if let Some(filter_ty) = Self::slice_split_ascii_whitespace_filter_ty(self_ty) {
             if let Some(field) = extend_target(target, RefProj::Field(0)) {
                 return self.iterator_next_back_at(frames, filter_ty, &field);
             }
@@ -818,6 +880,182 @@ impl<'a> Interpreter<'a> {
         )))
     }
 
+    /// One step of a `slice::Split` state, replaying core's
+    /// `Split::next` (front) and `Split::next_back` (back)
+    /// on the state the constructor's converted body built:
+    /// [remaining slice, predicate, finished]. The step
+    /// scans the remaining elements with the predicate -
+    /// applied through the modelled call path, with a
+    /// reference to the element, exactly as core's
+    /// `position` / `rposition` closures apply it - and
+    /// yields the subslice on the step's side of the first
+    /// (front) or last (back) matching element, advancing
+    /// the remainder past the separator. With no match the
+    /// step is core's `finish`: the whole remainder is
+    /// yielded once, as the stored slice value itself, and
+    /// the state is marked finished. The yielded and
+    /// remaining slices are snapshots in the denomination
+    /// the `Windows` step's windows use (see `tail_slice`
+    /// there).
+    fn slice_split_step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: &Value,
+        self_ty: &str,
+        back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = iterator_fields(state, self_ty)?;
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "slice split state",
+                "[slice, predicate, finished]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let finished = match &fields[2] {
+            Value::Bool(b) => *b,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "slice split finished flag",
+                    "boolean",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if finished {
+            return Ok((state.clone(), none_value()));
+        }
+        let (elems, _) = self.slice_elements(frames, &fields[0])?;
+        let pred_ty = second_generic_arg(self_ty).unwrap_or("");
+        let mut found: Option<usize> = None;
+        if back {
+            for idx in (0..elems.len()).rev() {
+                if self.slice_split_pred(frames, &fields[1], pred_ty, &elems[idx])? {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        } else {
+            for (idx, elem) in elems.iter().enumerate() {
+                if self.slice_split_pred(frames, &fields[1], pred_ty, elem)? {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        }
+        let sub_slice = |part: &[Value]| Value::FatRef {
+            base: Box::new(Value::Tuple(part.to_vec())),
+            len: part.len() as u128,
+        };
+        let (new_fields, result) = match found {
+            Some(idx) if back => (
+                vec![
+                    sub_slice(&elems[..idx]),
+                    fields[1].clone(),
+                    Value::Bool(false),
+                ],
+                some_value(sub_slice(&elems[idx + 1..])),
+            ),
+            Some(idx) => (
+                vec![
+                    sub_slice(&elems[idx + 1..]),
+                    fields[1].clone(),
+                    Value::Bool(false),
+                ],
+                some_value(sub_slice(&elems[..idx])),
+            ),
+            None => (
+                vec![fields[0].clone(), fields[1].clone(), Value::Bool(true)],
+                some_value(fields[0].clone()),
+            ),
+        };
+        Ok((rebuild_state(state, new_fields), result))
+    }
+
+    /// One front step of a `slice::SplitInclusive` state:
+    /// the `Split` state shape with core's inclusive scan -
+    /// the yielded subslice ends just past the first
+    /// matching element (or at the end of the remainder),
+    /// and the state is finished exactly when the yield
+    /// reaches the remainder's end. `SplitInclusive` has
+    /// no back step in core.
+    fn slice_split_inclusive_step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: &Value,
+        self_ty: &str,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = iterator_fields(state, self_ty)?;
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "slice split state",
+                "[slice, predicate, finished]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let finished = match &fields[2] {
+            Value::Bool(b) => *b,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "slice split finished flag",
+                    "boolean",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if finished {
+            return Ok((state.clone(), none_value()));
+        }
+        let (elems, _) = self.slice_elements(frames, &fields[0])?;
+        let pred_ty = second_generic_arg(self_ty).unwrap_or("");
+        let mut idx = elems.len();
+        for (i, elem) in elems.iter().enumerate() {
+            if self.slice_split_pred(frames, &fields[1], pred_ty, elem)? {
+                idx = i + 1;
+                break;
+            }
+        }
+        let sub_slice = |part: &[Value]| Value::FatRef {
+            base: Box::new(Value::Tuple(part.to_vec())),
+            len: part.len() as u128,
+        };
+        let new_fields = vec![
+            sub_slice(&elems[idx..]),
+            fields[1].clone(),
+            Value::Bool(idx == elems.len()),
+        ];
+        Ok((
+            rebuild_state(state, new_fields),
+            some_value(sub_slice(&elems[..idx])),
+        ))
+    }
+
+    /// Apply a `slice` split state's predicate to one
+    /// element, through the modelled call path: the
+    /// predicate is an `FnMut` handed a reference to the
+    /// element, applied with a reference to the predicate
+    /// value itself (the value-level application the
+    /// `Filter` step uses for its own predicate).
+    fn slice_split_pred(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        pred: &Value,
+        pred_ty: &str,
+        elem: &Value,
+    ) -> InterpResult<bool> {
+        let arg = Value::Ref(RefTarget::value(elem.clone()));
+        let keep =
+            self.call_callable_sync_typed(frames, pred, pred_ty, None, vec![arg])?;
+        match keep {
+            Value::Bool(b) => Ok(b),
+            other => Err(InterpError::type_mismatch(
+                "slice split predicate result",
+                "a boolean",
+                other.kind_name(),
+            )),
+        }
+    }
+
     /// One front step of a `str` splitn iterator (`SplitN` /
     /// `RSplitN`), replaying core's `SplitNInternal` step on
     /// the state the constructor's converted body built: the
@@ -973,6 +1211,50 @@ impl<'a> Interpreter<'a> {
             let (new_filter, result) =
                 self.next_back_on_state(frames, filter_ty, fields[0].clone())?;
             return Ok((rebuild_state(&state, vec![new_filter]), result));
+        }
+        if let Some(map_ty) = Self::split_ascii_whitespace_map_ty(self_ty) {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitAsciiWhitespace state",
+                    "[map]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_map, result) =
+                self.next_back_on_state(frames, map_ty, fields[0].clone())?;
+            return Ok((rebuild_state(&state, vec![new_map]), result));
+        }
+        if let Some(filter_ty) = Self::slice_split_ascii_whitespace_filter_ty(self_ty) {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitAsciiWhitespace state",
+                    "[filter]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_filter, result) =
+                self.next_back_on_state(frames, filter_ty, fields[0].clone())?;
+            return Ok((rebuild_state(&state, vec![new_filter]), result));
+        }
+        if is_slice_split_ty(self_ty) {
+            return self.slice_split_step(frames, &state, self_ty, true);
+        }
+        if let Some(split_ty) = slice_rsplit_split_ty(self_ty) {
+            // An `RSplit` state's back step is the wrapped
+            // `Split` state's front step.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "RSplit state",
+                    "[split]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_inner, result) =
+                self.slice_split_step(frames, &fields[0], &split_ty, false)?;
+            return Ok((rebuild_state(&state, vec![new_inner]), result));
         }
         if self_ty.starts_with("std::slice::Chunks<")
             || self_ty.starts_with("std::slice::RChunks<")
@@ -2187,6 +2469,40 @@ impl<'a> Interpreter<'a> {
                 self.next_on_state(frames, filter_ty, &fields[0])?;
             return Ok((rebuild_state(&state, vec![new_filter]), result));
         }
+        if let Some(map_ty) = Self::split_ascii_whitespace_map_ty(self_ty) {
+            // The value-level step of a
+            // `str::SplitAsciiWhitespace`: step the wrapped
+            // `Map` state and rewrap it in the one-field
+            // state.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitAsciiWhitespace state",
+                    "[map]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_map, result) =
+                self.next_on_state(frames, map_ty, &fields[0])?;
+            return Ok((rebuild_state(&state, vec![new_map]), result));
+        }
+        if let Some(filter_ty) = Self::slice_split_ascii_whitespace_filter_ty(self_ty) {
+            // The value-level step of a
+            // `slice::SplitAsciiWhitespace`: step the
+            // wrapped `Filter` state and rewrap it in the
+            // one-field state.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "SplitAsciiWhitespace state",
+                    "[filter]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_filter, result) =
+                self.next_on_state(frames, filter_ty, &fields[0])?;
+            return Ok((rebuild_state(&state, vec![new_filter]), result));
+        }
         if let Some(flatmap_ty) = Self::str_escape_flatmap_ty(self_ty) {
             // The value-level step of a `str` escape
             // iterator: step the wrapped `FlatMap` state
@@ -3194,6 +3510,28 @@ impl<'a> Interpreter<'a> {
         }
         if is_str_split_ty(self_ty) {
             return self.str_split_step(frames, state, self_ty, false);
+        }
+        if is_slice_split_ty(self_ty) {
+            return self.slice_split_step(frames, state, self_ty, false);
+        }
+        if is_slice_split_inclusive_ty(self_ty) {
+            return self.slice_split_inclusive_step(frames, state, self_ty);
+        }
+        if let Some(split_ty) = slice_rsplit_split_ty(self_ty) {
+            // An `RSplit` state is the wrapped `Split` state
+            // alone, and its front step is the wrapped
+            // state's back step.
+            let fields = iterator_fields(state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "RSplit state",
+                    "[split]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (new_inner, result) =
+                self.slice_split_step(frames, &fields[0], &split_ty, true)?;
+            return Ok((rebuild_state(state, vec![new_inner]), result));
         }
         if is_str_splitn_ty(self_ty) {
             return self.str_splitn_step(frames, state, self_ty);
@@ -8125,6 +8463,36 @@ fn is_str_split_ty(self_ty: &str) -> bool {
         || self_ty.starts_with("std::str::SplitTerminator<")
         || self_ty.starts_with("std::str::RSplitTerminator<")
         || self_ty.starts_with("std::str::SplitInclusive<")
+}
+
+/// Whether a rendered tag names a `slice::Split` iterator
+/// (`slice_split_step`'s machine; the `<` keeps
+/// `SplitInclusive` and the `SplitMut` family out - the
+/// mutable variants hand out `&mut` subslices, which the
+/// snapshot denomination cannot serve).
+fn is_slice_split_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("core::slice::Split<")
+        || self_ty.starts_with("std::slice::Split<")
+}
+
+/// Whether a rendered tag names a `slice::SplitInclusive`
+/// iterator (`slice_split_inclusive_step`'s machine).
+fn is_slice_split_inclusive_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("core::slice::SplitInclusive<")
+        || self_ty.starts_with("std::slice::SplitInclusive<")
+}
+
+/// The `Split` tag an `RSplit` tag wraps: an `RSplit`
+/// carries the same generic arguments as the `Split` it
+/// forwards to, under the same crate prefix.
+fn slice_rsplit_split_ty(self_ty: &str) -> Option<String> {
+    for prefix in ["core::slice::RSplit<", "std::slice::RSplit<"] {
+        if let Some(rest) = self_ty.strip_prefix(prefix) {
+            let split_prefix = prefix.replace("RSplit<", "Split<");
+            return Some(format!("{split_prefix}{rest}"));
+        }
+    }
+    None
 }
 
 /// Whether a rendered tag names one of the `str` splitn
