@@ -1216,11 +1216,21 @@ fn run_mode_async_drop_box_allocator_state_discriminant() {
     // discriminant: expected integer or bool, found unit".
     // Provably zero-sized state fields now convert to private
     // slots, so the dispatch reads the bool. The run then
-    // reaches the async-drop glue, which still stops on the
-    // consumed box pointer (an uninitialized read in the drop
-    // glue, tracked separately on Issue #513); when that gap
-    // closes this test should be strengthened to assert full
-    // completion with the native stdout.
+    // reaches the end-of-body drop sequence, whose first step
+    // moves the pointee out of the box (`let _x = *b`): the
+    // extracted raw pointer came from a `BoxDerefTransmute`
+    // over the box's `Unique` field inside the coroutine
+    // state, a place the cast's classification cannot name,
+    // and the wrapper-chain descent stopped at the `Unique`
+    // layer (it carries a `PhantomData` sibling), so the cast
+    // fabricated a reference to the `Unique` field itself and
+    // the move-out cleared the box's pointer word; the box's
+    // drop glue then read that word as uninitialized. The
+    // descent now also proceeds when the value's own field-0
+    // chain verifiably bottoms out at a pointer, so the
+    // extracted pointer names the allocation, the move-out
+    // clears the pointee, and the whole run completes with
+    // the native stdout.
     let dir = temp_dir("async-drop-box-allocator-discriminant");
     let src = fixture(&dir, "async_drop_box_allocator.rs", ASYNC_DROP_BOX_ALLOCATOR_SRC);
     let out = run_driver_extra(&src, &["--edition", "2021"]);
@@ -1231,11 +1241,12 @@ fn run_mode_async_drop_box_allocator_state_discriminant() {
     );
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "the run still stops in the async-drop glue; stderr={stderr}"
+        Some(0),
+        "the run must complete through the async-drop sequence; stderr={stderr}"
     );
-    assert!(
-        stderr.contains("read of uninitialized place"),
-        "the run must stop at the async-drop glue's uninitialized read; stderr={stderr}"
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Foo::async drop() : 10\nDone\n",
+        "the run must print the native stdout; stderr={stderr}"
     );
 }
