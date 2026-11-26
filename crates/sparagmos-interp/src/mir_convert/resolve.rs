@@ -650,6 +650,46 @@ fn convert_all_with(
             out.track_caller_defs.insert(key.clone(), c);
         }
     }
+    // The definition-location stamps of body-less
+    // `#[track_caller]` declarations (extern declarations the
+    // driver stamped from their definition spans), keyed by
+    // the name a function-item value names them under: a call
+    // through such a value binds the stamp of the declaration
+    // it was formed from, while the body it runs is the
+    // in-program definition's (see `fn_link_aliases` below).
+    for (def, stamp) in program.track_caller_defs.iter() {
+        let key = conv.body_key(def);
+        if out.functions.contains_key(&key)
+            || out.track_caller_defs.contains_key(&key)
+        {
+            continue;
+        }
+        if let Ok(c) = conv.convert_const_value(stamp, None) {
+            out.track_caller_defs.insert(key, c);
+        }
+    }
+    // The link aliases of body-less declarations: the name a
+    // function-item value carries for the declaration maps to
+    // the body of the one in-program definition exporting
+    // its link symbol, when there is exactly one and it
+    // converted. A declaration whose export is missing or
+    // unconverted keeps no alias, and a call through its
+    // value fails naming the declaration, as before.
+    out.fn_link_aliases = program
+        .link_symbols
+        .iter()
+        .filter_map(|(def, symbol)| {
+            let name = conv.body_key(def);
+            if out.functions.contains_key(&name) {
+                return None;
+            }
+            let target = conv.link_exports.get(symbol)?;
+            if !out.functions.contains_key(target) {
+                return None;
+            }
+            Some((name, target.clone()))
+        })
+        .collect();
     out.fn_shim_locations = [
         program.fn_shim_locations[0]
             .as_ref()

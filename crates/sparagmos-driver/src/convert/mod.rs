@@ -289,6 +289,16 @@ pub struct Converter {
     /// instead, which is the location the compiler's shim
     /// presents to the callee.
     pub track_caller_defs: HashMap<sm::DefId, sm::ConstValue>,
+    /// `#[track_caller]` instances registered so far that have
+    /// no body to take a definition stamp from (extern
+    /// declarations), awaiting fabrication from their
+    /// definition spans (see `fabricate_track_caller_decl_stamps`
+    /// in the body converter). The declaration's own span is
+    /// the location a call through a function-item value
+    /// naming the declaration presents to the callee, exactly
+    /// as a native link binds the declaration to the
+    /// in-program definition exporting its symbol.
+    pub track_caller_decl_pending: Vec<(sm::DefId, Instance)>,
     /// Declared ABIs of the function instances registered so
     /// far, keyed by the instance's Sparagmos `DefId` (see
     /// `note_fn_abi`). Handed to the interpreter with the
