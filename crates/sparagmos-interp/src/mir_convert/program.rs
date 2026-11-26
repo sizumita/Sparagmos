@@ -228,6 +228,21 @@ pub struct MirProgram {
     /// the `AsyncFn` family. Populated from type mentions,
     /// creation aggregates and zero-sized closure constants.
     pub async_closure_defs: std::collections::HashSet<mir::DefId>,
+    /// Program key of the body the compiler designated the
+    /// crate graph's `panic_handler` lang item, when the
+    /// driver recorded one and its body was collected. The
+    /// handler is an ordinary local body in the program; the
+    /// record exists so the allocation-error model can deliver
+    /// alloc's default (`__rdl`) panic to it, the way the
+    /// unwinder delivers every panic in a `no_std` program.
+    pub panic_handler: Option<String>,
+    /// Whether the program's crate graph links `std`, as
+    /// recorded by the driver. The allocation-error model
+    /// branches on it: a program linking std fails allocations
+    /// through std's own `rust_oom` (the default hook, then
+    /// abort); one without std falls back to alloc's `__rdl`
+    /// panic when it defines no handler of its own.
+    pub links_std: bool,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:

@@ -1576,6 +1576,23 @@ fn collect() -> ControlFlow<()> {
 
     let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
 
+    // The crate graph's panic handler, named by its collected
+    // body: the allocation-error model delivers alloc's
+    // default (`__rdl`) panic to it in a program that links
+    // no std (see `MirProgram::panic_handler`). A handler
+    // whose body was not collected names nothing.
+    let panic_handler = sparagmos_driver::convert::panic_handler_def().and_then(|def| {
+        let item = items.iter().find(|item| item.def_id() == def)?;
+        let name = item.name();
+        bodies.iter().any(|(n, _)| n == &name).then_some(name)
+    });
+    // Whether the crate graph links std: the external crates
+    // the local crate's compilation names (see
+    // `MirProgram::links_std`).
+    let links_std = rustc_public::external_crates()
+        .iter()
+        .any(|krate| krate.name == "std");
+
     // Certify the dropped types whose drop glue the compiler
     // knows is empty, over the same body set the monomorphization
     // checks scan: the interpreter's glue builder consults the
@@ -1594,6 +1611,8 @@ fn collect() -> ControlFlow<()> {
         local_body_count,
         local_report_count,
         entry_def_id,
+        panic_handler,
+        links_std,
         def_names: conv.def_names.clone(),
         intrinsic_defs: conv.intrinsic_defs.clone(),
         async_closure_defs: conv.async_closure_defs.clone(),

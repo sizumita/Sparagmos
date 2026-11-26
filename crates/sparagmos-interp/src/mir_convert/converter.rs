@@ -103,7 +103,10 @@ pub(super) struct Converter<'a> {
     /// program key of the shim body (`<crate>::_::__rust_alloc`,
     /// ...). In a linked binary the std allocation entry points
     /// bind to these shims; the conversion binds them the same
-    /// way (see `resolve_body_callee`).
+    /// way (see `resolve_body_callee`). A
+    /// `__rust_alloc_error_handler` entry (the shim a
+    /// `#[alloc_error_handler]` generates) rides along for the
+    /// allocation-error model; no call resolution reads it.
     pub(super) alloc_shims: HashMap<String, String>,
     /// Link symbols of the program's instances (see
     /// `MirProgram::link_symbols`).
@@ -190,6 +193,13 @@ impl<'a> Converter<'a> {
                 "__rust_dealloc",
                 "__rust_realloc",
                 "__rust_alloc_zeroed",
+                // The generated shim a `#[alloc_error_handler]`
+                // produces, scanned into the same table: the
+                // allocation-error model reads it from the
+                // program (the conversion-side routing below
+                // binds only the four allocation entry points,
+                // so its presence changes no call resolution).
+                "__rust_alloc_error_handler",
             ] {
                 if key.contains("::_::") && key.ends_with(symbol) {
                     alloc_shims

@@ -80,6 +80,8 @@ pub(crate) fn build_program(
     program.coverage = c.coverage.clone();
     program.fn_display_names = c.fn_display_names.clone();
     program.crate_overflow_checks = c.crate_overflow_checks.clone();
+    program.panic_handler = c.panic_handler.clone();
+    program.links_std = c.links_std;
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`

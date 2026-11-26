@@ -592,6 +592,13 @@ pub struct Interpreter<'a> {
     /// printed the `RUST_BACKTRACE=1` note (std's FIRST_PANIC):
     /// spent only by a report that prints the note.
     panic_note_spent: std::cell::Cell<bool>,
+    /// Whether std's default allocation-error hook has already
+    /// reported a failure in this process (its
+    /// `PREV_ALLOC_FAILURE` static): a second failure prints
+    /// the message with the recursion-guard line and no
+    /// backtrace part. Spent only by the allocation-error
+    /// model (see `builtins::alloc_error`).
+    alloc_failure_reported: std::cell::Cell<bool>,
     /// Whether the default panic reports are suppressed because
     /// an enclosing model produces them itself: the libtest
     /// harness model sets this while it runs tests, since it
@@ -1060,6 +1067,7 @@ impl<'a> Interpreter<'a> {
             hook_fired_depth: None,
             panics_in_flight: std::cell::RefCell::new(HashMap::new()),
             panic_note_spent: std::cell::Cell::new(false),
+            alloc_failure_reported: std::cell::Cell::new(false),
             panic_report_suppressed: std::cell::Cell::new(false),
             always_abort: std::cell::Cell::new(false),
             hook_abort: std::cell::Cell::new(false),

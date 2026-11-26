@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+mod alloc_error;
 mod asm_intrinsics;
 mod aux_crates;
 mod closures_coroutines;
