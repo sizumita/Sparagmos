@@ -2151,6 +2151,56 @@ impl<'a> Interpreter<'a> {
                 return Ok(text);
             }
         }
+        // `core::num::NonZero<T>`: every fmt impl core
+        // gives the type (`Debug`, `Display` and the
+        // radix / exponent traits) delegates to the
+        // primitive's own impl over the stored scalar, so
+        // the formatting is the scalar's, under the
+        // argument's type tag. The value arrives as nested
+        // one-field wrappers -- the `NonZeroInner`
+        // associated type hides the primitive one layer
+        // down, behind a type alias the debug-shape table
+        // cannot resolve -- so the unwrap follows the
+        // value's own one-field layers until a scalar
+        // bottoms out (the reading the debugger's `NonZero`
+        // rendering makes as well). The tag gate is what
+        // licenses the delegation: an arbitrary one-field
+        // ADT is not transparent to its payload's
+        // formatting (see the storage-wrapper arms above),
+        // but this type's impls are defined as the
+        // delegation. A value that does not unwrap to a
+        // scalar keeps the behaviour below.
+        if !matches!(trait_, FmtTrait::Pointer | FmtTrait::DebugNoop)
+            && tag_base_name(pointee_tag(ty)) == "NonZero"
+        {
+            if let Some(inner_ty) = first_generic_arg(pointee_tag(ty)) {
+                let mut cur = value;
+                let scalar = loop {
+                    match cur {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            cur = &fields[0];
+                        }
+                        Value::Tuple(fields) if fields.len() == 1 => {
+                            cur = &fields[0];
+                        }
+                        Value::Int(_) | Value::Uint(_) => {
+                            break Some(cur.clone());
+                        }
+                        _ => break None,
+                    }
+                };
+                if let Some(scalar) = scalar {
+                    return self.format_value(
+                        frames,
+                        &scalar,
+                        trait_,
+                        inner_ty,
+                        options,
+                        indent,
+                    );
+                }
+            }
+        }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(

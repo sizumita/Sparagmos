@@ -908,7 +908,7 @@ impl<'a> Interpreter<'a> {
     /// window. Storage held in the sparse form aliases like
     /// any other live storage: the projectors' `Subslice` arms
     /// cover `Value::SparseVec`.
-    fn range_view_base(
+    pub(super) fn range_view_base(
         &self,
         frames: &[Frame],
         receiver: &Value,

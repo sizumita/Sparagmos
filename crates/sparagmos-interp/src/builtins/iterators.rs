@@ -969,6 +969,10 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::ChunksExact<")
             || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::ChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<")
         {
             return self.chunk_step_state(frames, self_ty, &state, true);
         }
@@ -2144,6 +2148,10 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::ChunksExact<")
             || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::ChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<")
         {
             return self.chunk_step_state(frames, self_ty, &state, false);
         }
@@ -2213,9 +2221,16 @@ impl<'a> Interpreter<'a> {
     /// sub-slices are snapshot fat references, the form the
     /// `Windows` step above yields: the chunk family
     /// modelled here yields shared slices, whose reads the
-    /// snapshot serves exactly. The `Mut` variants are not
-    /// modelled -- a snapshot cannot serve a mutable
-    /// slice's writes -- so they keep the fallthrough.
+    /// snapshot serves exactly. A `Mut` variant's chunk must
+    /// instead alias the storage the remaining slice
+    /// denotes, or writes through it are lost: when the
+    /// state's slice is backed by live storage, the chunk
+    /// and the remaining slice are denominated as windows
+    /// over that storage, exactly as a range index over the
+    /// slice denominates its result (see `index_range`);
+    /// only a slice with no live storage behind it keeps
+    /// the snapshot form, whose elements are the only
+    /// storage the model has for it.
     fn chunk_step_state(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -2223,32 +2238,55 @@ impl<'a> Interpreter<'a> {
         state: &Value,
         from_back: bool,
     ) -> InterpResult<(Value, Value)> {
+        let mutable = self_ty.starts_with("std::slice::ChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<");
         let reverse = self_ty.starts_with("std::slice::RChunks<")
-            || self_ty.starts_with("std::slice::RChunksExact<");
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<");
         let exact = self_ty.starts_with("std::slice::ChunksExact<")
-            || self_ty.starts_with("std::slice::RChunksExact<");
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<");
         let take_back = reverse != from_back;
         let fields = iterator_fields(state, self_ty)?;
+        // The `Mut` variants carry one more field than
+        // their shared counterparts: a trailing
+        // `PhantomData` marker (present on `ChunksMut`,
+        // `RChunksMut` and `ChunksExactMut`;
+        // `RChunksExactMut` has none), the same shapes the
+        // `size_hint` arm above reads. The marker is inert
+        // state: it rides in `rest_fields` after the chunk
+        // size and is carried through the step untouched.
         let (slice_field, rest_fields): (&Value, Vec<Value>) = if exact {
-            if fields.len() != 3 {
+            if fields.len() != 3 && !(mutable && fields.len() == 4) {
                 return Err(InterpError::type_mismatch(
                     format!("{self_ty} state"),
                     "[remaining slice, remainder slice, chunk size]",
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            (&fields[0], vec![fields[1].clone(), fields[2].clone()])
+            (&fields[0], fields[1..].to_vec())
         } else {
-            if fields.len() != 2 {
+            if fields.len() != 2 && !(mutable && fields.len() == 3) {
                 return Err(InterpError::type_mismatch(
                     format!("{self_ty} state"),
                     "[remaining slice, chunk size]",
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            (&fields[0], vec![fields[1].clone()])
+            (&fields[0], fields[1..].to_vec())
         };
-        let size = chunk_size_of(rest_fields.last().expect("size field"), self_ty)?;
+        let size = chunk_size_of(
+            if exact {
+                &rest_fields[1]
+            } else {
+                &rest_fields[0]
+            },
+            self_ty,
+        )?;
         let (elems, _) = self.slice_elements(frames, slice_field)?;
         let len = elems.len();
         if size == 0 || len == 0 {
@@ -2257,10 +2295,32 @@ impl<'a> Interpreter<'a> {
         // A yielded chunk is a snapshot, denominated
         // exactly as the `Windows` step's windows are (see
         // `tail_slice` there): the base is the chunk's
-        // materialised element tuple itself.
-        let sub_slice = |part: &[Value]| Value::FatRef {
-            base: Box::new(Value::Tuple(part.to_vec())),
-            len: part.len() as u128,
+        // materialised element tuple itself. For a `Mut`
+        // variant the denomination is the window over the
+        // state's own slice base when that base is live
+        // storage (see the doc comment above), so `start`
+        // -- the part's offset within the remaining slice --
+        // is carried as well.
+        let sub_slice = |start: usize, part: &[Value]| -> InterpResult<Value> {
+            if mutable {
+                if let Some(base) = self.range_view_base(
+                    frames,
+                    slice_field,
+                    start,
+                    part.len(),
+                    len,
+                    "chunk step",
+                )? {
+                    return Ok(Value::FatRef {
+                        base: Box::new(base),
+                        len: part.len() as u128,
+                    });
+                }
+            }
+            Ok(Value::FatRef {
+                base: Box::new(Value::Tuple(part.to_vec())),
+                len: part.len() as u128,
+            })
         };
         // The plain variants' short chunk sits at the end
         // the primary direction yields last: a front step
@@ -2269,14 +2329,18 @@ impl<'a> Interpreter<'a> {
         // chunk of a `Chunks` (whose splitting is anchored at
         // the front) and the head chunk of an `RChunks`
         // (whose splitting is anchored at the back) alike.
-        let (item_elems, rest_elems): (&[Value], &[Value]) = if exact {
+        // The item's range within the remaining slice; the
+        // rest is the complementary range (the item sits at
+        // the front and the rest follows it, or the item
+        // sits at the back and the rest precedes it).
+        let (item_start, item_len): (usize, usize) = if exact {
             if len < size {
                 return Ok((state.clone(), none_value()));
             }
             if take_back {
-                (&elems[len - size..], &elems[..len - size])
+                (len - size, size)
             } else {
-                (&elems[..size], &elems[size..])
+                (0, size)
             }
         } else if from_back {
             let n = match len % size {
@@ -2284,23 +2348,29 @@ impl<'a> Interpreter<'a> {
                 r => r,
             };
             if take_back {
-                (&elems[len - n..], &elems[..len - n])
+                (len - n, n)
             } else {
-                (&elems[..n], &elems[n..])
+                (0, n)
             }
         } else {
             let n = size.min(len);
             if take_back {
-                (&elems[len - n..], &elems[..len - n])
+                (len - n, n)
             } else {
-                (&elems[..n], &elems[n..])
+                (0, n)
             }
         };
-        let mut new_fields = vec![sub_slice(rest_elems)];
+        let item_elems = &elems[item_start..item_start + item_len];
+        let (rest_start, rest_elems) = if item_start == 0 {
+            (item_len, &elems[item_len..])
+        } else {
+            (0, &elems[..item_start])
+        };
+        let mut new_fields = vec![sub_slice(rest_start, rest_elems)?];
         new_fields.extend(rest_fields);
         Ok((
             rebuild_state(state, new_fields),
-            some_value(sub_slice(item_elems)),
+            some_value(sub_slice(item_start, item_elems)?),
         ))
     }
 
@@ -3011,6 +3081,10 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::slice::RChunks<")
             || self_ty.starts_with("std::slice::ChunksExact<")
             || self_ty.starts_with("std::slice::RChunksExact<")
+            || self_ty.starts_with("std::slice::ChunksMut<")
+            || self_ty.starts_with("std::slice::RChunksMut<")
+            || self_ty.starts_with("std::slice::ChunksExactMut<")
+            || self_ty.starts_with("std::slice::RChunksExactMut<")
         {
             // The chunk step also lives in
             // `iterator_next_state`; it belongs here too
@@ -5599,6 +5673,10 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::slice::RChunks<")
         || self_ty.starts_with("std::slice::ChunksExact<")
         || self_ty.starts_with("std::slice::RChunksExact<")
+        || self_ty.starts_with("std::slice::ChunksMut<")
+        || self_ty.starts_with("std::slice::RChunksMut<")
+        || self_ty.starts_with("std::slice::ChunksExactMut<")
+        || self_ty.starts_with("std::slice::RChunksExactMut<")
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::sync::mpsc::Iter<")
         || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -5928,6 +6006,10 @@ fn into_iter_identity(ty: &str) -> bool {
         || ty.starts_with("std::slice::ChunksExact<")
         || ty.starts_with("std::slice::RChunks<")
         || ty.starts_with("std::slice::RChunksExact<")
+        || ty.starts_with("std::slice::ChunksMut<")
+        || ty.starts_with("std::slice::ChunksExactMut<")
+        || ty.starts_with("std::slice::RChunksMut<")
+        || ty.starts_with("std::slice::RChunksExactMut<")
         || self_ty_is(ty, "std::env::Args")
         || self_ty_is(ty, "std::env::ArgsOs")
         || self_ty_is(ty, "std::env::SplitPaths")
@@ -6020,6 +6102,18 @@ fn iterator_item_ty(ty: &str) -> Option<String> {
             return Some(format!("&mut {}", first_generic_arg(ty)?));
         }
     }
+    // Mutable slice-yielding sources: the item is a mutable
+    // slice reference.
+    for prefix in [
+        "std::slice::ChunksMut<",
+        "std::slice::RChunksMut<",
+        "std::slice::ChunksExactMut<",
+        "std::slice::RChunksExactMut<",
+    ] {
+        if ty.starts_with(prefix) {
+            return Some(format!("&mut [{}]", first_generic_arg(ty)?));
+        }
+    }
     // Slice-yielding sources: the item is a slice reference.
     for prefix in [
         "std::slice::Chunks<",
@@ -6080,6 +6174,10 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::slice::RChunks<")
         || self_ty.starts_with("std::slice::ChunksExact<")
         || self_ty.starts_with("std::slice::RChunksExact<")
+        || self_ty.starts_with("std::slice::ChunksMut<")
+        || self_ty.starts_with("std::slice::RChunksMut<")
+        || self_ty.starts_with("std::slice::ChunksExactMut<")
+        || self_ty.starts_with("std::slice::RChunksExactMut<")
         || self_ty.starts_with("std::option::IntoIter<")
         || self_ty.starts_with("std::option::Iter<")
         || self_ty.starts_with("std::option::IterMut<")

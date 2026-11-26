@@ -4420,6 +4420,85 @@ fn run_mode_chunks_mut_and_exact_len() {
     );
 }
 
+const CHUNKS_MUT_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3, 4, 5];
+    for c in v.chunks_mut(2) {
+        for x in c.iter_mut() { *x *= 10; }
+    }
+    println!("a {:?}", v);
+    let mut w = vec![1, 2, 3, 4, 5];
+    let mut it = w.chunks_mut(2);
+    let first = it.next().unwrap();
+    first[0] = 99;
+    println!("b {} {}", first[1], it.next().unwrap()[0]);
+    let mut u = vec![1, 2, 3, 4, 5, 6];
+    for c in u.rchunks_mut(2) {
+        c[0] += 100;
+    }
+    println!("c {:?}", u);
+    let mut t = vec![1, 2, 3, 4, 5];
+    for c in t.chunks_exact_mut(2) {
+        c[1] += 7;
+    }
+    println!("d {:?}", t);
+    let mut v2 = vec![1, 2, 3, 4, 5];
+    let mut it2 = v2.chunks_mut(2);
+    let last = it2.next_back().unwrap();
+    last[0] = 55;
+    let head = it2.next().unwrap();
+    head[1] = 22;
+    println!("nb {:?}", v2);
+    let mut w2 = vec![1, 2, 3, 4, 5, 6];
+    let mut rit = w2.rchunks_mut(4);
+    let tail = rit.next_back().unwrap();
+    tail[0] = 11;
+    println!("rnb {:?}", w2);
+    let mut e = vec![1, 2, 3, 4, 5];
+    let mut eit = e.chunks_exact_mut(2);
+    eit.next().unwrap()[0] = 10;
+    let rem = eit.into_remainder();
+    rem[0] = 50;
+    println!("rem {:?}", e);
+    let mut n = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+    for c in n.chunks_mut(2) {
+        c[0][0] += 100;
+    }
+    println!("nest {} {} {}", n[0][0], n[1][0], n[2][0]);
+    let mut arr = [1, 2, 3, 4];
+    for c in arr.chunks_mut(3) {
+        for x in c { *x += 1; }
+    }
+    println!("arr {:?}", arr);
+    let mut c0 = vec![1, 2, 3, 4];
+    let parts: Vec<&mut [i32]> = c0.chunks_mut(2).collect();
+    println!("collected {}", parts.len());
+    let mut s = vec![1, 2, 3, 4, 5];
+    let sit = s.chunks_mut(2);
+    println!("hint {:?}", sit.size_hint());
+    let mut z = vec![(), (), ()];
+    let mut count = 0;
+    for c in z.chunks_mut(2) { count += c.len(); }
+    println!("zst {count}");
+}
+"#;
+
+#[test]
+fn run_mode_chunks_mut_family_writes_alias_source() {
+    // The `Mut` chunk family as an iterator: `into_iter`
+    // is the identity, the step denominates each yielded
+    // chunk as a window over the source storage (so writes
+    // through a chunk land in the source, in both step
+    // directions), and the trailing marker field of the
+    // `Mut` states rides through the step untouched. The
+    // outputs below are native rustc 1.100.0's.
+    run_ok(
+        "chunks-mut-write",
+        CHUNKS_MUT_WRITE_SRC,
+        "a [10, 20, 30, 40, 50]\nb 2 3\nc [101, 2, 103, 4, 105, 6]\nd [1, 9, 3, 11, 5]\nnb [1, 22, 3, 4, 55]\nrnb [11, 2, 3, 4, 5, 6]\nrem [10, 2, 3, 4, 50]\nnest 101 3 105\narr [2, 3, 4, 5]\ncollected 2\nhint (3, Some(3))\nzst 3\n",
+    );
+}
+
 // Slice unsizing of pointer-carrying values: a reference-counted
 // handle is itself the pointer (its pointee lives in the
 // allocation store), a custom DST propagates the metadata
