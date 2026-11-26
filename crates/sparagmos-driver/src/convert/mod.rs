@@ -320,6 +320,23 @@ pub struct Converter {
     /// `note_fn_shim_location`). Index 0 is `call`, 1 is
     /// `call_mut`, 2 is `call_once`.
     pub fn_shim_locations: [Option<sm::ConstValue>; 3],
+    /// The location stamp of the `Coroutine::resume` vtable
+    /// shim — the trait method definition in core — recorded
+    /// by the dyn demand pass (see
+    /// `note_coroutine_shim_location`). A track-caller
+    /// coroutine entered through a `dyn` receiver observes
+    /// this location: the resume method is not
+    /// `#[track_caller]`, so no caller location forwards
+    /// through it.
+    pub coroutine_shim_location: Option<sm::ConstValue>,
+    /// Plain definition paths of the `#[track_caller]`
+    /// coroutines the dyn demand pass met through their
+    /// resume shims (see `note_track_caller_coroutine`).
+    /// Handed to the interpreter with the converted program:
+    /// the bodies registered under these paths are
+    /// track-caller bodies, which the resume instances'
+    /// definition stamps alone do not establish.
+    pub track_caller_coroutines: Vec<String>,
     /// Link symbols of the instances registered so far, keyed
     /// by the instance's Sparagmos `DefId` (see
     /// `note_link_symbol`). Handed to the interpreter with the

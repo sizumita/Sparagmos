@@ -661,7 +661,11 @@ fn convert_all_with(
             .as_ref()
             .and_then(|v| conv.convert_const_value(v, None).ok()),
     ];
-    mark_caller_location_bodies(&mut out);
+    out.coroutine_shim_location = program
+        .coroutine_shim_location
+        .as_ref()
+        .and_then(|v| conv.convert_const_value(v, None).ok());
+    mark_caller_location_bodies(&mut out, &program.track_caller_coroutines);
     Ok((out, failures))
 }
 
@@ -672,7 +676,10 @@ fn convert_all_with(
 /// a track-caller body. Each marked body gains a synthetic final
 /// local (typed as the location reference) that the interpreter
 /// binds the stamp to (see `Body::caller_location_local`).
-fn mark_caller_location_bodies(program: &mut ir::Program) {
+fn mark_caller_location_bodies(
+    program: &mut ir::Program,
+    track_caller_coroutines: &[String],
+) {
     // Bodies the driver recorded a definition-location stamp
     // for are track-caller bodies by the compiler's own
     // resolution, whether or not any converted direct call
@@ -696,6 +703,37 @@ fn mark_caller_location_bodies(program: &mut ir::Program) {
                         marked.push(func.clone());
                     }
                 }
+            }
+        }
+    }
+    // A coroutine body is registered under its own key,
+    // while the driver's definition stamp names the resume
+    // instance: mark the bodies of the coroutines the driver
+    // recorded as `#[track_caller]` (see
+    // `MirProgram::track_caller_coroutines`) as well, so the
+    // shim stamp the resume dispatch presents (see
+    // `ir::Program::coroutine_shim_location`) has a local to
+    // bind to. The recorded paths carry no instance
+    // arguments; a body key matches when its own arguments
+    // are set aside the same way.
+    if !track_caller_coroutines.is_empty() {
+        let keys: Vec<String> = program
+            .functions
+            .keys()
+            .filter(|k| !marked.contains(k))
+            .cloned()
+            .collect();
+        for key in keys {
+            let Some((parent, segment, _)) =
+                crate::interp::parse_coroutine_key(&key)
+            else {
+                continue;
+            };
+            if track_caller_coroutines
+                .iter()
+                .any(|p| *p == format!("{parent}::{segment}"))
+            {
+                marked.push(key);
             }
         }
     }

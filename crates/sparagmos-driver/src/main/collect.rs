@@ -1640,6 +1640,8 @@ fn collect() -> ControlFlow<()> {
         dtor_bodies,
         track_caller_defs: conv.track_caller_defs.clone(),
         fn_shim_locations: conv.fn_shim_locations.clone(),
+        coroutine_shim_location: conv.coroutine_shim_location.clone(),
+        track_caller_coroutines: conv.track_caller_coroutines.clone(),
         link_symbols: conv.link_symbols.clone(),
         source_files: conv.source_files.clone(),
         coverage,

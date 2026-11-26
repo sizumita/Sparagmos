@@ -44,6 +44,8 @@ impl Converter {
             track_caller_defs: HashMap::new(),
             fn_abis: HashMap::new(),
             fn_shim_locations: [None, None, None],
+            coroutine_shim_location: None,
+            track_caller_coroutines: Vec::new(),
             link_symbols: HashMap::new(),
             noting_track_caller: false,
             errors: Vec::new(),
@@ -404,6 +406,55 @@ impl Converter {
         self.noting_track_caller = false;
         if let Some(stamp) = stamp {
             self.fn_shim_locations[kind] = Some(stamp);
+        }
+    }
+
+    /// Record the location stamp of the `Coroutine::resume`
+    /// vtable shim: the definition location of the `resume`
+    /// method in core's `Coroutine` trait, which is the
+    /// location a track-caller coroutine entered through a
+    /// `dyn` receiver observes (the compiler attributes the
+    /// resume glue to the trait method's definition, as it
+    /// does the `Fn` shims to theirs). The stamp is fabricated
+    /// on the body of one concrete resume instance: a
+    /// terminator of that body re-spanned to the method's
+    /// definition span, resolved with the compiler's own
+    /// caller-location resolution (the fabrication
+    /// `def_location_stamp` performs for definition stamps).
+    pub fn note_coroutine_shim_location(
+        &mut self,
+        host: &mir::Body,
+        trait_def: &rustc_public::ty::TraitDef,
+    ) {
+        if self.coroutine_shim_location.is_some() || self.noting_track_caller {
+            return;
+        }
+        let Some(span) = coroutine_resume_def_span(trait_def) else {
+            return;
+        };
+        self.noting_track_caller = true;
+        let stamp = (|| {
+            let mut term = host.blocks.first()?.terminator.clone();
+            term.source_info.span = span;
+            self.call_site_stamp(host, &term)
+        })();
+        self.noting_track_caller = false;
+        if let Some(stamp) = stamp {
+            self.coroutine_shim_location = Some(stamp);
+        }
+    }
+
+    /// Record the plain definition path of a `#[track_caller]`
+    /// coroutine the dyn demand pass met through its resume
+    /// shim (see `note_coroutine_shim` in the binary). The
+    /// interpreter registers a coroutine body under its own
+    /// key, which the resume instance's definition stamp does
+    /// not name; this record is what marks that body as a
+    /// track-caller body when the program is converted (see
+    /// `mark_caller_location_bodies` in the interpreter).
+    pub fn note_track_caller_coroutine(&mut self, path: String) {
+        if !self.track_caller_coroutines.contains(&path) {
+            self.track_caller_coroutines.push(path);
         }
     }
 
@@ -1030,4 +1081,25 @@ impl Converter {
         let public: rustc_public::ty::Span = rustc_public::rustc_internal::stable(collapsed);
         Some((public.get_filename(), public.get_lines()))
     }
+}
+
+/// The definition span of the `resume` method of the
+/// `Coroutine` trait, read from the trait's own definition
+/// through the compiler context installed for the
+/// conversion. Outside a compilation callback there is no
+/// definition to read.
+fn coroutine_resume_def_span(
+    trait_def: &rustc_public::ty::TraitDef,
+) -> Option<rustc_public::ty::Span> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal_trait =
+            rustc_public::rustc_internal::internal(tcx, trait_def.def_id());
+        let resume = rustc_span::Symbol::intern("resume");
+        let item = tcx
+            .associated_item_def_ids(internal_trait)
+            .iter()
+            .find(|id| tcx.item_name(**id) == resume)?;
+        Some(rustc_public::rustc_internal::stable(tcx.def_span(*item)))
+    })
 }
