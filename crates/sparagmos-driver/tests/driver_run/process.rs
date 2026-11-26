@@ -697,6 +697,53 @@ fn run_mode_process_host_env_and_cwd() {
     );
 }
 
+const PROCESS_HOST_ENVS_SRC: &str = r#"
+use std::collections::{BTreeMap, HashMap};
+use std::process::Command;
+fn main() {
+    // `Command::envs` is served by its converted std body,
+    // which reaches `CommandEnv::set` through the inlined
+    // `env_mut()` -- a `&mut command.env` place read. Both map
+    // flavours must land in the child's environment.
+    let mut hash: HashMap<String, String> = HashMap::new();
+    hash.insert("ENVS_MARKER".to_string(), "from-hash".to_string());
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("echo $ENVS_MARKER")
+        .env_clear()
+        .envs(&hash)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("from-hash\n"), "hash envs missing: {text}");
+    let mut btree: BTreeMap<String, String> = BTreeMap::new();
+    btree.insert("ENVS_MARKER".to_string(), "from-btree".to_string());
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("echo $ENVS_MARKER")
+        .env_clear()
+        .envs(&btree)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("from-btree\n"), "btree envs missing: {text}");
+    println!("process-host-envs-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_envs_from_map() {
+    let dir = temp_dir("proc-host-envs");
+    let src = fixture(&dir, "process_host_envs.rs", PROCESS_HOST_ENVS_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-envs-ok\n"
+    );
+}
+
 const PROCESS_HOST_SPAWN_SRC: &str = r#"
 use std::process::{Command, Stdio};
 fn main() {
