@@ -1849,6 +1849,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
         "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
         "libc::read" | "libc::unix::read" => Builtin::LibcRead,
+        "libc::write" | "libc::unix::write" => Builtin::LibcWrite,
         "std::sys::io::error::unix::errno_location"
         | "libc::__errno_location"
         | "libc::unix::__errno_location" => Builtin::ErrnoLocation,

@@ -8759,6 +8759,10 @@ impl<'a> Interpreter<'a> {
                 arity(3)?;
                 self.exec_libc_read(frames, name, &vals)
             }
+            Builtin::LibcWrite => {
+                arity(3)?;
+                self.exec_libc_write(frames, name, &vals)
+            }
             Builtin::ErrnoLocation => {
                 arity(0)?;
                 self.exec_errno_location()
