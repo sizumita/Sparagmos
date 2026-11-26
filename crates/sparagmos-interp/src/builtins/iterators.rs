@@ -4031,6 +4031,126 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `FlattenCompat::size_hint` replayed on a flatten
+    /// composition's modelled state, for the `FlatMap` /
+    /// `Flatten` / `FlattenCompat` arm of
+    /// [`Self::iterator_size_hint`]. Core computes the hint
+    /// from the front and back inner iterators' hints and
+    /// the outer iterator's hint — read through the `Fuse`
+    /// the outer iterator is parked in, where a blown fuse
+    /// (the slot cleared to `None`) reports `(0, Some(0))`
+    /// — scaled by the outer item's fixed inner size when
+    /// it has one: an array is the one into-iterable whose
+    /// length core knows statically. An inner iterator of
+    /// core's one-shot family (it yields at most one item)
+    /// selects the specialised impl instead, which ignores
+    /// the front and back iterators entirely. `Ok(None)`
+    /// when the composition's legs are not derivable from
+    /// the tag, leaving the caller's fallback in place.
+    fn flatten_size_hint(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: &Value,
+    ) -> InterpResult<Option<(u128, Option<u128>)>> {
+        let Some((outer_ty, item_ty, inner_ty)) = flatten_step_types(self_ty)
+        else {
+            return Ok(None);
+        };
+        let compat = if self_ty
+            .starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            state.clone()
+        } else {
+            let fields = iterator_fields(state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "a one-field wrapper around a FlattenCompat",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            fields.into_iter().next().expect("one field checked")
+        };
+        let fields = iterator_fields(&compat, "FlattenCompat state")?;
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "FlattenCompat state",
+                "[fuse, front inner iterator, back inner iterator]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let fuse_fields = iterator_fields(&fields[0], "Fuse state")?;
+        if fuse_fields.len() != 1 {
+            return Err(InterpError::type_mismatch(
+                "Fuse state",
+                "a one-field wrapper around an Option",
+                format!("{} field(s)", fuse_fields.len()),
+            ));
+        }
+        let outer_hint = match option_payload_opt(fuse_fields[0].clone()) {
+            Some(outer_state) => {
+                self.size_hint_parts(frames, &outer_ty, outer_state)?
+            }
+            None => (0, Some(0)),
+        };
+        if is_one_shot_ty(&inner_ty) {
+            // The specialised impl: the outer hint, scaled
+            // by the item's fixed size when it has one —
+            // which for a one-shot inner iterator can only
+            // be 0 or 1.
+            return Ok(Some(match const_size_of_item(&item_ty) {
+                Some(0) => (0, Some(0)),
+                Some(1) => outer_hint,
+                _ => (0, outer_hint.1),
+            }));
+        }
+        let (flo, fhi) = match option_payload_opt(fields[1].clone()) {
+            Some(inner_state) => {
+                self.size_hint_parts(frames, &inner_ty, inner_state)?
+            }
+            None => (0, Some(0)),
+        };
+        let (blo, bhi) = match option_payload_opt(fields[2].clone()) {
+            Some(inner_state) => {
+                self.size_hint_parts(frames, &inner_ty, inner_state)?
+            }
+            None => (0, Some(0)),
+        };
+        let lo = flo.saturating_add(blo);
+        if let Some(fixed) = const_size_of_item(&item_ty) {
+            // Every remaining outer item expands to exactly
+            // `fixed` inner items: the lower bound scales
+            // outright, and the upper bound survives only
+            // when every leg's is known — checked
+            // arithmetic, as core's.
+            let fixed = fixed as u128;
+            let lower = outer_hint.0.saturating_mul(fixed).saturating_add(lo);
+            let upper = match (fhi, bhi, outer_hint.1) {
+                (Some(front), Some(back), Some(outer)) => {
+                    match fixed.checked_mul(outer) {
+                        Some(scaled) => front
+                            .checked_add(back)
+                            .and_then(|sum| sum.checked_add(scaled)),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            return Ok(Some((lower, upper)));
+        }
+        // The upper bound is known only when the outer
+        // iterator is certainly spent: what remains is then
+        // exactly the front and back iterators' contents.
+        let pair = match (outer_hint, fhi, bhi) {
+            ((0, Some(0)), Some(front), Some(back)) => {
+                (lo, front.checked_add(back))
+            }
+            _ => (lo, None),
+        };
+        Ok(Some(pair))
+    }
+
     /// The `ExactSizeIterator::len` of a slice-state
     /// iterator: the remaining element count the state's
     /// unified bounds encode (see
@@ -4245,6 +4365,26 @@ impl<'a> Interpreter<'a> {
             let (start, end) = escape_inner_range(&state, self_ty)?;
             let n = u128::from(end.saturating_sub(start));
             return Ok(hint(n, Some(n)));
+        }
+        if is_str_escape_ty(self_ty) {
+            // The `str` escape iterators forward `size_hint`
+            // to the wrapped `FlatMap` composition, exactly
+            // as their step forwards to it (see
+            // `str_escape_flatmap_ty`): core's impls are
+            // `self.inner.size_hint()`.
+            if let Some(flatmap_ty) = Self::str_escape_flatmap_ty(self_ty) {
+                let fields = iterator_fields(&state, self_ty)?;
+                if fields.len() != 1 {
+                    return Err(InterpError::type_mismatch(
+                        "str escape iterator state",
+                        "[flat map]",
+                        format!("{} field(s)", fields.len()),
+                    ));
+                }
+                let (lower, upper) =
+                    self.size_hint_parts(frames, flatmap_ty, fields[0].clone())?;
+                return Ok(hint(lower, upper));
+            }
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<")
             || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -4776,6 +4916,37 @@ impl<'a> Interpreter<'a> {
             let (_, upper) =
                 self.size_hint_parts(frames, inner_ty, fields[0].clone())?;
             return Ok(hint(0, upper));
+        }
+        if self_ty.starts_with("std::iter::Map<") {
+            // `Map::size_hint` is its inner iterator's,
+            // unchanged: the closure transforms each item
+            // but neither adds nor drops any.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Map state",
+                    "[iterator, closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (lower, upper) =
+                self.size_hint_parts(frames, inner_ty, fields[0].clone())?;
+            return Ok(hint(lower, upper));
+        }
+        if self_ty.starts_with("std::iter::FlatMap<")
+            || self_ty.starts_with("std::iter::Flatten<")
+            || self_ty
+                .starts_with("std::iter::adapters::flatten::FlattenCompat<")
+        {
+            // `FlatMap::size_hint` and `Flatten::size_hint`
+            // forward to the wrapped `FlattenCompat`'s,
+            // whose formula `flatten_size_hint` replays.
+            if let Some((lower, upper)) =
+                self.flatten_size_hint(frames, self_ty, &state)?
+            {
+                return Ok(hint(lower, upper));
+            }
         }
         // Any other iterator: the trait default, `(0, None)`.
         // That pair is a valid `size_hint` answer for every
@@ -5419,6 +5590,71 @@ enum SlotStep {
     Exhausted,
     /// The slot already stored `None`.
     Empty,
+}
+
+/// Whether a rendered tag names an iterator of core's
+/// one-shot family — the iterators that yield at most one
+/// item, for which `FlattenCompat` selects its specialised
+/// `size_hint`: the one-item and empty sources (`Once`,
+/// `OnceWith`, `Empty`, the `Option` and `Result`
+/// iterators, a zero- or one-element array's `IntoIter`)
+/// and the adapters that never increase the count
+/// (`Cloned`, `Copied`, `Filter`, `FilterMap`, `Map`) over
+/// one, which the check follows through the tag. A `&mut`
+/// iterator passes the property through, as core's
+/// blanket impl does.
+fn is_one_shot_ty(ty: &str) -> bool {
+    let ty = ty.strip_prefix("&mut ").unwrap_or(ty);
+    if ty.starts_with("std::iter::Once<")
+        || ty.starts_with("std::iter::OnceWith<")
+        || ty.starts_with("std::iter::Empty<")
+        || ty.starts_with("std::option::IntoIter<")
+        || ty.starts_with("core::option::IntoIter<")
+        || ty.starts_with("std::option::Iter<")
+        || ty.starts_with("core::option::Iter<")
+        || ty.starts_with("std::option::IterMut<")
+        || ty.starts_with("core::option::IterMut<")
+        || ty.starts_with("std::result::IntoIter<")
+        || ty.starts_with("core::result::IntoIter<")
+        || ty.starts_with("std::result::Iter<")
+        || ty.starts_with("core::result::Iter<")
+        || ty.starts_with("std::result::IterMut<")
+        || ty.starts_with("core::result::IterMut<")
+    {
+        return true;
+    }
+    if ty.starts_with("std::array::IntoIter<") {
+        // One-shot only for a zero- or one-element array.
+        let args = generic_args_of(ty);
+        return args.len() >= 2 && matches!(args[1].trim(), "0" | "1");
+    }
+    if ty.starts_with("std::iter::Cloned<")
+        || ty.starts_with("std::iter::Copied<")
+        || ty.starts_with("std::iter::Filter<")
+        || ty.starts_with("std::iter::FilterMap<")
+        || ty.starts_with("std::iter::Map<")
+    {
+        if let Some(inner) = first_generic_arg(ty) {
+            return is_one_shot_ty(inner);
+        }
+    }
+    false
+}
+
+/// The fixed length core's `ConstSizeIntoIterator`
+/// reports for an into-iterable tag: an array's length,
+/// the one statically known inner size (the impls cover
+/// `[T; N]` and its reference forms). `None` for every
+/// other type — and for an array whose length the tag
+/// does not render as a plain number.
+fn const_size_of_item(ty: &str) -> Option<usize> {
+    let ty = ty.strip_prefix("&mut ").unwrap_or(ty);
+    let ty = ty.strip_prefix('&').unwrap_or(ty);
+    if !ty.starts_with('[') || !ty.ends_with(']') {
+        return None;
+    }
+    let semi = ty.rfind(';')?;
+    ty[semi + 1..ty.len() - 1].trim().parse().ok()
 }
 
 /// The type triple a flatten composition's step machine runs
