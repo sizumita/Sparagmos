@@ -695,6 +695,24 @@ fn foreign_fn_defs(krate: &rustc_public::Crate) -> Vec<rustc_public::ty::FnDef> 
         .unwrap_or_default()
 }
 
+/// The merged `Drop` impl methods of every external crate,
+/// built once on first use and cached in `cache` (see
+/// `demand_drop_instances` for why the scan covers every
+/// external crate rather than the one a type's name names).
+fn foreign_drop_impl_methods(
+    cache: &mut Option<std::collections::HashMap<String, rustc_public::ty::FnDef>>,
+) -> &std::collections::HashMap<String, rustc_public::ty::FnDef> {
+    cache.get_or_insert_with(|| {
+        let mut defs = Vec::new();
+        for krate in rustc_public::external_crates() {
+            if !krate.is_local {
+                defs.extend(foreign_fn_defs(&krate));
+            }
+        }
+        drop_impl_methods(defs)
+    })
+}
+
 /// Demand a converted body for the `Drop` impl of every local ADT
 /// instantiation that the converted bodies drop (see the call site
 /// in `collect`). Each demanded body is converted like a local item
@@ -927,19 +945,30 @@ pub(crate) fn demand_drop_instances(
             let def_name = def.name();
             let type_key = drop_type_key(&def_name);
             let type_crate = type_key.split("::").next().unwrap_or("");
+            // The scan the name selects is consulted first, but
+            // a miss falls through to the other scan: a rendered
+            // name's first segment does not always name the
+            // crate that defines the type. The case that forces
+            // this is an auxiliary crate carrying the entry
+            // crate's own name (the test harness's aux-build
+            // convention names the auxiliary crate after the
+            // test crate): its types render under the local
+            // crate's name, so the dispatch above would look
+            // for their impls among the local crate's items
+            // only and never demand the destructor at all. The
+            // keys are full rendered paths, unique per type, so
+            // a hit in the other scan names the same impl the
+            // selected scan would have named.
             let impl_fn = if type_crate == local_crate_name {
-                impl_methods.get(&type_key)
+                impl_methods
+                    .get(&type_key)
+                    .or_else(|| {
+                        foreign_drop_impl_methods(&mut foreign_impl_methods).get(&type_key)
+                    })
             } else {
-                let methods = foreign_impl_methods.get_or_insert_with(|| {
-                    let mut defs = Vec::new();
-                    for krate in rustc_public::external_crates() {
-                        if !krate.is_local {
-                            defs.extend(foreign_fn_defs(&krate));
-                        }
-                    }
-                    drop_impl_methods(defs)
-                });
-                methods.get(&type_key)
+                foreign_drop_impl_methods(&mut foreign_impl_methods)
+                    .get(&type_key)
+                    .or_else(|| impl_methods.get(&type_key))
             };
             let Some(impl_fn) = impl_fn else {
                 continue;
@@ -1956,13 +1985,10 @@ pub(crate) fn certify_drop_no_impl(
             }
         }
     }
-    let local_crate_name = rustc_public::local_crate().name;
-    let mut scans: std::collections::HashMap<String, Option<std::collections::HashSet<String>>> =
-        std::collections::HashMap::new();
-    // The merged foreign impl-name set (see the doc comment
-    // above), built on first use and shared by every foreign
-    // candidate.
-    let mut foreign_names: Option<std::collections::HashSet<String>> = None;
+    // The impl-name set the certification consults (see the
+    // candidate loop): the union of the local scan and the
+    // merged foreign scan, built on first use.
+    let mut impl_names: Option<std::collections::HashSet<String>> = None;
     let mut out = std::collections::HashSet::new();
     let mut queried = 0usize;
     for (ty, def, args) in candidates {
@@ -1975,29 +2001,27 @@ pub(crate) fn certify_drop_no_impl(
         queried += 1;
         let def_name = def.name();
         let type_key = drop_type_key(&def_name);
-        let type_crate = type_key.split("::").next().unwrap_or("");
-        let scan = scans.entry(type_crate.to_string()).or_insert_with(|| {
-            if type_crate == local_crate_name.as_str() {
-                Some(local_drop_impl_methods().into_keys().collect())
-            } else {
-                Some(
-                    foreign_names
-                        .get_or_insert_with(|| {
-                            let mut defs = Vec::new();
-                            for krate in rustc_public::external_crates() {
-                                if !krate.is_local {
-                                    defs.extend(foreign_fn_defs(&krate));
-                                }
-                            }
-                            drop_impl_methods(defs).into_keys().collect()
-                        })
-                        .clone(),
-                )
-            }
+        // The certification asks whether ANY crate defines a
+        // `Drop` impl for this key, so the scan is the union of
+        // the local and merged foreign key sets: selecting one
+        // scan by the rendered name's first segment would
+        // certify a type whose impl lives in a same-named
+        // auxiliary crate (the aux-build convention) as having
+        // no impl at all, and the glue builder would then skip
+        // a destructor that really runs. The keys are full
+        // rendered paths, unique per type, so the union names
+        // no impl the separate scans would not.
+        let impl_names = impl_names.get_or_insert_with(|| {
+            let mut names: std::collections::HashSet<String> =
+                local_drop_impl_methods().into_keys().collect();
+            let mut foreign_cache = None;
+            names.extend(
+                foreign_drop_impl_methods(&mut foreign_cache)
+                    .keys()
+                    .cloned(),
+            );
+            names
         });
-        let Some(impl_names) = scan else {
-            continue;
-        };
         if impl_names.contains(&type_key) {
             continue;
         }
