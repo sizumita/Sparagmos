@@ -1166,6 +1166,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::string::String::into_bytes" | "alloc::string::String::into_bytes" => {
             Builtin::StringIntoBytes
         }
+        "std::string::String::as_mut_vec" | "alloc::string::String::as_mut_vec" => {
+            Builtin::StringAsMutVec
+        }
+        "std::string::String::leak" | "alloc::string::String::leak" => {
+            Builtin::StringLeak
+        }
         "std::string::String::into_boxed_str" | "alloc::string::String::into_boxed_str" => {
             Builtin::StringIntoBoxedStr
         }
@@ -1218,6 +1224,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::str::<impl str>::len" => Builtin::StrLen,
         "core::str::<impl str>::is_empty" => Builtin::StrIsEmpty,
         "core::str::<impl str>::as_bytes" => Builtin::StrAsBytes,
+        "core::str::<impl str>::as_bytes_mut" => Builtin::StrAsBytesMut,
         "core::str::<impl str>::chars" => Builtin::StrChars,
         "core::str::<impl str>::bytes" => Builtin::StrBytes,
         "core::str::<impl str>::make_ascii_uppercase" => {

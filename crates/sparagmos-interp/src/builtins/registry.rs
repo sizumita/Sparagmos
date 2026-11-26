@@ -437,6 +437,26 @@ pub enum Builtin {
     /// `String::into_bytes(String) -> Vec<u8>`: the string data as
     /// a vector of bytes (the model's element aggregate).
     StringIntoBytes,
+    /// `String::as_mut_vec(&mut String) -> &mut Vec<u8>`: the
+    /// string's storage viewed as its byte vector. The abstract
+    /// string has no byte slots a vector operation could write
+    /// through, so the call rewrites the receiver's storage in
+    /// place into the byte-vector element form (the form
+    /// `String::into_bytes` produces) and returns the receiver
+    /// reference unchanged: the place itself is the viewed
+    /// storage, exactly as for `AsMut`. Vector operations then
+    /// mutate the element form, and the string readers coerce
+    /// that form back to text (see `string_aggregate_bytes`), so
+    /// a write through the vector is a write to the string.
+    StringAsMutVec,
+    /// `String::leak(String) -> &'static mut str`: the string
+    /// data moved into a fresh allocation nothing owns, denoted
+    /// by a fat reference to it. The collected body rebuilds
+    /// the slice from the vector's raw parts (a pointer transmute
+    /// the conversion cannot serve); the allocation store entry
+    /// is the leaked storage, and with no owning box its entry
+    /// is never removed, as for a `Box::into_raw` leak.
+    StringLeak,
     /// `String::into_boxed_str(String) -> Box<str>`: the string
     /// data in a fresh box allocation. The collected body moves
     /// the `vec` field out of the string value and rebuilds the
@@ -521,6 +541,16 @@ pub enum Builtin {
     /// `str::as_bytes(&str) -> &[u8]`: a byte view of the string
     /// data.
     StrAsBytes,
+    /// `str::as_bytes_mut(&mut str) -> &mut [u8]`: a mutable
+    /// byte view of the string data. As for
+    /// `String::as_mut_vec`, the call rewrites the denoted
+    /// storage in place into the byte element form and returns
+    /// a fat reference over the same storage, so byte writes
+    /// land in the element form and the string readers coerce
+    /// it back (a write leaving the bytes invalid UTF-8 makes
+    /// the next string read fail its coercion, where native
+    /// semantics leave the value undefined).
+    StrAsBytesMut,
     /// `str::chars(&str)`: a `std::str::Chars` value in its
     /// real shape (see `str_chars_value`), the shape
     /// `Iterator::next` consumes for `std::str::Chars`.

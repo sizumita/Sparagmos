@@ -260,31 +260,25 @@ impl<'a> Interpreter<'a> {
         // above this never decides against a side that yields
         // no string: two element-form values (an `OsString`
         // has the same shape) keep the structural comparison
-        // below unless both sides yield their bytes.
+        // below unless both sides yield their bytes. The
+        // element form may sit under the one-field `String`
+        // wrapper or *be* the stored value itself (the shape
+        // `String::as_mut_vec` leaves in the string's
+        // storage); `string_from_element_form` reads both,
+        // the sparse form included.
         for (side, other) in [(&*a, &*b), (&*b, &*a)] {
-            let text = match side {
-                Value::Enum {
-                    variant: 0,
-                    fields,
-                } if fields.len() == 1 => {
-                    self.string_from_element_form(&fields[0])
-                }
-                _ => None,
-            };
+            let text = self.string_from_element_form(side);
             if let Some(text) = text {
                 match other {
                     Value::Str(y) => return Ok(text == *y),
                     Value::Bytes(y) => {
                         return Ok(text.as_bytes() == y.as_slice())
                     }
-                    Value::Enum {
-                        variant: 0,
-                        fields,
-                    } if fields.len() == 1 => {
+                    Value::Enum { variant: 0, .. } => {
                         if let Some(other_text) =
                             self.string_from_real_aggregate(frames, other)?
                                 .or_else(|| {
-                                    self.string_from_element_form(&fields[0])
+                                    self.string_from_element_form(other)
                                 })
                         {
                             return Ok(text == other_text);
@@ -588,15 +582,11 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             // two aggregate-shaped values.
             let text = match self.string_from_real_aggregate(frames, side)? {
                 Some(text) => Some(text),
-                None => match side {
-                    Value::Enum {
-                        variant: 0,
-                        fields,
-                    } if fields.len() == 1 => {
-                        self.string_from_element_form(&fields[0])
-                    }
-                    _ => None,
-                },
+                // The element form, under the one-field
+                // wrapper or as the stored value itself (see
+                // `values_equal`): `string_from_element_form`
+                // reads both, the sparse form included.
+                None => self.string_from_element_form(side),
             };
             if let Some(text) = text {
                 let ord = match other {
