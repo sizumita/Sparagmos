@@ -1016,3 +1016,249 @@ fn simd_reduce(
         _ => Err(unsupported("this simd reduction is not runtime-supported")),
     }
 }
+
+/// Registration fragment of the builtin name registry: the SIMD intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn simd_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::simd::simd_add" | "core::intrinsics::simd::simd_add" => {
+            Builtin::SimdOp(SimdOp::Add)
+        }
+        "std::intrinsics::simd::simd_sub" | "core::intrinsics::simd::simd_sub" => {
+            Builtin::SimdOp(SimdOp::Sub)
+        }
+        "std::intrinsics::simd::simd_mul" | "core::intrinsics::simd::simd_mul" => {
+            Builtin::SimdOp(SimdOp::Mul)
+        }
+        "std::intrinsics::simd::simd_div" | "core::intrinsics::simd::simd_div" => {
+            Builtin::SimdOp(SimdOp::Div)
+        }
+        "std::intrinsics::simd::simd_rem" | "core::intrinsics::simd::simd_rem" => {
+            Builtin::SimdOp(SimdOp::Rem)
+        }
+        "std::intrinsics::simd::simd_and" | "core::intrinsics::simd::simd_and" => {
+            Builtin::SimdOp(SimdOp::And)
+        }
+        "std::intrinsics::simd::simd_or" | "core::intrinsics::simd::simd_or" => {
+            Builtin::SimdOp(SimdOp::Or)
+        }
+        "std::intrinsics::simd::simd_xor" | "core::intrinsics::simd::simd_xor" => {
+            Builtin::SimdOp(SimdOp::Xor)
+        }
+        "std::intrinsics::simd::simd_shl" | "core::intrinsics::simd::simd_shl" => {
+            Builtin::SimdOp(SimdOp::Shl)
+        }
+        "std::intrinsics::simd::simd_shr" | "core::intrinsics::simd::simd_shr" => {
+            Builtin::SimdOp(SimdOp::Shr)
+        }
+        "std::intrinsics::simd::simd_eq" | "core::intrinsics::simd::simd_eq" => {
+            Builtin::SimdOp(SimdOp::Eq)
+        }
+        "std::intrinsics::simd::simd_ne" | "core::intrinsics::simd::simd_ne" => {
+            Builtin::SimdOp(SimdOp::Ne)
+        }
+        "std::intrinsics::simd::simd_lt" | "core::intrinsics::simd::simd_lt" => {
+            Builtin::SimdOp(SimdOp::Lt)
+        }
+        "std::intrinsics::simd::simd_le" | "core::intrinsics::simd::simd_le" => {
+            Builtin::SimdOp(SimdOp::Le)
+        }
+        "std::intrinsics::simd::simd_gt" | "core::intrinsics::simd::simd_gt" => {
+            Builtin::SimdOp(SimdOp::Gt)
+        }
+        "std::intrinsics::simd::simd_ge" | "core::intrinsics::simd::simd_ge" => {
+            Builtin::SimdOp(SimdOp::Ge)
+        }
+        "std::intrinsics::simd::simd_neg" | "core::intrinsics::simd::simd_neg" => {
+            Builtin::SimdOp(SimdOp::Neg)
+        }
+        "std::intrinsics::simd::simd_fabs" | "core::intrinsics::simd::simd_fabs" => {
+            Builtin::SimdOp(SimdOp::Fabs)
+        }
+        "std::intrinsics::simd::simd_ceil" | "core::intrinsics::simd::simd_ceil" => {
+            Builtin::SimdOp(SimdOp::Ceil)
+        }
+        "std::intrinsics::simd::simd_floor" | "core::intrinsics::simd::simd_floor" => {
+            Builtin::SimdOp(SimdOp::Floor)
+        }
+        "std::intrinsics::simd::simd_trunc" | "core::intrinsics::simd::simd_trunc" => {
+            Builtin::SimdOp(SimdOp::Trunc)
+        }
+        "std::intrinsics::simd::simd_round" | "core::intrinsics::simd::simd_round" => {
+            Builtin::SimdOp(SimdOp::Round)
+        }
+        "std::intrinsics::simd::simd_round_ties_even"
+        | "core::intrinsics::simd::simd_round_ties_even" => {
+            Builtin::SimdOp(SimdOp::RoundTiesEven)
+        }
+        "std::intrinsics::simd::simd_fsqrt" | "core::intrinsics::simd::simd_fsqrt" => {
+            Builtin::SimdOp(SimdOp::Fsqrt)
+        }
+        "std::intrinsics::simd::simd_fexp" | "core::intrinsics::simd::simd_fexp" => {
+            Builtin::SimdOp(SimdOp::Fexp)
+        }
+        "std::intrinsics::simd::simd_fexp2" | "core::intrinsics::simd::simd_fexp2" => {
+            Builtin::SimdOp(SimdOp::Fexp2)
+        }
+        "std::intrinsics::simd::simd_flog" | "core::intrinsics::simd::simd_flog" => {
+            Builtin::SimdOp(SimdOp::Flog)
+        }
+        "std::intrinsics::simd::simd_flog2" | "core::intrinsics::simd::simd_flog2" => {
+            Builtin::SimdOp(SimdOp::Flog2)
+        }
+        "std::intrinsics::simd::simd_flog10" | "core::intrinsics::simd::simd_flog10" => {
+            Builtin::SimdOp(SimdOp::Flog10)
+        }
+        "std::intrinsics::simd::simd_fsin" | "core::intrinsics::simd::simd_fsin" => {
+            Builtin::SimdOp(SimdOp::Fsin)
+        }
+        "std::intrinsics::simd::simd_fcos" | "core::intrinsics::simd::simd_fcos" => {
+            Builtin::SimdOp(SimdOp::Fcos)
+        }
+        "std::intrinsics::simd::simd_bswap" | "core::intrinsics::simd::simd_bswap" => {
+            Builtin::SimdOp(SimdOp::Bswap)
+        }
+        "std::intrinsics::simd::simd_bitreverse" | "core::intrinsics::simd::simd_bitreverse" => {
+            Builtin::SimdOp(SimdOp::BitReverse)
+        }
+        "std::intrinsics::simd::simd_ctlz" | "core::intrinsics::simd::simd_ctlz" => {
+            Builtin::SimdOp(SimdOp::Ctlz)
+        }
+        "std::intrinsics::simd::simd_ctpop" | "core::intrinsics::simd::simd_ctpop" => {
+            Builtin::SimdOp(SimdOp::Ctpop)
+        }
+        "std::intrinsics::simd::simd_cttz" | "core::intrinsics::simd::simd_cttz" => {
+            Builtin::SimdOp(SimdOp::Cttz)
+        }
+        "std::intrinsics::simd::simd_saturating_add"
+        | "core::intrinsics::simd::simd_saturating_add" => {
+            Builtin::SimdOp(SimdOp::SaturatingAdd)
+        }
+        "std::intrinsics::simd::simd_saturating_sub"
+        | "core::intrinsics::simd::simd_saturating_sub" => {
+            Builtin::SimdOp(SimdOp::SaturatingSub)
+        }
+        "std::intrinsics::simd::simd_carryless_mul"
+        | "core::intrinsics::simd::simd_carryless_mul" => Builtin::SimdOp(SimdOp::CarrylessMul),
+        "std::intrinsics::simd::simd_funnel_shl" | "core::intrinsics::simd::simd_funnel_shl" => {
+            Builtin::SimdOp(SimdOp::FunnelShl)
+        }
+        "std::intrinsics::simd::simd_funnel_shr" | "core::intrinsics::simd::simd_funnel_shr" => {
+            Builtin::SimdOp(SimdOp::FunnelShr)
+        }
+        "std::intrinsics::simd::simd_maximum_number_nsz"
+        | "core::intrinsics::simd::simd_maximum_number_nsz" => {
+            Builtin::SimdOp(SimdOp::MaximumNumber)
+        }
+        "std::intrinsics::simd::simd_minimum_number_nsz"
+        | "core::intrinsics::simd::simd_minimum_number_nsz" => {
+            Builtin::SimdOp(SimdOp::MinimumNumber)
+        }
+        "std::intrinsics::simd::simd_splat" | "core::intrinsics::simd::simd_splat" => {
+            Builtin::SimdOp(SimdOp::Splat)
+        }
+        "std::intrinsics::simd::simd_extract" | "core::intrinsics::simd::simd_extract" => {
+            Builtin::SimdOp(SimdOp::Extract)
+        }
+        "std::intrinsics::simd::simd_extract_dyn" | "core::intrinsics::simd::simd_extract_dyn" => {
+            Builtin::SimdOp(SimdOp::Extract)
+        }
+        "std::intrinsics::simd::simd_insert" | "core::intrinsics::simd::simd_insert" => {
+            Builtin::SimdOp(SimdOp::Insert)
+        }
+        "std::intrinsics::simd::simd_insert_dyn" | "core::intrinsics::simd::simd_insert_dyn" => {
+            Builtin::SimdOp(SimdOp::Insert)
+        }
+        "std::intrinsics::simd::simd_shuffle" | "core::intrinsics::simd::simd_shuffle" => {
+            Builtin::SimdOp(SimdOp::Shuffle)
+        }
+        "std::intrinsics::simd::simd_cast" | "core::intrinsics::simd::simd_cast" => {
+            Builtin::SimdOp(SimdOp::Cast)
+        }
+        "std::intrinsics::simd::simd_as" | "core::intrinsics::simd::simd_as" => {
+            Builtin::SimdOp(SimdOp::Cast)
+        }
+        "std::intrinsics::simd::simd_bitmask" | "core::intrinsics::simd::simd_bitmask" => {
+            Builtin::SimdOp(SimdOp::Bitmask)
+        }
+        "std::intrinsics::simd::simd_select" | "core::intrinsics::simd::simd_select" => {
+            Builtin::SimdOp(SimdOp::Select)
+        }
+        "std::intrinsics::simd::simd_select_bitmask"
+        | "core::intrinsics::simd::simd_select_bitmask" => Builtin::SimdOp(SimdOp::SelectBitmask),
+        "std::intrinsics::simd::simd_gather" | "core::intrinsics::simd::simd_gather" => {
+            Builtin::SimdOp(SimdOp::Gather)
+        }
+        "std::intrinsics::simd::simd_scatter" | "core::intrinsics::simd::simd_scatter" => {
+            Builtin::SimdOp(SimdOp::Scatter)
+        }
+        "std::intrinsics::simd::simd_masked_load" | "core::intrinsics::simd::simd_masked_load" => {
+            Builtin::SimdOp(SimdOp::MaskedLoad)
+        }
+        "std::intrinsics::simd::simd_masked_store"
+        | "core::intrinsics::simd::simd_masked_store" => Builtin::SimdOp(SimdOp::MaskedStore),
+        "std::intrinsics::simd::simd_arith_offset"
+        | "core::intrinsics::simd::simd_arith_offset" => Builtin::SimdOp(SimdOp::ArithOffset),
+        "std::intrinsics::simd::simd_reduce_add_ordered"
+        | "core::intrinsics::simd::simd_reduce_add_ordered" => {
+            Builtin::SimdOp(SimdOp::ReduceAddOrdered)
+        }
+        "std::intrinsics::simd::simd_reduce_add_unordered"
+        | "core::intrinsics::simd::simd_reduce_add_unordered" => {
+            Builtin::SimdOp(SimdOp::ReduceAddUnordered)
+        }
+        "std::intrinsics::simd::simd_reduce_mul_ordered"
+        | "core::intrinsics::simd::simd_reduce_mul_ordered" => {
+            Builtin::SimdOp(SimdOp::ReduceMulOrdered)
+        }
+        "std::intrinsics::simd::simd_reduce_mul_unordered"
+        | "core::intrinsics::simd::simd_reduce_mul_unordered" => {
+            Builtin::SimdOp(SimdOp::ReduceMulUnordered)
+        }
+        "std::intrinsics::simd::simd_reduce_max" | "core::intrinsics::simd::simd_reduce_max" => {
+            Builtin::SimdOp(SimdOp::ReduceMax)
+        }
+        "std::intrinsics::simd::simd_reduce_min" | "core::intrinsics::simd::simd_reduce_min" => {
+            Builtin::SimdOp(SimdOp::ReduceMin)
+        }
+        "std::intrinsics::simd::simd_reduce_and" | "core::intrinsics::simd::simd_reduce_and" => {
+            Builtin::SimdOp(SimdOp::ReduceAnd)
+        }
+        "std::intrinsics::simd::simd_reduce_or" | "core::intrinsics::simd::simd_reduce_or" => {
+            Builtin::SimdOp(SimdOp::ReduceOr)
+        }
+        "std::intrinsics::simd::simd_reduce_xor" | "core::intrinsics::simd::simd_reduce_xor" => {
+            Builtin::SimdOp(SimdOp::ReduceXor)
+        }
+        "std::intrinsics::simd::simd_reduce_all" | "core::intrinsics::simd::simd_reduce_all" => {
+            Builtin::SimdOp(SimdOp::ReduceAll)
+        }
+        "std::intrinsics::simd::simd_reduce_any" | "core::intrinsics::simd::simd_reduce_any" => {
+            Builtin::SimdOp(SimdOp::ReduceAny)
+        }
+        "std::intrinsics::simd::simd_fma" | "core::intrinsics::simd::simd_fma" => {
+            Builtin::SimdOp(SimdOp::Fma)
+        }
+        "std::intrinsics::simd::simd_relaxed_fma" | "core::intrinsics::simd::simd_relaxed_fma" => {
+            Builtin::SimdOp(SimdOp::Fma)
+        }
+        "std::intrinsics::simd::simd_cast_ptr" | "core::intrinsics::simd::simd_cast_ptr" => {
+            Builtin::SimdOp(SimdOp::CastPtr)
+        }
+        "std::intrinsics::simd::simd_expose_provenance"
+        | "core::intrinsics::simd::simd_expose_provenance" => {
+            Builtin::SimdOp(SimdOp::ExposeProvenance)
+        }
+        "std::intrinsics::simd::simd_with_exposed_provenance"
+        | "core::intrinsics::simd::simd_with_exposed_provenance" => {
+            Builtin::SimdOp(SimdOp::WithExposedProvenance)
+        }
+        _ => return None,
+    })
+}

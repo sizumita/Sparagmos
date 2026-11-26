@@ -5648,3 +5648,157 @@ fn exp_body(digits: &str, upper: bool) -> String {
     };
     format!("{mantissa}{}{exp}", if upper { 'E' } else { 'e' })
 }
+
+/// Registration fragment of the builtin name registry: the `core::fmt` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn fmt_lookup(canonical: &str) -> Option<Builtin> {
+    use crate::interp::FmtBuilderKind;
+    use crate::value::FmtTrait as F;
+    Some(match canonical {
+        "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
+        "std::fmt::format" | "std::fmt::format::format_inner"
+        | "alloc::fmt::format::format_inner" => Builtin::Format,
+        "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
+            Builtin::ArgumentsFromStr
+        }
+        "std::fmt::Arguments::new" => Builtin::ArgumentsNew,
+        "core::fmt::rt::Argument::new_display" => Builtin::ArgumentNew(F::Display),
+        "core::fmt::rt::Argument::new_debug" => Builtin::ArgumentNew(F::Debug),
+        "core::fmt::rt::Argument::new_debug_noop" => Builtin::ArgumentNew(F::DebugNoop),
+        "core::fmt::rt::Argument::new_octal" => Builtin::ArgumentNew(F::Octal),
+        "core::fmt::rt::Argument::new_lower_hex" => Builtin::ArgumentNew(F::LowerHex),
+        "core::fmt::rt::Argument::new_upper_hex" => Builtin::ArgumentNew(F::UpperHex),
+        "core::fmt::rt::Argument::new_pointer" => Builtin::ArgumentNew(F::Pointer),
+        "core::fmt::rt::Argument::new_binary" => Builtin::ArgumentNew(F::Binary),
+        "core::fmt::rt::Argument::new_lower_exp" => Builtin::ArgumentNew(F::LowerExp),
+        "core::fmt::rt::Argument::new_upper_exp" => Builtin::ArgumentNew(F::UpperExp),
+        "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
+        // The captured-`Formatter` surface (see the fmt engine):
+        // guest `fmt` implementation bodies write through these
+        // methods, and derive's fast-path finishers render
+        // through them. The finishers and the builder
+        // constructors/methods have no MIR bodies; `write_fmt`
+        // has one, displaced by the builtin so a guest body's
+        // `write!` lands in the same capture as its `write_str`
+        // calls.
+        "std::fmt::Formatter::write_str" | "core::fmt::Formatter::write_str" => {
+            Builtin::FormatterWriteStr
+        }
+        "std::fmt::Formatter::write_char" | "core::fmt::Formatter::write_char" => {
+            Builtin::FormatterWriteChar
+        }
+        "std::fmt::Formatter::pad" | "core::fmt::Formatter::pad" => Builtin::FormatterPad,
+        "std::fmt::Formatter::write_fmt" | "core::fmt::Formatter::write_fmt" => {
+            Builtin::FormatterWriteFmt
+        }
+        "std::fmt::Formatter::alternate" | "core::fmt::Formatter::alternate" => {
+            Builtin::FormatterAlternate
+        }
+        "std::fmt::Formatter::width" | "core::fmt::Formatter::width" => {
+            Builtin::FormatterWidth
+        }
+        "std::fmt::Formatter::precision" | "core::fmt::Formatter::precision" => {
+            Builtin::FormatterPrecision
+        }
+        "std::fmt::Formatter::fill" | "core::fmt::Formatter::fill" => Builtin::FormatterFill,
+        "std::fmt::Formatter::sign_plus" | "core::fmt::Formatter::sign_plus" => {
+            Builtin::FormatterSignPlus
+        }
+        "std::fmt::Formatter::sign_aware_zero_pad"
+        | "core::fmt::Formatter::sign_aware_zero_pad" => Builtin::FormatterSignAwareZeroPad,
+        "std::fmt::Formatter::debug_struct_field1_finish"
+        | "core::fmt::Formatter::debug_struct_field1_finish" => {
+            Builtin::DebugStructFinish { fields: 1 }
+        }
+        "std::fmt::Formatter::debug_tuple_field1_finish"
+        | "core::fmt::Formatter::debug_tuple_field1_finish" => {
+            Builtin::DebugTupleFinish { fields: 1 }
+        }
+        "std::fmt::Formatter::debug_struct_field2_finish"
+        | "core::fmt::Formatter::debug_struct_field2_finish" => {
+            Builtin::DebugStructFinish { fields: 2 }
+        }
+        "std::fmt::Formatter::debug_tuple_field2_finish"
+        | "core::fmt::Formatter::debug_tuple_field2_finish" => {
+            Builtin::DebugTupleFinish { fields: 2 }
+        }
+        "std::fmt::Formatter::debug_struct_field3_finish"
+        | "core::fmt::Formatter::debug_struct_field3_finish" => {
+            Builtin::DebugStructFinish { fields: 3 }
+        }
+        "std::fmt::Formatter::debug_tuple_field3_finish"
+        | "core::fmt::Formatter::debug_tuple_field3_finish" => {
+            Builtin::DebugTupleFinish { fields: 3 }
+        }
+        "std::fmt::Formatter::debug_struct_field4_finish"
+        | "core::fmt::Formatter::debug_struct_field4_finish" => {
+            Builtin::DebugStructFinish { fields: 4 }
+        }
+        "std::fmt::Formatter::debug_tuple_field4_finish"
+        | "core::fmt::Formatter::debug_tuple_field4_finish" => {
+            Builtin::DebugTupleFinish { fields: 4 }
+        }
+        "std::fmt::Formatter::debug_struct_field5_finish"
+        | "core::fmt::Formatter::debug_struct_field5_finish" => {
+            Builtin::DebugStructFinish { fields: 5 }
+        }
+        "std::fmt::Formatter::debug_tuple_field5_finish"
+        | "core::fmt::Formatter::debug_tuple_field5_finish" => {
+            Builtin::DebugTupleFinish { fields: 5 }
+        }
+        "std::fmt::Formatter::debug_struct_fields_finish"
+        | "core::fmt::Formatter::debug_struct_fields_finish" => {
+            Builtin::DebugStructFieldsFinish
+        }
+        "std::fmt::Formatter::debug_tuple_fields_finish"
+        | "core::fmt::Formatter::debug_tuple_fields_finish" => {
+            Builtin::DebugTupleFieldsFinish
+        }
+        "std::fmt::Formatter::debug_list" | "core::fmt::Formatter::debug_list" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::List)
+        }
+        "std::fmt::Formatter::debug_set" | "core::fmt::Formatter::debug_set" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Set)
+        }
+        "std::fmt::Formatter::debug_map" | "core::fmt::Formatter::debug_map" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Map)
+        }
+        "std::fmt::Formatter::debug_struct" | "core::fmt::Formatter::debug_struct" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Struct)
+        }
+        "std::fmt::Formatter::debug_tuple" | "core::fmt::Formatter::debug_tuple" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Tuple)
+        }
+        "std::fmt::DebugList::entry" | "core::fmt::DebugList::entry"
+        | "std::fmt::DebugSet::entry" | "core::fmt::DebugSet::entry" => {
+            Builtin::FmtBuilderEntry
+        }
+        "std::fmt::DebugMap::entry" | "core::fmt::DebugMap::entry" => {
+            Builtin::FmtBuilderMapEntry
+        }
+        "std::fmt::DebugStruct::field" | "core::fmt::DebugStruct::field" => {
+            Builtin::FmtBuilderStructField
+        }
+        "std::fmt::DebugTuple::field" | "core::fmt::DebugTuple::field" => {
+            Builtin::FmtBuilderTupleField
+        }
+        "std::fmt::DebugList::finish" | "core::fmt::DebugList::finish"
+        | "std::fmt::DebugSet::finish" | "core::fmt::DebugSet::finish"
+        | "std::fmt::DebugMap::finish" | "core::fmt::DebugMap::finish"
+        | "std::fmt::DebugStruct::finish" | "core::fmt::DebugStruct::finish"
+        | "std::fmt::DebugTuple::finish" | "core::fmt::DebugTuple::finish" => {
+            Builtin::FmtBuilderFinish { exhaustive: true }
+        }
+        "std::fmt::DebugStruct::finish_non_exhaustive"
+        | "core::fmt::DebugStruct::finish_non_exhaustive" => {
+            Builtin::FmtBuilderFinish { exhaustive: false }
+        }
+        _ => return None,
+    })
+}

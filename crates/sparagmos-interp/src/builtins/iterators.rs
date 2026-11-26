@@ -10685,3 +10685,110 @@ pub(super) fn slice_index_fail_message(start: usize, end: usize, len: usize) -> 
         format!("range end index {end} out of range for slice of length {len}")
     }
 }
+
+/// Registration fragment of the builtin name registry: the iterator trait surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn iterators_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
+        "std::iter::Iterator::next" => Builtin::IteratorNext,
+        "std::iter::DoubleEndedIterator::next_back"
+        | "core::iter::DoubleEndedIterator::next_back" => Builtin::IteratorNextBack,
+        "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
+        "std::iter::ExactSizeIterator::len" | "core::iter::ExactSizeIterator::len" => {
+            Builtin::IteratorLen
+        }
+        // The slice views are named with their generic group
+        // in the middle (`std::slice::Iter::<'a, T>::as_slice`),
+        // so they match by prefix and suffix like the `Vec`
+        // methods below.
+        _ if (canonical.starts_with("std::slice::Iter")
+            || canonical.starts_with("core::slice::Iter"))
+            && (canonical.ends_with(">::as_slice")
+                || canonical.ends_with(">::into_slice")
+                || canonical.ends_with(">::as_mut_slice")) =>
+        {
+            Builtin::SliceIterAsSlice
+        }
+        "std::iter::Iterator::count" => Builtin::IteratorCount,
+        "std::iter::Iterator::nth" => Builtin::IteratorNth,
+        "std::iter::Iterator::fold" => Builtin::IteratorFold,
+        "std::iter::Iterator::try_fold" => Builtin::IteratorTryFold,
+        "std::iter::Iterator::for_each" => Builtin::IteratorForEach,
+        "std::iter::Iterator::collect" => Builtin::IteratorCollect,
+        "std::iter::FromIterator::from_iter" => Builtin::FromIteratorFromIter,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the slice and B-tree iterator conversions.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn iter_guard_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("core::slice::<impl") && canonical.ends_with(">::iter") => {
+            Builtin::SliceIter
+        }
+        _ if canonical.starts_with("std::collections::BTreeSet")
+            && canonical.ends_with(">::iter") =>
+        {
+            Builtin::BTreeIter
+        }
+        _ if canonical.starts_with("std::collections::BTreeMap")
+            && canonical.ends_with(">::iter") =>
+        {
+            Builtin::BTreeIter
+        }
+        _ if canonical.starts_with("std::collections::BTreeMap")
+            && canonical.ends_with(">::keys") =>
+        {
+            Builtin::BTreeKeys
+        }
+        _ if canonical.starts_with("std::collections::BTreeMap")
+            && canonical.ends_with(">::values") =>
+        {
+            Builtin::BTreeValues
+        }
+        _ if (canonical.starts_with("std::slice::<impl")
+            || canonical.starts_with("alloc::slice::<impl"))
+            && (canonical.ends_with(">::to_vec") || canonical.ends_with(">::to_vec_in")) =>
+        {
+            Builtin::SliceToVec
+        }
+        _ if canonical.starts_with("core::slice::<impl")
+            && canonical.ends_with(">::windows") =>
+        {
+            Builtin::SliceWindows
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the indexing and empty-iterator surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn iter_misc_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::iter::empty" => Builtin::IterEmpty,
+        "std::ops::Index::index" => Builtin::IndexIndex,
+        "std::ops::IndexMut::index_mut" => Builtin::IndexMut,
+        "std::ops::DerefMut::deref_mut" | "core::ops::DerefMut::deref_mut" => Builtin::DerefMut,
+        _ => return None,
+    })
+}

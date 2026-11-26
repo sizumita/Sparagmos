@@ -332,7 +332,8 @@ class _GuardParser:
 
 
 def _parse_lookup_guards(body):
-    """Every guard arm of `lookup`, each expanded to its DNF entries.
+    """Every guard arm of the registry fragments, each expanded to
+    its DNF entries.
     An arm's condition may span several lines; it ends at the arm's
     `=>`. Any shape outside the modelled grammar is a hard error."""
     guards = []
@@ -345,14 +346,17 @@ def _parse_lookup_guards(body):
 class BuiltinRegistry:
     """The interpreter's builtin support, read from the builtins module.
 
-    Exact names come from the match arms of `lookup`; every guard arm
+    Exact names come from the match arms of the registration
+    fragments `lookup` chains (one `<family>_lookup` function per
+    builtin family module); every guard arm
     (`_ if <cond> =>`) is interpreted generically: the condition must
     be a boolean expression over `canonical.contains("..")`,
     `canonical.ends_with("..")`, `canonical.starts_with("..")` and
     `canonical == ".."` terms, combined with `&&`, `||` and
     parentheses, and is expanded to disjunctive normal form (each
     disjunct is one guard entry). Guard arms may span several lines.
-    The final `_ =>` arm of `lookup` delegates to two helper
+    The fallback of `lookup` (the delegation its final `_ =>` arm
+    always performed) hands names no fragment serves to two helper
     resolvers, modelled here from their own tables:
     `unicode_lookup_slow` (an exact set of `unicode_data` modules
     whose `::lookup_slow` callee is modelled) and `float_method`
@@ -374,10 +378,22 @@ class BuiltinRegistry:
         if end == -1:
             raise ValueError("builtins: end of lookup not found")
         body = source[start:end]
-        self.exact = set(re.findall(r'"([^"\n]+)"\s*(?:\||=>)', body))
+        # The registry is dispersed over the builtin family
+        # modules: `lookup` itself is a thin chain over one
+        # registration fragment per family (the `<family>_lookup`
+        # functions the family modules own), so the name table is
+        # the union of the fragments' bodies. The chain in `lookup`
+        # is the index of fragments: a fragment the chain does not
+        # name is not part of the registry, and a chain entry whose
+        # function is missing is a hard error (via `_fn_body`).
+        bodies = [body]
+        for name in re.findall(r"([a-z][a-z0-9_]*_lookup)\(canonical\)", body):
+            bodies.append(_fn_body(source, f"fn {name}(canonical"))
+        table = "\n".join(bodies)
+        self.exact = set(re.findall(r'"([^"\n]+)"\s*(?:\||=>)', table))
         if not self.exact:
             raise ValueError("builtins: no exact builtin names found")
-        self.guards = _parse_lookup_guards(body)
+        self.guards = _parse_lookup_guards(table)
         if not self.guards:
             raise ValueError("builtins: no lookup guards found")
         # Derived flags for the two historical special cases, kept for

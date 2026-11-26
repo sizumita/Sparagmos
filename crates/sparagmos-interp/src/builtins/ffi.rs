@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter,
@@ -494,4 +495,41 @@ impl<'a> Interpreter<'a> {
         }
         Ok(bytes)
     }
+}
+
+/// Registration fragment of the builtin name registry: the C string and OS string surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn ffi_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::ffi::c_str::strlen::runtime::strlen" => Builtin::LibcStrlen,
+        "std::ffi::CStr::from_bytes_with_nul" | "core::ffi::CStr::from_bytes_with_nul" => {
+            Builtin::CStrFromBytesWithNul
+        }
+        "std::ffi::CStr::from_bytes_until_nul" | "core::ffi::CStr::from_bytes_until_nul" => {
+            Builtin::CStrFromBytesUntilNul
+        }
+        "std::ffi::CStr::to_str" | "core::ffi::CStr::to_str" => Builtin::CStrToStr,
+        "alloc::ffi::c_str::<impl std::ffi::CStr>::to_string_lossy" => {
+            Builtin::CStrToStringLossy
+        }
+        "std::ffi::CString::new::SpecNewImpl::spec_new_impl" => {
+            Builtin::CStringSpecNewImpl
+        }
+        "std::ffi::CString::_from_vec_unchecked"
+        | "std::ffi::CString::from_vec_unchecked" => {
+            Builtin::CStringFromVecUnchecked
+        }
+        "std::ffi::CString::from_raw" => Builtin::CStringFromRaw,
+        "std::ffi::CString::into_string" => Builtin::CStringIntoString,
+        "std::ffi::OsString::to_string_lossy" => Builtin::ToStringLossy,
+        "std::ffi::OsStr::to_string_lossy" => Builtin::ToStringLossy,
+        "std::path::Path::to_string_lossy" => Builtin::ToStringLossy,
+        _ => return None,
+    })
 }

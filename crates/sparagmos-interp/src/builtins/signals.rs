@@ -354,3 +354,22 @@ fn zeroed_twin(value: &Value) -> Value {
         other => other.clone(),
     }
 }
+
+/// Registration fragment of the builtin name registry: the libc signal surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn signals_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "libc::sigaction" | "libc::unix::sigaction" => Builtin::LibcSigaction,
+        "libc::signal" | "libc::unix::signal" => Builtin::LibcSignal,
+        "libc::bsd_signal" | "libc::unix::bsd_signal" => Builtin::LibcSignal,
+        "libc::raise" | "libc::unix::raise" => Builtin::LibcRaise,
+        "libc::atexit" | "libc::unix::atexit" => Builtin::LibcAtexit,
+        _ => return None,
+    })
+}

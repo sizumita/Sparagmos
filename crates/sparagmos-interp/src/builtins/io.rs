@@ -698,3 +698,38 @@ impl<'a> Interpreter<'a> {
         }
     }
 }
+
+/// Registration fragment of the builtin name registry: the `std::io` print entry points.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn io_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::io::_print" => Builtin::Print,
+        "std::io::_eprint" => Builtin::Eprint,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the standard stream constructors.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn io_stream_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::io::stdout" => Builtin::Stdout,
+        "std::io::stdin" => Builtin::Stdin,
+        "std::io::Stdout::lock" | "std::io::Stderr::lock"
+        | "std::io::Stdin::lock" => Builtin::StdStreamLock,
+        "std::io::Write::write_fmt" => Builtin::WriteFmt,
+        _ => return None,
+    })
+}

@@ -76,6 +76,7 @@ mod values;
 mod views;
 mod waker;
 
+pub(crate) use self::alloc_error::*;
 pub(crate) use self::atomics::*;
 pub(crate) use self::backtrace::*;
 pub(crate) use self::btree::*;

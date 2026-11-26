@@ -270,3 +270,66 @@ impl<'a> Interpreter<'a> {
         })
     }
 }
+
+/// Registration fragment of the builtin name registry: the `Duration` constructors.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn time_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::time::Duration::new" => Builtin::DurationNew,
+        "std::time::Duration::from_secs" => Builtin::DurationFromSecs,
+        "std::time::Duration::from_millis" => Builtin::DurationFromMillis,
+        "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
+        "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the clock readings.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn time_now_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::time::Instant::now" => Builtin::InstantNow,
+        "std::time::SystemTime::now" => Builtin::SystemTimeNow,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the clock arithmetic surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn time_arith_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
+        "std::time::SystemTime::checked_add" => Builtin::TimeCheckedAdd(true),
+        "std::time::Instant::checked_sub" => Builtin::TimeCheckedSub(false),
+        "std::time::SystemTime::checked_sub" => Builtin::TimeCheckedSub(true),
+        "std::time::Instant::duration_since" => Builtin::InstantDurationSince,
+        "std::time::Instant::checked_duration_since" => {
+            Builtin::InstantCheckedDurationSince
+        }
+        "std::time::Instant::saturating_duration_since" => {
+            Builtin::InstantSaturatingDurationSince
+        }
+        "std::time::Instant::elapsed" => Builtin::InstantElapsed,
+        "std::time::SystemTime::duration_since" => Builtin::SystemTimeDurationSince,
+        "std::time::SystemTime::elapsed" => Builtin::SystemTimeElapsed,
+        _ => return None,
+    })
+}

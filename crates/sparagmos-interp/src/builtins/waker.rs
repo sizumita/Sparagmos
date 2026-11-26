@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     rc_handle_id,
@@ -214,4 +215,33 @@ impl<'a> Interpreter<'a> {
             new_raw
         })
     }
+}
+
+/// Registration fragment of the builtin name registry: the waker surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn waker_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // The waker wake methods: std's bodies read the
+        // `RawWaker`'s vtable reference out of the waker value,
+        // which the modelled `From` waker (a one-field aggregate
+        // carrying the handle) cannot serve, so the dispatch is
+        // modelled on the value's shape, exactly as the `Clone`
+        // model and the `WakerDrop` glue judge it. Registering
+        // the names also keeps the driver from collecting the
+        // std bodies (see sparagmos-driver's reach pass).
+        "std::task::Waker::wake" | "core::task::Waker::wake"
+        | "std::task::LocalWaker::wake" | "core::task::LocalWaker::wake" => {
+            Builtin::WakerWake
+        }
+        "std::task::Waker::wake_by_ref" | "core::task::Waker::wake_by_ref"
+        | "std::task::LocalWaker::wake_by_ref"
+        | "core::task::LocalWaker::wake_by_ref" => Builtin::WakerWakeByRef,
+        _ => return None,
+    })
 }

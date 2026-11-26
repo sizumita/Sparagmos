@@ -888,3 +888,20 @@ pub(super) fn needs_drop_for_tag(tag: &str) -> Option<bool> {
     }
     None
 }
+
+/// Registration fragment of the builtin name registry: the `Default` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn defaults_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::default::Default::default" | "core::default::Default::default" => {
+            Builtin::DefaultDefault
+        }
+        _ => return None,
+    })
+}

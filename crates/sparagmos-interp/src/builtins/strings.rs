@@ -1245,3 +1245,209 @@ fn compare_element_bytes(value: &Value, width: usize) -> InterpResult<Vec<u8>> {
         )),
     }
 }
+
+/// Registration fragment of the builtin name registry: the UTF-8 conversion and case-mapping surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn strings_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::str::from_utf8" | "core::str::from_utf8" => Builtin::FromUtf8,
+        _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
+            Builtin::RangeInclusiveNew
+        }
+        _ if canonical.ends_with("::to_uppercase") => Builtin::ToUppercase,
+        _ if canonical.ends_with("::to_lowercase") => Builtin::ToLowercase,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the string search surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn str_search_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::str::pattern::StrSearcher::new" => Builtin::StrSearcherNew,
+        "core::slice::memchr::memchr" => Builtin::Memchr { reverse: false },
+        "core::slice::memchr::memrchr" => Builtin::Memchr { reverse: true },
+        "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `String` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn string_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::string::ToString::to_string" | "alloc::string::ToString::to_string" => Builtin::ToStringToString,
+        // The `String` / `str` surface the abstract string value
+        // can answer directly. Registering a name here also keeps
+        // the driver from collecting the std body (see
+        // sparagmos-driver's reach pass), whose field projections
+        // on the buffer struct the abstract value cannot serve.
+        "std::string::String::new" | "alloc::string::String::new" => Builtin::StringNew,
+        "std::string::String::len" | "alloc::string::String::len" => Builtin::StringLen,
+        "std::string::String::is_empty" | "alloc::string::String::is_empty" => {
+            Builtin::StringIsEmpty
+        }
+        "std::string::String::capacity" | "alloc::string::String::capacity" => {
+            Builtin::StringCapacity
+        }
+        "std::string::String::with_capacity" | "alloc::string::String::with_capacity" => {
+            Builtin::StringWithCapacity
+        }
+        "std::string::String::as_str" | "alloc::string::String::as_str" => Builtin::StringAsStr,
+        "std::string::String::as_bytes" | "alloc::string::String::as_bytes" => {
+            Builtin::StringAsBytes
+        }
+        "std::string::String::into_bytes" | "alloc::string::String::into_bytes" => {
+            Builtin::StringIntoBytes
+        }
+        "std::string::String::as_mut_vec" | "alloc::string::String::as_mut_vec" => {
+            Builtin::StringAsMutVec
+        }
+        "std::string::String::leak" | "alloc::string::String::leak" => {
+            Builtin::StringLeak
+        }
+        "std::string::String::into_boxed_str" | "alloc::string::String::into_boxed_str" => {
+            Builtin::StringIntoBoxedStr
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `String` mutators.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn string_mut_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::string::String::push_str" | "alloc::string::String::push_str" => {
+            Builtin::StringPushStr
+        }
+        "std::string::String::push" | "alloc::string::String::push" => Builtin::StringPush,
+        "std::string::String::insert" | "alloc::string::String::insert" => {
+            Builtin::StringInsert
+        }
+        "std::string::String::insert_str" | "alloc::string::String::insert_str" => {
+            Builtin::StringInsertStr
+        }
+        "std::string::String::remove" | "alloc::string::String::remove" => {
+            Builtin::StringRemove
+        }
+        "std::string::String::truncate" | "alloc::string::String::truncate" => {
+            Builtin::StringTruncate
+        }
+        "std::string::String::pop" | "alloc::string::String::pop" => Builtin::StringPop,
+        "std::string::String::clear" | "alloc::string::String::clear" => {
+            Builtin::StringClear
+        }
+        "std::string::String::retain" | "alloc::string::String::retain" => {
+            Builtin::StringRetain
+        }
+        "std::string::String::replace_range" | "alloc::string::String::replace_range" => {
+            Builtin::StringReplaceRange
+        }
+        "std::string::String::split_off" | "alloc::string::String::split_off" => {
+            Builtin::StringSplitOff
+        }
+        "std::string::String::reserve" | "alloc::string::String::reserve"
+        | "std::string::String::reserve_exact" | "alloc::string::String::reserve_exact" => {
+            Builtin::StringReserve
+        }
+        "std::string::String::try_reserve" | "alloc::string::String::try_reserve"
+        | "std::string::String::try_reserve_exact"
+        | "alloc::string::String::try_reserve_exact" => Builtin::StringTryReserve,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `str` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn str_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::str::<impl str>::len" => Builtin::StrLen,
+        "core::str::<impl str>::is_empty" => Builtin::StrIsEmpty,
+        "core::str::<impl str>::as_bytes" => Builtin::StrAsBytes,
+        "core::str::<impl str>::as_bytes_mut" => Builtin::StrAsBytesMut,
+        "core::str::<impl str>::chars" => Builtin::StrChars,
+        "core::str::<impl str>::bytes" => Builtin::StrBytes,
+        "core::str::<impl str>::make_ascii_uppercase" => {
+            Builtin::StrMakeAsciiCase(true)
+        }
+        "core::str::<impl str>::make_ascii_lowercase" => {
+            Builtin::StrMakeAsciiCase(false)
+        }
+        "core::str::<impl str>::trim" => Builtin::StrTrim(TrimSide::Both),
+        "core::str::<impl str>::trim_start" => Builtin::StrTrim(TrimSide::Start),
+        "core::str::<impl str>::trim_end" => Builtin::StrTrim(TrimSide::End),
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `str` predicates.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn str_predicate_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::contains") => {
+            Builtin::StrContains
+        }
+        _ if canonical.starts_with("core::str::<impl")
+            && canonical.ends_with(">::starts_with") =>
+        {
+            Builtin::StrStartsWith
+        }
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::ends_with") => {
+            Builtin::StrEndsWith
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `FromStr` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn from_str_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::str::FromStr::from_str" | "core::str::FromStr::from_str" => {
+            Builtin::FromStrParse
+        }
+        _ => return None,
+    })
+}

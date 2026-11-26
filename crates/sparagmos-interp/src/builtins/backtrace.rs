@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::interp::Frame;
 use crate::value::Value;
 
@@ -95,4 +96,23 @@ pub(super) fn backtrace_display(value: &Value) -> String {
         Some(1) => "disabled backtrace".to_string(),
         _ => "unsupported backtrace".to_string(),
     }
+}
+
+/// Registration fragment of the builtin name registry: the backtrace surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn backtrace_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::backtrace::Backtrace::capture" => Builtin::BacktraceCapture,
+        "std::backtrace::Backtrace::force_capture" => {
+            Builtin::BacktraceForceCapture
+        }
+        "std::backtrace::Backtrace::status" => Builtin::BacktraceStatus,
+        _ => return None,
+    })
 }

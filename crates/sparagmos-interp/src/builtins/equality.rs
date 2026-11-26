@@ -768,3 +768,28 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Ok(Some(Ordering::Equal))
     }
 }
+
+/// Registration fragment of the builtin name registry: the comparison trait surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn equality_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // Comparison traits: the impls for the modelled data types
+        // are the derived ones, i.e. semantic value comparison.
+        _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
+        _ if canonical.ends_with("::PartialEq::ne") => Builtin::PartialEqNe,
+        _ if canonical.ends_with("::PartialOrd::partial_cmp") => Builtin::PartialCmp,
+        _ if canonical.ends_with("::PartialOrd::lt") => Builtin::PartialOrdRel(RelOp::Lt),
+        _ if canonical.ends_with("::PartialOrd::le") => Builtin::PartialOrdRel(RelOp::Le),
+        _ if canonical.ends_with("::PartialOrd::gt") => Builtin::PartialOrdRel(RelOp::Gt),
+        _ if canonical.ends_with("::PartialOrd::ge") => Builtin::PartialOrdRel(RelOp::Ge),
+        _ if canonical.ends_with("::Ord::cmp") => Builtin::OrdCmp,
+        _ if canonical.ends_with("::Clone::clone") => Builtin::CloneClone,
+        _ => return None,
+    })
+}
