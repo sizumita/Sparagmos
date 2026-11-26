@@ -2746,6 +2746,23 @@ impl<'a> Interpreter<'a> {
                 return Ok(step);
             }
         }
+        if is_char_escape_ty(self_ty) {
+            // The `char` escape iterators' step lives in
+            // `step_escape_inner` (the `EscapeIterInner`
+            // buffer state machine); it belongs here because
+            // the adapter arms below step their inner
+            // iterators through this entry (a `Map` over an
+            // `EscapeDebug` reaches the buffer only from
+            // here).
+            let (new_state, item) = step_escape_inner(state, self_ty, false)?;
+            return Ok((
+                new_state,
+                match item {
+                    Some(value) => some_value(value),
+                    None => none_value(),
+                },
+            ));
+        }
         let fields = iterator_fields(state, self_ty)?;
         // A `vec::IntoIter` in its real field layout (the
         // aggregate an inlined `Vec::into_iter` construction
@@ -3710,6 +3727,13 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let target = self.deref_value(frames, ref_arg)?;
         let state = self.read_resolved(frames, &target)?;
+        if is_char_escape_ty(self_ty) {
+            // The escape iterators' `len` is the `alive`
+            // range's length, the accounting their steps and
+            // size hints share.
+            let (start, end) = escape_inner_range(&state, self_ty)?;
+            return Ok(Value::Uint(u128::from(end.saturating_sub(start))));
+        }
         let elem_tag = first_generic_arg(self_ty).unwrap_or("");
         let (_, remaining) =
             self.slice_iter_front_and_remaining(frames, &state, self_ty, elem_tag)?;
@@ -3892,6 +3916,13 @@ impl<'a> Interpreter<'a> {
                     None => none_value(),
                 },
             ])
+        }
+        if is_char_escape_ty(self_ty) {
+            // Exact size, as core's impls report it: the
+            // remaining count is the `alive` range's length.
+            let (start, end) = escape_inner_range(&state, self_ty)?;
+            let n = u128::from(end.saturating_sub(start));
+            return Ok(hint(n, Some(n)));
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<")
             || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -4984,7 +5015,8 @@ pub(super) fn ref_pointee_is_container(inner: &str) -> bool {
 /// chase dereferences only once, leaving a reference where
 /// the iterator state belongs.
 pub fn iterator_len_modelled(self_ty: &str) -> bool {
-    self_ty.starts_with("std::slice::Iter<")
+    is_char_escape_ty(self_ty)
+        || self_ty.starts_with("std::slice::Iter<")
         || self_ty.starts_with("std::slice::IterMut<")
         || self_ty.starts_with("std::collections::btree_set::Iter<")
         || self_ty.starts_with("std::collections::btree_map::Iter<")
@@ -5028,6 +5060,7 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
+        || is_char_escape_ty(self_ty)
 }
 
 /// The outcome of one in-place step of an `Option<I>`
@@ -6711,6 +6744,202 @@ fn step_str_iter(
         )
     };
     Ok((str_iter_rewrap(state, self_ty, new_inner)?, Some(item)))
+}
+
+/// Whether a rendered tag names one of the `char` escape
+/// iterators: `char::EscapeDebug`, `char::EscapeDefault` and
+/// `char::EscapeUnicode` are one-field wrappers over core's
+/// `EscapeIterInner` buffer state, whose step
+/// `step_escape_inner` replays.
+fn is_char_escape_ty(self_ty: &str) -> bool {
+    self_ty_is(self_ty, "std::char::EscapeDebug")
+        || self_ty_is(self_ty, "core::char::EscapeDebug")
+        || self_ty_is(self_ty, "std::char::EscapeDefault")
+        || self_ty_is(self_ty, "core::char::EscapeDefault")
+        || self_ty_is(self_ty, "std::char::EscapeUnicode")
+        || self_ty_is(self_ty, "core::char::EscapeUnicode")
+}
+
+/// The bound past which an `EscapeIterInner` `alive` range
+/// denotes the union payload's literal char rather than a
+/// span of its escape-sequence buffer: core's
+/// `LITERAL_ESCAPE_START`. A literal payload's range is
+/// exactly the one slot at this bound (128..129); a buffer
+/// payload's range indexes the buffer (at most 10 slots).
+const ESCAPE_LITERAL_START: u8 = 128;
+
+/// The `alive` range stored in an `EscapeIterInner` value:
+/// a `Range<u8>` in its real two-field shape.
+fn escape_range_of(alive: &Value, self_ty: &str) -> InterpResult<(u8, u8)> {
+    let fields = iterator_fields(alive, self_ty)?;
+    if fields.len() != 2 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} alive range"),
+            "[start, end]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let as_u8 = |v: &Value| -> InterpResult<u8> {
+        match v {
+            Value::Uint(n) => Ok(*n as u8),
+            other => Err(InterpError::type_mismatch(
+                format!("{self_ty} alive range bound"),
+                "unsigned byte",
+                other.kind_name(),
+            )),
+        }
+    };
+    Ok((as_u8(&fields[0])?, as_u8(&fields[1])?))
+}
+
+/// The fields of the `EscapeIterInner` value a `char`
+/// escape iterator state wraps: [data, alive, escaping].
+fn escape_inner_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
+    let outer = iterator_fields(state, self_ty)?;
+    if outer.len() != 1 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "[EscapeIterInner]",
+            format!("{} field(s)", outer.len()),
+        ));
+    }
+    let inner = iterator_fields(&outer[0], self_ty)?;
+    if inner.len() != 3 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} EscapeIterInner state"),
+            "[data, alive, PhantomData]",
+            format!("{} field(s)", inner.len()),
+        ));
+    }
+    Ok(inner)
+}
+
+/// The `alive` range of the `EscapeIterInner` state a
+/// `char` escape iterator value wraps.
+fn escape_inner_range(state: &Value, self_ty: &str) -> InterpResult<(u8, u8)> {
+    let inner = escape_inner_fields(state, self_ty)?;
+    escape_range_of(&inner[1], self_ty)
+}
+
+/// The escape-sequence bytes of an `EscapeIterInner`
+/// payload in its buffer form: the union's `escape_seq`
+/// field is an array of `ascii::Char`, a fieldless byte
+/// enum whose value is its discriminant (a plain integer
+/// element is the same byte in storage form).
+fn escape_seq_bytes(data: &Value, self_ty: &str) -> InterpResult<Vec<u8>> {
+    let fields = iterator_fields(data, self_ty)?;
+    let array = fields.first().ok_or_else(|| {
+        InterpError::type_mismatch(
+            format!("{self_ty} EscapeIterInner data"),
+            "a union payload holding the escape-sequence array",
+            "no fields",
+        )
+    })?;
+    let items = match array {
+        Value::Tuple(items) => items,
+        other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} escape-sequence buffer"),
+                "an array of ascii::Char",
+                other.kind_name(),
+            ))
+        }
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Value::Enum { variant, .. } => Ok(*variant as u8),
+            Value::Uint(v) => Ok(*v as u8),
+            other => Err(InterpError::type_mismatch(
+                format!("{self_ty} escape-sequence element"),
+                "ascii::Char",
+                other.kind_name(),
+            )),
+        })
+        .collect()
+}
+
+/// The literal char of an `EscapeIterInner` payload in its
+/// `MaybeEscaped` literal form: the union's `literal` field
+/// is the one scalar slot the construction filled, beside
+/// the untouched buffer slot.
+fn escape_literal_char(data: &Value, self_ty: &str) -> InterpResult<char> {
+    let fields = iterator_fields(data, self_ty)?;
+    for field in &fields {
+        if let Value::Uint(v) = field {
+            if let Some(c) = char::from_u32(*v as u32) {
+                return Ok(c);
+            }
+        }
+    }
+    Err(InterpError::type_mismatch(
+        format!("{self_ty} EscapeIterInner data"),
+        "a union payload holding a literal char",
+        data.kind_name(),
+    ))
+}
+
+/// One step of a `char` escape iterator's state, from the
+/// front (`from_back == false`) or the back: core's
+/// `EscapeIterInner` serves the char at the `alive` range's
+/// taken end — the literal char when the range is the
+/// literal slot, the buffer byte there otherwise — and
+/// shrinks the range past it. The payload is carried
+/// unchanged; only the range moves, exactly as the real
+/// state transitions. An exhausted range yields `None` and
+/// leaves the state as it stands.
+fn step_escape_inner(
+    state: &Value,
+    self_ty: &str,
+    from_back: bool,
+) -> InterpResult<(Value, Option<Value>)> {
+    let outer = iterator_fields(state, self_ty)?;
+    if outer.len() != 1 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "[EscapeIterInner]",
+            format!("{} field(s)", outer.len()),
+        ));
+    }
+    let inner = escape_inner_fields(state, self_ty)?;
+    let (start, end) = escape_range_of(&inner[1], self_ty)?;
+    if start >= end {
+        return Ok((state.clone(), None));
+    }
+    let item = if end > ESCAPE_LITERAL_START {
+        escape_literal_char(&inner[0], self_ty)?
+    } else {
+        let bytes = escape_seq_bytes(&inner[0], self_ty)?;
+        let idx = usize::from(if from_back { end - 1 } else { start });
+        let byte = bytes.get(idx).copied().ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("{self_ty} escape-sequence buffer"),
+                "a byte at the alive range's taken end",
+                format!("{} byte(s)", bytes.len()),
+            )
+        })?;
+        // The buffer holds printable ASCII by construction.
+        char::from(byte)
+    };
+    let (new_start, new_end) = if from_back {
+        (start, end - 1)
+    } else {
+        (start + 1, end)
+    };
+    let new_alive = rebuild_state(
+        &inner[1],
+        vec![
+            Value::Uint(u128::from(new_start)),
+            Value::Uint(u128::from(new_end)),
+        ],
+    );
+    let mut new_inner = inner;
+    new_inner[1] = new_alive;
+    let rebuilt_inner = rebuild_state(&outer[0], new_inner);
+    Ok((
+        rebuild_state(state, vec![rebuilt_inner]),
+        Some(Value::Uint(u128::from(item as u32))),
+    ))
 }
 
 pub(super) fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
