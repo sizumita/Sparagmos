@@ -343,6 +343,17 @@ impl Converter {
     fn def_location_stamp(&mut self, body: &mir::Body) -> Option<sm::ConstValue> {
         let mut term = body.blocks.first()?.terminator.clone();
         term.source_info.span = body.span;
+        // The first terminator's scope can be an inlined frame's
+        // scope (at high MIR optimization levels the body's first
+        // call is often `Location::caller` inlined into the body,
+        // whose scope names that call site inside the body), and
+        // the compiler's caller-location resolution follows the
+        // scope, not the span: left standing, the definition
+        // stamp resolves to the inlined call's own site in the
+        // body instead of the body's definition. The body's own
+        // (root) scope carries no inlined call site, so the
+        // resolution falls back to the re-spanned definition span.
+        term.source_info.scope = 0;
         let stamp = self.call_site_stamp(body, &term)?;
         Some(stamp)
     }
@@ -932,6 +943,64 @@ impl Converter {
             line: lines.start_line as u32,
             col: lines.start_col as u32,
         }
+    }
+
+    /// The span of a method call's name within the call's
+    /// terminator span, recovered from the call's own source
+    /// text. A `#[track_caller]` stamp names the call's
+    /// `fn_span` — for a method call, the method name — but at
+    /// high MIR optimization levels the function operand can
+    /// arrive as a promoted constant whose span was erased, and
+    /// the terminator's own span starts at the receiver
+    /// expression (the head of the chain), not the segment being
+    /// called. The name is the last `.name` occurrence in the
+    /// terminator span's source text whose following token opens
+    /// the call's argument list: a method chain is written
+    /// left-to-right, so the segment being called is the last
+    /// one in its own span, ahead of any same-named call in the
+    /// receiver or the arguments. Anything else (a free-function
+    /// or associated-function call, whose span already starts at
+    /// the function path; a span with no source text) yields
+    /// `None` and the caller keeps the terminator span.
+    pub(crate) fn method_call_name_span(
+        &self,
+        term_span: rustc_public::ty::Span,
+        canonical: &str,
+    ) -> Option<rustc_public::ty::Span> {
+        let name = canonical.rsplit("::").next()?;
+        if name.is_empty()
+            || !name.chars().all(|ch| ch == '_' || ch.is_alphanumeric())
+        {
+            return None;
+        }
+        let tcx = compiler_tcx()?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let internal_span =
+                rustc_public::rustc_internal::internal(tcx, term_span);
+            let snippet =
+                tcx.sess.source_map().span_to_snippet(internal_span).ok()?;
+            let mut found: Option<usize> = None;
+            let mut start = 0;
+            while let Some(rel) = snippet[start..].find(name) {
+                let idx = start + rel;
+                let after = snippet[idx + name.len()..]
+                    .chars()
+                    .find(|ch| !ch.is_whitespace());
+                let before = snippet[..idx]
+                    .chars()
+                    .rev()
+                    .find(|ch| !ch.is_whitespace());
+                if before == Some('.') && matches!(after, Some('(' | '<' | ':')) {
+                    found = Some(idx);
+                }
+                start = idx + name.len();
+            }
+            let idx = found?;
+            let lo = rustc_span::BytePos(internal_span.lo().0 + idx as u32);
+            let named = internal_span.with_lo(lo);
+            Some(rustc_public::rustc_internal::stable(named))
+        }));
+        result.ok().flatten()
     }
 
     /// The (filename, lines) of a statement span as the
