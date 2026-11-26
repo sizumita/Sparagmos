@@ -1548,3 +1548,68 @@ fn debug_mode_huge_sparse_vec_prints_without_materialising() {
         );
     }
 }
+
+
+const DEBUG_TYPE_NAMES_SRC: &str = r#"
+use std::marker::PhantomData;
+struct Struct1;
+struct GenericStruct<T1, T2>(PhantomData<(T1, T2)>);
+mod mod1 {
+    pub struct Struct2;
+}
+trait Trait2<T1, T2> {
+    fn dummy(&self, _: T1, _: T2) {}
+}
+impl<T1, T2> Trait2<T1, T2> for isize {}
+fn rust_fn(_: Option<isize>) {}
+extern "C" fn extern_c_fn(_: isize) {}
+fn main() {
+    let generic_struct2: GenericStruct<
+        Struct1,
+        extern "system" fn(isize) -> usize,
+    > = GenericStruct(PhantomData);
+    let generic_box_trait =
+        Box::new(0isize) as Box<dyn Trait2<i32, mod1::Struct2>>;
+    let rust_fn = (rust_fn, 0usize);
+    let extern_c_fn = (extern_c_fn, 0usize);
+    let closure1 = (|x: isize| {}, 0usize);
+    let closure2 = (|x: i8, y: f32| (x as f32) + y, 0usize);
+    zzz();
+}
+#[inline(never)]
+fn zzz() {
+    ()
+}
+"#;
+
+#[test]
+fn debug_mode_type_names_display_fidelity() {
+    // The debuginfo type-names record's display fidelity: a
+    // function pointer renders with its full signature, a
+    // `dyn Trait<args>` keeps the trait's generic arguments,
+    // a function item's type is its fn-pointer spelling from
+    // the display-name table, and a closure's type is its
+    // environment name with no generic arguments.
+    let dir = temp_dir("debug-type-names");
+    let src = fixture(&dir, "type_names.rs", DEBUG_TYPE_NAMES_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 25\nrun\nwhatis generic_struct2\nwhatis generic_box_trait\nwhatis rust_fn\nwhatis extern_c_fn\nwhatis closure1\nwhatis closure2\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "type = type_names::GenericStruct<type_names::Struct1, extern \"system\" fn(isize) -> usize>",
+        "type = alloc::boxed::Box<dyn type_names::Trait2<i32, type_names::mod1::Struct2>, alloc::alloc::Global>",
+        "type = (fn(core::option::Option<isize>), usize)",
+        "type = (extern \"C\" fn(isize), usize)",
+        "type = (type_names::main::{closure_env#0}, usize)",
+        "type = (type_names::main::{closure_env#1}, usize)",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}

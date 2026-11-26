@@ -183,11 +183,16 @@ pub(super) fn generic_args_of(ty: &str) -> Vec<String> {
     let Some(open) = ty.find('<') else {
         return Vec::new();
     };
+    // A rendered tag can carry a function-pointer signature
+    // (`fn(T) -> U`): the `>` of its `->` arrow closes no
+    // bracket, here and in the split below.
     let mut depth = 0usize;
     let mut close = None;
+    let mut prev = '\0';
     for (i, c) in ty[open..].char_indices() {
         match c {
             '<' => depth += 1,
+            '>' if prev == '-' => {}
             '>' => {
                 depth -= 1;
                 if depth == 0 {
@@ -197,6 +202,7 @@ pub(super) fn generic_args_of(ty: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = c;
     }
     let Some(close) = close else {
         return Vec::new();
@@ -205,9 +211,11 @@ pub(super) fn generic_args_of(ty: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in inner.char_indices() {
         match c {
             '<' | '[' | '(' => depth += 1,
+            '>' if prev == '-' => {}
             '>' | ']' | ')' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(inner[start..i].trim().to_string());
@@ -215,6 +223,7 @@ pub(super) fn generic_args_of(ty: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = c;
     }
     parts.push(inner[start..].trim().to_string());
     parts.retain(|p| !p.is_empty());
@@ -773,13 +782,16 @@ pub(super) fn is_integer_tag(tag: &str) -> bool {
 /// there is none (a slice's inside is not an array's).
 pub(super) fn array_elem_tag(inner: &str) -> Option<&str> {
     let mut depth = 0i32;
+    let mut prev = '\0';
     for (i, c) in inner.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth -= 1,
             ';' if depth == 0 => return Some(inner[..i].trim()),
             _ => {}
         }
+        prev = c;
     }
     None
 }
@@ -802,9 +814,14 @@ pub(super) fn split_top_level(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            // The `>` of a function pointer signature's `->`
+            // (a spelling `ty_tag` produces for `FnPtr` types)
+            // closes nothing.
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(s[start..i].trim());
@@ -812,6 +829,7 @@ pub(super) fn split_top_level(s: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        prev = c;
     }
     let tail = s[start..].trim();
     if !tail.is_empty() {

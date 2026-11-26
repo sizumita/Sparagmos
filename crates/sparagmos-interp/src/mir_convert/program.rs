@@ -33,9 +33,9 @@ pub struct MirProgram {
     /// Debugger display names of the program's resolved
     /// function instances, as recorded by the driver (see
     /// `ir::Program::fn_display_names`): `(display name,
-    /// declaration signature)` pairs. Empty unless the driver
+    /// declaration signature, fn-pointer spelling)` triples. Empty unless the driver
     /// collected a debugger session.
-    pub fn_display_names: Vec<(String, String)>,
+    pub fn_display_names: Vec<(String, String, String)>,
     /// Resolved overflow-checks settings of the crates the
     /// driver compiled separately (its `--aux` crates), keyed
     /// by crate name, as recorded by the driver from each

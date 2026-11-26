@@ -153,6 +153,11 @@ impl Desc {
         if let Some(rest) = tag.strip_prefix("*mut ") {
             return Desc::PtrMut(Box::new(Desc::from_tag(rest)));
         }
+        if tag.starts_with("(dyn ") && tag.ends_with(')') {
+            // A parenthesized multi-bound `dyn` (the nested
+            // spelling `ty_tag` gives it): not a tuple.
+            return Desc::from_tag(&tag[1..tag.len() - 1]);
+        }
         if tag.starts_with('(') && tag.ends_with(')') {
             let inner = &tag[1..tag.len() - 1];
             if inner.trim().is_empty() {
@@ -257,9 +262,13 @@ pub(super) fn split_top_level(text: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
+    let mut prev = '\0';
     for (i, c) in text.char_indices() {
         match c {
             '<' | '(' | '[' | '{' => depth += 1,
+            // The `>` of a `->` arrow (a function signature's
+            // return marker inside a tag) closes nothing.
+            '>' if prev == '-' => {}
             '>' | ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(text[start..i].trim().to_string());
@@ -267,6 +276,7 @@ pub(super) fn split_top_level(text: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = c;
     }
     parts.push(text[start..].trim().to_string());
     // A trailing comma -- the canonical one-element tuple

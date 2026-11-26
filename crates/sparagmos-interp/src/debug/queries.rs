@@ -3,7 +3,7 @@
 use crate::interp::{Frame, Interpreter};
 use crate::ir::Ty;
 use crate::value::Value;
-use super::desc::{Desc, dwarf_type_name, field_desc, first_generic_arg, smart_pointer_pointee, tag_base_name};
+use super::desc::{Desc, dwarf_type_name, field_desc, first_generic_arg, smart_pointer_pointee, split_top_level, tag_base_name};
 use super::evaluate::{EvaluatedValue, evaluate_expr, resolve_base};
 use super::parse::{ExprStep, parse_expr};
 use super::render_gdb::render_gdb;
@@ -55,6 +55,192 @@ pub(super) fn lldb_format_scalar(
         LldbNumFormat::Unsigned => format!("{}", (v as u128) & mask),
         LldbNumFormat::Hex => format!("0x{:x}", (v as u128) & mask),
     })
+}
+
+/// The environment-name form of a rendered type name: a
+/// closure (or coroutine) type's debuginfo name is its
+/// environment struct's name, `{closure_env#N}` for the
+/// `{closure#N}` segment the conversion records, with the
+/// closure type's own generic arguments (kind, signature,
+/// upvars) dropped — the environment type carries none of
+/// them in its DWARF name. Applied segment by segment, so a
+/// closure type nested in a tuple or generic argument list
+/// is rewritten in place.
+pub(super) fn closure_env_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while !rest.is_empty() {
+        let hit = ["::{closure#", "::{coroutine#"]
+            .iter()
+            .filter_map(|seg| rest.find(seg).map(|i| (i, *seg)))
+            .min_by_key(|(i, _)| *i);
+        let Some((idx, seg)) = hit else {
+            out.push_str(rest);
+            break;
+        };
+        let env_seg = if seg.contains("closure") {
+            "::{closure_env#"
+        } else {
+            "::{coroutine_env#"
+        };
+        out.push_str(&rest[..idx]);
+        out.push_str(env_seg);
+        rest = &rest[idx + seg.len()..];
+        // The segment's `{...#N}` tail up to its closing brace.
+        match rest.find('}') {
+            Some(close) => {
+                out.push_str(&rest[..=close]);
+                rest = &rest[close + 1..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+        // A generic argument group directly after the segment
+        // is the closure type's own arguments: drop it.
+        if rest.starts_with('<') {
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut chars = rest.char_indices().peekable();
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '<' => depth += 1,
+                    // A `->` arrow (a function signature's
+                    // return marker) is not a group close.
+                    '-' if chars.peek().is_some_and(|(_, n)| *n == '>') => {
+                        chars.next();
+                    }
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(end) = end {
+                rest = &rest[end + 1..];
+            }
+        }
+    }
+    out
+}
+
+/// The candidate type names of an evaluated expression, for
+/// a type query: the single name [`expr_type_name`] computes,
+/// plus — when the recorded tag names a function item (a
+/// `FnDef` element, bare or inside a tuple) — the instance's
+/// fn-pointer spelling from the driver's display-name table
+/// (a function item's debuginfo type is its signature, not
+/// its name). A tag that names a generic definition without
+/// its arguments matches every recorded instance of it, and
+/// each is a candidate, as elsewhere in the renderers.
+pub(super) fn expr_type_names(
+    interp: &Interpreter,
+    ev: &EvaluatedValue,
+) -> Vec<String> {
+    let Some(name) = expr_type_name(ev) else {
+        return Vec::new();
+    };
+    let mut out = vec![name.clone()];
+    let Some(tag) = &ev.tag else {
+        return out;
+    };
+    let table = &interp.program().fn_display_names;
+    if table.is_empty() {
+        return out;
+    }
+    // The tag's FnDef candidates, element by element: a tuple
+    // tag's elements resolve independently, and the candidate
+    // names are the cartesian product of the resolutions.
+    let resolve = |elem: &str| -> Vec<String> {
+        let elem = elem.trim();
+        let mut hits: Vec<&str> = table
+            .iter()
+            .filter(|(display, _, ptr)| {
+                if ptr.is_empty() {
+                    return false;
+                }
+                if display == elem
+                    || display
+                        .strip_prefix(elem)
+                        .is_some_and(|rest| rest.starts_with('<'))
+                {
+                    return true;
+                }
+                // The tag's item name omits an extern block's
+                // `{extern#N}` segment the display name
+                // carries (`type_names::printf` for
+                // `type_names::{extern#0}::printf`).
+                let mut stripped = display.clone();
+                while let Some(start) = stripped.find("::{extern#") {
+                    let Some(close) = stripped[start..].find('}') else {
+                        break;
+                    };
+                    stripped.replace_range(start..start + close + 1, "");
+                }
+                stripped == elem
+                    || stripped
+                        .strip_prefix(elem)
+                        .is_some_and(|rest| rest.starts_with('<'))
+            })
+            .map(|(_, _, ptr)| ptr.as_str())
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        hits.into_iter().map(str::to_string).collect()
+    };
+    let trimmed = tag.trim();
+    let mut combos: Vec<String> = Vec::new();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let parts = split_top_level(inner);
+        let mut acc: Vec<Vec<String>> = vec![Vec::new()];
+        for part in &parts {
+            let hits = resolve(part);
+            if hits.is_empty() {
+                for combo in &mut acc {
+                    combo.push(part.clone());
+                }
+            } else {
+                let mut next = Vec::new();
+                for combo in &acc {
+                    for hit in &hits {
+                        let mut c = combo.clone();
+                        c.push(hit.clone());
+                        next.push(c);
+                    }
+                }
+                acc = next;
+                if acc.len() > 8 {
+                    acc.truncate(8);
+                }
+            }
+        }
+        for combo in acc {
+            let joined = if combo.len() == 1 {
+                format!("({},)", combo[0])
+            } else {
+                format!("({})", combo.join(", "))
+            };
+            combos.push(joined);
+        }
+    } else {
+        combos = resolve(trimmed)
+            .into_iter()
+            .map(|hit| hit)
+            .collect();
+    }
+    for combo in combos {
+        let combo = dwarf_type_name(&closure_env_name(&combo));
+        if combo != name && !out.contains(&combo) {
+            out.push(combo);
+        }
+    }
+    out
 }
 
 /// The rendering a per-command print format (`p/u`, `p/d`,
@@ -163,7 +349,7 @@ pub(super) fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
         return Some("*mut fn ()".to_string());
     }
     if let Some(tag) = &ev.tag {
-        return Some(dwarf_type_name(tag));
+        return Some(dwarf_type_name(&closure_env_name(tag)));
     }
     // A trailing cast step's spelled type, pointer layer
     // included: the cast's materialized view carries the
@@ -205,7 +391,9 @@ pub(super) fn desc_type_name(desc: &Desc) -> Option<String> {
         Desc::PtrConst(inner) => format!("*const {}", desc_type_name(inner)?),
         Desc::PtrMut(inner) => format!("*mut {}", desc_type_name(inner)?),
         Desc::Adt(tag) => dwarf_type_name(tag),
-        Desc::Closure(name) | Desc::Coroutine(name) => name.clone(),
+        Desc::Closure(name) | Desc::Coroutine(name) => {
+            closure_env_name(name)
+        }
         Desc::FnPtr => "*mut fn ()".to_string(),
         Desc::Int(name) => name.to_string(),
         Desc::Float(name) => name.to_string(),
@@ -387,11 +575,15 @@ pub(super) fn render_type_query(
             None => return vec![format!("type = <error: {e}>")],
         },
     };
-    let Some(name) = expr_type_name(&ev) else {
+    let names = expr_type_names(interp, &ev);
+    let Some(name) = names.first().cloned() else {
         return vec!["type = <unknown>".to_string()];
     };
     if !layout {
-        return vec![format!("type = {name}")];
+        return names
+            .iter()
+            .map(|name| format!("type = {name}"))
+            .collect();
     }
     // The layout form of a closure environment: gdb spells the
     // type as a struct over its captures, a capture taken by
@@ -621,7 +813,7 @@ pub(super) fn render_info_functions(
     let program = interp.program();
     let mut table: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::new();
-    for (display, signature) in &program.fn_display_names {
+    for (display, signature, _) in &program.fn_display_names {
         table.insert(display.as_str(), signature.as_str());
     }
     // (rendered name, signature line, spellings the pattern
@@ -656,7 +848,7 @@ pub(super) fn render_info_functions(
         ));
     }
     // Table entries no converted body claimed.
-    for (display, signature) in &program.fn_display_names {
+    for (display, signature, _) in &program.fn_display_names {
         if table.contains_key(display.as_str()) {
             entries.push((
                 display.clone(),

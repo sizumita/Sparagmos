@@ -1460,7 +1460,34 @@ impl Converter {
                     match &b.value {
                         rustc_public::ty::ExistentialPredicate::Trait(t) => {
                             let name = t.def_id.name();
-                            names.push((name.clone(), name));
+                            // The trait's own generic arguments
+                            // (the existential trait reference's
+                            // own arguments; `Self` is not among
+                            // them)
+                            // are part of the type's debuginfo
+                            // name (`dyn Trait2<i32, Struct2>`);
+                            // dropping them loses the arguments
+                            // from every rendering of the bound.
+                            let args: Vec<String> = t
+                                .generic_args
+                                .0
+                                .iter()
+                                .filter_map(|a| match a {
+                                    rustc_public::ty::GenericArgKind::Type(
+                                        ty,
+                                    ) => {
+                                        let converted = self.ty(ty);
+                                        Some(self.layout_key(&converted))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            let rendered = if args.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{name}<{}>", args.join(", "))
+                            };
+                            names.push((name, rendered));
                         }
                         rustc_public::ty::ExistentialPredicate::AutoTrait(d) => {
                             let name = d.name();

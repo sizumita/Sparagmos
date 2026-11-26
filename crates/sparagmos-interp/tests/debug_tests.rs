@@ -826,10 +826,11 @@ fn info_functions_prefers_the_display_name_table() {
         (
             "x::generic_func<i32>".to_string(),
             "(i32) -> i32".to_string(),
+            "fn(i32) -> i32".to_string(),
         ),
         // An instance with no converted body is listed from
         // the table alone.
-        ("x::helper<u8>".to_string(), "()".to_string()),
+        ("x::helper<u8>".to_string(), "()".to_string(), "fn()".to_string()),
     ];
     let mut s = session(p);
     let run = s.run_script(
