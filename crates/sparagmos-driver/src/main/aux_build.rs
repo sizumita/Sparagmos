@@ -237,66 +237,104 @@ pub(crate) fn declared_aux_binding_names(src_text: &str) -> std::collections::Ha
 }
 
 /// The flags a source file's own `//@ compile-flags:` directives
-/// declare (whitespace-split; scoped directives included, as in
-/// [`declared_aux_binding_names`]). compiletest compiles each
-/// auxiliary crate with its own file's flags; the main
-/// compilation's flags come from the caller instead.
-fn declared_compile_flags(src_text: &str) -> Vec<String> {
+/// declare for the active revision (whitespace-split).
+/// compiletest compiles each auxiliary crate with its own
+/// file's flags as loaded through the revision being compiled;
+/// the main compilation's flags come from the caller instead.
+/// The revision filter is load-bearing, not cosmetic: a
+/// `--crate-type=dylib` flag scoped to another revision,
+/// applied anyway, builds the crate as a dylib in every
+/// revision, and when the crate carrying an EII default
+/// implementation is built as a dylib too (its own `//@[dylib]`
+/// flags, for a revision the test may not even have), rustc's
+/// EII final-artifact check counts the default inside the
+/// dylib dependency as a second implementation beside the
+/// explicit one and the auxiliary build fails with "multiple
+/// implementations" (tests/ui/eii/default/call_impl.rs).
+fn declared_compile_flags(src_text: &str, active: &[String]) -> Vec<String> {
     let mut flags = Vec::new();
-    for line in src_text.lines() {
-        let Some(at) = line.find("//@") else { continue };
-        let rest = line[at + 3..].trim_start();
-        let rest = if rest.starts_with('[') {
-            match rest.find(']') {
-                Some(end) => rest[end + 1..].trim_start(),
-                None => continue,
-            }
-        } else {
-            rest
-        };
-        if let Some(value) = rest.strip_prefix("compile-flags:") {
+    for text in aux_directive_texts_for_revision(src_text, active) {
+        if let Some(value) = text.strip_prefix("compile-flags:") {
             flags.extend(value.split_whitespace().map(str::to_string));
         }
     }
     flags
 }
 
-/// Directive scan shared by the auxiliary-header readers
-/// below: yields each `//@` directive's text with any
-/// `//@[revision]` scope prefix stripped, the approximation
-/// declared_compile_flags already applies.
-fn aux_directive_texts(src_text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in src_text.lines() {
-        let Some(at) = line.find("//@") else { continue };
-        let rest = line[at + 3..].trim_start();
-        let rest = if rest.starts_with('[') {
-            match rest.find(']') {
-                Some(end) => rest[end + 1..].trim_start(),
-                None => continue,
-            }
-        } else {
-            rest
-        };
-        out.push(rest.to_string());
+/// One `//@` directive line split into its optional
+/// `//@[rev,...]` scope (the revision names verbatim, as one
+/// comma-joined string) and the directive text that follows
+/// it. `None` when the line carries no `//@` directive.
+fn directive_parts(line: &str) -> Option<(Option<String>, &str)> {
+    let at = line.find("//@")?;
+    let rest = line[at + 3..].trim_start();
+    if let Some(scoped) = rest.strip_prefix('[') {
+        let end = scoped.find(']')?;
+        Some((Some(scoped[..end].to_string()), scoped[end + 1..].trim_start()))
+    } else {
+        Some((None, rest))
     }
-    out
+}
+
+/// Whether a directive's scope admits the active revision: an
+/// unscoped directive always applies; a scoped one applies
+/// when one of its comma-separated revision names -- normalized
+/// the way the revision's cfg name is derived (lowercase, `-`
+/// as `_`, the subset runner's normalize_revision) -- is among
+/// `active`, the `--aux` spec's `;cfg=` names, which the runner
+/// stamps with the active revision. With no revision stamped,
+/// only unscoped directives apply: the unrevised compilation
+/// is the only one there is.
+fn scope_admits(scope: &Option<String>, active: &[String]) -> bool {
+    match scope {
+        None => true,
+        Some(names) => names
+            .split(',')
+            .map(|name| name.trim().to_lowercase().replace('-', "_"))
+            .any(|name| active.iter().any(|a| *a == name)),
+    }
+}
+
+/// The directive texts that apply to the active revision (see
+/// [`scope_admits`]). compiletest loads an auxiliary file's
+/// properties through the revision being compiled, so the
+/// readers that shape the build itself -- the file's own
+/// compile-flags, its rustc-env, its no-prefer-dynamic
+/// opt-out -- use this view: a `//@[other]` directive is not
+/// part of this build. The name scans
+/// (declared_aux_binding_names and friends) keep the union
+/// view, stripping scopes without filtering: a name a file
+/// declares under any revision is still a name it declares,
+/// and binding a built crate under it is benign where a
+/// flag would not be.
+fn aux_directive_texts_for_revision(src_text: &str, active: &[String]) -> Vec<String> {
+    src_text
+        .lines()
+        .filter_map(directive_parts)
+        .filter(|(scope, _)| scope_admits(scope, active))
+        .map(|(_, text)| text.to_string())
+        .collect()
 }
 
 /// Whether an auxiliary source opts out of the prefer-dynamic
-/// auxiliary build (`//@ no-prefer-dynamic`).
-fn declared_no_prefer_dynamic(src_text: &str) -> bool {
-    aux_directive_texts(src_text)
+/// auxiliary build (`//@ no-prefer-dynamic`) in the active
+/// revision.
+fn declared_no_prefer_dynamic(src_text: &str, active: &[String]) -> bool {
+    aux_directive_texts_for_revision(src_text, active)
         .iter()
         .any(|d| d.starts_with("no-prefer-dynamic"))
 }
 
 /// An auxiliary source's own `//@ rustc-env:` pairs and
-/// `//@ unset-rustc-env:` names.
-fn declared_rustc_env(src_text: &str) -> (Vec<(String, String)>, Vec<String>) {
+/// `//@ unset-rustc-env:` names, as they apply to the active
+/// revision.
+fn declared_rustc_env(
+    src_text: &str,
+    active: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
     let mut pairs = Vec::new();
     let mut unset = Vec::new();
-    for d in aux_directive_texts(src_text) {
+    for d in aux_directive_texts_for_revision(src_text, active) {
         if let Some(value) = d.strip_prefix("rustc-env:") {
             if let Some((name, value)) = value.trim().split_once('=') {
                 pairs.push((name.trim().to_string(), value.trim().to_string()));
@@ -770,7 +808,7 @@ pub(crate) fn compile_aux(
     // dependency is not a private one. Undeclared transitive deps
     // still resolve through the `-L dependency` directory above.
     let mut deps = declared_aux_binding_names(&src_text);
-    let own_flags = declared_compile_flags(&src_text);
+    let own_flags = declared_compile_flags(&src_text, &spec.cfgs);
     deps.extend(locator_extern_names(&own_flags));
     let mut binding_declared = declared_binding_names(&src_text);
     binding_declared.extend(locator_extern_names(&own_flags));
@@ -803,7 +841,7 @@ pub(crate) fn compile_aux(
     // dylib auxiliary built without it cannot satisfy the
     // "std only shows up once" requirement against the
     // prefer-dynamic sysroot std (linkage-attr/issue-12133-3).
-    if !declared_no_prefer_dynamic(&src_text)
+    if !declared_no_prefer_dynamic(&src_text, &spec.cfgs)
         && !own_flags.iter().any(|f| f.contains("prefer-dynamic"))
     {
         cmd.arg("-C").arg("prefer-dynamic");
@@ -825,7 +863,7 @@ pub(crate) fn compile_aux(
     for name in env_scrub {
         cmd.env_remove(name);
     }
-    let (aux_env, aux_unset) = declared_rustc_env(&src_text);
+    let (aux_env, aux_unset) = declared_rustc_env(&src_text, &spec.cfgs);
     for name in &aux_unset {
         cmd.env_remove(name);
     }
@@ -835,7 +873,7 @@ pub(crate) fn compile_aux(
     // The auxiliary crate's own `//@ compile-flags:` (compiletest
     // compiles each auxiliary crate with its own file's flags,
     // with the `{{...}}` template variables expanded).
-    for flag in declared_compile_flags(&src_text) {
+    for flag in declared_compile_flags(&src_text, &spec.cfgs) {
         cmd.arg(expand_aux_flag_variables(&flag, src_path));
     }
     // The crate's own overflow-checks setting, resolved from
