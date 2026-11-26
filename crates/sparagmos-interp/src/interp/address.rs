@@ -397,6 +397,7 @@ fn rvalue_liveness(rv: &Rvalue, uses: &mut [u64], n: usize) {
         | Rvalue::UnwrapArrayElems(op)
         | Rvalue::UnwrapSliceElems(op)
         | Rvalue::WrapSliceElems(op)
+        | Rvalue::BytesToStr(op)
         | Rvalue::IntToPtr(op)
         | Rvalue::EnumToInt(op, ..)
         | Rvalue::IntToEnum(op, ..)

@@ -321,6 +321,30 @@ impl<'a> Converter<'a> {
                             // here (the `DataPtr` path below owns
                             // them).
                             ir::Rvalue::PtrCastUnits(v, f)
+                        } else if matches!(ptr_pointee(target), Some(mir::Ty::Str))
+                            && match ctx.as_ref() {
+                                // A constant operand carries no
+                                // source type: the byte string
+                                // is the value it carries.
+                                None => true,
+                                Some(src) => {
+                                    !matches!(
+                                        ptr_pointee(src),
+                                        Some(mir::Ty::Str)
+                                    ) && ptr_pointee(src).is_some_and(|p| {
+                                        is_str_or_byte_slice(p)
+                                            || self
+                                                .pointee_is_byte_string_dst(p)
+                                    })
+                                }
+                            }
+                        {
+                            // A cast landing on a `str` pointee
+                            // from a byte-string pointee
+                            // re-denominates the value as the
+                            // string it denotes (see
+                            // `ir::Rvalue::BytesToStr`).
+                            ir::Rvalue::BytesToStr(v)
                         } else if ptr_pointee(target).is_some_and(|p| {
                             // A pointer cast to a thin target drops
                             // the metadata word when the source value

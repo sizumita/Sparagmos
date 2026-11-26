@@ -2490,6 +2490,37 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The string data value a byte-string value denotes
+    /// (see [`Rvalue::BytesToStr`]): the value itself when it
+    /// already is string data; otherwise the text its bytes
+    /// form. A value whose bytes the model cannot read, or
+    /// whose bytes are not valid UTF-8 (undefined behaviour
+    /// in the guest), is returned unchanged, keeping the
+    /// behaviour such a value has today at the string
+    /// consumers that meet it.
+    fn bytes_as_str(&self, frames: &[Frame], value: &Value) -> Value {
+        if let Value::Str(_) = value {
+            return value.clone();
+        }
+        let Ok((elems, _)) = self.slice_elements(frames, value) else {
+            return value.clone();
+        };
+        let mut bytes = Vec::with_capacity(elems.len());
+        for elem in &elems {
+            match elem {
+                Value::Uint(b) => bytes.push(*b as u8),
+                Value::Int(b) if (0..=255).contains(b) => {
+                    bytes.push(*b as u8)
+                }
+                _ => return value.clone(),
+            }
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => Value::Str(text),
+            Err(_) => value.clone(),
+        }
+    }
+
     pub(crate) fn eval_rvalue(
         &self,
         frames: &mut Vec<Frame>,
@@ -2807,6 +2838,10 @@ impl<'a> Interpreter<'a> {
                 // element view differs.
                 let value = self.eval_operand(frames, body, operand)?;
                 Ok(value)
+            }
+            Rvalue::BytesToStr(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                Ok(self.bytes_as_str(frames, &value))
             }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;

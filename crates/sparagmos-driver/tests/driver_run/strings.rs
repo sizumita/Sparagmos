@@ -3577,3 +3577,79 @@ fn main() {
 fn run_mode_str_slice_on_char_boundaries() {
     run_ok("str-slice-unicode", STR_SLICE_UNICODE_SRC, "h\né\n");
 }
+
+
+const FROM_UTF8_UNCHECKED_SRC: &str = r#"
+fn main() {
+    let data: &[u8] = b"ab";
+    let s = unsafe { std::str::from_utf8_unchecked(data) };
+    println!("{:?}", s);
+    println!("{}", s.len());
+    let mut it = data.windows(1);
+    let piece = it.next().unwrap();
+    let p = unsafe { std::str::from_utf8_unchecked(piece) };
+    println!("{:?} {}", p, p.len());
+    let v: Vec<u8> = vec![0xE3, 0x81, 0x82];
+    let m = unsafe { std::str::from_utf8_unchecked(&v) };
+    println!("{:?} {} {}", m, m.len(), m.chars().count());
+    for piece in "a b".split_ascii_whitespace() {
+        println!("{:?} {}", piece, piece.len());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_from_utf8_unchecked_denominates_str() {
+    // `from_utf8_unchecked` is a transmute from a byte
+    // slice to a `str`: the result must be denominated as
+    // the string it denotes, so `len`, `chars` and the
+    // Debug rendering read it as text -- over a plain
+    // slice, a `windows` piece, a `Vec` buffer and the
+    // `split_ascii_whitespace` pieces alike. (The checked
+    // `from_utf8` always produced the string value; the
+    // unchecked form kept the byte form and the string
+    // consumers refused it.)
+    let dir = temp_dir("from-utf8-unchecked");
+    let src = fixture(&dir, "utf8unchecked.rs", FROM_UTF8_UNCHECKED_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "\"ab\"\n2\n\"a\" 1\n\"あ\" 3 1\n\"a\" 1\n\"b\" 1\n",
+        "stdout={stdout}"
+    );
+}
+
+const STR_BYTE_SLICE_CAST_SRC: &str = r#"
+fn main() {
+    let data: &[u8] = b"ab";
+    let p = data as *const [u8] as *const str;
+    let s: &str = unsafe { &*p };
+    println!("{:?} {}", s, s.len());
+    let b: &[u8] = unsafe { std::mem::transmute(s) };
+    println!("{:?} {}", b, b.len());
+    let s2: &str = unsafe { std::mem::transmute(b) };
+    println!("{:?} {}", s2, s2.len());
+}
+"#;
+
+#[test]
+fn run_mode_str_byte_slice_casts_denominate_both_ways() {
+    // The raw-pointer cast form of the same crossing
+    // (`as *const str` over a byte slice) denominates as
+    // the string too, and the round trip back through a
+    // transmute reads the string value as the byte
+    // sequence it denotes.
+    let dir = temp_dir("str-byte-slice-casts");
+    let src = fixture(&dir, "strbyteslicecasts.rs", STR_BYTE_SLICE_CAST_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "\"ab\" 2\n[97, 98] 2\n\"ab\" 2\n",
+        "stdout={stdout}"
+    );
+}
