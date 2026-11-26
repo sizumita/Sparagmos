@@ -373,9 +373,44 @@ pub(super) fn default_value_for_tag(tag: &str) -> Option<Value> {
             let elem_default = default_value_for_tag(elem.trim())?;
             Value::Tuple(vec![elem_default; n])
         }
+        // Raw pointers: `Default` is the null pointer. The
+        // impl covers only `Thin` pointees, so a fat pointee
+        // (a slice, `str`, a `dyn` trait object) has no
+        // `Default` to serve and stays unsupported.
+        _ if tag.starts_with("*const ") || tag.starts_with("*mut ") => {
+            let inner = tag
+                .strip_prefix("*const ")
+                .or_else(|| tag.strip_prefix("*mut "))
+                .expect("guard checked")
+                .trim();
+            if inner == "str" || inner.starts_with("dyn ") || is_slice_tag(inner) {
+                return None;
+            }
+            Value::Ref(RefTarget::Null)
+        }
+        // `&[T]`: `Default` is the empty slice, in the shape
+        // a converted `&[]` constant takes -- a fat reference
+        // over the empty aggregate -- so it prices (the
+        // element type's dangling address) and compares as
+        // that constant does.
+        _ if tag.starts_with('&') && is_slice_tag(&tag[1..]) => Value::FatRef {
+            base: Box::new(Value::Ref(RefTarget::Value(
+                Box::new(Value::Tuple(Vec::new())),
+                Vec::new(),
+            ))),
+            len: 0,
+        },
         _ => return None,
     })
 }
+
+/// The deepest `Default::default()` fabrication recursion
+/// (see `Interpreter::default_value_depth`). A type whose
+/// derived `Default` recurses through a wrapper
+/// (`struct S { b: Box<S> }`) diverges natively as well;
+/// the cap keeps that divergence an explicit unsupported
+/// error here instead of a host stack overflow.
+const MAX_DEFAULT_DEPTH: u32 = 64;
 
 /// The `(size, align)` of a rendered type tag on this platform
 /// (x86_64), for the types whose layout is fixed and known.
@@ -393,6 +428,16 @@ impl<'a> Interpreter<'a> {
     /// handle for `Rc` / `Arc`), which only the interpreter can
     /// mint.
     pub(super) fn default_value(&self, tag: &str) -> Option<Value> {
+        self.default_value_depth(tag, 0)
+    }
+
+    /// `Default::default()` for a rendered type tag, with
+    /// the fabrication recursion depth (see
+    /// [`MAX_DEFAULT_DEPTH`]).
+    fn default_value_depth(&self, tag: &str, depth: u32) -> Option<Value> {
+        if depth > MAX_DEFAULT_DEPTH {
+            return None;
+        }
         let tag = tag.trim();
         if let Some(inner) = generic_first_arg(tag, "std::boxed::Box<") {
             let pointee = if is_slice_tag(inner) {
@@ -401,7 +446,7 @@ impl<'a> Interpreter<'a> {
                 // `Vec::into_boxed_slice` builds.
                 Value::Tuple(Vec::new())
             } else {
-                self.default_value(inner)?
+                self.default_value_depth(inner, depth + 1)?
             };
             let boxed = self.new_box(pointee);
             if let Some(ty) = ty_from_tag(inner) {
@@ -412,7 +457,7 @@ impl<'a> Interpreter<'a> {
         if let Some(inner) = generic_first_arg(tag, "std::rc::Rc<")
             .or_else(|| generic_first_arg(tag, "std::sync::Arc<"))
         {
-            let pointee = self.default_value(inner)?;
+            let pointee = self.default_value_depth(inner, depth + 1)?;
             return Some(self.rc_new_handle(pointee));
         }
         if let Some(inner) = generic_first_arg(tag, "std::hash::BuildHasherDefault<") {
@@ -453,7 +498,7 @@ impl<'a> Interpreter<'a> {
                 .get(hasher_idx)
                 .map(|s| s.trim())
                 .unwrap_or("std::hash::RandomState");
-            let hasher = self.default_value(hasher_tag)?;
+            let hasher = self.default_value_depth(hasher_tag, depth + 1)?;
             let ctrl = Value::Enum {
                 variant: 0,
                 fields: vec![Value::Ref(RefTarget::Value(
@@ -511,15 +556,80 @@ impl<'a> Interpreter<'a> {
         if tag.starts_with("std::collections::HashMap<")
             || tag.starts_with("std::collections::HashSet<")
         {
-            return self.hash_collection_default(tag);
+            return self.hash_collection_default(tag, depth);
         }
         if tag.starts_with("indexmap::set::IndexSet<")
             || tag.starts_with("indexmap::map::IndexMap<")
             || tag.starts_with("indexmap::IndexMap<")
         {
-            return self.index_collection_default(tag);
+            return self.index_collection_default(tag, depth);
         }
-        default_value_for_tag(tag)
+        if let Some(value) = default_value_for_tag(tag) {
+            return Some(value);
+        }
+        self.default_value_composite(tag, depth)
+    }
+
+    /// The `Default::default()` cases the arms above and the
+    /// pure tag function cannot serve: composites whose parts
+    /// are themselves only fabricable with the program at
+    /// hand, and a guest struct's derived `Default`.
+    ///
+    /// The composite arms mirror the pure function's, with
+    /// the recursion running through the interpreter: an
+    /// array or tuple over a guest ADT, which the pure
+    /// recursion cannot fabricate, resolves here.
+    ///
+    /// A struct outside the `std` / `core` / `alloc`
+    /// namespaces fabricates as the value its derived
+    /// `Default` builds -- each field the field type's own
+    /// default -- from the instance shape the driver
+    /// recorded for the formatter. The model's std surface
+    /// is enumerated by the arms above on purpose: a std
+    /// struct the arms do not name (a `VecDeque`, say)
+    /// keeps the explicit unsupported error rather than a
+    /// field-wise guess at a hand-written impl. Enums stay
+    /// unsupported in every namespace: which variant is
+    /// `#[default]` is not part of the recorded shape.
+    fn default_value_composite(&self, tag: &str, depth: u32) -> Option<Value> {
+        let tag = tag.trim();
+        if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
+            let inner = &tag[1..tag.len() - 1];
+            let mut vals = Vec::new();
+            for part in split_top_level(inner) {
+                vals.push(self.default_value_depth(part, depth + 1)?);
+            }
+            return Some(Value::Tuple(vals));
+        }
+        if tag.starts_with('[') && tag.ends_with(']') {
+            // `[T; N]`: an array of the element default.
+            let inner = &tag[1..tag.len() - 1];
+            let (elem, n) = inner.rsplit_once(';')?;
+            let n: usize = n.trim().parse().ok()?;
+            if n > 4096 {
+                return None;
+            }
+            let elem_default = self.default_value_depth(elem.trim(), depth + 1)?;
+            return Some(Value::Tuple(vec![elem_default; n]));
+        }
+        if tag.starts_with("std::")
+            || tag.starts_with("core::")
+            || tag.starts_with("alloc::")
+        {
+            return None;
+        }
+        let shape = self.program().adt_debug_shapes.get(tag)?;
+        if shape.kind != sparagmos_mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let mut fields = Vec::new();
+        for field in &shape.variants[0].fields {
+            fields.push(self.default_value_depth(&field.ty, depth + 1)?);
+        }
+        Some(Value::Enum {
+            variant: 0,
+            fields,
+        })
     }
 
     /// `Default::default()` for the std hash collections: the
@@ -538,7 +648,7 @@ impl<'a> Interpreter<'a> {
     /// the global one, the only allocator whose value is the
     /// unit-like `Global`. Any other shape keeps the explicit
     /// unsupported error.
-    fn hash_collection_default(&self, tag: &str) -> Option<Value> {
+    fn hash_collection_default(&self, tag: &str, depth: u32) -> Option<Value> {
         let (is_set, args) =
             if let Some(args) = generic_args(tag, "std::collections::HashMap<") {
                 (false, args)
@@ -555,7 +665,7 @@ impl<'a> Interpreter<'a> {
         if alloc_tag != "std::alloc::Global" && alloc_tag != "alloc::alloc::Global" {
             return None;
         }
-        let hasher = self.default_value(hasher_tag)?;
+        let hasher = self.default_value_depth(hasher_tag, depth + 1)?;
         let raw_table = self.empty_raw_table();
         let hashbrown_map = Value::Enum {
             variant: 0,
@@ -623,7 +733,7 @@ impl<'a> Interpreter<'a> {
     /// The hasher field is the hasher type's own default,
     /// recursively; any other shape keeps the explicit
     /// unsupported error.
-    fn index_collection_default(&self, tag: &str) -> Option<Value> {
+    fn index_collection_default(&self, tag: &str, depth: u32) -> Option<Value> {
         let (is_set, args) =
             if let Some(args) = generic_args(tag, "indexmap::set::IndexSet<") {
                 (true, args)
@@ -639,7 +749,7 @@ impl<'a> Interpreter<'a> {
             (false, 3) => args[2],
             _ => return None,
         };
-        let hasher = self.default_value(hasher_tag)?;
+        let hasher = self.default_value_depth(hasher_tag, depth + 1)?;
         let indices = Value::Enum {
             variant: 0,
             fields: vec![self.empty_raw_table()],
