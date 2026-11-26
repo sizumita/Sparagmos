@@ -183,3 +183,41 @@ fn run_mode_size_of_val_bare_tuple_tail() {
         "size 16\nalign 4\nv 5 10 20 30\nback 3 10\n",
     );
 }
+const WRAPPER_SCALAR_READ_SRC: &str = r#"
+use std::mem;
+#[repr(C)]
+struct Slice([u32]);
+#[repr(C)]
+struct Outer { f: u8, d: Slice }
+#[repr(C)]
+struct Sized { f: u8, d: [u32; 4] }
+fn main() { unsafe {
+    let s = Sized { f: 0, d: [1, 2, 3, 4] };
+    let r: &Outer = mem::transmute((&s, 4usize));
+    let d = std::ptr::addr_of!((*r).d);
+    println!("e0 {}", d.cast::<u32>().read_unaligned());
+    println!("e1 {}", d.cast::<u32>().add(1).read_unaligned());
+    println!("e3 {}", d.cast::<u32>().add(3).read_unaligned());
+    let sl = d as *const [u32];
+    println!("idx {}", (*sl)[2]);
+    let d0 = std::ptr::addr_of!((*r).d.0);
+    println!("proj {}", d0.cast::<u32>().read_unaligned());
+} }
+"#;
+
+#[test]
+fn run_mode_dst_wrapper_scalar_read() {
+    // A scalar read through a pointer cast from a one-field
+    // DST wrapper (`*const Slice` to `*const u32`): the cast
+    // denotes the wrapper's slice field's first element, so
+    // the read descends to the scalar at offset 0 instead of
+    // returning the tail field's whole array value. The same
+    // holds for offset reads from that element pointer, for
+    // a cast back to the slice type, and for the
+    // wrapper-first projection form.
+    run_ok(
+        "dst-wrapper-scalar-read",
+        WRAPPER_SCALAR_READ_SRC,
+        "e0 1\ne1 2\ne3 4\nidx 3\nproj 1\n",
+    );
+}
