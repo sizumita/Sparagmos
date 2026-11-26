@@ -1,0 +1,52 @@
+name: Auto Merge
+
+# Enables GitHub-native auto-merge (squash) on every pull request that
+# targets main, so lanes no longer run `gh pr merge --auto --squash`
+# by hand when they open a pull request.
+#
+# Enabling conditions:
+# - the pull request is not a draft,
+# - its base is main (stacked pull requests are excluded),
+# - it does not change anything under .github/workflows/ (workflow
+#   changes are merged manually by the integrator, as a standing rule).
+#
+# This workflow only enables auto-merge; whether a pull request
+# actually merges is decided by the required status checks
+# (build / test / fmt / clippy, driver / corpus (Rust 1.100.0), and
+# the flip-diff gate). It runs on pull_request_target so the
+# definition on main applies to every pull request regardless of what
+# the branch carries, and it never checks out the pull request's
+# code: it only calls the GitHub API.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  enable-auto-merge:
+    name: enable auto-merge
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Enable auto-merge unless the PR changes workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          files="$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')"
+          if printf '%s\n' "$files" | grep -q '^\.github/workflows/'; then
+            echo "This pull request changes .github/workflows/, so auto-merge is not enabled; it is merged manually." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            echo "Auto-merge is already enabled for #${PR_NUMBER}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh pr merge "$PR_NUMBER" --repo "${{ github.repository }}" --auto --squash
+          echo "Auto-merge (squash) enabled for #${PR_NUMBER}." >> "$GITHUB_STEP_SUMMARY"
