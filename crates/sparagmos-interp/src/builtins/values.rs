@@ -1423,6 +1423,29 @@ pub(super) fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
 /// type, a closure or coroutine type, a generic parameter, an
 /// unevaluated array length -- answer `None`, and the caller
 /// keeps the behaviour it has without a type.
+/// The byte index of the `;` at bracket depth zero in a
+/// rendered type tag's bracket body, when one is present:
+/// the separator between an array tag's element type and
+/// its length.
+fn top_level_semicolon(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '[' | '(' | '<' => depth += 1,
+            ']' | ')' | '>' => depth -= 1,
+            // A function pointer's return arrow is not a
+            // bracket close.
+            '-' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
+                chars.next();
+            }
+            ';' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn ty_from_tag(tag: &str) -> Option<Ty> {
     let tag = tag.trim();
     Some(match tag {
@@ -1449,10 +1472,14 @@ pub(crate) fn ty_from_tag(tag: &str) -> Option<Ty> {
         "()" => Ty::Unit,
         _ if tag.starts_with('[') && tag.ends_with(']') => {
             let inner = &tag[1..tag.len() - 1];
-            match inner.rsplit_once(';') {
-                Some((elem, n)) => {
-                    let n: u64 = n.trim().parse().ok()?;
-                    Ty::Array(Box::new(ty_from_tag(elem.trim())?), n)
+            // The length separator is the `;` at the bracket's
+            // own level: a slice of arrays (`[[u8; 2]]`)
+            // carries its element's `;` one level down, and
+            // only a top-level one denominates this bracket.
+            match top_level_semicolon(inner) {
+                Some(at) => {
+                    let n: u64 = inner[at + 1..].trim().parse().ok()?;
+                    Ty::Array(Box::new(ty_from_tag(inner[..at].trim())?), n)
                 }
                 None => Ty::Slice(Box::new(ty_from_tag(inner.trim())?)),
             }

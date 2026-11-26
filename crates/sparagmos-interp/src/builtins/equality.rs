@@ -8,6 +8,7 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter,
 };
+use crate::ir::Ty;
 use crate::value::{RefTarget, Value};
 
 use super::*;
@@ -45,6 +46,90 @@ fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
 }
 
 impl<'a> Interpreter<'a> {
+    /// The element lists of a slice comparison's two
+    /// operands when a side's fat pointer regroups its
+    /// storage's elements under the element shape the
+    /// comparison's own `Self` type names (a `[[u8; 3]; 2]`
+    /// storage ranged over as `[[u8; 2]]`): the regrouped
+    /// side's elements are the byte view's construction
+    /// (`foreign_slice_elements`), the other side's are the
+    /// ordinary element reading's. `None` when the `Self`
+    /// type is not a slice or neither side is such a view,
+    /// in which case the ordinary comparison judges.
+    fn regrouped_slice_elems(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<(Vec<Value>, Vec<Value>)>> {
+        let self_ty = ty_from_tag(generic_args.first()?)?;
+        let Ty::Slice(elem_ty) = &self_ty else {
+            return None;
+        };
+        let ea = self.foreign_slice_elements(frames, a, elem_ty);
+        let eb = self.foreign_slice_elements(frames, b, elem_ty);
+        if ea.is_none() && eb.is_none() {
+            return None;
+        }
+        Some((|| {
+            let ea = match ea {
+                Some(elems) => elems,
+                None => self.slice_elements(frames, a)?.0,
+            };
+            let eb = match eb {
+                Some(elems) => elems,
+                None => self.slice_elements(frames, b)?.0,
+            };
+            Ok((ea, eb))
+        })())
+    }
+
+    /// Slice equality under a regrouping view, when one
+    /// applies (see `regrouped_slice_elems`).
+    pub(crate) fn regrouped_slice_equal(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<bool>> {
+        let elems = self.regrouped_slice_elems(frames, generic_args, a, b)?;
+        Some((|| {
+            let (ea, eb) = elems?;
+            if ea.len() != eb.len() {
+                return Ok(false);
+            }
+            self.seq_equal(frames, &ea, &eb)
+        })())
+    }
+
+    /// Slice comparison under a regrouping view, when one
+    /// applies (see `regrouped_slice_elems`): element-wise
+    /// with the first non-`Equal` element deciding, then by
+    /// length, exactly as the ordinary slice arm of
+    /// `values_cmp`.
+    pub(crate) fn regrouped_slice_cmp(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+        discriminants: Option<&[i128]>,
+    ) -> Option<InterpResult<Option<Ordering>>> {
+        let elems = self.regrouped_slice_elems(frames, generic_args, a, b)?;
+        Some((|| {
+            let (ea, eb) = elems?;
+            for (x, y) in ea.iter().zip(eb.iter()) {
+                match self.values_cmp(frames, x, y, discriminants)? {
+                    Some(Ordering::Equal) => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Some(ea.len().cmp(&eb.len())))
+        })())
+    }
+
     pub(crate) fn values_equal(
         &self,
         frames: &[Frame],
