@@ -14,6 +14,61 @@ use super::program::*;
 impl<'a> Converter<'a> {
     // ----- places ----------------------------------------------------------
 
+    /// The flat storage slot of one state field of a coroutine
+    /// instance whose slot map the driver recorded: the map's
+    /// own slot for the field, except for a field whose type is
+    /// provably zero-sized, which gets a private slot of its
+    /// own (one per field type within the instance, above the
+    /// map's slots; the assignment is precomputed in
+    /// `Converter::new`, see `coroutine_zst_slot_map`). `None`
+    /// when the map has no slot for the (variant, field) pair,
+    /// exactly where the map lookup itself fails.
+    ///
+    /// The exception exists because the map assigns slots per
+    /// layout offset, and a zero-sized field's offset is not
+    /// exclusively its own: the compiler places such a field at
+    /// an offset another state's field also uses (in the state
+    /// being entered it can even share the offset within one
+    /// variant, which the driver's within-variant rule already
+    /// separates), and at the offset of a differently-typed
+    /// field of another state the zero-sized field can be the
+    /// offset's only occupant, so the map hands it that field's
+    /// shared slot. In the real layout the zero-sized field's
+    /// stores write no bytes and cannot disturb the other
+    /// field; in the flat field vector a store of its value
+    /// would overwrite the other field's cell (and a read
+    /// would return that field's value). A private slot keeps
+    /// both directions faithful: the field's own writes and
+    /// reads meet in a cell no sized field uses. Two distinct
+    /// zero-sized fields of one type in one instance share the
+    /// private slot; their values are of that one type, and a
+    /// zero-sized value carries no bytes the other field's
+    /// reads could mistake for its own beyond its type's own
+    /// tag-sized distinctions (a function item's identity is
+    /// its type, so it keys separately).
+    pub(super) fn coroutine_field_slot(
+        &self,
+        key: &str,
+        slots: &mir::CoroutineSlots,
+        variant: usize,
+        field: usize,
+        field_ty: Option<&mir::Ty>,
+    ) -> Option<u32> {
+        let mapped = *slots.variants.get(variant)?.get(field)?;
+        let Some(field_ty) = field_ty else {
+            return Some(mapped);
+        };
+        let tag = crate::builtins::ty_tag(field_ty, self.names);
+        if let Some(slot) = self
+            .coroutine_zst_slots
+            .get(key)
+            .and_then(|by_ty| by_ty.get(&tag))
+        {
+            return Some(*slot);
+        }
+        Some(mapped)
+    }
+
     pub(super) fn convert_place(
         &self,
         body: &mir::Body,
@@ -38,23 +93,31 @@ impl<'a> Converter<'a> {
         // the single layout slot of that field (see
         // `mir::CoroutineSlots`): a state field keeps one storage
         // cell in every state that contains it, which the
-        // positional field index does not express. A downcast not
+        // positional field index does not express. One exception
+        // is carved out in `coroutine_field_slot`: a provably
+        // zero-sized field converts to a private slot instead,
+        // because in the compiler's layout such a field can sit
+        // at the offset of a different state's differently-typed
+        // field, and its writes there are no-ops that must not
+        // overwrite that field's cell. A downcast not
         // followed by a field step, and every projection of an
         // instance with no recorded map, converts exactly as
         // before.
-        let mut coroutine_downcast: Option<(u32, &mir::CoroutineSlots)> = None;
+        let mut coroutine_downcast: Option<(u32, &mir::CoroutineSlots, String)> = None;
         for elem in &place.projection {
             while let Some(mir::Ty::Pat(inner, _)) = &ty {
                 ty = Some(inner.as_ref().clone());
             }
-            if let Some((variant, slots)) = coroutine_downcast.take() {
+            if let Some((variant, slots, key)) = coroutine_downcast.take() {
                 if let mir::PlaceElem::Field(idx, field_ty) = elem {
-                    if let Some(slot) = slots
-                        .variants
-                        .get(variant as usize)
-                        .and_then(|v| v.get(*idx as usize))
-                    {
-                        out.projection.push(ir::ProjectionElem::Field(*slot as usize));
+                    if let Some(slot) = self.coroutine_field_slot(
+                        &key,
+                        slots,
+                        variant as usize,
+                        *idx as usize,
+                        Some(field_ty),
+                    ) {
+                        out.projection.push(ir::ProjectionElem::Field(slot as usize));
                         ty = Some(field_ty.clone());
                         continue;
                     }
@@ -117,7 +180,7 @@ impl<'a> Converter<'a> {
                             self.names,
                         );
                         if let Some(slots) = self.coroutine_layouts.get(&key) {
-                            coroutine_downcast = Some((*variant, slots));
+                            coroutine_downcast = Some((*variant, slots, key));
                             // The downcast step is emitted (or
                             // folded into the following field step)
                             // at the top of the next iteration, so
@@ -144,7 +207,7 @@ impl<'a> Converter<'a> {
                 }
             });
         }
-        if let Some((variant, _)) = coroutine_downcast.take() {
+        if let Some((variant, _, _)) = coroutine_downcast.take() {
             out.projection.push(ir::ProjectionElem::Downcast(variant));
         }
         Ok(out)

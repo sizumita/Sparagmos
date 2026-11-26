@@ -1,4 +1,7 @@
-use super::{CLOSURE_GENERIC_CONTEXT_SRC, fixture, run_driver, summarize_driver, temp_dir};
+use super::{
+    CLOSURE_GENERIC_CONTEXT_SRC, fixture, run_driver, run_driver_extra, summarize_driver,
+    temp_dir,
+};
 
 
 const CLOSURE_CAPTURE_SRC: &str = r#"
@@ -1108,5 +1111,131 @@ fn run_mode_boxed_suspended_future_drops_parameters_once() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "boxed future param drop ok\n"
+    );
+}
+
+const ASYNC_DROP_BOX_ALLOCATOR_SRC: &str = r#"
+#![feature(async_drop)]
+#![allow(incomplete_features)]
+
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::future::{async_drop_in_place, AsyncDrop, Future};
+use std::pin::{pin, Pin};
+use std::ptr::NonNull;
+use std::task::{Context, Poll, Waker};
+
+struct Foo {
+    handle: usize,
+}
+
+impl Drop for Foo {
+    fn drop(&mut self) {
+        println!("Foo::drop() : {}", self.handle);
+    }
+}
+
+impl AsyncDrop for Foo {
+    async fn drop(self: Pin<&mut Self>) {
+        println!("Foo::async drop() : {}", self.handle);
+    }
+}
+
+unsafe impl Allocator for Foo {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Global.allocate(layout)
+    }
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        Global.deallocate(ptr, layout);
+    }
+}
+
+struct HasDrop;
+impl Drop for HasDrop {
+    fn drop(&mut self) {}
+}
+
+async fn bar(ident: usize) {
+    let b = Box::new_in(HasDrop, Foo { handle: ident });
+    if true {
+        let _x = *b;
+    } else {
+        let _y = b;
+    }
+}
+
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let (waker, _rx) = simple_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    let out = loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => break out,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    };
+    let drop_fut = unsafe { async_drop_in_place(fut.get_unchecked_mut()) };
+    let mut drop_fut = pin!(drop_fut);
+    loop {
+        match drop_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => break,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+    out
+}
+
+fn simple_waker() -> (Waker, std::sync::mpsc::Receiver<()>) {
+    struct SimpleWaker {
+        tx: std::sync::mpsc::Sender<()>,
+    }
+    impl std::task::Wake for SimpleWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.tx.send(()).unwrap();
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    (Waker::from(std::sync::Arc::new(SimpleWaker { tx })), rx)
+}
+
+fn main() {
+    block_on(bar(10));
+    println!("Done");
+}
+"#;
+
+#[test]
+fn run_mode_async_drop_box_allocator_state_discriminant() {
+    // The async-drop state machine of `bar` saves a `bool` in
+    // two states at one layout offset and a `()` in a third
+    // state at the same offset, where the `()` is that offset's
+    // only occupant. The poll body stores the `()` for the
+    // state it is entering and then dispatches on the `bool`
+    // through the other state's view; with the offset's shared
+    // slot for both, the unit store overwrote the bool and the
+    // dispatch stopped with "type mismatch in SwitchInt
+    // discriminant: expected integer or bool, found unit".
+    // Provably zero-sized state fields now convert to private
+    // slots, so the dispatch reads the bool. The run then
+    // reaches the async-drop glue, which still stops on the
+    // consumed box pointer (an uninitialized read in the drop
+    // glue, tracked separately on Issue #513); when that gap
+    // closes this test should be strengthened to assert full
+    // completion with the native stdout.
+    let dir = temp_dir("async-drop-box-allocator-discriminant");
+    let src = fixture(&dir, "async_drop_box_allocator.rs", ASYNC_DROP_BOX_ALLOCATOR_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("SwitchInt discriminant"),
+        "the state dispatch must read the saved bool, not the unit stored for another state; stderr={stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the run still stops in the async-drop glue; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("read of uninitialized place"),
+        "the run must stop at the async-drop glue's uninitialized read; stderr={stderr}"
     );
 }

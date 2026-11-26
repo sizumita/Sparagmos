@@ -1318,21 +1318,30 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         // state, whose fields are the upvars themselves; its
         // positional `Fields` plan already addresses the upvar
         // storage in exactly that way, so it is left alone.
+        // The slot is the shared `coroutine_field_slot`
+        // judgement, so a provably zero-sized field's plan
+        // addresses the same private slot place conversion
+        // wrote its value into, not the shared slot of the
+        // sized field whose offset it happens to share.
         let key = crate::builtins::ty_tag(&mir::Ty::Coroutine(def, args.to_vec()), conv.names);
         if let Some(slots) = conv.coroutine_layouts.get(&key) {
             for (v, plan) in plans.iter_mut().enumerate().skip(1) {
-                let Some(variant_slots) = slots.variants.get(v) else {
+                if slots.variants.get(v).is_none() {
                     continue;
-                };
+                }
                 if let P::Fields { fields, .. } = plan {
                     let mut steps: Vec<P> = Vec::new();
                     for (f, field_plan) in fields.drain(..).enumerate() {
                         if field_plan == P::Trivial {
                             continue;
                         }
-                        if let Some(slot) = variant_slots.get(f) {
+                        let field_ty =
+                            conv.adt_fields.get(def, args, v as u32, f as u32);
+                        if let Some(slot) =
+                            conv.coroutine_field_slot(&key, slots, v, f, field_ty)
+                        {
                             steps.push(P::At {
-                                path: vec![RefProj::Field(*slot as usize)],
+                                path: vec![RefProj::Field(slot as usize)],
                                 plan: Box::new(field_plan),
                             });
                         }
