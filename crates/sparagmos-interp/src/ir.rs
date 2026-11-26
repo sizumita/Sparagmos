@@ -1450,12 +1450,14 @@ pub enum DropPlan {
     /// a `&mut` reference to the value this plan applies to.
     CallDtor { func: String },
     /// Call the converted destructor body `func` for a std lock
-    /// guard (`MutexGuard` / `RwLockReadGuard` / `RwLockWriteGuard`),
+    /// guard (`MutexGuard` / `RwLockReadGuard` / `RwLockWriteGuard`,
+    /// or a mapped guard -- `MappedMutexGuard` /
+    /// `MappedRwLockReadGuard` / `MappedRwLockWriteGuard`),
     /// but only when the value this plan applies to is shaped like
     /// a guard the converted lock bodies built: an aggregate whose
     /// first field is a reference (to the lock, or -- for a read
-    /// guard -- the `NonNull` data pointer, a one-field aggregate
-    /// around a reference). The stdio lock types (`StdinLock` and
+    /// guard or a mapped guard -- the `NonNull` data pointer, a
+    /// one-field aggregate around a reference). The stdio lock types (`StdinLock` and
     /// its siblings) hold a guard field whose value the io builtins
     /// forge as the bare stream value, with no lock reference in
     /// it; the real destructor body would read that stream value

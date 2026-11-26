@@ -663,7 +663,9 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let inner = self.plan(args.first()?)?;
                 return Some(at_field0(inner));
             }
-            // Lock guards: the destructor releases the lock
+            // Lock guards (including the mapped guards, whose
+            // destructor releases the lock through the sys lock
+            // reference they hold next to the data pointer): the destructor releases the lock
             // (and poisons it when the guard is dropped while
             // unwinding). The lock state is real state in this
             // model -- the converted lock bodies maintain it in
@@ -680,9 +682,15 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // the guard, and neither field carries glue of its
             // own).
             "std::sync::MutexGuard" | "std::sync::RwLockReadGuard"
-            | "std::sync::RwLockWriteGuard" | "std::sync::nonpoison::MutexGuard"
+            | "std::sync::RwLockWriteGuard" | "std::sync::MappedMutexGuard"
+            | "std::sync::MappedRwLockReadGuard"
+            | "std::sync::MappedRwLockWriteGuard"
+            | "std::sync::nonpoison::MutexGuard"
             | "std::sync::nonpoison::RwLockReadGuard"
-            | "std::sync::nonpoison::RwLockWriteGuard" => {
+            | "std::sync::nonpoison::RwLockWriteGuard"
+            | "std::sync::nonpoison::MappedMutexGuard"
+            | "std::sync::nonpoison::MappedRwLockReadGuard"
+            | "std::sync::nonpoison::MappedRwLockWriteGuard" => {
                 let fields = self.variant_fields_plan(def, args)?;
                 let ty_key = format!("{:?}", mir::Ty::Adt(def, args.to_vec()));
                 let dtor = self

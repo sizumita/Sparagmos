@@ -73,8 +73,9 @@ pub(crate) enum GlueCompletion {
 /// Whether `value` is shaped like a lock guard the converted
 /// lock bodies built: an aggregate whose first field is a
 /// reference -- to the lock for `MutexGuard` /
-/// `RwLockWriteGuard`, or, for `RwLockReadGuard`, the `NonNull`
-/// data pointer (a one-field aggregate around a reference).
+/// `RwLockWriteGuard`, or, for `RwLockReadGuard` and the
+/// mapped guards, the `NonNull` data pointer (a one-field
+/// aggregate around a reference).
 fn lock_guard_shaped(value: &Value) -> bool {
     fn ref_like(value: &Value) -> bool {
         match value {

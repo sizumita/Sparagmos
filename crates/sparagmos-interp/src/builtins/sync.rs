@@ -275,32 +275,61 @@ impl<'a> Interpreter<'a> {
         arg: &Value,
         name: &str,
     ) -> InterpResult<Value> {
+        // The pointer denotes the lock's `UnsafeCell` place
+        // (std forms it by casting a pointer to the cell, and
+        // a cast does not change the denoted place in this
+        // model): the pointee is the cell's field 0.
+        let pointer = self.guard_data_pointer(frames, arg, name)?;
+        project_pointee_cell(pointer)
+    }
+
+    /// `Deref` / `DerefMut` for a mapped lock guard
+    /// (`MappedMutexGuard`, `MappedRwLockReadGuard`,
+    /// `MappedRwLockWriteGuard`): like a read guard, its first
+    /// field is the `NonNull` data pointer its constructor
+    /// stored, but that pointer already denotes the mapped
+    /// component itself -- `map` built it from the reference
+    /// the mapping closure returned, which names the exact
+    /// sub-place inside the lock's data -- so the pointee is
+    /// the pointer itself, with no `UnsafeCell` projection.
+    pub(super) fn mapped_guard_deref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        self.guard_data_pointer(frames, arg, name)
+    }
+
+    /// The data pointer a guard aggregate stores in its first
+    /// field (a read guard's or a mapped guard's): the field
+    /// is a `NonNull`, so peel the one-field wrappers around
+    /// the pointer value the constructor left there.
+    fn guard_data_pointer(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
         let guard = self.resolve_value(frames, arg)?;
         let fields = match guard {
             Value::Enum { fields, .. } if !fields.is_empty() => fields,
             other => {
                 return Err(InterpError::type_mismatch(
                     name,
-                    "a read guard aggregate",
+                    "a guard aggregate",
                     other.kind_name(),
                 ))
             }
         };
         let mut pointer = fields.into_iter().next().expect("len checked");
-        // Peel the `NonNull` wrapper (and any further one-field
-        // wrapper the constructor left around the pointer).
         loop {
             match pointer {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     pointer = fields.into_iter().next().expect("len checked");
                 }
-                // The pointer denotes the lock's `UnsafeCell`
-                // place (std forms it by casting a pointer to
-                // the cell, and a cast does not change the
-                // denoted place in this model): the pointee is
-                // the cell's field 0.
                 Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
-                    return project_pointee_cell(pointer);
+                    return Ok(pointer);
                 }
                 other => {
                     return Err(InterpError::type_mismatch(
