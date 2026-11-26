@@ -14,7 +14,14 @@
 //! to "expected failure but conversion succeeded" (Issue #509).
 //! The driver now replays the verdicts in `mono_check`; each
 //! test below pins one rejection and the nearby acceptance that
-//! guards it against over-rejection.
+//! guards it against over-rejection. A rejected compilation
+//! also stops the compiler session before the phases past
+//! analysis: the diagnostics behind a verdict were discounted
+//! at their fetches, so the compiler's own error gate cannot
+//! stop code generation, and code generation would evaluate
+//! the very constants a verdict rests on and panic on them --
+//! the rejection must surface as a compilation failure, never
+//! as a compiler crash.
 
 use std::process::Command;
 
@@ -588,4 +595,60 @@ fn simd_select_mismatched_lengths_rejected() {
         stderr.contains("invalid monomorphization of `simd_select`"),
         "stderr={stderr}"
     );
+}
+#[test]
+fn oversized_vtable_const_rejected_without_debuginfo() {
+    // `try_as_dyn` over `[u8; usize::MAX]` fails inside core:
+    // the vtable constant's evaluation reports E0080 ("values
+    // of the type ... are too big for the target
+    // architecture"). Conversion materializes the instance,
+    // discounts the diagnostic at the fetch and records it;
+    // the monomorphization walk turns the record into the
+    // compilation verdict. With debuginfo the session used to
+    // reach the same rejection through code generation's own
+    // error path, but without debuginfo code generation
+    // evaluated the erroneous constant first and panicked
+    // ("erroneous constant missed by mono item collection"),
+    // so the driver reported a compiler crash (exit 101)
+    // instead of the failure. The verdict now stops the
+    // session before code generation in both shapes.
+    let case = Case::new("vtable-oversized-const");
+    let src = case.write(
+        "case.rs",
+        "#![feature(try_as_dyn)]\n\
+         trait Trait {}\n\
+         pub fn foo(x: &[u8; usize::MAX]) {\n\
+             let _ = std::any::try_as_dyn::<[u8; usize::MAX], dyn Trait>(x);\n\
+         }\n",
+    );
+    for debuginfo in ["0", "2"] {
+        let flag = format!("debuginfo={debuginfo}");
+        let (code, _stdout, stderr) = case.convert(
+            &src,
+            &[
+                "--rustc-arg",
+                "--crate-type=lib",
+                "--rustc-arg",
+                "--emit=mir",
+                "--rustc-arg",
+                "-C",
+                "--rustc-arg",
+                &flag,
+            ],
+            true,
+        );
+        assert_eq!(code, 1, "debuginfo={debuginfo} stderr={stderr}");
+        assert!(
+            stderr.contains("compilation failed"),
+            "debuginfo={debuginfo} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("too big for the target architecture"),
+            "debuginfo={debuginfo} stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("conversion panicked"),
+            "debuginfo={debuginfo} stderr={stderr}"
+        );
+    }
 }
