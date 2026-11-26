@@ -1512,6 +1512,20 @@ const DEBUG_HUGE_VEC_SRC: &str = r#"fn main() {
 fn zzz() {}
 "#;
 
+const DEBUG_NESTED_BOX_SRC: &str = r#"enum Opt<T> { Empty, Val { val: T } }
+struct Node { next: Opt<Box<Box<Box<Node>>>>, value: usize }
+struct Pair(usize, usize);
+fn main() {
+    let deep = Box::new(Box::new(Box::new(Node {
+        next: Opt::Val { val: Box::new(Box::new(Box::new(Node { next: Opt::Empty, value: 31 }))) },
+        value: 30 })));
+    let pair = Box::new(Box::new(Pair(41, 42)));
+    zzz();
+    let _ = &pair;
+}
+fn zzz() {}
+"#;
+
 #[test]
 fn debug_mode_huge_sparse_vec_prints_without_materialising() {
     // The `pretty-huge-vec` shape: a vector whose declared
@@ -1607,6 +1621,33 @@ fn debug_mode_type_names_display_fidelity() {
         "type = (type_names::main::{closure_env#0}, usize)",
         "type = (type_names::main::{closure_env#1}, usize)",
     ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn debug_mode_field_steps_deref_nested_boxes() {
+    // A field step dereferences implicitly through every
+    // smart-pointer layer, the reading gdb applies: the
+    // debuginfo recursive-struct record's anonymous-types
+    // local wraps its struct in five `Box` layers, and both
+    // the named field and the enum-variant field behind them
+    // must resolve (a single-layer dereference stops at the
+    // next `Box`, whose shape has no such field). Positional
+    // fields take the same path.
+    let dir = temp_dir("debug-nested-box");
+    let src = fixture(&dir, "nested_box.rs", DEBUG_NESTED_BOX_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 9\nrun\nprint deep.value\nprint deep.next.val.value\nprint pair.1\nprint pair.0\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = 30", "$2 = 31", "$3 = 42", "$4 = 41"] {
         assert!(
             stdout.contains(want),
             "missing `{want}` in debug transcript: {stdout}"
