@@ -6658,38 +6658,55 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::SliceIter => {
                 arity(1)?;
-                let (elems, _) = match self.slice_elements(frames, &vals[0]) {
-                    Ok(elems) => elems,
-                    Err(err) => {
-                        // A slice over an address-only pointer
-                        // has no elements in the value model —
-                        // unless the element type has a single
-                        // value, in which case every element is
-                        // that value and no storage is needed to
-                        // produce them. A slice over a scalar's
-                        // own storage (the `slice::from_ref`
-                        // shape) reads its elements from the
-                        // storage itself.
-                        let elem_tag =
-                            generic_args.first().map(String::as_str).unwrap_or("");
-                        match self
-                            .scalar_backed_slice_elements(frames, &vals[0], elem_tag)
-                            .map(|elems| {
-                                let len = elems.len() as u128;
-                                (elems, len)
-                            })
-                            .or_else(|| {
-                                self.storageless_slice_elements(
-                                    frames,
-                                    &vals[0],
-                                    elem_tag,
-                                )
-                            })
-                        {
-                            Some(elems) => elems,
-                            None => return Err(err),
+                // A fat pointer whose formation regrouped its
+                // storage's elements iterates under the element
+                // type the call names, not the stored shape (see
+                // `regrouped_iter_elements`).
+                let regrouped = generic_args
+                    .first()
+                    .and_then(|tag| ty_from_tag(tag))
+                    .and_then(|elem_ty| {
+                        self.regrouped_iter_elements(frames, &vals[0], &elem_ty)
+                    })
+                    .map(|elems| {
+                        let len = elems.len() as u128;
+                        (elems, len)
+                    });
+                let (elems, _) = match regrouped {
+                    Some(elems) => elems,
+                    None => match self.slice_elements(frames, &vals[0]) {
+                        Ok(elems) => elems,
+                        Err(err) => {
+                            // A slice over an address-only pointer
+                            // has no elements in the value model —
+                            // unless the element type has a single
+                            // value, in which case every element is
+                            // that value and no storage is needed to
+                            // produce them. A slice over a scalar's
+                            // own storage (the `slice::from_ref`
+                            // shape) reads its elements from the
+                            // storage itself.
+                            let elem_tag =
+                                generic_args.first().map(String::as_str).unwrap_or("");
+                            match self
+                                .scalar_backed_slice_elements(frames, &vals[0], elem_tag)
+                                .map(|elems| {
+                                    let len = elems.len() as u128;
+                                    (elems, len)
+                                })
+                                .or_else(|| {
+                                    self.storageless_slice_elements(
+                                        frames,
+                                        &vals[0],
+                                        elem_tag,
+                                    )
+                                })
+                            {
+                                Some(elems) => elems,
+                                None => return Err(err),
+                            }
                         }
-                    }
+                    },
                 };
                 Ok(slice_iter_value(elems))
             }
@@ -9144,29 +9161,55 @@ impl<'a> Interpreter<'a> {
             // builds and `Iterator::next` consumes. A
             // scalar-backed slice (the `slice::from_ref`
             // shape) reads its elements from the scalar's
-            // own storage.
-            let (elems, _) = match self.slice_elements(frames, &value) {
-                Ok(elems) => elems,
-                Err(err) => {
-                    let elem_tag = slice_container_element_tag(self_ty)
-                        .or_else(|| {
-                            slice_container_element_tag(
-                                self_ty.strip_prefix('&').unwrap_or(self_ty),
-                            )
-                        })
-                        .unwrap_or("");
-                    match self.scalar_backed_slice_elements(
-                        frames,
-                        &value,
-                        elem_tag,
-                    ) {
-                        Some(elems) => {
-                            let len = elems.len() as u128;
-                            (elems, len)
+            // own storage. A fat pointer whose formation
+            // regrouped its storage's elements iterates
+            // under the element type the slice type names,
+            // not the stored shape (see
+            // `regrouped_iter_elements`).
+            let elem_ty = match ty_from_tag(super::fmt::pointee_tag(self_ty)) {
+                Some(Ty::Slice(elem)) | Some(Ty::Array(elem, _)) => Some(*elem),
+                _ => slice_container_element_tag(self_ty)
+                    .or_else(|| {
+                        slice_container_element_tag(
+                            self_ty.strip_prefix('&').unwrap_or(self_ty),
+                        )
+                    })
+                    .and_then(ty_from_tag),
+            };
+            let regrouped = elem_ty
+                .as_ref()
+                .and_then(|elem_ty| {
+                    self.regrouped_iter_elements(frames, &value, elem_ty)
+                })
+                .map(|elems| {
+                    let len = elems.len() as u128;
+                    (elems, len)
+                });
+            let (elems, _) = match regrouped {
+                Some(elems) => elems,
+                None => match self.slice_elements(frames, &value) {
+                    Ok(elems) => elems,
+                    Err(err) => {
+                        let elem_tag = slice_container_element_tag(self_ty)
+                            .or_else(|| {
+                                slice_container_element_tag(
+                                    self_ty.strip_prefix('&').unwrap_or(self_ty),
+                                )
+                            })
+                            .unwrap_or("");
+                        match self.scalar_backed_slice_elements(
+                            frames,
+                            &value,
+                            elem_tag,
+                        ) {
+                            Some(elems) => {
+                                let len = elems.len() as u128;
+                                (elems, len)
+                            }
+                            None => return Err(err),
                         }
-                        None => return Err(err),
                     }
-                }
+                },
             };
             Ok(slice_iter_value(elems))
         } else if self_ty.starts_with("&std::collections::BTreeSet<") {

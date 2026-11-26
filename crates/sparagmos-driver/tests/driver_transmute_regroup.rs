@@ -503,3 +503,90 @@ fn main() {
          u16-slice: [513, 1027]\n"
     );
 }
+
+/// Iteration over a regrouped slice yields the elements
+/// under the cast's shape: the `iter` / `into_iter`
+/// snapshots compose their elements from the storage's
+/// bytes under the element type the iterator's own type
+/// names, as the element reads and the formatting do.
+#[test]
+fn cast_slice_regroup_iteration() {
+    let stdout = run_ok(
+        "cast-regroup-iteration",
+        "cast_regroup_iteration.rs",
+        r#"
+fn main() {
+    let l: [[u8; 3]; 2] = [[3, 2, 6], [4, 5, 1]];
+    let p: *const [[u8; 3]] = &l;
+    let p: &[[u8; 2]] = unsafe { &*(p as *const [[u8; 2]]) };
+    for e in p.iter() {
+        println!("iter: {:?}", e);
+    }
+    let v: Vec<[u8; 2]> = p.iter().copied().collect();
+    println!("collected: {:?}", v);
+    let mut sum = 0u32;
+    for e in p {
+        for x in e {
+            sum += *x as u32;
+        }
+    }
+    println!("sum: {}", sum);
+    println!("count: {}", p.iter().count());
+    for (i, e) in p.iter().enumerate() {
+        println!("enum {}: {:?}", i, e);
+    }
+    for e in p.iter().rev() {
+        println!("rev: {:?}", e);
+    }
+    // A whole-slice re-slice of the regrouped view keeps
+    // the denomination (its base starts at the storage's
+    // first byte).
+    let q: &[[u8; 2]] = &p[..];
+    for e in q.iter() {
+        println!("whole: {:?}", e);
+    }
+    // The slice adapter steps compose their elements the
+    // same way.
+    for w in p.windows(2) {
+        println!("win: {:?}", w);
+    }
+    for c in p.chunks(1) {
+        println!("chunk: {:?}", c);
+    }
+    // A widening regrouping: the same storage ranged over
+    // as `u16` elements.
+    let s: &[u16] = unsafe { &*(&l as *const [[u8; 3]] as *const [u16]) };
+    for x in s.iter() {
+        println!("u16: {}", x);
+    }
+    // The non-regrouped control is unchanged.
+    let plain: &[u8] = &[10, 20, 30];
+    for x in plain.iter() {
+        println!("plain: {}", x);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "iter: [3, 2]\n\
+         iter: [6, 4]\n\
+         collected: [[3, 2], [6, 4]]\n\
+         sum: 15\n\
+         count: 2\n\
+         enum 0: [3, 2]\n\
+         enum 1: [6, 4]\n\
+         rev: [6, 4]\n\
+         rev: [3, 2]\n\
+         whole: [3, 2]\n\
+         whole: [6, 4]\n\
+         win: [[3, 2], [6, 4]]\n\
+         chunk: [[3, 2]]\n\
+         chunk: [[6, 4]]\n\
+         u16: 515\n\
+         u16: 1030\n\
+         plain: 10\n\
+         plain: 20\n\
+         plain: 30\n"
+    );
+}
