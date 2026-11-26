@@ -5890,3 +5890,139 @@ fn run_mode_split_at_and_raw_parts_over_vec_of_vecs() {
         "split 1 4 10\nraw 4 6\nwin 6\nmut 99\n",
     );
 }
+
+const VEC_PUSH_GROW_O3_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    let ok = v.len() == 3
+        && v.capacity() >= 3
+        && v[0] == 1
+        && v[1] == 2
+        && v[2] == 3;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// At opt-level 3 a `Vec::push` that reallocates runs the
+/// collected `RawVec::grow_one` body, which reads the capacity
+/// through the `&mut RawVec` / `&mut RawVecInner` references the
+/// caller formed over the vector's buffer field and writes the
+/// grown capacity and buffer pointer back through them. The
+/// vector a builtin built is in its real aggregate form, so
+/// those references must denote the aggregate's own field
+/// storage: completing the buffer-chain walk as the bare
+/// buffer pointer loses the vector place, the capacity read
+/// fabricates an empty aggregate for the `UsizeNoHighBit`
+/// slot, and the run stops with `type mismatch in assignment:
+/// expected Uint(Usize), found ADT value`.
+#[test]
+fn run_mode_vec_push_grows_from_empty_o3() {
+    let dir = temp_dir("vec-push-grow-o3");
+    let src = fixture(&dir, "case.rs", VEC_PUSH_GROW_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 push with reallocation must run to completion; stderr={stderr}"
+    );
+}
+
+const VEC_PUSH_GROW_WITH_CAPACITY_O3_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(2);
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(4);
+    let ok = v.len() == 4
+        && v.capacity() >= 4
+        && v[0] == 1
+        && v[1] == 2
+        && v[2] == 3
+        && v[3] == 4;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// The same growth through a vector whose buffer already lives
+/// in a heap allocation: the reallocation must copy the stored
+/// elements into the new buffer and record the new capacity in
+/// the vector's aggregate.
+#[test]
+fn run_mode_vec_push_grows_past_with_capacity_o3() {
+    let dir = temp_dir("vec-push-grow-with-capacity-o3");
+    let src = fixture(&dir, "case.rs", VEC_PUSH_GROW_WITH_CAPACITY_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 push past with_capacity must run to completion; stderr={stderr}"
+    );
+}
+
+const VEC_RESERVE_GROW_O3_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.reserve(10);
+    let mut ok = v.capacity() >= 11 && v.len() == 1 && v[0] == 1;
+    for i in 0..10 {
+        v.push(i);
+    }
+    ok = ok && v.len() == 11 && v[10] == 9;
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// `reserve` grows through the same `RawVec` growth path as a
+/// reallocating `push` (here without a following reallocation:
+/// the pushes afterwards fit the reserved capacity).
+#[test]
+fn run_mode_vec_reserve_grows_o3() {
+    let dir = temp_dir("vec-reserve-grow-o3");
+    let src = fixture(&dir, "case.rs", VEC_RESERVE_GROW_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 reserve growth must run to completion; stderr={stderr}"
+    );
+}
+
+const VEC_MANY_PUSHES_O3_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..100u64 {
+        v.push(i * 3);
+    }
+    let mut ok = v.len() == 100 && v.capacity() >= 100;
+    for i in 0..100u64 {
+        if v[i as usize] != i * 3 {
+            ok = false;
+        }
+    }
+    std::process::exit(if ok { 0 } else { 3 });
+}
+"#;
+
+/// Repeated growth: every reallocation moves the stored
+/// elements to the new buffer, so a hundred pushes read back
+/// exactly what was pushed.
+#[test]
+fn run_mode_vec_many_pushes_realloc_o3() {
+    let dir = temp_dir("vec-many-pushes-o3");
+    let src = fixture(&dir, "case.rs", VEC_MANY_PUSHES_O3_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 repeated push growth must run to completion; stderr={stderr}"
+    );
+}
