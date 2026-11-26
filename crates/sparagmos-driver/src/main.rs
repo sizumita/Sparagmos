@@ -1168,53 +1168,7 @@ fn driver_main_inner() {
             let reason = take_captured_panic()
                 .or_else(|| payload_reason(&*payload))
                 .unwrap_or_else(|| "panic with a non-string payload".to_string());
-            if is_delayed_bug_flush(&reason) {
-                // The compiler died on an internal error of its own
-                // (see `is_delayed_bug_flush`): a compiler crash
-                // (Issue #66). Convert mode reports it with the
-                // crash exit code, the code the native compiler
-                // dies with on the same flush; run mode keeps its
-                // single unsupported code, and the
-                // compilation-failure report, for every
-                // conversion-side failure.
-                if exec_mode {
-                    eprintln!("sparagmos-driver: compilation failed: {DELAYED_BUG_ABORT}");
-                    exit_process(2);
-                }
-                eprintln!("sparagmos-driver: compiler crashed: {DELAYED_BUG_ABORT}");
-                exit_process(101);
-            }
-            if let Some(abort) = treat_err_abort_reason(&reason) {
-                // The compiler itself aborted the compilation on a
-                // diagnostic it had already reported, under a flag
-                // ordering exactly that: a compilation failure, not
-                // a conversion gap, so it takes the
-                // compilation-failure report (and its exit codes),
-                // exactly like a front-end rejection recorded by
-                // the callbacks.
-                eprintln!("sparagmos-driver: compilation failed: {abort}");
-                exit_process(if exec_mode { 2 } else { 1 });
-            }
-            if mode == Mode::RunJit {
-                eprintln!(
-                    "sparagmos-driver run-jit: unsupported: Stable MIR conversion panicked: {reason}"
-                );
-                exit_process(2);
-            }
-            if exec_mode {
-                eprintln!(
-                    "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
-                );
-                exit_process(2);
-            }
-            // Any other panic that escapes the compiler run is an
-            // internal failure of the compiler itself (Issue #66):
-            // convert mode reports it as a crash, not as a clean
-            // compilation failure. Panics the conversion contains
-            // per body or per query never reach this point; they
-            // keep their named reasons in the report.
-            eprintln!("sparagmos-driver: Stable MIR conversion panicked: {reason}");
-            exit_process(101);
+            report_escaped_panic(&reason, exec_mode, mode);
         }
     };
     let collected = take();
@@ -1382,10 +1336,14 @@ fn driver_main_inner() {
             }
         }
         (Err(e), _) => {
-            eprintln!("sparagmos-driver: compilation failed: {e:?}");
-            // In run mode a failed compilation is a conversion failure,
-            // which the run contract reports as exit 2.
-            exit_process(if exec_mode { 2 } else { 1 });
+            // A panic raised inside the run can be folded into
+            // this bare `CompilerError::Failed` by the compiler's
+            // fatal-error machinery before it reaches the
+            // `catch_unwind` above; `report_failed_run` surfaces
+            // the panic hook's record of such a panic (see
+            // `begin_panic_capture`) and otherwise keeps the
+            // bare compilation-failure report.
+            report_failed_run(&e, exec_mode, mode);
         }
     }
 }

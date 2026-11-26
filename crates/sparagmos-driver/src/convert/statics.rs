@@ -137,7 +137,7 @@ impl Converter {
     pub fn note_unicode_data_tables(&mut self) {
         let mut crates = vec![rustc_public::local_crate()];
         crates.extend(rustc_public::external_crates());
-        for def in crates.iter().flat_map(|krate| krate.statics()) {
+        for def in crates.iter().flat_map(|krate| crate_statics(krate)) {
             let name = def.name();
             if !is_unicode_data_table(&name) || self.extra_static_seeds.contains_key(&name) {
                 continue;
@@ -156,6 +156,22 @@ impl Converter {
             }
         }
     }
+}
+
+/// The statics of one crate, enumerated under the same
+/// containment as the demand passes' foreign scans (see
+/// `foreign_fn_defs` in the driver binary): enumerating a
+/// crate's items asks the compiler for each item's kind, and
+/// a kind query an earlier contained panic poisoned aborts
+/// with the compiler's fatal error instead of answering,
+/// taking the whole compilation with it. A crate that cannot
+/// be enumerated contributes no statics here — the unicode
+/// tables live in core, so a foreign crate that fails
+/// enumeration loses nothing this pass exists to record —
+/// and one unenumerable crate must not abort the conversion.
+fn crate_statics(krate: &rustc_public::Crate) -> Vec<mir::mono::StaticDef> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| krate.statics()))
+        .unwrap_or_default()
 }
 
 /// Whether the item name is one of core's generated unicode
