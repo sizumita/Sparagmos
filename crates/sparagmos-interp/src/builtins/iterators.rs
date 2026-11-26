@@ -3614,6 +3614,25 @@ impl<'a> Interpreter<'a> {
                 return Ok((iterator_state_like(state, new_fields), item));
             }
         }
+        // An `array::IntoIter` in its real layout (the
+        // nested aggregate an inlined `array::IntoIter`
+        // construction builds -- see `array_iter_real_parts`):
+        // the modelled arm below steps only the [items, next
+        // index] state the `IntoIterator` builtin builds, so
+        // the real layout is stepped on its alive range first,
+        // the real-layout step `vec_into_iter_step_real` gives
+        // the Vec iterator on its pointer pair.
+        if self_ty.starts_with("std::array::IntoIter<") && fields.len() == 1 {
+            if let Some((new_state, item)) = array_iter_real_step(state, false) {
+                return Ok((
+                    new_state,
+                    match item {
+                        Some(value) => some_value(value),
+                        None => none_value(),
+                    },
+                ));
+            }
+        }
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
                 return Err(InterpError::type_mismatch(
@@ -5663,6 +5682,14 @@ impl<'a> Interpreter<'a> {
             }
             return Ok(hint(bytes, Some(bytes)));
         }
+        if self_ty.starts_with("std::array::IntoIter<") {
+            // The real layout (see `array_iter_real_parts`):
+            // the remaining count is the alive range's length.
+            if let Some(parts) = array_iter_real_parts(&state) {
+                let n = (parts.end - parts.start) as u128;
+                return Ok(hint(n, Some(n)));
+            }
+        }
         if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
@@ -7078,6 +7105,15 @@ fn step_owned_iter_back(
     state: &Value,
     self_ty: &str,
 ) -> InterpResult<(Value, Option<Value>)> {
+    // An `array::IntoIter` in its real layout (see
+    // `array_iter_real_parts`) steps from the back of its
+    // alive range, rebuilt in the same layout; the modelled
+    // parts below serve the [items, next index] state.
+    if self_ty.starts_with("std::array::IntoIter<") {
+        if let Some(step) = array_iter_real_step(state, true) {
+            return Ok(step);
+        }
+    }
     let (items, idx) = owned_iter_parts(state, self_ty)?;
     if items.len() > idx {
         let item = items[items.len() - 1].clone();
@@ -7272,6 +7308,216 @@ fn iterator_next_back_state(
     Err(unsupported(format!(
         "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"
     )))
+}
+
+/// The decoded real layout of an `array::IntoIter` state:
+/// the nested aggregate core's own construction builds,
+/// `IntoIter { inner: ManuallyDrop { value: PolymorphicIter {
+/// alive: IndexRange { start, end }, data: [MaybeUninit<T>;
+/// N] } } }`. This is the form the state has whenever the
+/// construction was inlined into the body that created the
+/// iterator (at higher opt levels the `into_iter` call in
+/// user code inlines, so the state a consumer builtin --
+/// `collect`, `extend_trusted`, `sum` -- receives is this
+/// aggregate), as opposed to the modelled [items, next
+/// index] state the `IntoIterator` builtin builds and the
+/// owned-iterator arm in `next_on_state` steps. The wrapper
+/// variants and the core's field order are carried verbatim
+/// so a stepped state rebuilds in exactly the shape it
+/// arrived in: guest code that later reads the iterator (an
+/// inlined `next`, `as_slice`, its drop glue) sees the
+/// layout it expects.
+struct ArrayIterRealParts {
+    /// Variants of the peeled one-field wrappers, outermost
+    /// first (the `IntoIter` aggregate itself, then the
+    /// `ManuallyDrop`).
+    wrappers: Vec<u32>,
+    /// The core aggregate's variant (the `PolymorphicIter`).
+    core_variant: u32,
+    /// Whether the core's fields are [alive, data] (the
+    /// declared order) rather than [data, alive].
+    alive_first: bool,
+    /// The alive range's own container variant, or `None`
+    /// when the range arrived as a tuple.
+    alive_variant: Option<u32>,
+    /// The data slots as stored: each a `MaybeUninit`
+    /// one-field aggregate around the element, or `Uninit`.
+    slots: Vec<Value>,
+    start: usize,
+    end: usize,
+}
+
+impl ArrayIterRealParts {
+    /// Rebuild the state in the same layout, with the given
+    /// data slots and alive range.
+    fn rebuild(&self, slots: Vec<Value>, start: usize, end: usize) -> Value {
+        let alive = match self.alive_variant {
+            Some(variant) => Value::Enum {
+                variant,
+                fields: vec![
+                    Value::Uint(start as u128),
+                    Value::Uint(end as u128),
+                ],
+            },
+            None => Value::Tuple(vec![
+                Value::Uint(start as u128),
+                Value::Uint(end as u128),
+            ]),
+        };
+        let data = Value::Tuple(slots);
+        let core_fields = if self.alive_first {
+            vec![alive, data]
+        } else {
+            vec![data, alive]
+        };
+        let mut value = Value::Enum {
+            variant: self.core_variant,
+            fields: core_fields,
+        };
+        for variant in self.wrappers.iter().rev() {
+            value = Value::Enum {
+                variant: *variant,
+                fields: vec![value],
+            };
+        }
+        value
+    }
+}
+
+/// Decode an `array::IntoIter` state in its real layout
+/// (see [`ArrayIterRealParts`]), or `None` when the state
+/// is not that shape -- the modelled [items, next index]
+/// state above all -- leaving the caller its usual
+/// handling.
+fn array_iter_real_parts(state: &Value) -> Option<ArrayIterRealParts> {
+    // Peel the one-field wrappers: `IntoIter`'s `inner`,
+    // then `ManuallyDrop`'s `value`.
+    let mut wrappers = Vec::new();
+    let mut cur = state;
+    while let Value::Enum { variant, fields } = cur {
+        if fields.len() != 1 {
+            break;
+        }
+        if wrappers.len() >= 2 {
+            return None;
+        }
+        wrappers.push(*variant);
+        cur = &fields[0];
+    }
+    if wrappers.is_empty() {
+        return None;
+    }
+    let Value::Enum {
+        variant: core_variant,
+        fields: core,
+    } = cur
+    else {
+        return None;
+    };
+    if core.len() != 2 {
+        return None;
+    }
+    // The core's two fields are the alive range and the
+    // data tuple, in either order: the range is the
+    // two-integer aggregate, the data the tuple of slots.
+    let as_range = |v: &Value| -> Option<(Option<u32>, u128, u128)> {
+        let (variant, fields) = match v {
+            Value::Enum { variant, fields } => (Some(*variant), fields),
+            Value::Tuple(fields) => (None, fields),
+            _ => return None,
+        };
+        if fields.len() != 2 {
+            return None;
+        }
+        match (&fields[0], &fields[1]) {
+            (Value::Uint(a), Value::Uint(b)) => Some((variant, *a, *b)),
+            _ => None,
+        }
+    };
+    let (alive_variant, start, end, alive_first, slots) =
+        match (as_range(&core[0]), &core[1]) {
+            (Some((variant, a, b)), Value::Tuple(slots)) => {
+                (variant, a, b, true, slots.clone())
+            }
+            _ => match (as_range(&core[1]), &core[0]) {
+                (Some((variant, a, b)), Value::Tuple(slots)) => {
+                    (variant, a, b, false, slots.clone())
+                }
+                _ => return None,
+            },
+        };
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    if start > end || end > slots.len() {
+        return None;
+    }
+    Some(ArrayIterRealParts {
+        wrappers,
+        core_variant: *core_variant,
+        alive_first,
+        alive_variant,
+        slots,
+        start,
+        end,
+    })
+}
+
+/// The element a real-layout data slot holds: the payload
+/// of its `MaybeUninit` one-field aggregate, or the slot
+/// itself when it is uninitialised. `None` for any other
+/// shape, which is not a slot this step reads.
+fn array_iter_slot_item(slot: &Value) -> Option<Value> {
+    match slot {
+        Value::Uninit => Some(Value::Uninit),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            Some(fields[0].clone())
+        }
+        _ => None,
+    }
+}
+
+/// A real-layout data slot's form after its element has
+/// moved out: the `MaybeUninit` wrapper kept, its payload
+/// uninitialised -- the marking the modelled step performs
+/// on its snapshot, one wrapper down.
+fn array_iter_slot_dead(slot: &Value) -> Value {
+    match slot {
+        Value::Enum { variant, fields } if fields.len() == 1 => {
+            Value::Enum {
+                variant: *variant,
+                fields: vec![Value::Uninit],
+            }
+        }
+        _ => Value::Uninit,
+    }
+}
+
+/// One step (front or back) of an `array::IntoIter` state
+/// in its real layout (see [`array_iter_real_parts`]):
+/// yields the element at the stepped end of the alive
+/// range, marks its slot moved out, and rebuilds the state
+/// in the same layout with the range narrowed by one.
+/// `None` when the state is not the real layout, leaving
+/// the caller its modelled handling and its shape error.
+fn array_iter_real_step(
+    state: &Value,
+    back: bool,
+) -> Option<(Value, Option<Value>)> {
+    let parts = array_iter_real_parts(state)?;
+    let (start, end) = (parts.start, parts.end);
+    if start >= end {
+        return Some((state.clone(), None));
+    }
+    let idx = if back { end - 1 } else { start };
+    let item = array_iter_slot_item(&parts.slots[idx])?;
+    let mut slots = parts.slots.clone();
+    slots[idx] = array_iter_slot_dead(&slots[idx]);
+    let (start, end) = if back {
+        (start, end - 1)
+    } else {
+        (start + 1, end)
+    };
+    Some((parts.rebuild(slots, start, end), Some(item)))
 }
 
 /// One `next` step of a `vec::IntoIter` in its real field
