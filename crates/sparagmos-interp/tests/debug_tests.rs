@@ -1553,3 +1553,137 @@ fn step_over_skips_a_temp_store_for_the_call_it_feeds() {
     );
 }
 
+
+#[test]
+fn history_reference_rereads_an_earlier_print_gdb() {
+    let mut s = session(sample_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("x"), print("$1")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "$1 = 42"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    // The history print is itself a print: its value takes
+    // the next history slot.
+    assert!(
+        run.transcript.iter().any(|l| l == "$2 = 42"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+/// A program with two in-scope values of different content:
+/// `x`, the computed local (42 at the line-3 stop), and `c`, a
+/// constant-valued variable (7).
+fn two_value_program() -> Program {
+    program_with_vars(vec![
+        DebugVarEntry {
+            name: "x".to_string(),
+            source: DebugVar::Place(1, vec![]),
+            is_char: false,
+            ty: None,
+            lines: (2, 2),
+        },
+        DebugVarEntry {
+            name: "c".to_string(),
+            source: DebugVar::Constant(Constant::Int(7)),
+            is_char: false,
+            ty: None,
+            lines: (2, 2),
+        },
+    ])
+}
+
+#[test]
+fn history_comparison_prints_the_equality_boolean_gdb() {
+    let mut s = session(two_value_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("x"),
+            print("c"),
+            print("$1 == $2"),
+            print("$1 != $2"),
+            print("$1 == $1"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in ["$1 = 42", "$2 = 7", "$3 = false", "$4 = true", "$5 = true"] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in transcript: {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn failed_print_keeps_its_history_slot_gdb() {
+    let mut s = session(sample_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("y"),
+            print("x"),
+            print("$2 == $2"),
+            print("$1"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    // The failed print took $1, so `x` is $2 and its
+    // self-comparison is $3; reading $1 back reports the
+    // failed print's empty slot.
+    assert!(
+        run.transcript.iter().any(|l| l == "$2 = 42"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "$3 = true"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript
+            .iter()
+            .any(|l| l.contains("history value `$1` has no value")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn history_comparison_lldb_numbers_from_zero() {
+    let mut s = session(two_value_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("x"),
+            print("c"),
+            print("$0 == $1"),
+            print("$0 != $1"),
+        ],
+        DebugDialect::Lldb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "= false"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "= true"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}

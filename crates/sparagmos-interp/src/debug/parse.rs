@@ -1,11 +1,12 @@
-//! The print-expression parser: dereferences, a base variable or static path, and the field / index steps after it.
+//! The print-expression parser: dereferences, a base variable, static path or history reference, and the field / index steps after it.
 
 use super::desc::Desc;
 
 /// A parsed print expression: dereferences first (they prefix
 /// the whole expression in debugger syntax), then a base
-/// variable — a plain name or a path naming a static — then
-/// field/index steps.
+/// variable — a plain name, a path naming a static, or a
+/// history reference (`$1`) naming an earlier print's value —
+/// then field/index steps.
 pub(super) struct ParsedExpr {
     pub(super) base: String,
     pub(super) steps: Vec<ExprStep>,
@@ -161,6 +162,25 @@ pub(super) fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
         }
         Ok(rest[s..*i].to_string())
     };
+    // A history reference (`$1`, `$12`) is a base of its own:
+    // it names the value an earlier print of the session
+    // produced (see `resolve_base` in the evaluator).
+    if rest.starts_with('$') {
+        let mut i = 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 1 {
+            return Err(format!("cannot parse expression `{text}`"));
+        }
+        let mut steps: Vec<ExprStep> = Vec::new();
+        parse_steps(&rest[i..], &mut steps)?;
+        steps.extend((0..derefs).map(|_| ExprStep::Deref));
+        return Ok(ParsedExpr {
+            base: rest[..i].to_string(),
+            steps,
+        });
+    }
     let mut base = ident(&mut i)?;
     while rest[i..].starts_with("::") {
         i += 2;
@@ -177,4 +197,37 @@ pub(super) fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
     parse_steps(&rest[i..], &mut steps)?;
     steps.extend((0..derefs).map(|_| ExprStep::Deref));
     Ok(ParsedExpr { base, steps })
+}
+
+/// Split a print expression at its top-level comparison: the
+/// `==` or `!=` outside any parenthesis or bracket, returning
+/// (lhs, is_equal, rhs) with both sides trimmed, or None when
+/// the expression carries no top-level comparison (or a side
+/// is empty). The evaluator speaks exactly one comparison, at
+/// the top level of the whole expression — the form the
+/// debuginfo suite's history checks use (`print $1 == $2`); a
+/// parenthesised comparison is outside the grammar. Each side
+/// is a print expression of the ordinary grammar, steps and
+/// casts included.
+pub(super) fn split_comparison(text: &str) -> Option<(&str, bool, &str)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'=' | b'!' if depth == 0 && bytes.get(i + 1) == Some(&b'=') => {
+                let lhs = text[..i].trim();
+                let rhs = text[i + 2..].trim();
+                if lhs.is_empty() || rhs.is_empty() {
+                    return None;
+                }
+                return Some((lhs, bytes[i] == b'=', rhs));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }

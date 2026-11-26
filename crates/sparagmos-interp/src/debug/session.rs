@@ -4,7 +4,7 @@ use crate::interp::{Frame, Interpreter};
 use crate::ir::{Body, Local, Program, SourceLine, Ty};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use super::evaluate::{evaluate_print, render_print};
+use super::evaluate::{EvaluatedValue, evaluate_print, render_print};
 use super::queries::{render_info_functions, render_info_locals, render_type_query};
 
 /// One command of a debugger session script, in the vocabulary the
@@ -214,6 +214,17 @@ pub(crate) struct DebugControl {
     pub(super) current_pos: Option<(u32, u32)>,
     /// The `$N` counter of gdb-form print output.
     pub(super) print_count: u32,
+    /// The print history: one slot per print command the
+    /// session has executed, in execution order — the value
+    /// the print evaluated to, or None when it failed. A slot
+    /// exists for a failed print too, so the numbering stays
+    /// aligned with the transcript's own `$N` labels (gdb's
+    /// `$N = ` prefix advances on a failed print in this
+    /// session's form, as `print_count` records). gdb names
+    /// slot i `$<i+1>` and lldb `$<i>`; a print expression
+    /// resolves the names against this table (see
+    /// `resolve_base` in the evaluator).
+    pub(super) history: Vec<Option<EvaluatedValue>>,
     /// The transcript lines emitted so far.
     transcript: Vec<String>,
     /// Source text by file id, for rendering stop lines.
@@ -408,6 +419,7 @@ impl DebugSession {
             bp_bindings: HashMap::new(),
             selected_frame: 0,
             print_count: 0,
+            history: Vec::new(),
             transcript: Vec::new(),
             source_text: std::mem::take(&mut self.source_text),
             dialect,

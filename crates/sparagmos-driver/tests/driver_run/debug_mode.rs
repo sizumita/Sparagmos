@@ -1314,6 +1314,82 @@ fn debug_mode_unsized_fat_pointer_forms() {
     }
 }
 
+fn debug_driver_session(
+    dir: &Path,
+    src: &Path,
+    script: &str,
+    dialect: &str,
+) -> Output {
+    // The subset runner's session invocation: the test's `-g`
+    // compile flag and the pass-disabled MIR pipeline the
+    // debugger sessions execute.
+    let script_path = dir.join("session.script");
+    std::fs::write(&script_path, script).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("debug")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--rustc-arg")
+        .arg("-g")
+        .arg("--rustc-arg")
+        .arg("-Zmir-opt-level=0")
+        .arg("--debug-script")
+        .arg(&script_path)
+        .arg("--debug-dialect")
+        .arg(dialect)
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+const DEBUG_HISTORY_EQ_SRC: &str = r#"struct Foo {
+    a: usize,
+}
+
+impl Foo {
+    #[inline(never)]
+    fn get_a(&self) -> Option<usize> {
+        Some(self.a)
+    }
+
+    #[inline(never)]
+    fn var_return_opt_try(&self) -> Option<usize> {
+        let r = self.get_a()?;
+        Some(r)
+    }
+}
+
+fn main() {
+    let f = Foo { a: 1 };
+    let _ = f.var_return_opt_try();
+}
+"#;
+
+#[test]
+fn debug_mode_history_equality_at_fn_breakpoint_gdb() {
+    // The debuginfo suite's zst-interferes-with-prologue
+    // session: stop in a method by function breakpoint, print
+    // `self`, step once, print it again, and print the history
+    // comparison `$1 == $2` — the session must answer `true`,
+    // the receiver being the same object at both stops.
+    let dir = temp_dir("debug-history-eq-gdb");
+    let src = fixture(&dir, "zst_prologue.rs", DEBUG_HISTORY_EQ_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "pretty-printers\nbreak-fn zst_prologue::Foo::var_return_opt_try\nrun\nprint self\nnext\nprint self\nprint $1 == $2\n",
+        "gdb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["$1 = ", "$2 = ", "$3 = true"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
 const DEBUG_STR_TEXT_SRC: &str = r#"struct Holder<'a> {
     inner: &'a str,
 }
@@ -1358,4 +1434,24 @@ fn debug_mode_str_values_render_as_text() {
             "missing `{want}` in debug transcript: {stdout}"
         );
     }
+}
+
+#[test]
+fn debug_mode_history_equality_at_fn_breakpoint_lldb() {
+    // The same session in lldb form: history numbers run
+    // from $0, and the comparison prints as a bare result.
+    let dir = temp_dir("debug-history-eq-lldb");
+    let src = fixture(&dir, "zst_prologue.rs", DEBUG_HISTORY_EQ_SRC);
+    let out = debug_driver_session(
+        &dir,
+        &src,
+        "break-fn zst_prologue::Foo::var_return_opt_try\nrun\nv self\nnext\nv self\nv $0 == $1\n",
+        "lldb",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("= true"),
+        "missing the comparison result in debug transcript: {stdout}"
+    );
 }
