@@ -3354,6 +3354,51 @@ impl<'a> Interpreter<'a> {
                     projection,
                 }))
             }
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                let target = Resolved::Alloc {
+                    id: *id,
+                    projection: projection.clone(),
+                };
+                let base = self.read_resolved(frames, &target)?;
+                // See the place arm: an element-entry suffix
+                // over a non-sequence entered element
+                // advances the entered position.
+                if !matches!(
+                    base,
+                    Value::Tuple(_)
+                        | Value::SparseVec { .. }
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                ) {
+                    if let Some(projection) =
+                        advance_entry_projection(projection, idx)
+                    {
+                        return Ok(Value::Ref(RefTarget::Alloc {
+                            id: *id,
+                            projection,
+                        }));
+                    }
+                }
+                let mut projection = projection.clone();
+                match base {
+                    Value::Tuple(_) => {
+                        projection.push(RefProj::Index(idx))
+                    }
+                    Value::Enum { .. } => {
+                        projection.push(RefProj::Field(idx))
+                    }
+                    ref other => {
+                        return Err(unsupported(format!(
+                            "Iterator::next for slice::IterMut over a {} is not runtime-supported",
+                            other.kind_name()
+                        )))
+                    }
+                }
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                }))
+            }
             Value::FatRef { base, .. } => self.iter_mut_element_ref(frames, base, idx),
             other => Err(unsupported(format!(
                 "Iterator::next for slice::IterMut over {} is not runtime-supported",
@@ -3827,6 +3872,7 @@ impl<'a> Interpreter<'a> {
                 },
             )
         } else if self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::option::IntoIter<")
@@ -3883,6 +3929,7 @@ impl<'a> Interpreter<'a> {
                 // not drop it a second time. (`slice::Iter` is
                 // stepped by its own real-layout arm above.)
                 let items = if self_ty.starts_with("std::array::IntoIter<")
+                    || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
                     || self_ty.starts_with("std::vec::IntoIter<")
                     || self_ty.starts_with("alloc::vec::IntoIter<")
                     || self_ty.starts_with("std::option::IntoIter<")
@@ -5664,6 +5711,7 @@ impl<'a> Interpreter<'a> {
             return Ok(hint(bytes, Some(bytes)));
         }
         if self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::collections::btree_set::IntoIter<")
@@ -6301,6 +6349,34 @@ pub(super) fn ref_pointee_is_container(inner: &str) -> bool {
         .any(|prefix| inner.starts_with(prefix))
 }
 
+/// The sequence tag a `Box` type tag's pointee names
+/// (`[T]` or `[T; N]`), or `None` for any other pointee:
+/// the boxed sequence forms are the ones whose
+/// `IntoIterator` impls iterate the pointee's elements.
+pub(super) fn box_sequence_tag(self_ty: &str) -> Option<&str> {
+    let inner = generic_first_arg(self_ty, "std::boxed::Box<")
+        .or_else(|| generic_first_arg(self_ty, "alloc::boxed::Box<"))?;
+    let inner = inner.trim();
+    (inner.starts_with('[') && inner.ends_with(']')).then_some(inner)
+}
+
+/// Whether a sequence tag (`[T]` or `[T; N]`) is the
+/// array form: the length separator sits at the tag's
+/// own bracket depth, not inside a nested element tag.
+pub(super) fn sequence_tag_is_array(tag: &str) -> bool {
+    let body = &tag[1..tag.len() - 1];
+    let mut depth = 0i32;
+    for ch in body.chars() {
+        match ch {
+            '<' | '[' | '(' | '{' => depth += 1,
+            '>' | ']' | ')' | '}' => depth -= 1,
+            ';' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether the modelled `ExactSizeIterator::len` serves
 /// this type: the slice-state iterators whose remaining
 /// count the unified bounds read (see
@@ -6345,6 +6421,7 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::collections::btree_set::IntoIter<")
         || self_ty.starts_with("std::collections::btree_map::IntoIter<")
         || self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty_is(self_ty, "std::env::Args")
@@ -6627,6 +6704,7 @@ fn into_iter_identity(ty: &str) -> bool {
         || ty.starts_with("std::collections::btree_map::IntoIter<")
         || ty.starts_with("std::slice::IterMut<")
         || ty.starts_with("std::array::IntoIter<")
+        || ty.starts_with("std::boxed::BoxedArrayIntoIter<")
         || ty.starts_with("std::vec::IntoIter<")
         || ty.starts_with("alloc::vec::IntoIter<")
         || ty.starts_with("std::vec::Drain<")
@@ -6769,6 +6847,7 @@ fn iterator_item_ty(ty: &str) -> Option<String> {
         "std::vec::IntoIter<",
         "alloc::vec::IntoIter<",
         "std::array::IntoIter<",
+        "std::boxed::BoxedArrayIntoIter<",
         "std::collections::vec_deque::IntoIter<",
         "alloc::collections::vec_deque::IntoIter<",
         "std::collections::linked_list::IntoIter<",
@@ -6872,6 +6951,7 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::collections::btree_set::IntoIter<")
         || self_ty.starts_with("std::collections::btree_map::IntoIter<")
         || self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty.starts_with("std::slice::Chunks<")
@@ -7249,6 +7329,7 @@ fn iterator_next_back_state(
         return step_str_iter(state, self_ty, true);
     }
     if self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty.starts_with("std::option::IntoIter<")

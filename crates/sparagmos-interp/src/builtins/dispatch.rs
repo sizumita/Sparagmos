@@ -9258,6 +9258,113 @@ impl<'a> Interpreter<'a> {
     ///   wrapper produces (`Tag` over its `u8`).
     ///
     /// Anything else stays unsupported at the call site.
+    /// The allocation pointer a `Box` value carries: the
+    /// box is the one-field aggregate holding it. A bare
+    /// pointer value standing in for the box (the shape a
+    /// raw-parts reconstruction produces) is its own
+    /// pointer.
+    fn box_pointer_of(&self, box_value: &Value) -> InterpResult<Value> {
+        match box_value {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                Ok(fields[0].clone())
+            }
+            ptr @ (Value::Ref(_) | Value::FatRef { .. }) => Ok(ptr.clone()),
+            other => Err(InterpError::type_mismatch(
+                "IntoIterator::into_iter for a Box",
+                "box value",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The pointee value a `Box` value denotes: the
+    /// pointee lives in the allocation store under the
+    /// box's pointer, so reading through the pointer
+    /// yields it.
+    fn box_pointee_of(
+        &self,
+        frames: &[Frame],
+        box_value: &Value,
+    ) -> InterpResult<Value> {
+        let ptr = self.box_pointer_of(box_value)?;
+        let target = self.deref_value(frames, &ptr)?;
+        self.read_resolved(frames, &target)
+    }
+
+    /// The `slice::IterMut` state over a container's
+    /// elements, in the iterator's real field layout (see
+    /// `slice_iter_value`): the `NonNull` first element
+    /// pointer, the past-the-end element pointer and the
+    /// `PhantomData` marker, all denoting places in the
+    /// container's own storage — the state the real
+    /// `iter_mut` body builds, which the `slice::IterMut`
+    /// steps consume. `container` is the value the
+    /// element references are formed against and
+    /// `container_tag` names the container type for the
+    /// element-type lookup.
+    fn slice_iter_mut_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        container: &Value,
+        len: u128,
+        container_tag: &str,
+    ) -> InterpResult<Value> {
+        // A zero-sized element type stores the iterator's
+        // length in the end field instead of a
+        // past-the-end pointer: core builds that state
+        // with `without_provenance_mut(len)` there, the
+        // converted `len` body reads the address back
+        // directly, and the `slice::IterMut` steps decode
+        // the same form (see `iter_zst_remaining`).
+        let zero_sized = slice_container_element_tag(container_tag)
+            .and_then(|tag| self.layout_of(tag))
+            .is_some_and(|(size, _)| size == 0);
+        let (first, end) = if zero_sized {
+            // The front pointer still denotes the first
+            // element when there is one. An empty
+            // zero-sized container has no element to
+            // denote and its steps never read the pointer
+            // (the stored length is zero), so the
+            // container value itself stands in.
+            let first = if len == 0 {
+                match container {
+                    Value::FatRef { base, .. } => (**base).clone(),
+                    _ => container.clone(),
+                }
+            } else {
+                self.iter_mut_element_ref(frames, container, 0)?
+            };
+            (first, Value::Ref(RefTarget::Address(len as u64)))
+        } else {
+            (
+                self.iter_mut_element_ref(frames, container, 0)?,
+                self.iter_mut_element_ref(
+                    frames,
+                    container,
+                    len as usize,
+                )?,
+            )
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![
+                // `ptr: NonNull<T>` — the one-field
+                // wrapper around the raw element pointer.
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![first],
+                },
+                end,
+                // `_marker: PhantomData<&mut T>` — a
+                // zero-sized ADT value.
+                Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+            ],
+        })
+    }
+
     /// The `IntoIterator::into_iter` value transformation: the
     /// iterator state the value iterates as, in the shape the
     /// modelled `Iterator::next` steps consume. Split out of
@@ -9291,6 +9398,7 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::collections::btree_map::IntoIter<")
             || self_ty.starts_with("std::slice::IterMut<")
             || self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::boxed::BoxedArrayIntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::vec::Drain<")
@@ -9496,6 +9604,33 @@ impl<'a> Interpreter<'a> {
             // their own `IntoIterator` (the states `env::args`
             // and `env::vars` built).
             Ok(value)
+        } else if self_ty.starts_with("std::boxed::Box<")
+            || self_ty.starts_with("alloc::boxed::Box<")
+        {
+            // A by-value `Box<[T; N]>` iterates as
+            // `array::IntoIter` over the pointee array and
+            // a by-value `Box<[T]>` as `vec::IntoIter` over
+            // the pointee elements: the states the array
+            // and Vec arms build, from the sequence the
+            // box's allocation holds.
+            let Some(inner) = box_sequence_tag(self_ty) else {
+                return Err(unsupported(format!(
+                    "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                )));
+            };
+            let pointee = self.box_pointee_of(frames, &value)?;
+            if sequence_tag_is_array(inner) {
+                let items = match &pointee {
+                    Value::Tuple(items) => items.clone(),
+                    _ => value_elements(&pointee)?,
+                };
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(items), Value::Uint(0)],
+                })
+            } else {
+                Ok(owned_iter_state(value_elements(&pointee)?))
+            }
         } else if self_ty.starts_with("std::vec::Vec<")
             || self_ty.starts_with("alloc::vec::Vec<")
         {
@@ -9578,60 +9713,28 @@ impl<'a> Interpreter<'a> {
                         value_elements(&pointee)?.len() as u128
                     }
                 };
-                // A zero-sized element type stores the
-                // iterator's length in the end field
-                // instead of a past-the-end pointer: core
-                // builds that state with
-                // `without_provenance_mut(len)` there, the
-                // converted `len` body reads the address
-                // back directly, and the `slice::IterMut`
-                // steps decode the same form (see
-                // `iter_zst_remaining`).
-                let zero_sized = slice_container_element_tag(inner)
-                    .and_then(|tag| self.layout_of(tag))
-                    .is_some_and(|(size, _)| size == 0);
-                let (first, end) = if zero_sized {
-                    // The front pointer still denotes the
-                    // first element when there is one. An
-                    // empty zero-sized container has no
-                    // element to denote and its steps never
-                    // read the pointer (the stored length
-                    // is zero), so the container reference
-                    // itself stands in.
-                    let first = if len == 0 {
-                        match &value {
-                            Value::FatRef { base, .. } => (**base).clone(),
-                            _ => value.clone(),
-                        }
-                    } else {
-                        self.iter_mut_element_ref(frames, &value, 0)?
-                    };
-                    (first, Value::Ref(RefTarget::Address(len as u64)))
-                } else {
-                    (
-                        self.iter_mut_element_ref(frames, &value, 0)?,
-                        self.iter_mut_element_ref(frames, &value, len as usize)?,
-                    )
+                self.slice_iter_mut_state(frames, &value, len, inner)
+            } else if inner.starts_with("std::boxed::Box<")
+                || inner.starts_with("alloc::boxed::Box<")
+            {
+                // `&mut Box<[T]>` and `&mut Box<[T; N]>`
+                // iterate as `slice::IterMut` over the
+                // pointee's elements: the construction is
+                // the Vec / array one above with the box's
+                // own pointer as the container, since the
+                // element references denote positions in
+                // the box's allocation.
+                let Some(seq) = box_sequence_tag(inner) else {
+                    return Err(unsupported(format!(
+                        "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                    )));
                 };
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![
-                        // `ptr: NonNull<T>` — the one-field
-                        // wrapper around the raw element
-                        // pointer.
-                        Value::Enum {
-                            variant: 0,
-                            fields: vec![first],
-                        },
-                        end,
-                        // `_marker: PhantomData<&mut T>` —
-                        // a zero-sized ADT value.
-                        Value::Enum {
-                            variant: 0,
-                            fields: Vec::new(),
-                        },
-                    ],
-                })
+                let target = self.deref_value(frames, &value)?;
+                let box_value = self.read_resolved(frames, &target)?;
+                let ptr = self.box_pointer_of(&box_value)?;
+                let pointee = self.box_pointee_of(frames, &box_value)?;
+                let len = value_elements(&pointee)?.len() as u128;
+                self.slice_iter_mut_state(frames, &ptr, len, seq)
             } else if inner.starts_with("std::option::Option<")
                 || inner.starts_with("core::option::Option<")
             {
@@ -9650,6 +9753,23 @@ impl<'a> Interpreter<'a> {
                 // keeps the unsupported error above.
                 Ok(value)
             }
+        } else if self_ty.starts_with("&std::boxed::Box<")
+            || self_ty.starts_with("&alloc::boxed::Box<")
+        {
+            // `&Box<[T]>` and `&Box<[T; N]>` iterate as
+            // `slice::Iter` over the pointee's elements:
+            // the state the `&[T]` arm builds, from the
+            // sequence the box's allocation holds.
+            let bare = self_ty.strip_prefix('&').unwrap_or(self_ty);
+            if box_sequence_tag(bare).is_none() {
+                return Err(unsupported(format!(
+                    "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                )));
+            }
+            let target = self.deref_value(frames, &value)?;
+            let box_value = self.read_resolved(frames, &target)?;
+            let pointee = self.box_pointee_of(frames, &box_value)?;
+            Ok(slice_iter_value(value_elements(&pointee)?))
         } else if self_ty.starts_with("&std::option::Option<")
             || self_ty.starts_with("&core::option::Option<")
         {

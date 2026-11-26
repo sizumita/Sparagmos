@@ -6277,3 +6277,121 @@ fn run_mode_vec_write_fmt_o3() {
         "O3 write! into a Vec<u8> must append the bytes; stderr={stderr}"
     );
 }
+
+const BOX_ARRAY_INTO_ITER_SRC: &str = r#"
+fn main() {
+    let b = Box::new([1, 2, 3]);
+    let mut it = b.into_iter();
+    println!("hint={:?}", it.size_hint());
+    println!("back={:?}", it.next_back());
+    let rest: Vec<i32> = it.collect();
+    println!("rest={rest:?}");
+    let big: Box<[u8; 33]> = Box::new([7u8; 33]);
+    println!("big={}", big.into_iter().count());
+    let nested = Box::new(Box::new([1, 2]));
+    println!("nested={}", nested.into_iter().sum::<i32>());
+    let e: Box<[i32; 0]> = Box::new([]);
+    println!("empty={}", e.into_iter().count());
+    let z: Box<[(); 3]> = Box::new([(), (), ()]);
+    println!("zst={}", z.into_iter().count());
+}
+"#;
+
+/// A by-value `Box<[T; N]>` iterates as
+/// `BoxedArrayIntoIter`: the modelled state is the
+/// pointee array's elements plus the next index, so the
+/// front and back steps, the exact size hint and the
+/// consumers all read it like the array iterator's.
+#[test]
+fn run_mode_box_array_into_iter_consumes() {
+    run_ok(
+        "box-array-into-iter",
+        BOX_ARRAY_INTO_ITER_SRC,
+        "hint=(3, Some(3))\nback=Some(3)\nrest=[1, 2]\nbig=33\nnested=3\nempty=0\nzst=3\n",
+    );
+}
+
+const REF_BOX_INTO_ITER_SRC: &str = r#"
+fn main() {
+    let boxed = vec![1, 2].into_boxed_slice();
+    let mut s = 0;
+    for x in &boxed { s += x; }
+    println!("refsum={s}");
+    let mut s2 = 0;
+    for x in boxed.into_iter() { s2 += x; }
+    println!("refsum2={s2}");
+    let ba = Box::new([10, 20]);
+    let mut s3 = 0;
+    for x in &ba { s3 += x; }
+    println!("refarr={s3}");
+    let mut bm = vec![1, 2].into_boxed_slice();
+    for x in &mut bm { *x += 10; }
+    println!("mut={:?}", &bm[..]);
+    let mut bam = Box::new([1, 2]);
+    for x in &mut bam { *x *= 3; }
+    println!("mutarr={:?}", &bam[..]);
+    let mut zm: Box<[(); 2]> = Box::new([(), ()]);
+    let mut cnt = 0;
+    for _ in &mut zm { cnt += 1; }
+    println!("zstmut={cnt}");
+}
+"#;
+
+/// `&Box<[T]>` and `&Box<[T; N]>` iterate as `slice::Iter`
+/// over the pointee's elements, and the `&mut` forms as
+/// `slice::IterMut` whose element references denote
+/// positions in the box's own allocation, so mutations
+/// through them land in the box.
+#[test]
+fn run_mode_ref_box_into_iter() {
+    run_ok(
+        "ref-box-into-iter",
+        REF_BOX_INTO_ITER_SRC,
+        "refsum=3\nrefsum2=3\nrefarr=30\nmut=[11, 12]\nmutarr=[3, 6]\nzstmut=2\n",
+    );
+}
+
+const BOX_INTO_ITER_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+struct D(i32);
+impl Drop for D { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
+fn main() {
+    let bs: Box<[D]> = vec![D(4), D(5)].into_boxed_slice();
+    let mut it = bs.into_iter();
+    let f = it.next().unwrap();
+    drop(f);
+    drop(it);
+    println!("slicedrops={}", DROPS.load(Ordering::SeqCst));
+    DROPS.store(0, Ordering::SeqCst);
+    let b = Box::new([D(1), D(2), D(3)]);
+    let mut it2 = b.into_iter();
+    let f2 = it2.next().unwrap();
+    drop(f2);
+    drop(it2);
+    println!("arraydrops={}", DROPS.load(Ordering::SeqCst));
+    let v: Vec<i32> = vec![1, 2, 3].into_boxed_slice().into_iter().collect();
+    println!("v={v:?}");
+}
+"#;
+
+/// In edition 2024 `boxed.into_iter()` resolves to the
+/// by-value `Box<[T]>` impl (in earlier editions it is
+/// the reference impl): a partially consumed owning
+/// boxed iterator drops exactly the elements it still
+/// owns, the yielded one once and the rest with the
+/// iterator — the same discipline as `vec::IntoIter`,
+/// and the same for `Box<[T; N]>` in any edition.
+#[test]
+fn run_mode_box_into_iter_drop_discipline_2024() {
+    let dir = temp_dir("box-into-iter-drop-2024");
+    let src = fixture(&dir, "case.rs", BOX_INTO_ITER_DROP_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "slicedrops=2\narraydrops=3\nv=[1, 2, 3]\n",
+        "stdout={stdout}"
+    );
+}

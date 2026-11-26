@@ -2260,6 +2260,7 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         | "std::vec::IntoIter"
         | "alloc::vec::IntoIter"
         | "std::array::IntoIter"
+        | "std::boxed::BoxedArrayIntoIter"
         | "std::option::IntoIter"
         | "std::option::Iter"
         | "std::option::IterMut"
