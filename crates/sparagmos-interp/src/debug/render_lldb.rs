@@ -7,8 +7,8 @@ use super::desc::{Desc, dwarf_type_name, path_text, render_vec_lldb, tag_base_na
 use super::evaluate::desc_scalar_width;
 use super::queries::nonzero_scalar;
 use super::render_gdb::{
-    MAX_RENDER_DEPTH, fat_base_text, nonzero_lldb_expanded, render_elements, render_gdb,
-    str_place_desc, union_field_values,
+    MAX_RENDER_DEPTH, UNION_FIELD_UNREADABLE, fat_base_text, nonzero_lldb_expanded,
+    render_elements, render_gdb, str_place_desc, union_field_from_bytes, union_field_values,
 };
 use super::session::{DebugDialect, PrintFormat};
 
@@ -120,8 +120,49 @@ pub(super) fn render_lldb_compact(
             Some(Desc::Bool) => Some("false".to_string()),
             _ => None,
         },
+        Value::UnionBytes { bytes } => {
+            // A union in its byte form, as in the gdb form:
+            // every declared field is read out of the storage
+            // bytes (see `union_field_from_bytes`).
+            let Some(Desc::Adt(tag)) = desc else {
+                return None;
+            };
+            let shape = interp.program().adt_debug_shapes.get(tag)?;
+            if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+                return None;
+            }
+            let vshape = shape.variants.first()?;
+            let parts = union_parts_lldb(interp, vshape, depth, |i| {
+                union_field_from_bytes(&vshape.fields, bytes, i)
+            })?;
+            Some(format!("{{{}}}", parts.join(", ")))
+        }
         _ => None,
     }
+}
+
+/// The `name:value` parts of a union's fields in lldb's
+/// compact form, each field's value produced by `value_of`
+/// (the storage reinterpretation behind the aggregate and
+/// byte forms); a field with no producible or renderable
+/// value degrades in place, as in the gdb form (see
+/// [`UNION_FIELD_UNREADABLE`]).
+fn union_parts_lldb(
+    interp: &Interpreter,
+    vshape: &sparagmos_mir::AdtDebugVariant,
+    depth: usize,
+    value_of: impl Fn(usize) -> Option<Value>,
+) -> Option<Vec<String>> {
+    let mut parts = Vec::with_capacity(vshape.fields.len());
+    for (i, field) in vshape.fields.iter().enumerate() {
+        let name = field.name.as_deref()?;
+        let d = Desc::from_tag(&field.ty);
+        let r = value_of(i)
+            .and_then(|v| render_lldb_compact(interp, &v, Some(&d), false, true, depth + 1))
+            .unwrap_or_else(|| UNION_FIELD_UNREADABLE.to_string());
+        parts.push(format!("{name}:{r}"));
+    }
+    Some(parts)
 }
 
 /// Render one ADT value in lldb's compact form (see
@@ -136,14 +177,10 @@ fn render_adt_lldb_compact(
 ) -> Option<String> {
     let vshape = shape.variants.get(variant as usize)?;
     if matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
-        let values = union_field_values(&vshape.fields, fields)?;
-        let mut parts = Vec::with_capacity(values.len());
-        for (i, v) in values.iter().enumerate() {
-            let name = vshape.fields[i].name.as_deref()?;
-            let d = Desc::from_tag(&vshape.fields[i].ty);
-            let r = render_lldb_compact(interp, v, Some(&d), false, true, depth + 1)?;
-            parts.push(format!("{name}:{r}"));
-        }
+        let values = union_field_values(&vshape.fields, fields);
+        let parts = union_parts_lldb(interp, vshape, depth, |i| {
+            values.get(i).cloned().flatten()
+        })?;
         return Some(format!("{{{}}}", parts.join(", ")));
     }
     if vshape.fields.len() != fields.len() {

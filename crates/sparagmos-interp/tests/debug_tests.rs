@@ -1732,3 +1732,302 @@ fn history_comparison_lldb_numbers_from_zero() {
         run.transcript
     );
 }
+
+/// A program that writes a union local through the given
+/// fields (one aggregate write per entry, in order) and stops
+/// at a line where the union can be printed. `fields` are the
+/// declared (name, type tag) pairs of `test::U`.
+fn union_written_program(
+    fields: Vec<(&str, &str)>,
+    writes: Vec<(Option<u32>, u128)>,
+) -> Program {
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    let statements: Vec<Statement> = writes
+        .iter()
+        .map(|(field_index, value)| {
+            Statement::assign(
+                Place::from_index(1),
+                Rvalue::AggregateAdt {
+                    variant: 0,
+                    operands: vec![Operand::const_uint(*value)],
+                    field_index: *field_index,
+                    units_from: None,
+                    payload_entry: None,
+                },
+            )
+        })
+        .collect();
+    let n_statements = statements.len();
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Adt("test::U".to_string())],
+        vec![
+            BasicBlockData::new(statements, TerminatorKind::Goto { target: BasicBlock(1) }),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines {
+            statements: vec![line(2); n_statements],
+            terminator: line(2),
+        },
+        BlockSourceLines {
+            statements: vec![line(3)],
+            terminator: line(3),
+        },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "u".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: Some("test::U".to_string()),
+        lines: (2, 2),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p.adt_debug_shapes.insert(
+        "test::U".to_string(),
+        AdtDebugShape {
+            kind: AdtShapeKind::Union,
+            variants: vec![AdtDebugVariant {
+                name: "U".to_string(),
+                fields: fields
+                    .iter()
+                    .map(|(name, ty)| AdtDebugField {
+                        name: Some(name.to_string()),
+                        ty: ty.to_string(),
+                    })
+                    .collect(),
+            }],
+        },
+    );
+    p
+}
+
+#[test]
+fn union_print_reinterprets_a_pointer_sibling() {
+    // A raw-pointer field shares the written integer field's
+    // storage: the whole-union print reads it back as the
+    // address the integer's bytes name (as gdb does), instead
+    // of failing the whole print on the pointer field.
+    let mut s = session(union_written_program(
+        vec![("bits", "u32"), ("p", "*const u8")],
+        vec![(None, 0x04030201)],
+    ));
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("u"), print("u.p"), print("u.bits")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = test::U {bits: 67305985, p: 0x4030201}",
+        "$2 = 0x4030201",
+        "$3 = 67305985",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn union_print_degrades_an_unreadable_struct_sibling() {
+    // A struct field's layout is not part of the recorded
+    // debug shape, so its bytes cannot be reinterpreted; the
+    // whole-union print degrades that field in place (the
+    // form gdb uses for a field it cannot read) and still
+    // prints the written field.
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    let mut program = union_written_program(
+        vec![("bits", "u32"), ("s", "test::S")],
+        vec![(None, 131073)],
+    );
+    program.adt_debug_shapes.insert(
+        "test::S".to_string(),
+        AdtDebugShape {
+            kind: AdtShapeKind::Struct,
+            variants: vec![AdtDebugVariant {
+                name: "S".to_string(),
+                fields: vec![
+                    AdtDebugField {
+                        name: Some("x".to_string()),
+                        ty: "u16".to_string(),
+                    },
+                    AdtDebugField {
+                        name: Some("y".to_string()),
+                        ty: "u16".to_string(),
+                    },
+                ],
+            }],
+        },
+    );
+    let mut s = session(program);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("u"), print("u.bits")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = test::U {bits: 131073, s: <error reading variable>}",
+        "$2 = 131073",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn union_print_reads_a_fat_sibling_from_scalar_storage() {
+    // A slice field read out of a written integer field's
+    // storage is the fat pointer those words name; in this
+    // dialect a fat pointer prints as its address, like the
+    // same value printed standalone.
+    let mut s = session(union_written_program(
+        vec![("bits", "u128"), ("s", "&[u8]")],
+        vec![(None, 5)],
+    ));
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("u"), print("u.s")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript
+            .iter()
+            .any(|l| l.starts_with("$1 = test::U {bits: 5, s: 0x")),
+        "missing fat-sibling whole print in {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l.starts_with("$2 = 0x")),
+        "missing fat-sibling field print in {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn union_print_reads_fields_from_byte_storage() {
+    // A union written through two fields is held as raw
+    // storage bytes; the whole-union print reads every field
+    // out of those bytes, including the pointer field whose
+    // tail bytes no write covered (they read as zero).
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Adt("test::U".to_string())],
+        vec![
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(1),
+                        Rvalue::AggregateAdt {
+                            variant: 0,
+                            operands: vec![Operand::const_uint(0x04030201)],
+                            field_index: Some(0),
+                            units_from: None,
+                            payload_entry: None,
+                        },
+                    ),
+                    Statement::assign(
+                        Place {
+                            local: sparagmos_interp::ir::Local(1),
+                            projection: vec![ProjectionElem::UnionField { idx: 1, table: 0 }],
+                        },
+                        Rvalue::Use(Operand::const_uint(0x9999)),
+                    ),
+                ],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines {
+            statements: vec![line(2), line(2)],
+            terminator: line(2),
+        },
+        BlockSourceLines {
+            statements: vec![line(3)],
+            terminator: line(3),
+        },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "u".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: Some("test::U".to_string()),
+        lines: (2, 2),
+    }];
+    let mut program = Program::new();
+    program.add_function(body);
+    program.source_files = vec!["test.rs".to_string()];
+    program.union_tables = vec![vec![
+        Some(ScalarShape::Int { bits: 32, signed: false }),
+        Some(ScalarShape::Int { bits: 16, signed: false }),
+        None,
+    ]];
+    program.adt_debug_shapes.insert(
+        "test::U".to_string(),
+        AdtDebugShape {
+            kind: AdtShapeKind::Union,
+            variants: vec![AdtDebugVariant {
+                name: "U".to_string(),
+                fields: vec![
+                    AdtDebugField {
+                        name: Some("a".to_string()),
+                        ty: "u32".to_string(),
+                    },
+                    AdtDebugField {
+                        name: Some("b".to_string()),
+                        ty: "u16".to_string(),
+                    },
+                    AdtDebugField {
+                        name: Some("p".to_string()),
+                        ty: "*const u8".to_string(),
+                    },
+                ],
+            }],
+        },
+    );
+    let mut s = session(program);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("u"), print("u.a"), print("u.b")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = test::U {a: 67344793, b: 39321, p: 0x4039999}",
+        "$2 = 67344793",
+        "$3 = 39321",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
