@@ -16,6 +16,7 @@ mod constants;
 mod debug_mode;
 mod drop_box;
 mod dst_size_of_val;
+mod dyn_vtable;
 mod ffi;
 mod fs_paths;
 mod generics;

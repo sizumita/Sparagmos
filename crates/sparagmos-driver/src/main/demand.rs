@@ -2367,7 +2367,18 @@ fn dyn_trait_refs(body: &rustc_public::mir::Body) -> Vec<rustc_public::ty::Trait
             }
             for bound in &bounds {
                 if let rustc_public::ty::ExistentialPredicate::Trait(et) = &bound.value {
-                    out.push(et.with_self_ty(concrete));
+                    // A higher-ranked object's existential
+                    // arguments carry the `dyn` binder's own
+                    // regions; erase them so the reference can
+                    // be asked for its vtable (see
+                    // `erase_bound_regions_args`).
+                    let erased = rustc_public::ty::ExistentialTraitRef {
+                        def_id: et.def_id,
+                        generic_args: sparagmos_driver::convert::erase_bound_regions_args(
+                            &et.generic_args,
+                        ),
+                    };
+                    out.push(erased.with_self_ty(concrete));
                 }
             }
         }
@@ -2546,6 +2557,28 @@ fn shim_coroutine_path(shim: &rustc_public::mir::Body) -> Option<String> {
     None
 }
 
+/// Whether `registered` is an impl-instance key
+/// (`<Self as Trait>::method`) for the same method the
+/// instance name `instance` ends in. A registration of that
+/// shape is one the interpreter's virtual-call resolution
+/// can already reach — by its exact candidate when the
+/// spelling matches, and otherwise by its unique-impl scan —
+/// so the instance needs no second registration under
+/// another spelling of the same key.
+fn impl_instance_key_for(registered: &str, instance: &str) -> bool {
+    if !registered.starts_with('<') {
+        return false;
+    }
+    let method_of = |n: &str| {
+        n.rsplit_once("::")
+            .map(|(_, m)| m.split("::<").next().unwrap_or(m).to_string())
+    };
+    match (method_of(registered), method_of(instance)) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
+}
+
 pub(crate) fn demand_dyn_instances(
     conv: &mut Converter,
     report: &mut ConversionReport,
@@ -2648,26 +2681,96 @@ pub(crate) fn demand_dyn_instances(
                                 ) else {
                                     continue;
                                 };
-                                let def_id =
-                                    conv.instance_def_id(inst.def.def_id(), &inst);
-                                if body_def_ids.contains(&def_id) {
-                                    continue;
-                                }
+                                // The dedup that matters here is the
+                                // instance *name*: the interpreter's
+                                // virtual-call resolution looks the
+                                // callee up by its full instance name
+                                // (`<Concrete as Trait>::method`), but
+                                // the instance-demand pass registers
+                                // the first converted instance of a
+                                // definition under the definition's
+                                // plain name, so an instance that was
+                                // already converted for a static or
+                                // generic call is present in the
+                                // program under a spelling dispatch
+                                // never constructs. A `DefId` match
+                                // alone must therefore not skip this
+                                // registration: the same instance body
+                                // is registered once more under its
+                                // own name (direct calls resolve
+                                // through the `DefId` table to the
+                                // same body under either spelling,
+                                // and program keys are name-based).
+                                //
+                                // Two qualifications. The second
+                                // registration clones the body the
+                                // first conversion produced instead
+                                // of converting the instance again:
+                                // the body is the same, and a second
+                                // conversion only redoes the work.
+                                // And it happens only when the
+                                // registration the instance already
+                                // has is not itself an impl-instance
+                                // key for this method: a second
+                                // impl-key spelling of one instance
+                                // (the collection's named-region
+                                // spelling next to this pass's
+                                // erased one, say) leaves the
+                                // interpreter's impl scan with two
+                                // candidate keys for a single impl,
+                                // and the scan, which must not guess
+                                // between genuinely different impls
+                                // of one trait, declines both — the
+                                // dispatch then fails although the
+                                // body is in the program.
                                 let name = inst.name().to_string();
                                 if bodies.iter().any(|(n, _)| n == &name) {
                                     continue;
                                 }
+                                let def_id =
+                                    conv.instance_def_id(inst.def.def_id(), &inst);
                                 let before = bodies.len();
-                                convert_item(
-                                    conv,
-                                    report,
-                                    bodies,
-                                    body_def_ids,
-                                    body_def_names,
-                                    name,
-                                    def_id,
-                                    Ok(Some(sbody.clone())),
-                                );
+                                match body_def_ids
+                                    .iter()
+                                    .position(|id| *id == def_id)
+                                {
+                                    Some(existing)
+                                        if impl_instance_key_for(
+                                            &body_def_names[existing],
+                                            &name,
+                                        ) =>
+                                    {
+                                        // Already registered under a
+                                        // key dispatch can reach.
+                                    }
+                                    Some(existing) => {
+                                        bodies.push((
+                                            name.clone(),
+                                            bodies[existing].1.clone(),
+                                        ));
+                                        body_def_ids.push(def_id);
+                                        body_def_names.push(name.clone());
+                                        report.functions.push(FnReport {
+                                            name: name.clone(),
+                                            blocks: sbody.blocks.len(),
+                                            locals: sbody.locals().len(),
+                                            arg_count: sbody.arg_locals().len(),
+                                            outcome: FnOutcome::Converted,
+                                        });
+                                    }
+                                    None => {
+                                        convert_item(
+                                            conv,
+                                            report,
+                                            bodies,
+                                            body_def_ids,
+                                            body_def_names,
+                                            name,
+                                            def_id,
+                                            Ok(Some(sbody.clone())),
+                                        );
+                                    }
+                                }
                                 if bodies.len() > before {
                                     *demanded += 1;
                                     converted_now.push(sbody.clone());

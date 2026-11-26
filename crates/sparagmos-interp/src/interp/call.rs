@@ -1434,9 +1434,15 @@ impl<'a> Interpreter<'a> {
         let mut found: Option<String> = None;
         for key in keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
-            let Some((self_part, trait_base, key_method)) =
-                parse_impl_key(base).or_else(|| parse_impl_block_key(base))
-            else {
+            // An impl-block key (`...::<impl Trait for Self>::m`)
+            // also parses, wrongly, as an impl key — its first
+            // ` as ` is the inner impl's — so the marker, not
+            // the parse order, chooses the parser.
+            let Some((self_part, trait_base, key_method)) = (if base.contains("::<impl ") {
+                parse_impl_block_key(base)
+            } else {
+                parse_impl_key(base)
+            }) else {
                 continue;
             };
             if key_method != method
@@ -2002,6 +2008,11 @@ fn drop_last_generic_arg(name: &str) -> Option<String> {
 
 fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
     let (head, method) = base.rsplit_once(">::")?;
+    // An instance key spells the method's own generic arguments
+    // as a trailing `::<...>` segment (`bar::<'_>` for a method
+    // with lifetime parameters); the method a call names is the
+    // segment-free name.
+    let method = method.split("::<").next().unwrap_or(method);
     if method.is_empty() || method.contains("::") {
         return None;
     }
@@ -2029,6 +2040,10 @@ fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
 /// call is converted.
 fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
     let (head, method) = base.rsplit_once(">::")?;
+    // As in `parse_impl_key`: the method's own generic
+    // arguments are a trailing `::<...>` segment, not part of
+    // the name a call names.
+    let method = method.split("::<").next().unwrap_or(method);
     if method.is_empty() || method.contains("::") {
         return None;
     }
@@ -2052,6 +2067,12 @@ fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
 /// itself, or the name with a generic argument list appended; the
 /// crate prefix may be omitted on a side that carries none.
 fn impl_self_matches(self_part: &str, name: &str) -> bool {
+    // The section and the queried name can be the very same
+    // rendering (a `Self` that is itself an impl-path type,
+    // whose base the `<` split below cannot recover).
+    if self_part == name {
+        return true;
+    }
     let self_base = self_part.split('<').next().unwrap_or(self_part);
     // The queried name may itself carry a generic argument list
     // (a fully rendered concrete type); only its base takes part

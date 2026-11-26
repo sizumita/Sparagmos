@@ -388,6 +388,197 @@ fn substitute_pred(
     }
 }
 
+/// `args` with the regions bound by the *enclosing* binder
+/// replaced by the erased region, recursively: the `for<'a>`
+/// variables a `dyn` type's existential arguments carry (a
+/// higher-ranked trait object's `FnLike<&'a T, &'a T>`). A
+/// trait reference whose arguments still mention such a
+/// variable cannot be asked for its vtable — the compiler's
+/// predicate construction rejects escaping bound variables —
+/// while the vtable itself is region-independent (method
+/// bodies are region-erased), so the erased instantiation
+/// names the same vtable: the instantiation the compiler
+/// itself performs when it materializes a vtable for a
+/// higher-ranked trait object. A variable of a binder the
+/// walk itself enters (a function pointer's own `for<'a>`)
+/// is that binder's, not the enclosing one's, and is kept;
+/// a shape the rebuild cannot represent keeps its argument,
+/// exactly as `substitute_args` keeps an unsubstitutable one.
+pub fn erase_bound_regions_args(args: &GenericArgs) -> GenericArgs {
+    erase_bound_regions_args_at(args, 0, 0)
+}
+
+fn erase_bound_regions_args_at(
+    args: &GenericArgs,
+    depth: usize,
+    binder_depth: u32,
+) -> GenericArgs {
+    GenericArgs(
+        args.0
+            .iter()
+            .map(|a| match a {
+                GenericArgKind::Type(t) => {
+                    GenericArgKind::Type(erase_bound_regions_ty(t, depth, binder_depth))
+                }
+                GenericArgKind::Lifetime(r) => {
+                    GenericArgKind::Lifetime(erase_bound_region(r.clone(), binder_depth))
+                }
+                _ => a.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// The region the enclosing binder binds, seen from
+/// `binder_depth` binders inside the arguments (its
+/// Debruijn index there), becomes the erased region; any
+/// other region is kept.
+fn erase_bound_region(region: Region, binder_depth: u32) -> Region {
+    match region.kind {
+        RegionKind::ReBound(index, _) if index == binder_depth => Region {
+            kind: RegionKind::ReErased,
+        },
+        _ => region,
+    }
+}
+
+/// A type with its enclosing-binder regions erased (see
+/// `erase_bound_regions_args`), rebuilt through the same
+/// shapes `substitute_ty` rebuilds; any other shape is
+/// returned as it was.
+fn erase_bound_regions_ty(ty: &Ty, depth: usize, binder_depth: u32) -> Ty {
+    if depth >= 8 {
+        return *ty;
+    }
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return *ty;
+    };
+    let TyKind::RigidTy(r) = kind else {
+        return *ty;
+    };
+    match r {
+        RigidTy::Adt(def, a2) => Ty::from_rigid_kind(RigidTy::Adt(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::Ref(region, inner, mutability) => Ty::from_rigid_kind(RigidTy::Ref(
+            erase_bound_region(region, binder_depth),
+            erase_bound_regions_ty(&inner, depth + 1, binder_depth),
+            mutability,
+        )),
+        RigidTy::RawPtr(inner, mutability) => Ty::from_rigid_kind(RigidTy::RawPtr(
+            erase_bound_regions_ty(&inner, depth + 1, binder_depth),
+            mutability,
+        )),
+        RigidTy::Slice(inner) => Ty::from_rigid_kind(RigidTy::Slice(
+            erase_bound_regions_ty(&inner, depth + 1, binder_depth),
+        )),
+        RigidTy::Pat(inner, pat) => Ty::from_rigid_kind(RigidTy::Pat(
+            erase_bound_regions_ty(&inner, depth + 1, binder_depth),
+            pat,
+        )),
+        RigidTy::Array(elem, len) => Ty::from_rigid_kind(RigidTy::Array(
+            erase_bound_regions_ty(&elem, depth + 1, binder_depth),
+            len,
+        )),
+        RigidTy::Tuple(ts) => Ty::from_rigid_kind(RigidTy::Tuple(
+            ts.iter()
+                .map(|t| erase_bound_regions_ty(t, depth + 1, binder_depth))
+                .collect(),
+        )),
+        RigidTy::FnDef(def, a2) => Ty::from_rigid_kind(RigidTy::FnDef(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::FnPtr(sig) => {
+            let Binder {
+                value: fsig,
+                bound_vars,
+            } = sig;
+            Ty::from_rigid_kind(RigidTy::FnPtr(Binder {
+                value: FnSig {
+                    inputs_and_output: fsig
+                        .inputs_and_output
+                        .iter()
+                        .map(|t| erase_bound_regions_ty(t, depth + 1, binder_depth + 1))
+                        .collect(),
+                    c_variadic: fsig.c_variadic,
+                    safety: fsig.safety,
+                    abi: fsig.abi,
+                },
+                bound_vars,
+            }))
+        }
+        RigidTy::Closure(def, a2) => Ty::from_rigid_kind(RigidTy::Closure(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::Coroutine(def, a2) => Ty::from_rigid_kind(RigidTy::Coroutine(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::CoroutineClosure(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineClosure(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::CoroutineWitness(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineWitness(
+            def,
+            erase_bound_regions_args_at(&a2, depth + 1, binder_depth),
+        )),
+        RigidTy::Dynamic(preds, region) => Ty::from_rigid_kind(RigidTy::Dynamic(
+            preds
+                .iter()
+                .map(|pred| erase_bound_regions_pred(pred, depth + 1, binder_depth))
+                .collect(),
+            erase_bound_region(region, binder_depth),
+        )),
+        _ => *ty,
+    }
+}
+
+/// An existential predicate with its enclosing-binder
+/// regions erased (see `erase_bound_regions_args`); the
+/// predicate's own binder is entered, so its variables are
+/// kept and the enclosing binder's shift by one.
+fn erase_bound_regions_pred(
+    pred: &Binder<ExistentialPredicate>,
+    depth: usize,
+    binder_depth: u32,
+) -> Binder<ExistentialPredicate> {
+    let value = match &pred.value {
+        ExistentialPredicate::Trait(tref) => ExistentialPredicate::Trait(ExistentialTraitRef {
+            def_id: tref.def_id,
+            generic_args: erase_bound_regions_args_at(
+                &tref.generic_args,
+                depth,
+                binder_depth + 1,
+            ),
+        }),
+        ExistentialPredicate::Projection(p) => {
+            let term = match &p.term {
+                TermKind::Type(t) => {
+                    TermKind::Type(erase_bound_regions_ty(t, depth, binder_depth + 1))
+                }
+                TermKind::Const(c) => TermKind::Const(c.clone()),
+            };
+            ExistentialPredicate::Projection(ExistentialProjection {
+                def_id: p.def_id,
+                generic_args: erase_bound_regions_args_at(
+                    &p.generic_args,
+                    depth,
+                    binder_depth + 1,
+                ),
+                term,
+            })
+        }
+        ExistentialPredicate::AutoTrait(def) => ExistentialPredicate::AutoTrait(*def),
+    };
+    Binder {
+        value,
+        bound_vars: pred.bound_vars.clone(),
+    }
+}
+
 /// A constant with the ambient frame's parameters
 /// substituted (see `compose_args`), or `None` when the
 /// substituted form cannot be represented: a substituted

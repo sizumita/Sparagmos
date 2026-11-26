@@ -93,6 +93,7 @@ pub use self::screen::{
     UNNORMALIZABLE_PROJECTION_REASON,
 };
 pub use self::statics::eii_impl_instance;
+pub use self::subst::erase_bound_regions_args;
 
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
