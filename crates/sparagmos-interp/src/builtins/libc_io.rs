@@ -1,15 +1,18 @@
-//! Descriptor-level libc I/O: `libc::read` over the
-//! interpreter's one descriptor space, and the errno cell
-//! the location calls hand out.
+//! Descriptor-level libc I/O: `libc::read` and
+//! `libc::write` over the interpreter's one descriptor
+//! space, and the errno cell the location calls hand out.
 //!
 //! A guest descriptor number names an entry of the file
 //! table or the socket table (the two share one counter,
 //! so the space is one space), or descriptor 0, the file
-//! model's stdin entry. `libc::read` runs the read on the
-//! host object behind the entry and reports the outcome
-//! the C call reports: the byte count on success, and -1
-//! with the host errno recorded in the errno cell on
-//! failure. A descriptor naming no entry fails with
+//! model's stdin entry. The call runs on the host object
+//! behind the entry and reports the outcome the C call
+//! reports: the byte count on success, and -1 with the
+//! host errno recorded in the errno cell on failure.
+//! Descriptors 1 and 2 are the guest's own standard
+//! streams: a `libc::write` there goes to the captured
+//! stdout / stderr the stdio model writes, not to a host
+//! descriptor of this process. A descriptor naming no entry fails with
 //! `EBADF`: that is the shape of a number never issued, of
 //! a descriptor already closed, and of a descriptor a
 //! parent hands a re-executed child it was cloexec in --
@@ -26,7 +29,7 @@
 //! the guest reads it back through the pointer -- the
 //! path `std::io::Error::last_os_error` takes.
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{Frame, Interpreter, SocketEntry};
@@ -140,6 +143,232 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Int(-1))
             }
         }
+    }
+
+    /// `libc::write(fd, buf, count) -> ssize_t`: write
+    /// the `count` bytes the buffer `buf` denotes to the
+    /// guest descriptor `fd`, on the host object behind
+    /// the descriptor's table entry (see the module
+    /// comment), the twin of `exec_libc_read`. Descriptors
+    /// 1 and 2 write the guest's captured stdout and
+    /// stderr. A would-block outcome on a socket waits
+    /// the way the socket model waits (see
+    /// `libc_socket_write`).
+    pub(super) fn exec_libc_write(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        name: &str,
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        let fd = match &vals[0] {
+            Value::Int(v) => *v as i64,
+            Value::Uint(v) => *v as i64,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a descriptor integer",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let count = match &vals[2] {
+            Value::Uint(v) => *v as usize,
+            Value::Int(v) if *v >= 0 => *v as usize,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a byte count",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if fd < 0 {
+            self.set_errno(frames, EBADF)?;
+            return Ok(Value::Int(-1));
+        }
+        let bytes = self.read_write_bytes(frames, &vals[1], count)?;
+        if fd == 1 {
+            return match self.write_stdout_partial(&bytes) {
+                Ok(n) => Ok(Value::Int(n as i128)),
+                Err(error) => {
+                    let code = error.raw_os_error().unwrap_or(EIO);
+                    self.set_errno(frames, code)?;
+                    Ok(Value::Int(-1))
+                }
+            };
+        }
+        if fd == 2 {
+            self.push_error_output(&String::from_utf8_lossy(&bytes));
+            return Ok(Value::Int(bytes.len() as i128));
+        }
+        let id = fd as u64;
+        // Descriptor 0 is the file model's stdin entry,
+        // registered on first use; any other descriptor is
+        // looked up in the file table first, then the
+        // socket table (one descriptor space, two tables).
+        // The host object answers for the entry's own
+        // direction: a write against a read-only file or
+        // the stdin duplicate fails with the host's errno.
+        let file_write = if id == 0 {
+            let stdin_id = self.stdin_file_id();
+            self.with_file(stdin_id, |f| f.write(&bytes))
+        } else {
+            self.with_file(id, |f| f.write(&bytes))
+        };
+        let result = match file_write {
+            Some(result) => Some(result),
+            None => self.libc_socket_write(frames, name, id, &bytes)?,
+        };
+        match result {
+            Some(Ok(n)) => Ok(Value::Int(n as i128)),
+            Some(Err(error)) => {
+                let code = error.raw_os_error().unwrap_or(EIO);
+                self.set_errno(frames, code)?;
+                Ok(Value::Int(-1))
+            }
+            None => {
+                self.set_errno(frames, EBADF)?;
+                Ok(Value::Int(-1))
+            }
+        }
+    }
+
+    /// One `write(2)` against the socket behind
+    /// descriptor `id`; `None` when the descriptor names
+    /// no socket. The host socket is nonblocking: while
+    /// an attempt cannot proceed and the guest descriptor
+    /// is a blocking one, the other guest threads run in
+    /// scheduling rounds, and where no round makes
+    /// progress the call suspends (or reports the honest
+    /// would-block-forever error), the socket model's own
+    /// pattern (see `libc_socket_read`). A
+    /// guest-nonblocking descriptor, and a stream with a
+    /// write timeout, surface the host's `WouldBlock`
+    /// error instead, as `write(2)` under `O_NONBLOCK` /
+    /// `SO_SNDTIMEO` does.
+    fn libc_socket_write(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        name: &str,
+        id: u64,
+        bytes: &[u8],
+    ) -> InterpResult<Option<std::io::Result<usize>>> {
+        enum Step {
+            Done(std::io::Result<usize>),
+            WouldBlock,
+        }
+        loop {
+            let step = self.with_socket(id, |entry| match entry {
+                SocketEntry::Stream {
+                    socket,
+                    nonblocking,
+                    write_timeout,
+                    ..
+                } => match socket.write(bytes) {
+                    Ok(n) => Step::Done(Ok(n)),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && !*nonblocking
+                            && write_timeout.is_none() =>
+                    {
+                        Step::WouldBlock
+                    }
+                    Err(error) => Step::Done(Err(error)),
+                },
+                SocketEntry::Udp {
+                    socket,
+                    nonblocking,
+                } => match socket.send(bytes) {
+                    Ok(n) => Step::Done(Ok(n)),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && !*nonblocking =>
+                    {
+                        Step::WouldBlock
+                    }
+                    Err(error) => Step::Done(Err(error)),
+                },
+                SocketEntry::Listener { socket, .. } => {
+                    // A listening socket has no write of
+                    // its own in std's model types; the
+                    // kernel's own answer (`EPIPE` on
+                    // Linux) comes from a duplicate of the
+                    // host descriptor.
+                    use std::os::fd::AsFd as _;
+                    let result = socket
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .and_then(|owned| {
+                            let mut file = std::fs::File::from(owned);
+                            file.write(bytes)
+                        });
+                    Step::Done(result)
+                }
+            });
+            match step {
+                Some(Step::Done(result)) => return Ok(Some(result)),
+                Some(Step::WouldBlock) => {
+                    self.tick_step()?;
+                    let (_, progressed) = self.schedule_round(frames)?;
+                    if !progressed {
+                        return Err(self.block_or_suspend(
+                            name,
+                            "a blocking libc::write on a socket",
+                        ));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Gather the bytes a descriptor write sends, from
+    /// the guest buffer `ptr` denotes (the read
+    /// `Write::write` performs out of its caller's buffer,
+    /// for a raw pointer): the mirror of
+    /// `write_read_bytes`. A fat pointer goes through the
+    /// slice elements; a thin pointer to a sequence value
+    /// takes the value's own bytes; a thin pointer to an
+    /// element position inside a sequence goes through
+    /// the sequence access, byte by byte. Only the bytes
+    /// the pointer denotes are ever gathered: a count
+    /// running past a fat slice's length gathers the
+    /// slice's bytes and the write comes back short, as
+    /// a `write` legally may, rather than inventing
+    /// bytes past the buffer.
+    fn read_write_bytes(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        ptr: &Value,
+        count: usize,
+    ) -> InterpResult<Vec<u8>> {
+        if matches!(ptr, Value::FatRef { .. }) {
+            let (elems, _) = self.slice_elements(frames, ptr)?;
+            let mut out = Vec::with_capacity(count.min(elems.len()));
+            for item in elems.iter().take(count) {
+                out.push(as_u128(item, "libc::write")? as u8);
+            }
+            return Ok(out);
+        }
+        let target = self.deref_value(frames, ptr)?;
+        let current = self.read_resolved(frames, &target)?;
+        if let Some(bytes) = sequence_bytes(&current) {
+            if bytes.len() >= count {
+                return Ok(bytes[..count].to_vec());
+            }
+        }
+        // The pointer denotes an element position inside
+        // a sequence rather than the sequence itself (an
+        // array's first-element pointer, the shape
+        // `as_ptr` on an array value produces): the
+        // sequence access reads each byte at its own
+        // position, continuing at the element's siblings.
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let byte = self.read_seq_at(frames, &target, index)?;
+            out.push(as_u128(&byte, "libc::write")? as u8);
+        }
+        Ok(out)
     }
 
     /// One `read(2)` against the socket behind descriptor
@@ -269,5 +498,31 @@ impl<'a> Interpreter<'a> {
             )?;
         }
         Ok(())
+    }
+}
+
+/// The bytes of a byte-sequence value (a byte block, a
+/// string's data, an element sequence of byte scalars),
+/// the shapes `replace_slice_bytes` writes into read
+/// back out; `None` for any other value, and for an
+/// element sequence holding a non-byte element.
+fn sequence_bytes(value: &Value) -> Option<Vec<u8>> {
+    fn collect(elems: &[Value]) -> Option<Vec<u8>> {
+        elems
+            .iter()
+            .map(|item| match item {
+                Value::Uint(v) => Some(*v as u8),
+                Value::Int(v) => Some(*v as u8),
+                _ => None,
+            })
+            .collect()
+    }
+    match value {
+        Value::Bytes(data) => Some(data.clone()),
+        Value::Str(text) => Some(text.as_bytes().to_vec()),
+        Value::Tuple(items) => collect(items),
+        Value::Enum { fields, .. } => collect(fields),
+        Value::SparseVec { elems, .. } => collect(elems),
+        _ => None,
     }
 }

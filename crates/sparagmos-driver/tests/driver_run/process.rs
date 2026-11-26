@@ -1499,6 +1499,107 @@ fn run_mode_libc_read_descriptors_and_errno() {
     assert_eq!(stdout, "libc-read-ok\n", "stderr={stderr}");
 }
 
+
+// ---------------------------------------------------------------------------
+// `libc::write` (issue #513), the twin of the read
+// above: the write runs on the host object behind the
+// descriptor's table entry, descriptors 1 and 2 write
+// the guest's captured stdout and stderr, and a
+// descriptor naming no entry fails with `EBADF` in the
+// errno cell. A descriptor probe matches a native
+// 1.100.0 run byte for byte (the listening descriptor's
+// write answers `EPIPE`, the kernel's own answer through
+// a duplicate of the host descriptor).
+// ---------------------------------------------------------------------------
+
+const LIBC_WRITE_AUX_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+pub const EBADF: i32 = libc::EBADF;
+pub const EPIPE: i32 = libc::EPIPE;
+
+/// `libc::write(fd, buf, buf.len())` and the errno the
+/// call leaves behind, as `(return, raw_os_error)`.
+pub fn write_from(fd: i32, buf: &[u8]) -> (i64, Option<i32>) {
+    let n = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
+    (n as i64, std::io::Error::last_os_error().raw_os_error())
+}
+"#;
+
+const LIBC_WRITE_SRC: &str = r#"
+extern crate libc_write_probe;
+
+use std::io::Read as _;
+use std::os::unix::io::AsRawFd as _;
+
+fn main() {
+    // A descriptor naming no entry, and a negative one:
+    // -1 with EBADF recorded.
+    let (n, e) = libc_write_probe::write_from(9999, b"xy");
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_write_probe::EBADF));
+    let (n, e) = libc_write_probe::write_from(-3, b"xy");
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_write_probe::EBADF));
+
+    // A real file: the bytes land in the file.
+    let dir = std::env::args().nth(1).unwrap();
+    let path = format!("{dir}/out.bin");
+    let f = std::fs::File::create(&path).unwrap();
+    let (n, _) = libc_write_probe::write_from(f.as_raw_fd(), b"hello");
+    assert_eq!(n, 5);
+    drop(f);
+    assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+    // Descriptor 1 is the guest's stdout, descriptor 2
+    // its stderr.
+    let (n, _) = libc_write_probe::write_from(1, b"via-libc-write\n");
+    assert_eq!(n, 15);
+    let (n, _) = libc_write_probe::write_from(2, b"err-via-libc\n");
+    assert_eq!(n, 13);
+
+    // A connected stream carries the bytes to the peer.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sender = std::net::TcpStream::connect(addr).unwrap();
+    let (mut receiver, _) = listener.accept().unwrap();
+    let (n, _) = libc_write_probe::write_from(sender.as_raw_fd(), b"abc");
+    assert_eq!(n, 3);
+    let mut rb = [0u8; 3];
+    receiver.read_exact(&mut rb).unwrap();
+    assert_eq!(&rb, b"abc");
+
+    // The listening descriptor itself answers with the
+    // kernel's error.
+    let (n, e) = libc_write_probe::write_from(listener.as_raw_fd(), b"z");
+    assert_eq!(n, -1);
+    assert_eq!(e, Some(libc_write_probe::EPIPE));
+    println!("libc-write-ok");
+}
+"#;
+
+#[test]
+fn run_mode_libc_write_descriptors_and_errno() {
+    let dir = temp_dir("libc-write");
+    let aux = fixture(&dir, "libc_write_probe.rs", LIBC_WRITE_AUX_SRC);
+    let src = fixture(&dir, "libc_write.rs", LIBC_WRITE_SRC);
+    let spec = format!("libc_write_probe={}", aux.display());
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let out = run_driver_extra(
+        &src,
+        &["--aux", &spec, "--guest-arg", &dir_arg],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert_eq!(stdout, "via-libc-write\nlibc-write-ok\n", "stderr={stderr}");
+    assert!(
+        stderr.contains("err-via-libc\n"),
+        "guest stderr must carry the descriptor-2 write; stderr={stderr}"
+    );
+}
+
 const FDS_CLOEXEC_SRC: &str = r#"
 extern crate libc_read_probe;
 

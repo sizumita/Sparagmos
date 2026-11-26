@@ -1630,6 +1630,16 @@ pub enum Builtin {
     /// `EBADF` recorded in the errno cell, as the host
     /// call's failure does.
     LibcRead,
+    /// `libc::write(fd, buf, count) -> ssize_t`: a write
+    /// to a guest descriptor (see `exec_libc_write` in
+    /// `builtins::libc_io`), the twin of `LibcRead`: the
+    /// write runs on the host object behind the
+    /// descriptor's table entry (descriptors 1 and 2 are
+    /// the guest's captured stdout and stderr), and a
+    /// descriptor naming no entry fails with `EBADF`
+    /// recorded in the errno cell, as the host call's
+    /// failure does.
+    LibcWrite,
     /// `std::sys::io::error::unix::errno_location()
     /// -> *mut c_int` (and the libc crate's own
     /// `__errno_location`): the address of the guest's
