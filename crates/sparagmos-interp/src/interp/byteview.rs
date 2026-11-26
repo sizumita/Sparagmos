@@ -61,6 +61,96 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// The byte layout of an ADT field, from its recorded
+    /// tag. A field whose tag names a type with no recorded
+    /// layout — a newtype wrapper the conversion never laid
+    /// out as its own instance, such as the standard
+    /// library's niche newtypes — falls back to the layout
+    /// of the scalar leaf the stored value itself holds:
+    /// the value model flattens such a wrapper to its leaf,
+    /// and the field's recorded slot size fixes the leaf's
+    /// width.
+    fn field_byte_layout(
+        &self,
+        name: &str,
+        variant: usize,
+        field: usize,
+        slot_size: usize,
+        value: &Value,
+    ) -> Option<ByteLayout> {
+        let tag = self.adt_field_tag(name, variant, field)?;
+        let resolved = self.byte_layout_of_tag(&tag);
+        // A newtype over a scalar leaf — a single-field ADT
+        // whose only field is a scalar of the slot's width —
+        // is stored as the leaf itself in the value model
+        // (the standard library's niche newtypes, flattened
+        // by the builtins that construct them), so its byte
+        // layout is the leaf's, whatever form the slot
+        // currently holds.
+        if let Some(ByteLayout::Adt(inner)) = &resolved {
+            if let Some(rows) = self.program().adt_field_layouts.get(inner) {
+                if rows.len() == 1 && rows[0].len() == 1 {
+                    if let Some(inner_tag) = self.adt_field_tag(inner, 0, 0) {
+                        if let Some(ByteLayout::Scalar(scalar)) =
+                            self.byte_layout_of_tag(&inner_tag)
+                        {
+                            if scalar.width() == slot_size {
+                                return Some(ByteLayout::Scalar(scalar));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(layout) = resolved {
+            // A layout the value's own form cannot walk — an
+            // ADT layout over a scalar leaf, the flattened
+            // newtype case — is not the field's layout here.
+            if !matches!(layout, ByteLayout::Adt(_))
+                || !matches!(
+                    value,
+                    Value::Uint(_)
+                        | Value::Int(_)
+                        | Value::Float(_)
+                        | Value::Float128(_)
+                        | Value::Bool(_)
+                )
+            {
+                return Some(layout);
+            }
+        }
+        let scalar = match value {
+            Value::Uint(_) => ByteScalar::Uint(match slot_size {
+                1 => UintTy::U8,
+                2 => UintTy::U16,
+                4 => UintTy::U32,
+                8 => UintTy::U64,
+                16 => UintTy::U128,
+                _ => return None,
+            }),
+            Value::Int(_) => ByteScalar::Int(match slot_size {
+                1 => IntTy::I8,
+                2 => IntTy::I16,
+                4 => IntTy::I32,
+                8 => IntTy::I64,
+                16 => IntTy::I128,
+                _ => return None,
+            }),
+            Value::Float(_) => ByteScalar::Float(match slot_size {
+                2 => FloatTy::F16,
+                4 => FloatTy::F32,
+                8 => FloatTy::F64,
+                _ => return None,
+            }),
+            Value::Float128(_) if slot_size == 16 => {
+                ByteScalar::Float(FloatTy::F128)
+            }
+            Value::Bool(_) if slot_size == 1 => ByteScalar::Bool,
+            _ => return None,
+        };
+        Some(ByteLayout::Scalar(scalar))
+    }
+
     /// The byte layout of a field type named by its recorded
     /// debug-shape tag (see [`Self::byte_layout_of_ty`]): the
     /// scalar and array tags resolve structurally, an ADT tag
@@ -355,9 +445,18 @@ impl<'a> Interpreter<'a> {
                     return Some(Ok(StorageByte::Padding));
                 };
                 let field = fields.get(f)?;
-                let tag = self.adt_field_tag(name, *variant as usize, f)?;
-                let field_layout = self.byte_layout_of_tag(&tag)?;
-                if self.byte_layout_size(&field_layout)? != row[f].1 as usize {
+                let field_layout = self.field_byte_layout(
+                    name,
+                    *variant as usize,
+                    f,
+                    row[f].1 as usize,
+                    field,
+                )?;
+                // The recorded slot can exceed the field
+                // type's own size (its tail padding, rounded
+                // to the containing type's alignment); only a
+                // slot smaller than the type is inconsistent.
+                if self.byte_layout_size(&field_layout)? > row[f].1 as usize {
                     return None;
                 }
                 self.storage_byte(field, &field_layout, pos - field_off)
@@ -506,6 +605,22 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ByteLayout::Adt(name) => {
+                // Uninitialised storage under an ADT layout
+                // starts as the first variant's skeleton: the
+                // tag bytes spliced into it re-form the value
+                // at the variant they name (carrying the other
+                // spliced bytes across), and field bytes land
+                // in the skeleton's fields — the same formation
+                // a byte write into a fresh `MaybeUninit` slot
+                // performs.
+                if matches!(slot, Value::Uninit) {
+                    let rows = self.program().adt_field_layouts.get(name)?;
+                    let first = rows.first()?;
+                    *slot = Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Uninit; first.len()],
+                    };
+                }
                 let (variant, row) = {
                     let Value::Enum { variant, .. } = &*slot else {
                         return None;
@@ -546,9 +661,23 @@ impl<'a> Interpreter<'a> {
                     }
                     return Some(Err(ByteVerdict::Padding(pos)));
                 };
-                let tag = self.adt_field_tag(name, variant as usize, f)?;
-                let field_layout = self.byte_layout_of_tag(&tag)?;
-                if self.byte_layout_size(&field_layout)? != row[f].1 as usize {
+                let field_layout = {
+                    let Value::Enum { fields, .. } = &*slot else {
+                        return None;
+                    };
+                    let field = fields.get(f)?;
+                    self.field_byte_layout(
+                        name,
+                        variant as usize,
+                        f,
+                        row[f].1 as usize,
+                        field,
+                    )?
+                };
+                // As on the read side: a recorded slot larger
+                // than the field type is its tail padding,
+                // not an inconsistency.
+                if self.byte_layout_size(&field_layout)? > row[f].1 as usize {
                     return None;
                 }
                 let Value::Enum { fields, .. } = slot else {
@@ -1866,6 +1995,813 @@ impl<'a> Interpreter<'a> {
         let next = if mutable { 0 } else { flag - 1 };
         self.refcell_set_flag(frames, &flag_target, next)
     }
+
+    // ----- foreign-view accesses ------------------------------
+    //
+    // A place reached through a reference whose pointee type
+    // differs from the type the storage was born with — the
+    // shape a `mem::transmute` of `&mut Enum` into `&mut Repr`
+    // produces, where the repr is a struct or union laid out
+    // over the same bytes — is a foreign access: the
+    // projection was converted against the accessing type, but
+    // the stored value is a value of the birth type, and the
+    // structural projectors would compose the accessing type's
+    // field tree inside the birth value's field slots, leaving
+    // a shape no birth-typed read can interpret (the tag value
+    // sitting in the payload slot, the payload union nested
+    // beside it, the discriminant never written). The byte
+    // view owns such accesses instead: the projection's byte
+    // span is priced through the accessing type's recorded
+    // layouts, and the bytes move through the birth value's
+    // storage with the same primitives the displaced-pointer
+    // view uses — a write of the tag field's bytes re-forms
+    // the enum at the named variant with the surviving storage
+    // spliced into it, exactly as the storage's bytes dictate,
+    // and a read constructs the accessing type's value from
+    // the span's bytes. An access is foreign only when the
+    // accessing and birth root types are different ADT
+    // instances and the reference's pointee extent agrees
+    // with the span its stored prefix denotes in the birth
+    // storage; anything the view cannot price or move
+    // declines to the ordinary paths, which keep their
+    // current behaviour there.
+
+    /// The declared (birth) root type of a resolved target and
+    /// its root-relative projection, for the foreign view's
+    /// detection (see above). `None` for a value target (a
+    /// constant's storage has no birth type to translate
+    /// against), for an element block (whose storage the
+    /// element model owns), and for a target whose birth type
+    /// is not recorded.
+    fn target_birth<'t>(
+        &self,
+        frames: &[Frame],
+        target: &'t Resolved,
+    ) -> Option<(Ty, &'t [RefProj])> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let body = self.program().get(&frame.func)?;
+                let ty = body.local_tys.get(*local)?.clone();
+                Some((ty, projection))
+            }
+            Resolved::Static { name, projection } => {
+                let ty = self.program().static_tys.get(name)?.clone();
+                Some((ty, projection))
+            }
+            Resolved::Alloc { id, projection } => {
+                if self.is_elem_block(*id) {
+                    return None;
+                }
+                let ty = self.alloc_ty(*id)?;
+                Some((ty, projection))
+            }
+            Resolved::Value(..) => None,
+        }
+    }
+
+    /// The (function, place description) pair an error about
+    /// `target` reports, mirroring `read_resolved_typed`.
+    fn target_desc(&self, frames: &[Frame], target: &Resolved) -> (String, String) {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let func = frames
+                    .get(*frame_pos)
+                    .map(|f| f.func.clone())
+                    .unwrap_or_default();
+                (func, describe_resolved(*local, projection))
+            }
+            Resolved::Static { name, .. } => {
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<static>".to_string());
+                (func, format!("static {name}"))
+            }
+            Resolved::Alloc { id, .. } => {
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<allocation>".to_string());
+                (func, format!("allocation #{id}"))
+            }
+            Resolved::Value(..) => (
+                "<constant>".to_string(),
+                "constant aggregate".to_string(),
+            ),
+        }
+    }
+
+    /// The birth root type of a foreign access (see the
+    /// section comment): the accessing root type and the
+    /// target's birth root type are different ADT instances,
+    /// and the target's projection contains no step whose
+    /// span the layouts do not determine (a byte displacement
+    /// is the displaced view's own case, a sub-slice has no
+    /// single span, the vector length slot is not storage).
+    /// The extent agreement the access needs — the two roots'
+    /// sizes equal, the reference denoting the whole storage —
+    /// is [`Self::foreign_span`]'s check, not this one's.
+    fn foreign_birth_ty(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        access_root: &Ty,
+    ) -> Option<Ty> {
+        let Ty::Adt(access_name) = access_root else {
+            return None;
+        };
+        let (birth, projection) = self.target_birth(frames, target)?;
+        let Ty::Adt(birth_name) = &birth else {
+            return None;
+        };
+        if access_name == birth_name {
+            return None;
+        }
+        if !self.program().adt_layouts.contains_key(access_name)
+            || !self.program().adt_layouts.contains_key(birth_name)
+        {
+            return None;
+        }
+        if projection.iter().any(|s| {
+            matches!(
+                s,
+                RefProj::ByteOffset(_)
+                    | RefProj::Subslice { .. }
+                    | RefProj::VecLen
+            )
+        }) {
+            return None;
+        }
+        Some(birth)
+    }
+
+    /// The byte span (offset, size) a root-relative projection
+    /// denotes within the storage of a value of type `root_ty`,
+    /// priced through the recorded field layouts — the foreign
+    /// view's addressing (see the section comment). A field
+    /// step prices through the instance's recorded layout row
+    /// for the variant the walk is inside; a union field step
+    /// adds nothing (every field starts at the union's base)
+    /// and takes the field's recorded span as the size. `None`
+    /// when a step's offset the recorded layouts do not
+    /// determine (a tuple step, an unrecorded field type on
+    /// the way in, an index into a non-array).
+    fn access_span(
+        &self,
+        root_ty: &Ty,
+        projection: &[RefProj],
+    ) -> Option<(usize, usize)> {
+        let mut ty: Option<Ty> = Some(root_ty.clone());
+        let mut off: usize = 0;
+        let mut size: usize = usize::try_from(self.ty_size(root_ty)?).ok()?;
+        let mut variant: usize = 0;
+        for (n, step) in projection.iter().enumerate() {
+            let last = n + 1 == projection.len();
+            match step {
+                RefProj::Field(i) | RefProj::UnionField { idx: i, .. } => {
+                    let union = matches!(step, RefProj::UnionField { .. });
+                    let cur = ty.as_ref()?;
+                    let Ty::Adt(name) = cur else {
+                        return None;
+                    };
+                    let (fo, fs) = if union {
+                        // A union's fields all start at its
+                        // base; a field's span is its own size.
+                        // The recorded layout row says so when
+                        // the instance has one; a union instance
+                        // that appears only as another ADT's
+                        // field may have none, and then the
+                        // field's declared type sizes it.
+                        match self
+                            .program()
+                            .adt_field_layouts
+                            .get(name)
+                            .and_then(|rows| rows.first())
+                            .and_then(|row| row.get(*i))
+                        {
+                            Some(&(fo, fs)) => (fo, fs),
+                            None => {
+                                let fty = self.instance_field_ty(
+                                    name, cur, 0, *i,
+                                )?;
+                                (0, self.ty_size(&fty)?)
+                            }
+                        }
+                    } else {
+                        let rows =
+                            self.program().adt_field_layouts.get(name)?;
+                        let row = rows.get(variant)?;
+                        *row.get(*i)?
+                    };
+                    off = off.checked_add(usize::try_from(fo).ok()?)?;
+                    size = usize::try_from(fs).ok()?;
+                    if !last {
+                        ty = Some(self.instance_field_ty(
+                            name,
+                            cur,
+                            if union { 0 } else { variant },
+                            *i,
+                        )?);
+                        variant = 0;
+                    }
+                }
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                }
+                RefProj::Index(k) => {
+                    let cur = ty.as_ref()?;
+                    let Ty::Array(elem, _) = cur else {
+                        return None;
+                    };
+                    let es = usize::try_from(self.ty_size(elem)?).ok()?;
+                    off = off.checked_add(k.checked_mul(es)?)?;
+                    size = es;
+                    if !last {
+                        ty = Some((**elem).clone());
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some((off, size))
+    }
+
+    /// The byte span a foreign access denotes, split at the
+    /// access's own dereference: the target's projection is
+    /// the reference's stored prefix (formed when the
+    /// reference was created) followed by the steps the
+    /// access's place adds past its dereference (formed
+    /// against the accessing type). The tail prices over the
+    /// accessing type. A non-empty prefix declines: the steps
+    /// a stored reference carries were formed against the
+    /// type of the place that created it — the birth type for
+    /// an ordinary borrow, an accessing view for a borrow
+    /// taken through one — and nothing at the access records
+    /// which, so a span priced for it could name the wrong
+    /// bytes; such accesses (a reference extracted from a
+    /// transmuted view and used elsewhere) keep the ordinary
+    /// structural path. For a reference to the storage root
+    /// itself the prefix is empty and the tail is the whole
+    /// projection.
+    fn foreign_span(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        access_root: &Ty,
+        birth: &Ty,
+        place: &Place,
+    ) -> Option<(usize, usize)> {
+        let (_, projection) = self.target_birth(frames, target)?;
+        let tail_len = place
+            .projection
+            .iter()
+            .rposition(|e| matches!(e, ProjectionElem::Deref))
+            .map(|p| place.projection.len() - p - 1)?;
+        if projection.len() != tail_len {
+            return None;
+        }
+        let access_size =
+            usize::try_from(self.program().adt_layouts.get(match access_root {
+                Ty::Adt(name) => name,
+                _ => return None,
+            })?.0)
+            .ok()?;
+        if usize::try_from(self.ty_size(birth)?).ok()? != access_size {
+            return None;
+        }
+        self.access_span(access_root, projection)
+    }
+
+    /// One byte of a value's storage, for the foreign view
+    /// (see [`Self::storage_byte`]): a definite byte, an
+    /// indeterminate (padding) byte, or a byte of storage
+    /// never written. `None` when the layout cannot judge the
+    /// position at all.
+    fn foreign_byte(
+        &self,
+        value: &Value,
+        layout: &ByteLayout,
+        pos: usize,
+    ) -> Option<ForeignByte> {
+        match self.storage_byte(value, layout, pos)? {
+            Ok(StorageByte::Byte(b)) => Some(ForeignByte::Byte(b)),
+            Ok(StorageByte::Padding) => Some(ForeignByte::Padding),
+            Err(ByteVerdict::Uninit) => Some(ForeignByte::Uninit),
+            Err(_) => None,
+        }
+    }
+
+    /// The byte image of a complete value of type `ty` being
+    /// written through a foreign view: per position, the
+    /// definite byte the value's storage holds there, or
+    /// `None` for a position the value does not determine
+    /// (its padding, which a write leaves as it lies). The
+    /// whole image is `None` (the access declines) when any
+    /// position's byte the value leaves uninitialised or the
+    /// layout cannot judge — a partial image spliced into
+    /// foreign storage would invent bytes. A niche-encoded
+    /// enum value in a niche variant has no field bytes to
+    /// extract: its image is the niche scalar's own pattern
+    /// at the recorded offset, padding elsewhere; the same
+    /// holds for the scalar form such a value flattens to.
+    fn written_value_bytes(
+        &self,
+        value: &Value,
+        ty: &Ty,
+        size: usize,
+    ) -> Option<Vec<Option<u8>>> {
+        if let Ty::Adt(name) = ty {
+            if let Some(niche) = self.program().adt_niches.get(name) {
+                let scalar = match value {
+                    Value::Enum { variant, .. }
+                        if *variant != niche.untagged_variant
+                            && (niche.niche_variants.0..=niche.niche_variants.1)
+                                .contains(variant) =>
+                    {
+                        Some(
+                            niche.niche_start
+                                + u128::from(variant - niche.niche_variants.0),
+                        )
+                    }
+                    Value::Uint(bits) => Some(*bits),
+                    Value::Int(bits) => Some(*bits as u128),
+                    _ => None,
+                };
+                if let Some(scalar) = scalar {
+                    let width = usize::try_from(niche.tag_bits / 8).ok()?;
+                    let off = usize::try_from(niche.niche_offset).ok()?;
+                    if off + width > size {
+                        return None;
+                    }
+                    let mut bytes = vec![None; size];
+                    for i in 0..width {
+                        bytes[off + i] = Some((scalar >> (8 * i)) as u8);
+                    }
+                    return Some(bytes);
+                }
+            }
+        }
+        let layout = self.byte_layout_of_ty(ty)?;
+        let mut bytes = Vec::with_capacity(size);
+        for pos in 0..size {
+            match self.foreign_byte(value, &layout, pos)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => {
+                    return None;
+                }
+            }
+        }
+        Some(bytes)
+    }
+
+    /// Construct the value of type `ty` whose storage bytes
+    /// are `bytes` (the foreign view's read): a definite byte
+    /// per position, `None` where the source storage held
+    /// padding there. `None` (the access declines) when the
+    /// type's value cannot be built from bytes here — a tuple
+    /// (whose field offsets are not recorded), a pointer, or
+    /// a byte the construction cannot judge. An ADT value is
+    /// built by splicing the bytes into an uninitialised
+    /// skeleton of the type, so an enum's tag bytes re-form
+    /// the skeleton at the variant they name, carrying the
+    /// already-spliced payload bytes across; a niche-encoded
+    /// enum whose niche window holds a niche variant's
+    /// pattern is that variant's value directly.
+    fn construct_from_bytes(&self, ty: &Ty, bytes: &[Option<u8>]) -> Option<Value> {
+        match ty {
+            Ty::Bool | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) => {
+                let mut bits: u128 = 0;
+                for (i, b) in bytes.iter().enumerate() {
+                    bits |= u128::from((*b)?) << (8 * i);
+                }
+                let shape = match ty {
+                    Ty::Bool => ScalarShape::Bool,
+                    Ty::Int(t) => ScalarShape::Int {
+                        bits: t.bits(),
+                        signed: true,
+                    },
+                    Ty::Uint(t) => ScalarShape::Int {
+                        bits: t.bits(),
+                        signed: false,
+                    },
+                    Ty::Float(t) => ScalarShape::Float { bits: t.bits() },
+                    _ => unreachable!(),
+                };
+                self.construct_scalar(bits, &shape).ok()
+            }
+            Ty::Array(elem, n) => {
+                let count = usize::try_from(*n).ok()?;
+                let es = usize::try_from(self.ty_size(elem)?).ok()?;
+                let mut items = Vec::with_capacity(count);
+                for i in 0..count {
+                    let slice = bytes.get(i * es..(i + 1) * es)?;
+                    items.push(self.construct_from_bytes(elem, slice)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            Ty::Adt(name) => {
+                if let Some(niche) = self.program().adt_niches.get(name) {
+                    let width = usize::try_from(niche.tag_bits / 8).ok()?;
+                    let off = usize::try_from(niche.niche_offset).ok()?;
+                    let mut bits: u128 = 0;
+                    let mut judged = true;
+                    for i in 0..width {
+                        match bytes.get(off + i) {
+                            Some(Some(b)) => bits |= u128::from(*b) << (8 * i),
+                            _ => {
+                                judged = false;
+                                break;
+                            }
+                        }
+                    }
+                    if judged
+                        && bits >= niche.niche_start
+                        && bits - niche.niche_start
+                            <= u128::from(
+                                niche.niche_variants.1 - niche.niche_variants.0,
+                            )
+                    {
+                        let variant = niche.niche_variants.0
+                            + u32::try_from(bits - niche.niche_start).ok()?;
+                        let fields = self
+                            .program()
+                            .adt_field_layouts
+                            .get(name)
+                            .and_then(|rows| rows.get(variant as usize))
+                            .map(|row| vec![Value::Uninit; row.len()])
+                            .unwrap_or_default();
+                        return Some(Value::Enum { variant, fields });
+                    }
+                }
+                let rows = self.program().adt_field_layouts.get(name)?;
+                let row0 = rows.first()?;
+                let mut skeleton = Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uninit; row0.len()],
+                };
+                let layout = ByteLayout::Adt(name.clone());
+                for (pos, b) in bytes.iter().enumerate() {
+                    let Some(b) = b else {
+                        continue;
+                    };
+                    match self.splice_storage_byte(&mut skeleton, &layout, pos, *b)? {
+                        Ok(()) => {}
+                        Err(ByteVerdict::Padding(_)) => {}
+                        Err(_) => return None,
+                    }
+                }
+                Some(skeleton)
+            }
+            _ => None,
+        }
+    }
+
+    /// The current root value of a resolved target, cloned;
+    /// `None` when the target holds no storage the foreign
+    /// view may move (a value target, a missing local, an
+    /// unseeded static, a freed allocation) — the access
+    /// declines and the ordinary path judges the target.
+    fn target_root_value(&self, frames: &[Frame], target: &Resolved) -> Option<Value> {
+        match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => frames.get(*frame_pos)?.locals.get(*local).cloned(),
+            Resolved::Static { name, .. } => self.static_base(name).ok(),
+            Resolved::Alloc { id, .. } => self.alloc_base(*id).ok(),
+            Resolved::Value(..) => None,
+        }
+    }
+
+    /// Store `value` as the root value of a resolved target;
+    /// `None` under the same conditions as
+    /// [`Self::target_root_value`].
+    fn store_target_root(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: Value,
+    ) -> Option<InterpResult<()>> {
+        match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => {
+                let slot = frames.get_mut(*frame_pos)?.locals.get_mut(*local)?;
+                *slot = value;
+                Some(Ok(()))
+            }
+            Resolved::Static { name, .. } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store.get_mut(name)?;
+                *slot = value;
+                Some(Ok(()))
+            }
+            Resolved::Alloc { id, .. } => {
+                let mut store = self.allocs.borrow_mut();
+                let slot = store.get_mut(id)?;
+                *slot = value;
+                Some(Ok(()))
+            }
+            Resolved::Value(..) => None,
+        }
+    }
+
+    /// The accessing root type of a place, for the foreign
+    /// view: the pointee type the place's last dereference
+    /// denotes, walked from the place's local with the same
+    /// steps [`Self::resolved_root_ty`] takes, plus the union
+    /// field step that walk cannot price (a union field's
+    /// declared type is its field type at variant 0). `None`
+    /// when the walk meets a step it cannot type.
+    fn foreign_access_root(&self, body: &Body, place: &Place) -> Option<Ty> {
+        self.foreign_place_walk(body, place).map(|(root, _)| root)
+    }
+
+    /// The declared type of the value a place denotes, for
+    /// the foreign view: the full walk of
+    /// [`Self::foreign_access_root`], returning the type at
+    /// the end of the projection (the value the access reads
+    /// or writes) alongside the accessing root type.
+    /// (`place_result_ty` cannot serve here: it prices no
+    /// field step into an ADT.)
+    fn foreign_place_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
+        self.foreign_place_walk(body, place).map(|(_, ty)| ty)
+    }
+
+    /// The walk behind [`Self::foreign_access_root`] and
+    /// [`Self::foreign_place_ty`]: (accessing root type,
+    /// result type) of a place.
+    /// The type of an ADT field for the foreign walks: the
+    /// declared-type table's skeleton, upgraded to the field's
+    /// full instance when the skeleton names only the generic
+    /// definition (its bare name has no recorded layout) and
+    /// the parent's recorded field tag names an instance that
+    /// does. The byte machinery is keyed by instance, so a
+    /// place whose type stays a bare definition name cannot
+    /// be extracted or constructed.
+    fn instance_field_ty(
+        &self,
+        parent_name: &str,
+        parent: &Ty,
+        variant: usize,
+        field: usize,
+    ) -> Option<Ty> {
+        let ty = self.adt_field_ty(parent, variant, field)?;
+        if let Ty::Adt(name) = &ty {
+            if !self.program().adt_layouts.contains_key(name) {
+                if let Some(tag) = self.adt_field_tag(parent_name, variant, field) {
+                    let tag = tag.trim();
+                    if self.program().adt_layouts.contains_key(tag) {
+                        return Some(Ty::Adt(tag.to_string()));
+                    }
+                }
+            }
+        }
+        Some(ty)
+    }
+
+    fn foreign_place_walk(
+        &self,
+        body: &Body,
+        place: &Place,
+    ) -> Option<(Ty, Ty)> {
+        let mut ty = body.local_ty(place.local)?.clone();
+        let mut root = ty.clone();
+        let mut variant = 0usize;
+        for elem in &place.projection {
+            match (elem, &ty) {
+                (ProjectionElem::Deref, Ty::Ref(inner)) => {
+                    ty = (**inner).clone();
+                    root = ty.clone();
+                    variant = 0;
+                }
+                (ProjectionElem::Field(i), Ty::Tuple(ts)) => {
+                    ty = ts.get(*i)?.clone();
+                }
+                (ProjectionElem::Field(i), Ty::Adt(name)) => {
+                    let name = name.clone();
+                    ty = self.instance_field_ty(&name, &ty, variant, *i)?;
+                }
+                (ProjectionElem::UnionField { idx, .. }, Ty::Adt(name)) => {
+                    let name = name.clone();
+                    ty = self.instance_field_ty(&name, &ty, 0, *idx)?;
+                }
+                (ProjectionElem::Index(_), Ty::Array(elem, _))
+                | (ProjectionElem::Index(_), Ty::Slice(elem))
+                | (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _))
+                | (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => {
+                    ty = (**elem).clone();
+                }
+                (ProjectionElem::Downcast(v), _) => {
+                    variant = *v as usize;
+                }
+                (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
+                    ty = Ty::Array(elem.clone(), 0);
+                }
+                (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
+                    ty = Ty::Slice(elem.clone());
+                }
+                _ => return None,
+            }
+        }
+        Some((root, ty))
+    }
+
+    /// Read a place through a foreign view (see the section
+    /// comment): the span's bytes come out of the birth
+    /// value's storage and the result is constructed as a
+    /// value of the place's own (accessing) type. `None` when
+    /// the access is not foreign or the view cannot judge it;
+    /// a judged uninitialised byte in the span is the read's
+    /// error, as on the ordinary path.
+    pub(crate) fn foreign_read(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+        target: &Resolved,
+    ) -> Option<InterpResult<Value>> {
+        let access_root = self.foreign_access_root(body, place)?;
+        let birth = self.foreign_birth_ty(frames, target, &access_root)?;
+        let (off, size) =
+            self.foreign_span(frames, target, &access_root, &birth, place)?;
+        if size == 0 {
+            return None;
+        }
+        let place_ty = self.foreign_place_ty(body, place)?;
+        // As on the write path, the span can carry the slot's
+        // tail padding past the value's own extent; the value
+        // read back is the value's extent.
+        let value_size = usize::try_from(self.ty_size(&place_ty)?).ok()?;
+        if value_size > size {
+            return None;
+        }
+        let size = value_size;
+        let root = self.target_root_value(frames, target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut bytes = Vec::with_capacity(size);
+        for i in 0..size {
+            match self.foreign_byte(&root, &layout, off + i)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => {
+                    let (func, desc) = self.target_desc(frames, target);
+                    return Some(Err(InterpError::UninitializedRead {
+                        func,
+                        place: desc,
+                    }));
+                }
+            }
+        }
+        let built = self.construct_from_bytes(&place_ty, &bytes);
+        built.map(Ok)
+    }
+
+    /// Set an enum place's discriminant through a foreign
+    /// view: the discriminant's own bytes are spliced into
+    /// the birth storage at the tag position the place's
+    /// span denotes, re-forming the birth value at the named
+    /// variant (the field writes that follow land in the new
+    /// variant's fields). A direct-tag enum's bytes are its
+    /// recorded tag's; a niche-encoded enum's are the niche
+    /// scalar's pattern for a niche variant. Setting the
+    /// untagged variant of a niche-encoded enum declines:
+    /// its niche scalar is the variant's own field value,
+    /// which the field write that follows a whole-value
+    /// assignment provides, and a bare discriminant set has
+    /// no byte of its own to write.
+    pub(crate) fn foreign_set_discriminant(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        place: &Place,
+        target: &Resolved,
+        variant: u32,
+    ) -> Option<InterpResult<()>> {
+        let access_root = self.foreign_access_root(body, place)?;
+        let birth = self.foreign_birth_ty(frames, target, &access_root)?;
+        let (off, _size) =
+            self.foreign_span(frames, target, &access_root, &birth, place)?;
+        let place_ty = self.foreign_place_ty(body, place)?;
+        let Ty::Adt(name) = &place_ty else {
+            return None;
+        };
+        let (base, bytes): (usize, Vec<u8>) =
+            if let Some(tag) = self.program().adt_tag_layouts.get(name) {
+                let discr = *tag.discriminants.get(variant as usize)?;
+                (
+                    off + tag.offset as usize,
+                    (0..tag.size as usize)
+                        .map(|i| (discr >> (8 * i)) as u8)
+                        .collect(),
+                )
+            } else if let Some(niche) = self.program().adt_niches.get(name) {
+                if variant == niche.untagged_variant
+                    || !(niche.niche_variants.0..=niche.niche_variants.1)
+                        .contains(&variant)
+                {
+                    return None;
+                }
+                let scalar = niche.niche_start
+                    + u128::from(variant - niche.niche_variants.0);
+                let width = usize::try_from(niche.tag_bits / 8).ok()?;
+                (
+                    off + niche.niche_offset as usize,
+                    (0..width)
+                        .map(|i| (scalar >> (8 * i)) as u8)
+                        .collect(),
+                )
+            } else {
+                return None;
+            };
+        let root = self.target_root_value(frames, target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut composed = root;
+        for (i, byte) in bytes.iter().enumerate() {
+            match self.splice_storage_byte(&mut composed, &layout, base + i, *byte) {
+                Some(Ok(())) => {}
+                Some(Err(ByteVerdict::Padding(_))) => {}
+                Some(Err(verdict)) => {
+                    let (func, desc) = self.target_desc(frames, target);
+                    return Some(Err(self.byte_view_error(
+                        verdict, &func, &desc, false,
+                    )));
+                }
+                None => return None,
+            }
+        }
+        self.store_target_root(frames, target, composed)
+    }
+
+    /// Write `value` to a place through a foreign view (see
+    /// the section comment): the value's byte image is
+    /// spliced into the birth value's storage at the span the
+    /// accessing projection denotes, and the composed birth
+    /// value is stored back — so a later birth-typed read
+    /// sees exactly the value the written bytes form. The
+    /// splice runs on a clone of the stored value: a view
+    /// that declines midway leaves the storage untouched and
+    /// the ordinary path runs instead.
+    pub(crate) fn foreign_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        place: &Place,
+        target: &Resolved,
+        value: &Value,
+    ) -> Option<InterpResult<()>> {
+        let access_root = self.foreign_access_root(body, place)?;
+        let birth = self.foreign_birth_ty(frames, target, &access_root)?;
+        let (off, size) =
+            self.foreign_span(frames, target, &access_root, &birth, place)?;
+        if size == 0 {
+            return None;
+        }
+        let place_ty = self.foreign_place_ty(body, place)?;
+        // The span prices the place's slot in the accessing
+        // type, whose recorded extent can carry the slot's
+        // tail padding (a field whose recorded size rounds up
+        // to the containing struct's alignment); the value's
+        // own extent is what a write of the value determines.
+        // A span smaller than the value cannot hold it.
+        let value_size = usize::try_from(self.ty_size(&place_ty)?).ok()?;
+        if value_size > size {
+            return None;
+        }
+        let size = value_size;
+        let bytes = self.written_value_bytes(value, &place_ty, size)?;
+        let root = self.target_root_value(frames, target)?;
+        let layout = self.byte_layout_of_ty(&birth)?;
+        let mut composed = root;
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(b) = b else {
+                continue;
+            };
+            match self.splice_storage_byte(&mut composed, &layout, off + i, *b) {
+                Some(Ok(())) => {}
+                Some(Err(ByteVerdict::Padding(_))) => {}
+                Some(Err(verdict)) => {
+                    let (func, desc) = self.target_desc(frames, target);
+                    return Some(Err(self.byte_view_error(
+                        verdict, &func, &desc, false,
+                    )));
+                }
+                None => {
+                    return None;
+                }
+            }
+        }
+        self.store_target_root(frames, target, composed)
+    }
 }
 
 /// A scalar shape for the byte view of a value's storage (see
@@ -1894,6 +2830,18 @@ impl ByteScalar {
             ByteScalar::Char => 4,
         }
     }
+}
+
+/// One byte of a value's storage as the foreign view judges
+/// it (see `Interpreter::foreign_byte`).
+enum ForeignByte {
+    /// A definite byte of the storage.
+    Byte(u8),
+    /// A byte of padding: inside the storage, covered by no
+    /// field and no tag, with no definite value.
+    Padding,
+    /// A byte of storage that was never written.
+    Uninit,
 }
 
 /// The layout the byte view of a value's storage descends by

@@ -565,6 +565,7 @@ fn convert_all_with(
         .collect();
     out.adt_field_layouts = program.adt_field_layouts.clone();
     out.adt_tag_layouts = program.adt_tag_layouts.clone();
+    out.adt_niches = program.adt_niches.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();

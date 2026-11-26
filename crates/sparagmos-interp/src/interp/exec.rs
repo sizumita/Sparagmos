@@ -1989,6 +1989,16 @@ impl<'a> Interpreter<'a> {
                     return written;
                 }
                 let target = self.resolve_place(frames, body, place)?;
+                // A shaped store through a foreign view (a
+                // reference transmuted to a different ADT over
+                // the same storage): the byte view owns it when
+                // it can judge it (see
+                // `Interpreter::foreign_write`).
+                if let Some(written) =
+                    self.foreign_write(frames, body, place, &target, &value)
+                {
+                    return written;
+                }
                 // The shaped store's fallthrough is a projected
                 // assignment like any other: it takes the place's
                 // root type evidence with it (see `write_place`).
@@ -1997,6 +2007,16 @@ impl<'a> Interpreter<'a> {
             }
             StatementKind::SetDiscriminant { place, variant } => {
                 let target = self.resolve_place(frames, body, place)?;
+                // A discriminant set through a foreign view (a
+                // reference transmuted to a different ADT over
+                // the same storage): the byte view owns it when
+                // it can judge it (see
+                // `Interpreter::foreign_set_discriminant`).
+                if let Some(set) = self.foreign_set_discriminant(
+                    frames, body, place, &target, *variant,
+                ) {
+                    return set;
+                }
                 match target {
                     Resolved::Place {
                         frame_pos,
@@ -2649,6 +2669,19 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::ShapedLoad(place, shape, moved) => {
                 let target = self.resolve_place(frames, body, place)?;
+                // A shaped load through a foreign view (a
+                // reference transmuted to a different ADT over
+                // the same storage): the byte view owns it when
+                // it can judge it (see `Interpreter::foreign_read`).
+                // A moved load keeps the shaped path: its
+                // clearing write below is a structural one.
+                if !*moved {
+                    if let Some(read) =
+                        self.foreign_read(frames, body, place, &target)
+                    {
+                        return read;
+                    }
+                }
                 let place_ty = self.place_result_ty(body, place);
                 let value =
                     self.shaped_load(frames, &target, shape, place_ty.as_ref())?;
