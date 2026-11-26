@@ -46,6 +46,6 @@ pub use ty::{
     EnvDebugShape, EnvDebugShapes, EnvDebugVariant,
     AdtDiscriminants, AdtFieldLayouts, AdtInstanceShapes, AdtLayouts, AdtNiches, AdtTagLayouts, CoroutineLayouts, CoroutineSlots, AdtShape, AdtShapeKind, TupleLayouts,
     AdtShapes, AliasKind, ArrayLen, DefId, DiscriminantValues, EnumNiche, EnumTag, FloatTy,
-    StaticTys, ThreadLocalDef, ThreadLocals,
+    ExtraStaticSeeds, StaticSeedDef, StaticTys, ThreadLocalDef, ThreadLocals,
     FnSig, IntTy, Mutability, Region, Safety, Ty, UintTy,
 };

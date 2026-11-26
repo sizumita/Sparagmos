@@ -179,6 +179,16 @@ pub enum Builtin {
     /// shape), so the converted public `std::net` bodies above
     /// them run unchanged.
     NetSys(NetSysOp),
+    /// A `core::unicode::unicode_data` skiplist property
+    /// lookup (`<module>::lookup_slow(char) -> bool`): the
+    /// generated tables' only reader has no MIR body in the
+    /// shipped core (it is `#[inline(never)]` and non-generic,
+    /// so the rmeta carries no body for it), so the runtime
+    /// replays core's `skip_search` over the module's own
+    /// table statics, whose seeds the driver records in the
+    /// program (see `exec_unicode_lookup_slow` in
+    /// `builtins::unicode`).
+    UnicodeLookupSlow(UnicodeProperty),
     /// `std::process::exit(code)`: end the run with the given
     /// exit code (see `InterpError::ProcessExit`).
     ProcessExit,
@@ -1736,6 +1746,44 @@ pub enum FsSysOp {
     Rename,
     SetPermissions,
     Symlink,
+}
+
+/// The `core::unicode::unicode_data` property modules whose
+/// membership test is a skiplist lookup (`skip_search` over
+/// the module's `SHORT_OFFSET_RUNS` / `OFFSETS` statics): the
+/// modules core's generated `unicode_data.rs` defines in that
+/// shape. A module not listed here keeps the explicit
+/// no-converted-body error rather than a guessed answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnicodeProperty {
+    Alphabetic,
+    CaseIgnorable,
+    Cf,
+    CnPlanes03,
+    DefaultIgnorableCodePoint,
+    GraphemeExtend,
+    Lt,
+    N,
+}
+
+impl UnicodeProperty {
+    /// The property module's full name in core: the statics
+    /// the lookup reads are its `SHORT_OFFSET_RUNS` and
+    /// `OFFSETS` items.
+    pub fn module_path(self) -> &'static str {
+        match self {
+            UnicodeProperty::Alphabetic => "core::unicode::unicode_data::alphabetic",
+            UnicodeProperty::CaseIgnorable => "core::unicode::unicode_data::case_ignorable",
+            UnicodeProperty::Cf => "core::unicode::unicode_data::cf",
+            UnicodeProperty::CnPlanes03 => "core::unicode::unicode_data::cn_planes_0_3",
+            UnicodeProperty::DefaultIgnorableCodePoint => {
+                "core::unicode::unicode_data::default_ignorable_code_point"
+            }
+            UnicodeProperty::GraphemeExtend => "core::unicode::unicode_data::grapheme_extend",
+            UnicodeProperty::Lt => "core::unicode::unicode_data::lt",
+            UnicodeProperty::N => "core::unicode::unicode_data::n",
+        }
+    }
 }
 
 /// The `std::sys::net::connection::socket` leaf operations

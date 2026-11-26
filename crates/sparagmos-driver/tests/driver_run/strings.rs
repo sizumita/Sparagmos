@@ -2811,3 +2811,91 @@ fn run_mode_char_escape_iterator_consumers() {
          total=6\n",
     );
 }
+
+const CHAR_ESCAPE_DISPLAY_SRC: &str = r#"
+fn main() {
+    println!("dbg-nl={}", '\n'.escape_debug());
+    println!("dbg-lit={}", 'a'.escape_debug());
+    println!("dbg-emoji={}", '\u{1f600}'.escape_debug().to_string());
+    println!("dft-nl={}", '\n'.escape_default());
+    println!("uni-e9={}", '\u{e9}'.escape_unicode());
+    println!("dbg-301={}", '\u{301}'.escape_debug());
+    let mut it = '\n'.escape_debug();
+    let _ = it.next();
+    println!("dbg-rest={}", it);
+}
+"#;
+
+#[test]
+fn run_mode_char_escape_display() {
+    // `Display` of the `char` escape iterators: core defines
+    // the impls as draining the iterator into the formatter
+    // (the `EscapeDebug` / `EscapeDefault` / `EscapeUnicode`
+    // impls forward to the inner buffer state's own
+    // drain-shaped `Display`), and the formatter follows
+    // that definition over the modelled step — including a
+    // partially consumed iterator, whose `Display` yields
+    // only the remaining chars. The `dbg-301` line also
+    // constructs its iterator through the unicode property
+    // tables (see `run_mode_char_escape_non_ascii_construction`).
+    // Expected output was produced by the native 1.100.0
+    // toolchain.
+    run_ok(
+        "char-escape-display",
+        CHAR_ESCAPE_DISPLAY_SRC,
+        "dbg-nl=\\n\n\
+         dbg-lit=a\n\
+         dbg-emoji=\u{1f600}\n\
+         dft-nl=\\n\n\
+         uni-e9=\\u{e9}\n\
+         dbg-301=\\u{301}\n\
+         dbg-rest=n\n",
+    );
+}
+
+const CHAR_ESCAPE_NON_ASCII_SRC: &str = r#"
+fn main() {
+    println!("{:?}", '\u{e9}'.escape_debug().collect::<Vec<char>>());
+    println!("{:?}", '\u{301}'.escape_debug().collect::<Vec<char>>());
+    println!("{:?}", '\u{600}'.escape_debug().collect::<Vec<char>>());
+    println!("{:?}", '\u{ad}'.escape_debug().collect::<Vec<char>>());
+    println!("{:?}", '\u{378}'.escape_debug().collect::<Vec<char>>());
+    println!("{}", '\u{e000}'.escape_debug().count());
+    println!("{}", '\u{7f}'.escape_debug().count());
+    println!("{}", '\u{e9}'.is_alphabetic());
+    println!("{}", '\u{301}'.is_alphabetic());
+}
+"#;
+
+#[test]
+fn run_mode_char_escape_non_ascii_construction() {
+    // Constructing `escape_debug` for a non-ASCII char: the
+    // decision path reads core's generated unicode property
+    // tables through each property module's `lookup_slow`,
+    // which has no MIR body in the shipped core. The
+    // interpreter models `lookup_slow` by replaying core's
+    // skiplist search over the module's two table statics,
+    // whose seeds the driver records with the program (no
+    // converted body ever references them). The cases cover
+    // the grapheme-extend (U+0301), format-control and
+    // default-ignorable (U+0600, U+00AD), unassigned
+    // (U+0378) and private-use (U+E000) branches, plus the
+    // alphabetic property read through the same model.
+    // Dropping the constructed values exercises the union
+    // inside the iterator state, whose fields carry no drop
+    // glue. Expected output was produced by the native
+    // 1.100.0 toolchain.
+    run_ok(
+        "char-escape-non-ascii",
+        CHAR_ESCAPE_NON_ASCII_SRC,
+        "['\u{e9}']\n\
+         ['\\\\', 'u', '{', '3', '0', '1', '}']\n\
+         ['\\\\', 'u', '{', '6', '0', '0', '}']\n\
+         ['\\\\', 'u', '{', 'a', 'd', '}']\n\
+         ['\\\\', 'u', '{', '3', '7', '8', '}']\n\
+         8\n\
+         6\n\
+         true\n\
+         false\n",
+    );
+}

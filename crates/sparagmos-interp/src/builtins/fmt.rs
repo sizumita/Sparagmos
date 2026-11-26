@@ -1978,6 +1978,20 @@ impl<'a> Interpreter<'a> {
         if let Some(text) = self.format_string_content(frames, value, trait_, ty, options)? {
             return Ok(text);
         }
+        // The escape iterators' `Display` is the drain of the
+        // iterator itself: core defines the `str` types' as
+        // `clone().try_for_each(|c| f.write_char(c))` and the
+        // `char` types' as the inner buffer state's `Display`,
+        // which writes the remaining chars in order. Every one
+        // of these types' steps is modelled, so the formatting
+        // is the drain of the value through the modelled step
+        // (on the formatting argument's own snapshot — the
+        // guest's value is not consumed).
+        if trait_ == FmtTrait::Display {
+            if let Some(text) = self.format_escape_display(frames, value, ty, options)? {
+                return Ok(text);
+            }
+        }
         // A guest `fmt` implementation body, when the program
         // collected one for this type, is the faithful
         // formatting: run it against a captured `Formatter`
@@ -2877,6 +2891,39 @@ impl<'a> Interpreter<'a> {
             }
         }
         None
+    }
+
+    /// `Display` for an escape iterator value (see
+    /// [`escape_display_tag`]): the concatenation of the
+    /// chars the value's own modelled step still yields, in
+    /// order — the text core's `Display` definitions for
+    /// these types produce. `None` for any other type.
+    fn format_escape_display(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        ty: &str,
+        options: &FmtOptions,
+    ) -> InterpResult<Option<String>> {
+        let plain = pointee_tag(ty);
+        if !escape_display_tag(plain) {
+            return Ok(None);
+        }
+        let (items, _) = self.drain_iterator(frames, plain, value.clone())?;
+        let mut text = String::new();
+        for item in items {
+            match item {
+                Value::Uint(v) => text.push(as_char(v)?),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("Display of {plain}"),
+                        "char items from the modelled step",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+        Ok(Some(pad_str(&text, options)))
     }
 
     fn format_display(
@@ -4597,6 +4644,24 @@ fn array_tag_len(tag: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Whether the type tag names one of the `char` escape
+/// iterator types, whose core `Display` is the drain of the
+/// iterator (see `format_escape_display`): the impls
+/// forward to the inner buffer state's own drain-shaped
+/// `Display`. The `str` escape types share that definition
+/// (`clone().try_for_each(write_char)`), but their iterator
+/// step is not modelled yet, so they are deliberately not
+/// named here: their `Display` keeps failing at the
+/// unconverted-ADT boundary until the step lands.
+pub(super) fn escape_display_tag(plain: &str) -> bool {
+    self_ty_is(plain, "core::char::EscapeDebug")
+        || self_ty_is(plain, "std::char::EscapeDebug")
+        || self_ty_is(plain, "core::char::EscapeDefault")
+        || self_ty_is(plain, "std::char::EscapeDefault")
+        || self_ty_is(plain, "core::char::EscapeUnicode")
+        || self_ty_is(plain, "std::char::EscapeUnicode")
 }
 
 pub(super) fn pointee_tag(ty: &str) -> &str {

@@ -276,6 +276,21 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             .get(&def)
             .or_else(|| conv.def_names.get(&def))?
             .clone();
+        // A union's fields are never dropped: the language
+        // requires them to be `Copy` or wrapped in
+        // `ManuallyDrop`, and a union has no `Drop` impl of
+        // its own, so its glue is empty whatever its fields
+        // declare. Planning the fields like a struct's would
+        // both over-drop (the fields alias one storage) and
+        // mismatch the stored value, which holds the one
+        // written field.
+        if conv
+            .adt_shapes
+            .get(&def)
+            .is_some_and(|shape| shape.kind == mir::AdtShapeKind::Union)
+        {
+            return Some(P::Trivial);
+        }
         // Modelled std types: their glue shape is fixed by the value
         // model, not by a converted body.
         match name.as_str() {

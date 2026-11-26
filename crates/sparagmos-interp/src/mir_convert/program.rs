@@ -102,6 +102,14 @@ pub struct MirProgram {
     /// driver (see `mir::ThreadLocalDef`): each entry's initializer
     /// seeds one thread's storage for that static.
     pub thread_locals: mir::ThreadLocals,
+    /// Driver-recorded seeds of statics no converted body
+    /// references, keyed by the static's name (see
+    /// `mir::StaticSeedDef`): core's unicode skiplist tables,
+    /// whose only readers have no converted body. Merged
+    /// into the program's seed table under their names, so
+    /// the runtime model that reads them finds the storage a
+    /// converted reference would have seeded.
+    pub extra_static_seeds: mir::ExtraStaticSeeds,
     /// Declared types of the program's statics, as recorded by
     /// the driver (see `mir::StaticTys`).
     pub static_tys: mir::StaticTys,

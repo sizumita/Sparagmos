@@ -113,3 +113,55 @@ pub(crate) fn eii_impl_static(
             .find(|candidate| candidate.def_id() == impl_id)
     })
 }
+
+impl Converter {
+    /// Record the seeds of core's generated unicode skiplist
+    /// tables (the `core::unicode::unicode_data` property
+    /// modules' `SHORT_OFFSET_RUNS` and `OFFSETS` statics) in
+    /// [`Converter::extra_static_seeds`].
+    ///
+    /// The tables' only reader is each module's
+    /// `lookup_slow`, which has no MIR body in the shipped
+    /// core, so no converted body ever references these
+    /// statics and the ordinary seed path — a seed rides
+    /// inside a converted `StaticRef` constant — cannot
+    /// reach them. The `lookup_slow` runtime model reads the
+    /// tables from the program's seed table by name, so they
+    /// are recorded directly: every static of every crate
+    /// whose name has the table shape is decoded against its
+    /// declared type, exactly as a whole-static reference's
+    /// seed is decoded. A table whose initializer cannot be
+    /// decoded gets no entry; naming it at run time then
+    /// fails with the explicit no-seed error, never a
+    /// guessed answer.
+    pub fn note_unicode_data_tables(&mut self) {
+        let mut crates = vec![rustc_public::local_crate()];
+        crates.extend(rustc_public::external_crates());
+        for def in crates.iter().flat_map(|krate| krate.statics()) {
+            let name = def.name();
+            if !is_unicode_data_table(&name) || self.extra_static_seeds.contains_key(&name) {
+                continue;
+            }
+            let Ok(ty) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            else {
+                continue;
+            };
+            let Some(alloc) = self.static_initializer(&def) else {
+                continue;
+            };
+            if let Some(seed) = self.decode_const(&ty, &alloc, 0, 0) {
+                let sm_ty = self.ty(&ty);
+                self.extra_static_seeds
+                    .insert(name, sm::StaticSeedDef { ty: sm_ty, init: seed });
+            }
+        }
+    }
+}
+
+/// Whether the item name is one of core's generated unicode
+/// skiplist tables: a `SHORT_OFFSET_RUNS` or `OFFSETS`
+/// static inside a `unicode_data` property module.
+fn is_unicode_data_table(name: &str) -> bool {
+    name.contains("::unicode_data::")
+        && (name.ends_with("::SHORT_OFFSET_RUNS") || name.ends_with("::OFFSETS"))
+}

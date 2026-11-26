@@ -1833,7 +1833,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         {
             Builtin::WeakFromRaw
         }
-        _ => return float_method(canonical),
+        _ => return unicode_lookup_slow(canonical).or_else(|| float_method(canonical)),
     })
 }
 
@@ -2008,6 +2008,30 @@ pub fn lookup_qualified(canonical: &str) -> Option<Builtin> {
         }
     }
     None
+}
+
+/// Resolve a `core::unicode::unicode_data` skiplist lookup
+/// callee (`<module>::lookup_slow`) to its builtin. The
+/// property modules are core's generated tables; only the
+/// modules whose lookup has the skiplist shape are modelled
+/// (see [`UnicodeProperty`]), and a name in any other shape
+/// stays an explicit unsupported call.
+fn unicode_lookup_slow(canonical: &str) -> Option<Builtin> {
+    let module = canonical.strip_suffix("::lookup_slow")?;
+    let property = match module {
+        "core::unicode::unicode_data::alphabetic" => UnicodeProperty::Alphabetic,
+        "core::unicode::unicode_data::case_ignorable" => UnicodeProperty::CaseIgnorable,
+        "core::unicode::unicode_data::cf" => UnicodeProperty::Cf,
+        "core::unicode::unicode_data::cn_planes_0_3" => UnicodeProperty::CnPlanes03,
+        "core::unicode::unicode_data::default_ignorable_code_point" => {
+            UnicodeProperty::DefaultIgnorableCodePoint
+        }
+        "core::unicode::unicode_data::grapheme_extend" => UnicodeProperty::GraphemeExtend,
+        "core::unicode::unicode_data::lt" => UnicodeProperty::Lt,
+        "core::unicode::unicode_data::n" => UnicodeProperty::N,
+        _ => return None,
+    };
+    Some(Builtin::UnicodeLookupSlow(property))
 }
 
 /// Resolve a primitive float method callee

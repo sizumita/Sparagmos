@@ -589,6 +589,23 @@ fn convert_all_with(
             Some((conv.static_key(def), seed))
         })
         .collect();
+    // The driver-recorded seeds of statics no converted body
+    // references (see `MirProgram::extra_static_seeds`): each
+    // initializer, converted with its declared type as
+    // context, enters the seed table under the static's name.
+    // A name a converted reference also seeded keeps that
+    // seed — it carries the reference path's own expansion —
+    // and a seed that does not convert is dropped; naming
+    // the static then fails with the explicit no-seed error.
+    for (name, defn) in program.extra_static_seeds.iter() {
+        if out.static_seeds.contains_key(name) {
+            continue;
+        }
+        if let Ok(seed) = conv.convert_const_value(&defn.init, Some(&defn.ty)) {
+            let seed = conv.expand_uninit_constant(&seed, &defn.ty, 0);
+            out.static_seeds.insert(name.clone(), seed);
+        }
+    }
     // The statics' declared types, keyed by the same static key
     // the `StaticRef` values carry, for the interpreter's
     // pointer-offset denomination over statics.

@@ -66,6 +66,9 @@ pub(crate) struct Collected {
     /// Thread-local statics of the converted program, for the
     /// interpreter (see `Converter::thread_locals`).
     pub(crate) thread_locals: sparagmos_mir::ThreadLocals,
+    /// Seeds of statics no converted body references, for
+    /// the interpreter (see `Converter::extra_static_seeds`).
+    pub(crate) extra_static_seeds: sparagmos_mir::ExtraStaticSeeds,
     /// Declared types of the converted program's statics, for
     /// the interpreter (see `Converter::static_tys_mir`).
     pub(crate) static_tys: sparagmos_mir::StaticTys,
