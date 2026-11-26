@@ -74,3 +74,78 @@ impl<'a> Interpreter<'a> {
         eval_unary(op, value, Some(&ty))
     }
 }
+
+/// Registration fragment of the builtin name registry: the bit-operation intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn primitives_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::black_box" => Builtin::BlackBox,
+        "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(BitOp::CtPop),
+        "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(BitOp::Ctlz),
+        "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(BitOp::Cttz),
+        // The `_nonzero` variants promise a non-zero operand (a
+        // zero operand is undefined behaviour in the guest); on
+        // every input where they are defined they agree with the
+        // plain operation, which is what the model computes.
+        "std::intrinsics::ctlz_nonzero" | "core::intrinsics::ctlz_nonzero" => {
+            Builtin::IntBitOp(BitOp::Ctlz)
+        }
+        "std::intrinsics::cttz_nonzero" | "core::intrinsics::cttz_nonzero" => {
+            Builtin::IntBitOp(BitOp::Cttz)
+        }
+        "std::intrinsics::bitreverse" | "core::intrinsics::bitreverse" => {
+            Builtin::IntBitOp(BitOp::BitReverse)
+        }
+        "std::intrinsics::bswap" | "core::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
+        "std::intrinsics::saturating_add" | "core::intrinsics::saturating_add" => {
+            Builtin::SaturatingArith(SatOp::Add)
+        }
+        "std::intrinsics::saturating_sub" | "core::intrinsics::saturating_sub" => {
+            Builtin::SaturatingArith(SatOp::Sub)
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the validity-assert intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn assert_intrinsics_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::assert_inhabited" | "core::intrinsics::assert_inhabited" => {
+            Builtin::AssertValidity
+        }
+        "std::intrinsics::assert_zero_valid" | "core::intrinsics::assert_zero_valid" => {
+            Builtin::AssertValidity
+        }
+        "std::intrinsics::assert_mem_uninitialized_valid"
+        | "core::intrinsics::assert_mem_uninitialized_valid" => Builtin::AssertValidity,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the integer-power overflow helper.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn num_pow_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::num::imp::overflow_panic::pow" => Builtin::IntPow,
+        _ => return None,
+    })
+}

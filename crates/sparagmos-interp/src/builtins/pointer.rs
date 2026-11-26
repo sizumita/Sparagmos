@@ -271,3 +271,152 @@ fn value_fingerprint(value: &Value) -> u64 {
         })
     }
 }
+
+/// Registration fragment of the builtin name registry: the memory and raw-pointer surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn pointer_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::mem::drop" => Builtin::MemDrop,
+        "std::mem::swap" => Builtin::MemSwap,
+        "std::ptr::swap_nonoverlapping" | "core::ptr::swap_nonoverlapping"
+        | "std::intrinsics::typed_swap_nonoverlapping"
+        | "core::intrinsics::typed_swap_nonoverlapping" => Builtin::SwapNonoverlapping,
+        "std::mem::size_of" => Builtin::MemSizeOf,
+        "std::mem::align_of" => Builtin::MemAlignOf,
+        "std::mem::size_of_val" => Builtin::MemSizeOfVal,
+        "std::mem::align_of_val" => Builtin::MemAlignOfVal,
+        // The same two intrinsics in their direct call form
+        // (`Layout::for_value` inside a converted std body calls
+        // them as functions, not as `std::mem` wrappers).
+        "std::intrinsics::size_of_val" | "core::intrinsics::size_of_val" => {
+            Builtin::MemSizeOfVal
+        }
+        "std::intrinsics::align_of_val" | "core::intrinsics::align_of_val" => {
+            Builtin::MemAlignOfVal
+        }
+        "std::intrinsics::fadd_fast" | "core::intrinsics::fadd_fast" => {
+            Builtin::FastFloat(FastFloatOp::Add)
+        }
+        "std::intrinsics::fsub_fast" | "core::intrinsics::fsub_fast" => {
+            Builtin::FastFloat(FastFloatOp::Sub)
+        }
+        "std::intrinsics::fmul_fast" | "core::intrinsics::fmul_fast" => {
+            Builtin::FastFloat(FastFloatOp::Mul)
+        }
+        "std::intrinsics::fdiv_fast" | "core::intrinsics::fdiv_fast" => {
+            Builtin::FastFloat(FastFloatOp::Div)
+        }
+        "std::intrinsics::frem_fast" | "core::intrinsics::frem_fast" => {
+            Builtin::FastFloat(FastFloatOp::Rem)
+        }
+        "std::intrinsics::float_to_int_unchecked" | "core::intrinsics::float_to_int_unchecked" => {
+            Builtin::FloatToIntUnchecked
+        }
+        "std::mem::needs_drop" => Builtin::MemNeedsDrop,
+        _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
+            Builtin::ManuallyDropNew
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the volatile and copy intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn volatile_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // A volatile access is a plain access in this
+        // single-threaded interpreter: volatility constrains the
+        // compiler's reordering and caching, neither of which the
+        // interpreter performs, and no concurrent observer exists.
+        "std::intrinsics::volatile_load" | "core::intrinsics::volatile_load" => {
+            Builtin::VolatileLoad
+        }
+        "std::intrinsics::unaligned_volatile_load"
+        | "core::intrinsics::unaligned_volatile_load" => Builtin::AtomicLoad,
+        "std::intrinsics::volatile_store" | "core::intrinsics::volatile_store" => {
+            Builtin::VolatileStore
+        }
+        // A nontemporal store is a plain store in this
+        // interpreter: the nontemporal hint only relaxes the
+        // cache behaviour of the access, which no observer of
+        // the sequential execution can distinguish.
+        "std::intrinsics::nontemporal_store" | "core::intrinsics::nontemporal_store" => {
+            Builtin::VolatileStore
+        }
+        "std::intrinsics::unaligned_volatile_store"
+        | "core::intrinsics::unaligned_volatile_store" => Builtin::AtomicStore,
+        "std::intrinsics::volatile_copy_memory" | "core::intrinsics::volatile_copy_memory" => {
+            Builtin::VolatileCopy
+        }
+        "std::intrinsics::volatile_copy_nonoverlapping_memory"
+        | "core::intrinsics::volatile_copy_nonoverlapping_memory" => Builtin::VolatileCopy,
+        // The `copy` intrinsics in their call form (the statement
+        // form of `copy_nonoverlapping` is handled in the
+        // interpreter proper): the same element copy as the
+        // `std::ptr` wrappers, whose snapshot makes it a correct
+        // memmove.
+        "std::intrinsics::copy" | "core::intrinsics::copy" => Builtin::PtrCopy,
+        "std::intrinsics::copy_nonoverlapping" | "core::intrinsics::copy_nonoverlapping" => {
+            Builtin::PtrCopy
+        }
+        "std::intrinsics::write_bytes" | "core::intrinsics::write_bytes" => Builtin::WriteBytes,
+        "std::intrinsics::volatile_set_memory" | "core::intrinsics::volatile_set_memory" => {
+            Builtin::VolatileSet
+        }
+        "std::intrinsics::arith_offset" | "core::intrinsics::arith_offset" => {
+            Builtin::ArithOffset { wrapping: true }
+        }
+        "std::intrinsics::offset" | "core::intrinsics::offset" => {
+            Builtin::ArithOffset { wrapping: false }
+        }
+        "std::intrinsics::ptr_offset_from" | "core::intrinsics::ptr_offset_from" => {
+            Builtin::PtrOffsetFrom { unsigned: false }
+        }
+        "std::intrinsics::ptr_offset_from_unsigned"
+        | "core::intrinsics::ptr_offset_from_unsigned" => {
+            Builtin::PtrOffsetFrom { unsigned: true }
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the pointer constructors.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn ptr_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::mem::zeroed" => Builtin::MemZeroed,
+        "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
+        "std::ops::FnPtr::addr" | "core::ops::FnPtr::addr" => {
+            Builtin::FnPtrAddr
+        }
+        "std::ops::FnPtr::as_ptr" | "core::ops::FnPtr::as_ptr" => {
+            Builtin::FnPtrAsPtr
+        }
+        "std::ops::FnPtr::from_ptr" | "core::ops::FnPtr::from_ptr" => {
+            Builtin::FnPtrFromPtr
+        }
+        "std::ptr::copy_nonoverlapping" | "std::ptr::copy" => Builtin::PtrCopy,
+        "std::intrinsics::compare_bytes" | "core::intrinsics::compare_bytes" => {
+            Builtin::CompareBytes
+        }
+        _ => return None,
+    })
+}

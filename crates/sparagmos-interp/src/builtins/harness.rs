@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter,
@@ -292,4 +293,26 @@ impl<'a> Interpreter<'a> {
         }
         Ok(out)
     }
+}
+
+/// Registration fragment of the builtin name registry: the test harness entry point.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn harness_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // The harness calls either a crate-local wrapper
+        // (`<crate>::test::test_main_env_args`) or, for an empty
+        // test list, the `test` crate's function directly.
+        _ if canonical == "test::test_main_env_args"
+            || canonical.ends_with("::test::test_main_env_args") =>
+        {
+            Builtin::TestMainEnvArgs
+        }
+        _ => return None,
+    })
 }

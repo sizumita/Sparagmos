@@ -301,3 +301,42 @@ fn try_reserve_error_kind(error: &Value) -> Option<(u32, Vec<Value>)> {
         _ => None,
     }
 }
+
+/// Registration fragment of the builtin name registry: the no-alloc shim marker.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn alloc_shim_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "alloc::alloc::__rust_no_alloc_shim_is_unstable_v2" => {
+            Builtin::NoAllocShimMarker
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the allocator entry points.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn alloc_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "alloc::alloc::__rust_alloc" => Builtin::RustAlloc { zeroed: false },
+        "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAlloc { zeroed: true },
+        "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
+        "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
+        "alloc::alloc::handle_alloc_error" | "std::alloc::handle_alloc_error" => {
+            Builtin::HandleAllocError
+        }
+        "alloc::raw_vec::handle_error" => Builtin::RawVecHandleError,
+        _ => return None,
+    })
+}

@@ -1,5 +1,7 @@
 //! Host libc functions backing the libc builtins.
 
+use super::*;
+
 
 
 
@@ -63,4 +65,23 @@ extern "C" {
     /// faithful execution.
     #[link_name = "lgamma_r"]
     pub(super) fn host_lgamma_r(x: f64, signp: *mut std::ffi::c_int) -> f64;
+}
+
+/// Registration fragment of the builtin name registry: the libc allocator surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn libc_alloc_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "libc::unix::malloc" => Builtin::LibcMalloc,
+        "libc::unix::calloc" => Builtin::LibcCalloc,
+        "libc::unix::free" => Builtin::LibcFree,
+        "libc::unix::realloc" => Builtin::LibcRealloc,
+        "libc::unix::posix_memalign" => Builtin::LibcPosixMemalign,
+        _ => return None,
+    })
 }

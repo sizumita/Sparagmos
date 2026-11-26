@@ -375,3 +375,67 @@ fn permissions_mode(value: &Value) -> Option<u32> {
         _ => None,
     }
 }
+
+/// Registration fragment of the builtin name registry: the filesystem and path query surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn fs_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::fs::read::inner" => Builtin::FsReadInner,
+        "std::fs::read_to_string::inner" => Builtin::FsReadToStringInner,
+        "std::string::String::from_utf8" => Builtin::StringFromUtf8,
+        "std::fs::write::inner" => Builtin::FsWriteInner,
+        "std::path::Path::is_absolute" => Builtin::PathIsAbsolute,
+        "std::path::Path::is_file" => Builtin::PathIsFile,
+        "std::path::Path::is_dir" => Builtin::PathIsDir,
+        "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
+        "std::path::Path::_join" => Builtin::PathJoin,
+        "std::path::Path::parent" => Builtin::PathParent,
+        "std::path::Path::file_name" => Builtin::PathFileName,
+        "std::path::Path::file_stem" => Builtin::PathFileStem,
+        "std::path::Path::extension" => Builtin::PathExtension,
+        "std::path::Path::_starts_with" => Builtin::PathStartsWith,
+        "std::path::Path::_ends_with" => Builtin::PathEndsWith,
+        "std::fs::OpenOptions::_open" => Builtin::FsOpen,
+        "std::fs::DirBuilder::_create" => Builtin::FsDirCreate,
+        "std::string::String::from_utf8_lossy" => Builtin::StringFromUtf8Lossy,
+        "std::str::from_utf8" => Builtin::StrFromUtf8,
+        "core::str::from_utf8" => Builtin::StrFromUtf8,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `std::sys::fs` leaf operations.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn fs_sys_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::fs::DirEntry::path" => Builtin::DirEntryPath,
+        "std::fs::DirEntry::file_name" => Builtin::DirEntryFileName,
+        "std::fs::DirEntry::metadata" => Builtin::DirEntryMetadata,
+        "std::sys::fs::metadata" => Builtin::FsSys(FsSysOp::Metadata),
+        "std::sys::fs::symlink_metadata" => Builtin::FsSys(FsSysOp::SymlinkMetadata),
+        "std::sys::fs::canonicalize" => Builtin::FsSys(FsSysOp::Canonicalize),
+        "std::sys::fs::copy" => Builtin::FsSys(FsSysOp::Copy),
+        "std::sys::fs::hard_link" => Builtin::FsSys(FsSysOp::HardLink),
+        "std::sys::fs::read_dir" => Builtin::FsSys(FsSysOp::ReadDir),
+        "std::sys::fs::read_link" => Builtin::FsSys(FsSysOp::ReadLink),
+        "std::sys::fs::remove_dir" => Builtin::FsSys(FsSysOp::RemoveDir),
+        "std::sys::fs::remove_dir_all" => Builtin::FsSys(FsSysOp::RemoveDirAll),
+        "std::sys::fs::remove_file" => Builtin::FsSys(FsSysOp::RemoveFile),
+        "std::sys::fs::rename" => Builtin::FsSys(FsSysOp::Rename),
+        "std::sys::fs::set_permissions" => Builtin::FsSys(FsSysOp::SetPermissions),
+        "std::sys::fs::symlink" => Builtin::FsSys(FsSysOp::Symlink),
+        _ => return None,
+    })
+}

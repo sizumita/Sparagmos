@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::interp::Interpreter;
 use crate::value::{RefProj, RefTarget, Value};
 
@@ -185,4 +186,19 @@ fn hash_wrapped_alloc_ref(value: &Value) -> Option<(u64, Vec<RefProj>)> {
             _ => return None,
         }
     }
+}
+
+/// Registration fragment of the builtin name registry: the hash-map random keys.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn hash_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::sys::random::linux::hashmap_random_keys" => Builtin::HashmapRandomKeys,
+        _ => return None,
+    })
 }

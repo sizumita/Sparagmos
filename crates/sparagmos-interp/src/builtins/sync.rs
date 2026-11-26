@@ -957,3 +957,197 @@ pub(super) fn sys_rwlock_notify_word(value: &Value) -> Option<u32> {
 pub(super) fn sys_rwlock_notify_word_mut(value: &mut Value) -> Option<&mut u128> {
     sys_lock_word_mut(sys_lock_field_mut(value, 1)?)
 }
+
+/// Registration fragment of the builtin name registry: the futex-backed synchronisation surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn sync_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // The thread surface (cooperative model, see `interp.rs`).
+        // Registering these names also keeps the driver from
+        // collecting the std thread machinery, whose internals
+        // (spawn hooks, OS threads, packet transmutes) the value
+        // model does not serve; the builtins model the observable
+        // semantics instead.
+        "std::thread::spawn" | "std::thread::spawn_unchecked" => Builtin::ThreadSpawn,
+        "std::sync::Barrier::new" => Builtin::BarrierNew,
+        "std::sync::Barrier::wait" => Builtin::BarrierWait,
+        // The futex-backed sys locks (std's `sys::sync`
+        // layer): the fast paths are plain atomic operations
+        // the converted bodies serve, but the contended paths
+        // sleep on a futex and have no converted body; the
+        // builtins model the waiting on the cooperative
+        // scheduler instead (see `builtins::sync`).
+        "std::sys::sync::mutex::futex::Mutex::lock_contended" => {
+            Builtin::SysMutexLockContended
+        }
+        "std::sys::sync::mutex::futex::Mutex::wake" => Builtin::SysMutexWake,
+        "std::sys::sync::rwlock::futex::RwLock::read_contended" => {
+            Builtin::SysRwLockReadContended
+        }
+        "std::sys::sync::rwlock::futex::RwLock::write_contended" => {
+            Builtin::SysRwLockWriteContended
+        }
+        "std::sys::sync::rwlock::futex::RwLock::wake_writer_or_readers" => {
+            Builtin::SysRwLockWakeWriterOrReaders
+        }
+        // The futex primitives themselves: bodies that ARE
+        // converted (the rwlock's `downgrade`, `Once`, the
+        // condvar, the thread parker) call them directly.
+        "std::sys::sync::futex::unix::futex_wait" => Builtin::FutexWait,
+        "std::sys::sync::futex::unix::futex_wake" => Builtin::FutexWake,
+        "std::sys::sync::futex::unix::futex_wake_all" => Builtin::FutexWakeAll,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the thread surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn thread_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::thread::Builder")
+            && (canonical.ends_with("::spawn")
+                || canonical.ends_with("::spawn_unchecked")) =>
+        {
+            Builtin::ThreadBuilderSpawn
+        }
+        _ if canonical.starts_with("std::thread::JoinHandle")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ThreadJoin
+        }
+        // Optimizing MIR inlines `JoinHandle::join` into a
+        // direct call to the inner type's join; it has the same
+        // contract (the thread's result or panic payload) and
+        // the same modelled receiver (see `join_handle_value`).
+        _ if canonical.starts_with("std::thread::lifecycle::JoinInner")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ThreadJoin
+        }
+        _ if canonical.starts_with("std::thread::ScopedJoinHandle")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ScopedThreadJoin
+        }
+        _ if canonical.contains("::Scope::") && canonical.ends_with("::spawn") => {
+            Builtin::ThreadScopedSpawn
+        }
+        "std::sys::thread_local::destructors::linux_like::register" => {
+            Builtin::TlsRegisterDtor
+        }
+        "std::thread::local::panic_access_error" => Builtin::PanicAccessError,
+        "std::thread::Builder::new" => Builtin::ThreadBuilderNew,
+        "std::thread::Builder::name" => Builtin::ThreadBuilderName,
+        "std::thread::Builder::stack_size" => Builtin::ThreadBuilderStackSize,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the current-thread surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn thread_api_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::thread::scope" => Builtin::ThreadScope,
+        "std::thread::current" => Builtin::ThreadCurrent,
+        "std::thread::Thread::id" => Builtin::ThreadIdOf,
+        "std::thread::Thread::name" => Builtin::ThreadName,
+        "std::thread::sleep" | "std::thread::sleep_ms" => Builtin::ThreadSleep,
+        "std::thread::yield_now" => Builtin::ThreadYield,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the mpsc channel surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn mpsc_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // The mpsc surface: the channel state lives in the
+        // interpreter (see `ChannelState` in `interp.rs`).
+        "std::sync::mpsc::channel" => Builtin::MpscChannel,
+        "std::sync::mpsc::sync_channel" => Builtin::MpscSyncChannel,
+        _ if canonical.contains("mpsc::SyncSender") && canonical.ends_with("::send") => {
+            Builtin::MpscSend
+        }
+        _ if canonical.contains("mpsc::Sender") && canonical.ends_with("::send") => {
+            Builtin::MpscSend
+        }
+        _ if canonical.contains("mpsc::SyncSender")
+            && canonical.ends_with("::try_send") =>
+        {
+            Builtin::MpscTrySend
+        }
+        _ if canonical.contains("mpsc::Receiver") && canonical.ends_with("::recv") => {
+            Builtin::MpscRecv
+        }
+        _ if canonical.contains("mpsc::Receiver")
+            && canonical.ends_with("::try_recv") =>
+        {
+            Builtin::MpscTryRecv
+        }
+        _ if canonical.contains("mpsc::Receiver")
+            && canonical.ends_with("::recv_timeout") =>
+        {
+            Builtin::MpscRecvTimeout
+        }
+        _ if canonical.contains("mpsc::Receiver") && canonical.ends_with("::iter") => {
+            Builtin::MpscIter
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Rc` and `Arc` constructors.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn rc_arc_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
+            Builtin::RcNew
+        }
+        _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::new") => {
+            Builtin::ArcNew
+        }
+        _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::from_raw") => {
+            Builtin::RcFromRaw
+        }
+        _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::from_raw") => {
+            Builtin::ArcFromRaw
+        }
+        _ if (canonical.starts_with("std::rc::Weak")
+            || canonical.starts_with("std::sync::Weak"))
+            && canonical.ends_with(">::from_raw") =>
+        {
+            Builtin::WeakFromRaw
+        }
+        _ => return None,
+    })
+}

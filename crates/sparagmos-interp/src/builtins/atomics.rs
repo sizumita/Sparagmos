@@ -53,3 +53,57 @@ impl<'a> Interpreter<'a> {
         self.write_resolved(frames, target, value)
     }
 }
+
+/// Registration fragment of the builtin name registry: the atomic intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn atomics_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::atomic_load" | "core::intrinsics::atomic_load" => Builtin::AtomicLoad,
+        "std::intrinsics::atomic_store" | "core::intrinsics::atomic_store" => {
+            Builtin::AtomicStore
+        }
+        "std::intrinsics::atomic_cxchg" | "core::intrinsics::atomic_cxchg" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_cxchgweak" | "core::intrinsics::atomic_cxchgweak" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_xchg" | "core::intrinsics::atomic_xchg" => Builtin::AtomicXchg,
+        "std::intrinsics::atomic_xadd" | "core::intrinsics::atomic_xadd" => Builtin::AtomicXadd,
+        "std::intrinsics::atomic_xsub" | "core::intrinsics::atomic_xsub" => Builtin::AtomicXsub,
+        "std::intrinsics::atomic_and" | "core::intrinsics::atomic_and" => {
+            Builtin::AtomicFetchOp(FetchOp::And)
+        }
+        "std::intrinsics::atomic_or" | "core::intrinsics::atomic_or" => {
+            Builtin::AtomicFetchOp(FetchOp::Or)
+        }
+        "std::intrinsics::atomic_xor" | "core::intrinsics::atomic_xor" => {
+            Builtin::AtomicFetchOp(FetchOp::Xor)
+        }
+        "std::intrinsics::atomic_nand" | "core::intrinsics::atomic_nand" => {
+            Builtin::AtomicFetchOp(FetchOp::Nand)
+        }
+        "std::intrinsics::atomic_max" | "core::intrinsics::atomic_max" => {
+            Builtin::AtomicFetchOp(FetchOp::Max)
+        }
+        "std::intrinsics::atomic_min" | "core::intrinsics::atomic_min" => {
+            Builtin::AtomicFetchOp(FetchOp::Min)
+        }
+        "std::intrinsics::atomic_umax" | "core::intrinsics::atomic_umax" => {
+            Builtin::AtomicFetchOp(FetchOp::UMax)
+        }
+        "std::intrinsics::atomic_umin" | "core::intrinsics::atomic_umin" => {
+            Builtin::AtomicFetchOp(FetchOp::UMin)
+        }
+        "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
+            Builtin::AtomicFence
+        }
+        _ => return None,
+    })
+}

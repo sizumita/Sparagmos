@@ -1548,3 +1548,167 @@ pub(crate) fn ty_from_tag(tag: &str) -> Option<Ty> {
         }
     })
 }
+
+/// Registration fragment of the builtin name registry: the generic `From::from` conversion.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn from_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::convert::From::from" => Builtin::FromFrom,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Deref` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn deref_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::hint::must_use" => Builtin::MustUse,
+        "std::ops::Deref::deref" | "core::ops::Deref::deref" => Builtin::Deref,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `AsRef` and `AsMut` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn as_ref_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::convert::AsRef::as_ref" | "core::convert::AsRef::as_ref" => Builtin::AsRef,
+        "std::convert::AsMut::as_mut" | "core::convert::AsMut::as_mut" => Builtin::AsMut,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Into` and `ToOwned` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn into_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::convert::Into::into" => Builtin::IntoInto,
+        "std::borrow::ToOwned::to_owned" => Builtin::ToOwned,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Box` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn box_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
+            Builtin::BoxNew
+        }
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new_uninit") => {
+            Builtin::BoxNewUninit
+        }
+        "std::boxed::box_assume_init_into_vec_unsafe" => Builtin::BoxAssumeInitIntoVec,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the cell and option/result surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn cell_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::new") => {
+            Builtin::CellNew
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::get") => {
+            Builtin::CellGet
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::set") => {
+            Builtin::CellSet
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::replace") => {
+            Builtin::CellReplace
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::into_inner") => {
+            Builtin::CellIntoInner
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::new") => {
+            Builtin::RefCellNew
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::borrow") => {
+            Builtin::RefCellBorrow
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::borrow_mut") =>
+        {
+            Builtin::RefCellBorrowMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::try_borrow") =>
+        {
+            Builtin::RefCellTryBorrow
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::try_borrow_mut") =>
+        {
+            Builtin::RefCellTryBorrowMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::get_mut") => {
+            Builtin::RefCellGetMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::replace") => {
+            Builtin::RefCellReplace
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::as_ptr") => {
+            Builtin::RefCellAsPtr
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::unwrap") => {
+            Builtin::OptionUnwrap
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::unwrap") => {
+            Builtin::ResultUnwrap
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::is_some") => {
+            Builtin::OptionIsSome
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::is_none") => {
+            Builtin::OptionIsNone
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::is_ok") => {
+            Builtin::ResultIsOk
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::is_err") => {
+            Builtin::ResultIsErr
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::take") => {
+            Builtin::OptionTake
+        }
+        _ => return None,
+    })
+}

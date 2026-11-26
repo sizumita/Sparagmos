@@ -1235,3 +1235,115 @@ pub(super) fn process_output_value(exit_code: i32, stdout: &[u8], stderr: &[u8])
         ],
     }
 }
+
+/// Registration fragment of the builtin name registry: the process environment surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn env_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::env::args" => Builtin::EnvArgs,
+        "std::env::args_os" => Builtin::EnvArgsOs,
+        "std::env::vars" => Builtin::EnvVars,
+        "std::env::vars_os" => Builtin::EnvVarsOs,
+        "std::env::current_exe" => Builtin::EnvCurrentExe,
+        "std::env::var::inner" => Builtin::EnvVarInner,
+        "std::env::split_paths" => Builtin::EnvSplitPaths,
+        "std::env::join_paths" => Builtin::EnvJoinPaths,
+        "std::sys::env::unix::getenv" => Builtin::EnvGetenv,
+        "std::sys::env::unix::setenv" => Builtin::EnvSetenv,
+        "std::sys::env::unix::unsetenv" => Builtin::EnvUnsetenv,
+        "std::env::current_dir" => Builtin::EnvCurrentDir,
+        "std::sys::paths::unix::getcwd" => Builtin::EnvCurrentDir,
+        "std::env::temp_dir" => Builtin::EnvTempDir,
+        "std::sys::paths::unix::temp_dir" => Builtin::EnvTempDir,
+        "std::env::home_dir" => Builtin::EnvHomeDir,
+        "std::sys::paths::unix::home_dir" => Builtin::EnvHomeDir,
+        "std::sys::paths::unix::chdir" => Builtin::SysChdir,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: process exit and abort.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn process_exit_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::process::exit" => Builtin::ProcessExit,
+        "std::process::abort" => Builtin::IntrinsicsAbort,
+        "std::intrinsics::abort" | "core::intrinsics::abort" => {
+            Builtin::IntrinsicsAbort
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Command` builder surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn command_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::sys::process::unix::common::Command::new" => Builtin::ProcessCommandNew,
+        "std::sys::process::unix::common::Command::arg" => Builtin::ProcessCommandArg,
+        "std::sys::process::unix::common::Command::cwd" => Builtin::ProcessCommandCwd,
+        "std::sys::process::unix::common::Command::env_mut" => Builtin::ProcessCommandEnvMut,
+        "std::sys::process::env::CommandEnv::set" => Builtin::ProcessCommandEnvSet,
+        "std::sys::process::env::CommandEnv::remove" => Builtin::ProcessCommandEnvRemove,
+        "std::sys::process::env::CommandEnv::clear" => Builtin::ProcessCommandEnvClear,
+        "std::sys::process::unix::common::Command::stdin" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::common::Command::stdout" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::common::Command::stderr" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::unix::Command::spawn" => Builtin::ProcessSpawn,
+        "std::env::current_exe" => Builtin::CurrentExe,
+        "std::process::id" => Builtin::ProcessId,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `std::process` public surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn command_api_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::process::Command::new" => Builtin::ProcessCommandNewPublic,
+        "std::process::Command::arg" => Builtin::ProcessCommandArgPublic,
+        "std::process::Command::current_dir" => Builtin::ProcessCommandCwdPublic,
+        "std::process::Command::env" => Builtin::ProcessCommandEnvPublic,
+        "std::process::Command::env_remove" => Builtin::ProcessCommandEnvRemovePublic,
+        "std::process::Command::env_clear" => Builtin::ProcessCommandEnvClearPublic,
+        "std::process::Command::stdin" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::stdout" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::stderr" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::spawn" => Builtin::ProcessSpawn,
+        "std::process::Command::output" => Builtin::ProcessOutput,
+        "std::process::Command::status" => Builtin::ProcessSpawn,
+        "std::process::Child::wait" => Builtin::ProcessChildWait,
+        "std::process::Child::try_wait" => Builtin::ProcessChildTryWait,
+        "std::process::Child::kill" => Builtin::ProcessChildKill,
+        "std::process::Child::wait_with_output" => {
+            Builtin::ProcessChildWaitWithOutput
+        }
+        "std::process::Child::id" => Builtin::ProcessChildId,
+        "std::sys::process::output" => Builtin::ProcessOutput,
+        _ => return None,
+    })
+}

@@ -526,3 +526,27 @@ fn sequence_bytes(value: &Value) -> Option<Vec<u8>> {
         _ => None,
     }
 }
+
+/// Registration fragment of the builtin name registry: the libc I/O surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn libc_io_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        // `exit` ends the process with the given status,
+        // running the registered `atexit` handlers: the
+        // same observable behaviour as `std::process::exit`,
+        // whose builtin serves both.
+        "libc::exit" | "libc::unix::exit" => Builtin::ProcessExit,
+        "libc::read" | "libc::unix::read" => Builtin::LibcRead,
+        "libc::write" | "libc::unix::write" => Builtin::LibcWrite,
+        "std::sys::io::error::unix::errno_location"
+        | "libc::__errno_location"
+        | "libc::unix::__errno_location" => Builtin::ErrnoLocation,
+        _ => return None,
+    })
+}

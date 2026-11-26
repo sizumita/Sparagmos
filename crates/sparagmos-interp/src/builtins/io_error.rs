@@ -2,6 +2,7 @@
 
 
 
+use super::*;
 use crate::value::{RefTarget, Value};
 
 
@@ -361,4 +362,28 @@ pub(super) fn io_result_from_host(result: Result<Value, std::io::Error>) -> Valu
         Ok(value) => io_result_ok(value),
         Err(error) => io_result_err(host_io_error(&error)),
     }
+}
+
+/// Registration fragment of the builtin name registry: the `io::Error` OS-function surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn io_error_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::io::error::os_functions::get_os_functions" => Builtin::IoGetOsFunctions,
+        "core::io::error::os_functions::set_functions" => Builtin::IoSetOsFunctions,
+        "core::io::error::os_functions::set_functions::set_functions_inner" => {
+            Builtin::IoSetOsFunctions
+        }
+        "std::sys::io::error::unix::decode_error_kind" => Builtin::IoDecodeErrorKind,
+        "alloc::io::error::custom_owner_from_box" => Builtin::IoCustomOwnerFromBox,
+        "core::io::error::repr::Repr::new_custom" => Builtin::IoReprNewCustom,
+        "std::sys::io::error::unix::format_error" => Builtin::IoFormatOsError,
+        "std::sys::io::error::unix::is_interrupted" => Builtin::IoIsInterrupted,
+        _ => return None,
+    })
 }

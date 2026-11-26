@@ -1554,3 +1554,146 @@ mod tests {
         );
     }
 }
+
+/// Registration fragment of the builtin name registry: the networking surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn net_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::net::TcpListener::bind" => {
+            Builtin::NetSys(NetSysOp::ListenerBind)
+        }
+        "std::net::TcpListener::accept" => {
+            Builtin::NetSys(NetSysOp::ListenerAccept)
+        }
+        "std::net::TcpListener::local_addr" => {
+            Builtin::NetSys(NetSysOp::ListenerSocketAddr)
+        }
+        "std::net::TcpListener::try_clone" => {
+            Builtin::NetSys(NetSysOp::ListenerDuplicate)
+        }
+        "std::net::TcpListener::set_ttl" => {
+            Builtin::NetSys(NetSysOp::ListenerSetTtl)
+        }
+        "std::net::TcpListener::ttl" => {
+            Builtin::NetSys(NetSysOp::ListenerTtl)
+        }
+        "std::net::TcpListener::set_only_v6" => {
+            Builtin::NetSys(NetSysOp::ListenerSetOnlyV6)
+        }
+        "std::net::TcpListener::only_v6" => {
+            Builtin::NetSys(NetSysOp::ListenerOnlyV6)
+        }
+        "std::net::TcpListener::take_error" => {
+            Builtin::NetSys(NetSysOp::ListenerTakeError)
+        }
+        "std::net::TcpListener::set_nonblocking" => {
+            Builtin::NetSys(NetSysOp::ListenerSetNonblocking)
+        }
+        "std::net::TcpStream::connect" => {
+            Builtin::NetSys(NetSysOp::StreamConnect)
+        }
+        "std::net::TcpStream::connect_timeout" => {
+            Builtin::NetSys(NetSysOp::StreamConnectTimeout)
+        }
+        "std::net::TcpStream::local_addr" => {
+            Builtin::NetSys(NetSysOp::StreamSocketAddr)
+        }
+        "std::net::TcpStream::peer_addr" => {
+            Builtin::NetSys(NetSysOp::StreamPeerAddr)
+        }
+        "std::net::TcpStream::peek" => {
+            Builtin::NetSys(NetSysOp::StreamPeek)
+        }
+        "std::net::TcpStream::try_clone" => {
+            Builtin::NetSys(NetSysOp::StreamDuplicate)
+        }
+        "std::net::TcpStream::shutdown" => {
+            Builtin::NetSys(NetSysOp::StreamShutdown)
+        }
+        "std::net::TcpStream::set_nodelay" => {
+            Builtin::NetSys(NetSysOp::StreamSetNodelay)
+        }
+        "std::net::TcpStream::nodelay" => {
+            Builtin::NetSys(NetSysOp::StreamNodelay)
+        }
+        "std::net::TcpStream::set_ttl" => {
+            Builtin::NetSys(NetSysOp::StreamSetTtl)
+        }
+        "std::net::TcpStream::ttl" => {
+            Builtin::NetSys(NetSysOp::StreamTtl)
+        }
+        "std::net::TcpStream::take_error" => {
+            Builtin::NetSys(NetSysOp::StreamTakeError)
+        }
+        "std::net::TcpStream::set_nonblocking" => {
+            Builtin::NetSys(NetSysOp::StreamSetNonblocking)
+        }
+        "std::net::TcpStream::set_read_timeout" => {
+            Builtin::NetSys(NetSysOp::StreamSetReadTimeout)
+        }
+        "std::net::TcpStream::read_timeout" => {
+            Builtin::NetSys(NetSysOp::StreamReadTimeout)
+        }
+        "std::net::TcpStream::set_write_timeout" => {
+            Builtin::NetSys(NetSysOp::StreamSetWriteTimeout)
+        }
+        "std::net::TcpStream::write_timeout" => {
+            Builtin::NetSys(NetSysOp::StreamWriteTimeout)
+        }
+        "std::sys::net::connection::socket::TcpStream::read" => {
+            Builtin::NetSys(NetSysOp::StreamRead)
+        }
+        "std::sys::net::connection::socket::TcpStream::read_vectored" => {
+            Builtin::NetSys(NetSysOp::StreamReadVectored)
+        }
+        "std::sys::net::connection::socket::TcpStream::write" => {
+            Builtin::NetSys(NetSysOp::StreamWrite)
+        }
+        "std::sys::net::connection::socket::TcpStream::write_vectored" => {
+            Builtin::NetSys(NetSysOp::StreamWriteVectored)
+        }
+        "std::net::UdpSocket::bind" => {
+            Builtin::NetSys(NetSysOp::UdpBind)
+        }
+        "std::net::UdpSocket::local_addr" => {
+            Builtin::NetSys(NetSysOp::UdpSocketAddr)
+        }
+        "std::net::UdpSocket::try_clone" => {
+            Builtin::NetSys(NetSysOp::UdpDuplicate)
+        }
+        "std::net::UdpSocket::recv_from" => {
+            Builtin::NetSys(NetSysOp::UdpRecvFrom)
+        }
+        "std::net::UdpSocket::send_to" => {
+            Builtin::NetSys(NetSysOp::UdpSendTo)
+        }
+        "std::net::UdpSocket::connect" => {
+            Builtin::NetSys(NetSysOp::UdpConnect)
+        }
+        "std::net::UdpSocket::recv" => Builtin::NetSys(NetSysOp::UdpRecv),
+        "std::net::UdpSocket::send" => Builtin::NetSys(NetSysOp::UdpSend),
+        "std::net::UdpSocket::set_broadcast" => {
+            Builtin::NetSys(NetSysOp::UdpSetBroadcast)
+        }
+        "std::net::UdpSocket::broadcast" => {
+            Builtin::NetSys(NetSysOp::UdpBroadcast)
+        }
+        "std::net::UdpSocket::set_ttl" => {
+            Builtin::NetSys(NetSysOp::UdpSetTtl)
+        }
+        "std::net::UdpSocket::ttl" => Builtin::NetSys(NetSysOp::UdpTtl),
+        "std::net::UdpSocket::take_error" => {
+            Builtin::NetSys(NetSysOp::UdpTakeError)
+        }
+        "std::net::UdpSocket::set_nonblocking" => {
+            Builtin::NetSys(NetSysOp::UdpSetNonblocking)
+        }
+        _ => return None,
+    })
+}

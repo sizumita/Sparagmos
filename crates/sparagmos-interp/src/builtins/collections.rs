@@ -871,3 +871,113 @@ pub(super) fn vec_append_in_place(
         )),
     }
 }
+
+/// Registration fragment of the builtin name registry: the `Vec::into_boxed_slice` conversion.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn vec_boxed_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::into_boxed_slice") =>
+        {
+            Builtin::VecIntoBoxedSlice
+        }
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the `Vec` surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn vec_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::new") => {
+            Builtin::VecNew
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::push") => {
+            Builtin::VecPush
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::extend_from_slice") =>
+        {
+            Builtin::VecExtendFromSlice
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::len") => {
+            Builtin::VecLen
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::is_empty") => {
+            Builtin::VecIsEmpty
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::with_capacity")
+                || canonical.ends_with(">::with_capacity_in")) =>
+        {
+            Builtin::VecWithCapacity
+        }
+        "std::vec::from_elem" => Builtin::VecFromElem,
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::reserve")
+                || canonical.ends_with(">::reserve_exact")) =>
+        {
+            Builtin::VecReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::try_reserve")
+                || canonical.ends_with(">::try_reserve_exact")) =>
+        {
+            Builtin::VecTryReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::shrink_to_fit")
+                || canonical.ends_with(">::shrink_to")) =>
+        {
+            Builtin::VecShrink
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::set_len") => {
+            Builtin::VecSetLen
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::as_ptr") || canonical.ends_with(">::as_mut_ptr")) =>
+        {
+            Builtin::VecAsPtr
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::extend_trusted") =>
+        {
+            Builtin::VecExtendTrusted
+        }
+        "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter" => {
+            Builtin::VecFromIterNested
+        }
+        // The in-place collect entry the `SpecFromIter`
+        // specialization selects when the iterator's source is a
+        // `Vec` allocation (`SourceIter` + `InPlaceIterable` with
+        // an `AsVecIntoIter` source: `vec::IntoIter` itself and
+        // every adapter forwarding those traits). Its collected
+        // body drives the source allocation's raw buffer through
+        // `SourceIter::as_inner` / `AsVecIntoIter::as_into_iter`,
+        // which the value model does not serve; the observable
+        // semantics are the nested collect's -- the yielded
+        // items, in order, in a fresh vector -- so the same
+        // model serves this entry.
+        "std::vec::in_place_collect::from_iter_in_place"
+        | "alloc::vec::in_place_collect::from_iter_in_place" => {
+            Builtin::VecFromIterNested
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {
+            Builtin::VecCapacity
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::remove::assert_failed") => Builtin::VecRemoveAssertFailed,
+        _ => return None,
+    })
+}

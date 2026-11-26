@@ -820,3 +820,29 @@ pub(super) fn pathbuf_value(bytes: &[u8]) -> Value {
         fields: vec![os_string],
     }
 }
+
+/// Registration fragment of the builtin name registry: the path component surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn path_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::path::Path::parent" => Builtin::PathPart(PathPart::Parent),
+        "std::path::Path::file_name" => Builtin::PathPart(PathPart::FileName),
+        "std::path::Path::file_stem" => Builtin::PathPart(PathPart::FileStem),
+        "std::path::Path::extension" => Builtin::PathPart(PathPart::Extension),
+        "std::path::Path::components" => Builtin::PathComponents,
+        "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
+        "std::path::PathBuf::_push" => Builtin::PathBufPush,
+        "std::path::PathBuf::pop" => Builtin::PathBufPop,
+        "std::path::PathBuf::_set_extension" => Builtin::PathBufSetExtension,
+        "std::path::Path::_with_extension" => Builtin::PathWithExtension,
+        "std::path::PathBuf::new" => Builtin::PathBufNew,
+        "std::path::PathBuf::with_capacity" => Builtin::PathBufNew,
+        _ => return None,
+    })
+}
