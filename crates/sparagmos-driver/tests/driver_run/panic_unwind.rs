@@ -2903,3 +2903,117 @@ fn run_mode_nounwind_panic_reports_cannot_unwind() {
         "not the cleanup report: {stderr}"
     );
 }
+
+const ASSERT_ARRAY_SRC: &str = r#"
+fn main() { assert_eq!([1, 2, 3], [1, 2, 4]); }
+"#;
+
+#[test]
+fn run_mode_assert_eq_array_operands_render_with_debug() {
+    // core renders `assert_failed`'s operands with `{:?}`: an
+    // array operand is the bracketed element list, not the
+    // value model's tuple form.
+    let dir = temp_dir("asserarray");
+    let src = fixture(&dir, "asserarray.rs", ASSERT_ARRAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "assert exits 101: {stderr}");
+    assert!(
+        stderr.contains(
+            "assertion `left == right` failed\n  left: [1, 2, 3]\n right: [1, 2, 4]"
+        ),
+        "array operands render as Debug: {stderr}"
+    );
+}
+
+const ASSERT_VEC_SRC: &str = r#"
+fn main() { assert_eq!(vec![1, 2, 3], vec![1, 2, 4]); }
+"#;
+
+#[test]
+fn run_mode_assert_eq_vec_operands_render_with_debug() {
+    // A `Vec` operand is its element list under `{:?}`, not
+    // the storage enum's internal form.
+    let dir = temp_dir("assertvec");
+    let src = fixture(&dir, "assertvec.rs", ASSERT_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "assert exits 101: {stderr}");
+    assert!(
+        stderr.contains(
+            "assertion `left == right` failed\n  left: [1, 2, 3]\n right: [1, 2, 4]"
+        ),
+        "Vec operands render as Debug: {stderr}"
+    );
+    assert!(
+        !stderr.contains("variant 0"),
+        "no internal enum form in the message: {stderr}"
+    );
+}
+
+const ASSERT_STRUCT_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+fn main() { assert_eq!(Point { x: 1, y: 2 }, Point { x: 1, y: 3 }); }
+"#;
+
+#[test]
+fn run_mode_assert_eq_struct_operands_render_with_debug() {
+    // A derived-`Debug` struct operand renders through its
+    // `Debug` impl: the type name and named fields.
+    let dir = temp_dir("assertstruct");
+    let src = fixture(&dir, "assertstruct.rs", ASSERT_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "assert exits 101: {stderr}");
+    assert!(
+        stderr.contains(
+            "assertion `left == right` failed\n  left: Point { x: 1, y: 2 }\n right: Point { x: 1, y: 3 }"
+        ),
+        "struct operands render as Debug: {stderr}"
+    );
+}
+
+const ASSERT_NE_MSG_SRC: &str = r#"
+fn main() {
+    assert_ne!(vec![1, 2], vec![1, 2]);
+}
+"#;
+
+#[test]
+fn run_mode_assert_ne_operands_render_with_debug() {
+    // The `!=` comparison names its own failure line and the
+    // operands still render with `{:?}`.
+    let dir = temp_dir("assertne");
+    let src = fixture(&dir, "assertne.rs", ASSERT_NE_MSG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "assert exits 101: {stderr}");
+    assert!(
+        stderr.contains(
+            "assertion `left != right` failed\n  left: [1, 2]\n right: [1, 2]"
+        ),
+        "assert_ne operands render as Debug: {stderr}"
+    );
+}
+
+const ASSERT_CUSTOM_MSG_SRC: &str = r#"
+fn main() { assert_eq!([1, 2, 3], [1, 2, 4], "custom note"); }
+"#;
+
+#[test]
+fn run_mode_assert_eq_custom_message_keeps_debug_operands() {
+    // With a custom message the failure line gains `: {msg}`
+    // and the operands below it still render with `{:?}`.
+    let dir = temp_dir("assertmsg");
+    let src = fixture(&dir, "assertmsg.rs", ASSERT_CUSTOM_MSG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "assert exits 101: {stderr}");
+    assert!(
+        stderr.contains(
+            "assertion `left == right` failed: custom note\n  left: [1, 2, 3]\n right: [1, 2, 4]"
+        ),
+        "custom message with Debug operands: {stderr}"
+    );
+}
