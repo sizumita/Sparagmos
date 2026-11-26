@@ -48,9 +48,38 @@ pub(crate) fn eii_impl_static(
         let tcx = compiler_tcx()?;
         let internal =
             rustc_public::rustc_internal::internal(tcx, def.def_id());
-        let map = tcx.externally_implementable_items(internal.krate);
-        let (_, impls) = map.get(&internal)?;
-        // The registry holds every implementation of the
+        // The registry is per crate: a crate's map names the
+        // implementations recorded for that crate, so an
+        // implementation defined in a different crate than the
+        // declaration -- the declaration in an auxiliary crate,
+        // the implementation in the crate being compiled, or
+        // the other way round -- appears only in its own
+        // crate's map, never in the declaration's. The
+        // compiler's own EII check merges every crate's map
+        // for exactly this reason (see
+        // the check_externally_implementable_items pass in
+        // rustc_passes), and the resolution does the same:
+        // every registration of this declaration, from the
+        // local crate and every external crate, is a candidate.
+        let mut impl_ids: Vec<rustc_span::def_id::DefId> = Vec::new();
+        for cnum in tcx
+            .crates(())
+            .iter()
+            .chain(std::iter::once(&rustc_span::def_id::LOCAL_CRATE))
+        {
+            let map = tcx.externally_implementable_items(*cnum);
+            if let Some((_, impls)) = map.get(&internal) {
+                for id in impls.keys() {
+                    if !impl_ids.contains(id) {
+                        impl_ids.push(*id);
+                    }
+                }
+            }
+        }
+        if impl_ids.is_empty() {
+            return None;
+        }
+        // The registrations hold every implementation of the
         // declaration, the declaration's own default among
         // them when it has one: the default is registered
         // under an item carrying the declaration's own name.
@@ -61,12 +90,12 @@ pub(crate) fn eii_impl_static(
         // compiler itself reports; none at all (a default
         // registered beside a same-named item in another
         // module) leaves the declaration unimplemented here.
-        let impl_internal = if impls.len() == 1 {
-            *impls.keys().next()?
+        let impl_internal = if impl_ids.len() == 1 {
+            impl_ids[0]
         } else {
             let decl_name = tcx.item_name(internal);
-            let explicit: Vec<_> = impls
-                .keys()
+            let explicit: Vec<_> = impl_ids
+                .iter()
                 .filter(|id| tcx.item_name(**id) != decl_name)
                 .collect();
             if explicit.len() == 1 {
