@@ -55,6 +55,78 @@ pub fn canonical_name(name: &str) -> String {
     out
 }
 
+/// A callee the converter serves with a builtin node because the
+/// collected body only re-derives a pure predicate the interpreter
+/// can evaluate directly (see `ub_check_terminator` in
+/// `mir_convert` and `exec_ub_check_helper` in `builtins`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UbCheckHelper {
+    /// `core::ub_checks::maybe_is_nonoverlapping::runtime`:
+    /// `(src: *const (), dst: *const (), size: usize,
+    /// count: usize) -> bool`.
+    Nonoverlapping,
+    /// `*const T::is_aligned_to` / `*mut T::is_aligned_to`:
+    /// `(ptr, align: usize) -> bool`.
+    IsAlignedTo,
+    /// `std::hint::select_unpredictable`:
+    /// `(cond: bool, true_val: T, false_val: T) -> T`.
+    SelectUnpredictable,
+    /// The `assert_unsafe_precondition!` shim of
+    /// `ptr::copy_nonoverlapping`: `(src: *const (), dst: *mut (),
+    /// size: usize, align: usize, count: usize) -> ()`.
+    CopyNonoverlappingPrecondition,
+    /// The `assert_unsafe_precondition!` shim of `ptr::copy`:
+    /// `(src: *const (), dst: *mut (), align: usize,
+    /// zero_size: bool) -> ()`.
+    CopyPrecondition,
+}
+
+impl UbCheckHelper {
+    /// Whether every panic the collected body can raise is a
+    /// `nounwind` panic (a `panic_nounwind` /
+    /// `panic_nounwind_fmt` call inside the body): conversion
+    /// marks such a call block `Terminate`, so a panic the
+    /// builtin node raises aborts exactly as the body's did
+    /// instead of unwinding to a `catch_unwind`.
+    pub(crate) fn panics_are_nounwind(self) -> bool {
+        matches!(
+            self,
+            UbCheckHelper::Nonoverlapping
+                | UbCheckHelper::CopyNonoverlappingPrecondition
+                | UbCheckHelper::CopyPrecondition
+        )
+    }
+}
+
+/// Identify one of the [`UbCheckHelper`] callees from a canonical
+/// callee name. The runtime checks the converter resolves to
+/// `true` (debug-profile semantics) put these helpers inside the
+/// precondition checks of the standard library's unsafe
+/// operations, so hot code — a sort's element copies, say — calls
+/// them per element; each collected body spends dozens of
+/// statements re-deriving the predicate.
+pub(crate) fn ub_check_helper(name: &str) -> Option<UbCheckHelper> {
+    if name.ends_with("ub_checks::maybe_is_nonoverlapping::runtime") {
+        return Some(UbCheckHelper::Nonoverlapping);
+    }
+    if name.ends_with(">::is_aligned_to")
+        && (name.contains("ptr::const_ptr::<impl *const ")
+            || name.contains("ptr::mut_ptr::<impl *mut "))
+    {
+        return Some(UbCheckHelper::IsAlignedTo);
+    }
+    if name == "std::hint::select_unpredictable" || name == "core::hint::select_unpredictable" {
+        return Some(UbCheckHelper::SelectUnpredictable);
+    }
+    if name.ends_with("ptr::copy_nonoverlapping::precondition_check") {
+        return Some(UbCheckHelper::CopyNonoverlappingPrecondition);
+    }
+    if name.ends_with("ptr::copy::precondition_check") {
+        return Some(UbCheckHelper::CopyPrecondition);
+    }
+    None
+}
+
 fn is_lifetime_list(inner: &str) -> bool {
     !inner.is_empty()
         && inner.split(',').all(|part| {

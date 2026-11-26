@@ -777,6 +777,30 @@ impl<'a> Converter<'a> {
                 }
             })
             .collect();
+        // A block whose call conversion diverted to one of the
+        // nounwind ub-check helpers (see `ub_check_terminator`):
+        // every panic the collected body can raise crosses a
+        // `Terminate` boundary inside the body (its
+        // `panic_nounwind` / `panic_nounwind_fmt` call), so the
+        // call block's action is `Terminate` too — a panic the
+        // builtin node raises aborts exactly as the body's did,
+        // instead of unwinding to a `catch_unwind`. (The
+        // precondition shims are `#[rustc_nounwind]`, so their
+        // blocks already carry `Terminate`; this keeps the
+        // `ub_checks::runtime` predicate's blocks consistent.)
+        for (i, block) in out.blocks.iter().enumerate() {
+            if matches!(out.unwind[i], ir::UnwindAction::Terminate(_)) {
+                continue;
+            }
+            if let ir::TerminatorKind::CallBuiltin { name, .. } = &block.terminator {
+                if crate::builtins::ub_check_helper(name)
+                    .is_some_and(|helper| helper.panics_are_nounwind())
+                {
+                    out.unwind[i] =
+                        ir::UnwindAction::Terminate(ir::UnwindTerminateReason::CannotUnwind);
+                }
+            }
+        }
         out.zst_locals = body
             .local_decls
             .iter()

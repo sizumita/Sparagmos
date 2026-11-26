@@ -44,6 +44,39 @@ fn run_mode_size_of_align_of_user_adts() {
     );
 }
 
+const PTR_COPY_AND_SELECT_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = (0..16).collect();
+    let p = v.as_mut_ptr();
+    unsafe {
+        std::ptr::copy(p, p.add(1), 8);
+        let src: Vec<i32> = (100..108).collect();
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p.add(8), 8);
+    }
+    println!("v: {:?}", v);
+    let x = std::hint::select_unpredictable(true, 10, 20);
+    let y = std::hint::select_unpredictable(false, 10, 20);
+    let s = std::hint::select_unpredictable(true, "left", "right");
+    println!("select: {x} {y} {s}");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_copy_and_select_unpredictable() {
+    // The public raw-pointer copies and
+    // `hint::select_unpredictable` (which conversion now also
+    // serves natively, as one of the ub-check helper family):
+    // the overlapping `ptr::copy` shift, a disjoint
+    // `copy_nonoverlapping`, and the select over both a scalar
+    // and a fat `&str` value must produce exactly the native
+    // results.
+    run_ok(
+        "ptr-copy-and-select",
+        PTR_COPY_AND_SELECT_SRC,
+        "v: [0, 0, 1, 2, 3, 4, 5, 6, 100, 101, 102, 103, 104, 105, 106, 107]\nselect: 10 20 left\n",
+    );
+}
+
 const PTR_EQ_SRC: &str = r#"
 fn f() {}
 fn g() {}

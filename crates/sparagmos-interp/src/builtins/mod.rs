@@ -69,6 +69,7 @@ mod strings;
 mod sync;
 mod time;
 mod unicode;
+mod ub_checks;
 mod values;
 mod views;
 mod waker;
@@ -108,6 +109,7 @@ pub(crate) use self::strings::*;
 pub(crate) use self::sync::*;
 pub(crate) use self::time::*;
 pub(crate) use self::unicode::*;
+pub(crate) use self::ub_checks::*;
 pub(crate) use self::values::*;
 pub(crate) use self::views::*;
 pub(crate) use self::waker::*;
@@ -391,4 +393,49 @@ mod tests {
         assert_eq!(guard_elem_tag("my_crate::Ref<'_, i32>"), None);
         assert_eq!(guard_elem_tag("i32"), None);
     }
+    #[test]
+    fn ub_check_helper_classifies_the_diverted_names() {
+        // The runtime predicate and its shims, in the spellings
+        // the driver renders (either crate prefix), plus the
+        // alignment predicate and the select intrinsic's
+        // wrapper.
+        assert_eq!(
+            ub_check_helper("core::ub_checks::maybe_is_nonoverlapping::runtime"),
+            Some(UbCheckHelper::Nonoverlapping)
+        );
+        assert_eq!(
+            ub_check_helper("std::ptr::const_ptr::<impl *const T>::is_aligned_to"),
+            Some(UbCheckHelper::IsAlignedTo)
+        );
+        assert_eq!(
+            ub_check_helper("core::ptr::mut_ptr::<impl *mut T>::is_aligned_to"),
+            Some(UbCheckHelper::IsAlignedTo)
+        );
+        assert_eq!(
+            ub_check_helper("std::hint::select_unpredictable"),
+            Some(UbCheckHelper::SelectUnpredictable)
+        );
+        assert_eq!(
+            ub_check_helper("std::ptr::copy_nonoverlapping::precondition_check"),
+            Some(UbCheckHelper::CopyNonoverlappingPrecondition)
+        );
+        assert_eq!(
+            ub_check_helper("core::ptr::copy::precondition_check"),
+            Some(UbCheckHelper::CopyPrecondition)
+        );
+        // The operations themselves, and other operations'
+        // shims, are not diverted.
+        assert_eq!(ub_check_helper("std::ptr::copy_nonoverlapping"), None);
+        assert_eq!(ub_check_helper("std::ptr::read::precondition_check"), None);
+        assert_eq!(ub_check_helper("std::ptr::copy"), None);
+        // Only the helpers whose bodies panic exclusively
+        // through `panic_nounwind` / `panic_nounwind_fmt` get
+        // the `Terminate` call-block marking.
+        assert!(UbCheckHelper::Nonoverlapping.panics_are_nounwind());
+        assert!(UbCheckHelper::CopyNonoverlappingPrecondition.panics_are_nounwind());
+        assert!(UbCheckHelper::CopyPrecondition.panics_are_nounwind());
+        assert!(!UbCheckHelper::IsAlignedTo.panics_are_nounwind());
+        assert!(!UbCheckHelper::SelectUnpredictable.panics_are_nounwind());
+    }
+
 }

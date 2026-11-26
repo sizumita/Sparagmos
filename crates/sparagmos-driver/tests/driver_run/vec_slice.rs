@@ -5590,6 +5590,82 @@ fn run_mode_sort_interleaved_forty_scratch_offset_from() {
     );
 }
 
+const SORT_UB_CHECK_FOUR_HUNDRED_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    for k in 0..400usize {
+        let j = (k * 7 + 1) % 4;
+        v.push((j * 1000 + (k / 4)) as i32);
+    }
+    v.sort();
+    let mut sorted = v.len() == 400;
+    for i in 1..v.len() { if v[i - 1] > v[i] { sorted = false; } }
+    let mut sum: i64 = 0;
+    for x in &v { sum += *x as i64; }
+    println!("stable sorted {} sum {} first {} last {}", sorted, sum, v[0], v[399]);
+    let mut w: Vec<i32> = Vec::new();
+    for i in (0..400usize).rev() { w.push(v[i]); }
+    w.sort_unstable();
+    let mut same = w.len() == v.len();
+    for i in 0..w.len() { if w[i] != v[i] { same = false; } }
+    println!("unstable same {}", same);
+}
+"#;
+
+#[test]
+fn run_mode_sort_ub_check_predicates_four_hundred() {
+    // Four hundred elements in the interleaved shape of the
+    // `mpsc_stress` sort: the stable and unstable sorts drive
+    // thousands of `ptr::copy_nonoverlapping` / `ptr::copy`
+    // calls inside core, each gated by a `core::ub_checks`
+    // precondition (non-overlap, alignment, non-null) that the
+    // interpreter now evaluates natively at the call instead of
+    // executing the collected check bodies. The verdicts must
+    // accept every one of the sort's own copies — a false
+    // positive aborts the run in the precondition check (exit
+    // 134) — and the sorted results must be exact: the sum and
+    // the endpoints pin the whole multiset.
+    run_ok(
+        "sort-ub-check-four-hundred",
+        SORT_UB_CHECK_FOUR_HUNDRED_SRC,
+        "stable sorted true sum 619800 first 0 last 3099\nunstable same true\n",
+    );
+}
+
+const SORT_UB_CHECK_ZERO_SIZE_SRC: &str = r#"
+fn main() {
+    let mut z: Vec<()> = vec![(); 64];
+    z.sort();
+    println!("zst len {}", z.len());
+    let mut e: Vec<i32> = Vec::new();
+    e.sort();
+    println!("empty len {}", e.len());
+    let mut one: Vec<i32> = vec![42];
+    one.sort();
+    println!("one {:?}", one);
+    let a: Vec<i32> = (0..10).collect();
+    let mut b: Vec<i32> = vec![0; 10];
+    b[..0].copy_from_slice(&a[..0]);
+    b.copy_from_slice(&a);
+    println!("copied {:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_sort_ub_check_zero_size_paths() {
+    // The zero-sized corner of the same preconditions: a ZST
+    // sort, an empty sort, and a zero-length slice copy. The
+    // aligned-and-non-null predicate must accept these through
+    // its zero-size arm (a dangling or never-dereferenced
+    // pointer is fine when nothing is copied), exactly as the
+    // collected check bodies accept them.
+    run_ok(
+        "sort-ub-check-zero-size",
+        SORT_UB_CHECK_ZERO_SIZE_SRC,
+        "zst len 64\nempty len 0\none [42]\ncopied [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\n",
+    );
+}
+
 const SORT_TWO_SORTED_RUNS_SRC: &str = r#"
 fn main() {
     let mut v: Vec<usize> = Vec::new();

@@ -1091,6 +1091,58 @@ impl<'a> Converter<'a> {
     /// `Sub` call keeps the normal paths (a collected body wins;
     /// the names are not in the builtin registry, so reach still
     /// collects the generic shim bodies).
+    /// A direct call to one of the `core::ub_checks` runtime
+    /// predicates (or to the raw-pointer alignment predicate
+    /// they bottom out in, or to `hint::select_unpredictable`,
+    /// or to the `assert_unsafe_precondition!` shims of
+    /// `ptr::copy` / `ptr::copy_nonoverlapping`, whose bodies
+    /// only compose those predicates) converts to a builtin
+    /// node: the collected bodies re-derive, per call, a pure
+    /// predicate over the arguments' priced addresses, and the
+    /// runtime checks the converter resolves to `true` put
+    /// these helpers inside the precondition checks of the
+    /// standard library's unsafe operations, so hot code pays
+    /// the whole derivation per element copy. The builtin node
+    /// evaluates the same predicate directly under the same
+    /// address model (see `exec_ub_check_helper` in
+    /// `builtins`). Every other call keeps the normal paths.
+    fn ub_check_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some((name, _generic_args, _raw)) = self.resolve_external_callee(func) else {
+            return Ok(None);
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        if crate::builtins::ub_check_helper(&canonical).is_none() {
+            return Ok(None);
+        }
+        let mut ir_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            ir_args.push(self.convert_operand(body, arg, None)?);
+        }
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args: Vec::new(),
+            args: ir_args,
+            destination: self.convert_place(body, destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            consumed_glue: None,
+            skipped_glue: None,
+            elem_glue: None,
+            receiver_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+            unique_elem: None,
+            zeroed_value: None,
+        }))
+    }
+
     fn time_add_sub_terminator(
         &self,
         body: &mir::Body,
@@ -2017,6 +2069,14 @@ impl<'a> Converter<'a> {
                 )? {
                     term
                 } else if let Some(term) = self.file_io_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
+                } else if let Some(term) = self.ub_check_terminator(
                     body,
                     func,
                     args,
