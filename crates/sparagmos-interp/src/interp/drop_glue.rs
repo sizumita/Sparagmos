@@ -735,6 +735,38 @@ impl<'a> Interpreter<'a> {
                             }
                             continue;
                         }
+                        // A `Vec` value in its real aggregate form
+                        // ([RawVec, len]): the elements live behind
+                        // the buffer pointer, not in the aggregate's
+                        // fields, so enumerating the fields would run
+                        // the element glue against the buffer
+                        // descriptor and the length slot. Translate
+                        // the value to the element form and run this
+                        // plan against the translation in a nested
+                        // session, as the elided-element arm runs a
+                        // plan against a standalone value. The
+                        // translation of a zero-length vector never
+                        // touches its buffer pointer (a dangling
+                        // address-only pointer an allocator model
+                        // handed out has no pointee to read). A value
+                        // whose buffer the model cannot read back
+                        // declines the translation and keeps the
+                        // enumeration below.
+                        if let Some(translated) =
+                            self.vec_from_real_form(frames, &value)
+                        {
+                            let nested = GlueSession {
+                                root: RefTarget::value(translated?),
+                                work: vec![(
+                                    Vec::new(),
+                                    P::Each { elem: elem.clone() },
+                                )],
+                                adts: active.adts.clone(),
+                                completion: GlueCompletion::Resume,
+                            };
+                            suspended.push(std::mem::replace(&mut active, nested));
+                            continue 'sessions;
+                        }
                         let (count, is_enum) = match &value {
                             Value::Tuple(items) => (items.len(), false),
                             Value::Enum { fields, .. } => (fields.len(), true),
