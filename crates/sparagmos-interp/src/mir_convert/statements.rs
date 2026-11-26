@@ -294,6 +294,19 @@ impl<'a> Converter<'a> {
         if self.consumer_builtin_preempts(func) {
             return None;
         }
+        // An `Iterator::next` / `DoubleEndedIterator::
+        // next_back` call on a `str` split-family iterator is
+        // not bound to a body either: the modelled state
+        // machine (`str_split_step`) is the family's faithful
+        // execution, while a collected impl body -- the
+        // predicate pattern's converts cleanly -- drives the
+        // searcher through the `Chars` byte-snapshot machinery
+        // and yields the pieces as byte snapshots rather than
+        // string values. The builtin pre-empts the body, as
+        // it does for the iterator consumers above.
+        if self.split_next_builtin_preempts(func) {
+            return None;
+        }
         let Some(plain) = self.unconverted.get(&name) else {
             // A name that is not itself a collected body denotes
             // a trait item the call names directly (the func
@@ -517,6 +530,38 @@ impl<'a> Converter<'a> {
     /// only the builtin-produced iterator states satisfy. For
     /// any other iterator type — adapters such as `Map` /
     /// `Filter`, whose values are genuine structs built by
+    /// Whether this call is `Iterator::next` or
+    /// `DoubleEndedIterator::next_back` on a `str`
+    /// split-family iterator, whose modelled state machine
+    /// pre-empts a collected impl body (see
+    /// `resolve_body_callee`).
+    fn split_next_builtin_preempts(&self, func: &mir::Operand) -> bool {
+        let Some((name, _, raw_generic_args)) = self.resolve_external_callee(func)
+        else {
+            return false;
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        let Some(kind) = crate::builtins::lookup_qualified(&canonical) else {
+            return false;
+        };
+        if !matches!(
+            kind,
+            crate::builtins::Builtin::IteratorNext
+                | crate::builtins::Builtin::IteratorNextBack
+        ) {
+            return false;
+        }
+        let Some(iter_ty) = raw_generic_args.first() else {
+            return false;
+        };
+        let tag = crate::builtins::ty_tag(iter_ty, self.names);
+        tag.starts_with("std::str::Split<")
+            || tag.starts_with("std::str::RSplit<")
+            || tag.starts_with("std::str::SplitTerminator<")
+            || tag.starts_with("std::str::RSplitTerminator<")
+            || tag.starts_with("std::str::SplitInclusive<")
+    }
+
     /// collected constructors — the instance body, including
     /// its specializations, is the faithful execution, so it
     /// wins whenever the program has one.

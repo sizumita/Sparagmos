@@ -602,36 +602,53 @@ impl<'a> Interpreter<'a> {
     /// finished]`, and the five types differ only in which
     /// internal step each direction runs (the terminators in
     /// the constructor's recorded `allow_trailing_empty`).
-    /// Only the `char` pattern's searcher is modelled -- the
-    /// search is a substring search for the needle's UTF-8
-    /// encoding, which is exact because a char's encoding never
-    /// occurs inside another char's -- and any other searcher
-    /// shape is the generic unsupported error, as before.
+    /// Two searcher shapes are modelled: the `char` pattern's
+    /// searcher -- the search is a substring search for the
+    /// needle's UTF-8 encoding, which is exact because a char's
+    /// encoding never occurs inside another char's -- and the
+    /// `char`-predicate searcher (`CharPredicateSearcher`),
+    /// whose scan applies the predicate to each char of the
+    /// remaining window. Any other searcher shape is the
+    /// generic unsupported error, as before.
     fn str_split_step(
         &mut self,
+        frames: &mut Vec<Frame>,
         state: &Value,
         self_ty: &str,
         back: bool,
     ) -> InterpResult<(Value, Value)> {
-        let Some(mut parts) = StrSplitParts::decode(state) else {
-            return Err(unsupported(format!(
-                "Iterator::next for {self_ty} is not runtime-supported"
-            )));
-        };
         let reversed = self_ty.starts_with("std::str::RSplit<")
             || self_ty.starts_with("std::str::RSplitTerminator<");
         let inclusive = self_ty.starts_with("std::str::SplitInclusive<");
-        let item = match (back == reversed, inclusive) {
-            (true, false) => parts.next(),
-            (true, true) => parts.next_inclusive(),
-            (false, false) => parts.next_back(),
-            (false, true) => parts.next_back_inclusive(),
-        };
-        let new_state = parts.encode(state);
-        Ok(match item {
-            Some(piece) => (new_state, some_value(Value::Str(piece))),
-            None => (new_state, none_value()),
-        })
+        if let Some(mut parts) = StrSplitParts::decode(state) {
+            let item = match (back == reversed, inclusive) {
+                (true, false) => parts.next(),
+                (true, true) => parts.next_inclusive(),
+                (false, false) => parts.next_back(),
+                (false, true) => parts.next_back_inclusive(),
+            };
+            let new_state = parts.encode(state);
+            return Ok(match item {
+                Some(piece) => (new_state, some_value(Value::Str(piece))),
+                None => (new_state, none_value()),
+            });
+        }
+        if let Some(mut parts) = StrSplitPredParts::decode(state) {
+            let item = match (back == reversed, inclusive) {
+                (true, false) => parts.next(self, frames)?,
+                (true, true) => parts.next_inclusive(self, frames)?,
+                (false, false) => parts.next_back(self, frames)?,
+                (false, true) => parts.next_back_inclusive(self, frames)?,
+            };
+            let new_state = parts.encode(state);
+            return Ok(match item {
+                Some(piece) => (new_state, some_value(Value::Str(piece))),
+                None => (new_state, none_value()),
+            });
+        }
+        Err(unsupported(format!(
+            "Iterator::next for {self_ty} is not runtime-supported"
+        )))
     }
 
     /// The place-based back step of a `Map` (see `map_next`):
@@ -742,7 +759,7 @@ impl<'a> Interpreter<'a> {
             return self.chunk_step_state(frames, self_ty, &state, true);
         }
         if is_str_split_ty(self_ty) {
-            return self.str_split_step(&state, self_ty, true);
+            return self.str_split_step(frames, &state, self_ty, true);
         }
         if self_ty.starts_with("std::vec::Drain<")
             || self_ty.starts_with("alloc::vec::Drain<")
@@ -2367,7 +2384,7 @@ impl<'a> Interpreter<'a> {
             };
         }
         if is_str_split_ty(self_ty) {
-            return self.str_split_step(state, self_ty, false);
+            return self.str_split_step(frames, state, self_ty, false);
         }
         if self_ty.starts_with("std::sync::mpsc::Iter<")
             || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -4659,6 +4676,11 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::sync::mpsc::Iter<")
         || self_ty.starts_with("std::sync::mpsc::IntoIter<")
         || self_ty.starts_with("std::sync::mpsc::TryIter<")
+        || self_ty.starts_with("std::str::Split<")
+        || self_ty.starts_with("std::str::RSplit<")
+        || self_ty.starts_with("std::str::SplitTerminator<")
+        || self_ty.starts_with("std::str::RSplitTerminator<")
+        || self_ty.starts_with("std::str::SplitInclusive<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
@@ -6259,6 +6281,323 @@ impl StrSplitParts {
             }
         }
         self.back_match(true)
+    }
+}
+
+/// The decoded state of a `str` split iterator over a
+/// `char`-predicate pattern: core's `SplitInternal` fields
+/// plus the `CharPredicateSearcher` state the step machine
+/// drives. The searcher is a one-field wrapper over the
+/// `MultiCharEqSearcher` -- its predicate, its haystack and
+/// its `CharIndices` -- and the window the scan runs over is
+/// the front/back byte indices of the `CharIndices`'
+/// byte-slice iterator: the searcher's front step consumes
+/// chars from the front of the one window, its back step
+/// from the back, exactly as core's searcher shares the one
+/// `CharIndices` between both directions.
+struct StrSplitPredParts {
+    start: usize,
+    end: usize,
+    haystack: String,
+    front: usize,
+    back: usize,
+    predicate: Value,
+    allow_trailing_empty: bool,
+    finished: bool,
+}
+
+impl StrSplitPredParts {
+    /// Decode the state value, or `None` when it is not the
+    /// predicate-searcher split state (another pattern's
+    /// searcher, whose step stays unsupported). A predicate
+    /// the modelled call path cannot apply -- anything but a
+    /// closure or a function pointer; a zero-sized `Fn`
+    /// type's value carries no callable identity of its own
+    /// -- also declines, leaving the state to the generic
+    /// unsupported error.
+    fn decode(state: &Value) -> Option<Self> {
+        let outer = iterator_fields(state, "").ok()?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let internal = iterator_fields(&outer[0], "").ok()?;
+        if internal.len() != 5 {
+            return None;
+        }
+        let matcher = iterator_fields(&internal[2], "").ok()?;
+        if matcher.len() != 1 {
+            return None;
+        }
+        let searcher = iterator_fields(&matcher[0], "").ok()?;
+        if searcher.len() != 3 {
+            return None;
+        }
+        if !matches!(searcher[0], Value::Closure { .. } | Value::FnPtr(_)) {
+            return None;
+        }
+        let Value::Str(haystack) = &searcher[1] else {
+            return None;
+        };
+        // `CharIndices` pairs the front char index with its
+        // `Chars`, which wraps the byte-slice iterator whose
+        // bounds are the window.
+        let char_indices = iterator_fields(&searcher[2], "").ok()?;
+        if char_indices.len() != 2 {
+            return None;
+        }
+        let chars = iterator_fields(&char_indices[1], "").ok()?;
+        if chars.len() != 1 {
+            return None;
+        }
+        let (front, back) = slice_iter_bounds(&chars[0], "").ok()?;
+        let as_usize = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Uint(x) => usize::try_from(*x).ok(),
+                _ => None,
+            }
+        };
+        Some(StrSplitPredParts {
+            start: as_usize(&internal[0])?,
+            end: as_usize(&internal[1])?,
+            haystack: haystack.clone(),
+            front,
+            back,
+            predicate: searcher[0].clone(),
+            allow_trailing_empty: internal[3] == Value::Bool(true),
+            finished: internal[4] == Value::Bool(true),
+        })
+    }
+
+    /// Rebuild the state value with the stepped fields, in
+    /// the exact shape `decode` read.
+    fn encode(&self, state: &Value) -> Value {
+        let outer = iterator_fields(state, "").expect("state decoded");
+        let internal = iterator_fields(&outer[0], "").expect("state decoded");
+        let matcher = iterator_fields(&internal[2], "").expect("state decoded");
+        let searcher = iterator_fields(&matcher[0], "").expect("state decoded");
+        let char_indices = iterator_fields(&searcher[2], "").expect("state decoded");
+        let chars = iterator_fields(&char_indices[1], "").expect("state decoded");
+        let iter_fields = iterator_fields(&chars[0], "").expect("state decoded");
+        let new_front =
+            iter_ptr_with_index(&iter_fields[0], self.front).expect("state decoded");
+        let new_back =
+            iter_ptr_with_index(&iter_fields[1], self.back).expect("state decoded");
+        let new_iter = rebuild_state(
+            &chars[0],
+            vec![new_front, new_back, iter_fields[2].clone()],
+        );
+        let new_chars = rebuild_state(&char_indices[1], vec![new_iter]);
+        // The `CharIndices` front field is the char index of
+        // the window's front byte position.
+        let front_index = self.haystack[..self.front].chars().count();
+        let new_indices = rebuild_state(
+            &searcher[2],
+            vec![Value::Uint(front_index as u128), new_chars],
+        );
+        let new_searcher = rebuild_state(
+            &matcher[0],
+            vec![
+                self.predicate.clone(),
+                Value::Str(self.haystack.clone()),
+                new_indices,
+            ],
+        );
+        let new_matcher = rebuild_state(&internal[2], vec![new_searcher]);
+        let new_internal = rebuild_state(
+            &outer[0],
+            vec![
+                Value::Uint(self.start as u128),
+                Value::Uint(self.end as u128),
+                new_matcher,
+                Value::Bool(self.allow_trailing_empty),
+                Value::Bool(self.finished),
+            ],
+        );
+        rebuild_state(state, vec![new_internal])
+    }
+
+    /// The searcher's `char_eq.matches`: apply the predicate
+    /// to one char.
+    fn matches(
+        &self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+        c: char,
+    ) -> InterpResult<bool> {
+        match interp.call_callable_sync(
+            frames,
+            &self.predicate,
+            None,
+            vec![Value::Uint(c as u32 as u128)],
+        )? {
+            Value::Bool(b) => Ok(b),
+            other => Err(InterpError::type_mismatch(
+                "split predicate result",
+                "a boolean",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The searcher's `next_match`: the first char of the
+    /// window the predicate accepts. Rejected chars are
+    /// consumed, as the searcher's own `next` consumes them,
+    /// so the front ends just past the accepted char, or at
+    /// the window's back when no char is accepted.
+    fn next_match(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<(usize, usize)>> {
+        let window = self.haystack[self.front..self.back].to_string();
+        for (rel, c) in window.char_indices() {
+            let at = self.front + rel;
+            if self.matches(interp, frames, c)? {
+                self.front = at + c.len_utf8();
+                return Ok(Some((at, self.front)));
+            }
+        }
+        self.front = self.back;
+        Ok(None)
+    }
+
+    /// The searcher's `next_match_back`: the last accepted
+    /// char of the window; the back retreats to its start.
+    fn next_match_back(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<(usize, usize)>> {
+        let window = self.haystack[self.front..self.back].to_string();
+        for (rel, c) in window.char_indices().rev() {
+            let at = self.front + rel;
+            if self.matches(interp, frames, c)? {
+                self.back = at;
+                return Ok(Some((at, at + c.len_utf8())));
+            }
+        }
+        self.back = self.front;
+        Ok(None)
+    }
+
+    /// `SplitInternal::get_end` (the same tail the `char`
+    /// searcher's machine runs).
+    fn get_end(&mut self) -> Option<String> {
+        if !self.finished {
+            self.finished = true;
+            if self.allow_trailing_empty || self.end > self.start {
+                return Some(self.haystack[self.start..self.end].to_string());
+            }
+        }
+        None
+    }
+
+    /// `SplitInternal::next`.
+    fn next(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self.next_match(interp, frames)? {
+            Some((a, b)) => {
+                let elt = self.haystack[self.start..a].to_string();
+                self.start = b;
+                Ok(Some(elt))
+            }
+            None => Ok(self.get_end()),
+        }
+    }
+
+    /// `SplitInternal::next_inclusive`.
+    fn next_inclusive(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self.next_match(interp, frames)? {
+            Some((_, b)) => {
+                let elt = self.haystack[self.start..b].to_string();
+                self.start = b;
+                Ok(Some(elt))
+            }
+            None => Ok(self.get_end()),
+        }
+    }
+
+    /// The post-dance half of `SplitInternal::next_back` /
+    /// `next_back_inclusive`, mirroring the `char` searcher's
+    /// machine.
+    fn back_match(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+        inclusive: bool,
+    ) -> InterpResult<Option<String>> {
+        match self.next_match_back(interp, frames)? {
+            Some((a, b)) => {
+                let elt = self.haystack[b..self.end].to_string();
+                self.end = if inclusive { b } else { a };
+                Ok(Some(elt))
+            }
+            None => {
+                self.finished = true;
+                Ok(Some(self.haystack[self.start..self.end].to_string()))
+            }
+        }
+    }
+
+    /// `SplitInternal::next_back`, including its
+    /// `allow_trailing_empty` dance.
+    fn next_back(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(interp, frames, false)? {
+                Some(elt) if !elt.is_empty() => return Ok(Some(elt)),
+                _ => {
+                    if self.finished {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        self.back_match(interp, frames, false)
+    }
+
+    /// `SplitInternal::next_back_inclusive`: the mirror of
+    /// `next_back` over `back_match`'s inclusive form.
+    fn next_back_inclusive(
+        &mut self,
+        interp: &mut Interpreter<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<Option<String>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if !self.allow_trailing_empty {
+            self.allow_trailing_empty = true;
+            match self.back_match(interp, frames, true)? {
+                Some(elt) if !elt.is_empty() => return Ok(Some(elt)),
+                _ => {
+                    if self.finished {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        self.back_match(interp, frames, true)
     }
 }
 
