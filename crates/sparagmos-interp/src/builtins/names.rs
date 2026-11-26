@@ -220,6 +220,13 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             .get(def)
             .cloned()
             .unwrap_or_else(|| format!("{def:?}")),
+        // A foreign (extern) type is identified by its
+        // definition's name, as a function item is: the tag is
+        // the only identity a foreign type has.
+        T::Foreign(def) => names
+            .get(def)
+            .cloned()
+            .unwrap_or_else(|| format!("{def:?}")),
         T::Coroutine(def, args) => {
             // A coroutine type is named by its definition (the
             // async fn / coroutine literal it was lowered from),
@@ -394,6 +401,7 @@ pub(super) fn ir_ty_tag(ty: &crate::ir::Ty) -> Option<String> {
             }
         }
         T::Coroutine(name) => name.clone(),
+        T::Foreign(name) => name.clone(),
         T::Never => "!".to_string(),
     })
 }

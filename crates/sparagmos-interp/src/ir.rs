@@ -207,6 +207,14 @@ pub enum Ty {
     /// `Poll` / `CoroutineState` values. Values of this type are
     /// [`crate::value::Value::Coroutine`].
     Coroutine(String),
+    /// A foreign (extern) type: a type declared in an `extern`
+    /// block, opaque to Rust. It is unsized with an unknown
+    /// layout, has no fields, no drop glue and no values: valid
+    /// MIR only ever holds one behind a reference or raw pointer,
+    /// and that pointer is thin (an extern type carries no
+    /// pointer metadata). Only the definition's rendered name is
+    /// kept, for identity and display.
+    Foreign(String),
 }
 
 impl Ty {

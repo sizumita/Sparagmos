@@ -722,6 +722,7 @@ fn ir_ty_name(ty: &Ty) -> String {
         Ty::Closure(name, _) => name.clone(),
         Ty::Dynamic(_) => "dyn".to_string(),
         Ty::Coroutine(name) => name.clone(),
+        Ty::Foreign(name) => dwarf_type_name(name),
     }
 }
 
