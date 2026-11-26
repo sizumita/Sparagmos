@@ -71,6 +71,7 @@ pub(crate) fn build_program(
     program.mat_plans = c.mat_plans.clone();
     program.drop_trivial_adts = c.drop_trivial_adts.clone();
     program.drop_no_impl_adts = c.drop_no_impl_adts.clone();
+    program.needs_drop_verdicts = c.needs_drop_verdicts.clone();
     program.dtor_bodies = c.dtor_bodies.clone();
     program.track_caller_defs = c.track_caller_defs.clone();
     program.fn_shim_locations = c.fn_shim_locations.clone();

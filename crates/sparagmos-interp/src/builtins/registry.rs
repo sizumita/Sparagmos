@@ -1348,7 +1348,9 @@ pub enum Builtin {
     /// which agrees on every input where the intrinsic is
     /// defined.
     FloatToIntUnchecked,
-    /// `std::mem::needs_drop::<T>()` (types with a known answer only).
+    /// `std::mem::needs_drop::<T>()` (the compiler's verdict
+    /// recorded at conversion, else the types the static tag
+    /// table knows).
     MemNeedsDrop,
     /// `ManuallyDrop::new(value)`: an ADT aggregate of one field.
     ManuallyDropNew,

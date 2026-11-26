@@ -1850,6 +1850,74 @@ pub(crate) fn certify_drop_trivial(
     out
 }
 
+/// The compiler's verdict for every type a collected body's
+/// `core::mem::needs_drop` call asks about, keyed by the asked
+/// type's rendered tag (the key the interpreter's
+/// `MemNeedsDrop` builtin receives). The verdict is the
+/// emptiness of the type's drop-in-place shim — the same
+/// resolution `certify_drop_trivial` trusts — so the answer
+/// agrees with the drop glue the program runs by
+/// construction: a union is answered by its own destructor
+/// alone (its fields never carry glue), a struct or enum by
+/// its destructor and its fields together. A query that
+/// panics (an unaskable type, an odd instantiation) records
+/// no verdict, and the builtin keeps its unsupported answer
+/// for that type.
+pub(crate) fn certify_needs_drop(
+    conv: &mut Converter,
+    bodies: &[rustc_public::mir::Body],
+) -> std::collections::HashMap<String, bool> {
+    // Resolving `drop_in_place` requires the `drop_glue` lang
+    // item; a crate graph without one (a minicore) makes the
+    // query emit a fatal diagnostic instead of panicking,
+    // which the `catch_unwind` below cannot contain. Certify
+    // nothing there, as in `certify_drop_trivial`.
+    if !sparagmos_driver::convert::drop_glue_lang_item_defined() {
+        return std::collections::HashMap::new();
+    }
+    let mut candidates: Vec<rustc_public::ty::Ty> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for body in bodies {
+        for (def, args) in sparagmos_driver::reach::call_targets(body) {
+            let name = def.name();
+            if name != "std::mem::needs_drop" && name != "core::mem::needs_drop" {
+                continue;
+            }
+            if args_mention_params(&args) {
+                continue;
+            }
+            let Some(ty) = args.0.iter().find_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if seen.insert(format!("{ty:?}")) {
+                candidates.push(ty);
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    let mut queried = 0usize;
+    for ty in candidates {
+        if queried >= MAX_DROP_CERTIFICATIONS {
+            break;
+        }
+        queried += 1;
+        let certified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inst = Instance::resolve_drop_in_place(ty);
+            let needs = !inst.is_empty_shim();
+            let converted = conv.ty(&ty);
+            let key = conv.layout_key(&converted);
+            (key, needs)
+        }));
+        if let Ok((key, needs)) = certified {
+            out.insert(key, needs);
+        }
+    }
+    out
+}
+
 /// The `dyn` trait references one Stable MIR body forms: every
 /// unsizing cast whose target mentions a `dyn` type and whose
 /// source pointee is a concrete sized type, as a `TraitRef` with

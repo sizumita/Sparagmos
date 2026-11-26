@@ -2551,6 +2551,15 @@ pub struct Program {
     /// formatter when it meets an ADT value.
     pub adt_debug_shapes:
         std::collections::HashMap<String, sparagmos_mir::AdtDebugShape>,
+    /// The compiler's `needs_drop` verdict for the types the
+    /// program's `core::mem::needs_drop` calls ask about,
+    /// keyed by the type's rendered tag, as recorded by the
+    /// driver (see `crate::mir_convert::MirProgram::needs_drop_verdicts`).
+    /// The `MemNeedsDrop` builtin answers from this table
+    /// first: the verdict is the emptiness of the type's
+    /// drop-in-place shim, so it agrees with the drop glue
+    /// the program runs by construction.
+    pub needs_drop_verdicts: std::collections::HashMap<String, bool>,
     /// Debugger shapes of the program's monomorphic closure and
     /// coroutine instances, keyed by the rendered instance name
     /// (the type tag the debugger interface sees), as recorded by

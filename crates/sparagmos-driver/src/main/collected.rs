@@ -88,6 +88,10 @@ pub(crate) struct Collected {
     /// empty, for the interpreter (see `certify_drop_trivial`).
     pub(crate) drop_trivial_adts: std::collections::HashSet<String>,
     pub(crate) drop_no_impl_adts: std::collections::HashSet<String>,
+    /// The compiler's `needs_drop` verdict for every type a
+    /// collected body's `core::mem::needs_drop` call asks
+    /// about, for the interpreter (see `certify_needs_drop`).
+    pub(crate) needs_drop_verdicts: std::collections::HashMap<String, bool>,
     pub(crate) dtor_bodies: std::collections::HashMap<String, String>,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The

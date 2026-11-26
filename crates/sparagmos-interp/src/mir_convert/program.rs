@@ -165,6 +165,15 @@ pub struct MirProgram {
     /// otherwise have to refuse (an unrecorded impl cannot be
     /// ruled out for an uncertified foreign type).
     pub drop_no_impl_adts: std::collections::HashSet<String>,
+    /// The compiler's verdict for every type a collected
+    /// body's `core::mem::needs_drop` call asks about, as
+    /// recorded by the driver (it resolves each asked type's
+    /// drop-in-place shim through Stable MIR and keeps
+    /// whether the shim is non-empty). Keyed by the type's
+    /// rendered tag, the key the `MemNeedsDrop` builtin
+    /// receives. Converted into the interpreter's table (see
+    /// `ir::Program::needs_drop_verdicts`).
+    pub needs_drop_verdicts: std::collections::HashMap<String, bool>,
     /// Destructor bodies the driver demanded for specific ADT
     /// instantiations, keyed by the `Debug` rendering of the
     /// instantiation's type (the certification tables' key) with

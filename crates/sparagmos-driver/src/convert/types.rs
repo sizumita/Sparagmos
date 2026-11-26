@@ -863,7 +863,7 @@ impl Converter {
         }
     }
 
-    fn layout_key(&mut self, converted: &sm::Ty) -> String {
+    pub fn layout_key(&mut self, converted: &sm::Ty) -> String {
         while self.layout_names.len() < self.def_names.len() {
             let index = self.layout_names.len();
             self.layout_names.insert(

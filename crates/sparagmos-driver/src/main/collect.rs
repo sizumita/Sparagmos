@@ -1555,6 +1555,7 @@ fn collect() -> ControlFlow<()> {
     // destructor out for.
     let drop_trivial_adts = certify_drop_trivial(&mut conv, &alias_sources);
     let drop_no_impl_adts = certify_drop_no_impl(&mut conv, &alias_sources);
+    let needs_drop_verdicts = certify_needs_drop(&mut conv, &alias_sources);
 
     stash(Collected {
         report,
@@ -1588,6 +1589,7 @@ fn collect() -> ControlFlow<()> {
         mat_plans: conv.mat_plans.clone(),
         drop_trivial_adts,
         drop_no_impl_adts,
+        needs_drop_verdicts,
         dtor_bodies,
         track_caller_defs: conv.track_caller_defs.clone(),
         fn_shim_locations: conv.fn_shim_locations.clone(),

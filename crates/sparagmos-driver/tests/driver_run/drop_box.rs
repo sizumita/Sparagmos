@@ -4397,3 +4397,83 @@ fn main() {
 fn run_mode_box_new_in_zst_custom_allocator() {
     run_ok("box-new-in-zst", BOX_NEW_IN_ZST_ALLOC_SRC, "box-new-in-zst-ok\n");
 }
+const NEEDS_DROP_UNION_SRC: &str = r#"
+use std::mem::{needs_drop, ManuallyDrop};
+
+struct NeedDrop;
+impl Drop for NeedDrop {
+    fn drop(&mut self) {}
+}
+
+union UnionOk1<T> {
+    empty: (),
+    value: ManuallyDrop<T>,
+}
+
+union ActuallyDrop<T> {
+    inner: ManuallyDrop<T>,
+}
+impl<T> Drop for ActuallyDrop<T> {
+    fn drop(&mut self) {}
+}
+
+fn main() {
+    // A union's fields never make it need drop; only its own
+    // `Drop` impl does (the shape
+    // tests/ui/union/union-manuallydrop-rpass.rs and
+    // tests/ui/union/union-nodrop.rs exercise).
+    assert!(!needs_drop::<UnionOk1<NeedDrop>>());
+    assert!(needs_drop::<ActuallyDrop<u8>>());
+    assert!(needs_drop::<ActuallyDrop<Box<u8>>>());
+    println!("needs-drop-union-ok");
+}
+"#;
+
+#[test]
+fn run_mode_needs_drop_union_verdicts() {
+    run_ok("needs-drop-union", NEEDS_DROP_UNION_SRC, "needs-drop-union-ok\n");
+}
+
+const NEEDS_DROP_GUEST_SRC: &str = r#"
+use std::mem::{needs_drop, ManuallyDrop};
+
+struct NeedDrop;
+impl Drop for NeedDrop {
+    fn drop(&mut self) {}
+}
+
+union NoDrop<T> {
+    inner: ManuallyDrop<T>,
+}
+
+struct Foo {
+    x: NoDrop<Box<u8>>,
+}
+
+struct Baz {
+    x: NoDrop<Box<u8>>,
+    y: Box<u8>,
+}
+
+enum Choice {
+    Plain(u8),
+    Owned(Box<u8>),
+}
+
+fn main() {
+    assert!(!needs_drop::<Foo>());
+    assert!(!needs_drop::<NoDrop<Box<u8>>>());
+    assert!(needs_drop::<Baz>());
+    assert!(needs_drop::<Choice>());
+    assert!(needs_drop::<NeedDrop>());
+    assert!(!needs_drop::<(u8, [u16; 2])>());
+    assert!(needs_drop::<(u8, String)>());
+    assert!(!needs_drop::<ManuallyDrop<String>>());
+    println!("needs-drop-guest-ok");
+}
+"#;
+
+#[test]
+fn run_mode_needs_drop_guest_verdicts() {
+    run_ok("needs-drop-guest", NEEDS_DROP_GUEST_SRC, "needs-drop-guest-ok\n");
+}
