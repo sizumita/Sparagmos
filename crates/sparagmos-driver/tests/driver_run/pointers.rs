@@ -3785,3 +3785,44 @@ fn run_mode_zero_sized_pointer_ops_through_null() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "zst-null-ops-ok\n");
 }
+
+
+const FNPTR_CAST_SRC: &str = r#"
+fn callee(x: u32) -> u32 { x + 41 }
+fn other(x: u32) -> u32 { x + 1 }
+
+fn main() {
+    // Function item and function pointer to raw pointer
+    // (FnPtrToPtr, the fptr section of
+    // tests/ui/transmute/cast-rfc0401.rs / cast-rfc0401).
+    let fp: fn(u32) -> u32 = callee;
+    let p = fp as *const ();
+    let q = callee as *const ();
+    assert_eq!(p, q);
+    assert_eq!(p as usize, fp as usize);
+    assert!(!p.is_null());
+    let r = fp as *mut u8;
+    assert_eq!(r as usize, p as usize);
+    let o = other as *const ();
+    assert_ne!(p, o);
+    // A safe fn pointer viewed as an unsafe fn pointer still
+    // calls the same function.
+    let ufp = fp as unsafe fn(u32) -> u32;
+    assert_eq!(unsafe { ufp(1) }, 42);
+    // The raw pointer transmutes back to a callable fn pointer.
+    let back: fn(u32) -> u32 = unsafe { std::mem::transmute(p) };
+    assert_eq!(back(1), 42);
+    assert_eq!(back as usize, p as usize);
+    // A direct read through the cast pointer reads the same
+    // code byte as the integer round trip.
+    let direct = unsafe { *(fp as *const u8) };
+    let via_int = unsafe { *((fp as usize) as *const u8) };
+    assert_eq!(direct, via_int);
+    println!("fnptr-cast-ok");
+}
+"#;
+
+#[test]
+fn run_mode_fnptr_to_raw_ptr_cast() {
+    run_ok("fnptr-cast", FNPTR_CAST_SRC, "fnptr-cast-ok\n");
+}

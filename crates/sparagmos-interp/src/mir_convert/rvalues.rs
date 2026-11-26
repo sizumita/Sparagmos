@@ -357,12 +357,46 @@ impl<'a> Converter<'a> {
                             ir::Rvalue::Use(v)
                         }
                     }
+                    // A function pointer cast to a raw pointer
+                    // (`f as *const ()`, `f as *mut u8`): the
+                    // result is a data pointer denoting the
+                    // function's code, at the callable's synthetic
+                    // address -- the same address the function
+                    // pointer itself exposes as an integer, so the
+                    // cast result compares, integerises and (through
+                    // the recorded exposed target) code-reads and
+                    // transmutes back exactly as natively. The
+                    // target is always a thin raw pointer in
+                    // well-typed MIR (a function pointer has no
+                    // metadata half); any other target shape stays
+                    // an explicit unsupported.
+                    mir::CastKind::FnPtrToPtr => {
+                        if matches!(target, mir::Ty::RawPtr(..))
+                            && is_thin_ptr_ty(target)
+                        {
+                            ir::Rvalue::FnPtrToPtr(v)
+                        } else {
+                            ir::Rvalue::Unsupported(format!(
+                                "Cast FnPtrToPtr to {}",
+                                target.kind_name()
+                            ))
+                        }
+                    }
                     // Reifying a function item into a function
                     // pointer does not change the value in this
                     // model: both are the callable value naming the
                     // function.
                     mir::CastKind::PointerCoercion(
                         mir::PointerCoercion::ReifyFnPointer,
+                    ) => ir::Rvalue::Use(v),
+                    // A safe function pointer viewed as an unsafe
+                    // function pointer (and the reverse re-viewing
+                    // rustc spells the same way): the safety of a
+                    // signature is a type-level property this model
+                    // does not track, and the callable value naming
+                    // the function is unchanged.
+                    mir::CastKind::PointerCoercion(
+                        mir::PointerCoercion::UnsafeFnPointer,
                     ) => ir::Rvalue::Use(v),
                     // A non-capturing closure coerced to a function
                     // pointer: the closure value itself is the

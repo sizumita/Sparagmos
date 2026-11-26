@@ -386,6 +386,7 @@ fn rvalue_liveness(rv: &Rvalue, uses: &mut [u64], n: usize) {
         | Rvalue::DataPtr(op)
         | Rvalue::Materialize(op, _)
         | Rvalue::PtrToInt(op)
+        | Rvalue::FnPtrToPtr(op)
         | Rvalue::PtrField(op, _)
         | Rvalue::PtrFieldFirstElem(op, _)
         | Rvalue::PtrCastUnits(op, _)
