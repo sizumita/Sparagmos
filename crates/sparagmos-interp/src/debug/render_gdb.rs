@@ -1,8 +1,9 @@
 //! gdb-form rendering: aggregates, layouts and the union byte forms behind the raw `$N = ...` print.
 
-use crate::interp::Interpreter;
+use crate::interp::{Frame, Interpreter};
 use crate::value::Value;
 use super::desc::{Desc, dwarf_type_name, split_top_level};
+use super::printers::render_gdb_any;
 use super::queries::{desc_type_name, nonzero_scalar};
 use super::render_lldb::{
     escape_str, render_env_gdb, render_lldb_compact, render_scalar, scalar_desc_bit_width,
@@ -25,13 +26,30 @@ pub(super) fn render_elements(
     shared: Option<&Desc>,
     dialect: DebugDialect,
     depth: usize,
+    frames: &[Frame],
+    pretty: bool,
+    elements: usize,
 ) -> Option<Vec<String>> {
     let mut parts = Vec::with_capacity(fields.len());
     for (i, field) in fields.iter().enumerate() {
         let d = shared.or_else(|| descs.get(i));
         parts.push(match dialect {
             DebugDialect::Gdb => {
-                render_gdb(interp, field, d, false, None, depth + 1)?
+                if pretty {
+                    render_gdb_any(interp, frames, field, d, depth + 1, elements)?
+                } else {
+                    render_gdb_mode(
+                        interp,
+                        frames,
+                        field,
+                        d,
+                        false,
+                        None,
+                        depth + 1,
+                        false,
+                        elements,
+                    )?
+                }
             }
             DebugDialect::Lldb => {
                 render_lldb_compact(interp, field, d, false, true, depth + 1)?
@@ -80,11 +98,73 @@ pub(super) fn render_gdb(
     format: Option<PrintFormat>,
     depth: usize,
 ) -> Option<String> {
+    render_gdb_mode(
+        interp,
+        &[],
+        value,
+        desc,
+        top_char,
+        format,
+        depth,
+        false,
+        200,
+    )
+}
+
+/// Render a value in gdb form in a session with the pretty
+/// printers enabled: the raw aggregate form of [`render_gdb`],
+/// except that a nested value whose type has a provider
+/// renders in the provider's form, the way gdb applies the
+/// printers at every level of a printed value (an
+/// `Option<String>`'s payload prints as a quoted string, not
+/// as the string's raw aggregate). `elements` is the
+/// session's `print elements` setting, for the provider
+/// forms' truncation.
+pub(super) fn render_gdb_with_printers(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    top_char: bool,
+    format: Option<PrintFormat>,
+    depth: usize,
+    elements: usize,
+) -> Option<String> {
+    render_gdb_mode(
+        interp, frames, value, desc, top_char, format, depth, true, elements,
+    )
+}
+
+/// The shared body of [`render_gdb`] and
+/// [`render_gdb_with_printers`]; `pretty` selects the
+/// field-rendering mode (see the latter).
+#[allow(clippy::too_many_arguments)]
+fn render_gdb_mode(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    top_char: bool,
+    format: Option<PrintFormat>,
+    depth: usize,
+    pretty: bool,
+    elements: usize,
+) -> Option<String> {
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
     if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
-        return render_gdb(interp, &scalar, Some(&inner), top_char, format, depth);
+        return render_gdb_mode(
+            interp,
+            frames,
+            &scalar,
+            Some(&inner),
+            top_char,
+            format,
+            depth,
+            pretty,
+            elements,
+        );
     }
     match value {
         Value::Bool(_)
@@ -115,14 +195,28 @@ pub(super) fn render_gdb(
             if let Some(elem) = array_elem {
                 let mut rendered = Vec::with_capacity(fields.len());
                 for field in fields {
-                    rendered.push(render_gdb(
-                        interp,
-                        field,
-                        Some(elem),
-                        false,
-                        None,
-                        depth + 1,
-                    )?);
+                    rendered.push(if pretty {
+                        render_gdb_any(
+                            interp,
+                            frames,
+                            field,
+                            Some(elem),
+                            depth + 1,
+                            elements,
+                        )?
+                    } else {
+                        render_gdb_mode(
+                            interp,
+                            frames,
+                            field,
+                            Some(elem),
+                            false,
+                            None,
+                            depth + 1,
+                            false,
+                            elements,
+                        )?
+                    });
                 }
                 Some(format!("[{}]", compress_repeats(&rendered)))
             } else {
@@ -137,6 +231,9 @@ pub(super) fn render_gdb(
                     None,
                     DebugDialect::Gdb,
                     depth,
+                    frames,
+                    pretty,
+                    elements,
                 )?;
                 if parts.len() == 1 {
                     Some(format!("({},)", parts[0]))
@@ -150,7 +247,10 @@ pub(super) fn render_gdb(
                 return None;
             };
             let shape = interp.program().adt_debug_shapes.get(tag)?;
-            render_adt_gdb(interp, tag, shape, *variant, fields, depth)
+            render_adt_gdb(
+                interp, tag, shape, *variant, fields, depth, frames, pretty,
+                elements,
+            )
         }
         Value::Str(s) => {
             // gdb prints a `str` value -- a `&str` place, or a
@@ -728,6 +828,7 @@ pub(super) fn nonzero_lldb_expanded(
 }
 
 /// Render one ADT value in gdb form (see [`render_gdb`]).
+#[allow(clippy::too_many_arguments)]
 fn render_adt_gdb(
     interp: &Interpreter,
     tag: &str,
@@ -735,6 +836,9 @@ fn render_adt_gdb(
     variant: u32,
     fields: &[Value],
     depth: usize,
+    frames: &[Frame],
+    pretty: bool,
+    elements: usize,
 ) -> Option<String> {
     // The printed name is the DWARF (definition-path) form of
     // the recorded tag; the shape lookup above used the tag
@@ -750,7 +854,21 @@ fn render_adt_gdb(
         for (i, v) in values.iter().enumerate() {
             let name = vshape.fields[i].name.as_deref()?;
             let d = Desc::from_tag(&vshape.fields[i].ty);
-            let r = render_gdb(interp, v, Some(&d), false, None, depth + 1)?;
+            let r = if pretty {
+                render_gdb_any(interp, frames, v, Some(&d), depth + 1, elements)?
+            } else {
+                render_gdb_mode(
+                    interp,
+                    frames,
+                    v,
+                    Some(&d),
+                    false,
+                    None,
+                    depth + 1,
+                    false,
+                    elements,
+                )?
+            };
             parts.push(format!("{name}: {r}"));
         }
         return Some(format!("{tag} {{{}}}", parts.join(", ")));
@@ -768,14 +886,28 @@ fn render_adt_gdb(
         let mut parts = Vec::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
             let name = vshape.fields[i].name.as_deref()?;
-            let v = render_gdb(
-                interp,
-                field,
-                Some(&descs[i]),
-                false,
-                None,
-                depth + 1,
-            )?;
+            let v = if pretty {
+                render_gdb_any(
+                    interp,
+                    frames,
+                    field,
+                    Some(&descs[i]),
+                    depth + 1,
+                    elements,
+                )?
+            } else {
+                render_gdb_mode(
+                    interp,
+                    frames,
+                    field,
+                    Some(&descs[i]),
+                    false,
+                    None,
+                    depth + 1,
+                    false,
+                    elements,
+                )?
+            };
             parts.push(format!("{name}: {v}"));
         }
         Some(parts)
@@ -796,6 +928,9 @@ fn render_adt_gdb(
                     None,
                     DebugDialect::Gdb,
                     depth,
+                    frames,
+                    pretty,
+                    elements,
                 )?;
                 Some(format!("{tag} ({})", parts.join(", ")))
             }
@@ -816,6 +951,9 @@ fn render_adt_gdb(
                     None,
                     DebugDialect::Gdb,
                     depth,
+                    frames,
+                    pretty,
+                    elements,
                 )?;
                 Some(format!("{prefix}({})", parts.join(", ")))
             }

@@ -504,6 +504,51 @@ fn gdb_pretty_printers_render_slice_str_and_uninit_vec() {
 }
 
 #[test]
+fn gdb_print_elements_truncates_printed_strings() {
+    // gdb's `set print elements` reaches the session as a
+    // command: a print after it truncates a long string at
+    // the limit, the way the real debugger's does, while a
+    // print before it (under the default limit) does not.
+    fn cvar(name: &str, constant: Constant, ty: &str) -> DebugVarEntry {
+        DebugVarEntry {
+            name: name.to_string(),
+            source: DebugVar::Constant(constant),
+            is_char: false,
+            ty: Some(ty.to_string()),
+            lines: (2, 2),
+        }
+    }
+    let p = program_with_vars(vec![cvar(
+        "owned",
+        Constant::Str("IAMA optional string!".to_string()),
+        "alloc::string::String",
+    )]);
+    let mut s = session(p);
+    s.set_pretty_printers(true);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("owned"),
+            DebugCommand::SetPrintElements(5),
+            print("owned"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = \"IAMA optional string!\"",
+        "$2 = \"IAMA \"...",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
 fn lldb_provider_lines_for_slice_and_str() {
     let mut s = session(constant_sequence_program());
     s.set_breakpoint("test.rs", 3);

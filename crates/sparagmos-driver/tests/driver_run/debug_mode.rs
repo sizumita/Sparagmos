@@ -520,6 +520,53 @@ fn debug_mode_mut_slice_and_str_render_with_pretty_printers() {
     }
 }
 
+const DEBUG_PRETTY_STD_SRC: &str = r#"use std::ffi::OsString;
+struct Holder {
+    text: String,
+}
+fn main() {
+    let os_string = OsString::from("IAMA OS string \u{1F603}");
+    let some_string = Some("IAMA optional string!".to_owned());
+    let holder = Holder { text: "held".to_owned() };
+    zzz();
+    let _ = (&os_string, &some_string, &holder);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_pretty_std_os_string_and_option_string() {
+    // The pretty-std shapes: an `OsString` renders as its
+    // text (its recorded type names the re-export path
+    // `std::ffi::OsString`, not the definition path the
+    // provider classification was written against), an
+    // `Option<String>` payload renders through the `String`
+    // provider inside the raw enum form (gdb applies the
+    // printers at every level), and a `print elements`
+    // limit set mid-session truncates the payload string
+    // of a later print.
+    let dir = temp_dir("debug-pretty-std");
+    let src = fixture(&dir, "pretty_std.rs", DEBUG_PRETTY_STD_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "pretty-printers\nbreak 9\nrun\nprint os_string\nprint some_string\nprint holder\nprint-elements 5\nprint some_string\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = \"IAMA OS string ",
+        "$2 = core::option::Option<alloc::string::String>::Some(\"IAMA optional string!\")",
+        "{text: \"held\"}",
+        "$4 = core::option::Option<alloc::string::String>::Some(\"IAMA \"...",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
 const DEBUG_MUT_CAPTURE_SRC: &str = r#"struct MyStruct { my_field1: u32, my_field2: u32 }
 fn _zzz() {}
 fn main() {
