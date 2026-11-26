@@ -730,6 +730,59 @@ fn codegen_only_prefetch_intrinsic_converts() {
 }
 
 #[test]
+fn codegen_only_black_box_intrinsic_converts() {
+    // `black_box` must be overridden too, and the
+    // interpreter has no model for it — but code
+    // generation lowers it (an inline-asm barrier
+    // around the value), so a call in the minicore
+    // shape — a locally declared body-less intrinsic,
+    // as the codegen-llvm ABI tests link — is shimmed
+    // by the backend the verdict mirrors and converts.
+    // (The verdict originally reported it, rejecting
+    // those valid programs.)
+    let case = Case::new("black-box-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         pub const fn black_box<T>(dummy: T) -> T;\n\
+         fn main() { let _x = black_box(41u32); }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn codegen_only_raw_eq_intrinsic_converts() {
+    // `raw_eq` must be overridden too, and the
+    // interpreter has no model for it — but code
+    // generation lowers it to a load-and-compare of
+    // the pointee, so the calls std's slice and array
+    // equality bodies make are shimmed by the backend
+    // the verdict mirrors and convert. The case is
+    // compiled at opt-level 3, as the records are:
+    // below it the equality is dispatched as an
+    // interpreter builtin and the call never lands in
+    // a converted body. (The verdict originally
+    // reported them, rejecting the valid programs of
+    // tests/codegen-llvm/array-equality.rs and
+    // slice-ref-equality.rs.)
+    let case = Case::new("raw-eq-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"lib\"]\n\
+         #[no_mangle]\n\
+         pub fn array_eq_value(a: [u16; 3], b: [u16; 3]) -> bool { a == b }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Copt-level=3"],
+        true,
+    );
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
 fn comptime_intrinsic_converts() {
     // `offset_of` must be overridden too, but it is a
     // `#[rustc_comptime]` intrinsic: the compiler rejects

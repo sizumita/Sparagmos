@@ -355,16 +355,21 @@ fn codegen_served_unmodelled(name: &str) -> bool {
             // Singletons code generation lowers directly:
             // the single-thread fence (its multi-thread
             // sibling is modelled), the debug trap, the
-            // hint intrinsics, the vtable queries, and the
+            // hint intrinsics, the black-box hint (an
+            // inline-asm barrier around the value), the
+            // raw memory equality (a load-and-compare of
+            // the pointee), the vtable queries, and the
             // offload device count (lowered to the OpenMP
             // runtime call).
             | "atomic_singlethreadfence"
+            | "black_box"
             | "breakpoint"
             | "cold_path"
             | "exact_div"
             | "is_val_statically_known"
             | "offload_get_num_devices"
             | "ptr_mask"
+            | "raw_eq"
             | "return_address"
             | "select_unpredictable"
             | "vtable_align"
