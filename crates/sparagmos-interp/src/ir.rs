@@ -1100,6 +1100,21 @@ pub enum Rvalue {
     /// address names no place), exactly like a pointer constant
     /// with no provenance.
     IntToPtr(Operand),
+    /// A function-pointer-to-raw-pointer cast
+    /// (`CastKind::FnPtrToPtr`, e.g. `f as *const ()`): the
+    /// operand is a callable value (a function item / function
+    /// pointer, or a non-capturing closure in that role), and
+    /// the result is the data pointer that denotes the
+    /// function's code: an address-only reference at the
+    /// callable's synthetic address (the same address
+    /// [`Rvalue::PtrToInt`] exposes for the callable), with the
+    /// callable's identity recorded as the address's exposed
+    /// target. The result therefore compares and converts to
+    /// an integer exactly as the function pointer itself does,
+    /// a read through it serves the function's code image (see
+    /// `Interpreter::fn_code_deref`), and a transmute back to a
+    /// function-pointer type recovers the callable value.
+    FnPtrToPtr(Operand),
     /// A `Transmute` cast from an integer to a transparent
     /// single-payload wrapper around a thin pointer (`NonNull`,
     /// `Unique`): the reverse of transmuting the wrapper to an

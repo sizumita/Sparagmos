@@ -4286,3 +4286,272 @@ fn transmute_slice_of_ints_to_fieldless_enum_reads_variants() {
         Value::Uint(5)
     );
 }
+
+// ----- function pointer to raw pointer casts (FnPtrToPtr) -------------------
+
+const CALLEE_DEF: mir::DefId = mir::DefId::new(0, 21);
+const OTHER_DEF: mir::DefId = mir::DefId::new(0, 22);
+
+fn fnptr_u32_ty() -> mir::Ty {
+    mir::Ty::FnPtr(Box::new(mir::FnSig::new(vec![u32_ty()], u32_ty())))
+}
+
+fn raw_unit_ty() -> mir::Ty {
+    mir::Ty::RawPtr(Box::new(mir::Ty::unit()), mir::Mutability::Not)
+}
+
+fn raw_u8_ty() -> mir::Ty {
+    mir::Ty::RawPtr(Box::new(u8_ty()), mir::Mutability::Not)
+}
+
+/// callee body: _0 = Add(copy _1, 41_u32); return
+fn callee_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[u32_ty(), u32_ty()]),
+        1,
+        vec![block(
+            vec![assign(
+                place(0),
+                binop(mir::BinOp::Add, copy(1), const_u32(41)),
+            )],
+            ret(),
+        )],
+    )
+}
+
+/// other body: _0 = Add(copy _1, 1_u32); return
+fn other_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[u32_ty(), u32_ty()]),
+        1,
+        vec![block(
+            vec![assign(
+                place(0),
+                binop(mir::BinOp::Add, copy(1), const_u32(1)),
+            )],
+            ret(),
+        )],
+    )
+}
+
+fn fnptr_prog() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("callee", CALLEE_DEF, callee_body());
+    prog.add_with_def_id("other", OTHER_DEF, other_body());
+    prog
+}
+
+fn reify(def: mir::DefId, dest: u32) -> mir::Statement {
+    assign(
+        place(dest),
+        mir::Rvalue::Cast(
+            mir::CastKind::PointerCoercion(mir::PointerCoercion::ReifyFnPointer),
+            fndef_operand(def),
+            fnptr_u32_ty(),
+        ),
+    )
+}
+
+#[test]
+fn fnptr_to_ptr_address_matches_fnptr_address_and_differs_per_function() {
+    // check returns 1 when the address of (callee as *const ())
+    // equals the address the callee fn pointer itself exposes,
+    // is non-zero, and differs from (other as *const ()) address.
+    // locals: 0 u32 (return), 1/2 fnptr, 3/4 raw ptr, 5/6/7 usize,
+    // 8/9/10 bool
+    let body = mir::Body::new(
+        decls(&[
+            u32_ty(),
+            fnptr_u32_ty(),
+            fnptr_u32_ty(),
+            raw_unit_ty(),
+            raw_unit_ty(),
+            usize_ty(),
+            usize_ty(),
+            usize_ty(),
+            bool_ty(),
+            bool_ty(),
+            bool_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    reify(CALLEE_DEF, 1),
+                    reify(OTHER_DEF, 2),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Cast(mir::CastKind::FnPtrToPtr, copy(1), raw_unit_ty()),
+                    ),
+                    assign(
+                        place(4),
+                        mir::Rvalue::Cast(mir::CastKind::FnPtrToPtr, copy(2), raw_unit_ty()),
+                    ),
+                    assign(
+                        place(5),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerExposeProvenance,
+                            copy(3),
+                            usize_ty(),
+                        ),
+                    ),
+                    assign(
+                        place(6),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerExposeProvenance,
+                            copy(1),
+                            usize_ty(),
+                        ),
+                    ),
+                    assign(
+                        place(7),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerExposeProvenance,
+                            copy(4),
+                            usize_ty(),
+                        ),
+                    ),
+                    assign(place(8), binop(mir::BinOp::Eq, copy(5), copy(6))),
+                    assign(place(9), binop(mir::BinOp::Ne, copy(5), copy(7))),
+                    assign(place(10), binop(mir::BinOp::Ne, copy(5), const_int(0, 8))),
+                ],
+                switch_bool(copy(8), 3, 1),
+            ),
+            block(vec![], switch_bool(copy(9), 3, 2)),
+            block(vec![], switch_bool(copy(10), 3, 4)),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_u32(0)))],
+                ret(),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_u32(1)))],
+                ret(),
+            ),
+        ],
+    );
+    let mut prog = fnptr_prog();
+    prog.add("check", body);
+    let v = interpret_mir(&prog, "check", vec![]).expect("fnptr cast check must run");
+    assert_eq!(v, Value::Uint(1));
+}
+
+#[test]
+fn fnptr_to_ptr_transmuted_back_calls_the_function() {
+    // roundtrip: let p = callee as *const (); let f = transmute(p);
+    // return f(1) -- the cast result transmutes back to the callable
+    // value and the call returns 42.
+    // locals: 0 u32 (return), 1 fnptr, 2 raw ptr, 3 fnptr
+    let body = mir::Body::new(
+        decls(&[u32_ty(), fnptr_u32_ty(), raw_unit_ty(), fnptr_u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    reify(CALLEE_DEF, 1),
+                    assign(
+                        place(2),
+                        mir::Rvalue::Cast(mir::CastKind::FnPtrToPtr, copy(1), raw_unit_ty()),
+                    ),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Cast(mir::CastKind::Transmute, copy(2), fnptr_u32_ty()),
+                    ),
+                ],
+                call(copy(3), const_u32(1), 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = fnptr_prog();
+    prog.add("roundtrip", body);
+    let v = interpret_mir(&prog, "roundtrip", vec![]).expect("fnptr roundtrip must run");
+    assert_eq!(v, Value::Uint(42));
+}
+
+#[test]
+fn fnptr_as_unsafe_fnptr_calls_the_function() {
+    // via_unsafe: let f = callee as unsafe fn(u32) -> u32
+    // (PointerCoercion UnsafeFnPointer); return f(1) == 42.
+    // locals: 0 u32 (return), 1 fnptr, 2 fnptr (unsafe view)
+    let body = mir::Body::new(
+        decls(&[u32_ty(), fnptr_u32_ty(), fnptr_u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    reify(CALLEE_DEF, 1),
+                    assign(
+                        place(2),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerCoercion(
+                                mir::PointerCoercion::UnsafeFnPointer,
+                            ),
+                            copy(1),
+                            fnptr_u32_ty(),
+                        ),
+                    ),
+                ],
+                call(copy(2), const_u32(1), 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = fnptr_prog();
+    prog.add("via_unsafe", body);
+    let v = interpret_mir(&prog, "via_unsafe", vec![]).expect("unsafe fnptr view must run");
+    assert_eq!(v, Value::Uint(42));
+}
+
+#[test]
+fn fnptr_to_ptr_direct_deref_reads_the_code_image() {
+    // code_byte: the byte read directly through (callee as *const u8)
+    // equals the byte read through (callee as usize as *const u8), the
+    // code-image path the integer round trip already served.
+    // locals: 0 bool (return), 1 fnptr, 2 raw u8 ptr, 3 usize,
+    // 4 raw u8 ptr, 5 u8, 6 u8
+    let body = mir::Body::new(
+        decls(&[
+            bool_ty(),
+            fnptr_u32_ty(),
+            raw_u8_ty(),
+            usize_ty(),
+            raw_u8_ty(),
+            u8_ty(),
+            u8_ty(),
+        ]),
+        0,
+        vec![block(
+            vec![
+                reify(CALLEE_DEF, 1),
+                assign(
+                    place(2),
+                    mir::Rvalue::Cast(mir::CastKind::FnPtrToPtr, copy(1), raw_u8_ty()),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerExposeProvenance,
+                        copy(1),
+                        usize_ty(),
+                    ),
+                ),
+                assign(
+                    place(4),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerWithExposedProvenance,
+                        copy(3),
+                        raw_u8_ty(),
+                    ),
+                ),
+                assign(place(5), mir::Rvalue::Use(copy_deref(2))),
+                assign(place(6), mir::Rvalue::Use(copy_deref(4))),
+                assign(place(0), binop(mir::BinOp::Eq, copy(5), copy(6))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = fnptr_prog();
+    prog.add("code_byte", body);
+    let v = interpret_mir(&prog, "code_byte", vec![]).expect("fnptr code deref must run");
+    assert_eq!(v, Value::Bool(true));
+}

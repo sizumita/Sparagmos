@@ -2569,6 +2569,20 @@ impl<'a> Interpreter<'a> {
                     }),
                 }
             }
+            Rvalue::FnPtrToPtr(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                match synthetic_address(&value) {
+                    Some(addr) => {
+                        self.note_exposed_target(addr as u64, &value);
+                        Ok(Value::Ref(RefTarget::Address(addr as u64)))
+                    }
+                    None => Err(InterpError::TypeMismatch {
+                        context: "function-pointer-to-pointer cast".to_string(),
+                        expected: "a function pointer value".to_string(),
+                        found: value.kind_name().to_string(),
+                    }),
+                }
+            }
             Rvalue::PtrField(operand, depth) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_field_value(frames, body, value, *depth)
