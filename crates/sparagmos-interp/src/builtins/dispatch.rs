@@ -3740,6 +3740,14 @@ impl<'a> Interpreter<'a> {
                 // at equal types.
                 if target == source && !target.is_empty() {
                     Ok(value)
+                } else if legacy_new_range_conversion(source, target) {
+                    // core's `From` impls between the legacy
+                    // `std::ops::` range types and the new
+                    // `std::range::` ones (`Range`, `RangeFrom`,
+                    // `RangeToInclusive`, in both directions)
+                    // copy the fields in order, so the value
+                    // already is the target's shape.
+                    Ok(value)
                 } else if matches!(value, Value::Str(_))
                     && (target == "std::string::String" || target == "str" || target == "&str")
                 {
@@ -9087,6 +9095,9 @@ impl<'a> Interpreter<'a> {
         if matches!(value, Value::DynRef { .. })
             || self_ty.starts_with("std::ops::Range<")
             || self_ty.starts_with("std::ops::RangeInclusive<")
+            || self_ty.starts_with("std::ops::RangeFrom<")
+            || self_ty.starts_with("std::range::RangeFromIter<")
+            || self_ty.starts_with("std::iter::StepBy<")
             || self_ty.starts_with("std::iter::Rev<")
             || self_ty.starts_with("std::slice::Iter<")
             || self_ty.starts_with("std::collections::btree_set::Iter<")
@@ -9183,6 +9194,24 @@ impl<'a> Interpreter<'a> {
             // converted body, and the owning iterators by
             // the arms below.
             Ok(value)
+        } else if self_ty.starts_with("std::range::RangeFrom<") {
+            // The new range API's `RangeFrom` iterates as
+            // `RangeFromIter { start, exhausted: false }` --
+            // the two-field state core's own `into_iter`
+            // builds and the modelled `RangeFromIter` step
+            // (and the converted `remainder` body) consumes.
+            let fields = iterator_fields(&value, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "IntoIterator::into_iter for a range::RangeFrom",
+                    "[start]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            Ok(Value::Enum {
+                variant: 0,
+                fields: vec![fields[0].clone(), Value::Bool(false)],
+            })
         } else if self_ty.starts_with('[') {
             // Array by value: iteration state is the element
             // tuple plus the next index (our layout for

@@ -149,14 +149,240 @@ pub(super) fn char_advance(start: u128, n: u128) -> u128 {
     }
 }
 
-/// The element type tag of a `Range<elem>` / `RangeInclusive<elem>`
-/// type tag.
+/// Whether a `From` conversion between a legacy `std::ops::`
+/// range type and its `std::range::` counterpart (in either
+/// direction) exists in core for this pair of type tags with
+/// the same generic argument: `Range`, `RangeFrom` and
+/// `RangeToInclusive` convert both ways by copying their
+/// fields in order. (`RangeInclusive` is absent on purpose:
+/// its legacy-to-new conversion reads the source's iteration
+/// state and can panic, so it is not a field copy.)
+pub(super) fn legacy_new_range_conversion(source: &str, target: &str) -> bool {
+    fn kind_arg<'a>(ty: &'a str, module: &str, kind: &str) -> Option<&'a str> {
+        ty.strip_prefix(&format!("{module}::{kind}<"))
+            .and_then(|rest| rest.strip_suffix('>'))
+    }
+    for kind in ["Range", "RangeFrom", "RangeToInclusive"] {
+        for (a, b) in [(source, target), (target, source)] {
+            if let (Some(x), Some(y)) = (
+                kind_arg(a, "std::ops", kind),
+                kind_arg(b, "std::range", kind),
+            ) {
+                return x == y;
+            }
+        }
+    }
+    false
+}
+
+/// The element type tag of a `Range<elem>` / `RangeInclusive<elem>` /
+/// `RangeFrom<elem>` / `RangeFromIter<elem>` type tag.
 pub(super) fn range_elem_ty(self_ty: &str) -> &str {
     self_ty
         .strip_prefix("std::ops::RangeInclusive<")
+        .or_else(|| self_ty.strip_prefix("std::range::RangeFromIter<"))
+        .or_else(|| self_ty.strip_prefix("std::ops::RangeFrom<"))
+        .or_else(|| self_ty.strip_prefix("std::range::RangeFrom<"))
         .or_else(|| self_ty.strip_prefix("std::ops::Range<"))
         .and_then(|rest| rest.strip_suffix('>'))
         .unwrap_or("")
+}
+
+/// The width in bits and signedness of an integer element type
+/// whose `Step` arithmetic the range machines serve.
+fn range_int_width(elem: &str) -> Option<(u32, bool)> {
+    Some(match elem {
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" => (64, false),
+        "u128" => (128, false),
+        "usize" => (64, false),
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" => (64, true),
+        "i128" => (128, true),
+        "isize" => (64, true),
+        _ => return None,
+    })
+}
+
+/// Whether the range machines step this element type at all:
+/// the integers and `char`. Any other `Step` type is a user
+/// implementation whose forward step is code, not arithmetic.
+pub(super) fn range_elem_step_served(elem: &str) -> bool {
+    elem == "char" || range_int_width(elem).is_some()
+}
+
+/// The bit pattern of an integer bound in its element width
+/// (see `range_count` on the signed materialisation of wide
+/// unsigned constants: the pattern is what denotes the value,
+/// whichever of the two integer forms carries it).
+fn range_bits(value: &Value, width: u32) -> Option<u128> {
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    match value {
+        Value::Uint(v) => Some(v & mask),
+        Value::Int(v) => Some((*v as u128) & mask),
+        _ => None,
+    }
+}
+
+/// The value of a stepped bit pattern, in the representation
+/// the input carried: an input in signed form (a wide unsigned
+/// constant's materialisation, or a signed element's value)
+/// reads the pattern back sign-extended from the width.
+fn range_unbits(like: &Value, bits: u128, width: u32) -> Value {
+    match like {
+        Value::Int(_) => {
+            let v = if width >= 128 {
+                bits as i128
+            } else if bits & (1u128 << (width - 1)) != 0 {
+                bits as i128 - (1i128 << width)
+            } else {
+                bits as i128
+            };
+            Value::Int(v)
+        }
+        _ => Value::Uint(bits),
+    }
+}
+
+/// `Step::forward_checked(value, 1)` for a range bound: the
+/// successor, or `None` where the step leaves the element
+/// type's domain (an integer at its maximum, `char` at
+/// `char::MAX`). An element type the range machines do not
+/// step also yields `None`; callers that must tell the two
+/// apart consult [`range_elem_step_served`] first.
+pub(super) fn range_step_forward_checked(
+    value: &Value,
+    elem: &str,
+) -> InterpResult<Option<Value>> {
+    if elem == "char" {
+        let code = match value {
+            Value::Uint(v) => *v,
+            Value::Int(v) => *v as u128,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "range bound step",
+                    "integer",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if code >= 0x10FFFF {
+            return Ok(None);
+        }
+        return Ok(Some(range_increment(value, elem)?));
+    }
+    let Some((width, signed)) = range_int_width(elem) else {
+        return Ok(None);
+    };
+    let Some(bits) = range_bits(value, width) else {
+        return Err(InterpError::type_mismatch(
+            "range bound step",
+            "integer",
+            value.kind_name(),
+        ));
+    };
+    let max = if signed {
+        (1u128 << (width - 1)) - 1
+    } else if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    if bits == max {
+        return Ok(None);
+    }
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    Ok(Some(range_unbits(
+        value,
+        bits.wrapping_add(1) & mask,
+        width,
+    )))
+}
+
+/// The maximum value of an unsigned integer element type,
+/// as a count: the clamp core's specialised `StepBy` step
+/// applies to a step wider than the element type.
+pub(super) fn range_elem_max(elem: &str) -> Option<u128> {
+    let (width, signed) = range_int_width(elem)?;
+    if signed {
+        return None;
+    }
+    Some(if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    })
+}
+
+/// `value + delta` wrapping in the element type's width, in
+/// the representation `value` carries: the arithmetic of
+/// core's specialised `StepBy` step over an integer range,
+/// whose stored bound is stepped past its last yield without
+/// ever being read again. `None` for an element type the
+/// range machines do not step.
+pub(super) fn range_wrapping_add(value: &Value, elem: &str, delta: u128) -> Option<Value> {
+    let (width, _) = range_int_width(elem)?;
+    let bits = range_bits(value, width)?;
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    Some(range_unbits(
+        value,
+        bits.wrapping_add(delta) & mask,
+        width,
+    ))
+}
+
+/// `Step::forward(value, 1)` for a range bound, as core's
+/// integer and `char` implementations perform it: the checked
+/// step's result when it exists; at the maximum, the addition
+/// overflow panic when the session runs with overflow checks
+/// (the `#[rustc_inherit_overflow_checks]` on the step makes
+/// the caller's setting decide) and the wrap to the type's
+/// minimum when it does not. `char` has no wrapping form: its
+/// `Step::forward` is the trait default, which panics at the
+/// maximum in every build.
+pub(super) fn range_step_forward(
+    value: &Value,
+    elem: &str,
+    overflow_checks: bool,
+) -> InterpResult<Value> {
+    if let Some(next) = range_step_forward_checked(value, elem)? {
+        return Ok(next);
+    }
+    if elem == "char" {
+        return Err(InterpError::panic_str_payload(
+            "overflow in `Step::forward`",
+        ));
+    }
+    let Some((width, signed)) = range_int_width(elem) else {
+        return Err(InterpError::type_mismatch(
+            "range bound step",
+            "an integer element type",
+            elem,
+        ));
+    };
+    if overflow_checks {
+        return Err(InterpError::panic_str_payload(
+            "attempt to add with overflow",
+        ));
+    }
+    let min = if signed { 1u128 << (width - 1) } else { 0 };
+    Ok(range_unbits(value, min, width))
 }
 
 /// The element count of a range, as `size_hint` reports it:
