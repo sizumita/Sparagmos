@@ -4990,6 +4990,27 @@ pub fn hash_iterator_tag(self_ty: &str) -> bool {
         || self_ty.starts_with("hashbrown::raw::RawExtractIf")
 }
 
+/// Whether this type tag names an iterator the modelled
+/// consumers cannot drain -- a hash-collection iterator or
+/// one of the concrete collection iterators (see
+/// `hash_iterator_tag` / `collection_iterator_tag`) --
+/// possibly wrapped in adapter types (`Map`, `Cloned`,
+/// `Filter`, ...): an adapter's step composes its inner
+/// iterator's step, so an adapter over a body-served iterator
+/// is itself body-served, and the collected body chain is the
+/// only faithful execution for the consumers that drain it.
+/// Judged recursively over the tag's generic arguments; each
+/// argument is a strictly smaller substring of the tag, so
+/// the recursion terminates.
+pub fn body_served_iterator_tag(self_ty: &str) -> bool {
+    if hash_iterator_tag(self_ty) || collection_iterator_tag(self_ty) {
+        return true;
+    }
+    generic_args_of(self_ty)
+        .iter()
+        .any(|arg| body_served_iterator_tag(arg))
+}
+
 /// Whether this `IntoIterator::into_iter` `Self` tag names a
 /// hash collection (by value or by reference) or a reference
 /// to a hash-collection iterator (the `&mut I` blanket impl):
