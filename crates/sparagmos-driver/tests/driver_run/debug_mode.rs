@@ -1216,3 +1216,50 @@ fn debug_mode_lldb_command_formats_are_honored() {
         );
     }
 }
+
+const DEBUG_MULTILINE_CHAIN_SRC: &str = r#"struct Foo;
+impl Foo {
+    fn bar(self) -> Foo {
+        println!("bar");
+        self
+    }
+    fn baz(self) -> Foo {
+        println!("baz");
+        self
+    }
+}
+fn main() {
+    let f = Foo;
+    f.bar()
+        .baz();
+}
+"#;
+
+#[test]
+fn debug_mode_multiline_chain_up_shows_the_called_segment() {
+    // A method chain split across lines: a native debugger
+    // attributes each call in the chain to the line of its own
+    // segment, so `up` from inside `baz` shows the `.baz()`
+    // line in the caller, not the line the chain starts on --
+    // and `up` from inside `bar` shows the `f.bar()` line.
+    let dir = temp_dir("debug-multiline-chain");
+    let src = fixture(&dir, "multiline_chain.rs", DEBUG_MULTILINE_CHAIN_SRC);
+    let out = debug_driver(&dir, &src, "break 8\nrun\nup\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("15\t        .baz();"),
+        "`up` from baz did not show the `.baz()` line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("14\t    f.bar()"),
+        "`up` from baz showed the chain's first line: {stdout}"
+    );
+    let out = debug_driver(&dir, &src, "break 4\nrun\nup\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("14\t    f.bar()"),
+        "`up` from bar did not show the `f.bar()` line: {stdout}"
+    );
+}

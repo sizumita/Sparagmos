@@ -832,7 +832,7 @@ impl Converter {
                 .iter()
                 .map(|s| self.source_line(s.source_info.span, body.span))
                 .collect(),
-            terminator: self.source_line(bb.terminator.source_info.span, body.span),
+            terminator: self.terminator_line(body, bb),
         };
         let terminator = self.terminator_kind(body, &bb.terminator);
         let mut data = sm::BasicBlockData::new(sm::Terminator::new(terminator));
@@ -842,6 +842,37 @@ impl Converter {
         // `convert_body` (see `mark_cleanup_region`).
         data.is_cleanup = false;
         (data, lines)
+    }
+
+    /// The source line of one block's terminator. A call is
+    /// attributed -- by the compiler's own location resolution
+    /// and by native line tables alike -- to the span of its
+    /// function operand (the `fn_span` recorded for the call):
+    /// for a free function that is the call expression's own
+    /// start, and for a method call it is the method name,
+    /// while the terminator's own span covers the whole
+    /// receiver expression. A method chain split across lines
+    /// is therefore attributed to the line of the segment being
+    /// called (`.baz()`), not the chain's first line -- the
+    /// same span `caller_location_stamp` stamps `#[track_caller]`
+    /// locations from. An indirect call (a closure or function
+    /// pointer held in a local) has no callee span and keeps
+    /// the terminator's own span, as does a callee span the
+    /// compiler cannot place.
+    fn terminator_line(
+        &mut self,
+        body: &mir::Body,
+        bb: &mir::BasicBlock,
+    ) -> sm::SourceLine {
+        if let mir::TerminatorKind::Call { func, .. } = &bb.terminator.kind {
+            if let mir::Operand::Constant(c) = func {
+                let line = self.source_line(c.span, body.span);
+                if line.is_known() {
+                    return line;
+                }
+            }
+        }
+        self.source_line(bb.terminator.source_info.span, body.span)
     }
 
     /// Resolve one Stable MIR span to the (file, line) the debugger
