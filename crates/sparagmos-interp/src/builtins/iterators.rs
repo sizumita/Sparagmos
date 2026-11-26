@@ -3769,8 +3769,9 @@ impl<'a> Interpreter<'a> {
             // successor -- core's `Step::forward`, whose
             // overflow behaviour (the addition panic under
             // overflow checks, the wrap to the minimum
-            // without) the session's own setting decides, as
-            // the `#[rustc_inherit_overflow_checks]` on the
+            // without) the instantiating crate's setting
+            // decides, resolved from the call stack, as the
+            // `#[rustc_inherit_overflow_checks]` on the
             // step prescribes. The successor is computed
             // first, exactly as core's `next` computes it
             // before yielding, so stepping at the maximum
@@ -3789,7 +3790,7 @@ impl<'a> Interpreter<'a> {
                 )));
             }
             let start = fields[0].clone();
-            let next = range_step_forward(&start, elem, self.overflow_checks())?;
+            let next = range_step_forward(&start, elem, self.overflow_checks_at(frames))?;
             (vec![next], some_value(start))
         } else if self_ty.starts_with("std::range::RangeFromIter<") {
             // The new range API's by-value iterator: the
@@ -3801,10 +3802,10 @@ impl<'a> Interpreter<'a> {
             // its bound -- `Step::forward`, which panics
             // under overflow checks and wraps without -- and
             // clears the flag; then the step itself is the
-            // checked step when the session has overflow
-            // checks (the maximum is yielded once, with the
-            // flag set and the bound left in place) and the
-            // wrapping step when it does not.
+            // checked step when the stepping crate has
+            // overflow checks (the maximum is yielded once,
+            // with the flag set and the bound left in place)
+            // and the wrapping step when it does not.
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
                     "RangeFromIter state",
@@ -3829,10 +3830,11 @@ impl<'a> Interpreter<'a> {
                     ))
                 }
             };
+            let overflow_checks = self.overflow_checks_at(frames);
             if exhausted {
-                start = range_step_forward(&start, elem, self.overflow_checks())?;
+                start = range_step_forward(&start, elem, overflow_checks)?;
             }
-            if self.overflow_checks() {
+            if overflow_checks {
                 match range_step_forward_checked(&start, elem)? {
                     Some(next) => (
                         vec![next, Value::Bool(false)],
@@ -3844,7 +3846,7 @@ impl<'a> Interpreter<'a> {
                     ),
                 }
             } else {
-                let next = range_step_forward(&start, elem, false)?;
+                let next = range_step_forward(&start, elem, overflow_checks)?;
                 (vec![next, Value::Bool(false)], some_value(start))
             }
         } else if self_ty.starts_with("std::iter::Empty<") {
