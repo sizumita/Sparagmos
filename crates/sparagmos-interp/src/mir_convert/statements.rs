@@ -220,6 +220,25 @@ impl<'a> Converter<'a> {
     /// vtable at run time): an explicit error, never a silently
     /// different result.
     fn resolve_body_callee(&self, func: &mir::Operand) -> Option<String> {
+        // A direct call to one of the definitions the driver's
+        // reach walk collects a body for only when it is demanded
+        // *as a value* (`mem::drop`, `Deref::deref`; see
+        // `value_demand_needs_body` in the driver) is not bound
+        // to that body: the registry pre-empts collection for
+        // directly named calls to these definitions precisely
+        // because the builtin model is their faithful execution,
+        // and the collected body -- a concrete impl's projection
+        // over the real value layout -- disagrees with the model
+        // for the `Self` types the model owns (lock guards,
+        // `Rc`/`Arc`, modelled buffers), so binding the direct
+        // call to it corrupts every deref and drop the model
+        // would have served. The body stays in the program for
+        // the call through the value, which names the plain
+        // definition with no call site at which to bake a
+        // builtin and is the only shape that needs it.
+        if self.value_demand_builtin_preempts(func) {
+            return None;
+        }
         let Some(name) = self.resolve_callee(func) else {
             // The std allocation entry points have no collected
             // body (the builtin model pre-empts them), so they
@@ -455,6 +474,116 @@ impl<'a> Converter<'a> {
     /// applies only where the callee is already known to have no
     /// body at all (the external conversion below and the run
     /// time's name dispatch).
+    /// Whether this call names one of the builtin-owned
+    /// definitions the driver's reach walk collects a body for
+    /// only under a *value* demand (`mem::drop`, `Deref::deref`;
+    /// the kind list mirrors `value_demand_needs_body` in the
+    /// driver's reach walk -- keep the two in sync), in a shape
+    /// the collected body must not bind (see
+    /// `resolve_body_callee`). Checked exactly as the
+    /// external/builtin conversion checks the callee, so a call
+    /// is only ever diverted to a builtin that conversion would
+    /// really produce.
+    fn value_demand_builtin_preempts(&self, func: &mir::Operand) -> bool {
+        let Some((name, _, raw_generic_args)) =
+            self.resolve_external_callee(func)
+        else {
+            return false;
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        match crate::builtins::lookup_qualified(&canonical) {
+            // `mem::drop`'s body only runs the argument's drop
+            // glue, which the builtin serves from the drop plan
+            // for every `T`; a direct call is never bound to a
+            // collected body on the un-demanded path either.
+            Some(crate::builtins::Builtin::MemDrop) => true,
+            // A `deref` body is a concrete impl's projection
+            // over its `Self` layout. For a `Self` the value
+            // model owns -- a foreign type (see
+            // `fmt_foreign_self` for the split), or the one
+            // external type the `Deref` model serves by name,
+            // `smallvec::SmallVec` (see `smallvec_array_arg`) --
+            // the builtin pre-empts; a guest type's own `deref`
+            // body is written against the layout the model does
+            // reproduce, and stays the resolution, exactly as
+            // for `fmt`.
+            Some(crate::builtins::Builtin::Deref) => {
+                let Some(self_name) =
+                    self.deref_call_self(&name, &raw_generic_args)
+                else {
+                    return false;
+                };
+                let head =
+                    self_name.trim().trim_start_matches('&').trim_start();
+                head.starts_with("dyn ")
+                    || !crate::builtins::guest_fmt_tag(&self_name)
+                    || Self::smallvec_self(&self_name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a rendered `Self` type denotes the
+    /// `smallvec::SmallVec<[T; N]>` the `Deref` builtin models
+    /// by name (see `smallvec_array_arg` in the builtin
+    /// registry, whose key this mirrors): the bare path, or
+    /// the same path behind one naming-crate segment.
+    fn smallvec_self(self_name: &str) -> bool {
+        let rest = if let Some(r) = self_name.strip_prefix("smallvec::SmallVec<") {
+            r
+        } else {
+            let Some((_, tail)) = self_name.split_once("::") else {
+                return false;
+            };
+            let Some(r) = tail.strip_prefix("smallvec::SmallVec<") else {
+                return false;
+            };
+            r
+        };
+        rest.starts_with('[')
+    }
+
+    /// The `Self` type a `Deref::deref` call is monomorphized
+    /// at, in rendered form, mirroring the three callee name
+    /// shapes `fmt_call_self` handles: the trait item (whose
+    /// `Self` is the call's first generic argument), the
+    /// resolved impl instance (`<Self as Trait>::deref`), and
+    /// the module-qualified impl instance (`core::...::<impl
+    /// Deref for Type>::deref`).
+    fn deref_call_self(
+        &self,
+        name: &str,
+        raw_generic_args: &[mir::Ty],
+    ) -> Option<String> {
+        if name == "core::ops::Deref::deref"
+            || name == "std::ops::Deref::deref"
+        {
+            return raw_generic_args
+                .first()
+                .map(|t| self.concrete_ty_name(t));
+        }
+        if let Some(inner) = name
+            .strip_suffix(">::deref")
+            .and_then(|n| n.rsplit_once("::<impl ").map(|(_, i)| i))
+        {
+            let (trait_path, self_part) = inner.rsplit_once(" for ")?;
+            if trait_path == "core::ops::Deref"
+                || trait_path == "std::ops::Deref"
+            {
+                return Some(self_part.to_string());
+            }
+            return None;
+        }
+        let rest = name.strip_prefix('<')?;
+        let (self_part, trait_part) = rest.rsplit_once(" as ")?;
+        let trait_path = trait_part.strip_suffix(">::deref")?;
+        if trait_path == "core::ops::Deref" || trait_path == "std::ops::Deref"
+        {
+            return Some(self_part.to_string());
+        }
+        None
+    }
+
     fn external_builtin(&self, func: &mir::Operand) -> bool {
         self.resolve_external_callee(func).is_some_and(|(name, _, _)| {
             let canonical = crate::builtins::canonical_name(&name);

@@ -1418,8 +1418,21 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// allocation, `_print`, the panic formatting path — makes the
 /// interpreter prefer the real body over the model and breaks
 /// the representation agreement between them (the async-closure
-/// corpus tests are the regression that pins this). Extend the
-/// kind list only with a value-call regression test per kind.
+/// corpus tests are the regression that pins this). The bodies
+/// this exception collects are bound only to calls through the
+/// value: at conversion, a direct call is pre-empted back to
+/// the builtin model whenever the model owns the call's shape
+/// (for `mem::drop`, every direct call; for `Deref::deref`,
+/// the calls whose `Self` the model serves -- see
+/// `value_demand_builtin_preempts` in the converter), because
+/// a concrete impl body collected here -- a lock guard's or
+/// an `Rc`'s `deref`, say -- projects the real value layout
+/// the model does not reproduce, and binding direct calls to
+/// it breaks every modelled deref in the program (the
+/// dyn-dispatch, lock-guard and SmallVec corpus tests pin
+/// this). Extend the kind list only with a value-call
+/// regression test per kind, and extend the conversion
+/// pre-emption's list with it.
 fn value_demand_needs_body(canonical: &str, demand: Demand) -> bool {
     if demand != Demand::Value {
         return false;
