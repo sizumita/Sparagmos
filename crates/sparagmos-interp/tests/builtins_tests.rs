@@ -4688,6 +4688,9 @@ fn simd_eq_mask_drives_select() {
 
 const INTO_INTO: mir::DefId = mir::DefId::new(0, 440);
 const REFCELL_TY: mir::DefId = mir::DefId::new(0, 442);
+const STDIO_TY: mir::DefId = mir::DefId::new(0, 443);
+const FILE_TY: mir::DefId = mir::DefId::new(0, 444);
+const OWNED_FD_TY: mir::DefId = mir::DefId::new(0, 445);
 
 fn names_em() -> HashMap<mir::DefId, String> {
     let mut names = names_bi();
@@ -4696,6 +4699,9 @@ fn names_em() -> HashMap<mir::DefId, String> {
         (INTO_INTO, "std::convert::Into::into".to_string()),
         (CELL_TY, "std::cell::Cell".to_string()),
         (REFCELL_TY, "std::cell::RefCell".to_string()),
+        (STDIO_TY, "std::process::Stdio".to_string()),
+        (FILE_TY, "std::fs::File".to_string()),
+        (OWNED_FD_TY, "std::os::fd::OwnedFd".to_string()),
     ]);
     names
 }
@@ -4713,6 +4719,81 @@ fn cell_i32_ty() -> mir::Ty {
 
 fn refcell_i32_ty() -> mir::Ty {
     mir::Ty::Adt(REFCELL_TY, vec![i32_ty()])
+}
+
+fn stdio_ty() -> mir::Ty {
+    mir::Ty::Adt(STDIO_TY, vec![])
+}
+
+fn file_ty() -> mir::Ty {
+    mir::Ty::Adt(FILE_TY, vec![])
+}
+
+fn owned_fd_ty() -> mir::Ty {
+    mir::Ty::Adt(OWNED_FD_TY, vec![])
+}
+
+/// The handle chain the fs model builds for a file: the
+/// file-table id under four one-field wrappers (see
+/// `file_value` in the builtins).
+fn handle_chain(id: u128) -> Value {
+    let mut value = Value::Uint(id);
+    for _ in 0..4 {
+        value = Value::Enum {
+            variant: 0,
+            fields: vec![value],
+        };
+    }
+    value
+}
+
+/// A body that builds the handle chain for id 9 in local 1
+/// (through the nesting locals 2..=4) and converts it to
+/// `Stdio` with `From::from`, returning the `Stdio`.
+fn stdio_from_body(source: mir::Ty) -> mir::Body {
+    mir::Body::new(
+        decls(&[stdio_ty(), file_ty(), file_ty(), file_ty(), file_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(4),
+                        adt_aggregate(FILE_TY, 0, vec![], vec![const_int(9, 8)]),
+                    ),
+                    assign(
+                        place(3),
+                        adt_aggregate(FILE_TY, 0, vec![], vec![move_(4)]),
+                    ),
+                    assign(
+                        place(2),
+                        adt_aggregate(FILE_TY, 0, vec![], vec![move_(3)]),
+                    ),
+                    assign(
+                        place(1),
+                        adt_aggregate(FILE_TY, 0, vec![], vec![move_(2)]),
+                    ),
+                ],
+                call(
+                    fndef(FROM_FROM, vec![stdio_ty(), source]),
+                    vec![move_(1)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    )
+}
+
+fn stdio_fd_shape(id: u128) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 3,
+            fields: vec![handle_chain(id)],
+        }],
+    }
 }
 
 fn cell_shape(v: Value) -> Value {
@@ -4775,6 +4856,34 @@ fn from_from_cell_wraps_the_value() {
     );
     let value = interpret_mir(&program_em(body), "main", vec![]).expect("run");
     assert_eq!(value, cell_shape(Value::Uint(7)));
+}
+
+#[test]
+fn from_from_file_to_stdio_wraps_the_handle_in_the_fd_variant() {
+    // fn main() -> Stdio {
+    //   _1 = File(9);
+    //   _0 = From::from::<Stdio, File>(move _1);
+    //   return _0;
+    // }
+    let value = interpret_mir(&program_em(stdio_from_body(file_ty())), "main", vec![])
+        .expect("run");
+    assert_eq!(value, stdio_fd_shape(9));
+}
+
+#[test]
+fn from_from_owned_fd_to_stdio_wraps_the_handle_in_the_fd_variant() {
+    // fn main() -> Stdio {
+    //   _1 = OwnedFd(9);
+    //   _0 = From::from::<Stdio, OwnedFd>(move _1);
+    //   return _0;
+    // }
+    let value = interpret_mir(
+        &program_em(stdio_from_body(owned_fd_ty())),
+        "main",
+        vec![],
+    )
+    .expect("run");
+    assert_eq!(value, stdio_fd_shape(9));
 }
 
 #[test]
