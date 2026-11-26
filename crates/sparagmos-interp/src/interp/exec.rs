@@ -3202,7 +3202,7 @@ impl<'a> Interpreter<'a> {
                 // answer the declared length, and writes apply
                 // the `Vec::set_len` storage change to the
                 // vector itself.
-                if let Some(base_place) = vec_len_slot_base(body, place) {
+                if let Some(base_place) = vec_len_slot_base(self.program(), body, place) {
                     let target = self.resolve_place(frames, body, &base_place)?;
                     let value = match target {
                         Resolved::Place {

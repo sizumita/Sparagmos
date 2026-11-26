@@ -3172,7 +3172,7 @@ impl<'a> Interpreter<'a> {
         place: &Place,
         value: &Value,
     ) -> Option<InterpResult<()>> {
-        let base = vec_len_slot_base(body, place)?;
+        let base = vec_len_slot_base(self.program(), body, place)?;
         let new_len = match value {
             Value::Uint(n) => usize::try_from(*n).ok()?,
             Value::Int(n) if *n >= 0 => usize::try_from(*n).ok()?,
@@ -3182,7 +3182,7 @@ impl<'a> Interpreter<'a> {
             Ok(target) => target,
             Err(e) => return Some(Err(e)),
         };
-        let uninit_elem = vec_elem_tag(body, &base)
+        let uninit_elem = vec_elem_tag(self.program(), body, &base)
             .map(|tag| crate::builtins::uninit_elem_value_for_tag(&tag))
             .unwrap_or(Value::Uninit);
         Some(self.modify_resolved(frames, &target, |slot| {

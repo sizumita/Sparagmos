@@ -3293,12 +3293,27 @@ pub(crate) fn aggregate_buf_slot_write(
     }
 }
 
-pub(crate) fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
-    let (last, prefix) = place.projection.split_last()?;
-    if !matches!(last, ProjectionElem::Field(1)) {
-        return None;
-    }
-    let mut cur_ty = body.local_ty(place.local)?.clone();
+/// The declared type a projection prefix reaches from a
+/// local's declared type, tracked through reference, field
+/// and downcast steps with the program's field-type table.
+/// This is the tracking the length-slot shape judgments
+/// (`vec_len_slot_base`, `vec_elem_tag`) need when the vector
+/// sits behind a field of the place's root -- a struct's
+/// `Vec` field above all: an inlined `Vec::pop` inside a
+/// collected std body writes `(*self).data.len`, whose prefix
+/// crosses the owner's field step, and a walk that only
+/// follows references never reaches the vector. A step the
+/// table cannot type (a field whose recorded type mentions
+/// a generic parameter at its head, an index step) ends the
+/// tracking (`None`).
+fn prefix_result_ty(
+    program: &Program,
+    body: &Body,
+    local: Local,
+    prefix: &[ProjectionElem],
+) -> Option<Ty> {
+    let mut cur_ty = body.local_ty(local)?.clone();
+    let mut variant = 0usize;
     for elem in prefix {
         match elem {
             ProjectionElem::Deref => {
@@ -3307,9 +3322,29 @@ pub(crate) fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
                     _ => return None,
                 };
             }
+            ProjectionElem::Field(idx) => {
+                cur_ty = adt_field_ty_in(program, &cur_ty, variant, *idx)?;
+                variant = 0;
+            }
+            ProjectionElem::Downcast(v) => {
+                variant = *v as usize;
+            }
             _ => return None,
         }
     }
+    Some(cur_ty)
+}
+
+pub(crate) fn vec_len_slot_base(
+    program: &Program,
+    body: &Body,
+    place: &Place,
+) -> Option<Place> {
+    let (last, prefix) = place.projection.split_last()?;
+    if !matches!(last, ProjectionElem::Field(1)) {
+        return None;
+    }
+    let cur_ty = prefix_result_ty(program, body, place.local, prefix)?;
     if is_vec_adt_ty(&cur_ty) {
         let mut base = place.clone();
         base.projection = prefix.to_vec();
@@ -3322,21 +3357,14 @@ pub(crate) fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
 /// The rendered element type tag of the `Vec` a base place
 /// denotes: the first generic argument of the vector's ADT
 /// name, with the base's type tracked from the local through
-/// reference steps exactly as `vec_len_slot_base` tracks it.
+/// the prefix steps exactly as `vec_len_slot_base` tracks it.
 /// `None` when the type does not resolve to a `Vec` instance.
-pub(crate) fn vec_elem_tag(body: &Body, base: &Place) -> Option<String> {
-    let mut cur_ty = body.local_ty(base.local)?.clone();
-    for elem in &base.projection {
-        match elem {
-            ProjectionElem::Deref => {
-                cur_ty = match cur_ty {
-                    Ty::Ref(pointee) => (*pointee).clone(),
-                    _ => return None,
-                };
-            }
-            _ => return None,
-        }
-    }
+pub(crate) fn vec_elem_tag(
+    program: &Program,
+    body: &Body,
+    base: &Place,
+) -> Option<String> {
+    let cur_ty = prefix_result_ty(program, body, base.local, &base.projection)?;
     if !is_vec_adt_ty(&cur_ty) {
         return None;
     }

@@ -3537,3 +3537,46 @@ fn run_mode_array_into_iter_by_ref_rebuild_o3() {
         "2\n3\ntrue\n6\n4\n5\ntrue\n"
     );
 }
+
+const BINARY_HEAP_POP_SRC: &str = r#"
+use std::collections::BinaryHeap;
+fn main() {
+    let mut h = BinaryHeap::new();
+    h.push(3); h.push(1); h.push(4); h.push(1); h.push(5);
+    println!("{:?}", h.pop());
+    println!("{:?}", h.pop());
+    let mut sum = 0;
+    while let Some(x) = h.pop() { sum += x; }
+    println!("sum {}", sum);
+    println!("{:?}", h.pop());
+}
+"#;
+
+#[test]
+fn run_mode_binary_heap_pop() {
+    // `BinaryHeap::pop` in its collected std body inlines
+    // `Vec::pop`, whose length decrement writes the place
+    // `(*self).data.len`: the length slot of a `Vec` reached
+    // through the owner's field step. The write path's
+    // length-slot pre-pass recognised the slot only when the
+    // place's prefix crossed references alone, so the write
+    // fell through to place resolution, which answers the
+    // slot as a detached value, and the run stopped with
+    // "expected mutable place, found constant aggregate".
+    // The shape judgment now tracks the declared type across
+    // field steps as well. The outputs are native rustc
+    // 1.100.0's.
+    let dir = temp_dir("binary-heap-pop");
+    let src = fixture(&dir, "binary_heap_pop.rs", BINARY_HEAP_POP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "binary heap pop must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some(5)\nSome(4)\nsum 5\nNone\n"
+    );
+}
