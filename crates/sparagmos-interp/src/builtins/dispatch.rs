@@ -3900,6 +3900,35 @@ impl<'a> Interpreter<'a> {
                             value.kind_name(),
                         )),
                     }
+                } else if target == "std::string::String"
+                    && (source == "&str" || source == "&mut str")
+                {
+                    // `String: From<&str>` / `From<&mut str>`
+                    // copies the text into a fresh string; in
+                    // this value model the string value is the
+                    // text itself, resolved through the
+                    // reference (the borrowed text is not
+                    // consumed: the resolved `Str` is the copy).
+                    match self.resolve_value(frames, &value)? {
+                        s @ Value::Str(_) => Ok(s),
+                        _ => {
+                            // A `str` place over byte storage
+                            // (the `encode_utf8` window over a
+                            // byte array) does not resolve to
+                            // the text value; its bytes are the
+                            // text, read as a byte slice.
+                            let bytes =
+                                self.slice_bytes(frames, &value, "From::from to String")?;
+                            match String::from_utf8(bytes) {
+                                Ok(text) => Ok(Value::Str(text)),
+                                Err(_) => Err(InterpError::type_mismatch(
+                                    "From::from to String",
+                                    "valid UTF-8 text",
+                                    "invalid UTF-8 bytes",
+                                )),
+                            }
+                        }
+                    }
                 } else if matches!(value, Value::Int(_) | Value::Uint(_)) && is_integer_tag(target)
                 {
                     // The `From` impls between integer types are the
@@ -4202,6 +4231,32 @@ impl<'a> Interpreter<'a> {
                         self.record_box_ty(&boxed, ty);
                     }
                     Ok(boxed)
+                } else if (target.starts_with("std::pin::Pin<")
+                    || target.starts_with("core::pin::Pin<"))
+                    && (generic_first_arg(target, "std::pin::Pin<") == Some(source)
+                        || generic_first_arg(target, "core::pin::Pin<") == Some(source))
+                {
+                    // `Pin<P>: From<P>` (the `Box` impl and the
+                    // reference impls): the pin is the one-field
+                    // wrapper around the pointer value itself,
+                    // the shape `Pin::new` builds and the
+                    // `Deref` / `DerefMut` models unwrap.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
+                } else if (target.starts_with("std::ptr::NonNull<")
+                    || target.starts_with("core::ptr::NonNull<"))
+                    && source.starts_with('&')
+                {
+                    // `NonNull<T>: From<&T>` / `From<&mut T>`:
+                    // the one-field wrapper around the
+                    // reference's own pointer value; the
+                    // pointee is not read.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
                 } else if target.starts_with("std::cell::Cell<") {
                     // `From<T> for Cell<T>` is `Cell::new` by
                     // definition (core::cell), so the result is the
@@ -4297,6 +4352,37 @@ impl<'a> Interpreter<'a> {
                     // assembles that aggregate from the source's
                     // elements (see `vec_deque_from_value`).
                     Ok(self.vec_deque_from_value(frames, value)?)
+                } else if (target.starts_with("std::collections::BinaryHeap<")
+                    || target.starts_with("alloc::collections::BinaryHeap<"))
+                    && (source.starts_with("std::vec::Vec<")
+                        || source.starts_with("alloc::vec::Vec<"))
+                {
+                    // `BinaryHeap<T>: From<Vec<T>>`: std moves
+                    // the vector's buffer into the heap's
+                    // single `data` field and rebuilds the
+                    // heap order; the model builds that real
+                    // aggregate over a fresh element block
+                    // holding the elements in heap order (see
+                    // `binary_heap_from_vec`).
+                    self.binary_heap_from_vec(frames, value)
+                } else if [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .any(|prefix| generic_first_arg(target, prefix) == Some(source))
+                    && !source.is_empty()
+                {
+                    // `Rc<T>: From<T>` / `Arc<T>: From<T>` is
+                    // `Rc::new` / `Arc::new`: a fresh counted
+                    // handle over the value itself. Judged
+                    // before the counted-slice arm below: a
+                    // `Vec` source whose target pointee is the
+                    // vector itself is this conversion, not
+                    // the slice one.
+                    Ok(self.rc_new_handle(value))
                 } else if (target.starts_with("std::rc::Rc<")
                     || target.starts_with("std::sync::Arc<"))
                     && (source.starts_with("std::vec::Vec<")
@@ -4530,6 +4616,12 @@ impl<'a> Interpreter<'a> {
                             "From::from from {source} to {target} is not runtime-supported"
                         ))),
                     }
+                } else if let Some(wrapped) = self.guest_struct_from(target, value) {
+                    // A guest struct whose `From` is the
+                    // struct construction itself
+                    // (`#[derive(From)]` and the trivial
+                    // manual impls): see `guest_struct_from`.
+                    Ok(wrapped)
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"
@@ -9921,6 +10013,58 @@ impl<'a> Interpreter<'a> {
                 "IntoIterator::into_iter for {self_ty} is not runtime-supported"
             )))
         }
+    }
+
+    /// The `From` conversion a guest struct's own impl
+    /// performs when the impl is the struct construction
+    /// itself (`#[derive(From)]`, and manual impls of the
+    /// same shape): the converted value fills the struct's
+    /// one real field, and every remaining field is a
+    /// `PhantomData` marker, whose value is the empty
+    /// aggregate. (The recorded shape renders a generic
+    /// field's type with the parameter's own name, so the
+    /// field is identified structurally -- the single
+    /// non-marker field -- not by comparing type names.)
+    /// `None` for any other target: std/core/alloc targets
+    /// are the modelled conversions in the dispatch above,
+    /// enum and union targets have no such impl, and a
+    /// struct with a further real field could be doing
+    /// anything with the value.
+    fn guest_struct_from(&self, target: &str, value: Value) -> Option<Value> {
+        if target.starts_with("std::")
+            || target.starts_with("core::")
+            || target.starts_with("alloc::")
+        {
+            return None;
+        }
+        let shape = self.program().adt_debug_shapes.get(target)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let mut value = Some(value);
+        let mut fields = Vec::with_capacity(shape.variants[0].fields.len());
+        for field in &shape.variants[0].fields {
+            let ty = field.ty.trim();
+            if ty.starts_with("std::marker::PhantomData<")
+                || ty.starts_with("core::marker::PhantomData<")
+            {
+                fields.push(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                });
+            } else if value.is_some() {
+                fields.push(value.take().expect("checked above"));
+            } else {
+                return None;
+            }
+        }
+        if value.is_some() {
+            return None;
+        }
+        Some(Value::Enum {
+            variant: 0,
+            fields,
+        })
     }
 
     fn wrapped_byte_fill(&self, tag: &str, byte: u8, depth: u32) -> Option<Value> {
