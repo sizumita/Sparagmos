@@ -1819,19 +1819,41 @@ pub(crate) fn project_value_ev(
         };
         value = match step {
             RefProj::Field(idx) => match value {
-                Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
-                    InterpError::UninitializedRead {
-                        func: func.to_string(),
-                        place: place.to_string(),
-                    }
-                })?,
-                Value::Enum { ref fields, .. } => {
-                    fields.get(*idx).cloned().ok_or_else(|| {
-                        InterpError::UninitializedRead {
+                Value::Tuple(ref items) => match items.get(*idx) {
+                    Some(v) => v.clone(),
+                    // A field step on an aggregate holding no
+                    // fields at all: the aggregate is zero-sized
+                    // in form (a unit-like value, or a one-field
+                    // wrapper over a zero-sized value whose
+                    // storage the model holds as the bare wrapped
+                    // value -- the ManuallyDrop over a set's
+                    // marker value that a MaybeUninit slot of a
+                    // BTreeSet holds, read back by slice_remove's
+                    // assume_init_read), so field 0 -- the only
+                    // field such a wrapper has -- is the value
+                    // itself, exactly as the scalar and pointer
+                    // wrapper arms below yield it. A missing
+                    // field of an aggregate that does hold fields
+                    // keeps the uninitialized read.
+                    None if items.is_empty() && *idx == 0 => value.clone(),
+                    None => {
+                        return Err(InterpError::UninitializedRead {
                             func: func.to_string(),
                             place: place.to_string(),
-                        }
-                    })?
+                        })
+                    }
+                },
+                Value::Enum { ref fields, .. } => match fields.get(*idx) {
+                    Some(v) => v.clone(),
+                    // The empty-aggregate wrapper step above,
+                    // for an ADT-shaped value.
+                    None if fields.is_empty() && *idx == 0 => value.clone(),
+                    None => {
+                        return Err(InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        })
+                    }
                 }
                 Value::Coroutine {
                     ref fields,
@@ -3164,18 +3186,32 @@ pub(crate) fn project_value_ref_ev<'a>(
                     _ => 0,
                 };
                 cur = match cur {
-                    Value::Tuple(items) => items.get(*idx).ok_or_else(|| {
-                        InterpError::UninitializedRead {
-                            func: func.to_string(),
-                            place: place.to_string(),
+                    Value::Tuple(items) => match items.get(*idx) {
+                        Some(v) => v,
+                        // The empty-aggregate wrapper step of
+                        // project_value (see there): field 0 of
+                        // an aggregate holding no fields is the
+                        // value itself.
+                        None if items.is_empty() && *idx == 0 => cur,
+                        None => {
+                            return Err(InterpError::UninitializedRead {
+                                func: func.to_string(),
+                                place: place.to_string(),
+                            })
                         }
-                    })?,
-                    Value::Enum { fields, .. } => fields.get(*idx).ok_or_else(|| {
-                        InterpError::UninitializedRead {
-                            func: func.to_string(),
-                            place: place.to_string(),
+                    },
+                    Value::Enum { fields, .. } => match fields.get(*idx) {
+                        Some(v) => v,
+                        // The empty-aggregate wrapper step of
+                        // project_value (see there).
+                        None if fields.is_empty() && *idx == 0 => cur,
+                        None => {
+                            return Err(InterpError::UninitializedRead {
+                                func: func.to_string(),
+                                place: place.to_string(),
+                            })
                         }
-                    })?,
+                    },
                     // A sparse vector value, as in
                     // `project_value`: a field step addresses an
                     // element (the spare-capacity tail past the
