@@ -5,7 +5,7 @@
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     box_alloc_pointer,
-    Frame, Interpreter,
+    Frame, Interpreter, Resolved,
 };
 use crate::ir::Ty;
 use crate::value::{RefTarget, Value};
@@ -619,6 +619,85 @@ pub(super) fn vec_ensure_capacity(
         return;
     }
     vec_grow_storage(slot, target, uninit_elem);
+}
+
+impl<'a> Interpreter<'a> {
+    /// Append `items` to a vector value in its real aggregate
+    /// form (see `vec_real_aggregate_parts`): the elements are
+    /// written into the storage the buffer pointer denotes, at
+    /// the declared length, and the length field advances past
+    /// them — the append the element form performs on its own
+    /// fields, carried out on the form a converted body builds
+    /// field by field. The storage must already hold the new
+    /// elements (see `vec_ensure_capacity`, whose real-form
+    /// branch also materialises a storage-less buffer).
+    /// Returns `false`, leaving the value untouched, when it
+    /// is not in the real form.
+    pub(super) fn vec_append_real_form(
+        &self,
+        frames: &mut Vec<Frame>,
+        slot: &mut Value,
+        items: &[Value],
+        op: &str,
+    ) -> InterpResult<bool> {
+        let Some((_, len)) = vec_real_aggregate_parts(slot) else {
+            return Ok(false);
+        };
+        if !items.is_empty() {
+            let ptr = Self::real_vec_buffer_ptr(slot).ok_or_else(|| {
+                unsupported(format!(
+                    "{op} on a vector whose buffer pointer is not a reference value"
+                ))
+            })?;
+            let seq = self.deref_value(frames, &ptr)?;
+            for (offset, item) in items.iter().enumerate() {
+                self.write_seq_at(frames, &seq, len + offset, item.clone())?;
+            }
+        }
+        if let Value::Enum { fields, .. } = slot {
+            if let Some(len_slot) = fields.get_mut(1) {
+                *len_slot = Value::Uint((len + items.len()) as u128);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Append `items` to the vector the target denotes,
+    /// growing its storage first (see `vec_ensure_capacity`):
+    /// a vector in its real aggregate form takes the buffer
+    /// write path (see `vec_append_real_form`); every other
+    /// shape takes the in-place element append
+    /// (see `vec_append_in_place`).
+    pub(super) fn vec_append_resolved(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        items: &[Value],
+        op: &str,
+        uninit_elem: &Value,
+        elem_size: usize,
+    ) -> InterpResult<()> {
+        let current = self.read_resolved(frames, target)?;
+        if vec_real_aggregate_parts(&current).is_some() {
+            let mut value = current;
+            vec_ensure_capacity(
+                self,
+                &mut value,
+                items.len(),
+                false,
+                uninit_elem,
+                elem_size,
+            );
+            self.vec_append_real_form(frames, &mut value, items, op)?;
+            self.write_resolved(frames, target, value)?;
+            return Ok(());
+        }
+        self.modify_resolved(frames, target, |slot| {
+            vec_ensure_capacity(self, slot, items.len(), false, uninit_elem, elem_size);
+            vec_append_in_place(slot, items, op)
+        })?;
+        Ok(())
+    }
 }
 
 /// Append `items` to the vector value in `slot`, in place:
