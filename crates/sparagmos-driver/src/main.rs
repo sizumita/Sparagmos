@@ -538,7 +538,130 @@ fn exit_process(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// The prefix of the compile flow's scratch output directory
+/// names in the system temp directory; the suffix is the
+/// creating process's pid (`sparagmos-driver-out-{pid}`, see
+/// `PROCESS_SCRATCH`).
+const SCRATCH_OUT_DIR_PREFIX: &str = "sparagmos-driver-out-";
+
+/// How long a scratch output directory must go unmodified
+/// before the startup reaper (see `reap_stale_scratch`) may
+/// remove it. The creator's death is the primary signal; the
+/// age margin is the backstop for what the pid check cannot
+/// see: a killed driver's own children (a host rustc, a guest
+/// process) can briefly write into its out dir after it dies,
+/// and a recycled pid can make a stale directory look owned
+/// until the new owner exits. One hour is far beyond any
+/// single driver run's lifetime -- the subset runner kills a
+/// driver after a few minutes at most -- so a directory this
+/// old whose creator is gone has no live user left.
+const SCRATCH_REAP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Parse the creator pid out of a scratch output directory
+/// name (`sparagmos-driver-out-{pid}`). Only a plain positive
+/// `pid_t` is accepted: pid 0 and negative values are
+/// process-group addresses to `kill`, never a creator, and a
+/// suffix with trailing junk is not a name this driver
+/// produced.
+fn scratch_out_dir_pid(file_name: &std::ffi::OsStr) -> Option<u32> {
+    let name = file_name.to_str()?;
+    let suffix = name.strip_prefix(SCRATCH_OUT_DIR_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = suffix.parse().ok()?;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Whether a process with `pid` currently exists. Signal 0
+/// performs the existence check without delivering a signal;
+/// EPERM means the process exists but is owned by another
+/// user, which is still alive for the reaper's purpose. On
+/// platforms without signals the answer is conservatively
+/// "alive": the reaper then removes nothing there.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Whether the startup reaper may remove a scratch output
+/// directory: its creator is another process, that process is
+/// gone, and the directory has been unmodified for at least
+/// `SCRATCH_REAP_MIN_AGE` (see there).
+fn scratch_out_dir_reapable(
+    pid: u32,
+    own_pid: u32,
+    alive: bool,
+    age: std::time::Duration,
+) -> bool {
+    pid != own_pid && !alive && age >= SCRATCH_REAP_MIN_AGE
+}
+
+/// Remove scratch output directories whose creating driver
+/// process is gone. `remove_process_scratch` only runs on
+/// paths the process itself reaches: a driver the subset
+/// runner kills at its per-record timeout, or one that dies
+/// with its host, never gets there, and a measurement wave
+/// spawns thousands of drivers, so the orphans kept
+/// accumulating after #537 (tens of thousands of directories,
+/// ~100 GB, cleared by hand). Every driver start therefore
+/// sweeps the temp directory first: the runner starts a
+/// driver per record, so the sweep runs continuously during
+/// a measurement, and a local invocation reaps what an
+/// earlier killed run left behind. The
+/// `SPARAGMOS_DRIVER_KEEP_SCRATCH` opt-out disables the
+/// sweep as well: a session that keeps its own scratch for
+/// inspection does not have other sessions' scratch removed
+/// from under it either. Only `sparagmos-driver-out-{pid}`
+/// directories are candidates -- the materialised artifact
+/// source trees keep their deliberate exemption (see
+/// `PROCESS_SCRATCH`). Best-effort throughout: a directory a
+/// concurrent reaper already removed, or one that cannot be
+/// read, is not an error.
+fn reap_stale_scratch() {
+    if std::env::var_os("SPARAGMOS_DRIVER_KEEP_SCRATCH").is_some() {
+        return;
+    }
+    let temp_dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&temp_dir) else {
+        return;
+    };
+    let own_pid = std::process::id();
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Some(pid) = scratch_out_dir_pid(&entry.file_name()) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if scratch_out_dir_reapable(pid, own_pid, process_alive(pid), age) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 fn main() {
+    reap_stale_scratch();
     let worker = std::thread::Builder::new()
         .name("sparagmos-driver".to_string())
         .stack_size(DRIVER_STACK_SIZE)
@@ -833,7 +956,7 @@ fn driver_main_inner() {
     // Only the MIR is needed: emit metadata into a scratch directory so
     // running the driver never leaves build artifacts in the caller's
     // working directory.
-    let out_dir = std::env::temp_dir().join(format!("sparagmos-driver-out-{}", std::process::id()));
+    let out_dir = std::env::temp_dir().join(format!("{}{}", SCRATCH_OUT_DIR_PREFIX, std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
     register_process_scratch(&out_dir);
 
@@ -1264,5 +1387,50 @@ fn driver_main_inner() {
             // which the run contract reports as exit 2.
             exit_process(if exec_mode { 2 } else { 1 });
         }
+    }
+}
+
+#[cfg(test)]
+mod scratch_reap_tests {
+    use super::*;
+
+    fn pid_of(name: &str) -> Option<u32> {
+        scratch_out_dir_pid(std::ffi::OsStr::new(name))
+    }
+
+    #[test]
+    fn parses_creator_pid_from_out_dir_names() {
+        assert_eq!(pid_of("sparagmos-driver-out-1"), Some(1));
+        assert_eq!(pid_of("sparagmos-driver-out-4194304"), Some(4194304));
+        // Not names this driver produces: no pid, pid 0 (a
+        // process-group address), a sign, trailing junk, a pid
+        // that does not fit a `pid_t`, and the deliberately
+        // exempt artifact-source trees.
+        assert_eq!(pid_of("sparagmos-driver-out-"), None);
+        assert_eq!(pid_of("sparagmos-driver-out-0"), None);
+        assert_eq!(pid_of("sparagmos-driver-out--1"), None);
+        assert_eq!(pid_of("sparagmos-driver-out-12x"), None);
+        assert_eq!(pid_of("sparagmos-driver-out-99999999999"), None);
+        assert_eq!(pid_of("sparagmos-artifact-sources-123"), None);
+        assert_eq!(pid_of("sparagmos-driver-out"), None);
+    }
+
+    #[test]
+    fn reapable_only_when_dead_old_and_not_own() {
+        let old = SCRATCH_REAP_MIN_AGE;
+        let young = std::time::Duration::ZERO;
+        assert!(scratch_out_dir_reapable(4242, 1111, false, old));
+        assert!(!scratch_out_dir_reapable(4242, 1111, true, old));
+        assert!(!scratch_out_dir_reapable(4242, 1111, false, young));
+        assert!(!scratch_out_dir_reapable(1111, 1111, false, old));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_sees_self_and_not_a_pid_above_the_kernel_max() {
+        assert!(process_alive(std::process::id()));
+        // Linux caps pids at 2^22 and macOS below 100_000, so
+        // this pid cannot belong to any process.
+        assert!(!process_alive(999_999_999));
     }
 }
