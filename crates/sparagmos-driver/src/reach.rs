@@ -816,7 +816,28 @@ pub fn collect_reachable(
                             bodies_taken += 1;
                             RecordKind::SyntheticCtor { inst, body }
                         }
-                        None => no_body("no MIR body available"),
+                        // An extern-item-impl (EII) function
+                        // declaration has no body of its own;
+                        // the registered implementation's body,
+                        // instantiated with the declaration's
+                        // own arguments, is its body (see
+                        // `crate::convert::eii_impl_instance`).
+                        // It is recorded under the declaration's
+                        // instance, the key its call sites
+                        // resolve through, and walked like any
+                        // other collected body.
+                        None => match crate::convert::eii_impl_instance(&inst)
+                            .and_then(|impl_inst| {
+                                fetch_body_contained(&impl_inst).ok().flatten()
+                            }) {
+                            Some(body) => {
+                                bodies_taken += 1;
+                                frontier.push(distance + 1, demand, body.clone());
+                                walked_bodies.push(body.clone());
+                                RecordKind::WithBody { inst, body }
+                            }
+                            None => no_body("no MIR body available"),
+                        },
                     },
                 },
                 _ if bodies_taken >= cap => {

@@ -1,4 +1,7 @@
-use super::{Command, aux_spec, fixture, run_driver_with_aux, run_driver_with_aux_specs, temp_dir};
+use super::{
+    Command, aux_spec, fixture, run_driver, run_driver_with_aux, run_driver_with_aux_specs,
+    temp_dir,
+};
 
 
 // ----- auxiliary crates (--aux) ----------------------------------------------
@@ -176,6 +179,152 @@ fn run_mode_aux_crate_eii_decl_reads_impl_seed() {
         "the EII declaration must read its implementation's value; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n5\n");
+}
+
+
+const EII_FN_LOCAL_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+mod decl {
+    #[eii(eii1)]
+    pub fn decl1(x: u64) -> u64 { x + 1 }
+}
+
+fn main() {
+    println!("{}", decl::decl1(41));
+}
+"#;
+
+#[test]
+fn run_mode_eii_fn_local_default_executes() {
+    // An extern-item-impl (EII) function declaration in the
+    // crate itself, carrying a default body: the declaration
+    // item has no MIR body of its own (the default lives in a
+    // compiler-generated item), so the call stopped as a call
+    // to a function with no converted body. The registered
+    // implementation's body is the declaration's body (the
+    // tests/ui/eii/default/local_crate shape, Issue #513).
+    let dir = temp_dir("eii-fn-local");
+    let src = fixture(&dir, "eiifnlocal.rs", EII_FN_LOCAL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the EII default body must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+
+const EII_FN_AUX_DEFAULT_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+#[eii(eii1)]
+pub fn decl1(x: u64) -> u64 { x + 1 }
+"#;
+
+const EII_FN_AUX_DEFAULT_MAIN_SRC: &str = r#"
+extern crate decllib;
+
+fn main() {
+    println!("{}", decllib::decl1(41));
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_eii_fn_default_executes() {
+    // The declaration and its default body both live in an
+    // auxiliary crate; the main crate only calls the
+    // declaration (the tests/ui/eii/default/call_default
+    // shape, Issue #513).
+    let dir = temp_dir("eii-fn-aux-default");
+    let aux = fixture(&dir, "decllib.rs", EII_FN_AUX_DEFAULT_SRC);
+    let src = fixture(&dir, "eiifnauxmain.rs", EII_FN_AUX_DEFAULT_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("decllib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the aux EII default body must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+
+const EII_FN_AUX_DECL_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+#[eii(eii1)]
+pub fn decl1(x: u64) -> u64;
+"#;
+
+const EII_FN_AUX_IMPL_MAIN_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+extern crate decllib as codegen;
+
+#[codegen::eii1]
+fn eii1_impl(x: u64) -> u64 { x + 100 }
+
+fn main() {
+    println!("{}", codegen::decl1(41));
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_eii_fn_explicit_impl_executes() {
+    // The declaration lives in an auxiliary crate and the
+    // explicit implementation in the main crate: the
+    // compiler's registry of implementations is per crate, so
+    // the implementation is recorded only in the main crate's
+    // map (the tests/ui/eii/linking/codegen_cross_crate
+    // shape, Issue #513).
+    let dir = temp_dir("eii-fn-aux-impl");
+    let aux = fixture(&dir, "decllib.rs", EII_FN_AUX_DECL_SRC);
+    let src = fixture(&dir, "eiifnimplmain.rs", EII_FN_AUX_IMPL_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("decllib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the explicit EII implementation must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "141\n");
+}
+
+
+const EII_FN_AUX_OVERRIDE_MAIN_SRC: &str = r#"
+#![feature(extern_item_impls)]
+
+extern crate decllib as codegen;
+
+#[codegen::eii1]
+fn eii1_impl(x: u64) -> u64 { x + 100 }
+
+fn main() {
+    println!("{}", codegen::decl1(41));
+}
+"#;
+
+#[test]
+fn run_mode_aux_crate_eii_fn_explicit_impl_overrides_default() {
+    // The declaration carries a default body in the auxiliary
+    // crate and the main crate registers an explicit
+    // implementation: the explicit implementation overrides
+    // the default (the tests/ui/eii/default/call_impl shape,
+    // Issue #513).
+    let dir = temp_dir("eii-fn-aux-override");
+    let aux = fixture(&dir, "decllib.rs", EII_FN_AUX_DEFAULT_SRC);
+    let src = fixture(&dir, "eiifnoverridemain.rs", EII_FN_AUX_OVERRIDE_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("decllib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the explicit EII implementation must override the default; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "141\n");
 }
 
 

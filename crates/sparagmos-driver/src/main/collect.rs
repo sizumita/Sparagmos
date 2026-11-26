@@ -495,16 +495,51 @@ fn collect() -> ControlFlow<()> {
                     account_trivial_const(&mut report, name);
                     continue;
                 }
-                let mut reasons = BTreeMap::new();
-                reasons.insert("no MIR body available".to_string(), 1);
-                report.functions.push(FnReport {
-                    name,
-                    blocks: 0,
-                    locals: 0,
-                    arg_count: 0,
-                    outcome: FnOutcome::Skipped { reasons },
-                });
-                continue;
+                // An extern-item-impl (EII) function declaration
+                // has no body of its own; the registered
+                // implementation's body, instantiated with the
+                // declaration's own arguments, is its body (see
+                // `convert::eii_impl_instance`). Fetch that body
+                // and convert it under the declaration's name,
+                // the way the declaration itself would have been
+                // converted; a body the projection screen would
+                // reject is not fetched (the screen below judges
+                // the declaration's own types, and the demand
+                // passes judge the implementation separately).
+                let eii_body = sparagmos_driver::convert::eii_impl_instance(&instance)
+                    .and_then(|impl_inst| {
+                        match fetch_query_normalize_aware(
+                            &impl_inst.name(),
+                            sparagmos_driver::convert::generated_simd_impl_method(
+                                &impl_inst,
+                            ),
+                            || impl_inst.body(),
+                        ) {
+                            Ok(Some(body)) => Some(body),
+                            _ => None,
+                        }
+                    })
+                    .filter(|body| {
+                        sparagmos_driver::convert::unnormalizable_projection_in_body(
+                            body,
+                        )
+                        .is_none()
+                    });
+                match eii_body {
+                    Some(body) => body,
+                    None => {
+                        let mut reasons = BTreeMap::new();
+                        reasons.insert("no MIR body available".to_string(), 1);
+                        report.functions.push(FnReport {
+                            name,
+                            blocks: 0,
+                            locals: 0,
+                            arg_count: 0,
+                            outcome: FnOutcome::Skipped { reasons },
+                        });
+                        continue;
+                    }
+                }
             }
             Err(reason) => {
                 if reason

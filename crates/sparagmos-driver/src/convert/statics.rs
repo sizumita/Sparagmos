@@ -1,4 +1,4 @@
-//! Foreign (extern-block) statics and the extern-item-impl (EII) storage they resolve to.
+//! Foreign (extern-block) items and the extern-item-impl (EII) implementations they resolve to.
 
 use super::*;
 
@@ -112,6 +112,78 @@ pub(crate) fn eii_impl_static(
             .flat_map(|krate| krate.statics())
             .find(|candidate| candidate.def_id() == impl_id)
     })
+}
+
+/// The instance that provides the body of the extern-item-impl
+/// (EII) declaration `inst` names, when it names one. An EII
+/// function declaration (`#[eii(name)] pub fn f(..);`, or one
+/// carrying a default body) is a foreign item: it has no MIR
+/// body of its own, so a call to it stops as a call to a
+/// function with no converted body. The body lives in the one
+/// implementation registered for the declaration in this
+/// compilation - an explicit `#[name] fn g(..) { .. }` or the
+/// declaration's own default, which the compiler registers as
+/// an implementation too - and that implementation is an
+/// ordinary function whose body, instantiated with the
+/// declaration's own generic arguments (an implementation
+/// carries the declaration's signature), IS the declaration's
+/// body. The compiler's `externally_implementable_items`
+/// registry names them; an explicit implementation overrides
+/// the default (see the selection in the body). `None` when
+/// the item is not an EII declaration, when no implementation
+/// is registered, or when the registrations do not resolve
+/// to one implementation.
+pub fn eii_impl_instance(
+    inst: &rustc_public::mir::mono::Instance,
+) -> Option<rustc_public::mir::mono::Instance> {
+    let impl_def = screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal =
+            rustc_public::rustc_internal::internal(tcx, inst.def.def_id());
+        // The registry is per crate, exactly as for statics
+        // (see `eii_impl_static`): a crate's map names the
+        // implementations recorded for that crate, so an
+        // implementation defined in a different crate than
+        // the declaration appears only in its own crate's
+        // map. Merge every crate's map, the way the
+        // compiler's own EII check does.
+        let mut explicit: Vec<rustc_span::def_id::DefId> = Vec::new();
+        let mut defaults: Vec<rustc_span::def_id::DefId> = Vec::new();
+        for cnum in tcx
+            .crates(())
+            .iter()
+            .chain(std::iter::once(&rustc_span::def_id::LOCAL_CRATE))
+        {
+            let map = tcx.externally_implementable_items(*cnum);
+            if let Some((_, impls)) = map.get(&internal) {
+                for (id, imp) in impls {
+                    let list = if imp.is_default {
+                        &mut defaults
+                    } else {
+                        &mut explicit
+                    };
+                    if !list.contains(id) {
+                        list.push(*id);
+                    }
+                }
+            }
+        }
+        // An explicit implementation overrides the default.
+        // More than one explicit implementation is a
+        // duplication the compiler itself reports, and a
+        // declaration carries at most one default, so
+        // anything but exactly one chosen registration
+        // leaves the declaration unimplemented here.
+        let chosen = if explicit.len() == 1 {
+            explicit[0]
+        } else if explicit.is_empty() && defaults.len() == 1 {
+            defaults[0]
+        } else {
+            return None;
+        };
+        Some(rustc_public::rustc_internal::stable(chosen))
+    })?;
+    resolve_instance_guarded(rustc_public::ty::FnDef(impl_def), &inst.args())
 }
 
 impl Converter {
