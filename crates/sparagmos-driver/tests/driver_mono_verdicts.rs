@@ -922,3 +922,125 @@ fn common_linkage_zero_initializer_converts() {
     let (code, _stdout, stderr) = case.convert(&src, &[], true);
     assert_eq!(code, 0, "stderr={stderr}");
 }
+
+
+#[test]
+fn adapter_tower_instantiation_recursion_is_a_recursion_limit_failure() {
+    // The packet-decoder recursion of
+    // tests/ui/codegen/normalization-overflow/
+    // recursion-issue-122823.rs (and -92004.rs, the same
+    // program): each `operator_packet` instantiation calls
+    // `decode_packets` on an iterator wrapped in one more
+    // `Peekable<Take<...>>` layer, so instantiation nests
+    // without bound and rustc reports the recursion limit.
+    // The driver must report that same failure (exit 1) --
+    // and reach it promptly: the verdict is final the
+    // moment the collector's depth cap trips, so conversion
+    // must not keep materializing the tower's bodies, and
+    // screening each demanded instance must not re-walk
+    // the tower suffix once per path that reaches it.
+    let case = Case::new("adapter-tower");
+    let src = case.write(
+        "case.rs",
+        "use std::vec::Vec;\n\
+         use std::iter::Peekable;\n\
+         \n\
+         pub fn main() {\n\
+             let packet = decode(vec![1,0,1,0]);\n\
+         }\n\
+         \n\
+         pub fn decode(bitstream: Vec<u64>) -> Packet {\n\
+             let mut bitstream_itr = bitstream.into_iter().peekable();\n\
+             return match decode_packet(&mut bitstream_itr) {\n\
+                 Some(p) => p,\n\
+                 None    => panic!(\"expected outer packet\"),\n\
+             }\n\
+         }\n\
+         \n\
+         pub fn decode_packets<I: Iterator<Item = u64>>(itr: &mut Peekable<I>) -> Vec<Packet> {\n\
+             let mut res = Vec::new();\n\
+             loop {\n\
+                 match decode_packet(itr) {\n\
+                     Some(p) => { res.push(p); },\n\
+                     None    => break\n\
+                 }\n\
+             }\n\
+         \n\
+             return res;\n\
+         }\n\
+         \n\
+         pub fn decode_packet<I: Iterator<Item = u64>>(itr: &mut Peekable<I>) -> Option<Packet> {\n\
+             let version = extend_number(0, itr, 3)?;\n\
+             let type_id = extend_number(0, itr, 3)?;\n\
+             return operator_packet(version, type_id, itr);\n\
+         }\n\
+         \n\
+         pub fn operator_packet<I: Iterator<Item = u64>>(version: u64, type_id: u64, itr: &mut Peekable<I>) -> Option<Packet> {\n\
+             let p = OperatorPacket {\n\
+                 version: version,\n\
+                 type_id: type_id,\n\
+                 packets: decode_packets(&mut itr.take(0).peekable()),\n\
+             };\n\
+         \n\
+             return Some(Packet::Operator(p));\n\
+         }\n\
+         \n\
+         pub fn extend_number<I: Iterator<Item = u64>>(num: u64, itr: &mut Peekable<I>, take: u64) -> Option<u64> {\n\
+             let mut value = num;\n\
+             for _ in 0..take {\n\
+                 value *= 2;\n\
+                 value += itr.next()?;\n\
+             }\n\
+         \n\
+             return Some(value);\n\
+         }\n\
+         \n\
+         #[derive(Debug)]\n\
+         pub enum Packet {\n\
+             Operator(OperatorPacket),\n\
+         }\n\
+         \n\
+         #[derive(Debug)]\n\
+         pub struct OperatorPacket {\n\
+             version: u64,\n\
+             type_id: u64,\n\
+             packets: Vec<Packet>\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("reached the recursion limit while instantiating"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn finite_adapter_tower_converts() {
+    // The finite form of the same shape: a bounded stack
+    // of `Take`/`Peekable` adapters, demanded and converted
+    // in full. The projection screen's memoized walks and
+    // the resolution scan's per-ADT buckets must not turn
+    // a bounded tower into a rejection.
+    let case = Case::new("finite-tower");
+    let src = case.write(
+        "case.rs",
+        "pub fn total<I: Iterator<Item = u32>>(itr: &mut std::iter::Peekable<I>) -> u32 {\n\
+             let mut sum = 0;\n\
+             while let Some(x) = itr.next() {\n\
+                 sum += x;\n\
+                 let _ = itr.peek();\n\
+             }\n\
+             sum\n\
+         }\n\
+         \n\
+         pub fn main() {\n\
+             let v: Vec<u32> = vec![1, 2, 3, 4, 5];\n\
+             let mut itr = v.iter().copied().take(4).peekable().take(3).peekable();\n\
+             let n = total(&mut itr);\n\
+             println!(\"{n}\");\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
