@@ -2193,6 +2193,163 @@ impl<'a> Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
+    /// The base denomination for a fat reference formed by
+    /// `ptr::from_raw_parts` over a data pointer. A data pointer
+    /// denoting one element of a sequence (its target's
+    /// projection ends in an `Index` step) forms a slice over
+    /// that sequence's elements from that position on, so the
+    /// base is denominated as the sequence window it is: the
+    /// trailing element step becomes a `Subslice` step over the
+    /// sequence the head steps denote -- the denomination range
+    /// indexing gives a window (see `windowed_base`). Without
+    /// it the formed base is value-identical to the base a
+    /// deref / unsizing formation produces for a slice over the
+    /// pointed element's own elements, and the two readings
+    /// collide exactly when the element is itself a sequence of
+    /// the fat length (a `chunks_exact` chunk over a
+    /// `Vec<Vec<T>>` whose first inner vector is as long as the
+    /// chunk): the formation provenance is the only thing that
+    /// tells them apart, so it is recorded here, at formation,
+    /// not guessed at the readers.
+    ///
+    /// The window is recorded only when it stays inside the
+    /// head sequence's length: a formation ranging past it is
+    /// not a window over that sequence in its own element units
+    /// (a byte-length reinterpretation over a wider element
+    /// type is the canonical case), and it keeps the raw-parts
+    /// denomination the readers already serve.
+    ///
+    /// It is recorded only where the collision is real: the
+    /// element at the window's start is itself a sequence of
+    /// exactly the fat length. A formation whose start element
+    /// is a scalar, or a sequence of a different length, is
+    /// already denominated unambiguously by the element step
+    /// (a reader tells the two readings apart by length), and
+    /// rewriting its base would disturb the readers that key
+    /// on the element-step shape -- the ordinary `split_at`
+    /// halves over a scalar sequence, the line pieces of a
+    /// `str`, and a sort's slices over its buffer and scratch
+    /// storage all form through here.
+    pub(crate) fn raw_parts_base(
+        &self,
+        frames: &[Frame],
+        base: Value,
+        len: u128,
+    ) -> Value {
+        let Ok(window_len) = usize::try_from(len) else {
+            return base;
+        };
+        let windowed = |projection: &[RefProj]| -> Option<Vec<RefProj>> {
+            let (RefProj::Index(start), head) = projection.split_last()? else {
+                return None;
+            };
+            let mut projection = head.to_vec();
+            projection.push(RefProj::Subslice {
+                offset: *start,
+                len: window_len,
+            });
+            Some(projection)
+        };
+        // The candidate base with the window step recorded, and
+        // the head target the window ranges over (the same
+        // target with the trailing element step dropped).
+        let (candidate, head): (Value, Value) = match &base {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            }) => match (windowed(projection), projection.split_last()) {
+                (Some(windowed), Some((_, head))) => (
+                    Value::Ref(RefTarget::place(*frame, *local, windowed)),
+                    Value::Ref(RefTarget::place(*frame, *local, head.to_vec())),
+                ),
+                _ => return base,
+            },
+            Value::Ref(RefTarget::Static {
+                name,
+                projection,
+            }) => match (windowed(projection), projection.split_last()) {
+                (Some(windowed), Some((_, head))) => (
+                    Value::Ref(RefTarget::Static {
+                        name: name.clone(),
+                        projection: windowed,
+                    }),
+                    Value::Ref(RefTarget::Static {
+                        name: name.clone(),
+                        projection: head.to_vec(),
+                    }),
+                ),
+                _ => return base,
+            },
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                match (windowed(projection), projection.split_last()) {
+                    (Some(windowed), Some((_, head))) => (
+                        Value::Ref(RefTarget::Alloc {
+                            id: *id,
+                            projection: windowed,
+                        }),
+                        Value::Ref(RefTarget::Alloc {
+                            id: *id,
+                            projection: head.to_vec(),
+                        }),
+                    ),
+                    _ => return base,
+                }
+            }
+            Value::Ref(RefTarget::Value(value, projection)) => {
+                match (windowed(projection), projection.split_last()) {
+                    (Some(windowed), Some((_, head))) => (
+                        Value::Ref(RefTarget::Value(value.clone(), windowed)),
+                        Value::Ref(RefTarget::Value(value.clone(), head.to_vec())),
+                    ),
+                    _ => return base,
+                }
+            }
+            _ => return base,
+        };
+        let start = match &candidate {
+            Value::Ref(RefTarget::Place { projection, .. })
+            | Value::Ref(RefTarget::Static { projection, .. })
+            | Value::Ref(RefTarget::Alloc { projection, .. })
+            | Value::Ref(RefTarget::Value(_, projection)) => match projection.last() {
+                Some(RefProj::Subslice { offset, .. }) => *offset,
+                _ => return base,
+            },
+            _ => return base,
+        };
+        let head_value = self
+            .deref_value(frames, &head)
+            .and_then(|target| self.read_resolved(frames, &target))
+            .ok();
+        let head_len = head_value.as_ref().and_then(|value| value.len());
+        let collides = head_value
+            .as_ref()
+            .and_then(|value| {
+                project_value(
+                    value.clone(),
+                    &[RefProj::Index(start)],
+                    "raw parts base",
+                    "raw parts base",
+                )
+                .ok()
+            })
+            .is_some_and(|element| {
+                matches!(
+                    element,
+                    Value::Tuple(_)
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                        | Value::Enum { .. }
+                        | Value::SparseVec { .. }
+                        | Value::FatRef { .. }
+                ) && element.len() == Some(len)
+            });
+        match head_len {
+            Some(head_len) if start as u128 + len <= head_len && collides => candidate,
+            _ => base,
+        }
+    }
+
     pub(crate) fn eval_rvalue(
         &self,
         frames: &mut Vec<Frame>,
@@ -2245,7 +2402,7 @@ impl<'a> Interpreter<'a> {
                             }
                         };
                         Ok(Value::FatRef {
-                            base: Box::new(base),
+                            base: Box::new(self.raw_parts_base(frames, base, len)),
                             len,
                         })
                     }

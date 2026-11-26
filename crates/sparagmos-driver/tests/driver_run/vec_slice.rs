@@ -5726,6 +5726,21 @@ fn main() {
 }
 "#;
 
+const CHUNKS_EXACT_NESTED_VEC_SRC: &str = r#"
+fn main() {
+    let v: Vec<Vec<usize>> = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9], vec![10]];
+    let mut it = v.chunks_exact(3);
+    let c = it.next().unwrap();
+    println!("c {} {} {} {}", c[0][0], c[1][0], c[2][0], it.remainder().len());
+    let mut rit = v.rchunks_exact(3);
+    let rc = rit.next().unwrap();
+    println!("r {} {} {}", rc[0][0], rc[1][0], rc[2][0]);
+    let mut sum = 0;
+    for c in v.chunks_exact(2) { sum += c[0][0] + c[1][0]; }
+    println!("sum {sum}");
+}
+"#;
+
 #[test]
 fn run_mode_vec_resize_opt_level_3() {
     let dir = temp_dir("vec-resize-opt");
@@ -5738,4 +5753,61 @@ fn run_mode_vec_resize_opt_level_3() {
         "vec resize at opt-level 3 must run; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "vec-resize-opt-ok\n");
+}
+
+#[test]
+fn run_mode_chunks_exact_over_vec_of_vecs_index_reads() {
+    // The `Exact` chunk variants' state is built by core's
+    // converted body: the stored whole-chunk slice is a
+    // `from_raw_parts` fat reference over the container's
+    // element pointer, a base value-identical to the one a
+    // deref formation produces for a slice over the first
+    // element's own elements. The step read the stored slice
+    // by the element reading, so a chunk whose length equals
+    // the first inner vector's length (3 and 3 here) yielded
+    // the inner vector's elements as the chunk's elements and
+    // `c[0][0]` died in slice elements. The raw-parts
+    // formation now denominates its base as the container
+    // window it ranges over (see `raw_parts_base`), and the
+    // chunk step's snapshots are denominated by their element
+    // tuple. The outputs below are native rustc 1.100.0's.
+    run_ok(
+        "chunks-exact-nested-vec",
+        CHUNKS_EXACT_NESTED_VEC_SRC,
+        "c 1 4 6 1\nr 4 6 10\nsum 21\n",
+    );
+}
+
+const RAW_PARTS_NESTED_VEC_SRC: &str = r#"
+fn main() {
+    let v: Vec<Vec<usize>> = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9], vec![10]];
+    let s: &[Vec<usize>] = &v;
+    let (a, b) = s.split_at(3);
+    println!("split {} {} {}", a[0][0], a[1][0], b[0][0]);
+    let u = unsafe { std::slice::from_raw_parts(s.as_ptr().add(1), 2) };
+    println!("raw {} {}", u[0][0], u[1][0]);
+    let w = &u[1..];
+    println!("win {}", w[0][0]);
+    let mut mv = vec![vec![1], vec![2], vec![3]];
+    let sm: &mut [Vec<usize>] = &mut mv;
+    let (ma, _mb) = sm.split_at_mut(2);
+    ma[0].push(99);
+    println!("mut {}", mv[0][1]);
+}
+"#;
+
+#[test]
+fn run_mode_split_at_and_raw_parts_over_vec_of_vecs() {
+    // The same formation denomination through the direct
+    // shapes: `split_at` (core's body forms both halves with
+    // `from_raw_parts` over the receiver's element pointer),
+    // an offset `from_raw_parts`, a range window over the
+    // formed slice, and a mutable split whose writes must
+    // alias the container through the window denomination.
+    // The outputs below are native rustc 1.100.0's.
+    run_ok(
+        "raw-parts-nested-vec",
+        RAW_PARTS_NESTED_VEC_SRC,
+        "split 1 4 10\nraw 4 6\nwin 6\nmut 99\n",
+    );
 }
