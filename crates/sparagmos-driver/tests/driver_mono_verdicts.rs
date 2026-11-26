@@ -730,6 +730,31 @@ fn codegen_only_prefetch_intrinsic_converts() {
 }
 
 #[test]
+fn comptime_intrinsic_converts() {
+    // `offset_of` must be overridden too, but it is a
+    // `#[rustc_comptime]` intrinsic: the compiler rejects
+    // its calls outside constant contexts, so the calls
+    // the `offset_of!` desugar places in inline const
+    // blocks and promoted constants are evaluated as
+    // constants and never reach code generation — there
+    // is no backend shim to miss. (The verdict originally
+    // reported them, rejecting the valid programs of
+    // tests/ui/offset-of/*.)
+    let case = Case::new("offset-of-comptime");
+    let src = case.write(
+        "case.rs",
+        "struct S { v: u8, w: u16 }\n\
+         fn return_static_slice() -> &'static [usize] {\n\
+         &[core::mem::offset_of!(S, v), core::mem::offset_of!(S, w)] }\n\
+         fn use_reference() -> usize {\n\
+         let r = &core::mem::offset_of!(S, v); *r * 6 }\n\
+         fn main() { let _ = return_static_slice(); let _ = use_reference(); }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
 fn fallback_body_intrinsic_converts() {
     // `rotate_left` is declared in core with a fallback body,
     // so it need not be overridden: the method's body calls
