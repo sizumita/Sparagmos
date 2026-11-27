@@ -451,7 +451,26 @@ pub(crate) fn fetch_instance_body(
     // the verdict rustc's collector reports for the same
     // overflow, instead of recording it as this definition's
     // demand failure.
-    fetch_query_normalize_aware(&inst.name(), false, || inst.body())
+    let fetched = fetch_query_normalize_aware(&inst.name(), false, || inst.body());
+    // A body whose fetch died on the tail-call terminator (the
+    // one Stable MIR conversion gap this reason names) is
+    // retried through the internal materialization that
+    // rewrites the tail call as a call and a return (see
+    // `convert::tail_call_erased_body`): the rewritten body is
+    // the instance's body, converted by the same bridge
+    // conversion the fetch would have applied. A retry that
+    // cannot produce a body leaves the named reason standing.
+    if let Err(reason) = &fetched {
+        if reason == TAIL_CALL_REASON {
+            if let Some(body) = sparagmos_driver::convert::with_body_materialization(
+                &inst.name(),
+                || sparagmos_driver::convert::tail_call_erased_body(inst),
+            ) {
+                return Ok(Some(body));
+            }
+        }
+    }
+    fetched
 }
 
 /// Whether a conversion error is one of the contained Stable

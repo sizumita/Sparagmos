@@ -1,11 +1,15 @@
 use super::{Command, fixture, run_driver, run_driver_with_aux, run_ok, summarize_driver, temp_dir};
 
 
-const INTRINSIC_NAMED_TAIL_CALL_SRC: &str = r#"
+const INTRINSIC_NAMED_UNCONVERTED_SRC: &str = r#"
+#![feature(unsafe_binders)]
 #![allow(incomplete_features)]
-#![feature(explicit_tail_calls)]
+use std::unsafe_binder::wrap_binder;
 fn atomic_fence() {
-    become atomic_fence()
+    unsafe {
+        let x = 1;
+        let _binder: unsafe<'a> i32 = wrap_binder!(x);
+    }
 }
 fn main() {
     atomic_fence();
@@ -17,15 +21,19 @@ fn main() {
 fn run_mode_unconverted_body_named_like_an_intrinsic_exits_two() {
     // An ordinary function that merely shares a compiler
     // intrinsic's name (`atomic_fence`) and whose body failed
-    // conversion (here: skipped for its tail call, exactly as in
-    // `run_mode_tail_call_body_is_skipped_and_call_exits_two`)
-    // must keep its recorded conversion failure. The intrinsic
-    // fallback serves body-less intrinsic declarations, never a
-    // body that exists; when `external_builtin` consulted it,
-    // this call was diverted to `Builtin::AtomicFence` and the
-    // run silently completed (exit 0, "main done" printed).
+    // conversion (here: skipped for its `wrap_binder!` body,
+    // whose WrapUnsafeBinder conversion Stable MIR leaves
+    // unimplemented) must keep its recorded conversion failure.
+    // The intrinsic fallback serves body-less intrinsic
+    // declarations, never a body that exists; when
+    // `external_builtin` consulted it, this call was diverted to
+    // `Builtin::AtomicFence` and the run silently completed
+    // (exit 0, "main done" printed). (The unconverted-body
+    // vehicle used to be a tail call; those bodies convert since
+    // the internal MIR materialization — see
+    // `run_mode_tail_call_body_is_converted_and_call_executes`.)
     let dir = temp_dir("intrinsicname");
-    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_TAIL_CALL_SRC);
+    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_UNCONVERTED_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);

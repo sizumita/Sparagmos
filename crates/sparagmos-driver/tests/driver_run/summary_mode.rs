@@ -2,11 +2,13 @@ use super::{ANON_CONST_GENERIC_SRC, CLOSURE_GENERIC_CONTEXT_SRC, CTOR_VALUE_SRC,
 
 
 #[test]
-fn summary_mode_tail_call_body_is_skipped_with_named_reason() {
-    // In summary (convert) mode the same containment reports the
-    // tail-call body as skipped with its named reason, and the
-    // rest of the crate still converts: no conversion panic is
-    // reported anywhere.
+fn summary_mode_tail_call_body_is_converted() {
+    // In summary (convert) mode the tail-call body is reported
+    // converted: the Stable MIR fetch panic is contained at the
+    // compiler boundary and the body is materialized through the
+    // compiler's internal MIR with the tail call rewritten as a
+    // call plus a return (Issue #384), so the target crate is
+    // complete and no conversion panic is reported anywhere.
     let dir = temp_dir("tailcall-summary");
     let src = fixture(&dir, "tailcall.rs", TAIL_CALL_SRC);
     let out = summarize_driver(&src);
@@ -15,15 +17,23 @@ fn summary_mode_tail_call_body_is_skipped_with_named_reason() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "summary mode succeeds with a named skip; stderr={stderr}"
+        "summary mode succeeds with the body converted; stderr={stderr}"
     );
     let line = stdout
         .lines()
         .find(|l| l.contains("countdown"))
         .unwrap_or_else(|| panic!("summary lists countdown: {stdout}"));
     assert!(
-        line.contains("body contains a tail call"),
-        "the skip reason names the tail call: {line}"
+        line.contains("[converted]"),
+        "the tail-call body is converted: {line}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 2, skipped: 0"),
+        "the target crate is complete: {stdout}"
+    );
+    assert!(
+        !stdout.contains("body contains a tail call"),
+        "no body still skips on a tail call: {stdout}"
     );
     assert!(
         !stdout.contains("panicked") && !stderr.contains("panicked"),
@@ -517,32 +527,42 @@ fn summary_mode_generic_const_definition_is_not_demanded() {
     );
 }
 
-const TAIL_CALL_GENERIC_SRC: &str = r#"
+const WRAP_BINDER_GENERIC_SRC: &str = r#"
+#![feature(unsafe_binders)]
 #![allow(incomplete_features)]
-#![feature(explicit_tail_calls)]
-fn countdown<T: Copy>(n: u32, m: T) -> u32 {
-    if n == 0 { 0 } else { become countdown(n - 1, m) }
+use std::unsafe_binder::wrap_binder;
+fn wrap<T: Copy>(x: T) -> T {
+    unsafe {
+        let _binder: unsafe<'a> T = wrap_binder!(x);
+    }
+    x
 }
-fn main() { let _ = countdown::<u32>(3, 0); }
+fn main() { let _ = wrap::<i32>(1); }
 "#;
 
 #[test]
 fn summary_mode_demanded_generic_with_unconvertible_body_stays_skipped() {
     // Demand does not excuse a body that cannot be converted: the
     // generic definition is demanded concretely from `main`, its
-    // instance fails conversion with the named tail-call reason,
-    // and the definition stays skipped — the target crate stays
-    // incomplete for that named reason alone.
-    let dir = temp_dir("generic-tailcall");
-    let src = fixture(&dir, "generic_tailcall.rs", TAIL_CALL_GENERIC_SRC);
+    // instance fails conversion with the named unsafe-binder
+    // reason (a body that wraps a value with `wrap_binder!` needs
+    // the WrapUnsafeBinder conversion Stable MIR leaves
+    // unimplemented — the remaining half of Issue #384), and the
+    // definition stays skipped — the target crate stays
+    // incomplete for that named reason alone. (The vehicle used
+    // to be a tail-call body; those convert since the internal
+    // MIR materialization, so the wrap body carries the contract
+    // now.)
+    let dir = temp_dir("generic-binder");
+    let src = fixture(&dir, "generic_binder.rs", WRAP_BINDER_GENERIC_SRC);
     let out = summarize_driver(&src);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("fn generic_tailcall::countdown:"))
+        .find(|l| l.starts_with("fn generic_binder::wrap:"))
         .expect("summary lists the generic definition");
     assert!(
-        line.contains("SKIPPED") && line.contains("tail call"),
+        line.contains("SKIPPED") && line.contains("unsafe binder"),
         "the demanded-but-unconvertible definition stays skipped with its reason: {line}"
     );
     assert!(

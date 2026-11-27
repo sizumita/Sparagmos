@@ -39,6 +39,7 @@ use rustc_public::{CrateDef, CrateDefType};
 use sparagmos_mir as sm;
 
 mod guard;
+mod tail_call;
 mod display_names;
 mod statics;
 mod subst;
@@ -65,6 +66,7 @@ mod helpers;
 // not referenced through this facade at all; both are intentional,
 // so the unused-imports lint is allowed at the top of this file.
 pub use self::guard::*;
+pub use self::tail_call::*;
 pub use self::display_names::*;
 pub use self::statics::*;
 pub use self::subst::*;
