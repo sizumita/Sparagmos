@@ -123,6 +123,19 @@ fn convert_mode_nested_closure_type_explosion_is_bounded() {
         stdout.contains("expanded type tree exceeds the conversion size limit"),
         "main must be skipped by the conversion size limit:\n{stdout}"
     );
+    // The refusal happens once, up front: the body pre-scan in
+    // `convert_body` rejects the body for its over-limit local
+    // before any local or statement is converted. Without it,
+    // every mention of the doubling types was converted (and
+    // refused) separately — the same reason reported 52 times
+    // and gigabytes materialized for a body that can only ever
+    // be skipped (Issue #481).
+    assert!(
+        stdout.contains(
+            "SKIPPED (expanded type tree exceeds the conversion size limit (2097152 nodes) x1)"
+        ),
+        "main must be refused exactly once, by the body pre-scan:\n{stdout}"
+    );
 }
 
 #[test]

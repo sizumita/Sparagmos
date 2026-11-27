@@ -592,6 +592,37 @@ impl Converter {
     /// the list of reasons (variant names) instead of a body.
     pub fn convert_body(&mut self, body: &mir::Body) -> Result<sm::Body, Vec<String>> {
         self.errors.clear();
+        // Issue #481, second half: refuse a body carrying an
+        // over-limit local type *before* converting anything in
+        // it. The per-type guard in `Converter::ty` already
+        // refuses such a type, but only after the locals and
+        // statements that spell smaller-but-still-enormous
+        // prefixes of the same exponential chain have been
+        // materialized one by one: the nested-closure record's
+        // main spells thirty bindings whose types double per
+        // binding, so conversion built (and dropped) the whole
+        // tower up to the limit for every one of the dozens of
+        // mentions before the largest type tripped the guard
+        // (about 1.4GB peak and 27s for a body that can only
+        // ever be skipped). The locals are converted
+        // unconditionally, so a body with an over-limit local
+        // fails either way; the pre-scan (the same memoized
+        // expanded-size walk, costing O(min(expanded size,
+        // limit)) per distinct type) makes it fail once, up
+        // front, with the same reason. Types that appear only
+        // in statements keep the per-type guard in
+        // `Converter::ty` as their bound.
+        for decl in body.locals() {
+            if !crate::reach::ty_within_expanded_size(
+                &decl.ty,
+                crate::reach::MAX_TY_EXPANDED_SIZE,
+            ) {
+                return Err(vec![format!(
+                    "expanded type tree exceeds the conversion size limit ({} nodes)",
+                    crate::reach::MAX_TY_EXPANDED_SIZE
+                )]);
+            }
+        }
         let locals: Vec<sm::LocalDecl> = body
             .locals()
             .iter()
