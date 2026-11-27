@@ -136,6 +136,7 @@ pub enum CompileError {
     ProgramOnly(&'static str),
     /// A panic instruction referenced a message outside the table.
     BadMessageIndex(u32),
+    BadLocationIndex(u32),
     /// A panic instruction referenced a place string outside the
     /// table.
     BadPlaceIndex(u32),
@@ -160,6 +161,9 @@ impl std::fmt::Display for CompileError {
                 write!(f, "{what} is only available in a program compile")
             }
             CompileError::BadMessageIndex(i) => write!(f, "panic message index {i} out of range"),
+            CompileError::BadLocationIndex(i) => {
+                write!(f, "panic location index {i} out of range")
+            }
             CompileError::BadPlaceIndex(i) => write!(f, "panic place index {i} out of range"),
             CompileError::BadStaticIndex(i) => write!(f, "static index {i} out of range"),
             CompileError::BadHostIndex(i) => write!(f, "host function index {i} out of range"),
@@ -184,13 +188,19 @@ impl From<std::io::Error> for CompileError {
 /// program (the owner is [`crate::program::CompiledProgram`]).
 #[derive(Debug, Clone)]
 pub struct ProgramCtx {
-    /// Address of the program's panic context: two `u64` words,
-    /// `[panicked: u64, message_index: u64]`.
+    /// Address of the program's panic context: three `u64` words,
+    /// `[panicked: u64, message_index: u64, location_index: u64]`
+    /// (the location index is `u64::MAX` for a panic site with no
+    /// known source position).
     pub flag_addr: usize,
     /// Address of `sparagmos_panic` (the runtime's panic entry point).
     pub panic_fn: usize,
     /// Panic message table: `(ptr, len)` of each message's UTF-8 bytes.
     pub messages: Vec<(usize, usize)>,
+    /// Panic location table: `(ptr, len)` of each location's
+    /// `file:line:col` UTF-8 bytes, indexed by the panic
+    /// instructions' `loc` field.
+    pub locations: Vec<(usize, usize)>,
     /// Address of the program layer's index-message formatter:
     /// `extern "C" fn(len: u64, index: u64, buf: *mut u8) -> usize`,
     /// writing a length-prefixed message into `scratch_buf` and
@@ -1153,7 +1163,7 @@ impl<'a> Compiler<'a> {
                     self.store_reg(*dst2, Reg::Rdx)?;
                 }
             }
-            Instr::Panic { msg } => {
+            Instr::Panic { msg, loc } => {
                 let ctx = self
                     .ctx
                     .ok_or(CompileError::ProgramOnly("Panic"))?;
@@ -1162,10 +1172,16 @@ impl<'a> Compiler<'a> {
                     .get(*msg as usize)
                     .copied()
                     .ok_or(CompileError::BadMessageIndex(*msg))?;
+                if *loc != crate::ir::NO_LOCATION
+                    && ctx.locations.get(*loc as usize).is_none()
+                {
+                    return Err(CompileError::BadLocationIndex(*loc));
+                }
                 // sparagmos_panic(msg_ptr, msg_len): records the panic
                 // in the runtime. Then record it in the program's own
-                // panic context (flag + message index) and return from
-                // this function; callers propagate via CheckPanic.
+                // panic context (flag + message index + location
+                // index) and return from this function; callers
+                // propagate via CheckPanic.
                 self.e.mov_ri64(Reg::Rdi, ptr as i64);
                 self.e.mov_ri64(Reg::Rsi, len as i64);
                 self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
@@ -1175,6 +1191,8 @@ impl<'a> Compiler<'a> {
                 self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
                 self.e.mov_ri64(Reg::Rcx, *msg as i64);
                 self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+                self.e.mov_ri64(Reg::Rcx, *loc as i64);
+                self.e.mov_store(Reg::Rax, 16, Reg::Rcx);
                 self.e.leave();
                 self.e.ret();
             }
@@ -1191,7 +1209,7 @@ impl<'a> Compiler<'a> {
                 let target = self.e.position();
                 self.e.buf.patch_rel32(at, target);
             }
-            Instr::PanicIndexOob { len, index } => {
+            Instr::PanicIndexOob { len, index, loc } => {
                 let fmt_fn = self
                     .ctx
                     .ok_or(CompileError::ProgramOnly("PanicIndexOob"))?
@@ -1200,9 +1218,10 @@ impl<'a> Compiler<'a> {
                     "PanicIndexOob",
                     fmt_fn,
                     &[FmtArg::Op(*len), FmtArg::Op(*index)],
+                    *loc,
                 )?;
             }
-            Instr::PanicNegativeIndex { index, place } => {
+            Instr::PanicNegativeIndex { index, place, loc } => {
                 let ctx = self
                     .ctx
                     .ok_or(CompileError::ProgramOnly("PanicNegativeIndex"))?;
@@ -1220,9 +1239,10 @@ impl<'a> Compiler<'a> {
                         FmtArg::Imm(ptr as i64),
                         FmtArg::Imm(len as i64),
                     ],
+                    *loc,
                 )?;
             }
-            Instr::PanicRangeEnd { end, len } => {
+            Instr::PanicRangeEnd { end, len, loc } => {
                 let fmt_fn = self
                     .ctx
                     .ok_or(CompileError::ProgramOnly("PanicRangeEnd"))?
@@ -1231,9 +1251,10 @@ impl<'a> Compiler<'a> {
                     "PanicRangeEnd",
                     fmt_fn,
                     &[FmtArg::Op(*end), FmtArg::Op(*len)],
+                    *loc,
                 )?;
             }
-            Instr::PanicSliceIndex { from, end } => {
+            Instr::PanicSliceIndex { from, end, loc } => {
                 let fmt_fn = self
                     .ctx
                     .ok_or(CompileError::ProgramOnly("PanicSliceIndex"))?
@@ -1242,6 +1263,7 @@ impl<'a> Compiler<'a> {
                     "PanicSliceIndex",
                     fmt_fn,
                     &[FmtArg::Op(*from), FmtArg::Op(*end)],
+                    *loc,
                 )?;
             }
         }
@@ -1262,6 +1284,7 @@ impl<'a> Compiler<'a> {
         name: &'static str,
         fmt_fn: usize,
         args: &[FmtArg],
+        loc: u32,
     ) -> Result<(), CompileError> {
         let ctx = self.ctx.ok_or(CompileError::ProgramOnly(name))?;
         for (i, a) in args.iter().enumerate() {
@@ -1277,11 +1300,16 @@ impl<'a> Compiler<'a> {
         self.e.mov_ri64(Reg::Rdi, (ctx.scratch_buf + 8) as i64);
         self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
         self.e.call_r(Reg::Rax);
+        if loc != crate::ir::NO_LOCATION && ctx.locations.get(loc as usize).is_none() {
+            return Err(CompileError::BadLocationIndex(loc));
+        }
         self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
         self.e.mov_ri64(Reg::Rcx, 1);
         self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
         self.e.mov_ri64(Reg::Rcx, -1);
         self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+        self.e.mov_ri64(Reg::Rcx, loc as i64);
+        self.e.mov_store(Reg::Rax, 16, Reg::Rcx);
         self.e.leave();
         self.e.ret();
         Ok(())

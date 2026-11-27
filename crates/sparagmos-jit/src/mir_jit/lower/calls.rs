@@ -124,11 +124,13 @@ impl<'a> FnLower<'a> {
                         let len_v = self.operand_value(len, &len_ty)?;
                         let idx_v = self.operand_value(index, &idx_ty)?;
                         let id = self.new_block();
+                        let loc = self.cur_loc;
                         self.seal_block(
                             id,
                             vec![Instr::PanicIndexOob {
                                 len: IrOperand::Value(len_v),
                                 index: IrOperand::Value(idx_v),
+                                loc,
                             }],
                             IrTerminator::Unreachable,
                         );
@@ -1649,11 +1651,12 @@ impl<'a> FnLower<'a> {
                 if count != 0 {
                     return Err(self.err("panic_nounwind_fmt destination is not never"));
                 }
+                let loc = self.entry_loc_arg();
                 self.emit_host_call(
                     builtins::HOST_PANIC_NOUNWIND_FMT,
                     dst,
                     None,
-                    vec![IrOperand::Value(handle)],
+                    vec![IrOperand::Value(handle), IrOperand::Const(loc)],
                 );
                 self.finish_builtin_call(&dst_loc, dst, target, true);
                 Ok(())
@@ -1682,13 +1685,14 @@ impl<'a> FnLower<'a> {
                     }
                     _ => false,
                 };
+                let loc = self.entry_loc_arg();
                 if is_arguments {
                     let handle = self.arg_word(&args[0], "panic argument")?;
                     self.emit_host_call(
                         builtins::HOST_PANIC_FMT,
                         dst,
                         None,
-                        vec![IrOperand::Value(handle)],
+                        vec![IrOperand::Value(handle), IrOperand::Const(loc)],
                     );
                 } else {
                     let (ptr, len) = self.operand_pair(&args[0])?;
@@ -1696,7 +1700,11 @@ impl<'a> FnLower<'a> {
                         builtins::HOST_PANIC_STR,
                         dst,
                         None,
-                        vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                        vec![
+                            IrOperand::Value(ptr),
+                            IrOperand::Value(len),
+                            IrOperand::Const(loc),
+                        ],
                     );
                 }
                 self.finish_builtin_call(&dst_loc, dst, target, true);
@@ -1713,11 +1721,12 @@ impl<'a> FnLower<'a> {
                 if count != 0 {
                     return Err(self.err("panic_fmt destination is not never"));
                 }
+                let loc = self.entry_loc_arg();
                 self.emit_host_call(
                     builtins::HOST_PANIC_FMT,
                     dst,
                     None,
-                    vec![IrOperand::Value(handle)],
+                    vec![IrOperand::Value(handle), IrOperand::Const(loc)],
                 );
                 self.finish_builtin_call(&dst_loc, dst, target, true);
                 Ok(())
@@ -1769,11 +1778,16 @@ impl<'a> FnLower<'a> {
                 match shape {
                     Payload::StrPair => {
                         let (ptr, len) = self.operand_pair(&args[0])?;
+                        let loc = self.entry_loc_arg();
                         self.emit_host_call(
                             builtins::HOST_PANIC_STR,
                             dst,
                             None,
-                            vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                            vec![
+                                IrOperand::Value(ptr),
+                                IrOperand::Value(len),
+                                IrOperand::Const(loc),
+                            ],
                         );
                         self.finish_builtin_call(&dst_loc, dst, target, true);
                     }
@@ -1790,11 +1804,16 @@ impl<'a> FnLower<'a> {
                                 "begin_panic String payload of an unsupported shape",
                             ));
                         };
+                        let loc = self.entry_loc_arg();
                         self.emit_host_call(
                             builtins::HOST_PANIC_STR,
                             dst,
                             None,
-                            vec![IrOperand::Value(ptr), IrOperand::Value(len)],
+                            vec![
+                                IrOperand::Value(ptr),
+                                IrOperand::Value(len),
+                                IrOperand::Const(loc),
+                            ],
                         );
                         self.finish_builtin_call(&dst_loc, dst, target, true);
                     }

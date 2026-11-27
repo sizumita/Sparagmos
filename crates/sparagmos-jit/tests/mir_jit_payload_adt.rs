@@ -128,6 +128,7 @@ fn build_with_table(
             .collect(),
         names: names.clone(),
         adt_discriminants: table.clone(),
+        source_files: Vec::new(),
     };
     let interp_in = common::interp_program(
         specs
@@ -751,6 +752,7 @@ fn expect_unsupported(f: FnSpec, substr: &str) {
         }],
         names,
         adt_discriminants: tables(),
+        source_files: Vec::new(),
     })
     .expect_err("compile must fail");
     match err {

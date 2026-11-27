@@ -210,10 +210,11 @@ fn jit_bounds_check_assert_message() {
 fn jit_panic_report_is_std_default_shape() {
     // #540: a guest panic under run-jit prints std's default
     // panic report on stderr, not the JIT path's former invented
-    // `thread 'main' panicked: <msg>` line. The JIT records no
-    // location, so the head is the no-location form the
-    // interpreter also uses; with the backtrace environment off
-    // the report ends with the `RUST_BACKTRACE=1` note.
+    // `thread 'main' panicked: <msg>` line. The report head
+    // names the panic's location (the `panic!` call site, file
+    // :1:13 in the fixture below) as std's does; with the
+    // backtrace environment off the report ends with the
+    // `RUST_BACKTRACE=1` note.
     let dir = temp_dir("report-shape");
     let file = fixture(&dir, "case.rs", "fn main() { panic!(\"quux\"); }\n");
     let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
@@ -229,12 +230,42 @@ fn jit_panic_report_is_std_default_shape() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         stderr,
-        "\nthread 'main' (1) panicked:\nquux\n\
-         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        format!(
+            "\nthread 'main' (1) panicked at {}:1:13:\nquux\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            file.display()
+        ),
         "stderr must be exactly std's default panic report"
     );
     assert!(
         !stderr.contains("panicked: quux"),
         "the invented single-line form must not appear: {stderr}"
+    );
+}
+
+#[test]
+fn jit_panic_report_names_assert_location() {
+    // #540: a bounds-check `Assert` panic under run-jit also
+    // names its location: the indexing site inside the callee
+    // (line 3, the `C[10]` expression), not the caller's.
+    let dir = temp_dir("report-assert-location");
+    let file = fixture(
+        &dir,
+        "case.rs",
+        "const C: &'static [u8; 5] = b\"hello\";\n\
+         #[allow(unconditional_panic)]\n\
+         fn test() -> u8 { C[10] }\n\
+         fn main() { test(); }\n",
+    );
+    let out = run_driver_jit(&file);
+    assert_eq!(out.status.code(), Some(101), "expected exit 101");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "thread 'main' (1) panicked at {}:3:19:\n\
+             index out of bounds: the len is 5 but the index is 10",
+            file.display()
+        )),
+        "stderr must name the assert site: {stderr}"
     );
 }

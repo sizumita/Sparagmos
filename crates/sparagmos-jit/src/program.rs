@@ -40,6 +40,9 @@ use crate::memory::JitMemory;
 struct PanicCtx {
     panicked: Cell<u64>,
     message_index: Cell<u64>,
+    /// Index into the program's panic-location table, or
+    /// `u64::MAX` when the panic site has no known position.
+    location_index: Cell<u64>,
 }
 
 /// A two-word result as the generated code returns it: the first
@@ -301,6 +304,11 @@ pub struct CompiledProgram {
     /// these bytes to `sparagmos_panic`, so they must not move.
     #[allow(dead_code)]
     messages: Vec<Box<str>>,
+    /// The panic location strings (`file:line:col` of each panic
+    /// site); the recorded panic's location index names one, so
+    /// they must not move.
+    #[allow(dead_code)]
+    locations: Vec<Box<str>>,
     /// The place strings a negative-index message names; generated
     /// code passes pointers to these bytes to the message
     /// formatter, so they must not move.
@@ -367,6 +375,7 @@ impl CompiledProgram {
         );
         self.panic_ctx.panicked.set(0);
         self.panic_ctx.message_index.set(0);
+        self.panic_ctx.location_index.set(u64::MAX);
         // The builtin layer starts each Rust-side entry with a
         // fresh store and empty output buffers, like the panic
         // context above. Safety: no generated code is running at
@@ -393,10 +402,13 @@ impl CompiledProgram {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "<unknown panic message>".to_string())
             };
-            return Err(PanicRecord {
-                message,
-                location: None,
-            });
+            let loc_idx = self.panic_ctx.location_index.get();
+            let location = if loc_idx == u64::MAX {
+                None
+            } else {
+                self.locations.get(loc_idx as usize).map(|l| l.to_string())
+            };
+            return Err(PanicRecord { message, location });
         }
         Ok((result.first, result.second))
     }
@@ -414,6 +426,7 @@ pub fn compile_program(
         funcs,
         messages,
         places,
+        Vec::new(),
         statics,
         BuiltinTables::default(),
     )
@@ -428,6 +441,7 @@ pub fn compile_program_with_builtins(
     funcs: &[Function],
     messages: Vec<String>,
     places: Vec<String>,
+    locations: Vec<String>,
     statics: Vec<StaticBlob>,
     tables: BuiltinTables,
 ) -> Result<CompiledProgram, CompileError> {
@@ -437,8 +451,10 @@ pub fn compile_program_with_builtins(
     let panic_ctx = Box::new(PanicCtx {
         panicked: Cell::new(0),
         message_index: Cell::new(0),
+        location_index: Cell::new(u64::MAX),
     });
     let messages: Vec<Box<str>> = messages.into_iter().map(|s| s.into_boxed_str()).collect();
+    let locations: Vec<Box<str>> = locations.into_iter().map(|s| s.into_boxed_str()).collect();
     let places: Vec<Box<str>> = places.into_iter().map(|s| s.into_boxed_str()).collect();
     let scratch_buf: Box<[u8; 128]> = Box::new([0; 128]);
     // The static blobs: allocate every blob's storage first (each
@@ -499,6 +515,10 @@ pub fn compile_program_with_builtins(
             .iter()
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
+        locations: locations
+            .iter()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .collect(),
         index_fmt_fn: format_index_message as usize,
         neg_index_fmt_fn: format_negative_index_message as usize,
         range_end_fmt_fn: format_range_end_message as usize,
@@ -553,6 +573,7 @@ pub fn compile_program_with_builtins(
         param_counts: funcs.iter().map(|f| f.param_count).collect(),
         panic_ctx,
         messages,
+        locations,
         places,
         scratch_buf,
         statics: storages,
@@ -644,7 +665,7 @@ mod tests {
     fn panic_propagates_through_calls() {
         // fn boom() = panic("kaboom"); fn mid() = boom(); fn top() = mid()
         let mut b = FunctionBuilder::new("boom", 0);
-        b.push_raw(Instr::Panic { msg: 0 });
+        b.push_raw(Instr::Panic { msg: 0, loc: crate::ir::NO_LOCATION });
         let boom = b.finish(Terminator::Unreachable);
         let mk_caller = |name: &str, callee: u32| {
             let mut b = FunctionBuilder::new(name, 0);
@@ -669,6 +690,43 @@ mod tests {
             sparagmos_runtime::error::last_panic().map(|p| p.message),
             Some("kaboom".to_string())
         );
+    }
+
+    #[test]
+    fn panic_record_carries_location() {
+        // fn boom() = panic at guest.rs:3:7: the panic site's
+        // location index resolves through the program's location
+        // table into the record the caller reports (#540).
+        let mut b = FunctionBuilder::new("boom", 0);
+        b.push_raw(Instr::Panic { msg: 0, loc: 0 });
+        let boom = b.finish(Terminator::Unreachable);
+        let prog = compile_program_with_builtins(
+            &[boom],
+            vec!["kaboom".to_string()],
+            vec![],
+            vec!["guest.rs:3:7".to_string()],
+            vec![],
+            BuiltinTables::default(),
+        )
+        .unwrap();
+        let err = prog.call(0, &[]).expect_err("panic must surface");
+        assert_eq!(err.message, "kaboom");
+        assert_eq!(err.location.as_deref(), Some("guest.rs:3:7"));
+    }
+
+    #[test]
+    fn panic_record_without_location() {
+        // A site with NO_LOCATION records no location.
+        let mut b = FunctionBuilder::new("boom", 0);
+        b.push_raw(Instr::Panic {
+            msg: 0,
+            loc: crate::ir::NO_LOCATION,
+        });
+        let boom = b.finish(Terminator::Unreachable);
+        let prog =
+            compile_program(&[boom], vec!["kaboom".to_string()], vec![], vec![]).unwrap();
+        let err = prog.call(0, &[]).expect_err("panic must surface");
+        assert_eq!(err.location, None);
     }
 
     /// fn callee(p0..p{n-1}) = p0 + 2*p1 + ... + n*p{n-1}: distinct

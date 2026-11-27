@@ -32,6 +32,7 @@ fn jit_program_input(c: &Collected) -> sparagmos_jit::MirProgramInput {
         functions,
         names,
         adt_discriminants: c.adt_discriminants.clone(),
+        source_files: c.source_files.clone(),
     }
 }
 
