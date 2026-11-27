@@ -1582,13 +1582,11 @@ fn run_mode_union_displaced_scalar_write_never_mis_splices() {
     // byte splice judged the write by that minimal width: it
     // spliced the low byte into the *first* element at byte 4,
     // past its declared width, producing `0x9_FFFF_FFFF`
-    // there and leaving the denoted element unwritten — the
-    // run exited 0 with corrupted values. The write now
-    // declines the splice at the declared width and is an
-    // explicit unsupported-projection error instead of a
-    // silent wrong value. (A future composition of this
-    // write should change this test to assert the correct
-    // values above.)
+    // there and leaving the denoted element unwritten. The
+    // shaped store now splices the pointee's declared width
+    // into the written field's byte image at the displaced
+    // position, so the write lands on the denoted element
+    // and the source's assertions hold.
     let dir = temp_dir("union-displaced-scalar-write");
     let src = fixture(
         &dir,
@@ -1599,13 +1597,50 @@ fn run_mode_union_displaced_scalar_write_never_mis_splices() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "the displaced write must not silently corrupt; stderr={stderr}"
+        Some(0),
+        "the displaced write must land at the declared width; stderr={stderr}"
     );
-    assert!(
-        stderr.contains("write through a pointer displaced 4 bytes"),
-        "the failure is the explicit displaced-write error: {stderr}"
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const WRAPPED_MAYBEUNINIT_DISPLACED_WRITE_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+struct W { arr: ManuallyDrop<MaybeUninit<[u32; 2]>> }
+fn main() {
+    let mut w = W { arr: ManuallyDrop::new(MaybeUninit::new([0xFFFF_FFFF; 2])) };
+    unsafe {
+        let p = (*w.arr).as_mut_ptr() as *mut u32;
+        *p.add(1) = 9;
+        let arr = (*w.arr).assume_init_ref();
+        assert_eq!(arr[0], 0xFFFF_FFFF);
+        assert_eq!(arr[1], 9);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_wrapped_maybeuninit_displaced_scalar_write_lands() {
+    // Issue #501, the non-union form: the same displaced
+    // whole-element write into a `ManuallyDrop<MaybeUninit<
+    // [u32; 2]>>` field of a plain struct (the storage
+    // SmallVec-shaped wrappers hold without a union of their
+    // own) lands on the denoted element at the pointee's
+    // declared width.
+    let dir = temp_dir("wrapped-maybeuninit-displaced-write");
+    let src = fixture(
+        &dir,
+        "wrapped_maybeuninit_displaced_write.rs",
+        WRAPPED_MAYBEUNINIT_DISPLACED_WRITE_SRC,
     );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the displaced write must land at the declared width; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
 const PTR_BYTE_DISPLACED_READ_SRC: &str = r#"
