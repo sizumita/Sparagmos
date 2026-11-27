@@ -69,7 +69,18 @@ impl<'a> Interpreter<'a> {
                     usize::try_from(*n).ok()?,
                 )
             }
-            Ty::Adt(name) => ByteLayout::Adt(name.clone()),
+            Ty::Adt(name) => ByteLayout::Adt(
+                // The IR's ADT types carry only the
+                // definition's name, while the layout tables
+                // are keyed by the rendered instance name:
+                // denominate the layout by the instance the
+                // name denotes in this program (see
+                // `adt_instance_key`). An ambiguous or
+                // unrecorded name keeps the bare name, and
+                // every lookup below declines as before.
+                self.adt_instance_key(name)
+                    .unwrap_or_else(|| name.clone()),
+            ),
             _ => return None,
         })
     }
@@ -230,15 +241,16 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Whether the recorded debug shape names a union.
-    /// The shape table is keyed like the layout tables, by
-    /// the rendered instance name, so a generic instance
-    /// under a bare `Ty::Adt` name is not detected — the
-    /// same denomination limit every name-keyed byte-view
-    /// lookup already has.
+    /// Whether the ADT a type name denotes is a union.
+    /// The kind is a property of the definition, shared by
+    /// every instance, so the question goes through the
+    /// definition-level shape channel (see
+    /// `debug_shape_for_def`): a recorded instance entry
+    /// answers for a bare definition name, and a rendered
+    /// instance name answers for itself.
     fn adt_is_union(&self, name: &str) -> bool {
         matches!(
-            self.program().adt_debug_shapes.get(name),
+            self.debug_shape_for_def(name),
             Some(shape) if shape.kind == sparagmos_mir::AdtShapeKind::Union
         )
     }
@@ -351,12 +363,20 @@ impl<'a> Interpreter<'a> {
             match step {
                 RefProj::Field(i) => match &ty {
                     Some(Ty::Adt(name)) => {
-                        let rows = self.program().adt_field_layouts.get(name)?;
+                        // The field rows and field tags are
+                        // recorded under the rendered instance
+                        // name; the walk's type names the
+                        // definition alone (see
+                        // `adt_instance_key`).
+                        let key = self
+                            .adt_instance_key(name)
+                            .unwrap_or_else(|| name.clone());
+                        let rows = self.program().adt_field_layouts.get(&key)?;
                         let row = rows.get(variant)?;
                         let &(field_off, _) = row.get(*i)?;
                         off = off.checked_add(usize::try_from(field_off).ok()?)?;
                         ty = self
-                            .adt_field_tag(name, variant, *i)
+                            .adt_field_tag(&key, variant, *i)
                             .filter(|tag| {
                                 self.program().adt_field_layouts.contains_key(tag)
                             })
@@ -1707,7 +1727,10 @@ impl<'a> Interpreter<'a> {
         else {
             return false;
         };
-        if !self.program().adt_field_layouts.contains_key(&name) {
+        // The recorded field layout lives under the
+        // rendered instance name (see `adt_instance_key`).
+        let key = self.adt_instance_key(&name).unwrap_or(name);
+        if !self.program().adt_field_layouts.contains_key(&key) {
             return false;
         }
         let Some(base) = base else { return false };
