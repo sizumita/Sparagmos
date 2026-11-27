@@ -6893,6 +6893,20 @@ impl<'a> Interpreter<'a> {
                     &vals[1],
                 ) {
                     eq?
+                } else if let Some(eq) = self.punned_tuple_equal(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                ) {
+                    eq?
+                } else if let Some(eq) = self.punned_scalar_equal(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                ) {
+                    eq?
                 } else if let Some(eq) = self.box_pointee_equal(
                     frames,
                     generic_args,
@@ -6934,6 +6948,22 @@ impl<'a> Interpreter<'a> {
                     &vals[1],
                 ) {
                     ord?
+                } else if let Some(ord) = self.punned_tuple_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
+                ) {
+                    ord?
+                } else if let Some(ord) = self.punned_scalar_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
+                ) {
+                    ord?
                 } else {
                     self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?
                 };
@@ -6971,6 +7001,22 @@ impl<'a> Interpreter<'a> {
                     generic_args,
                     &vals[0],
                     &vals[1],
+                ) {
+                    ord?
+                } else if let Some(ord) = self.punned_tuple_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
+                ) {
+                    ord?
+                } else if let Some(ord) = self.punned_scalar_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
                 ) {
                     ord?
                 } else {
@@ -7011,6 +7057,22 @@ impl<'a> Interpreter<'a> {
                     generic_args,
                     &vals[0],
                     &vals[1],
+                ) {
+                    ord?
+                } else if let Some(ord) = self.punned_tuple_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
+                ) {
+                    ord?
+                } else if let Some(ord) = self.punned_scalar_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                    cmp_discriminants,
                 ) {
                     ord?
                 } else {
@@ -9284,6 +9346,19 @@ impl<'a> Interpreter<'a> {
                     }
                     Value::Ref(_) => {
                         let target = self.deref_value(frames, &vals[0])?;
+                        // A reference denoting the element of a
+                        // same-width punned scalar view (Issue
+                        // #479) denotes the storage's bits under
+                        // the element kind: the owned value is
+                        // the punned reading, not the backing
+                        // scalar the plain resolution returns.
+                        if let Some(tag) = generic_args.first() {
+                            if let Some(v) =
+                                self.punned_scalar_element(frames, &target, tag)
+                            {
+                                return Ok(v);
+                            }
+                        }
                         match self.read_resolved(frames, &target)? {
                             Value::Tuple(items) => Ok(Value::Enum {
                                 variant: 0,
