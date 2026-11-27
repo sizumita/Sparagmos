@@ -592,3 +592,40 @@ fn run_mode_btree_map_debug_format() {
         "empty {}\nmap {1: 10, 2: 20}\nset {1, 3}\npretty {\n    1: 10,\n    2: 20,\n}\n"
     );
 }
+
+const BTREE_BOXED_OS_STR_SET_SRC: &str = r#"
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+fn main() {
+    let mut s: BTreeSet<Box<std::ffi::OsStr>> = BTreeSet::new();
+    s.insert(OsString::from("pear").into_boxed_os_str());
+    s.insert(OsString::from("banana").into_boxed_os_str());
+    s.insert(OsString::from("kiwi").into_boxed_os_str());
+    s.insert(OsString::from("banana").into_boxed_os_str());
+    println!("len={}", s.len());
+    let probe: Box<std::ffi::OsStr> = OsString::from("kiwi").into_boxed_os_str();
+    println!("contains={}", s.contains(&probe));
+    println!("iter={:?}", s.iter().collect::<Vec<_>>());
+}
+"#;
+
+#[test]
+fn run_mode_btree_boxed_os_str_set() {
+    // A `BTreeSet<Box<OsStr>>` searches through the boxes'
+    // own ordering, which is the pointees' byte order; the
+    // tree's node storage presents both sides as the stored
+    // boxes.
+    let dir = temp_dir("btreeboxedosstr");
+    let src = fixture(&dir, "btreeboxedosstr.rs", BTREE_BOXED_OS_STR_SET_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "BTreeSet<Box<OsStr>> insert/contains/iterate must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=3\ncontains=true\niter=[\"banana\", \"kiwi\", \"pear\"]\n"
+    );
+}

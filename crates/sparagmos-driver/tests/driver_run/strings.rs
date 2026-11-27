@@ -4234,6 +4234,108 @@ fn run_mode_os_string_into_boxed_os_str_edges() {
     );
 }
 
+const BOXED_OS_STR_VEC_SORT_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+
+fn show(tag: &str, v: &[Box<OsStr>]) {
+    for (i, e) in v.iter().enumerate() {
+        println!("{} {} len={} bytes={:?} lossy={}", tag, i, e.len(), e.as_bytes(), e.to_string_lossy());
+    }
+}
+
+fn main() {
+    let mut v: Vec<Box<OsStr>> = vec![
+        OsString::from("pear").into_boxed_os_str(),
+        OsString::from("banana").into_boxed_os_str(),
+        OsString::from("kiwi").into_boxed_os_str(),
+        OsString::from("apple").into_boxed_os_str(),
+    ];
+    v.sort();
+    show("sorted", &v);
+    println!("ord_ok={}", v.windows(2).all(|w| w[0] <= w[1]));
+    let needle: Box<OsStr> = OsString::from("banana").into_boxed_os_str();
+    println!("eq0={} eq1={}", v[0] == needle, v[1] == needle);
+    let mut u: Vec<Box<OsStr>> = vec![
+        OsString::from("pear").into_boxed_os_str(),
+        OsString::from("banana").into_boxed_os_str(),
+        OsString::from("kiwi").into_boxed_os_str(),
+    ];
+    u.sort_unstable();
+    show("unstable", &u);
+    u.sort_by(|x, y| x.cmp(y));
+    show("by_box", &u);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_os_str_vec_sort_orders() {
+    // Sorting a `Vec<Box<OsStr>>` compares through the
+    // generic sort machinery, which hands the comparison
+    // one side as the box aggregate a slot holds and the
+    // other as the bare pointee snapshot it extracted: the
+    // ordering is the pointees' byte order either way.
+    // Comparisons after the sort meet the same pair of
+    // forms in the other order (an element the rotation
+    // moved keeps the snapshot form in its slot), for
+    // equality as for ordering. The sorted order is read
+    // back through the byte readers, which accept every
+    // form.
+    run_ok(
+        "boxed-os-str-vec-sort",
+        BOXED_OS_STR_VEC_SORT_SRC,
+        "sorted 0 len=5 bytes=[97, 112, 112, 108, 101] lossy=apple\nsorted 1 len=6 bytes=[98, 97, 110, 97, 110, 97] lossy=banana\nsorted 2 len=4 bytes=[107, 105, 119, 105] lossy=kiwi\nsorted 3 len=4 bytes=[112, 101, 97, 114] lossy=pear\nord_ok=true\neq0=false eq1=true\nunstable 0 len=6 bytes=[98, 97, 110, 97, 110, 97] lossy=banana\nunstable 1 len=4 bytes=[107, 105, 119, 105] lossy=kiwi\nunstable 2 len=4 bytes=[112, 101, 97, 114] lossy=pear\nby_box 0 len=6 bytes=[98, 97, 110, 97, 110, 97] lossy=banana\nby_box 1 len=4 bytes=[107, 105, 119, 105] lossy=kiwi\nby_box 2 len=4 bytes=[112, 101, 97, 114] lossy=pear\n",
+    );
+}
+
+const BOXED_SCALAR_VEC_SORT_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<Box<u32>> = vec![Box::new(30), Box::new(10), Box::new(20)];
+    v.sort();
+    println!("sorted={:?}", v);
+    let a = Box::new(7u32);
+    let b = Box::new(9u32);
+    println!("cmp={:?} eq={} lt={}", a.cmp(&b), a == b, a < b);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_scalar_vec_sort() {
+    // The scalar-pointee form of the same presentation: a
+    // sort over `Vec<Box<u32>>` hands the comparison the
+    // stored box against the bare integer snapshot.
+    run_ok(
+        "boxed-scalar-vec-sort",
+        BOXED_SCALAR_VEC_SORT_SRC,
+        "sorted=[10, 20, 30]\ncmp=Less eq=false lt=true\n",
+    );
+}
+
+const BOXED_SLICE_CMP_SORT_SRC: &str = r#"
+fn main() {
+    let a: Box<[u8]> = vec![2u8, 2].into_boxed_slice();
+    let b: Box<[u8]> = vec![2u8, 3].into_boxed_slice();
+    let c: Box<[u8]> = vec![2u8, 2].into_boxed_slice();
+    println!("cmp={:?} eq={} lt={}", a.cmp(&b), a == c, a < b);
+    let mut v: Vec<Box<[u8]>> = vec![vec![3u8, 1].into_boxed_slice(), vec![1u8, 9].into_boxed_slice(), vec![3u8, 0].into_boxed_slice()];
+    v.sort();
+    for (i, e) in v.iter().enumerate() {
+        println!("s{} len={} elems={:?}", i, e.len(), &**e);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_cmp_and_sort() {
+    // A slice pointee orders element-wise, in the direct
+    // (tagged) comparisons and in a sort's generic ones.
+    run_ok(
+        "boxed-slice-cmp-and-sort",
+        BOXED_SLICE_CMP_SORT_SRC,
+        "cmp=Less eq=true lt=true\ns0 len=2 elems=[1, 9]\ns1 len=2 elems=[3, 0]\ns2 len=2 elems=[3, 1]\n",
+    );
+}
+
 const SORT_STRING_ELEMENTS_SRC: &str = r#"
 fn main() {
     // Sorting more than twenty `String` elements takes the

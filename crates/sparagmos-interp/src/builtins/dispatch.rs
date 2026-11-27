@@ -6864,6 +6864,13 @@ impl<'a> Interpreter<'a> {
                     cmp_discriminants,
                 ) {
                     ord?
+                } else if let Some(ord) = self.box_pointee_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                ) {
+                    ord?
                 } else {
                     self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?
                 };
@@ -6894,6 +6901,13 @@ impl<'a> Interpreter<'a> {
                     &vals[0],
                     &vals[1],
                     cmp_discriminants,
+                ) {
+                    ord?
+                } else if let Some(ord) = self.box_pointee_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
                 ) {
                     ord?
                 } else {
@@ -6927,6 +6941,13 @@ impl<'a> Interpreter<'a> {
                     &vals[0],
                     &vals[1],
                     cmp_discriminants,
+                ) {
+                    ord?
+                } else if let Some(ord) = self.box_pointee_cmp(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
                 ) {
                     ord?
                 } else {
