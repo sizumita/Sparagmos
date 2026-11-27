@@ -172,6 +172,25 @@ pub fn captured_panic_is_const_expr_normalize(text: &str) -> bool {
         && location.contains("rustc_middle/src/mir/consts.rs:338:")
 }
 
+/// Whether a panic hook record (the text
+/// [`record_captured_panic`] stores) is rustc_public's
+/// unimplemented unsafe-binder type conversion: the bare
+/// "not implemented" payload of the `unimplemented!()` at
+/// convert/stable/ty.rs:471, identified by its location (the
+/// identification `unimplemented_site_reason` makes in the
+/// driver for the same site). A type whose kind question hits
+/// this site is an unsafe binder type (`ty::UnsafeBinder`):
+/// the binder is transparent at the value level, so the kind
+/// question can be answered by erasure instead (see
+/// [`unsafe_binder_inner_ty`]).
+pub fn captured_panic_is_unsafe_binder_ty(text: &str) -> bool {
+    let Some((message, location)) = text.split_once(" (panicked at ") else {
+        return false;
+    };
+    message == "not implemented"
+        && location.contains("rustc_public/src/unstable/convert/stable/ty.rs:471:")
+}
+
 /// Every const-expr-normalize panic record of the run (see
 /// [`captured_panic_is_const_expr_normalize`]), noted by the
 /// panic hook alongside the bug-witness list and read only
@@ -354,12 +373,48 @@ pub(crate) fn coroutine_closure_const_parts(
     })
 }
 
+/// The type an unsafe binder type wraps, as it stands under
+/// the binder: `unsafe<'a> &'a T` erases to `&'a T`, whose
+/// region still mentions the binder's bound variable — a
+/// region the converter treats opaquely, like any other.
+/// An unsafe binder is transparent at the
+/// value level — wrapping and unwrapping are identity
+/// operations on the wrapped value — so a body that merely
+/// mentions a binder type (a local's type, an argument or
+/// return type, a field type) converts exactly as if the
+/// binder were not there; only the wrap/unwrap constructs
+/// themselves need the bridge conversions that stay
+/// unimplemented (see [`UNSAFE_BINDER_REASON`]). The question
+/// goes through the internal view, like
+/// [`coroutine_closure_const_parts`]: the stable kind
+/// question is itself the unimplemented conversion. Returns
+/// `None` for a type that is not an unsafe binder, and when
+/// the internal view is unavailable.
+pub fn unsafe_binder_inner_ty(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, ty.clone());
+        let mut inner = internal;
+        while let rustc_middle::ty::TyKind::UnsafeBinder(binder) = inner.kind() {
+            inner = *binder.as_ref().skip_binder();
+        }
+        if inner == internal {
+            return None;
+        }
+        Some(rustc_public::rustc_internal::stable(inner))
+    })
+}
+
 /// Run a Stable MIR query under the coroutine-closure guard:
 /// a query whose answer needs to render or inspect a
 /// coroutine-closure (async closure) type panics inside
 /// rustc_public (see [`COROUTINE_CLOSURE_TYPE_REASON`]); the
 /// guard classifies that panic and answers `None`, and
-/// re-raises any other panic untouched.
+/// re-raises any other panic untouched. The guard answers
+/// `None` for the unsafe-binder type site as well (see
+/// [`captured_panic_is_unsafe_binder_ty`]): a kind question
+/// about a binder type has no stable answer, and the caller
+/// erases the binder instead (see [`unsafe_binder_inner_ty`]).
 pub fn guarded_query<T>(f: impl FnOnce() -> T) -> Option<T> {
     clear_captured_panic();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -377,7 +432,12 @@ pub fn guarded_query<T>(f: impl FnOnce() -> T) -> Option<T> {
             // cleared above, hence this very panic's — is the
             // witness that identifies it.
             match take_captured_panic() {
-                Some(record) if record.contains("FIXME(async_closures)") => None,
+                Some(record)
+                    if record.contains("FIXME(async_closures)")
+                        || captured_panic_is_unsafe_binder_ty(&record) =>
+                {
+                    None
+                }
                 other => {
                     if let Some(record) = other {
                         record_captured_panic(record);
@@ -905,6 +965,27 @@ mod tests {
         let validator = format!("MIR validation failure (panic with a non-string payload) (panicked at {DEV}/rustc_mir_transform/src/validate.rs:81:24)");
         assert!(!captured_panic_is_compiler_bug(&validator));
         assert!(captured_panic_is_mir_validator_fail(&validator));
+    }
+
+    /// The unsafe-binder type site (Issue #510) is named by
+    /// its bare "not implemented" payload and its location
+    /// alone: the same payload at the const-expr site, and a
+    /// different payload at the binder site, are not this
+    /// class.
+    #[test]
+    fn unsafe_binder_ty_site_is_named() {
+        let record = format!(
+            "not implemented (panicked at /rustc/compiler/rustc_public/src/unstable/convert/stable/ty.rs:471:9)"
+        );
+        assert!(captured_panic_is_unsafe_binder_ty(&record));
+        let const_expr_site = format!(
+            "not implemented (panicked at /rustc/compiler/rustc_public/src/unstable/convert/stable/ty.rs:577:9)"
+        );
+        assert!(!captured_panic_is_unsafe_binder_ty(&const_expr_site));
+        let other_payload = format!(
+            "boom (panicked at /rustc/compiler/rustc_public/src/unstable/convert/stable/ty.rs:471:9)"
+        );
+        assert!(!captured_panic_is_unsafe_binder_ty(&other_payload));
     }
 
     /// The const-expr witness list is append-only and scoped
