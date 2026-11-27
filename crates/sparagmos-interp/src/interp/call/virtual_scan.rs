@@ -51,6 +51,25 @@ impl<'a> Interpreter<'a> {
         } else if let Some(rest) = trait_path.strip_prefix("core::") {
             paths.push(format!("std::{rest}"));
         }
+        // A first pass over the bodies conversion keyed by
+        // the tag spelling of their `Self` type (see
+        // `Program::impl_tag_bodies`): the queried name is
+        // a rendered type tag, and where a type inside the
+        // generic arguments is spelled differently in a
+        // tag than in an instance key -- a closure, above
+        // all -- neither spelling pass below can tell two
+        // instances of one generic impl apart, while the
+        // table names the one body whose receiver's
+        // declared type renders as exactly this tag.
+        for path in &paths {
+            if let Some(key) = self.program.impl_tag_bodies.get(&(
+                concrete.to_string(),
+                path.clone(),
+                method.to_string(),
+            )) {
+                return Some(key.clone());
+            }
+        }
         let keys = || {
             self.program
                 .functions

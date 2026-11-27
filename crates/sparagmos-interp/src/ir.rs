@@ -2734,6 +2734,25 @@ pub struct Program {
     /// callee entered through the value observes is the
     /// declaration's, not the definition's.
     pub fn_link_aliases: HashMap<String, String>,
+    /// Converted impl-method bodies keyed by the rendered
+    /// tag of their `Self` type: `(Self tag, trait path,
+    /// method) -> program key`, holding only the triples
+    /// exactly one converted body answers to. Filled by
+    /// conversion (see `mir_convert::resolve::impl_tag_bodies`)
+    /// from each impl body receiver's declared type, which
+    /// conversion still holds as a full type. The interpreter's
+    /// virtual-dispatch scan is queried with a rendered type
+    /// tag, whose spelling of a type inside the generic
+    /// arguments -- a closure, above all: the tag names the
+    /// definition (`main::{closure#0}`) with its arguments,
+    /// the instance key names the span (`{closure@...}`) --
+    /// shares no text with the instance key's spelling of the
+    /// same type, so neither of the scan's spelling passes can
+    /// tell two instances of one generic impl apart when the
+    /// difference sits inside the arguments; this table is the
+    /// bridge conversion builds while both spellings are at
+    /// hand. Empty for hand-built programs.
+    pub impl_tag_bodies: HashMap<(String, String, String), String>,
     /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
     /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
     /// `call_once`): the trait method definitions in core,

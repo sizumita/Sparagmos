@@ -729,6 +729,39 @@ fn collect() -> ControlFlow<()> {
         &seed_bodies,
         &mut demand_state,
     );
+
+    // The `Iterator::next` demand above ran over the item
+    // bodies only: the generic local instances converted
+    // here name further stepped types in their own calls --
+    // an adapter composition inside a generic helper (a
+    // guest iterator `.map`ped inside a formatting function,
+    // say) names its source's `next` body nowhere else -- so
+    // the demand runs once more over the instance bodies.
+    // Instances the first run already demanded are skipped
+    // by identity inside the pass; the bodies this run
+    // demands join the seed bodies like the first run's.
+    let mut next_scan = seed_bodies.clone();
+    next_scan.extend(instance_seeds.iter().cloned());
+    let next_scan_len = next_scan.len();
+    let (next_credited, next_failures) = demand_iterator_next_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut next_scan,
+    );
+    for (def, (count, counts)) in next_credited {
+        let slot = drop_credited.entry(def).or_insert((0, counts));
+        slot.0 += count;
+    }
+    for (def, reasons) in next_failures {
+        let slot = drop_failures.entry(def).or_default();
+        for (k, v) in reasons {
+            *slot.entry(k.clone()).or_default() += v;
+        }
+    }
+    seed_bodies.extend(next_scan[next_scan_len..].iter().cloned());
     // The program DefIds and report names collected so far,
     // shared with every merge and demand pass below: the
     // reachability collection resolves some of the same closure

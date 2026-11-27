@@ -10,6 +10,7 @@ use super::converter::*;
 use super::drop_glue::DropGlueBuilder;
 use super::errors::*;
 use super::program::*;
+use super::helpers::{parse_impl_block_key, parse_impl_key};
 
 
 /// The key each function of `program` is stored under in the
@@ -458,6 +459,70 @@ pub fn conversions_performed() -> usize {
 /// for the run entry points: the entry function's own failure is a
 /// whole-run conversion failure, exactly as before per-body
 /// isolation, so callers need the failures beside the program.
+/// The `(Self tag, trait path, method) -> program key`
+/// table of the converted program's impl-method bodies
+/// (see `ir::Program::impl_tag_bodies`): for every
+/// converted body whose key is an impl-method key, the
+/// tag the body's receiver type renders as, computed
+/// from the declared receiver type conversion still
+/// holds in full. A triple two distinct bodies would
+/// answer to is dropped: the table only ever names a
+/// body the tag identifies uniquely. A body is entered
+/// only when its receiver -- peeled through plain
+/// references -- renders as the key's own `Self` type:
+/// an arbitrary self type (`Box<Self>` and the like) or
+/// a self-less associated function's first argument
+/// does not name `Self`, and entering either would put
+/// a wrong body behind the tag.
+fn impl_tag_bodies(
+    program: &MirProgram,
+    keys: &[String],
+    converted: &HashMap<String, ir::Body>,
+) -> HashMap<(String, String, String), String> {
+    let mut table: HashMap<(String, String, String), Option<String>> = HashMap::new();
+    for (f, key) in program.functions.iter().zip(keys) {
+        if !converted.contains_key(key) {
+            continue;
+        }
+        let base = key.split('#').next().unwrap_or(key.as_str());
+        let Some((self_part, trait_base, method)) =
+            parse_impl_key(base).or_else(|| parse_impl_block_key(base))
+        else {
+            continue;
+        };
+        let Some(decl) = f.body.local_decls.get(1) else {
+            continue;
+        };
+        let mut self_ty = &decl.ty;
+        loop {
+            match self_ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                    self_ty = inner;
+                }
+                _ => break,
+            }
+        }
+        let tag = crate::builtins::ty_tag(self_ty, &program.fn_names);
+        if tag.split('<').next() != self_part.split('<').next() {
+            continue;
+        }
+        let entry = (tag, trait_base, method);
+        match table.get(&entry) {
+            None => {
+                table.insert(entry, Some(key.clone()));
+            }
+            Some(Some(existing)) if *existing != *key => {
+                table.insert(entry, None);
+            }
+            _ => {}
+        }
+    }
+    table
+        .into_iter()
+        .filter_map(|(entry, key)| key.map(|key| (entry, key)))
+        .collect()
+}
+
 pub(super) fn convert_all(
     program: &MirProgram,
 ) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
@@ -573,6 +638,7 @@ fn convert_all_with(
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
     out.needs_drop_verdicts = program.needs_drop_verdicts.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
+    out.impl_tag_bodies = impl_tag_bodies(program, &keys, &out.functions);
     out.alloc_shims = conv.alloc_shims.clone();
     out.panic_handler = program.panic_handler.clone();
     out.links_std = program.links_std;
