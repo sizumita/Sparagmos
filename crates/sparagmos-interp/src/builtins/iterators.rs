@@ -2430,6 +2430,21 @@ impl<'a> Interpreter<'a> {
                     Value::Str(text) => os_string_value(text.as_bytes()),
                     other => other,
                 })
+            } else if self_ty_is(self_ty, "std::env::Args") {
+                // An element carried in the `OsString` form is
+                // an argument that is not valid UTF-8; std's
+                // `Args::next` converts each element with an
+                // unwrap, so stepping over one panics in the
+                // guest, exactly as natively.
+                match item {
+                    Some(Value::Str(_)) | None => item,
+                    Some(_) => {
+                        return Err(InterpError::Panic {
+                            message: "called `Result::unwrap()` on an `Err` value: argument is not valid Unicode".to_string(),
+                            payload: None,
+                        })
+                    }
+                }
             } else {
                 item
             };
@@ -7593,6 +7608,19 @@ fn iterator_next_back_state(
                 Value::Str(text) => os_string_value(text.as_bytes()),
                 other => other,
             })
+        } else if self_ty_is(self_ty, "std::env::Args") {
+            // As in the front step: an element in the
+            // `OsString` form is not valid UTF-8, and std's
+            // conversion panics on it.
+            match item {
+                Some(Value::Str(_)) | None => item,
+                Some(_) => {
+                    return Err(InterpError::Panic {
+                        message: "called `Result::unwrap()` on an `Err` value: argument is not valid Unicode".to_string(),
+                        payload: None,
+                    })
+                }
+            }
         } else {
             item
         };

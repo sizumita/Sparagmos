@@ -810,6 +810,77 @@ pub(crate) fn read_guest_env_file(path: &std::path::Path) -> std::io::Result<Vec
     Ok(env)
 }
 
+/// Write a run's guest arguments to a fresh private
+/// temporary file (see `create_private_temp_file`), in the
+/// length-prefixed binary form `read_guest_args_file`
+/// reads: a sequence of u32-LE-length-prefixed byte
+/// strings, one per argument, in invocation order. This is
+/// the channel for an argument that is not valid UTF-8: the
+/// command line of a conversion subprocess is text in this
+/// driver's plumbing, so such an argument cannot travel on
+/// it without changing its bytes, while the file carries
+/// it unchanged (the guest environment file's standing
+/// solution to the same problem). Returns the file's path;
+/// the caller removes it once the run is over.
+fn write_guest_args_file(args: &[Vec<u8>]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    for arg in args {
+        buf.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+        buf.extend_from_slice(arg);
+    }
+    let (path, mut file) = create_private_temp_file("guest-args")?;
+    if let Err(e) = file.write_all(&buf) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// Read back a file `write_guest_args_file` wrote.
+pub(crate) fn read_guest_args_file(path: &std::path::Path) -> std::io::Result<Vec<Vec<u8>>> {
+    let buf = std::fs::read(path)?;
+    let mut args = Vec::new();
+    let mut at = 0usize;
+    while at < buf.len() {
+        let len_bytes = buf.get(at..at + 4).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated args file")
+        })?;
+        at += 4;
+        let n = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let bytes = buf.get(at..at + n).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated args file")
+        })?;
+        at += n;
+        args.push(bytes.to_vec());
+    }
+    Ok(args)
+}
+
+/// Append a spawn request's guest arguments to a conversion
+/// subprocess's command line: as `--guest-arg` values when
+/// every argument is valid UTF-8, and otherwise as one
+/// `--guest-args-file` naming a file that carries the whole
+/// list byte for byte (see `write_guest_args_file`). Returns
+/// the arguments file's path when one was written, for the
+/// caller to remove once the run is over.
+fn push_guest_args(
+    tail: &mut Vec<String>,
+    args: &[Vec<u8>],
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    if args.iter().all(|arg| std::str::from_utf8(arg).is_ok()) {
+        for arg in args {
+            tail.push("--guest-arg".to_string());
+            tail.push(String::from_utf8_lossy(arg).into_owned());
+        }
+        return Ok(None);
+    }
+    let path = write_guest_args_file(args)?;
+    tail.push("--guest-args-file".to_string());
+    tail.push(path.display().to_string());
+    Ok(Some(path))
+}
+
 /// Replace this process's environment with the complete
 /// assignment `env`: the run entry point applies the guest
 /// environment file with this after the conversion is done,
@@ -1960,22 +2031,19 @@ pub(crate) fn artifact_run(
     tail.push(env_path.display().to_string());
     tail.push("--guest-program-name".to_string());
     tail.push(program_name);
-    // The arguments travel as command-line strings, and
-    // the interpreter's argument model holds text: an
-    // argument that is not valid UTF-8 cannot be carried
-    // without changing its bytes, so the invocation is
-    // unsupported rather than silently lossy.
-    for arg in &request.args {
-        if std::str::from_utf8(arg).is_err() {
+    // The arguments travel as command-line strings, or in
+    // an arguments file when one is not valid UTF-8 (see
+    // `push_guest_args`).
+    let args_path = match push_guest_args(&mut tail, &request.args) {
+        Ok(path) => path,
+        Err(e) => {
             let _ = std::fs::remove_file(&stderr_path);
             let _ = std::fs::remove_file(&env_path);
             return Err(format!(
-                "tool interception: running artifact `{program}`: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
+                "tool interception: running artifact `{program}`: cannot record the guest arguments: {e}"
             ));
         }
-        tail.push("--guest-arg".to_string());
-        tail.push(String::from_utf8_lossy(arg).into_owned());
-    }
+    };
     let outcome = run_convert_subprocess(
         exe,
         &tail,
@@ -1986,6 +2054,9 @@ pub(crate) fn artifact_run(
     let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stderr_path);
     let _ = std::fs::remove_file(&env_path);
+    if let Some(path) = &args_path {
+        let _ = std::fs::remove_file(path);
+    }
     let (code, stdout, stderr) = outcome?;
     if code == 2 {
         // Exit 2 is both the subprocess's driver-failure code
@@ -2110,28 +2181,28 @@ pub(crate) fn self_run(
     // this spawn wired as its stdout, as a native child's
     // would (see `InterpConfig::stdout_sink`).
     tail.push("--guest-stdout-passthrough".to_string());
-    // The arguments travel as command-line strings, as in
-    // `artifact_run`: an argument that is not valid UTF-8
-    // cannot be carried without changing its bytes, so the
-    // invocation is unsupported rather than silently lossy.
-    for arg in &request.args {
-        if std::str::from_utf8(arg).is_err() {
+    // The arguments travel as command-line strings, or in
+    // an arguments file when one is not valid UTF-8, as in
+    // `artifact_run` (see `push_guest_args`).
+    let args_path = match push_guest_args(&mut tail, &request.args) {
+        Ok(path) => path,
+        Err(e) => {
             let _ = std::fs::remove_file(&stderr_path);
             let _ = std::fs::remove_file(&env_path);
-            return Err(
-                "self spawn: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
-                    .to_string(),
-            );
+            return Err(format!(
+                "self spawn: cannot record the guest arguments: {e}"
+            ));
         }
-        tail.push("--guest-arg".to_string());
-        tail.push(String::from_utf8_lossy(arg).into_owned());
-    }
+    };
     let start_dir = std::env::current_dir()
         .map_err(|e| format!("self spawn: no working directory: {e}"))?;
     let outcome = run_convert_subprocess(exe, &tail, &start_dir, false, &[]);
     let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stderr_path);
     let _ = std::fs::remove_file(&env_path);
+    if let Some(path) = &args_path {
+        let _ = std::fs::remove_file(path);
+    }
     let (code, stdout, stderr) = outcome?;
     if code == 2 {
         // As in `artifact_run`: exit 2 is both the

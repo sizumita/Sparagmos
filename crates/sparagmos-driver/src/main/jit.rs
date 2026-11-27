@@ -52,7 +52,7 @@ pub(crate) fn jit_compile_program(c: &Collected) -> Result<sparagmos_jit::JitPro
 /// entry cannot model — guest arguments, a C-convention
 /// `main(argc, argv)`, an entry returning `ExitCode` — are
 /// reported as unsupported (exit 2), never guessed.
-pub(crate) fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
+pub(crate) fn execute_jit(c: &Collected, guest_args: &[Vec<u8>]) -> i32 {
     if !guest_args.is_empty() {
         eprintln!(
             "sparagmos-driver run-jit: unsupported: guest arguments are not supported by JIT execution"

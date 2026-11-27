@@ -699,7 +699,18 @@ impl<'a> Interpreter<'a> {
                     items.push(Value::Str(self.program_path().to_string()));
                 }
                 for arg in self.guest_args() {
-                    items.push(Value::Str(arg.clone()));
+                    // An argument that is valid UTF-8 is the
+                    // text element the argument iterators have
+                    // always carried; one that is not is
+                    // carried in the `OsString` form instead,
+                    // so its bytes survive unchanged (the
+                    // `ArgsOs` step yields it as-is, and the
+                    // `Args` step panics on it, as std's own
+                    // conversion does).
+                    match String::from_utf8(arg.clone()) {
+                        Ok(text) => items.push(Value::Str(text)),
+                        Err(_) => items.push(os_string_value(arg)),
+                    }
                 }
                 let common_args = Value::Enum {
                     variant: 0,
@@ -1504,7 +1515,11 @@ impl<'a> Interpreter<'a> {
                 // json request, is refused as before. The json
                 // format without the unlocking option is likewise
                 // refused before listing or running.
-                let raw_args: Vec<String> = self.guest_args().to_vec();
+                let raw_args: Vec<String> = self
+            .guest_args()
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
                 let opts = HarnessOpts::parse(&raw_args);
                 let bootstrap = std::env::var("RUSTC_BOOTSTRAP").is_ok();
                 let mut unstable_options = false;
