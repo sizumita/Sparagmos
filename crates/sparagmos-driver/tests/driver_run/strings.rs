@@ -5084,3 +5084,158 @@ fn run_mode_os_str_bare_form_ordering() {
         "lit lt=true pc=Some(Less)\nlit gt=true pc=Some(Greater)\nfrom lt=true pc=Some(Less)\nfrom gt=true pc=Some(Greater)\nagg lt=true pc=Some(Less)\nagg gt=true pc=Some(Greater)\nsame pc=Some(Equal) lt=false le=true\ntext lt=true pc=Some(Less)\nraw lt=true pc=Some(Less)\nraw-lit pc=Some(Greater)\n",
     );
 }
+
+const FROM_OS_STR_TO_COUNTED_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let r: Rc<OsStr> = Rc::from(OsStr::new("borrowed"));
+    println!("rc-ref: {:?} len={}", r, r.len());
+    let r2: Rc<OsStr> = Rc::from(OsString::from("owned"));
+    println!("rc-owned: {:?}", r2);
+    let b: Box<OsStr> = OsString::from("boxed").into_boxed_os_str();
+    let r3: Rc<OsStr> = Rc::from(b);
+    println!("rc-box: {:?} strong={}", r3, Rc::strong_count(&r3));
+    let a: Arc<OsStr> = Arc::from(OsStr::new("arc-ref"));
+    let a2: Arc<OsStr> = Arc::from(OsString::from("arc-owned"));
+    let ab: Box<OsStr> = OsString::from("arc-box").into_boxed_os_str();
+    let a3: Arc<OsStr> = Arc::from(ab);
+    println!("arc: {:?} {:?} {:?}", a, a2, a3);
+    let v: Vec<Rc<OsStr>> = vec![Rc::from(OsStr::new("x")), Rc::from(OsString::from("yy"))];
+    println!("vec: {:?}", v);
+    println!("eq={}", r == Rc::from(OsStr::new("borrowed")));
+}
+"#;
+
+#[test]
+fn run_mode_from_os_str_to_counted() {
+    // `From<&OsStr>` / `From<OsString>` / `From<Box<OsStr>>`
+    // for `Rc<OsStr>` / `Arc<OsStr>`: the borrowed and owned
+    // forms clone the byte string into a fresh counted handle;
+    // the boxed form moves the pointee out of the box. Before
+    // the fix all three stopped in the generic `From` handler
+    // as not runtime-supported, so a `Vec<Rc<OsStr>>` could not
+    // even be constructed (expected output verified against a
+    // native 1.100.0 build of the same source).
+    run_ok(
+        "from-os-str-counted",
+        FROM_OS_STR_TO_COUNTED_SRC,
+        "rc-ref: \"borrowed\" len=8\nrc-owned: \"owned\"\nrc-box: \"boxed\" strong=1\narc: \"arc-ref\" \"arc-owned\" \"arc-box\"\nvec: [\"x\", \"yy\"]\neq=true\n",
+    );
+}
+
+const FROM_PATH_TO_COUNTED_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let r: Rc<Path> = Rc::from(Path::new("a/b"));
+    println!("rc-ref: {:?} name={:?}", r, r.file_name());
+    let r2: Rc<Path> = Rc::from(PathBuf::from("c/d"));
+    println!("rc-owned: {:?}", r2);
+    let b: Box<Path> = PathBuf::from("e/f").into_boxed_path();
+    let r3: Rc<Path> = Rc::from(b);
+    println!("rc-box: {:?} disp={}", r3, r3.display());
+    let a: Arc<Path> = Arc::from(Path::new("g/h"));
+    let a2: Arc<Path> = Arc::from(PathBuf::from("i"));
+    println!("arc: {:?} {:?}", a, a2);
+}
+"#;
+
+#[test]
+fn run_mode_from_path_to_counted() {
+    // `From<&Path>` / `From<PathBuf>` / `From<Box<Path>>` for
+    // `Rc<Path>` / `Arc<Path>`, the path twin of the `OsStr`
+    // conversions above.
+    run_ok(
+        "from-path-counted",
+        FROM_PATH_TO_COUNTED_SRC,
+        "rc-ref: \"a/b\" name=Some(\"b\")\nrc-owned: \"c/d\"\nrc-box: \"e/f\" disp=e/f\narc: \"g/h\" \"i\"\n",
+    );
+}
+
+const FROM_C_STR_TO_COUNTED_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let r: Rc<CStr> = Rc::from(CStr::from_bytes_with_nul(b"hello\0").unwrap());
+    println!("rc-ref: {:?} bytes={:?}", r, r.to_bytes());
+    let r2: Rc<CStr> = Rc::from(CString::new("owned").unwrap());
+    println!("rc-owned: {:?}", r2);
+    let b: Box<CStr> = Box::from(CStr::from_bytes_with_nul(b"boxed\0").unwrap());
+    let r3: Rc<CStr> = Rc::from(b);
+    println!("rc-box: {:?} strong={}", r3, Rc::strong_count(&r3));
+    let a: Arc<CStr> = Arc::from(CStr::from_bytes_with_nul(b"arc-ref\0").unwrap());
+    let a2: Arc<CStr> = Arc::from(CString::new("arc-owned").unwrap());
+    println!("arc: {:?} {:?}", a, a2);
+}
+"#;
+
+#[test]
+fn run_mode_from_c_str_to_counted() {
+    // `From<&CStr>` / `From<CString>` / `From<Box<CStr>>` for
+    // `Rc<CStr>` / `Arc<CStr>`: the handle stores the byte
+    // sequence, terminator included, as a `CString` buffer
+    // does.
+    run_ok(
+        "from-c-str-counted",
+        FROM_C_STR_TO_COUNTED_SRC,
+        "rc-ref: \"hello\" bytes=[104, 101, 108, 108, 111]\nrc-owned: \"owned\"\nrc-box: \"boxed\" strong=1\narc: \"arc-ref\" \"arc-owned\"\n",
+    );
+}
+
+const FROM_BOX_TO_COUNTED_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let r: Rc<u32> = Rc::from(Box::new(42u32));
+    println!("rc-box-u32: {} strong={}", r, Rc::strong_count(&r));
+    let a: Arc<String> = Arc::from(Box::new(String::from("text")));
+    println!("arc-box-string: {}", a);
+}
+"#;
+
+#[test]
+fn run_mode_from_box_to_counted() {
+    // The generic `From<Box<T>>` for `Rc<T>` / `Arc<T>`: the
+    // box pointee moves into a fresh counted handle and the
+    // box allocation is released.
+    run_ok(
+        "from-box-counted",
+        FROM_BOX_TO_COUNTED_SRC,
+        "rc-box-u32: 42 strong=1\narc-box-string: text\n",
+    );
+}
+
+const FROM_COW_TO_COUNTED_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{CStr, OsStr, OsString};
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let a: Rc<str> = Rc::from(Cow::Borrowed("x"));
+    let a2: Rc<str> = Rc::from(Cow::Owned::<str>(String::from("owned-str")));
+    let b: Rc<[u8]> = Rc::from(Cow::Borrowed(&[1u8, 2][..]));
+    let b2: Arc<[u8]> = Arc::from(Cow::Owned::<[u8]>(vec![3u8, 4]));
+    let c: Rc<OsStr> = Rc::from(Cow::Borrowed(OsStr::new("y")));
+    let c2: Arc<OsStr> = Arc::from(Cow::Owned::<OsStr>(OsString::from("owned-os")));
+    let d: Rc<Path> = Rc::from(Cow::Borrowed(Path::new("z")));
+    let e: Rc<CStr> = Rc::from(Cow::Borrowed(CStr::from_bytes_with_nul(b"w\0").unwrap()));
+    println!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a, a2, b, b2, c, c2, d, e);
+}
+"#;
+
+#[test]
+fn run_mode_from_cow_to_counted() {
+    // The Cow forms of the counted conversions: the borrowed
+    // variant clones the borrowed data into the handle, the
+    // owned variant hands its owned form over.
+    run_ok(
+        "from-cow-counted",
+        FROM_COW_TO_COUNTED_SRC,
+        "\"x\" \"owned-str\" [1, 2] [3, 4] \"y\" \"owned-os\" \"z\" \"w\"\n",
+    );
+}
