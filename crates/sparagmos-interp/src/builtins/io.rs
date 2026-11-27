@@ -64,6 +64,99 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Write `bytes` through a `std::fs::File` handle, in
+    /// the descriptor model's terms (see `desc_route` in
+    /// `interp::state`): a handle over a file-table entry
+    /// writes to that file, and so does a handle built by
+    /// `File::from_raw_fd` over a descriptor the routing
+    /// assigns to an entry (descriptor 0's stdin entry above
+    /// all). A handle over descriptor 1 or 2 -- numbers the
+    /// file counter never issues, so no table entry ever
+    /// carries them -- writes to the guest's standard stream
+    /// through the captured-stream model instead, so the
+    /// bytes land where the guest's own stream writes land,
+    /// as a native descriptor write lands on the process's
+    /// stream. `None` when the handle names nothing the
+    /// model holds (the caller's not-open error).
+    fn file_write(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+    ) -> Option<std::io::Result<usize>> {
+        if self.has_file(id) {
+            return self.with_file(id, |f| {
+                <std::fs::File as std::io::Write>::write(f, bytes)
+            });
+        }
+        match self.desc_route(id) {
+            crate::interp::DescRoute::Stdout => {
+                Some(self.write_stdout_partial(bytes))
+            }
+            crate::interp::DescRoute::Stderr => {
+                Some(self.write_stderr_bytes(bytes))
+            }
+            _ => self.desc_entry_id(id).and_then(|entry| {
+                self.with_file(entry, |f| {
+                    <std::fs::File as std::io::Write>::write(f, bytes)
+                })
+            }),
+        }
+    }
+
+    /// The `write_all` form of [`Self::file_write`].
+    fn file_write_all(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+    ) -> Option<std::io::Result<()>> {
+        if self.has_file(id) {
+            return self.with_file(id, |f| {
+                <std::fs::File as std::io::Write>::write_all(f, bytes)
+            });
+        }
+        match self.desc_route(id) {
+            crate::interp::DescRoute::Stdout => {
+                Some(self.write_stdout(bytes))
+            }
+            crate::interp::DescRoute::Stderr => Some(
+                self.write_stderr_bytes(bytes).map(|_| ()),
+            ),
+            _ => self.desc_entry_id(id).and_then(|entry| {
+                self.with_file(entry, |f| {
+                    <std::fs::File as std::io::Write>::write_all(
+                        f, bytes,
+                    )
+                })
+            }),
+        }
+    }
+
+    /// The `flush` form of [`Self::file_write`]: the captured
+    /// streams are unbuffered, so flushing a standard-stream
+    /// handle settles the stdout line buffer, as flushing
+    /// the guest's own `Stdout` handle does.
+    fn file_flush(
+        &mut self,
+        id: u64,
+    ) -> Option<std::io::Result<()>> {
+        if self.has_file(id) {
+            return self.with_file(id, |f| {
+                <std::fs::File as std::io::Write>::flush(f)
+            });
+        }
+        match self.desc_route(id) {
+            crate::interp::DescRoute::Stdout => {
+                Some(self.flush_stdout())
+            }
+            crate::interp::DescRoute::Stderr => Some(Ok(())),
+            _ => self.desc_entry_id(id).and_then(|entry| {
+                self.with_file(entry, |f| {
+                    <std::fs::File as std::io::Write>::flush(f)
+                })
+            }),
+        }
+    }
+
     /// The bytes of a byte-slice value (the buffer a `Write`
     /// call hands over).
     pub(super) fn slice_bytes(
@@ -210,9 +303,27 @@ impl<'a> Interpreter<'a> {
                 // exhaust the host through one call.
                 let want = (*len).min(1 << 23) as usize;
                 let mut buf = vec![0u8; want];
-                let read = self.with_file(id, |f| {
-                    <std::fs::File as std::io::Read>::read(f, &mut buf)
-                });
+                let read = if self.has_file(id) {
+                    self.with_file(id, |f| {
+                        <std::fs::File as std::io::Read>::read(
+                            f, &mut buf,
+                        )
+                    })
+                } else if matches!(
+                    self.desc_route(id),
+                    crate::interp::DescRoute::Stdout
+                        | crate::interp::DescRoute::Stderr
+                ) {
+                    Some(Err(std::io::Error::from_raw_os_error(9)))
+                } else {
+                    self.desc_entry_id(id).and_then(|entry| {
+                        self.with_file(entry, |f| {
+                            <std::fs::File as std::io::Read>::read(
+                                f, &mut buf,
+                            )
+                        })
+                    })
+                };
                 match read {
                     Some(Ok(n)) => {
                         self.write_bytes_into_slice(frames, &vals[1], 0, &buf[..n])?;
@@ -575,9 +686,7 @@ impl<'a> Interpreter<'a> {
                     };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
-                let written = self.with_file(id, |f| {
-                    <std::fs::File as std::io::Write>::write(f, &bytes)
-                });
+                let written = self.file_write(id, &bytes);
                 self.file_result(written, |n| Value::Uint(n as u128))
             }
             "std::io::Write::write_all" => {
@@ -600,9 +709,7 @@ impl<'a> Interpreter<'a> {
                     };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
-                let written = self.with_file(id, |f| {
-                    <std::fs::File as std::io::Write>::write_all(f, &bytes)
-                });
+                let written = self.file_write_all(id, &bytes);
                 self.file_result(written, |()| Value::Unit)
             }
             "std::io::Write::flush" => {
@@ -624,9 +731,7 @@ impl<'a> Interpreter<'a> {
                     };
                 }
                 let id = self.file_id_of(frames, &vals[0])?;
-                let flushed = self.with_file(id, |f| {
-                    <std::fs::File as std::io::Write>::flush(f)
-                });
+                let flushed = self.file_flush(id);
                 self.file_result(flushed, |()| Value::Unit)
             }
             "std::io::Seek::seek" => {

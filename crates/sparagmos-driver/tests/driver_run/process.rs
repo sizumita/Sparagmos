@@ -2451,3 +2451,125 @@ fn run_mode_process_host_exec() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "exec-ok\n");
 }
+
+const RAW_FD_STREAM_SRC: &str = r#"
+use std::fs::File;
+use std::io::{Read, Write};
+use std::mem;
+use std::os::unix::io::FromRawFd;
+
+fn main() {
+    // A `File` built over descriptor 1 or 2 denotes the
+    // guest's standard stream: its writes land where the
+    // guest's own stream writes land, and reading it is
+    // the native EBADF error, not a run failure.
+    unsafe {
+        let mut out = File::from_raw_fd(1);
+        out.write_all(b"via-fd-stdout\n").unwrap();
+        out.flush().unwrap();
+        mem::forget(out);
+        let mut err = File::from_raw_fd(2);
+        err.write_all(b"via-fd-stderr\n").unwrap();
+        mem::forget(err);
+        let mut out2 = File::from_raw_fd(1);
+        let mut buf = [0u8; 4];
+        assert!(out2.read(&mut buf).is_err());
+        mem::forget(out2);
+    }
+    println!("raw-fd-stream-ok");
+}
+"#;
+
+#[test]
+fn run_mode_raw_fd_standard_streams() {
+    let dir = temp_dir("raw-fd-stream");
+    let src = fixture(&dir, "raw_fd_stream.rs", RAW_FD_STREAM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "via-fd-stdout\nraw-fd-stream-ok\n"
+    );
+    assert!(
+        stderr.contains("via-fd-stderr\n"),
+        "stderr={stderr}"
+    );
+}
+
+const RAW_FD_CHILD_WRITES_SRC: &str = r#"
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::mem;
+use std::os::unix::io::FromRawFd;
+use std::process::Command;
+use std::thread;
+
+const THREADS: usize = 4;
+const WRITES: usize = 50;
+const WRITE_SIZE: usize = 4096;
+
+fn main() {
+    if env::args().len() == 1 {
+        // The io-stdout-blocking-writes shape: a
+        // self-spawned child whose threads write through
+        // a `File` over descriptor 1, collected through
+        // `output()`.
+        let me = env::current_exe().unwrap();
+        let out = Command::new(me).arg("run-the-test").output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), 0);
+        assert_eq!(out.stdout.len(), THREADS * WRITES * WRITE_SIZE);
+        // Sampled content check: a full byte-by-byte scan
+        // of the captured output through the interpreter
+        // costs far more than the writes themselves.
+        let n = out.stdout.len();
+        for i in (0..n).step_by(4093) {
+            assert_eq!(out.stdout[i], b'a');
+        }
+        assert_eq!(out.stdout[n - 1], b'a');
+        println!("raw-fd-child-writes-ok");
+    } else {
+        let threads = (0..THREADS)
+            .map(|_| {
+                thread::spawn(|| {
+                    let buf = [b'a'; WRITE_SIZE];
+                    for _ in 0..WRITES {
+                        unsafe {
+                            let mut file = File::from_raw_fd(1);
+                            file.write_all(&buf).unwrap();
+                            mem::forget(file);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+}
+"#;
+
+#[test]
+fn run_mode_process_host_raw_fd_child_writes() {
+    let dir = temp_dir("proc-host-raw-fd-writes");
+    let src = fixture(
+        &dir,
+        "process_host_raw_fd_writes.rs",
+        RAW_FD_CHILD_WRITES_SRC,
+    );
+    let out = run_driver_with_process_host_timeout(
+        &src,
+        &[],
+        &dir,
+        std::time::Duration::from_secs(180),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "raw-fd-child-writes-ok\n"
+    );
+}

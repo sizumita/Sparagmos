@@ -824,6 +824,11 @@ impl<'a> Interpreter<'a> {
         id
     }
 
+    /// Whether table id `id` currently names an open file.
+    pub(crate) fn has_file(&self, id: u64) -> bool {
+        self.files.borrow().contains_key(&id)
+    }
+
     /// Run `f` against the host file behind table id `id`;
     /// `None` when the id names no open file (a handle closed
     /// already, or one the model never issued).
