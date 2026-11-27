@@ -150,6 +150,28 @@ fn main() {
     );
 }
 
+/// Constant scalar arguments whose formatter reaches the fmt
+/// engine as a raw `Argument` over a value-backed target: the
+/// denoted value alone cannot denominate them (a `char` and a
+/// `u32` are the same value), so the formatter constant must
+/// carry its impl instance name for the engine to recover the
+/// `Self` type. Each scalar below renders through its own
+/// type: the char as a character, the cast as a number.
+#[test]
+fn const_format_constant_scalar_args() {
+    run_ok_both_opts(
+        "scalar-args",
+        r#"
+fn main() {
+    let s = format!("{} {} {} {}", 'z', true, 1.5f64, 'z' as u32);
+    let t = format!("{:?} {:x}", 'z', 'z' as u32);
+    println!("{s} | {t}");
+}
+"#,
+        "z true 1.5 122 | 'z' 7a\n",
+    );
+}
+
 /// Control: a runtime argument takes the `format_inner` branch
 /// of the same inlined `fmt::format` body, not the `ToOwned`
 /// branch; it must keep working at the same opt levels.
