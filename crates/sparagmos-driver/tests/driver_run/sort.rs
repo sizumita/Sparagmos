@@ -139,3 +139,76 @@ fn run_mode_sort_vec_path_refs_utf8() {
          \"zeta\" len=4\n",
     );
 }
+
+const OSSTR_LITERAL_SORT_SRC: &str = r#"
+use std::ffi::OsStr;
+
+fn main() {
+    let mut v: Vec<&OsStr> = vec![OsStr::new("banana"), OsStr::new("apple")];
+    v.sort();
+    println!("{:?} {:?}", v[0], v[1]);
+    let mut w: Vec<&OsStr> = vec![
+        OsStr::new("cherry"),
+        OsStr::new("apple"),
+        OsStr::new("banana"),
+    ];
+    w.sort_unstable();
+    println!("{:?} {:?} {:?}", w[0], w[1], w[2]);
+    println!("lens {} {}", v[0].len(), w[2].len());
+}
+"#;
+
+#[test]
+fn run_mode_sort_vec_osstr_refs_literal() {
+    // Regression for the second defect of the #513 pin
+    // family: with `OsStr::new` elements the sort itself
+    // stopped — the unstable sort's `insert_tail` copy met
+    // its own `copy_nonoverlapping` precondition check
+    // (`requires that both pointer arguments are aligned and
+    // non-null and the specified memory ranges do not
+    // overlap`). The element pointers were priced 8 bytes
+    // apart instead of 16: the tag layout table priced a
+    // reference to a dynamically sized ADT (`OsStr`, `Path`,
+    // `CStr`, any DST struct) as a thin pointer, knowing
+    // only `str` and slices as fat pointees, so a buffer of
+    // `&OsStr` elements was denominated at half its true
+    // stride wherever the tag walk priced it (the buffer
+    // price behind `as_mut_ptr`, `offset_from`, and the
+    // range checks). `layout_of` now judges a reference or
+    // raw-pointer tag's pointee against the program's DST
+    // records before the static table.
+    run_ok(
+        "sort-vec-osstr-refs-literal",
+        OSSTR_LITERAL_SORT_SRC,
+        "\"apple\" \"banana\"\n\
+         \"apple\" \"banana\" \"cherry\"\n\
+         lens 5 6\n",
+    );
+}
+
+const PATH_LITERAL_SORT_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    let mut v: Vec<&Path> = vec![Path::new("banana"), Path::new("apple")];
+    v.sort();
+    println!("{:?} {:?}", v[0], v[1]);
+    let mut w: Vec<&Path> = vec![Path::new("cherry"), Path::new("apple")];
+    w.sort_unstable();
+    println!("{:?} {:?}", w[0], w[1]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_vec_path_refs_literal() {
+    // The `&Path` literal form crossed the same thin
+    // pricing as `&OsStr` (see
+    // `run_mode_sort_vec_osstr_refs_literal`): element
+    // pointers into a `Vec<&Path>` buffer priced 8 apart.
+    run_ok(
+        "sort-vec-path-refs-literal",
+        PATH_LITERAL_SORT_SRC,
+        "\"apple\" \"banana\"\n\
+         \"apple\" \"cherry\"\n",
+    );
+}
