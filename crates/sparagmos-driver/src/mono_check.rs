@@ -1513,6 +1513,7 @@ pub fn check_required_consts() -> Option<String> {
         finding: None,
         crash: None,
         mono_finding: None,
+        force_abandoned: false,
     };
     walk.collect_roots();
     walk.run();
@@ -2128,6 +2129,64 @@ fn verify_panic_linkage(
     None
 }
 
+/// Whether every type `instance` drags in normalizes in the
+/// monomorphized environment, asked the way the collector
+/// asks it: the `try_` variant of instantiate-and-normalize,
+/// whose failure is exactly "the collector does not collect
+/// this item". The question is asked not only of the
+/// instance's signature but through the fields of the ADTs
+/// the signature and arguments mention: a drop glue's
+/// pointee carries its projections in its fields, not in the
+/// glue's signature, and it is the field projection's failure
+/// to normalize that keeps the collector from ever forcing
+/// the glue. A panic in the probe answers that the types
+/// normalize: the question could not be asked, which is not
+/// the abandonment's premise.
+fn instance_types_normalize<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+) -> bool {
+    let typing_env = fully_monomorphized();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut work: Vec<rustc_middle::ty::Ty<'tcx>> =
+            vec![instance.ty(tcx, typing_env)];
+        work.extend(instance.args.iter().filter_map(|arg| arg.as_type()));
+        let mut seen = std::collections::HashSet::new();
+        while let Some(ty) = work.pop() {
+            if !seen.insert(ty) {
+                continue;
+            }
+            if instance
+                .try_instantiate_mir_and_normalize_erasing_regions(
+                    tcx,
+                    typing_env,
+                    rustc_middle::ty::EarlyBinder::bind(tcx, ty),
+                )
+                .is_err()
+            {
+                return false;
+            }
+            for sub in ty.walk() {
+                if let Some(sub_ty) = sub.as_type() {
+                    if let rustc_middle::ty::TyKind::Adt(def, args) = sub_ty.kind() {
+                        for field in def.all_fields() {
+                            match tcx.try_normalize_erasing_regions(
+                                typing_env,
+                                field.ty(tcx, args),
+                            ) {
+                                Ok(field_ty) => work.push(field_ty),
+                                Err(_) => return false,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }))
+    .unwrap_or(true)
+}
+
 struct RequiredConstWalk<'tcx> {
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     visited: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
@@ -2146,6 +2205,19 @@ struct RequiredConstWalk<'tcx> {
     /// after `check_bodies`, whose findings name some of the
     /// same rejections more precisely.
     mono_finding: Option<String>,
+    /// Set by `process` when this instance's `check_mono_item`
+    /// force took the abandonment branch (the force panicked
+    /// with no errors counted before it) AND the instance is
+    /// of the abandoned kind: its types do not normalize in
+    /// the monomorphized environment, so the collector would
+    /// never force it (see `instance_types_normalize`). The
+    /// compiler-bug witness such a force leaves is the
+    /// abandoned force's own, discounted with its diagnostics,
+    /// so `run` does not convert it into `crash`. A force
+    /// abandoned on an instance whose types DO normalize is
+    /// one the collector itself makes for a collected
+    /// instance, and its witness stays a crash.
+    force_abandoned: bool,
 }
 
 impl<'tcx> RequiredConstWalk<'tcx> {
@@ -2157,6 +2229,7 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             // The bug-witness snapshot for this instance's
             // processing, diffed below.
             let witnesses_before = crate::convert::compiler_bug_witness_len();
+            self.force_abandoned = false;
             // Instance-body access and constant evaluation go
             // through the compiler's internals and can panic on
             // exotic instances (foreign bodies with no MIR here,
@@ -2177,8 +2250,14 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             // The diff is scoped to this instance's processing,
             // so bug panics contained on speculative paths the
             // walk does not decide (and the findings computed
-            // after the walk) never reach it.
-            if self.crash.is_none() {
+            // after the walk) never reach it. One exemption: a
+            // force `process` abandoned on an instance whose
+            // types do not normalize (see `force_abandoned`)
+            // leaves its bug witness discounted with its
+            // diagnostics: the collector would never make that
+            // force, so the compiler dying inside it is not a
+            // crash on a collected instance.
+            if self.crash.is_none() && !self.force_abandoned {
                 if let Some(record) =
                     crate::convert::compiler_bug_witness_since(witnesses_before)
                 {
@@ -2493,6 +2572,16 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 // abandoned force's diagnostics are discounted
                 // the same way: with no errors counted before the
                 // force, resetting restores exactly that state.
+                // The force's compiler-bug witness is discounted
+                // with its diagnostics only when the instance is
+                // of the abandoned kind — its types do not
+                // normalize in the monomorphized environment, so
+                // the collector would never make this force. A
+                // force abandoned on an instance whose types do
+                // normalize is the collector's own force on a
+                // collected instance, and the compiler dying
+                // inside it stays a crash verdict in `run`.
+                self.force_abandoned = !instance_types_normalize(tcx, instance);
                 tcx.dcx().reset_err_count();
             }
         }
