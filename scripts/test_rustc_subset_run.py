@@ -1824,6 +1824,146 @@ class RunCmdMemoryLimitTests(unittest.TestCase):
         self.assertEqual(bucket, "memory limit")
 
 
+class WindowsProcessLayerTests(unittest.TestCase):
+    """The runner process layer's Windows branches (Issue #517).
+
+    Each branch is selected from sys.platform at call time;
+    these tests patch it to "win32" and stub the process side,
+    so they run on the POSIX hosts CI uses. The POSIX forms are
+    pinned alongside: selecting the Windows branch must not
+    move them.
+    """
+
+    def test_kill_process_tree_uses_taskkill_on_windows(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return unittest.mock.Mock(returncode=0)
+
+        with unittest.mock.patch.object(sys, "platform", "win32"), \
+                unittest.mock.patch.object(
+                    run.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(
+                    run.os, "killpg",
+                    side_effect=AssertionError("killpg used")), \
+                unittest.mock.patch.object(
+                    run.os, "kill",
+                    side_effect=AssertionError("kill used")):
+            run._kill_process_tree(4242, pgid=4242,
+                                   extra_pids=(4242, 7777))
+        # The root's tree kill covers its descendants; a
+        # remembered member is named individually, and the
+        # root is not killed twice.
+        self.assertEqual(
+            calls,
+            [["taskkill", "/PID", "4242", "/T", "/F"],
+             ["taskkill", "/PID", "7777", "/T", "/F"]])
+
+    def test_kill_process_tree_posix_form_unchanged(self):
+        killed = []
+        with unittest.mock.patch.object(sys, "platform", "linux"), \
+                unittest.mock.patch.object(
+                    run, "_proc_tree", lambda pid: ([4321], 0)), \
+                unittest.mock.patch.object(
+                    run.os, "killpg",
+                    lambda pgid, sig: killed.append(("pg", pgid, sig))), \
+                unittest.mock.patch.object(
+                    run.os, "kill",
+                    lambda pid, sig: killed.append(("pid", pid, sig))):
+            run._kill_process_tree(4321, pgid=4321,
+                                   extra_pids=(9999,))
+        self.assertEqual(
+            killed,
+            [("pg", 4321, run.signal.SIGKILL),
+             ("pid", 9999, run.signal.SIGKILL),
+             ("pid", 4321, run.signal.SIGKILL)])
+
+    def test_lib_path_entry_windows_uses_path_and_semicolons(self):
+        with unittest.mock.patch.object(sys, "platform", "win32"), \
+                unittest.mock.patch.dict(
+                    os.environ, {"PATH": "C:\\Windows"}, clear=True):
+            name, value = run._lib_path_entry(["C:\\a", "C:\\b"])
+        self.assertEqual(name, "PATH")
+        self.assertEqual(value, "C:\\a;C:\\b;C:\\Windows")
+
+    def test_lib_path_entry_posix_form_unchanged(self):
+        with unittest.mock.patch.object(sys, "platform", "linux"), \
+                unittest.mock.patch.dict(
+                    os.environ, {"LD_LIBRARY_PATH": "/prev"},
+                    clear=True):
+            self.assertEqual(
+                run._lib_path_entry(["/a", "/b"]),
+                ("LD_LIBRARY_PATH", "/a:/b:/prev"))
+        with unittest.mock.patch.object(sys, "platform", "linux"), \
+                unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(run._lib_path_entry(["/a"]),
+                             ("LD_LIBRARY_PATH", "/a"))
+
+    def test_find_artifact_windows_bare_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "foo.dll").touch()
+            (Path(td) / "bar.lib").touch()
+            (Path(td) / "libbaz.rlib").touch()
+            (Path(td) / "baz.dll").touch()
+            with unittest.mock.patch.object(sys, "platform", "win32"):
+                # A dylib / proc-macro artifact is `{name}.dll`
+                # with no lib prefix; a staticlib is `{name}.lib`.
+                self.assertEqual(run.find_artifact(td, "foo"),
+                                 Path(td) / "foo.dll")
+                self.assertEqual(run.find_artifact(td, "bar"),
+                                 Path(td) / "bar.lib")
+                # The rlib still outranks the same crate's dll.
+                self.assertEqual(run.find_artifact(td, "baz"),
+                                 Path(td) / "libbaz.rlib")
+
+    def test_find_artifact_posix_form_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "foo.dll").touch()
+            (Path(td) / "libqux.so").touch()
+            with unittest.mock.patch.object(sys, "platform", "linux"):
+                # The bare-name glob is Windows-only: a prefixless
+                # dll is not an artifact name on POSIX.
+                self.assertIsNone(run.find_artifact(td, "foo"))
+                self.assertEqual(run.find_artifact(td, "qux"),
+                                 Path(td) / "libqux.so")
+
+    def test_support_artifact_suffixes(self):
+        with unittest.mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(run._support_artifact_suffixes(),
+                             (".rlib", ".so", ".dylib"))
+        with unittest.mock.patch.object(sys, "platform", "win32"):
+            suffixes = run._support_artifact_suffixes()
+        self.assertIn(".dll", suffixes)
+        self.assertIn(".lib", suffixes)
+        self.assertIn(".rlib", suffixes)
+
+    def test_stage3_recipe_env_platform_forms(self):
+        paths = {"rustc": "/tc/rustc", "rustdoc": "/tc/rustdoc",
+                 "sysroot_lib": "/tc/lib",
+                 "target_lib": "/tc/target/lib"}
+        with unittest.mock.patch.object(
+                run, "stage3_toolchain_paths", lambda: paths):
+            with unittest.mock.patch.object(sys, "platform", "linux"):
+                env = run.stage3_recipe_env(
+                    Path("/rust"), Path("/build"), "run-make")
+            self.assertEqual(env["LD_LIB_PATH_ENVVAR"],
+                             "LD_LIBRARY_PATH")
+            self.assertEqual(env["LD_LIBRARY_PATH"],
+                             "/tc/lib:/tc/target/lib")
+            self.assertNotIn("PATH", env)
+            with unittest.mock.patch.object(sys, "platform", "win32"), \
+                    unittest.mock.patch.dict(
+                        os.environ, {"PATH": "C:\\Windows"},
+                        clear=True):
+                env = run.stage3_recipe_env(
+                    Path("/rust"), Path("/build"), "run-make")
+            self.assertEqual(env["LD_LIB_PATH_ENVVAR"], "PATH")
+            self.assertEqual(env["PATH"],
+                             "/tc/lib;/tc/target/lib;C:\\Windows")
+            self.assertNotIn("LD_LIBRARY_PATH", env)
+
+
 class ConcreteEditionTests(unittest.TestCase):
     def test_closed_range_takes_lower_bound(self):
         # compiletest's range is half-open and, with no requested
