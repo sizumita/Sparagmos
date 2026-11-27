@@ -61,6 +61,11 @@ pub(super) struct Converter<'a> {
     pub(super) coroutine_zst_slots: HashMap<String, HashMap<String, u32>>,
     /// ADT instance layouts of the program (see `MirProgram`).
     pub(super) adt_layouts: &'a mir::AdtLayouts,
+    /// Runtime layout descriptors of the program's dynamically
+    /// sized ADT instances (see `MirProgram`). Consulted to
+    /// decide whether a type is unsized (see
+    /// `Converter::ty_is_unsized`).
+    pub(super) adt_dst_layouts: &'a mir::AdtDstLayouts,
     /// Per-variant field layouts of the program's ADT
     /// instances (see `MirProgram`).
     pub(super) adt_field_layouts: &'a mir::AdtFieldLayouts,
@@ -251,6 +256,7 @@ impl<'a> Converter<'a> {
             coroutine_layouts: &program.coroutine_layouts,
             coroutine_zst_slots,
             adt_layouts: &program.adt_layouts,
+            adt_dst_layouts: &program.adt_dst_layouts,
             adt_field_layouts: &program.adt_field_layouts,
             tuple_layouts: &program.tuple_layouts,
             adt_tag_layouts: &program.adt_tag_layouts,

@@ -952,6 +952,42 @@ fn run_mode_path_mixed_cmp() {
     run_ok("path-mixed-cmp", PATH_MIXED_CMP_SRC, "path-mixed-cmp-ok\n");
 }
 
+const PATH_REF_SORT_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // Sorting a Vec of wide references (each element is a fat
+    // pointer: two words) exercises the sort's internal
+    // element copies at the element type's true stride; a
+    // second sort over a Vec of a different element type runs
+    // in the same program.
+    let a = PathBuf::from("a/b");
+    let b = PathBuf::from("a-b");
+    let c = PathBuf::from("c");
+    let mut v: Vec<&Path> = vec![c.as_path(), b.as_path(), a.as_path()];
+    v.sort();
+    assert_eq!(v[0].to_str().unwrap(), "a/b");
+    assert_eq!(v[1].to_str().unwrap(), "a-b");
+    assert_eq!(v[2].to_str().unwrap(), "c");
+    let mut w: Vec<PathBuf> = vec![
+        PathBuf::from("a/b"),
+        PathBuf::from("c"),
+        PathBuf::from("a/b"),
+        PathBuf::from("a-b"),
+        PathBuf::from("c"),
+    ];
+    w.sort();
+    w.dedup();
+    assert_eq!(w.len(), 3);
+    println!("path-ref-sort-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_ref_sort() {
+    run_ok("path-ref-sort", PATH_REF_SORT_SRC, "path-ref-sort-ok\n");
+}
+
 const PATHBUF_PTR_SWAP_SRC: &str = r#"
 use std::path::PathBuf;
 

@@ -870,7 +870,7 @@ impl<'a> Interpreter<'a> {
             Ty::Float(t) => u64::from(t.bits() / 8),
             Ty::Adt(name) => self.program().adt_layouts.get(name).map(|&(size, _)| size)?,
             Ty::Ref(pointee) => {
-                if matches!(&**pointee, Ty::Slice(_) | Ty::Str | Ty::Dynamic(..)) {
+                if self.ty_is_unsized(pointee) {
                     16
                 } else {
                     8

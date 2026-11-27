@@ -2451,19 +2451,27 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Whether a type is dynamically sized in the model's
-    /// terms: a slice, a string, or an ADT whose last field is
-    /// (recursively) dynamically sized — the shape of the
-    /// byte-string DST wrappers (`OsStr`, `Path`, `CStr`) and
-    /// of custom DST structs. Judged from the conversion-
-    /// recorded field table; a bounded walk, as a recursive
-    /// tail would be an infinitely sized type.
+    /// terms: a slice, a string, a trait object or a foreign
+    /// type; a tuple whose tail is dynamically sized; or an
+    /// ADT whose last field is (recursively) dynamically
+    /// sized — the shape of the byte-string DST wrappers
+    /// (`OsStr`, `Path`, `CStr`) and of custom DST structs.
+    /// Judged from the conversion-recorded field table; a
+    /// bounded walk, as a recursive tail would be an
+    /// infinitely sized type. A reference to an unsized type
+    /// is a fat pointer: it occupies two words, not one.
     pub(crate) fn ty_is_unsized(&self, ty: &Ty) -> bool {
         fn inner(interp: &Interpreter, ty: &Ty, depth: usize) -> bool {
             if depth > 16 {
                 return false;
             }
             match ty {
-                Ty::Slice(_) | Ty::Str => true,
+                Ty::Slice(_) | Ty::Str | Ty::Dynamic(..) | Ty::Foreign(_) => {
+                    true
+                }
+                Ty::Tuple(ts) => ts.last().is_some_and(|tail| {
+                    inner(interp, tail, depth + 1)
+                }),
                 Ty::Adt(name) => interp
                     .program()
                     .adt_field_tys
