@@ -4268,3 +4268,57 @@ fn run_mode_cast_temporary_has_its_own_address() {
     // suite's `cast/cast-not-treated-as-lvalue` shape).
     run_ok("cast-temp-address", CAST_TEMP_ADDRESS_SRC, "cast temp ok\n");
 }
+
+const COPY_FROM_UNINIT_NESTED_SRC: &str = r#"
+use std::alloc::{alloc, Layout};
+use std::mem::{ManuallyDrop, MaybeUninit};
+
+union Data {
+    inline: ManuallyDrop<MaybeUninit<[u32; 4]>>,
+    heap: *mut u32,
+}
+
+fn main() {
+    unsafe {
+        // An uninit-born nested array (the SmallVec inline
+        // buffer shape), filled element by element through a
+        // pointer derived from the union field.
+        let mut data = Data {
+            inline: ManuallyDrop::new(MaybeUninit::uninit()),
+        };
+        let base = (*data.inline).as_mut_ptr() as *mut u32;
+        for i in 0..4 {
+            base.add(i).write(10 + (i as u32) * 7);
+        }
+        // The grow step: copy the inline elements out to a
+        // fresh heap buffer with `copy_nonoverlapping`.
+        let layout = Layout::array::<u32>(4).unwrap();
+        let heap = alloc(layout) as *mut u32;
+        std::ptr::copy_nonoverlapping(base, heap, 4);
+        let out = std::slice::from_raw_parts(heap, 4);
+        assert_eq!(out, [10, 17, 24, 31]);
+        println!("grow ok: {:?}", out);
+        // And back into another uninit-born nested array.
+        let mut dst = Data {
+            inline: ManuallyDrop::new(MaybeUninit::uninit()),
+        };
+        let dst_base = (*dst.inline).as_mut_ptr() as *mut u32;
+        std::ptr::copy_nonoverlapping(heap, dst_base, 4);
+        let back = std::slice::from_raw_parts(dst_base, 4);
+        assert_eq!(back, [10, 17, 24, 31]);
+        println!("back ok: {:?}", back);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_copy_nonoverlapping_from_uninit_nested_array() {
+    // Issue #500: `copy_nonoverlapping` out of a scalar-packed
+    // nested (uninit-born) array -- the SmallVec grow shape --
+    // must move every element, not fail on the packed storage.
+    run_ok(
+        "copy-from-uninit-nested",
+        COPY_FROM_UNINIT_NESTED_SRC,
+        "grow ok: [10, 17, 24, 31]\nback ok: [10, 17, 24, 31]\n",
+    );
+}

@@ -2151,6 +2151,113 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The size in bytes of one slot of the sequence `target`
+    /// denotes at `path` (the target's projection up to the
+    /// sequence's base), when conversion recorded it: the
+    /// `field_elem_sizes` record for the field path (whose
+    /// components are field indices -- a union field step is a
+    /// field index in that record, as conversion walks unions
+    /// like structs), or the array element size for a bare
+    /// array local. A path with no record of its own falls
+    /// back to the declared types along the path, walked
+    /// through the fields' recorded type tags, when the path
+    /// ends at an array. `None` for every other shape: a
+    /// non-place target, a path with a step that is not a
+    /// field step, or no record and no such walk for the path.
+    pub(crate) fn seq_slot_size(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        path: &[RefProj],
+    ) -> Option<u64> {
+        let Resolved::Place {
+            frame_pos, local, ..
+        } = target
+        else {
+            return None;
+        };
+        let frame = frames.get(*frame_pos)?;
+        let body = self.program().functions.get(&frame.func)?;
+        let mut field_path = Vec::new();
+        for step in path {
+            match step {
+                RefProj::Field(f) => field_path.push(*f),
+                RefProj::UnionField { idx, .. } => field_path.push(*idx),
+                _ => return None,
+            }
+        }
+        if field_path.is_empty() {
+            match body.local_tys.get(*local) {
+                Some(Ty::Array(elem_ty, _)) => self.ty_size(elem_ty),
+                _ => None,
+            }
+        } else if let Some(size) = body
+            .field_elem_sizes
+            .get(*local)
+            .and_then(|sizes| sizes.get(&field_path))
+            .copied()
+        {
+            Some(size)
+        } else {
+            // No record for the path: conversion's walk does
+            // not enter every wrapper (a union's fields above
+            // all), so a path through such a wrapper to an
+            // array field has no record of its own. The array's
+            // element size is still derivable from the declared
+            // type the path denotes.
+            match self.target_denoted_ty(frames, target, path) {
+                Some(Ty::Array(elem, _)) => self.ty_size(&elem),
+                _ => None,
+            }
+        }
+    }
+
+    /// The declared type a place target's projection denotes,
+    /// walked through the program's field-type table (the walk
+    /// [`Self::seq_slot_size`]'s fallback takes). `None` when
+    /// the target is not a place, a step is not a field step,
+    /// or a field's type is not recorded.
+    pub(crate) fn target_denoted_ty(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        path: &[RefProj],
+    ) -> Option<Ty> {
+        let Resolved::Place {
+            frame_pos, local, ..
+        } = target
+        else {
+            return None;
+        };
+        let frame = frames.get(*frame_pos)?;
+        let body = self.program().functions.get(&frame.func)?;
+        let mut ty = body.local_tys.get(*local)?.clone();
+        let mut variant = 0usize;
+        for step in path {
+            let (i, union) = match step {
+                RefProj::Field(i) => (*i, false),
+                RefProj::UnionField { idx, .. } => (*idx, true),
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                    continue;
+                }
+                _ => return None,
+            };
+            let Ty::Adt(name) = &ty else {
+                return None;
+            };
+            let name = name.clone();
+            ty = self.instance_field_ty(
+                &name,
+                &ty,
+                if union { 0 } else { variant },
+                i,
+            )?;
+            variant = 0;
+        }
+        Some(ty)
+    }
+
     /// The directly-resolved target of element `index` of the
     /// sequence starting at `target`, when `target` denotes a
     /// single element of it (see [`Self::read_seq_at`]); `None`
