@@ -998,3 +998,170 @@ fn run_mode_flat_map_size_hint() {
         "map=(3, Some(3))\nopt-fresh=(0, Some(3))\nopt-first=Some(1)\nopt-after1=(0, Some(2))\narr=(4, Some(4))\nvec-fresh=(0, None)\nvec-first=Some(1)\nvec-mid=(1, None)\nfl-first=Some(1)\nfl-mid=(1, None)\n"
     );
 }
+
+
+/// A guest-defined `Iterator` impl whose only demand
+/// arrives through the builtin-diverted consumer names:
+/// `group_by` (an `IteratorExt`-style constructor) builds
+/// a `GroupBy` over a `Peekable`, a modelled `Zip` steps
+/// it, and `collect` drains the group iterators. The
+/// `GroupBy::next` body -- a generic impl whose `G`
+/// parameter is not determined by `Self` -- must be
+/// materialised by the iterator demand pass, its inner
+/// `Peekable::next` call must be served by the collected
+/// core body, and the key closure it stores must be
+/// callable through the `&mut` reference `Option::map`
+/// hands to `call_once`. Mirrors the shape of
+/// `tests/ui/impl-trait/example-calendar.rs`'s
+/// `test_group_by`.
+const GROUP_BY_SRC: &str = r#"
+struct GroupBy<It: Iterator, F> {
+    it: std::iter::Peekable<It>,
+    f: F,
+}
+
+impl<It, F> Clone for GroupBy<It, F>
+where
+    It: Iterator + Clone,
+    It::Item: Clone,
+    F: Clone,
+{
+    fn clone(&self) -> Self {
+        GroupBy { it: self.it.clone(), f: self.f.clone() }
+    }
+}
+
+impl<G, It, F> Iterator for GroupBy<It, F>
+where
+    It: Iterator + Clone,
+    It::Item: Clone,
+    F: Clone + FnMut(&It::Item) -> G,
+    G: Eq + Clone,
+{
+    type Item = (G, InGroup<std::iter::Peekable<It>, F, G>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.peek().map(&mut self.f).map(|key| {
+            let start = self.it.clone();
+            while let Some(k) = self.it.peek().map(&mut self.f) {
+                if key != k {
+                    break;
+                }
+                self.it.next();
+            }
+            (key.clone(), InGroup { it: start, f: self.f.clone(), g: key })
+        })
+    }
+}
+
+#[derive(Copy, Clone)]
+struct InGroup<It, F, G> {
+    it: It,
+    f: F,
+    g: G,
+}
+
+impl<It: Iterator, F: FnMut(&It::Item) -> G, G: Eq> Iterator for InGroup<It, F, G> {
+    type Item = It::Item;
+
+    fn next(&mut self) -> Option<It::Item> {
+        self.it.next().and_then(|x| {
+            if (self.f)(&x) == self.g { Some(x) } else { None }
+        })
+    }
+}
+
+trait IteratorExt: Iterator + Sized {
+    fn group_by<G, F>(self, f: F) -> GroupBy<Self, F>
+    where
+        F: Clone + FnMut(&Self::Item) -> G,
+        G: Eq,
+    {
+        GroupBy { it: self.peekable(), f }
+    }
+}
+
+impl<It> IteratorExt for It where It: Iterator {}
+
+fn main() {
+    let input = [[1, 1], [1, 1], [1, 2], [2, 2], [2, 3], [2, 3], [3, 3]];
+    let by_x = input.iter().cloned().group_by(|a| a[0]);
+    let expected_1: &[&[[i32; 2]]] = &[
+        &[[1, 1], [1, 1], [1, 2]],
+        &[[2, 2], [2, 3], [2, 3]],
+        &[[3, 3]],
+    ];
+    for ((_, a), b) in by_x.zip(expected_1.iter().cloned()) {
+        assert_eq!(&a.collect::<Vec<_>>()[..], b);
+    }
+    println!("group_by ok");
+}
+"#;
+
+#[test]
+fn run_mode_group_by_guest_iterator_impl() {
+    run_ok("group-by-demand", GROUP_BY_SRC, "group_by ok\n");
+}
+
+/// `Peekable::next` has no modelled state-machine step:
+/// its state is the genuine struct the collected `peek`
+/// body manipulates, so a direct `next` call on a
+/// `Peekable` -- here from a plain local function -- is
+/// served by the collected core body.
+const PEEKABLE_NEXT_SRC: &str = r#"
+fn step<I: Iterator>(it: &mut std::iter::Peekable<I>) -> Option<I::Item> {
+    it.next()
+}
+
+fn main() {
+    let input = [[1, 1], [1, 2], [2, 2]];
+    let mut p = input.iter().cloned().peekable();
+    assert_eq!(p.peek(), Some(&[1, 1]));
+    assert_eq!(step(&mut p), Some([1, 1]));
+    assert_eq!(step(&mut p), Some([1, 2]));
+    assert_eq!(step(&mut p), Some([2, 2]));
+    assert_eq!(step(&mut p), None);
+    println!("peekable next ok");
+}
+"#;
+
+#[test]
+fn run_mode_peekable_next_direct_call() {
+    run_ok("peekable-next", PEEKABLE_NEXT_SRC, "peekable next ok\n");
+}
+
+
+/// `FnOnce::call_once` handed a closure through a
+/// reference: inside `Option::map`'s body the callable
+/// operand is the `&mut` field borrow, and the `CallOnce`
+/// dispatch must follow the reference to the closure
+/// (the shape `Peekable::peek`'s internal
+/// `Option::map(&mut self.f)`-style calls take).
+const MAP_CALL_ONCE_SRC: &str = r#"
+struct S<F: FnMut(i32) -> i32> {
+    it: std::iter::Peekable<std::vec::IntoIter<i32>>,
+    f: F,
+}
+
+impl<F: FnMut(i32) -> i32> S<F> {
+    fn peek_key(&mut self) -> Option<i32> {
+        self.it.peek().copied().map(&mut self.f)
+    }
+}
+
+fn main() {
+    let mut s = S {
+        it: vec![10, 20].into_iter().peekable(),
+        f: |x| x + 1,
+    };
+    assert_eq!(s.peek_key(), Some(11));
+    assert_eq!(s.it.next(), Some(10));
+    assert_eq!(s.peek_key(), Some(21));
+    println!("map call_once ok");
+}
+"#;
+
+#[test]
+fn run_mode_map_call_once_through_mut_ref() {
+    run_ok("map-call-once-ref", MAP_CALL_ONCE_SRC, "map call_once ok\n");
+}

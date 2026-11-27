@@ -1091,6 +1091,26 @@ impl<'a> Interpreter<'a> {
                                 } else {
                                     (value, env_ref)
                                 };
+                            // A reference receiver names the
+                            // blanket `FnOnce` impl for `&F` /
+                            // `&mut F` (which requires `F: FnMut`):
+                            // the pointee is the callable, called
+                            // without being consumed -- the shape
+                            // of a generic consumer's `call_once`
+                            // on a borrowed closure, such as an
+                            // `Option::map` handed `&mut self.f`.
+                            // Follow the reference to the callable
+                            // as the `Call` / `CallMut` arm's deref
+                            // chain and the callable-operand
+                            // completion path both do; a reference
+                            // whose chain ends elsewhere keeps the
+                            // value (and its error) unchanged.
+                            let (value, env_ref) =
+                                if matches!(value, Value::Ref(_) | Value::FatRef { .. }) {
+                                    self.callable_through_refs(frames, value, env_ref)?
+                                } else {
+                                    (value, env_ref)
+                                };
                             // A by-value receiver may still be a
                             // transparent one-field wrapper around
                             // the callable (an `FnOnce` wrapper
