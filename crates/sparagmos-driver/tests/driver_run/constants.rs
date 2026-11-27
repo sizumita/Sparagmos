@@ -179,6 +179,64 @@ fn run_mode_large_u32_table_const() {
 }
 
 #[test]
+fn run_mode_byte_slice_constant_at_allocation_offset() {
+    // A `&[u8]` constant minted in a const context pointing into
+    // the middle of its backing allocation (a subslice built with
+    // `from_raw_parts` over a byte string): the denoted bytes are
+    // the ones from the pointer's stored offset on, not the
+    // allocation's prefix of the same length. Before the
+    // offset-aware fat-pointer decode, the constant materialised
+    // as the prefix bytes and the program printed those instead.
+    let src = r#"
+const B: &[u8] = b"prefix-hello";
+const T: &[u8] = unsafe { std::slice::from_raw_parts(B.as_ptr().add(7), 5) };
+fn main() { println!("{} {} {}", T[0], T[4], T.len()); }
+"#;
+    let dir = temp_dir("byte-slice-offset");
+    let src = fixture(&dir, "byte_slice_offset.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offset byte slice constant must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "104 111 5\n",
+        "decoded slice bytes must be the denoted range"
+    );
+}
+
+#[test]
+fn run_mode_byte_array_window_constant_at_allocation_offset() {
+    // A thin `&[u8; 3]` constant denoting a window into the middle
+    // of a larger byte-array allocation: the plain-pointee
+    // shortcut must read from the pointer's stored offset, not
+    // the allocation's start. Before the offset-aware decode, the
+    // constant materialised as the allocation's first bytes.
+    let src = r#"
+const B: [u8; 8] = *b"abcdefgh";
+const T: &[u8; 3] = unsafe { &*B.as_ptr().add(2).cast::<[u8; 3]>() };
+fn main() { println!("{} {}", T[0], T[2]); }
+"#;
+    let dir = temp_dir("byte-array-window-offset");
+    let src = fixture(&dir, "byte_array_window_offset.rs", src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offset byte array window constant must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "99 101\n",
+        "decoded window bytes must be the denoted range"
+    );
+}
+
+#[test]
 fn run_mode_nested_zst_table_stays_undecoded() {
     // A nonzero-stride element type can contain zero-sized
     // arrays whose declared lengths multiply without occupying
