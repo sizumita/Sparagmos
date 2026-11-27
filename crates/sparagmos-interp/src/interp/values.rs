@@ -277,9 +277,33 @@ pub(crate) fn value_tree_has_scalar(value: &Value) -> bool {
     }
 }
 
+/// The field type of the ADT `name` when it is a
+/// transparent integer newtype: exactly one variant with
+/// exactly one field, whose recorded type is an integer.
+/// `None` for every other ADT, and when the field table
+/// does not record the ADT at all.
+fn adt_integer_newtype_field(program: &Program, name: &str) -> Option<Ty> {
+    let variants = super::project::adt_field_tys_of(program, name)?;
+    if variants.len() != 1 {
+        return None;
+    }
+    let fields = &variants[0];
+    if fields.len() != 1 {
+        return None;
+    }
+    match &fields[0] {
+        Some(t @ (Ty::Uint(_) | Ty::Int(_))) => Some(t.clone()),
+        _ => None,
+    }
+}
+
 impl<'a> Interpreter<'a> {
     /// Validate / wrap a value being stored into a typed direct local.
-    pub(crate) fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
+    pub(crate) fn normalize_for_ty(
+        &self,
+        mut value: Value,
+        ty: Option<&Ty>,
+    ) -> InterpResult<Value> {
         if value == Value::Uninit {
             // A `MaybeUninit` place holding the bare marker
             // denotes the uninitialized union value: the store
@@ -494,6 +518,37 @@ impl<'a> Interpreter<'a> {
                     if fields.len() == 1 && matches!(fields[0], Value::Str(_)) {
                         value = fields[0].clone();
                     }
+                }
+            }
+        }
+        // A bare integer stored into a one-field ADT place:
+        // the ADT is a transparent integer newtype — the
+        // niche wrappers of `core::num::niche_types` are the
+        // measured case (a guest body assigns a `Duration`'s
+        // nanoseconds field, which the time model produces
+        // in its bare integer form, into a `Nanoseconds`
+        // place). The store wraps the scalar in the ADT's
+        // single-variant, single-field aggregate, the shape
+        // a decoded constant of the ADT carries; the field's
+        // readers accept both forms. The guard is exact —
+        // one variant, one field, of integer type — so no
+        // multi-field ADT store changes its verdict.
+        if let Some(Ty::Adt(name)) = ty {
+            if let Some(field_ty) = adt_integer_newtype_field(self.program, name) {
+                let wrapped = match (&value, &field_ty) {
+                    (Value::Uint(v), Ty::Uint(ut)) => Some(Value::Uint(*v & ut.max())),
+                    (Value::Int(v), Ty::Int(it)) => Some(Value::Int(wrap_signed(*v, it.bits()))),
+                    (Value::Uint(v), Ty::Int(it)) => {
+                        Some(Value::Int(wrap_signed(*v as i128, it.bits())))
+                    }
+                    (Value::Int(v), Ty::Uint(ut)) => Some(Value::Uint((*v as u128) & ut.max())),
+                    _ => None,
+                };
+                if let Some(field) = wrapped {
+                    return Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![field],
+                    });
                 }
             }
         }

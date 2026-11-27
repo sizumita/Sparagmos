@@ -2570,7 +2570,7 @@ impl<'a> Interpreter<'a> {
                             local: *local,
                         }
                     })?;
-                    *slot = Self::normalize_for_ty(value, target_body.local_ty(Local(*local)))?;
+                    *slot = self.normalize_for_ty(value, target_body.local_ty(Local(*local)))?;
                     return Ok(());
                 }
                 let func = frames[*frame_pos].func.clone();
