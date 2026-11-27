@@ -357,8 +357,7 @@ impl Converter {
             self.record_dst_layout(def, args, &key);
             return;
         }
-        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        let Ok(Ok(layout)) = layout else {
+        let Some(layout) = guarded_layout(ty) else {
             return;
         };
         let shape = layout.shape();
@@ -437,10 +436,7 @@ impl Converter {
                     if ty_mentions_coroutine(&fty) {
                         return;
                     }
-                    let queried = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| fty.layout()),
-                    );
-                    let Ok(Ok(layout)) = queried else {
+                    let Some(layout) = guarded_layout(&fty) else {
                         return;
                     };
                     let shape = layout.shape();
@@ -585,10 +581,7 @@ impl Converter {
                 if ty_mentions_coroutine(&fty) {
                     return;
                 }
-                let queried = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| fty.layout()),
-                );
-                let Ok(Ok(flayout)) = queried else { return };
+                let Some(flayout) = guarded_layout(&fty) else { return };
                 row.push((off, flayout.shape().size.bytes() as u64));
             }
             out[*v] = row;
@@ -695,8 +688,7 @@ impl Converter {
         if adt_sizedness(def, args, 0) == Sizedness::Unsized {
             return;
         }
-        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        let Ok(Ok(layout)) = layout else {
+        let Some(layout) = guarded_layout(ty) else {
             return;
         };
         let shape = layout.shape();
@@ -831,8 +823,7 @@ impl Converter {
         // only by a where-clause on the definition, whose
         // trait has no unconditional implementation for the
         // substituted arguments at all.
-        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        if !matches!(layout, Ok(Ok(_))) {
+        if guarded_layout(ty).is_none() {
             return;
         }
         let kind = shape.kind;
@@ -933,8 +924,7 @@ impl Converter {
         if !self.layout_attempted.insert(key.clone()) {
             return;
         }
-        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        let Ok(Ok(layout)) = layout else {
+        let Some(layout) = guarded_layout(ty) else {
             return;
         };
         let shape = layout.shape();
@@ -987,9 +977,7 @@ impl Converter {
         if converted_mentions_coroutine(converted) {
             return;
         }
-        let layout =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        let Ok(Ok(layout)) = layout else {
+        let Some(layout) = guarded_layout(ty) else {
             return;
         };
         let shape = layout.shape();
@@ -1004,10 +992,7 @@ impl Converter {
         }
         let mut spans = Vec::with_capacity(elem_tys.len());
         for (elem_ty, off) in elem_tys.iter().zip(offsets.iter()) {
-            let queried = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| elem_ty.layout()),
-            );
-            let Ok(Ok(elayout)) = queried else { return };
+            let Some(elayout) = guarded_layout(elem_ty) else { return };
             spans.push((
                 off.bytes() as u64,
                 elayout.shape().size.bytes() as u64,
@@ -1043,8 +1028,7 @@ impl Converter {
         let sm::Ty::Coroutine(..) = converted else {
             return;
         };
-        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
-        let Ok(Ok(layout)) = layout else {
+        let Some(layout) = guarded_layout(ty) else {
             return;
         };
         let shape = layout.shape();

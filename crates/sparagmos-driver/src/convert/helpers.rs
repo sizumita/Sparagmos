@@ -683,7 +683,7 @@ pub(crate) fn ty_mentions_coroutine(ty: &rustc_public::ty::Ty) -> bool {
 
 /// Field offsets of a type's layout, in definition order.
 pub(crate) fn arbitrary_offsets(ty: &rustc_public::ty::Ty) -> Option<Vec<usize>> {
-    let shape = ty.layout().ok()?.shape();
+    let shape = guarded_layout(ty)?.shape();
     match shape.fields {
         FieldsShape::Arbitrary { offsets } => {
             Some(offsets.iter().map(|o| o.bytes()).collect())
