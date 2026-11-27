@@ -36,14 +36,15 @@ name: Official Measurement
 # - the metric-2(b) pass is partitioned by host class
 #   (ci-subset-tools.py partition; docs/CI.md): the Linux x86_64
 #   class keeps the sharded measure jobs, and the other classes
-#   (linux-aarch64, darwin-aarch64, darwin-x86_64, windows-msvc)
+#   (linux-aarch64, darwin-aarch64, darwin-x86_64, windows-msvc,
+#   windows-gnu)
 #   are judged by the measure-host jobs on their native runners,
 #   so records conditioned on those hosts are attempted instead
-#   of recorded out of environment. (The windows-gnu class has
-#   no jobs yet: its host model is the pinned toolchain hosted
-#   on the gnu target, while the windows-latest jobs install
-#   the runner's native MSVC-hosted toolchain, so its records
-#   stay in the Linux residual class. Issue #517.)
+#   of recorded out of environment. (The windows-gnu class's
+#   host model is the pinned toolchain hosted on the gnu target,
+#   so its windows-latest jobs install that toolchain -- the
+#   toolchain action's non-host install -- instead of the
+#   runner's native MSVC-hosted one. Issue #517.)
 #   Metric 4 and metric 3 stay on the Linux host over the full
 #   survey: the JIT lowers x86_64 machine code, and metric 3's
 #   candidate predicate reads only survey-classified properties;
@@ -254,7 +255,10 @@ jobs:
   # host toolchain, so no class can run another class's build.
   # The run steps use bash on every runner (Git Bash on Windows),
   # and the Windows build's binary carries the .exe suffix the
-  # matrix names per class.
+  # matrix names per class. The matrix's host key names the
+  # toolchain descriptor the install step selects: the plain
+  # pinned release, except for windows-gnu, whose descriptor is
+  # the pinned release hosted on the gnu target.
   build-host:
     name: build driver (${{ matrix.class }})
     runs-on: ${{ matrix.runner }}
@@ -269,15 +273,23 @@ jobs:
           - class: linux-aarch64
             runner: ubuntu-24.04-arm
             bin: sparagmos-driver
+            host: 1.100.0
           - class: darwin-aarch64
             runner: macos-15
             bin: sparagmos-driver
+            host: 1.100.0
           - class: darwin-x86_64
             runner: macos-15-intel
             bin: sparagmos-driver
+            host: 1.100.0
           - class: windows-msvc
             runner: windows-latest
             bin: sparagmos-driver.exe
+            host: 1.100.0
+          - class: windows-gnu
+            runner: windows-latest
+            bin: sparagmos-driver.exe
+            host: 1.100.0-x86_64-pc-windows-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -285,8 +297,16 @@ jobs:
       - name: Install Rust 1.100.0 with rustc-dev
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.100.0
+          toolchain: ${{ matrix.host }}
           components: rustc-dev
+
+      # The toolchain action sets a non-host toolchain as the
+      # default on a best-effort basis; assert it took, so this
+      # class never silently runs on the runner's native
+      # MSVC-hosted toolchain instead.
+      - name: Verify the gnu-hosted toolchain is the default
+        if: matrix.class == 'windows-gnu'
+        run: "rustc -vV | grep -q '^host: x86_64-pc-windows-gnu$'"
 
       - name: Cache cargo registry and driver target
         uses: Swatinem/rust-cache@v2
@@ -867,41 +887,61 @@ jobs:
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 0
           - class: linux-aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 1
           - class: darwin-aarch64
             target: aarch64-apple-darwin
             runner: macos-15
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 0
           - class: darwin-aarch64
             target: aarch64-apple-darwin
             runner: macos-15
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 1
           - class: darwin-x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 0
           - class: darwin-x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
             bin: sparagmos-driver
+            host: 1.100.0
             shard: 1
           - class: windows-msvc
             target: x86_64-pc-windows-msvc
             runner: windows-latest
             bin: sparagmos-driver.exe
+            host: 1.100.0
             shard: 0
           - class: windows-msvc
             target: x86_64-pc-windows-msvc
             runner: windows-latest
             bin: sparagmos-driver.exe
+            host: 1.100.0
+            shard: 1
+          - class: windows-gnu
+            target: x86_64-pc-windows-gnu
+            runner: windows-latest
+            bin: sparagmos-driver.exe
+            host: 1.100.0-x86_64-pc-windows-gnu
+            shard: 0
+          - class: windows-gnu
+            target: x86_64-pc-windows-gnu
+            runner: windows-latest
+            bin: sparagmos-driver.exe
+            host: 1.100.0-x86_64-pc-windows-gnu
             shard: 1
     steps:
       - name: Checkout
@@ -917,7 +957,7 @@ jobs:
       - name: Install Rust 1.100.0 with rustc-dev
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.100.0
+          toolchain: ${{ matrix.host }}
           components: rustc-dev
           # The same target set as the Linux measure jobs: the
           # runner screens compile-flags --target against the
@@ -982,6 +1022,14 @@ jobs:
             x86_64-unknown-linux-musl,
             x86_64-unknown-none,
             x86_64-unknown-uefi
+      # The toolchain action sets a non-host toolchain as the
+      # default on a best-effort basis; assert it took, so this
+      # class never silently runs on the runner's native
+      # MSVC-hosted toolchain instead.
+      - name: Verify the gnu-hosted toolchain is the default
+        if: matrix.class == 'windows-gnu'
+        run: "rustc -vV | grep -q '^host: x86_64-pc-windows-gnu$'"
+
       - name: Restore rust source tree
         uses: actions/cache@v4
         with:

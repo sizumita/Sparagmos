@@ -483,14 +483,16 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - The enabled classes are `linux-x86_64` (the `measure` shards
   on `ubuntu-latest`) and, as the `measure-host` jobs,
   `linux-aarch64` (`ubuntu-24.04-arm`), `darwin-aarch64`
-  (`macos-15`), `darwin-x86_64` (`macos-15-intel`) and
-  `windows-msvc` (`windows-latest`); each measure-host class
+  (`macos-15`), `darwin-x86_64` (`macos-15-intel`),
+  `windows-msvc` (`windows-latest`) and `windows-gnu`
+  (`windows-latest`); each measure-host class
   runs with a driver the `build-host` job builds natively on
   the class's runner and the runner's host model selected
   through `SPARAGMOS_HOST_TARGET`. On the survey of run
   45564001677 the partition assigns 56 records to
   `linux-aarch64`, 29 to `darwin-aarch64`, 2 to
-  `darwin-x86_64` and 72 to `windows-msvc`: a
+  `darwin-x86_64`, 72 to `windows-msvc` and 9 to
+  `windows-gnu`: a
   record both macOS models admit goes to `darwin-aarch64`,
   which precedes `darwin-x86_64` in the partition order, so
   `darwin-x86_64` holds only the records its model alone
@@ -521,17 +523,18 @@ denominator. Runs on every push to `main` and on manual dispatch.
   condition as unconditionally true, so a file carrying it is
   never run as a test on any host -- it is a module input to
   another test, which carries its own record -- and its record
-  is classified out of environment. The remaining classes are
-  defined in the runner's host profiles and in the partition
-  rule but have no jobs yet, so their records stay in the
-  residual class: the `windows-gnu` class
-  (`x86_64-pc-windows-gnu`) waits on a host toolchain entry of
-  its own: its host model is the pinned toolchain hosted on
-  the gnu target (a MinGW-hosted rustc and linker), while the
-  `windows-latest` jobs install the runner's native
-  MSVC-hosted toolchain, so the class's records (9 on that
-  survey) stay in the residual class until a job installs the
-  gnu-hosted toolchain (issue #517).
+  is classified out of environment. Every class defined in
+  the runner's host profiles and in the partition rule has
+  jobs. The `windows-gnu` class's host model is the pinned
+  toolchain hosted on the gnu target (a MinGW-hosted rustc;
+  the gnu toolchain is self-contained, linker included), so
+  its `windows-latest` jobs install that toolchain through
+  the toolchain action's non-host install -- the matrix's
+  `host` key carries the gnu-hosted descriptor -- instead of
+  the runner's native MSVC-hosted toolchain, and a step
+  asserts the gnu-hosted toolchain is the default before any
+  judging, so the class cannot be silently judged by the
+  MSVC host (issue #517).
 - Auxiliary crates are built the way compiletest builds them:
   with the test's own compile arguments, which carry the
   revision's `--cfg` for a revised test (an incremental test's

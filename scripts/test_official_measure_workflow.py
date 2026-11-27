@@ -82,10 +82,10 @@ def matrix_includes():
     """The workflow's matrix include entries, in file order.
 
     Each entry is the mapping its `- class:` line opens; the
-    target/runner/bin/shard lines that follow belong to it until the
-    next entry or a non-entry line ends it. Entries without a
-    target are the build-host matrix's; entries with one are the
-    measure-host matrix's."""
+    target/runner/bin/shard/host lines that follow belong to it
+    until the next entry or a non-entry line ends it. Entries
+    without a target are the build-host matrix's; entries with
+    one are the measure-host matrix's."""
     entries = []
     current = None
     for line in workflow_text().splitlines():
@@ -94,7 +94,7 @@ def matrix_includes():
             current = {"class": m.group(1)}
             entries.append(current)
             continue
-        m = re.match(r"\s+(target|runner|bin|shard): (\S+)$", line)
+        m = re.match(r"\s+(target|runner|bin|shard|host): (\S+)$", line)
         if m and current is not None:
             current[m.group(1)] = m.group(2)
         elif line.strip() and not line.strip().startswith("#"):
@@ -125,6 +125,15 @@ class HostMatrixTest(unittest.TestCase):
                 self.assertEqual(e["target"],
                                  tools.HOST_CLASSES[cls], cls)
                 self.assertEqual(e["runner"], runner, cls)
+        # Every host entry names the toolchain descriptor its
+        # install step selects: the plain pinned release for the
+        # classes the runner's native toolchain hosts, and the
+        # gnu-hosted descriptor for windows-gnu, whose host model
+        # is the pinned toolchain hosted on the gnu target.
+        for e in entries:
+            want = ("1.100.0-x86_64-pc-windows-gnu"
+                    if e["class"] == "windows-gnu" else "1.100.0")
+            self.assertEqual(e["host"], want, e["class"])
 
 
 if __name__ == "__main__":
