@@ -264,9 +264,22 @@ impl<'a> Interpreter<'a> {
         } else {
             (secs, nanos)
         };
+        // The nanoseconds field is the `Nanoseconds` niche
+        // wrapper's own aggregate (a one-field ADT value), the
+        // shape a decoded Duration constant carries: a guest
+        // body that reads the field assigns it to a place of
+        // that ADT type, which a bare integer does not
+        // satisfy. (`time_pair` unwraps the wrapper, as it
+        // does for decoded constants.)
         Ok(Value::Enum {
             variant: 0,
-            fields: vec![Value::Uint(u128::from(secs)), Value::Uint(u128::from(nanos))],
+            fields: vec![
+                Value::Uint(u128::from(secs)),
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uint(u128::from(nanos))],
+                },
+            ],
         })
     }
 }

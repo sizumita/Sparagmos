@@ -582,3 +582,255 @@ fn run_mode_libtest_terse_format() {
     assert!(!stdout.contains("... FAILED"), "stdout={stdout}");
     assert!(!stdout.contains("... ignored"), "stdout={stdout}");
 }
+
+const PANIC_ABORT_CRATE_SRC: &str = r#"
+#![feature(test)]
+
+extern crate test;
+
+use std::io::Write;
+use test::Bencher;
+
+#[test]
+fn it_works() {
+    assert_eq!(1 + 1, 2);
+}
+
+#[test]
+#[should_panic]
+fn it_panics() {
+    assert_eq!(1 + 1, 4);
+}
+
+#[test]
+fn it_fails() {
+    println!("hello, world");
+    writeln!(std::io::stderr(), "testing321").unwrap();
+    assert_eq!(1 + 1, 5);
+}
+
+#[test]
+fn it_exits() {
+    std::process::exit(123);
+}
+
+#[bench]
+fn benchmark(b: &mut Bencher) {
+    b.iter(|| assert_eq!(1 + 1, 2));
+}
+"#;
+
+/// A `panic=abort` test binary enters through
+/// `test_main_env_args_abort`: each test is accounted for as
+/// the harness's spawned subprocess — a panic the descriptor
+/// does not expect aborts the child (a plain failure whose
+/// section is the child's stdout, the stderr delimiter, and
+/// the child's stderr with the hook's report, the test
+/// running on the child's main thread), an expected panic
+/// exits the child with libtest's success code, a test
+/// body's own `process::exit` is read from its code, and a
+/// bench descriptor runs as a test with a single-iteration
+/// bencher. The run as a whole reports the failures and
+/// exits 101, like libtest.
+#[test]
+fn run_mode_panic_abort_harness_accounts_for_spawned_tests() {
+    let dir = temp_dir("panic-abort-harness");
+    let src = fixture(&dir, "panic_abort.rs", PANIC_ABORT_CRATE_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--test")
+        .arg("--rustc-arg")
+        .arg("-Cpanic=abort")
+        .arg("--rustc-arg")
+        .arg("-Zpanic_abort_tests")
+        .arg("--guest-arg")
+        .arg("--test-threads=1")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a run with failures exits 101; stderr={stderr}"
+    );
+    assert_eq!(stderr, "", "the harness reports on stdout alone");
+    // The line of `it_fails`' assertion in the fixture.
+    let assert_line = PANIC_ABORT_CRATE_SRC
+        .lines()
+        .position(|l| l.contains("assert_eq!(1 + 1, 5)"))
+        .expect("the fixture carries the assertion")
+        + 1;
+    let expected = format!(
+        "\nrunning 5 tests\n\
+         test benchmark ... ok\n\
+         test it_exits ... FAILED\n\
+         test it_fails ... FAILED\n\
+         test it_panics - should panic ... ok\n\
+         test it_works ... ok\n\
+         \nfailures:\n\
+         \n---- it_exits stdout ----\n\
+         ---- it_exits stderr ----\n\
+         note: got unexpected return code 123\n\
+         ---- it_fails stdout ----\n\
+         hello, world\n\
+         ---- it_fails stderr ----\n\
+         testing321\n\
+         \nthread 'main' (1) panicked at {}:{}:5:\n\
+         assertion `left == right` failed\n\
+         \u{20} left: 2\n\
+         \u{20}right: 5\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         \n\nfailures:\n\
+         \u{20}\u{20}\u{20}\u{20}it_exits\n\
+         \u{20}\u{20}\u{20}\u{20}it_fails\n\
+         \ntest result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+        src.display(),
+        assert_line
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+const PANIC_ABORT_NOCAPTURE_SRC: &str = r#"
+#[test]
+fn it_works() {
+    println!("about to succeed");
+}
+
+#[test]
+#[should_panic]
+fn it_panics() {
+    println!("about to panic");
+    assert_eq!(1 + 1, 4);
+}
+
+#[test]
+fn it_fails() {
+    println!("about to fail");
+    assert_eq!(1 + 1, 4);
+}
+"#;
+
+/// The same harness under `--nocapture`: the children's
+/// stdio is inherited, so their output flows live, and each
+/// child's panic report — backtrace note included, every
+/// child being a fresh process — goes to the run's stderr
+/// as the panic happens, a passing should-panic test's
+/// report included. The failure section captures nothing.
+#[test]
+fn run_mode_panic_abort_harness_nocapture_streams_child_reports() {
+    let dir = temp_dir("panic-abort-nocapture");
+    let src = fixture(&dir, "panic_abort_nc.rs", PANIC_ABORT_NOCAPTURE_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--test")
+        .arg("--rustc-arg")
+        .arg("-Cpanic=abort")
+        .arg("--rustc-arg")
+        .arg("-Zpanic_abort_tests")
+        .arg("--guest-arg")
+        .arg("--test-threads=1")
+        .arg("--guest-arg")
+        .arg("--nocapture")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101), "the run has a failure");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout,
+        "\nrunning 3 tests\n\
+         test it_fails ... about to fail\nFAILED\n\
+         test it_panics - should panic ... about to panic\nok\n\
+         test it_works ... about to succeed\nok\n\
+         \nfailures:\n\
+         \n---- it_fails stdout ----\n\
+         ---- it_fails stderr ----\n\
+         \n\nfailures:\n\
+         \u{20}\u{20}\u{20}\u{20}it_fails\n\
+         \ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+        "nocapture stdout must match native"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let reports = stderr.matches("panicked at").count();
+    assert_eq!(
+        reports, 2,
+        "both panicking children print their report; stderr={stderr}"
+    );
+    let notes = stderr
+        .matches("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace")
+        .count();
+    assert_eq!(
+        notes, 2,
+        "each child is a fresh process and spends its own backtrace note; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("thread 'main' (1) panicked at"),
+        "the children report on their main thread; stderr={stderr}"
+    );
+}
+
+/// The harness's spawned subprocess re-enters the same entry
+/// with `__RUST_TEST_INVOKE` naming its test: the named test
+/// runs in that process and the process leaves by the
+/// child's verdict — libtest's success exit code (50) for a
+/// pass, an abort for a panic. Modelled by running the
+/// driver itself with the variable set.
+#[test]
+fn run_mode_panic_abort_secondary_process_runs_one_named_test() {
+    let dir = temp_dir("panic-abort-secondary");
+    let src = fixture(&dir, "panic_abort.rs", PANIC_ABORT_CRATE_SRC);
+    let run_secondary = |name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+            .arg("run")
+            .arg(&src)
+            .arg("--rustc-arg")
+            .arg("--test")
+            .arg("--rustc-arg")
+            .arg("-Cpanic=abort")
+            .arg("--rustc-arg")
+            .arg("-Zpanic_abort_tests")
+            .env("RUSTC_BOOTSTRAP", "1")
+            .env("RUST_BACKTRACE", "0")
+            .env("__RUST_TEST_INVOKE", name)
+            .output()
+            .expect("failed to run sparagmos-driver")
+    };
+    // A passing test: the process exits with TR_OK (50) and
+    // prints nothing.
+    let out = run_secondary("it_works");
+    assert_eq!(
+        out.status.code(),
+        Some(50),
+        "a passing secondary exits with libtest's TR_OK; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    // An expected panic is also a pass.
+    let out = run_secondary("it_panics");
+    assert_eq!(out.status.code(), Some(50), "an expected panic exits TR_OK");
+    // A panicking test: its report reaches the process's
+    // stderr and the process aborts (the driver mirrors a
+    // guest abort as exit 134, 128 + SIGABRT).
+    let out = run_secondary("it_fails");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a failing secondary aborts; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("thread 'main' (1) panicked at"),
+        "the child's hook prints the report before the abort; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("assertion `left == right` failed"),
+        "the report carries the panic message; stderr={stderr}"
+    );
+}

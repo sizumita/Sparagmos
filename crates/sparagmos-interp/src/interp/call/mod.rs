@@ -246,6 +246,19 @@ impl<'a> Interpreter<'a> {
         // does not consume the location is served the declared
         // arguments only, as in the `CallBuiltin` conversion.
         let mut arg_values = arg_values;
+        // The panic entry points this path serves directly
+        // (it bypasses `exec_builtin`'s stamp pre-pass) note
+        // the stamp as their panic's location before it is
+        // dropped, exactly as the pre-pass does.
+        if matches!(
+            kind,
+            crate::builtins::Builtin::AssertFailed
+                | crate::builtins::Builtin::PanicNounwindFmt
+        ) && arg_values.last().is_some_and(is_caller_location_value)
+        {
+            let stamp = arg_values.pop().expect("stamp checked");
+            self.note_forwarded_panic_stamp(frames, stamp);
+        }
         if !crate::builtins::consumes_caller_location(kind)
             && arg_values.len() > 1
             && arg_values.last().is_some_and(is_caller_location_value)

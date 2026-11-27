@@ -3758,3 +3758,40 @@ fn run_mode_guest_payload_drop_panic_then_disposal_panic_aborts() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+const ASSERT_AFTER_UNWRAP_SRC: &str = r#"
+fn main() {
+    let ok: Result<i32, String> = Ok(3);
+    let _ = ok.unwrap();
+    assert_eq!(1 + 1, 5);
+}
+"#;
+
+/// An assertion failure's report names the assertion's own
+/// call site: `assert_failed` is a `#[track_caller]` panic
+/// entry, so the caller-location stamp the driver appends to
+/// its call is the panic's location, noted by the runtime
+/// (the builtin consumes the stamp). The stamp used to be
+/// dropped at conversion for this entry, so the report fell
+/// back to the most recent earlier track-caller stamp — the
+/// `unwrap` on the line above — or to no location at all.
+#[test]
+fn run_mode_assert_failed_reports_the_assertion_site() {
+    let dir = temp_dir("assert-location");
+    let src = fixture(&dir, "assert_loc.rs", ASSERT_AFTER_UNWRAP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "an uncaught panic exits 101; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr,
+        format!(
+            "\nthread 'main' (1) panicked at {}:5:5:\nassertion `left == right` failed\n  left: 2\n right: 5\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
