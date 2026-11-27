@@ -4863,6 +4863,83 @@ impl<'a> Interpreter<'a> {
                     } else {
                         self.boxed_slice_value(value, pointee_ty, "From::from to Box<[T]>")
                     }
+                } else if (target.starts_with("std::boxed::Box<")
+                    || target.starts_with("alloc::boxed::Box<"))
+                    && (generic_first_arg(target, "std::boxed::Box<")
+                        == Some("std::ffi::CStr")
+                        || generic_first_arg(target, "alloc::boxed::Box<")
+                            == Some("std::ffi::CStr"))
+                    && (source == "std::ffi::CString"
+                        || source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                {
+                    // `From<CString> for Box<CStr>` (and the
+                    // owned Cow source) is `into_boxed_c_str`:
+                    // the box holds the C string's fat slice
+                    // itself -- the shape `CString::deref`
+                    // produces and the shape the `&CStr` source
+                    // below boxes -- not the `CString` aggregate.
+                    // Boxing the aggregate (the catch-all `Box`
+                    // arm's verbatim move) would leave the
+                    // length-trusting consumers (`to_bytes`,
+                    // `to_bytes_with_nul`) reading the
+                    // aggregate's field count as the string's
+                    // length, while the byte-scanning consumers
+                    // (Debug, equality, ordering) read through
+                    // it and hide the defect.
+                    let owned = if source == "std::ffi::CString" {
+                        value
+                    } else {
+                        // A Cow source: the borrowed variant's
+                        // field is the `&CStr` itself, which
+                        // already denotes the fat slice the box
+                        // holds; the owned variant's field is
+                        // the `CString` the arm below converts.
+                        match self.resolve_value(frames, &value)? {
+                            Value::Enum {
+                                variant: 0,
+                                mut fields,
+                                ..
+                            } if fields.len() == 1 => {
+                                let held =
+                                    fields.pop().expect("len checked");
+                                let fat = self
+                                    .resolve_value(frames, &held)?;
+                                let boxed = self.new_box(fat);
+                                if let Some(ty) = ty_from_tag(
+                                    "std::ffi::CStr",
+                                ) {
+                                    self.record_box_ty(&boxed, ty);
+                                }
+                                return Ok(boxed);
+                            }
+                            Value::Enum {
+                                variant: 1,
+                                mut fields,
+                                ..
+                            } if fields.len() == 1 => {
+                                fields.pop().expect("len checked")
+                            }
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to Box<CStr>",
+                                    "cow aggregate",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    };
+                    let receiver = Value::Ref(RefTarget::Value(
+                        Box::new(owned),
+                        Vec::new(),
+                    ));
+                    let pointee =
+                        self.c_string_deref(frames, &receiver)?;
+                    let boxed = self.new_box(pointee);
+                    if let Some(ty) = ty_from_tag("std::ffi::CStr") {
+                        self.record_box_ty(&boxed, ty);
+                    }
+                    Ok(boxed)
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
                     let boxed = self.new_box(value);

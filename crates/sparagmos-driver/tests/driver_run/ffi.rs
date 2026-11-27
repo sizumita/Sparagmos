@@ -1626,3 +1626,70 @@ fn run_mode_os_str_to_ascii_lowercase() {
         "\"abc def xyz\"\n\"mixed\"\n\"already lower 123\"\n",
     );
 }
+
+const BOXED_CSTR_FROM_CSTRING_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+fn main() {
+    let b: Box<CStr> = Box::from(CString::new("abc").unwrap());
+    println!("bytes_len={}", b.to_bytes().len());
+    println!("with_nul={:?}", b.to_bytes_with_nul());
+    println!("debug={:?}", b);
+    let d: &CStr = &b;
+    println!("deref_debug={:?}", d);
+    let c: Box<CStr> = Box::from(CString::new("abd").unwrap());
+    println!("eq={} ord={:?}", b == Box::from(CString::new("abc").unwrap()), b.cmp(&c));
+    let e: Box<CStr> = CString::new("").unwrap().into();
+    println!("empty={} {}", e.to_bytes().len(), e.to_bytes_with_nul().len());
+    let n = unsafe { CString::from_vec_unchecked(vec![b'x', 0x80, b'y']) };
+    let nb: Box<CStr> = Box::from(n);
+    println!("nonascii={:?}", nb.to_bytes_with_nul());
+    println!("lossy_len={}", nb.to_string_lossy().chars().count());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_cstr_from_cstring_keeps_its_length() {
+    // `Box<CStr>: From<CString>` is `into_boxed_c_str`: the
+    // box holds the C string's fat slice itself, not the
+    // `CString` aggregate. Boxing the aggregate verbatim (the
+    // generic `Box` conversion's move) left the
+    // length-trusting consumers reading the aggregate's
+    // field count (1) as the string's length, so `to_bytes`
+    // came out empty and `to_bytes_with_nul` a single byte,
+    // while the byte-scanning consumers (Debug, equality,
+    // ordering) read through the aggregate and hid it.
+    run_ok(
+        "boxed-cstr-from-cstring",
+        BOXED_CSTR_FROM_CSTRING_SRC,
+        "bytes_len=3\nwith_nul=[97, 98, 99, 0]\ndebug=\"abc\"\nderef_debug=\"abc\"\neq=true ord=Less\nempty=0 1\nnonascii=[120, 128, 121, 0]\nlossy_len=3\n",
+    );
+}
+
+const BOXED_CSTR_FROM_COW_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{CStr, CString};
+fn main() {
+    let owned: Box<CStr> = Box::from(Cow::Owned(CString::new("abc").unwrap()));
+    println!("owned={} {}", owned.to_bytes().len(), owned.to_bytes_with_nul().len());
+    let cs = CString::new("abc").unwrap();
+    let cow: Cow<'_, CStr> = Cow::Borrowed(&cs);
+    let borrowed: Box<CStr> = Box::from(cow);
+    println!("borrowed={} {}", borrowed.to_bytes().len(), borrowed.to_bytes_with_nul().len());
+    let from_ref: Box<CStr> = Box::from(&*cs);
+    println!("from_ref={} {}", from_ref.to_bytes().len(), from_ref.to_bytes_with_nul().len());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_cstr_from_cow_keeps_its_length() {
+    // The Cow sources of `Box<CStr>` end at the same fat
+    // slice pointee: the owned variant through its `CString`
+    // (which had the same aggregate-boxing defect as the
+    // direct `CString` source), the borrowed variant through
+    // the `&CStr` it holds, as the plain `&CStr` source does.
+    run_ok(
+        "boxed-cstr-from-cow",
+        BOXED_CSTR_FROM_COW_SRC,
+        "owned=3 4\nborrowed=3 4\nfrom_ref=3 4\n",
+    );
+}
