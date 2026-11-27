@@ -2111,6 +2111,30 @@ impl<'a> Interpreter<'a> {
         }
         // References format as their pointee for every trait here.
         if matches!(value, Value::Ref(_)) {
+            // A reference denoting the element of a same-width
+            // punned scalar view (a `&[u32]` over an `f32`
+            // place, Issue #479) denotes the storage's bits
+            // under the element kind, not the backing scalar:
+            // a consumer that resolves the reference through
+            // this arm (a sequence or aggregate element, above
+            // all) formats the punned reading. The direct
+            // argument path judges the same shape through the
+            // byte view; this arm covers the consumers that
+            // arrive with only the value and its tag.
+            if let Ok(target) = self.deref_value(frames, value) {
+                if let Some(punned) =
+                    self.punned_scalar_element(frames, &target, pointee_tag(ty))
+                {
+                    return self.format_value(
+                        frames,
+                        &punned,
+                        trait_,
+                        pointee_tag(ty),
+                        options,
+                        indent,
+                    );
+                }
+            }
             let pointee = self.resolve_value(frames, value)?;
             return self.format_value(frames, &pointee, trait_, ty, options, indent);
         }

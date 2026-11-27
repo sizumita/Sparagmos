@@ -476,6 +476,71 @@ fn run_mode_punned_scalar_view_into_iter_yields_the_element_kind() {
     );
 }
 
+const PUNNED_SCALAR_VIEW_CMP_SRC: &str = r#"
+fn main() {
+    let x: f32 = 1.0;
+    let view = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u32, 1) };
+    let r = &view[0];
+    let five = 5u32;
+    let big = 1065353216u32;
+    println!("eq={} ne={}", r == &big, r != &five);
+    println!("lt={} gt={} le={}", r < &2000000000u32, r > &five, r <= &big);
+    println!("cmp={:?} max={} min={}", r.cmp(&&big), std::cmp::max(r, &five), std::cmp::min(r, &five));
+    let y: u32 = 0x3F80_0000;
+    let view2 = unsafe { std::slice::from_raw_parts(&y as *const u32 as *const f32, 1) };
+    let rf = &view2[0];
+    println!("feq={} flt={} fcmp={:?}", rf == &1.0f32, rf < &2.0f32, rf.partial_cmp(&&1.0f32));
+    println!("tup={}", (r, 1) == (&big, 1));
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_reference_comparisons_use_the_element_kind() {
+    // A consumer that resolves the element reference
+    // directly to compare it (the `PartialEq` / `PartialOrd`
+    // / `Ord` builtins, including a derived tuple comparison
+    // holding the reference) compares the element under its
+    // own kind, not the backing scalar (Issue #479). Native
+    // rustc 1.100.0's output.
+    run_ok(
+        "punned-scalar-view-cmp",
+        PUNNED_SCALAR_VIEW_CMP_SRC,
+        "eq=true ne=true\nlt=true gt=true le=true\ncmp=Equal max=1065353216 min=5\nfeq=true flt=true fcmp=Some(Equal)\ntup=true\n",
+    );
+}
+
+const PUNNED_SCALAR_VIEW_AGG_FMT_SRC: &str = r#"
+fn main() {
+    let x: f32 = 1.0;
+    let view = unsafe { std::slice::from_raw_parts(&x as *const f32 as *const u32, 1) };
+    let r = &view[0];
+    println!("vec={:?}", vec![r]);
+    println!("arr={:?}", [r]);
+    println!("opt={:?}", Some(r));
+    println!("slice={:?}", &[r]);
+    println!("owned={:?} {}", view[0].to_owned(), r.to_owned());
+    let y: u32 = 0x3F80_0000;
+    let view2 = unsafe { std::slice::from_raw_parts(&y as *const u32 as *const f32, 1) };
+    println!("fvec={:?} fopt={:?}", vec![&view2[0]], Some(&view2[0]));
+    println!("fowned={}", view2[0].to_owned());
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_aggregate_consumers_use_the_element_kind() {
+    // Consumers that resolve the element reference through
+    // an aggregate (a vector / array / option of the
+    // reference formatted with `Debug`) and the `ToOwned`
+    // builtin see the element under its own kind, not the
+    // backing scalar (Issue #479). Native rustc 1.100.0's
+    // output.
+    run_ok(
+        "punned-scalar-view-agg-fmt",
+        PUNNED_SCALAR_VIEW_AGG_FMT_SRC,
+        "vec=[1065353216]\narr=[1065353216]\nopt=Some(1065353216)\nslice=[1065353216]\nowned=1065353216 1065353216\nfvec=[1.0] fopt=Some(1.0)\nfowned=1\n",
+    );
+}
+
 const CHAR_REFERENCE_FMT_SRC: &str = r#"
 fn main() {
     let c: char = 'A';

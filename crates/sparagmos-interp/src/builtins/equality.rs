@@ -21,6 +21,41 @@ use super::*;
 /// is a bare scalar: the comparison is over the element
 /// type, and only one side's storage carries the wrapper
 /// form. Any other shape passes through unchanged.
+/// The element tag a scalar comparison under a punned view
+/// is judged by: the compared type the call's generic
+/// arguments name, with one reference layer removed (a
+/// comparison of references themselves -- the derived
+/// `PartialEq` of a tuple holding the element reference,
+/// above all -- names the reference type, while the
+/// operands the builtin receives are the references behind
+/// it). A non-reference tag passes through unchanged.
+/// The scalar type tag a tuple field type names, through
+/// one reference layer (the element tag a punned field is
+/// judged by, in the spelling `scalar_shape_of_tag`
+/// reads). `None` for a field type that is not a scalar or
+/// a reference to one.
+fn scalar_tag_of_ty(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Ref(inner) => scalar_tag_of_ty(inner),
+        Ty::Bool => Some("bool".to_string()),
+        Ty::Int(t) => Some(format!("{t:?}").to_lowercase()),
+        Ty::Uint(t) => Some(format!("{t:?}").to_lowercase()),
+        Ty::Float(t) => Some(format!("{t:?}").to_lowercase()),
+        _ => None,
+    }
+}
+
+fn punned_scalar_tag(tag: &str) -> &str {
+    let tag = tag.trim();
+    match tag.strip_prefix('&') {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            rest.strip_prefix("mut ").unwrap_or(rest).trim_start()
+        }
+        None => tag,
+    }
+}
+
 fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
     fn is_scalar(v: &Value) -> bool {
         matches!(
@@ -333,6 +368,225 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Ok(Some(ea.len().cmp(&eb.len())))
+        })())
+    }
+
+    /// One operand of a scalar comparison, read under the
+    /// compared type's own kind when the operand is a
+    /// reference denoting a scalar storage of the same width
+    /// but a different kind (a same-width punned view's
+    /// element reference: `&view[0]` for a `&[u32]` over an
+    /// `f32` place, Issue #479): the reference denotes the
+    /// storage's bits under the element kind, not the backing
+    /// scalar, so the operand is the punned reading (see
+    /// `Interpreter::punned_scalar_element`). A reference
+    /// spilled through a local is followed, as the fmt
+    /// argument path follows it. `None` when the operand
+    /// denotes no such punned element.
+    fn punned_scalar_operand(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_tag: &str,
+    ) -> Option<Value> {
+        let mut cur = value.clone();
+        for _ in 0..8 {
+            let target = self.deref_value(frames, &cur).ok()?;
+            if let Some(v) = self.punned_scalar_element(frames, &target, elem_tag) {
+                return Some(v);
+            }
+            let read = self.read_resolved(frames, &target).ok()?;
+            match read {
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                    cur = read;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Scalar equality under a same-width punned view, when
+    /// one applies (see `punned_scalar_operand`): the punned
+    /// operand is read under the compared type's kind and the
+    /// other operand resolves as usual, so the pair compares
+    /// as values of the compared type. `None` when neither
+    /// operand is such a view, in which case the ordinary
+    /// comparison judges.
+    pub(crate) fn punned_scalar_equal(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<bool>> {
+        let tag = punned_scalar_tag(generic_args.first()?);
+        let pa = self.punned_scalar_operand(frames, a, tag);
+        let pb = self.punned_scalar_operand(frames, b, tag);
+        if pa.is_none() && pb.is_none() {
+            return None;
+        }
+        Some((|| {
+            let a = match pa {
+                Some(v) => v,
+                None => self.resolve_ref(frames, a)?.into_owned(),
+            };
+            let b = match pb {
+                Some(v) => v,
+                None => self.resolve_ref(frames, b)?.into_owned(),
+            };
+            self.values_equal(frames, &a, &b)
+        })())
+    }
+
+    /// Scalar comparison under a same-width punned view,
+    /// when one applies: the ordering counterpart of
+    /// `punned_scalar_equal`.
+    pub(crate) fn punned_scalar_cmp(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+        discriminants: Option<&[i128]>,
+    ) -> Option<InterpResult<Option<Ordering>>> {
+        let tag = punned_scalar_tag(generic_args.first()?);
+        let pa = self.punned_scalar_operand(frames, a, tag);
+        let pb = self.punned_scalar_operand(frames, b, tag);
+        if pa.is_none() && pb.is_none() {
+            return None;
+        }
+        Some((|| {
+            let a = match pa {
+                Some(v) => v,
+                None => self.resolve_ref(frames, a)?.into_owned(),
+            };
+            let b = match pb {
+                Some(v) => v,
+                None => self.resolve_ref(frames, b)?.into_owned(),
+            };
+            self.values_cmp(frames, &a, &b, discriminants)
+        })())
+    }
+
+    /// The field list of a resolved tuple value (a tuple
+    /// value, or the one-variant aggregate form arrays and
+    /// tuples also travel in). `None` for any other shape.
+    fn tuple_fields(value: &Value) -> Option<Vec<Value>> {
+        match value {
+            Value::Tuple(items) => Some(items.clone()),
+            Value::Enum { fields, .. } => Some(fields.clone()),
+            _ => None,
+        }
+    }
+
+    /// The per-field operands of a tuple comparison under a
+    /// punned view (see `punned_scalar_operand`): each field
+    /// pair, with a field that is a punned scalar element
+    /// reference replaced by its punned reading and the other
+    /// side of that pair resolved as usual. `None` when the
+    /// compared type is not a tuple, either operand does not
+    /// resolve to a tuple of the declared arity, or no field
+    /// is such a view -- the ordinary structural comparison
+    /// then judges, exactly as before.
+    fn punned_tuple_fields(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<Vec<(Value, Value)>>> {
+        let self_ty = ty_from_tag(generic_args.first()?)?;
+        let Ty::Tuple(field_tys) = &self_ty else {
+            return None;
+        };
+        let ra = self.resolve_ref(frames, a).ok()?;
+        let rb = self.resolve_ref(frames, b).ok()?;
+        let fa = Self::tuple_fields(&ra)?;
+        let fb = Self::tuple_fields(&rb)?;
+        if fa.len() != field_tys.len() || fb.len() != field_tys.len() {
+            return None;
+        }
+        let mut any = false;
+        let mut pairs = Vec::with_capacity(fa.len());
+        for ((x, y), ty) in fa.into_iter().zip(fb).zip(field_tys.iter()) {
+            let tag = scalar_tag_of_ty(ty);
+            let (px, py) = match tag {
+                Some(tag) => (
+                    self.punned_scalar_operand(frames, &x, &tag),
+                    self.punned_scalar_operand(frames, &y, &tag),
+                ),
+                None => (None, None),
+            };
+            if px.is_some() || py.is_some() {
+                any = true;
+            }
+            pairs.push((x, y, px, py));
+        }
+        if !any {
+            return None;
+        }
+        Some((|| {
+            let mut out = Vec::with_capacity(pairs.len());
+            for (x, y, px, py) in pairs {
+                let x = match px {
+                    Some(v) => v,
+                    None => self.resolve_ref(frames, &x)?.into_owned(),
+                };
+                let y = match py {
+                    Some(v) => v,
+                    None => self.resolve_ref(frames, &y)?.into_owned(),
+                };
+                out.push((x, y));
+            }
+            Ok(out)
+        })())
+    }
+
+    /// Tuple equality under a punned scalar view in one of
+    /// its fields, when one applies (see
+    /// `punned_tuple_fields`): the derived `PartialEq` of a
+    /// tuple holding the element reference compares the
+    /// fields under their own kinds.
+    pub(crate) fn punned_tuple_equal(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<bool>> {
+        let pairs = self.punned_tuple_fields(frames, generic_args, a, b)?;
+        Some((|| {
+            for (x, y) in pairs? {
+                if !self.values_equal(frames, &x, &y)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })())
+    }
+
+    /// Tuple comparison under a punned scalar view in one
+    /// of its fields: the ordering counterpart of
+    /// `punned_tuple_equal`, with the first non-`Equal`
+    /// field deciding, as a derived `partial_cmp` does.
+    pub(crate) fn punned_tuple_cmp(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+        discriminants: Option<&[i128]>,
+    ) -> Option<InterpResult<Option<Ordering>>> {
+        let pairs = self.punned_tuple_fields(frames, generic_args, a, b)?;
+        Some((|| {
+            for (x, y) in pairs? {
+                match self.values_cmp(frames, &x, &y, discriminants)? {
+                    Some(Ordering::Equal) => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Some(Ordering::Equal))
         })())
     }
 
