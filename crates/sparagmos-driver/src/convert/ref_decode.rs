@@ -530,12 +530,21 @@ impl Converter {
                 }
                 Some(sm::ConstValue::SliceVal(elems))
             }
-            TyKind::RigidTy(RigidTy::Array(elem, _))
+            TyKind::RigidTy(RigidTy::Array(elem, len))
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) =>
             {
                 // Byte arrays keep the established `Bytes` form (the
-                // fmt pieces template is the canonical case).
-                let bytes = alloc_bytes_in(&target, target_off..target.bytes.len())?;
+                // fmt pieces template is the canonical case). The
+                // declared length of the array governs, not the
+                // extent of the backing allocation: the array may
+                // be one field of a larger allocation (a static
+                // struct field is the canonical case), whose
+                // following fields are not part of the array, and
+                // whose trailing padding bytes are uninitialised
+                // and would fail the read.
+                let count = len.eval_target_usize().ok()? as usize;
+                let end = target_off.checked_add(count)?;
+                let bytes = alloc_bytes_in(&target, target_off..end)?;
                 if !self.spend_const_budget(bytes.len()) {
                     return None;
                 }
