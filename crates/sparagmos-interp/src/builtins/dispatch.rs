@@ -6425,6 +6425,13 @@ impl<'a> Interpreter<'a> {
                     &vals[1],
                 ) {
                     eq?
+                } else if let Some(eq) = self.box_pointee_equal(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                ) {
+                    eq?
                 } else {
                     self.values_equal(frames, &vals[0], &vals[1])?
                 };
@@ -7282,40 +7289,47 @@ impl<'a> Interpreter<'a> {
                         let len = elems.len() as u128;
                         (elems, len)
                     });
+                let elem_tag =
+                    generic_args.first().map(String::as_str).unwrap_or("");
+                // A slice over a scalar's own storage (the
+                // `slice::from_ref` shape, and a same-width
+                // punned view over a scalar) reads its elements
+                // from the storage itself, under the element
+                // kind the call names: consult that reading
+                // ahead of the plain element reading, whose
+                // scalar case hands the storage back under its
+                // own kind. Shapes the scalar reading does not
+                // judge keep the plain reading below.
+                let scalar_backed = self
+                    .scalar_backed_slice_elements(frames, &vals[0], elem_tag)
+                    .map(|elems| {
+                        let len = elems.len() as u128;
+                        (elems, len)
+                    });
                 let (elems, _) = match regrouped {
                     Some(elems) => elems,
-                    None => match self.slice_elements(frames, &vals[0]) {
-                        Ok(elems) => elems,
-                        Err(err) => {
-                            // A slice over an address-only pointer
-                            // has no elements in the value model —
-                            // unless the element type has a single
-                            // value, in which case every element is
-                            // that value and no storage is needed to
-                            // produce them. A slice over a scalar's
-                            // own storage (the `slice::from_ref`
-                            // shape) reads its elements from the
-                            // storage itself.
-                            let elem_tag =
-                                generic_args.first().map(String::as_str).unwrap_or("");
-                            match self
-                                .scalar_backed_slice_elements(frames, &vals[0], elem_tag)
-                                .map(|elems| {
-                                    let len = elems.len() as u128;
-                                    (elems, len)
-                                })
-                                .or_else(|| {
-                                    self.storageless_slice_elements(
-                                        frames,
-                                        &vals[0],
-                                        elem_tag,
-                                    )
-                                })
-                            {
-                                Some(elems) => elems,
-                                None => return Err(err),
+                    None => match scalar_backed {
+                        Some(elems) => elems,
+                        None => match self.slice_elements(frames, &vals[0]) {
+                            Ok(elems) => elems,
+                            Err(err) => {
+                                // A slice over an address-only
+                                // pointer has no elements in the
+                                // value model — unless the element
+                                // type has a single value, in which
+                                // case every element is that value
+                                // and no storage is needed to
+                                // produce them.
+                                match self.storageless_slice_elements(
+                                    frames,
+                                    &vals[0],
+                                    elem_tag,
+                                ) {
+                                    Some(elems) => elems,
+                                    None => return Err(err),
+                                }
                             }
-                        }
+                        },
                     },
                 };
                 Ok(slice_iter_value(elems))
@@ -10260,30 +10274,31 @@ impl<'a> Interpreter<'a> {
                     let len = elems.len() as u128;
                     (elems, len)
                 });
+            let elem_tag = slice_container_element_tag(self_ty)
+                .or_else(|| {
+                    slice_container_element_tag(
+                        self_ty.strip_prefix('&').unwrap_or(self_ty),
+                    )
+                })
+                .unwrap_or("");
+            // As in `Builtin::SliceIter`: the scalar-backed
+            // reading, under the element kind the slice type
+            // names, is consulted ahead of the plain element
+            // reading.
+            let scalar_backed = self
+                .scalar_backed_slice_elements(frames, &value, elem_tag)
+                .map(|elems| {
+                    let len = elems.len() as u128;
+                    (elems, len)
+                });
             let (elems, _) = match regrouped {
                 Some(elems) => elems,
-                None => match self.slice_elements(frames, &value) {
-                    Ok(elems) => elems,
-                    Err(err) => {
-                        let elem_tag = slice_container_element_tag(self_ty)
-                            .or_else(|| {
-                                slice_container_element_tag(
-                                    self_ty.strip_prefix('&').unwrap_or(self_ty),
-                                )
-                            })
-                            .unwrap_or("");
-                        match self.scalar_backed_slice_elements(
-                            frames,
-                            &value,
-                            elem_tag,
-                        ) {
-                            Some(elems) => {
-                                let len = elems.len() as u128;
-                                (elems, len)
-                            }
-                            None => return Err(err),
-                        }
-                    }
+                None => match scalar_backed {
+                    Some(elems) => elems,
+                    None => match self.slice_elements(frames, &value) {
+                        Ok(elems) => elems,
+                        Err(err) => return Err(err),
+                    },
                 },
             };
             Ok(slice_iter_value(elems))

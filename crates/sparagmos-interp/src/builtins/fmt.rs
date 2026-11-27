@@ -2883,6 +2883,12 @@ impl<'a> Interpreter<'a> {
                 };
                 if fields.len() == 1 {
                     fields[0].clone()
+                } else if let Some(fat) = box_fat_pointer(value) {
+                    // A fat box: the box's own pointer is the
+                    // fat one at the end of the field-0 chain,
+                    // whose metadata the thin extraction below
+                    // would drop.
+                    fat
                 } else {
                     self.dyn_data_pointer(value)
                 }
@@ -5259,6 +5265,28 @@ pub(super) fn escape_display_tag(plain: &str) -> bool {
         || self_ty_is(plain, "std::str::EscapeDefault")
         || self_ty_is(plain, "core::str::EscapeUnicode")
         || self_ty_is(plain, "std::str::EscapeUnicode")
+}
+
+/// The fat pointer at the end of a box aggregate's
+/// field-0 chain, when the chain ends in one: following
+/// first fields through the `Unique` / `NonNull` wrappers
+/// reaches the pointer the box carries, and for a fat box
+/// that pointer is the fat one, metadata included. `None`
+/// when the chain ends in anything else.
+fn box_fat_pointer(value: &Value) -> Option<Value> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Enum { fields, .. } if !fields.is_empty() => {
+                cur = &fields[0];
+            }
+            Value::Tuple(items) if !items.is_empty() => {
+                cur = &items[0];
+            }
+            fat @ Value::FatRef { .. } => return Some(fat.clone()),
+            _ => return None,
+        }
+    }
 }
 
 pub(super) fn pointee_tag(ty: &str) -> &str {

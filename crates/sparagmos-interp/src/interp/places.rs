@@ -979,10 +979,16 @@ impl<'a> Interpreter<'a> {
                                     // address (see
                                     // `enter_tuple_wrapped_sequence`).
                                     match pointee {
-                                        Ty::Array(elem, n) => self
-                                            .enter_tuple_wrapped_sequence(
-                                                frames, resolved, elem, *n,
-                                            ),
+                                        Ty::Array(elem, n) => {
+                                            let resolved = self
+                                                .enter_tuple_wrapped_sequence(
+                                                    frames, resolved, elem,
+                                                    *n,
+                                                );
+                                            self.window_to_declared_array(
+                                                frames, resolved, *n,
+                                            )
+                                        }
                                         _ => resolved,
                                     }
                                 }
@@ -1288,6 +1294,137 @@ impl<'a> Interpreter<'a> {
     /// reading stands only when the item cannot be an element:
     /// a tuple or byte block is never a scalar element, so
     /// the `([u8; N],)` shape still enters.
+    /// The target `resolved` with a trailing element-index
+    /// step rebased to the window of `len` elements starting
+    /// at that index, when the container the step ranges over
+    /// holds a sequence that covers the window. `None` when
+    /// the target does not end in an index step or the
+    /// container is not such a sequence.
+    fn rebase_element_position(
+        &self,
+        frames: &[Frame],
+        resolved: &Resolved,
+        len: u64,
+    ) -> Option<Resolved> {
+        fn projection_of(target: &Resolved) -> &Vec<RefProj> {
+            match target {
+                Resolved::Place { projection, .. }
+                | Resolved::Static { projection, .. }
+                | Resolved::Alloc { projection, .. } => projection,
+                Resolved::Value(_, projection) => projection,
+            }
+        }
+        fn projection_of_mut(target: &mut Resolved) -> &mut Vec<RefProj> {
+            match target {
+                Resolved::Place { projection, .. }
+                | Resolved::Static { projection, .. }
+                | Resolved::Alloc { projection, .. } => projection,
+                Resolved::Value(_, projection) => projection,
+            }
+        }
+        let Some(RefProj::Index(start)) =
+            projection_of(resolved).last().cloned()
+        else {
+            return None;
+        };
+        let mut rebased = resolved.clone();
+        projection_of_mut(&mut rebased).pop();
+        let stored = self.read_resolved(frames, &rebased).ok()?;
+        let total = match &stored {
+            Value::Tuple(items) => items.len() as u64,
+            Value::Bytes(bytes) => bytes.len() as u64,
+            Value::SparseVec { len, .. } => {
+                u64::try_from(*len).unwrap_or(u64::MAX)
+            }
+            _ => return None,
+        };
+        if start as u64 + len > total {
+            return None;
+        }
+        projection_of_mut(&mut rebased).push(RefProj::Subslice {
+            offset: start,
+            len: len as usize,
+        });
+        Some(rebased)
+    }
+
+    /// A dereference whose pointee is an array of exactly
+    /// `len` elements, over storage holding a longer element
+    /// sequence: the pointer named the whole allocation (a
+    /// fat pointer cast to an array pointer drops the fat
+    /// metadata at the cast; a sub-slice's `as_ptr` names the
+    /// allocation it was carved from), so the target the walk
+    /// resolved denotes the allocation's sequence, not the
+    /// array's. The declared array is the sequence's first
+    /// `len` elements: the target is windowed to them, and
+    /// every later step addresses inside the window. A target
+    /// whose stored form is not a longer sequence is returned
+    /// unchanged.
+    fn window_to_declared_array(
+        &self,
+        frames: &[Frame],
+        resolved: Resolved,
+        len: u64,
+    ) -> Resolved {
+        // A target whose projection already passes through
+        // a recorded view denomination (a slice cast's
+        // regrouping of the storage it ranges over) denotes
+        // exactly the element the view's steps select: the
+        // cast's denomination governs the dereference, and
+        // re-windowing the target against the longer birth
+        // sequence behind the view would retarget it at a
+        // window of elements instead of the element itself.
+        let projection = match &resolved {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection,
+            Resolved::Value(_, projection) => projection,
+        };
+        if projection
+            .iter()
+            .any(|step| matches!(step, RefProj::View(_)))
+        {
+            return resolved;
+        }
+        // An element position of a longer sequence (the
+        // target ends in an index step, the shape a
+        // sub-slice's `as_ptr` leaves): the array the
+        // dereference denotes starts at that element, so the
+        // trailing step becomes the window over the container
+        // that starts there.
+        if let Some(rebased) =
+            self.rebase_element_position(frames, &resolved, len)
+        {
+            return rebased;
+        }
+        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+            return resolved;
+        };
+        let stored_len = match &stored {
+            Value::Tuple(items) => items.len() as u64,
+            Value::Bytes(bytes) => bytes.len() as u64,
+            Value::SparseVec { len, .. } => {
+                u64::try_from(*len).unwrap_or(u64::MAX)
+            }
+            _ => return resolved,
+        };
+        if stored_len <= len {
+            return resolved;
+        }
+        let step = RefProj::Subslice {
+            offset: 0,
+            len: len as usize,
+        };
+        let mut resolved = resolved;
+        match &mut resolved {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection.push(step),
+            Resolved::Value(_, projection) => projection.push(step),
+        }
+        resolved
+    }
+
     fn enter_tuple_wrapped_sequence(
         &self,
         frames: &[Frame],

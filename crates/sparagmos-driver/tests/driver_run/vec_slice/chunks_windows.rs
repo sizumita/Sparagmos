@@ -428,3 +428,41 @@ fn run_mode_chunks_exact_over_vec_of_vecs_index_reads() {
         "c 1 4 6 1\nr 4 6 10\nsum 21\n",
     );
 }
+
+const CHUNK_ARRAY_PTR_SRC: &str = r#"
+struct Chunks<'a> { v: &'a [i32] }
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a [i32; 3];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.v.len() < 3 {
+            None
+        } else {
+            let (fst, snd) = self.v.split_at(3);
+            self.v = snd;
+            let ptr = fst.as_ptr() as *const [i32; 3];
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+fn main() {
+    let slice: &[i32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let mut chunks = Chunks { v: slice };
+    let mut iter = [[1, 2, 3], [4, 5, 6], [7, 8, 9]].iter();
+    while let Some(a) = chunks.next() {
+        assert_eq!(a, iter.next().unwrap());
+    }
+    println!("chunk array ptr ok");
+}
+"#;
+
+#[test]
+fn run_mode_chunk_array_pointer_windows() {
+    // A sub-slice's `as_ptr` cast to an array pointer
+    // denotes the chunk at the sub-slice's offset: the
+    // first chunk reads from the allocation's start, the
+    // later chunks from their element positions -- neither
+    // the whole allocation nor the single element at the
+    // position (the rustc suite's
+    // `const-generics/type-dependent/issue-70507` shape).
+    run_ok("chunk-array-ptr", CHUNK_ARRAY_PTR_SRC, "chunk array ptr ok\n");
+}

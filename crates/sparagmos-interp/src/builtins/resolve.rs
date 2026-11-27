@@ -346,6 +346,14 @@ impl<'a> Interpreter<'a> {
         value: &'x Value,
     ) -> InterpResult<Cow<'x, Value>> {
         let mut cur: Cow<'x, Value> = Cow::Borrowed(value);
+        // The length of the fat pointer the walk last followed
+        // through, when that step was a fat-pointer step: a fat
+        // pointer of length 1 whose pointee is a scalar denotes
+        // the one-element sequence holding that scalar (a
+        // `Box<T>` allocation reinterpreted as a `[T; 1]` by
+        // `Box::into_boxed_slice`), so the followed value is
+        // denominated as that sequence where it lands.
+        let mut fat_len: Option<u128> = None;
         loop {
             let follows = match &*cur {
                 Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => false,
@@ -370,11 +378,29 @@ impl<'a> Interpreter<'a> {
                 _ => false,
             };
             if !follows {
-                return Ok(cur);
+                break;
             }
+            fat_len = match &*cur {
+                Value::FatRef { len, .. } => Some(*len),
+                _ => None,
+            };
             let target = self.deref_value(frames, &cur)?;
             cur = self.read_resolved_ref(frames, &target)?;
         }
+        if fat_len == Some(1) {
+            match &*cur {
+                Value::Bool(_)
+                | Value::Int(_)
+                | Value::Uint(_)
+                | Value::Float(_)
+                | Value::Float128(_) => {
+                    let scalar = cur.into_owned();
+                    return Ok(Cow::Owned(Value::Tuple(vec![scalar])));
+                }
+                _ => {}
+            }
+        }
+        Ok(cur)
     }
 
     /// The bytes behind a raw C string pointer, up to (not

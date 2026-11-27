@@ -688,7 +688,24 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let base = self.resolve_ref(frames, base)?;
-                let elems = elements_of(base)?.truncated(*len as usize);
+                // A fat pointer of length 1 over a scalar
+                // pointee (a `Box<T>` allocation reinterpreted
+                // as a `[T; 1]` by `Box::into_boxed_slice`, a
+                // one-element `from_raw_parts` over a scalar):
+                // the scalar is the slice's one element (the
+                // one-element view `unsized_tail_len` names).
+                let elems = match &*base {
+                    Value::Bool(_)
+                    | Value::Int(_)
+                    | Value::Uint(_)
+                    | Value::Float(_)
+                    | Value::Float128(_)
+                        if *len == 1 =>
+                    {
+                        SliceElems::Values(Cow::Owned(vec![base.into_owned()]))
+                    }
+                    _ => elements_of(base)?.truncated(*len as usize),
+                };
                 let elems = match self.seq_snapshot_key(frames, value) {
                     Some((frame_pos, local, path)) => elems.with_rescue(|elems| {
                         self.rescue_elided_snapshot(

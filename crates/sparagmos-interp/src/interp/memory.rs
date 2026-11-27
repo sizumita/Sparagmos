@@ -2955,6 +2955,53 @@ impl<'a> Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
+/// A read through a dereference whose place is declared an
+/// array of exactly `n` elements, over storage holding a
+/// longer element sequence: the pointer the place was read
+/// through named the whole allocation (a fat pointer cast to
+/// an array pointer drops the fat metadata at the cast, and
+/// a sub-slice's `as_ptr` names the allocation it was carved
+/// from), so the stored sequence is the allocation's, not
+/// the array's. The declared array is its first `n`
+/// elements. Any other read is returned unchanged.
+fn truncate_to_declared_array(
+    value: Value,
+    place: &Place,
+    place_ty: Option<&Ty>,
+) -> Value {
+    let Some(Ty::Array(_, n)) = place_ty else {
+        return value;
+    };
+    // A projection that already applies a subslice window
+    // holds its window from the projector: the declared
+    // length of such a place can be the pattern tail's
+    // degenerate length rather than the window's, and the
+    // read value must stand as projected.
+    if !place
+        .projection
+        .iter()
+        .any(|step| matches!(step, ProjectionElem::Deref))
+        || place
+            .projection
+            .iter()
+            .any(|step| matches!(step, ProjectionElem::Subslice { .. }))
+    {
+        return value;
+    }
+    let n = usize::try_from(*n).unwrap_or(usize::MAX);
+    match value {
+        Value::Tuple(mut items) if items.len() > n => {
+            items.truncate(n);
+            Value::Tuple(items)
+        }
+        Value::Bytes(mut bytes) if bytes.len() > n => {
+            bytes.truncate(n);
+            Value::Bytes(bytes)
+        }
+        other => other,
+    }
+}
+
     pub(crate) fn read_place(
         &self,
         frames: &[Frame],
@@ -2986,7 +3033,9 @@ impl<'a> Interpreter<'a> {
         // view owns it when it can judge it (see
         // `Interpreter::foreign_read`).
         if let Some(read) = self.foreign_read(frames, body, place, &target) {
-            return read;
+            return read.map(|value| {
+                Self::truncate_to_declared_array(value, place, place_ty.as_ref())
+            });
         }
         // Read through the borrowing form: a projected read lends
         // the denoted value out of the frame's storage, so only
@@ -2995,9 +3044,12 @@ impl<'a> Interpreter<'a> {
         // (every element of a vector, for a single indexed read).
         // Results and errors are identical (see
         // `read_resolved_ref`).
-        Ok(self
-            .read_resolved_ref_typed(frames, &target, place_ty.as_ref())?
-            .into_owned())
+        Ok(Self::truncate_to_declared_array(
+            self.read_resolved_ref_typed(frames, &target, place_ty.as_ref())?
+                .into_owned(),
+            place,
+            place_ty.as_ref(),
+        ))
     }
 
     pub(crate) fn write_place(
