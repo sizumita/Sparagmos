@@ -593,14 +593,31 @@ impl Converter {
                             };
                         }
                     }
-                    Some(TyKind::RigidTy(RigidTy::Array(elem, _))) if plain => {
+                    Some(TyKind::RigidTy(RigidTy::Array(elem, len))) if plain => {
                         if matches!(
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
+                            // The declared length of the array
+                            // governs, not the extent of the backing
+                            // allocation: the array may be one field
+                            // of a larger allocation (a const item
+                            // tuple field is the canonical case),
+                            // whose following fields are not part of
+                            // the array, and whose trailing padding
+                            // bytes are uninitialised and would fail
+                            // the read. A length that cannot be
+                            // evaluated keeps the allocation-extent
+                            // read.
+                            let end = match len.eval_target_usize() {
+                                Ok(n) => target_off
+                                    .checked_add(n as usize)
+                                    .unwrap_or(pointee.bytes.len()),
+                                Err(_) => pointee.bytes.len(),
+                            };
                             return match alloc_bytes_in(
                                 &pointee,
-                                target_off..pointee.bytes.len(),
+                                target_off..end,
                             ) {
                                 Some(data) => sm::ConstValue::Bytes(data),
                                 None => {
