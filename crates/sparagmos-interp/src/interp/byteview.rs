@@ -1360,6 +1360,42 @@ impl<'a> Interpreter<'a> {
         extra: i128,
         seq: bool,
     ) -> Option<InterpResult<Value>> {
+        // A value target holding an erased constant block: the
+        // block's bytes are the storage itself, so a byte read
+        // needs no layout -- the position is the projection's
+        // byte displacement (a step that denominates in elements
+        // of an unknown size is not priceable over raw bytes and
+        // declines, as does a sequence access, whose caller owns
+        // the element denomination). A byte the constant left
+        // uninitialised reads as the indeterminate value, as a
+        // padding byte does below.
+        if !seq {
+            if let Resolved::Value(base, projection) = target {
+                if let Value::ErasedBlock { bytes, .. } = base {
+                    let mut pos: i128 = extra;
+                    let mut priceable = true;
+                    for step in projection {
+                        match step {
+                            RefProj::ByteOffset(d) => pos += d,
+                            RefProj::Index(0) | RefProj::View(_) => {}
+                            _ => {
+                                priceable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if priceable && pos >= 0 {
+                        match bytes.get(usize::try_from(pos).unwrap_or(usize::MAX)) {
+                            Some(Some(byte)) => {
+                                return Some(Ok(Value::Uint(u128::from(*byte))));
+                            }
+                            Some(None) => return Some(Ok(Value::Uninit)),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
         let (projection, base, base_ty, func, place_desc) =
             self.byte_view_base(frames, target)?;
         let pos = match self.byte_view_position(&base_ty, projection, extra)? {

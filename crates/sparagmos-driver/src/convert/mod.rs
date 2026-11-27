@@ -391,6 +391,21 @@ pub struct Converter {
     /// reference to one shared byte block copy that block once
     /// per element, unbounded by the call count.
     const_budget: usize,
+    /// Statics whose initializer seed is being decoded by
+    /// `decode_static_ref` / `decode_static_slice_ref` on the
+    /// path from the root constant. A reference back to one of
+    /// them closes an initializer cycle (`static L: Node =
+    /// Node { next: &L, .. }`): the seed cannot be decoded by
+    /// value, because the decode would recurse until the depth
+    /// budget refuses the whole constant, so the nested
+    /// reference carries an uninitialized placeholder seed
+    /// instead. The interpreter's seed table ranks a bare
+    /// placeholder below the real seed the enclosing decode
+    /// produces (see the `StaticRef` arm of the interpreter's
+    /// constant conversion), so the one storage is seeded by
+    /// the real initializer whichever reference is converted
+    /// first.
+    static_seed_decoding: std::collections::HashSet<sm::DefId>,
     /// Set when a `spend_const_budget` charge does not fit.
     /// Read by the erased-pointer fallback in `decode_ref`,
     /// which clears it before attempting an erased decode and

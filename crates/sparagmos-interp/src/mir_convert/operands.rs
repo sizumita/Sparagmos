@@ -628,7 +628,28 @@ impl<'a> Converter<'a> {
                 let (seed, seed_priority) = match self.static_tys.get(def) {
                     Some(ty) => {
                         let ty = ty.clone();
-                        (self.expand_uninit_constant(&seed, &ty, 0), 2)
+                        // A bare `Uninit` seed ranks lowest: it
+                        // is the placeholder the driver records
+                        // for a reference that closes a
+                        // static-initializer cycle, whose real
+                        // seed the enclosing decode produces as
+                        // another reference to the same static
+                        // (see `decode_static_ref` in the
+                        // driver), and the real seed must win
+                        // whichever reference is converted first.
+                        // A genuinely uninitialized static's only
+                        // seed is this same form and stands
+                        // unopposed, so the demotion changes
+                        // nothing for it; the expansion to the
+                        // declared type's skeleton still applies,
+                        // giving the storage its shape.
+                        let priority =
+                            if matches!(&**value, mir::ConstValue::Uninit) {
+                                0
+                            } else {
+                                2
+                            };
+                        (self.expand_uninit_constant(&seed, &ty, 0), priority)
                     }
                     None if projection.is_empty() => {
                         let seed_ty = match (inner_ctx, len) {
