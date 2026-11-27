@@ -151,9 +151,12 @@ fn generic_uninit_screen_does_not_crash() {
 /// body's types for the projection screen reaches
 /// rustc_public's unimplemented `ty::UnsafeBinder` conversion.
 /// The screen must have no opinion, and the body's own
-/// conversion then reports the named unsupported reason
-/// instead of the driver crashing (the shape of
-/// tests/ui/unsafe-binders/simple.rs).
+/// conversion erases the binder to the type it wraps (the
+/// binder is transparent at the value level), so the body
+/// converts instead of the driver crashing or skipping (the
+/// shape of tests/ui/unsafe-binders/simple.rs; the
+/// binder-type fixtures of Issue #510 live in
+/// driver_unsafe_binder.rs).
 const UNSAFE_BINDER_RS: &str = "\
 #![feature(unsafe_binders)]
 
@@ -163,12 +166,16 @@ fn main() {
 ";
 
 #[test]
-fn unsafe_binder_body_skips_with_named_reason() {
+fn unsafe_binder_body_converts_by_erasure() {
     let (code, stdout, stderr) = convert("unsafe_binder", UNSAFE_BINDER_RS, &[], &[]);
     assert_eq!(code, Some(0), "driver failed: {stderr}");
     assert!(
-        stdout.contains("body mentions an unsafe binder"),
-        "expected the named unsafe-binder skip reason, got: {stdout}"
+        !stdout.contains("body mentions an unsafe binder"),
+        "expected the binder-typed body to convert, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 1, skipped: 0"),
+        "expected the target crate to convert completely, got: {stdout}"
     );
 }
 

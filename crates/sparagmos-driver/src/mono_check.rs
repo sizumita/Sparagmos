@@ -211,6 +211,26 @@
 //!   public. Anything not conclusive is treated as encoded:
 //!   the check only narrows, never widens.
 //!
+//! - The symbol-name / def-path dump verdict of code
+//!   generation's opening test hook
+//!   (`rustc_symbol_mangling::test::dump_symbol_names_and_def_paths`,
+//!   called from `start_codegen` only when the output types
+//!   should codegen): for every local item carrying
+//!   `#[rustc_dump_symbol_name]` or `#[rustc_dump_def_path]`,
+//!   rustc emits an error carrying the item's mangled symbol
+//!   name or def path, so the compilation fails -- the dump
+//!   is the test harness's output, delivered as a diagnostic.
+//!   The hook never runs in a metadata-only session, so
+//!   conversion accepted these programs. The predicate is
+//!   pure session/HIR state -- the `rustc_attrs` feature is
+//!   enabled and a local item carries one of the two
+//!   attributes -- which the driver's session already
+//!   carries, so the check below (`dump_symbol_finding`)
+//!   replays it exactly: it fires for precisely the items
+//!   the hook reports on. (Verified against the pinned
+//!   rustc 1.100.0: a dump-carrying source exits 0 under
+//!   `--emit=metadata` and 1 under `--emit=link`.)
+//!
 //! - Check mode: when the compilation being judged is a
 //!   compiletest check compilation (`--emit=metadata` — a
 //!   `check-pass` / `check-fail` test, or an incremental
@@ -219,7 +239,7 @@
 //!   above that replay them cannot decide it: the
 //!   required-constant walk, the `check_mono_item` forces,
 //!   the duplicate-symbol, common-linkage, panic-runtime,
-//!   LTO / prefer-dynamic and target-cpu verdicts, the
+//!   LTO / prefer-dynamic, target-cpu and dump verdicts, the
 //!   unshimmed-intrinsic
 //!   verdict, and the body checks (SIMD / atomic / layout).
 //!   Each was verified against the pinned compiler to stay
@@ -1558,6 +1578,8 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// (`lto_prefer_dynamic_finding`), which needs no walk
 /// either, and the target-cpu session validation
 /// (`target_cpu_finding`), which needs no walk either.
+/// The dump verdict (`dump_symbol_finding`) needs no walk
+/// either.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1596,6 +1618,7 @@ pub fn check_required_consts() -> Option<String> {
             panic_runtime_finding(tcx),
             lto_prefer_dynamic_finding(tcx),
             target_cpu_finding(tcx),
+            dump_symbol_finding(tcx),
         ] {
             if let Some(finding) = finding {
                 note_check_mode_verdict(finding);
@@ -1647,6 +1670,7 @@ pub fn check_required_consts() -> Option<String> {
         .or_else(|| panic_runtime_finding(tcx))
         .or_else(|| lto_prefer_dynamic_finding(tcx))
         .or_else(|| target_cpu_finding(tcx))
+        .or_else(|| dump_symbol_finding(tcx))
 }
 
 /// The `check_mono_item` finding of the most recent
@@ -2155,6 +2179,53 @@ fn target_cpu_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
                  (rustc rejects a `-C target-cpu` the target spec \
                  lists as unsupported, at code generation)"
             ));
+        }
+    }
+    None
+}
+
+/// The symbol-name / def-path dump verdict, mirroring
+/// `rustc_symbol_mangling::test::dump_symbol_names_and_def_paths`,
+/// the test hook `start_codegen` runs as code generation
+/// starts (and only when the output types should codegen,
+/// which a metadata-only session's never do): when the
+/// `rustc_attrs` feature is enabled, every local item
+/// carrying `#[rustc_dump_symbol_name]` or
+/// `#[rustc_dump_def_path]` is reported with an error
+/// carrying its mangled symbol name or its def path, so
+/// the compilation fails. The evidence is the attribute
+/// itself on a local item -- the same evidence the hook
+/// walks -- so the replay fires for precisely the
+/// compilations rustc rejects this way, and stays silent
+/// when the feature is off (the attributes cannot be
+/// parsed as dump attributes then, and the hook returns
+/// before walking) or no local item carries either one.
+fn dump_symbol_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
+    if !tcx.features().rustc_attrs() {
+        return None;
+    }
+    for local_def_id in tcx.iter_local_def_id() {
+        let def_id = local_def_id.to_def_id();
+        for dump in [
+            (
+                rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpSymbolName(..)),
+                "symbol-name",
+            ),
+            (
+                rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpDefPath(..)),
+                "def-path",
+            ),
+        ] {
+            if dump.0 {
+                return Some(format!(
+                    "`{}` carries a rustc dump attribute, so code \
+                     generation reports its {} as an error \
+                     (rustc's dump test hook rejects the \
+                     compilation at code generation)",
+                    tcx.def_path_str(def_id),
+                    dump.1
+                ));
+            }
         }
     }
     None

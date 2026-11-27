@@ -48,6 +48,13 @@ impl Converter {
 
     pub fn ty(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
         let Some(kind) = guarded_ty_kind(ty) else {
+            // An unsafe binder type erases to the type it
+            // wraps (see `unsafe_binder_inner_ty`): the binder
+            // is transparent at the value level, so the body
+            // converts with the wrapped type in its place.
+            if let Some(inner) = unsafe_binder_inner_ty(ty) {
+                return self.ty(&inner);
+            }
             // A coroutine-closure type, whose kind the bridge
             // cannot hand over (see `guarded_ty_kind`): neither
             // its structure nor a layout can be asked. The value
