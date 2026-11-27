@@ -1008,3 +1008,74 @@ fn run_mode_extend_other_spec_extend_instances() {
         "stdout={stdout}"
     );
 }
+
+const SLICE_ITER_CELL_WRITE_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Named {
+    name: &'static str,
+    contents: Cell<Option<usize>>,
+}
+
+fn named(name: &'static str) -> Named {
+    Named { name, contents: Cell::new(None) }
+}
+
+fn main() {
+    let a = [named("a"), named("b")];
+    for x in a.iter() {
+        x.contents.set(Some(7));
+    }
+    let mut v: Vec<Cell<i32>> = Vec::new();
+    v.push(Cell::new(10));
+    v.push(Cell::new(20));
+    for x in v.iter() {
+        x.set(x.get() + 1);
+    }
+    let mut sv: Vec<Cell<i32>> = Vec::with_capacity(64);
+    sv.push(Cell::new(5));
+    sv.push(Cell::new(6));
+    for x in sv.iter() {
+        x.set(x.get() + 1);
+    }
+    let mut w: Vec<Named> = Vec::new();
+    w.push(named("x"));
+    w.push(named("y"));
+    for x in &w {
+        x.contents.set(Some(9));
+    }
+    println!(
+        "arr {} {} vec {} {} sparse {} {} ref {} {}",
+        a[0].contents.get().unwrap(),
+        a[1].contents.get().unwrap(),
+        v[0].get(),
+        v[1].get(),
+        sv[0].get(),
+        sv[1].get(),
+        w[0].contents.get().unwrap(),
+        w[1].contents.get().unwrap()
+    );
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_write_through_cell() {
+    // A write through a reference a borrowed slice iteration
+    // yields -- a `Cell::set` on an element -- must land in
+    // the container's own storage: `slice::Iter` construction
+    // denotes the element positions in real storage when it
+    // can (see `slice_iter_storage_state`), over an array, a
+    // vector buffer, a spare-capacity (sparse) vector and the
+    // `IntoIterator` for `&Vec` form alike. It used to stop
+    // with "expected mutable place, found constant aggregate"
+    // because the state held an element snapshot. (A vector
+    // stored as a field sequence -- the `vec!` literal form --
+    // keeps the snapshot: its element positions are field
+    // steps, which the pointer machinery denominates
+    // ambiguously.)
+    run_ok(
+        "slice-iter-cell-write",
+        SLICE_ITER_CELL_WRITE_SRC,
+        "arr 7 7 vec 11 21 sparse 6 7 ref 9 9\n",
+    );
+}

@@ -3543,7 +3543,9 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut projection = projection.clone();
                 match base {
-                    Value::Tuple(_) => projection.push(RefProj::Index(idx)),
+                    Value::Tuple(_) | Value::SparseVec { .. } => {
+                        projection.push(RefProj::Index(idx))
+                    }
                     Value::Enum { .. } => projection.push(RefProj::Field(idx)),
                     ref other => {
                         return Err(unsupported(format!(
@@ -3583,7 +3585,9 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut projection = projection.clone();
                 match base {
-                    Value::Tuple(_) => projection.push(RefProj::Index(idx)),
+                    Value::Tuple(_) | Value::SparseVec { .. } => {
+                        projection.push(RefProj::Index(idx))
+                    }
                     Value::Enum { .. } => projection.push(RefProj::Field(idx)),
                     ref other => {
                         return Err(unsupported(format!(
@@ -3624,7 +3628,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut projection = projection.clone();
                 match base {
-                    Value::Tuple(_) => {
+                    Value::Tuple(_) | Value::SparseVec { .. } => {
                         projection.push(RefProj::Index(idx))
                     }
                     Value::Enum { .. } => {
@@ -3648,6 +3652,88 @@ impl<'a> Interpreter<'a> {
                 other.kind_name()
             ))),
         }
+    }
+
+    /// The storage-backed `slice::Iter` state over the
+    /// elements a slice argument denotes, when the element
+    /// positions live in real storage (the positions
+    /// `iter_mut_element_ref` denotes): the yielded
+    /// references then name the container's own elements, so
+    /// a write through one (an interior-mutable element --
+    /// the only write a shared reference admits) lands in
+    /// the container instead of in the element snapshot.
+    /// `elems` is the snapshot reading of the same elements:
+    /// a position whose read-back differs from the snapshot
+    /// element declines the state, so a container form whose
+    /// positions denote anything else keeps the snapshot.
+    pub(super) fn slice_iter_storage_state(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        elems: &[Value],
+    ) -> Option<Value> {
+        let first = self.iter_mut_element_ref(frames, arg, 0).ok()?;
+        let end = self.iter_mut_element_ref(frames, arg, elems.len()).ok()?;
+        // The step machinery locates a pointer's element step
+        // with `elem_step_pos`, which reads a trailing entry
+        // step as part of the element the earlier steps denote:
+        // a container nested inside another element sequence
+        // (a `Vec` element of a `Vec`, a field's `Vec`) can
+        // produce a projection whose own element step the
+        // machinery would locate at the outer sequence's step
+        // instead, and stepping such a state would walk the
+        // outer sequence. A field-step element position is
+        // ambiguous in the same way for the pointer-offset
+        // machinery: a lone `Field(0)` over a field-stored
+        // element sequence reads there as the sequence's base
+        // field, so an offset appends an index step behind it
+        // instead of advancing the field step, and the
+        // resulting projection denotes a position inside the
+        // first element. A byte-displaced position (a regrouped
+        // view's element) is out for the same reason the step
+        // machinery's index-pair shortcut excludes it: reading
+        // drops the displacement, so the position belongs to
+        // the real-pointer step. Adopt the state only when both
+        // built positions carry an index element step the
+        // machinery reads back as the position it denotes, as
+        // the final step of the projection, with no byte
+        // displacement anywhere in the projection.
+        let denotes = |v: &Value, idx: usize| -> bool {
+            let projection = match v {
+                Value::Ref(RefTarget::Place { projection, .. })
+                | Value::Ref(RefTarget::Static { projection, .. })
+                | Value::Ref(RefTarget::Alloc { projection, .. })
+                | Value::Ref(RefTarget::Value(_, projection)) => projection,
+                _ => return false,
+            };
+            !projection.is_empty()
+                && elem_step_pos(projection) == Some(projection.len() - 1)
+                && matches!(projection.last(), Some(RefProj::Index(_)))
+                && !projection
+                    .iter()
+                    .any(|step| matches!(step, RefProj::ByteOffset(_)))
+                && iter_ptr_index(v, None) == Some(idx)
+        };
+        if !denotes(&first, 0) || !denotes(&end, elems.len()) {
+            return None;
+        }
+        if !elems.is_empty() {
+            let read_back = |idx: usize, at: &Value| -> Option<bool> {
+                let target = self.deref_value(frames, at).ok()?;
+                let value = self.read_resolved(frames, &target).ok()?;
+                Some(value == elems[idx])
+            };
+            if read_back(0, &first) != Some(true) {
+                return None;
+            }
+            let last = self
+                .iter_mut_element_ref(frames, arg, elems.len() - 1)
+                .ok()?;
+            if read_back(elems.len() - 1, &last) != Some(true) {
+                return None;
+            }
+        }
+        Some(slice_iter_state(first, end))
     }
 
     /// One `Iterator::next` step on an iterator state value:
@@ -4138,7 +4224,7 @@ impl<'a> Interpreter<'a> {
                         .expect("index step checked");
                     let item =
                         iter_ptr_value(&ptr_field).expect("pointer field checked");
-                    let item = btree_pair_item(self_ty, item);
+                    let item = btree_step_item(self_ty, item);
                     (vec![advanced, end, fields[2].clone()], some_value(item))
                 } else {
                     (fields, none_value())
@@ -8162,6 +8248,14 @@ pub(super) fn slice_iter_value(elems: Vec<Value>) -> Value {
         Box::new(snapshot),
         vec![RefProj::Index(len)],
     ));
+    slice_iter_state(ptr, end)
+}
+
+/// The `slice::Iter` value in the struct's real field layout
+/// over a front element pointer and a past-the-end element
+/// pointer (see `slice_iter_value` for why the layout
+/// matters).
+pub(super) fn slice_iter_state(first: Value, end: Value) -> Value {
     Value::Enum {
         variant: 0,
         fields: vec![
@@ -8169,7 +8263,7 @@ pub(super) fn slice_iter_value(elems: Vec<Value>) -> Value {
             // the raw element pointer.
             Value::Enum {
                 variant: 0,
-                fields: vec![ptr],
+                fields: vec![first],
             },
             end,
             // `_marker: PhantomData<&T>` — a zero-sized ADT
@@ -8594,7 +8688,7 @@ fn step_slice_iter_back(
             let item_field = iter_ptr_with_index(&fields[0], (end - 1) as usize)
                 .expect("index step checked");
             let item = iter_ptr_value(&item_field).expect("pointer field checked");
-            let item = btree_pair_item(self_ty, item);
+            let item = btree_step_item(self_ty, item);
             return Ok((
                 iterator_state_like(
                     state,
@@ -8636,7 +8730,7 @@ fn step_slice_iter_back(
         let item_field =
             iter_ptr_with_index(&fields[0], end - 1).expect("index step checked");
         let item = iter_ptr_value(&item_field).expect("pointer field checked");
-        let item = btree_pair_item(self_ty, item);
+        let item = btree_step_item(self_ty, item);
         Ok((
             iterator_state_like(
                 state,

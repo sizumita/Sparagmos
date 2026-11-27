@@ -629,3 +629,161 @@ fn run_mode_btree_boxed_os_str_set() {
         "len=3\ncontains=true\niter=[\"banana\", \"kiwi\", \"pear\"]\n"
     );
 }
+
+const BTREE_ITER_CELL_WRITE_SRC: &str = r#"
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+
+struct BTM<'a> {
+    name: &'static str,
+    contents: Cell<Option<&'a BTreeMap<BTM<'a>, BTM<'a>>>>,
+}
+
+impl<'a> BTM<'a> {
+    fn new(name: &'static str) -> BTM<'a> {
+        BTM { name, contents: Cell::new(None) }
+    }
+}
+impl<'a> PartialEq for BTM<'a> {
+    fn eq(&self, rhs: &BTM<'a>) -> bool {
+        self.name == rhs.name
+    }
+}
+impl<'a> Eq for BTM<'a> {}
+impl<'a> PartialOrd for BTM<'a> {
+    fn partial_cmp(&self, rhs: &BTM<'a>) -> Option<Ordering> {
+        Some(self.cmp(rhs))
+    }
+}
+impl<'a> Ord for BTM<'a> {
+    fn cmp(&self, rhs: &BTM<'a>) -> Ordering {
+        self.name.cmp(rhs.name)
+    }
+}
+
+struct BTS<'a> {
+    name: &'static str,
+    contents: Cell<Option<&'a BTreeSet<BTS<'a>>>>,
+}
+
+impl<'a> BTS<'a> {
+    fn new(name: &'static str) -> BTS<'a> {
+        BTS { name, contents: Cell::new(None) }
+    }
+}
+impl<'a> PartialEq for BTS<'a> {
+    fn eq(&self, rhs: &BTS<'a>) -> bool {
+        self.name == rhs.name
+    }
+}
+impl<'a> Eq for BTS<'a> {}
+impl<'a> PartialOrd for BTS<'a> {
+    fn partial_cmp(&self, rhs: &BTS<'a>) -> Option<Ordering> {
+        Some(self.cmp(rhs))
+    }
+}
+impl<'a> Ord for BTS<'a> {
+    fn cmp(&self, rhs: &BTS<'a>) -> Ordering {
+        self.name.cmp(rhs.name)
+    }
+}
+
+fn main() {
+    let mut btm: BTreeMap<BTM, BTM> = BTreeMap::new();
+    btm.insert(BTM::new("btk0"), BTM::new("btv0"));
+    btm.insert(BTM::new("btk1"), BTM::new("btv1"));
+    for (k, v) in btm.iter() {
+        k.contents.set(Some(&btm));
+        v.contents.set(Some(&btm));
+    }
+    let mut landed = 0;
+    for (k, v) in btm.iter() {
+        if k.contents.get().is_some() {
+            landed += 1;
+        }
+        if v.contents.get().is_some() {
+            landed += 1;
+        }
+    }
+    let mut bts: BTreeSet<BTS> = BTreeSet::new();
+    bts.insert(BTS::new("bts0"));
+    bts.insert(BTS::new("bts1"));
+    for v in bts.iter() {
+        v.contents.set(Some(&bts));
+    }
+    let mut set_landed = 0;
+    for v in bts.iter() {
+        if v.contents.get().is_some() {
+            set_landed += 1;
+        }
+    }
+    println!("landed {} {}", landed, set_landed);
+}
+"#;
+
+#[test]
+fn run_mode_btree_iter_write_through_cell() {
+    // A write through a reference borrowed iteration yields --
+    // a `Cell::set` on a key or value -- must land in the
+    // tree's own node storage: the borrowed-iteration states
+    // hold the yielded items as references into the node
+    // allocations (see `btree_map_pair_targets_of_ref`), so a
+    // fresh iteration observes the writes. The shape is
+    // `tests/ui/drop/dropck_legal_cycles.rs` Cycle 10, whose
+    // back-references are set exactly this way; it used to
+    // stop with "expected mutable place, found constant
+    // aggregate" because the states held an element snapshot.
+    run_ok(
+        "btree-iter-cell-write",
+        BTREE_ITER_CELL_WRITE_SRC,
+        "landed 4 2\n",
+    );
+}
+
+const BTREE_ITER_CELL_MULTINODE_SRC: &str = r#"
+use std::cell::Cell;
+use std::collections::BTreeMap;
+
+fn main() {
+    let mut m: BTreeMap<i32, Cell<i32>> = BTreeMap::new();
+    for i in 0..50 {
+        m.insert(i, Cell::new(i * 10));
+    }
+    for (_, v) in m.iter() {
+        v.set(v.get() + 1);
+    }
+    let mut sum = 0;
+    for (_, v) in m.iter() {
+        sum += v.get();
+    }
+    for (_, v) in m.iter().rev() {
+        v.set(v.get() * 2);
+    }
+    for v in m.values() {
+        v.set(0);
+    }
+    let mut zeros = 0;
+    for v in m.values() {
+        if v.get() == 0 {
+            zeros += 1;
+        }
+    }
+    println!("sum {} zeros {}", sum, zeros);
+}
+"#;
+
+#[test]
+fn run_mode_btree_iter_write_through_cell_multinode() {
+    // The same write-through over a tree tall enough to have
+    // internal nodes: the yielded references denote slots in
+    // every node's allocation (the target walk interleaves
+    // edge subtrees with each internal node's own pairs), and
+    // the back step (`.rev()`) and `values()` hand out the
+    // same storage references.
+    run_ok(
+        "btree-iter-cell-multinode",
+        BTREE_ITER_CELL_MULTINODE_SRC,
+        "sum 12300 zeros 50\n",
+    );
+}

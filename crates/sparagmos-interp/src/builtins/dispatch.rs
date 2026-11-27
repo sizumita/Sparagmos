@@ -7833,12 +7833,20 @@ impl<'a> Interpreter<'a> {
                         let len = elems.len() as u128;
                         (elems, len)
                     });
+                let mut storage_state = None;
                 let (elems, _) = match regrouped {
                     Some(elems) => elems,
                     None => match scalar_backed {
                         Some(elems) => elems,
                         None => match self.slice_elements(frames, &vals[0]) {
-                            Ok(elems) => elems,
+                            Ok(elems) => {
+                                storage_state = self.slice_iter_storage_state(
+                                    frames,
+                                    &vals[0],
+                                    &elems.0,
+                                );
+                                elems
+                            }
                             Err(err) => {
                                 // A slice over an address-only
                                 // pointer has no elements in the
@@ -7859,30 +7867,26 @@ impl<'a> Interpreter<'a> {
                         },
                     },
                 };
-                Ok(slice_iter_value(elems))
+                Ok(match storage_state {
+                    Some(state) => state,
+                    None => slice_iter_value(elems),
+                })
             }
             Builtin::BTreeIter => {
                 arity(1)?;
-                let elems = if name.contains("BTreeSet") {
-                    self.btree_set_elements_of_ref(frames, &vals[0])?
+                if name.contains("BTreeSet") {
+                    self.btree_set_iter_value(frames, &vals[0])
                 } else {
-                    self.btree_map_pair_elements_of_ref(frames, &vals[0])?
-                };
-                Ok(slice_iter_value(elems))
+                    self.btree_map_iter_value(frames, &vals[0])
+                }
             }
             Builtin::BTreeKeys => {
                 arity(1)?;
-                let pairs = self.btree_map_pairs_of_ref(frames, &vals[0])?;
-                Ok(slice_iter_value(
-                    pairs.into_iter().map(|(key, _)| key).collect(),
-                ))
+                self.btree_keys_value(frames, &vals[0])
             }
             Builtin::BTreeValues => {
                 arity(1)?;
-                let pairs = self.btree_map_pairs_of_ref(frames, &vals[0])?;
-                Ok(slice_iter_value(
-                    pairs.into_iter().map(|(_, value)| value).collect(),
-                ))
+                self.btree_values_value(frames, &vals[0])
             }
             Builtin::StrContains | Builtin::StrStartsWith | Builtin::StrEndsWith => {
                 arity(2)?;
@@ -10984,23 +10988,29 @@ impl<'a> Interpreter<'a> {
                     let len = elems.len() as u128;
                     (elems, len)
                 });
+            let mut storage_state = None;
             let (elems, _) = match regrouped {
                 Some(elems) => elems,
                 None => match scalar_backed {
                     Some(elems) => elems,
                     None => match self.slice_elements(frames, &value) {
-                        Ok(elems) => elems,
+                        Ok(elems) => {
+                            storage_state = self
+                                .slice_iter_storage_state(frames, &value, &elems.0);
+                            elems
+                        }
                         Err(err) => return Err(err),
                     },
                 },
             };
-            Ok(slice_iter_value(elems))
+            Ok(match storage_state {
+                Some(state) => state,
+                None => slice_iter_value(elems),
+            })
         } else if self_ty.starts_with("&std::collections::BTreeSet<") {
-            let elems = self.btree_set_elements_of_ref(frames, &value)?;
-            Ok(slice_iter_value(elems))
+            self.btree_set_iter_value(frames, &value)
         } else if self_ty.starts_with("&std::collections::BTreeMap<") {
-            let elems = self.btree_map_pair_elements_of_ref(frames, &value)?;
-            Ok(slice_iter_value(elems))
+            self.btree_map_iter_value(frames, &value)
         } else if self_ty_is(self_ty, "std::env::Args")
             || self_ty_is(self_ty, "std::env::ArgsOs")
             || self_ty_is(self_ty, "std::env::Vars")

@@ -274,6 +274,351 @@ impl<'a> Interpreter<'a> {
         }
         Ok(())
     }
+
+    /// The `(key, value)` storage targets of the `BTreeMap`
+    /// behind a reference, in iteration order: the position of
+    /// each entry's key slot and value slot in the tree's node
+    /// allocations. Borrowed iteration builds its yielded
+    /// references from these targets, so a write through a
+    /// yielded reference (an interior-mutable key or value --
+    /// the only write a shared reference admits) lands in the
+    /// tree's own storage instead of in a snapshot copy.
+    ///
+    /// `None` when some entry's position cannot be denoted: a
+    /// node array shorter than the declared length (the elided
+    /// zero-sized slots the value walk fills in) has no storage
+    /// position for the missing entries, and a node pointer
+    /// that does not name an allocation names no storage at
+    /// all. The caller then keeps the snapshot iteration the
+    /// value walk serves, errors included: every shape this
+    /// walk declines is re-judged by that walk on the way out.
+    pub(super) fn btree_map_pair_targets_of_ref(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<Vec<(RefTarget, RefTarget)>> {
+        let target = self.deref_value(frames, value).ok()?;
+        let map = self.read_resolved(frames, &target).ok()?;
+        self.btree_map_pair_targets(frames, &map)
+    }
+
+    /// The key storage targets of the `BTreeSet` behind a
+    /// reference, in iteration order (see
+    /// `btree_map_pair_targets_of_ref`).
+    pub(super) fn btree_set_key_targets_of_ref(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<Vec<RefTarget>> {
+        let target = self.deref_value(frames, value).ok()?;
+        let set = self.read_resolved(frames, &target).ok()?;
+        let fields = match &set {
+            Value::Enum { fields, .. } if fields.len() == 1 => fields,
+            _ => return None,
+        };
+        let pairs = self.btree_map_pair_targets(frames, &fields[0])?;
+        Some(pairs.into_iter().map(|(key, _)| key).collect())
+    }
+
+    /// The `btree_map::Iter` state over the map behind a
+    /// reference: the slice-Iter state (see `slice_iter_value`)
+    /// whose snapshot holds the yielded items themselves --
+    /// the `(key, value)` reference pair per entry, denoting
+    /// the tree's node storage -- when every entry's slot
+    /// position can be denoted, so a write through a yielded
+    /// reference lands in the tree; the element snapshot
+    /// otherwise.
+    pub(super) fn btree_map_iter_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match self.btree_map_pair_targets_of_ref(frames, value) {
+            Some(pairs) => Ok(slice_iter_value(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Value::Tuple(vec![Value::Ref(key), Value::Ref(value)])
+                    })
+                    .collect(),
+            )),
+            None => Ok(slice_iter_value(
+                self.btree_map_pair_elements_of_ref(frames, value)?,
+            )),
+        }
+    }
+
+    /// The `btree_set::Iter` state over the set behind a
+    /// reference (see `btree_map_iter_value`): the snapshot
+    /// holds each element's key reference when every position
+    /// can be denoted.
+    pub(super) fn btree_set_iter_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match self.btree_set_key_targets_of_ref(frames, value) {
+            Some(targets) => Ok(slice_iter_value(
+                targets.into_iter().map(Value::Ref).collect(),
+            )),
+            None => Ok(slice_iter_value(
+                self.btree_set_elements_of_ref(frames, value)?,
+            )),
+        }
+    }
+
+    /// The `btree_map::Keys` state over the map behind a
+    /// reference (see `btree_map_iter_value`).
+    pub(super) fn btree_keys_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match self.btree_map_pair_targets_of_ref(frames, value) {
+            Some(pairs) => Ok(slice_iter_value(
+                pairs
+                    .into_iter()
+                    .map(|(key, _)| Value::Ref(key))
+                    .collect(),
+            )),
+            None => {
+                let pairs = self.btree_map_pairs_of_ref(frames, value)?;
+                Ok(slice_iter_value(
+                    pairs.into_iter().map(|(key, _)| key).collect(),
+                ))
+            }
+        }
+    }
+
+    /// The `btree_map::Values` state over the map behind a
+    /// reference (see `btree_map_iter_value`).
+    pub(super) fn btree_values_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match self.btree_map_pair_targets_of_ref(frames, value) {
+            Some(pairs) => Ok(slice_iter_value(
+                pairs
+                    .into_iter()
+                    .map(|(_, value)| Value::Ref(value))
+                    .collect(),
+            )),
+            None => {
+                let pairs = self.btree_map_pairs_of_ref(frames, value)?;
+                Ok(slice_iter_value(
+                    pairs.into_iter().map(|(_, value)| value).collect(),
+                ))
+            }
+        }
+    }
+
+    /// The pair targets of a `BTreeMap` value, walked from the
+    /// tree's node storage in the same order and under the
+    /// same shape checks as `btree_map_pairs`.
+    fn btree_map_pair_targets(
+        &self,
+        frames: &[Frame],
+        map: &Value,
+    ) -> Option<Vec<(RefTarget, RefTarget)>> {
+        let fields = match map {
+            Value::Enum { fields, .. } if fields.len() >= 2 => fields,
+            _ => return None,
+        };
+        let declared = btree_count(&fields[1], "BTreeMap length").ok()?;
+        let root_fields: &[Value] = match &fields[0] {
+            Value::Enum { fields, .. } => fields,
+            _ => &[],
+        };
+        let mut out = Vec::new();
+        match root_fields.len() {
+            // `Option::None`: no payload fields.
+            0 => {}
+            // `Option::Some(root)`: the NodeRef is the payload.
+            1 => self.btree_walk_noderef_targets(frames, &root_fields[0], &mut out, 0)?,
+            // A niche-packed `Option<Root>` reads as the NodeRef
+            // itself; a null node pointer there is the empty tree.
+            _ => {
+                let (_, ptr) = btree_noderef_parts(&fields[0]).ok()?;
+                if ptr.is_some() {
+                    self.btree_walk_noderef_targets(frames, &fields[0], &mut out, 0)?;
+                }
+            }
+        }
+        if out.len() != declared {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Append the pair targets under one `NodeRef` to `out`,
+    /// in iteration order (see `btree_walk_noderef`).
+    fn btree_walk_noderef_targets(
+        &self,
+        frames: &[Frame],
+        noderef: &Value,
+        out: &mut Vec<(RefTarget, RefTarget)>,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        let (height, ptr) = btree_noderef_parts(noderef).ok()?;
+        let ptr = btree_internal_target(ptr, height > 0)?;
+        let node_target = match ptr {
+            RefTarget::Alloc { .. } => ptr,
+            _ => return None,
+        };
+        let node = self
+            .btree_node_value(frames, Some(node_target.clone()), "BTree node reference")
+            .ok()?;
+        self.btree_walk_node_targets(frames, &node_target, &node, height, out, depth)
+    }
+
+    /// Append the pair targets stored in one node value to
+    /// `out`. `node_target` names the node value itself in its
+    /// allocation. A leaf (height 0) holds its pairs directly;
+    /// an internal node interleaves its edge subtrees with its
+    /// own pairs, which sit in the leaf data at field 0.
+    fn btree_walk_node_targets(
+        &self,
+        frames: &[Frame],
+        node_target: &RefTarget,
+        node: &Value,
+        height: usize,
+        out: &mut Vec<(RefTarget, RefTarget)>,
+        depth: usize,
+    ) -> Option<()> {
+        let fields = match node {
+            Value::Enum { fields, .. } => fields,
+            _ => return None,
+        };
+        if height == 0 {
+            if fields.len() != 5 {
+                return None;
+            }
+            return self.btree_push_leaf_targets(node_target, &[], fields, out);
+        }
+        if fields.len() != 2 {
+            return None;
+        }
+        let data_fields = match &fields[0] {
+            Value::Enum { fields, .. } => fields,
+            _ => return None,
+        };
+        if data_fields.len() != 5 {
+            return None;
+        }
+        let len = btree_count(&data_fields[2], "BTree leaf length").ok()?;
+        let edges = match &fields[1] {
+            Value::Tuple(items) => items,
+            _ => return None,
+        };
+        if edges.len() < len + 1 {
+            return None;
+        }
+        let mut own = Vec::new();
+        self.btree_push_leaf_targets(
+            node_target,
+            &[RefProj::Field(0)],
+            data_fields,
+            &mut own,
+        )?;
+        if own.len() != len {
+            return None;
+        }
+        for i in 0..=len {
+            let edge = btree_maybe_uninit(&edges[i]).ok()?;
+            let ptr = btree_ptr_of(&edge).ok()?;
+            let ptr = btree_internal_target(ptr, height > 1)?;
+            let child_target = match ptr {
+                RefTarget::Alloc { .. } => ptr,
+                _ => return None,
+            };
+            let child = self
+                .btree_node_value(frames, Some(child_target.clone()), "BTree internal edge")
+                .ok()?;
+            self.btree_walk_node_targets(
+                frames,
+                &child_target,
+                &child,
+                height - 1,
+                out,
+                depth + 1,
+            )?;
+            if i < len {
+                out.push(own[i].clone());
+            }
+        }
+        Some(())
+    }
+
+    /// Append the pair targets of one leaf-shaped field group
+    /// (`[parent, parent index, length, keys, values]`) sitting
+    /// at `prefix` within the node value `node_target` names.
+    fn btree_push_leaf_targets(
+        &self,
+        node_target: &RefTarget,
+        prefix: &[RefProj],
+        fields: &[Value],
+        out: &mut Vec<(RefTarget, RefTarget)>,
+    ) -> Option<()> {
+        let len = btree_count(&fields[2], "BTree leaf length").ok()?;
+        let raw_keys = match &fields[3] {
+            Value::Tuple(items) => items,
+            _ => return None,
+        };
+        let raw_values = match &fields[4] {
+            Value::Tuple(items) => items,
+            _ => return None,
+        };
+        // An array shorter than the declared length holds
+        // elided zero-sized slots: the missing entries were
+        // never stored and have no position to denote.
+        if raw_keys.len() < len || raw_values.len() < len {
+            return None;
+        }
+        for i in 0..len {
+            let key = btree_slot_target(node_target, prefix, 3, i, &raw_keys[i])?;
+            let value = btree_slot_target(node_target, prefix, 4, i, &raw_values[i])?;
+            out.push((key, value));
+        }
+        Some(())
+    }
+}
+
+/// The storage target of one B-tree leaf slot: the slot sits
+/// in the node's key (field 3) or value (field 4) array at
+/// `index`, under `prefix` within the node value the target
+/// names. A slot stored in the `MaybeUninit` field-0 payload
+/// form denotes its payload; any other stored form denotes
+/// the slot itself. An uninitialized slot within the declared
+/// length denotes nothing.
+fn btree_slot_target(
+    node_target: &RefTarget,
+    prefix: &[RefProj],
+    array_field: usize,
+    index: usize,
+    slot: &Value,
+) -> Option<RefTarget> {
+    if matches!(slot, Value::Uninit) {
+        return None;
+    }
+    let mut target = node_target.clone();
+    let projection = match &mut target {
+        RefTarget::Place { projection, .. }
+        | RefTarget::Static { projection, .. }
+        | RefTarget::Alloc { projection, .. }
+        | RefTarget::Value(_, projection) => projection,
+        RefTarget::Address(_) | RefTarget::Null => return None,
+    };
+    projection.extend_from_slice(prefix);
+    projection.push(RefProj::Field(array_field));
+    projection.push(RefProj::Index(index));
+    if matches!(slot, Value::Enum { variant: 0, fields } if fields.len() == 1) {
+        projection.push(RefProj::Field(0));
+    }
+    Some(target)
 }
 
 /// The `slice::Iter` value over an element snapshot, in the
@@ -487,4 +832,48 @@ pub(super) fn btree_pair_item(self_ty: &str, item: Value) -> Value {
         }
         _ => item,
     }
+}
+
+/// Whether the type tag names one of the borrowed B-tree
+/// iterators (the tags that share the slice-state step).
+fn is_btree_iter_ty(self_ty: &str) -> bool {
+    self_ty.starts_with("std::collections::btree_set::Iter<")
+        || self_ty.starts_with("std::collections::btree_map::Iter<")
+        || self_ty.starts_with("std::collections::btree_map::Keys<")
+        || self_ty.starts_with("std::collections::btree_map::Values<")
+}
+
+/// The item a btree iterator step hands out. The states the
+/// btree iteration builtins build hold the yielded items
+/// themselves in the snapshot (references into the tree's
+/// node storage), so the item is the snapshot element the
+/// step's pointer denotes, not the pointer. A pointer that
+/// denotes no snapshot element (a state built another way)
+/// keeps the pair-splitting reading of `btree_pair_item`.
+pub(super) fn btree_step_item(self_ty: &str, ptr: Value) -> Value {
+    if is_btree_iter_ty(self_ty) {
+        if let Value::Ref(RefTarget::Value(snapshot, projection)) = &ptr {
+            if let Some(item) = value_at_projection(snapshot, projection) {
+                return item;
+            }
+        }
+    }
+    btree_pair_item(self_ty, ptr)
+}
+
+/// The value a `(value, projection)` pair denotes, navigating
+/// field and index steps over aggregates. `None` when a step
+/// names no part of the value.
+fn value_at_projection(value: &Value, projection: &[RefProj]) -> Option<Value> {
+    let mut current = value;
+    for step in projection {
+        current = match (current, step) {
+            (Value::Tuple(items), RefProj::Index(i)) => items.get(*i)?,
+            (Value::Tuple(items), RefProj::Field(i)) => items.get(*i)?,
+            (Value::Enum { fields, .. }, RefProj::Field(i)) => fields.get(*i)?,
+            (Value::Enum { fields, .. }, RefProj::Index(i)) => fields.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(current.clone())
 }
