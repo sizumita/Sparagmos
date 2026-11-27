@@ -1675,3 +1675,65 @@ fn run_mode_tool_interception_snapshot_tree_is_private() {
         "materialised snapshot entries were not owner-only: {seen:?}"
     );
 }
+
+const TEST_CRATE_GUEST_SRC: &str = r##"
+use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // A `--test` build of a root with no `main` (the
+    // harness supplies it): the primary artifact is the
+    // test binary named after the crate, not a library.
+    std::fs::write(
+        "t.rs",
+        "#[test]\nfn a() { assert_eq!(1 + 1, 2); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--test")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("t.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "test compile failed");
+    assert!(std::path::Path::new("t").exists(), "test binary artifact missing");
+    assert!(
+        !std::path::Path::new("libt.rlib").exists(),
+        "test build recorded a library"
+    );
+
+    // The recorded binary runs through the artifact seam:
+    // libtest's own main drives the one test.
+    let out = Command::new("./t").output().unwrap();
+    assert!(out.status.success(), "test binary run failed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("test result: ok"),
+        "libtest summary missing: {text}"
+    );
+    assert!(text.contains("1 passed"), "pass count missing: {text}");
+
+    println!("test crate guest ok");
+}
+"##;
+
+#[test]
+fn run_mode_tool_interception_test_crate_binary() {
+    let dir = temp_dir("tool-test-crate");
+    let src = fixture(&dir, "test_crate_guest.rs", TEST_CRATE_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "test crate guest ok\n", "stderr={stderr}");
+}
