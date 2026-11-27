@@ -3546,6 +3546,68 @@ fn run_mode_generic_assert_captures_render_like_core() {
     );
 }
 
+const GENERIC_ASSERT_STRAIGHT_SRC: &str = r##"
+#![feature(generic_assert)]
+use std::panic;
+
+#[derive(Clone, Copy, PartialEq)]
+struct CopyDebug(i32);
+impl std::fmt::Debug for CopyDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CONSTDEBUG")
+    }
+}
+
+fn grab<F: FnOnce() + panic::UnwindSafe>(f: F) -> String {
+    let err = panic::catch_unwind(f).unwrap_err();
+    if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        panic!("payload not a string");
+    }
+}
+
+fn check() {
+    let copy_debug = CopyDebug(1);
+    assert!(copy_debug == CopyDebug(3));
+}
+
+fn main() {
+    let m = grab(|| { check(); });
+    println!("M|{m}|");
+}
+"##;
+
+#[test]
+fn run_mode_generic_assert_capture_straight_line_keeps_payload_form() {
+    // The shape of tests/ui/macros/rfc-2011-nicer-assert-messages/
+    // feature-gate-generic_assert.rs: the capture is stored by a
+    // straight-line `assert!` in a plain function (no closure
+    // between the capture and the store). The store of
+    // `Capture::elem` is a shaped store through the capture's
+    // dereference whose shape covers the field exactly; it must
+    // keep the payload's own denomination (the newtype's `Debug`
+    // renders through it), not rebuild the field from the
+    // shape's flattened bytes, which denominates the payload by
+    // its scalar layout and renders the bare integer instead.
+    let dir = temp_dir("genericassert-straight");
+    let src = fixture(&dir, "genericassert_straight.rs", GENERIC_ASSERT_STRAIGHT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "caught assert panic terminates normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "M|Assertion failed: copy_debug == CopyDebug(3)\nWith captures:\n  copy_debug = CONSTDEBUG\n|\n",
+        "the capture renders the payload's own Debug"
+    );
+}
+
 const CAUGHT_PAYLOAD_DROP_SRC: &str = r#"
 use std::sync::atomic::{AtomicBool, Ordering};
 static DROPPED: AtomicBool = AtomicBool::new(false);
