@@ -394,7 +394,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `check-fail`, a UI view with no pass/fail/run directive —
   compiletest's UI default is check-fail — or an incremental
   `cpass` revision) is judged on the metadata-visible
-  verdicts only. The reference check compilation never runs
+  verdicts only, unless the view's own compile-flags add an
+  `--emit` kind beyond the analysis-level ones (metadata,
+  dep-info): the added emit accumulates with compiletest's
+  `--emit=metadata` and makes the reference compilation
+  evaluate what a metadata-only compilation never reaches,
+  so such a view keeps the full verdict chain. The reference check compilation never runs
   the monomorphization collector or code generation, so the
   driver's codegen-level verdicts — the collector walk's
   required-constant and `check_mono_item` findings, the
