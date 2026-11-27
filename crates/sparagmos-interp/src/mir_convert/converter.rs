@@ -1114,14 +1114,15 @@ impl<'a> Converter<'a> {
     /// Every value constructed charges its node count against
     /// `budget` (see [`MAX_ZST_VALUE_NODES`]); a construction that
     /// does not fit reports `Many`, so the synthesis never
-    /// materialises an enormous value tree.
+    /// materialises an enormous value tree. The walk's recursion
+    /// depth is capped separately (see [`MAX_ZST_VALUE_DEPTH`]).
     fn unique_value(
         &self,
         ty: &mir::Ty,
         depth: u32,
         budget: &mut u64,
     ) -> UniqueValue {
-        if depth > 32 {
+        if depth > MAX_ZST_VALUE_DEPTH {
             return UniqueValue::Many;
         }
         match ty {

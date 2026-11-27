@@ -92,6 +92,20 @@ pub(super) enum UniqueValue {
 /// read then takes the ordinary uninitialised path.
 pub(super) const MAX_ZST_VALUE_NODES: u64 = 1 << 20;
 
+/// The deepest type nesting a `zst_value` synthesis walks. The
+/// proof is structural, so depth is not a soundness input: the
+/// cap exists only to bound the recursive walk's stack, and it
+/// is sized from that cost -- a debug build converts a 1,200-
+/// level nest of one-field structs inside a 384 KiB stack, so
+/// 1,024 levels stay far inside the smallest stacks conversion
+/// runs on. Real nesting passes the previous cap of 32 easily:
+/// the `punch_card` return type of tests/ui/expr/weird-exprs.rs
+/// nests 111 levels of one-field zero-sized structs, and
+/// wrapper chains nest deeper still. A type nested deeper than
+/// this is treated as having many values, with the same
+/// consequence as exceeding the node budget.
+pub(super) const MAX_ZST_VALUE_DEPTH: u32 = 1024;
+
 /// Charge `nodes` against a `zst_value` synthesis budget; `false`
 /// when the charge does not fit.
 pub(super) fn spend_zst_nodes(budget: &mut u64, nodes: u64) -> bool {

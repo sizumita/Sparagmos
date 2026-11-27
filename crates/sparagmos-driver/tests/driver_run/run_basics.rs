@@ -135,3 +135,62 @@ fn run_mode_dyn_dispatch_distinguishes_fn_ptr_signatures() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "dynsig ok\n");
 }
+
+#[test]
+fn run_mode_deeply_nested_zst_range_chain_return() {
+    // The `punch_card` shape of tests/ui/expr/weird-exprs.rs: a
+    // return type nesting dozens of one-field zero-sized structs
+    // (`RangeToInclusive` / `RangeTo` over `RangeFull`). rustc
+    // MIR writes none of the places of a zero-sized type, so the
+    // callee's `_0` is unwritten and the return reads as the
+    // type's single value -- which conversion only synthesises
+    // when its structural proof reaches the innermost type. The
+    // proof's recursion cap (32) used to give up a dozen levels
+    // short of this chain's end, and the return failed as a read
+    // of uninitialized place `_0` (exit 2).
+    let mut expr = "..".to_string();
+    for _ in 0..48 {
+        expr = format!("..={expr}");
+    }
+    let src = format!(
+        "fn punch_card() -> impl std::fmt::Debug {{\n    {expr}\n}}\nfn main() {{ punch_card(); println!(\"done\"); }}\n"
+    );
+    let dir = temp_dir("deep-zst-range-chain");
+    let src_path = fixture(&dir, "deep_zst_range_chain.rs", &src);
+    let out = run_driver(&src_path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a deeply nested zero-sized return must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
+
+#[test]
+fn run_mode_deeply_nested_zst_wrapper_chain_return() {
+    // The same proof-depth point through user-defined wrappers:
+    // a one-field struct nested forty deep over `()` is a
+    // zero-sized type with a single value, so MIR leaves the
+    // return place unwritten and the value is the conversion
+    // synthesis -- which must reach the bottom of the chain.
+    let mut ty = "()".to_string();
+    let mut val = "()".to_string();
+    for _ in 0..40 {
+        ty = format!("W<{ty}>");
+        val = format!("W({val})");
+    }
+    let src = format!(
+        "struct W<T>(T);\nfn deep() -> {ty} {{ {val} }}\nfn main() {{ let _x = deep(); println!(\"done\"); }}\n"
+    );
+    let dir = temp_dir("deep-zst-wrapper-chain");
+    let src_path = fixture(&dir, "deep_zst_wrapper_chain.rs", &src);
+    let out = run_driver(&src_path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a deeply nested zero-sized wrapper return must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
