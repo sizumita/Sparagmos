@@ -3966,6 +3966,34 @@ fn truncate_to_declared_array(
                 Self::truncate_to_declared_array(value, place, place_ty.as_ref())
             });
         }
+        // An aggregate (array) read through a byte-displaced
+        // target (the load side of the displaced store above):
+        // the byte view composes the value from the base
+        // storage's bytes at the displaced position. A target
+        // the byte view cannot judge falls through to the
+        // ordinary path.
+        if let Some(ty) = &place_ty {
+            if matches!(ty, Ty::Array(..)) {
+                let projection = match &target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection,
+                };
+                let displaced = projection
+                    .iter()
+                    .any(|s| matches!(s, RefProj::ByteOffset(d) if *d != 0));
+                let elem_block = matches!(&target, Resolved::Alloc { id, .. }
+                    if self.is_elem_block(*id));
+                if displaced && !elem_block {
+                    if let Some(view) =
+                        self.byte_view_displaced_load(frames, &target, ty)
+                    {
+                        return view;
+                    }
+                }
+            }
+        }
         // Read through the borrowing form: a projected read lends
         // the denoted value out of the frame's storage, so only
         // the projected part is cloned into the owned result,
@@ -4054,6 +4082,37 @@ fn truncate_to_declared_array(
                         &shape,
                         root_ty.as_ref(),
                     );
+                }
+            }
+        }
+        // An aggregate (array) write through a byte-displaced
+        // target (a reference transmuted to an array type at a
+        // byte offset inside differently typed storage): the
+        // position crosses the base storage's element
+        // boundaries, so no structural projection denotes it,
+        // but the byte view splices the value's byte image at
+        // the displaced position (see
+        // `byte_view_displaced_store`). A target the byte view
+        // cannot judge falls through to the ordinary path.
+        if let Some(ty) = &place_ty {
+            if matches!(ty, Ty::Array(..)) {
+                let projection = match &target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection,
+                };
+                let displaced = projection
+                    .iter()
+                    .any(|s| matches!(s, RefProj::ByteOffset(d) if *d != 0));
+                let elem_block = matches!(&target, Resolved::Alloc { id, .. }
+                    if self.is_elem_block(*id));
+                if displaced && !elem_block {
+                    if let Some(view) = self.byte_view_displaced_store(
+                        frames, &target, &value, ty,
+                    ) {
+                        return view;
+                    }
                 }
             }
         }
