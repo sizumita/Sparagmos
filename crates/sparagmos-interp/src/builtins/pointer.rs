@@ -417,6 +417,7 @@ pub(crate) fn ptr_lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::compare_bytes" | "core::intrinsics::compare_bytes" => {
             Builtin::CompareBytes
         }
+        "std::intrinsics::raw_eq" | "core::intrinsics::raw_eq" => Builtin::RawEq,
         _ => return None,
     })
 }

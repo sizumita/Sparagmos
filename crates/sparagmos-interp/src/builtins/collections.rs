@@ -978,6 +978,7 @@ pub(crate) fn vec_lookup(canonical: &str) -> Option<Builtin> {
             Builtin::VecCapacity
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::remove::assert_failed") => Builtin::VecRemoveAssertFailed,
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::insert_mut::assert_failed") => Builtin::VecInsertAssertFailed,
         _ => return None,
     })
 }

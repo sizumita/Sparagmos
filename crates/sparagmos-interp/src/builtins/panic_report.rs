@@ -113,6 +113,14 @@ pub(crate) fn panic_lookup(canonical: &str) -> Option<Builtin> {
         "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
         "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
         "core::slice::copy_from_slice_impl::len_mismatch_fail" => Builtin::LenMismatchFail,
+        "core::num::imp::int_log10::panic_for_nonpositive_argument" => {
+            Builtin::PanicForNonpositiveArgument
+        }
+        "core::slice::sort::shared::smallsort::panic_on_ord_violation" => {
+            Builtin::PanicOnOrdViolation
+        }
+        "alloc::sync::panic_arc_overflow" => Builtin::PanicArcOverflow,
+        "core::str::slice_error_fail" => Builtin::SliceErrorFail,
         _ => return None,
     })
 }

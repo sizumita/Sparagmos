@@ -601,6 +601,26 @@ pub enum Builtin {
     /// `core::num::from_ascii_bytes_radix_panic(radix)`: raise a
     /// guest panic naming the out-of-range radix.
     FromAsciiRadixPanic,
+    /// `core::num::imp::int_log10::panic_for_nonpositive_argument()`:
+    /// the `ilog` family's guard for a non-positive argument;
+    /// raise a guest panic with core's message.
+    PanicForNonpositiveArgument,
+    /// `core::slice::sort::shared::smallsort::
+    /// panic_on_ord_violation()`: raised when a sort's comparison
+    /// function provably does not implement a total order; raise
+    /// a guest panic with core's message.
+    PanicOnOrdViolation,
+    /// `alloc::sync::panic_arc_overflow()`: the `Arc` counter
+    /// overflow guard; raise a guest panic with alloc's message.
+    PanicArcOverflow,
+    /// `std::cell::panic_already_borrowed(_: BorrowMutError)`:
+    /// the `RefCell` double-borrow guard; raise a guest panic
+    /// with core's message.
+    PanicAlreadyBorrowed,
+    /// `core::str::slice_error_fail(s, begin, end)`: raise a
+    /// guest panic with the message core's branch order selects
+    /// for the failing string range.
+    SliceErrorFail,
     /// `core::slice::index::slice_index_fail(start, end, len)`:
     /// raise a guest panic with the message core's branch order
     /// selects for the failing range.
@@ -636,6 +656,9 @@ pub enum Builtin {
     /// `Vec::remove`'s nested `assert_failed(index, len)`: raise
     /// a guest panic with alloc's removal-index message.
     VecRemoveAssertFailed,
+    /// `Vec::insert_mut`'s nested `assert_failed(index, len)`:
+    /// raise a guest panic with alloc's insertion-index message.
+    VecInsertAssertFailed,
     /// `std::thread::spawn(f)` / `spawn_unchecked(f)`: capture the
     /// callable as a pending thread (cooperative model, see
     /// `interp.rs`) and return its join handle.
@@ -735,6 +758,13 @@ pub enum Builtin {
     ThreadSleep,
     /// `std::thread::yield_now()`: a cooperative scheduling point.
     ThreadYield,
+    /// `core::core_arch::x86::sse2::pause` (what
+    /// `std::hint::spin_loop` lowers to): a spin-wait hint with
+    /// no architectural effect, so the model is a no-op (in
+    /// particular it is not a scheduling point: native code may
+    /// spin on it without the holder of a lock making progress
+    /// being observable).
+    SpinPause,
     /// `std::sync::mpsc::channel()`: a new unbounded channel.
     MpscChannel,
     /// `std::sync::mpsc::sync_channel(bound)`: a new bounded channel.
@@ -1405,6 +1435,17 @@ pub enum Builtin {
     /// `std::intrinsics::saturating_add` / `saturating_sub`:
     /// integer arithmetic clamped to the operand type's range.
     SaturatingArith(SatOp),
+    /// `intrinsics::exact_div(x, y)`: the exact quotient. The
+    /// caller guarantees the division is exact and the divisor
+    /// nonzero, so the model divides directly; a zero divisor
+    /// still raises the usual divide-by-zero guest panic.
+    ExactDiv,
+    /// `core::slice::sort::stable::drift::sqrt_approx(n)`: the
+    /// driftsort run-length heuristic, a pure integer formula
+    /// over the input length; the model computes it directly
+    /// (the native body's general sort machinery around it is
+    /// what conversion cannot demand as a standalone callee).
+    SqrtApprox,
     /// `std::intrinsics::atomic_load(ptr)`: in this
     /// single-threaded interpreter an atomic load is a plain read
     /// through the pointer; the ordering only constrains
@@ -1495,6 +1536,10 @@ pub enum Builtin {
     /// the memcmp of two byte ranges (the inlined slice / `str`
     /// ordering core).
     CompareBytes,
+    /// `intrinsics::raw_eq(a, b) -> bool`: byte equality of the
+    /// two referenced values of the generic type, over the same
+    /// byte ranges `compare_bytes` reads.
+    RawEq,
     /// One `std::intrinsics::simd::*` operation: lane-wise
     /// arithmetic, comparison, shuffling, casting, gathering,
     /// scattering and reduction over the vector values the

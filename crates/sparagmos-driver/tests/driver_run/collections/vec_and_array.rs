@@ -212,3 +212,36 @@ fn run_mode_array_into_iter_by_ref_rebuild_o3() {
         "2\n3\ntrue\n6\n4\n5\ntrue\n"
     );
 }
+const INSERT_MUT_OUT_OF_BOUNDS_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    v.insert_mut(5, 9);
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_mut_out_of_bounds_panics_with_alloc_message() {
+    let dir = temp_dir("vec-insert-mut-oob");
+    let src = fixture(&dir, "insert_mut.rs", INSERT_MUT_OUT_OF_BOUNDS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("insertion index (is 5) should be <= len (is 3)"),
+        "stderr={stderr}"
+    );
+}
+
+const INSERT_MUT_AT_END_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    let r = v.insert_mut(3, 9);
+    *r += 1;
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_mut_at_end_returns_the_inserted_ref() {
+    run_ok("vec-insert-mut-at-end", INSERT_MUT_AT_END_SRC, "[1, 2, 3, 10]\n");
+}

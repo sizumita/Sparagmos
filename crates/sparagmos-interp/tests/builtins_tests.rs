@@ -5270,3 +5270,289 @@ fn string_push_accepts_the_aggregate_form() {
     let value = interpret_mir(&program(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Str(".".to_string()));
 }
+
+// ----- Lane M3: small std-coverage families ---------------------------------
+//
+// The never-returning guard shims and small pure helpers std's
+// own bodies name but conversion cannot demand as standalone
+// callees (a nested `assert_failed`, the `ilog` family's panic
+// guard, the driftsort heuristic, the spin hint, the exact-div
+// and raw-eq intrinsics), each served by a builtin whose
+// behaviour is pinned here.
+
+const INT_LOG10_PANIC: mir::DefId = mir::DefId::new(0, 610);
+const ORD_VIOLATION_PANIC: mir::DefId = mir::DefId::new(0, 611);
+const ARC_OVERFLOW_PANIC: mir::DefId = mir::DefId::new(0, 612);
+const ALREADY_BORROWED_PANIC: mir::DefId = mir::DefId::new(0, 613);
+const STR_SLICE_ERROR_FAIL: mir::DefId = mir::DefId::new(0, 614);
+const VEC_INSERT_ASSERT_FAILED: mir::DefId = mir::DefId::new(0, 615);
+const DRIFT_SQRT_APPROX: mir::DefId = mir::DefId::new(0, 616);
+const SSE2_PAUSE: mir::DefId = mir::DefId::new(0, 617);
+const EXACT_DIV_M3: mir::DefId = mir::DefId::new(0, 618);
+const RAW_EQ_M3: mir::DefId = mir::DefId::new(0, 619);
+
+fn names_m3() -> HashMap<mir::DefId, String> {
+    let mut names = names_cu();
+    names.extend([
+        (
+            INT_LOG10_PANIC,
+            "core::num::imp::int_log10::panic_for_nonpositive_argument".to_string(),
+        ),
+        (
+            ORD_VIOLATION_PANIC,
+            "core::slice::sort::shared::smallsort::panic_on_ord_violation".to_string(),
+        ),
+        (ARC_OVERFLOW_PANIC, "alloc::sync::panic_arc_overflow".to_string()),
+        (
+            ALREADY_BORROWED_PANIC,
+            "std::cell::panic_already_borrowed".to_string(),
+        ),
+        (STR_SLICE_ERROR_FAIL, "core::str::slice_error_fail".to_string()),
+        (
+            VEC_INSERT_ASSERT_FAILED,
+            "std::vec::Vec::<T, A>::insert_mut::assert_failed".to_string(),
+        ),
+        (
+            DRIFT_SQRT_APPROX,
+            "core::slice::sort::stable::drift::sqrt_approx".to_string(),
+        ),
+        (SSE2_PAUSE, "core::core_arch::x86::sse2::pause".to_string()),
+        (EXACT_DIV_M3, "std::intrinsics::exact_div".to_string()),
+        (RAW_EQ_M3, "std::intrinsics::raw_eq".to_string()),
+    ]);
+    names
+}
+
+fn program_m3(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_m3();
+    prog
+}
+
+/// A `main` whose only block calls the diverging callee `def` with
+/// `args`; returns the guest panic message it raises.
+fn diverging_panic_m3(def: mir::DefId, args: Vec<mir::Operand>) -> String {
+    let body = mir::Body::new(
+        decls(&[mir::Ty::unit(), mir::Ty::unit()]),
+        0,
+        vec![block(vec![], call_diverging(fndef(def, vec![]), args, 1))],
+    );
+    expect_panic(interpret_mir(&program_m3(body), "main", vec![]))
+}
+
+fn const_zero_sized() -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::ZeroSized))
+}
+
+#[test]
+fn registry_covers_lane_m3_callees() {
+    let cases: &[(&str, Builtin)] = &[
+        (
+            "core::num::imp::int_log10::panic_for_nonpositive_argument",
+            Builtin::PanicForNonpositiveArgument,
+        ),
+        (
+            "core::slice::sort::shared::smallsort::panic_on_ord_violation",
+            Builtin::PanicOnOrdViolation,
+        ),
+        ("alloc::sync::panic_arc_overflow", Builtin::PanicArcOverflow),
+        ("std::cell::panic_already_borrowed", Builtin::PanicAlreadyBorrowed),
+        ("core::cell::panic_already_borrowed", Builtin::PanicAlreadyBorrowed),
+        ("core::str::slice_error_fail", Builtin::SliceErrorFail),
+        (
+            "std::vec::Vec::<T, A>::insert_mut::assert_failed",
+            Builtin::VecInsertAssertFailed,
+        ),
+        (
+            "core::slice::sort::stable::drift::sqrt_approx",
+            Builtin::SqrtApprox,
+        ),
+        ("core::core_arch::x86::sse2::pause", Builtin::SpinPause),
+        ("std::intrinsics::exact_div", Builtin::ExactDiv),
+        ("core::intrinsics::exact_div", Builtin::ExactDiv),
+        ("std::intrinsics::raw_eq", Builtin::RawEq),
+        ("core::intrinsics::raw_eq", Builtin::RawEq),
+    ];
+    for (name, want) in cases {
+        assert_eq!(lookup(&canonical_name(name)), Some(*want), "{name}");
+    }
+}
+
+#[test]
+fn int_log10_panic_message() {
+    let message = diverging_panic_m3(INT_LOG10_PANIC, vec![]);
+    assert_eq!(message, "argument of integer logarithm must be positive");
+}
+
+#[test]
+fn ord_violation_panic_message() {
+    let message = diverging_panic_m3(ORD_VIOLATION_PANIC, vec![]);
+    assert_eq!(
+        message,
+        "user-provided comparison function does not correctly implement a total order"
+    );
+}
+
+#[test]
+fn arc_overflow_panic_message() {
+    let message = diverging_panic_m3(ARC_OVERFLOW_PANIC, vec![]);
+    assert_eq!(message, "Arc counter overflow");
+}
+
+#[test]
+fn already_borrowed_panic_message() {
+    // The `BorrowMutError` argument is an opaque token; the
+    // message does not depend on it.
+    let message = diverging_panic_m3(ALREADY_BORROWED_PANIC, vec![const_zero_sized()]);
+    assert_eq!(message, "RefCell already borrowed");
+}
+
+#[test]
+fn vec_insert_assert_failed_message() {
+    let message = diverging_panic_m3(
+        VEC_INSERT_ASSERT_FAILED,
+        vec![const_usize(5), const_usize(3)],
+    );
+    assert_eq!(message, "insertion index (is 5) should be <= len (is 3)");
+}
+
+#[test]
+fn str_slice_error_fail_selects_core_message_by_branch() {
+    let run = |s: &str, begin: u64, end: u64| {
+        diverging_panic_m3(
+            STR_SLICE_ERROR_FAIL,
+            vec![const_str(s), const_usize(begin), const_usize(end)],
+        )
+    };
+    assert_eq!(
+        run("hello", 3, 10),
+        "end byte index 10 is out of bounds for string of length 5"
+    );
+    assert_eq!(
+        run("hello", 7, 8),
+        "start byte index 7 is out of bounds for string of length 5"
+    );
+    assert_eq!(run("hello", 2, 1), "byte range starts at 2 but ends at 1");
+    assert_eq!(
+        run("héllo", 0, 2),
+        "end byte index 2 is not a char boundary; it is inside 'é' (bytes 1..3) of string"
+    );
+    assert_eq!(
+        run("héllo", 2, 6),
+        "start byte index 2 is not a char boundary; it is inside 'é' (bytes 1..3) of string"
+    );
+}
+
+#[test]
+fn sqrt_approx_computes_core_formula() {
+    let run = |n: u64| {
+        let body = mir::Body::new(
+            decls(&[usize_ty()]),
+            0,
+            vec![
+                block(
+                    vec![],
+                    call(fndef(DRIFT_SQRT_APPROX, vec![]), vec![const_usize(n)], 0, 1),
+                ),
+                block(vec![], ret()),
+            ],
+        );
+        interpret_mir(&program_m3(body), "main", vec![]).expect("run")
+    };
+    assert_eq!(run(0), Value::Uint(0));
+    assert_eq!(run(1), Value::Uint(1));
+    assert_eq!(run(5000), Value::Uint(71));
+    assert_eq!(run(20000), Value::Uint(142));
+}
+
+#[test]
+fn spin_pause_is_a_no_op() {
+    let body = mir::Body::new(
+        decls(&[mir::Ty::unit(), mir::Ty::unit()]),
+        0,
+        vec![
+            block(vec![], call(fndef(SSE2_PAUSE, vec![]), vec![], 1, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_m3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Unit);
+}
+
+#[test]
+fn exact_div_divides_signed_and_unsigned() {
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(EXACT_DIV_M3, vec![i32_ty()]),
+                    vec![const_i32(-84), const_i32(-7)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_m3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(12));
+
+    let body = mir::Body::new(
+        decls(&[usize_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(EXACT_DIV_M3, vec![usize_ty()]),
+                    vec![const_usize(100), const_usize(10)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_m3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(10));
+}
+
+#[test]
+fn raw_eq_compares_pointee_bytes() {
+    let run = |a: i32, b: i32| {
+        let body = mir::Body::new(
+            decls(&[
+                bool_ty(),
+                i32_ty(),
+                i32_ty(),
+                ref_ty(i32_ty(), false),
+                ref_ty(i32_ty(), false),
+            ]),
+            0,
+            vec![
+                block(
+                    vec![
+                        assign(place(1), mir::Rvalue::Use(const_i32(a))),
+                        assign(place(2), mir::Rvalue::Use(const_i32(b))),
+                        assign(place(3), ref_rvalue(1, false)),
+                        assign(place(4), ref_rvalue(2, false)),
+                    ],
+                    call(
+                        fndef(RAW_EQ_M3, vec![i32_ty()]),
+                        vec![move_(3), move_(4)],
+                        0,
+                        1,
+                    ),
+                ),
+                block(vec![], ret()),
+            ],
+        );
+        interpret_mir(&program_m3(body), "main", vec![]).expect("run")
+    };
+    assert_eq!(run(7, 7), Value::Bool(true));
+    assert_eq!(run(7, 8), Value::Bool(false));
+}

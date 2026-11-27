@@ -5973,6 +5973,88 @@ impl<'a> Interpreter<'a> {
                     "removal index (is {index}) should be < len (is {len})"
                 )))
             }
+            Builtin::VecInsertAssertFailed => {
+                arity(2)?;
+                let index = as_u128(&vals[0], name)?;
+                let len = as_u128(&vals[1], name)?;
+                Err(InterpError::panic_string_payload(format!(
+                    "insertion index (is {index}) should be <= len (is {len})"
+                )))
+            }
+            Builtin::PanicForNonpositiveArgument => {
+                arity(0)?;
+                Err(InterpError::panic_string_payload(
+                    "argument of integer logarithm must be positive".to_string(),
+                ))
+            }
+            Builtin::PanicOnOrdViolation => {
+                arity(0)?;
+                Err(InterpError::panic_string_payload(
+                    "user-provided comparison function does not correctly implement a total order"
+                        .to_string(),
+                ))
+            }
+            Builtin::PanicArcOverflow => {
+                arity(0)?;
+                Err(InterpError::panic_string_payload(
+                    "Arc counter overflow".to_string(),
+                ))
+            }
+            Builtin::PanicAlreadyBorrowed => {
+                arity(1)?;
+                Err(InterpError::panic_string_payload(
+                    "RefCell already borrowed".to_string(),
+                ))
+            }
+            Builtin::SliceErrorFail => {
+                arity(3)?;
+                let text = self.resolve_string(frames, &vals[0])?;
+                let begin = as_u128(&vals[1], name)? as usize;
+                let end = as_u128(&vals[2], name)? as usize;
+                Err(InterpError::panic_string_payload(slice_error_fail_message(
+                    &text, begin, end,
+                )))
+            }
+            Builtin::SqrtApprox => {
+                arity(1)?;
+                // core's formula, in the guest's own `usize`
+                // arithmetic: with `ilog = (n | 1).ilog2()` and
+                // `shift = ceil(ilog / 2)`, the approximation is
+                // `((1 << shift) + (n >> shift)) / 2`.
+                let n = as_u128(&vals[0], name)? as u64;
+                let ilog = (n | 1).ilog2();
+                let shift = ilog.div_ceil(2);
+                let approx = ((1u64 << shift) + (n >> shift)) / 2;
+                Ok(Value::Uint(approx as u128))
+            }
+            Builtin::SpinPause => {
+                arity(0)?;
+                Ok(Value::Unit)
+            }
+            Builtin::ExactDiv => {
+                arity(2)?;
+                match (&vals[0], &vals[1]) {
+                    (Value::Int(a), Value::Int(b)) => {
+                        if *b == 0 {
+                            Err(InterpError::panic("attempt to divide by zero"))
+                        } else {
+                            Ok(Value::Int(a / b))
+                        }
+                    }
+                    (Value::Uint(a), Value::Uint(b)) => {
+                        if *b == 0 {
+                            Err(InterpError::panic("attempt to divide by zero"))
+                        } else {
+                            Ok(Value::Uint(a / b))
+                        }
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "two integers of one signedness",
+                        other.0.kind_name(),
+                    )),
+                }
+            }
             Builtin::CatchUnwind => {
                 arity(3)?;
                 let try_fn = expect_fn_ptr(&vals[0], name)?;
@@ -9109,6 +9191,64 @@ impl<'a> Interpreter<'a> {
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 }))
+            }
+            Builtin::RawEq => {
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if tag == "str" {
+                    let a = self.resolve_string(frames, &vals[0])?;
+                    let b = self.resolve_string(frames, &vals[1])?;
+                    return Ok(Value::Bool(a == b));
+                }
+                // The byte count behind one reference, by the
+                // same cascade `size_of_val` uses (a slice spans
+                // its length × the element size).
+                let mut byte_len = |interp: &mut Self, v: &Value| -> InterpResult<u128> {
+                    if is_slice_tag(tag) {
+                        let elem = &tag[1..tag.len() - 1];
+                        let (elem_size, _) = interp.layout_of(elem).ok_or_else(|| {
+                            unsupported(format!(
+                                "raw_eq for {tag} is not runtime-supported"
+                            ))
+                        })?;
+                        let len = match v {
+                            Value::FatRef { len, .. } => *len,
+                            _ => {
+                                let value = interp.resolve_value(frames, v)?;
+                                value.len().ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        "raw_eq",
+                                        "slice value",
+                                        value.kind_name(),
+                                    )
+                                })?
+                            }
+                        };
+                        Ok(len * elem_size)
+                    } else if let Some((size, _)) = interp.dyn_layout_of(frames, v, tag) {
+                        Ok(size)
+                    } else if let Some((size, _)) = interp.layout_of(tag) {
+                        Ok(size)
+                    } else if let Some((size, _)) =
+                        interp.dst_size_align_of_val(frames, v, tag)
+                    {
+                        Ok(size)
+                    } else {
+                        Err(unsupported(format!(
+                            "raw_eq for {tag} is not runtime-supported"
+                        )))
+                    }
+                };
+                let n0 = byte_len(self, &vals[0])?;
+                let n1 = byte_len(self, &vals[1])?;
+                if n0 != n1 {
+                    return Ok(Value::Bool(false));
+                }
+                let n = usize::try_from(n0).map_err(|_| {
+                    unsupported(format!("raw_eq for {tag} is not runtime-supported"))
+                })?;
+                let (a, b) = self.read_compare_ranges(frames, &vals[0], &vals[1], n)?;
+                Ok(Value::Bool(a == b))
             }
             Builtin::SimdOp(op) => self.exec_simd(op, frames, generic_args, &vals),
             Builtin::RustAlloc { zeroed } => {
