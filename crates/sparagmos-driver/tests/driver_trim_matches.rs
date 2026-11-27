@@ -169,7 +169,11 @@ fn contains_verbose_expected(s: &str, fn_name: &str) -> bool {
 }
 
 fn main() {
-    let s = "   3:     0x5555 - <backtrace::double::Double as std::ops::Drop>::drop\n";
+    // The helper scans for a space-led `backtrace[hash]::` frame (the
+    // verbosely demangled shape the HACK comment in the real test
+    // describes); the angle-bracket Drop frame above it contains no
+    // ` backtrace` needle and must not match.
+    let s = "   2:     0x5555 - <backtrace::double::Double as std::ops::Drop>::drop\n   3:     0x5555 - backtrace[9f86d081884c7d]::double::Double\n";
     println!("verbose={}", contains_verbose_expected(s, "double"));
     println!("other={}", contains_verbose_expected(s, "foo"));
 }
