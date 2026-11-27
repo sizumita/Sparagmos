@@ -32,6 +32,15 @@ similar) have no std to build; `core,alloc` is their ceiling,
 and records whose test files use std then fail at the guest
 compile on their merits instead of staying unattempted.
 
+Two targets (amdgcn-amd-amdhsa, avr-none) refuse to compile
+anything at all without an explicit `-C target-cpu`, so their
+entries also pin one -- the cpu the blocked records themselves
+name in their compile-flags (see TIER3_TARGET_CPU below). A
+record naming a different cpu for one of those triples then
+fails at the guest compile with a target-cpu ABI mismatch
+instead of staying unattempted: again a verdict on its merits,
+not a screening artefact.
+
 Usage: python3 scripts/build-tier3-std.py [--triple T] [--force]
 """
 
@@ -50,6 +59,23 @@ TOOLCHAIN = "1.100.0"
 # set does not matter; build-std resolves the dependency closure.
 TIER3_STD = {
     "aarch64v8r-unknown-none": ("core", "alloc"),
+    "aarch64-unknown-linux-pauthtest": ("core", "std", "panic_unwind"),
+    "amdgcn-amd-amdhsa": ("core", "alloc"),
+    "avr-none": ("core", "alloc"),
+    "riscv32e-unknown-none-elf": ("core", "alloc"),
+}
+
+# triple -> the `-C target-cpu` its build-std run must carry.
+# These targets have no default cpu: rustc refuses to compile
+# even core without an explicit one. The pinned cpu is the one
+# the records blocked by the triple themselves specify in their
+# compile-flags -- gfx900 in 15 of the 16 amdgcn flag sets,
+# atmega328p in 15 of the 17 avr ones (the exceptions are one
+# gfx1100, one atmega328 and one attiny11 flag set; those
+# records meet the ABI-mismatch error described above).
+TIER3_TARGET_CPU = {
+    "amdgcn-amd-amdhsa": "gfx900",
+    "avr-none": "atmega328p",
 }
 
 PROBE_CRATE = "tier3-std-probe"
@@ -106,6 +132,19 @@ def collect_rlibs(build_root, triple):
     return sorted(rlibs)
 
 
+def target_cpu_env(triple):
+    """The extra cargo env pinning `-C target-cpu` for the
+    triples in TIER3_TARGET_CPU, scoped to that target only via
+    CARGO_TARGET_<TRIPLE>_RUSTFLAGS, so host-side compilations
+    in the same cargo run are unaffected."""
+    cpu = TIER3_TARGET_CPU.get(triple)
+    if cpu is None:
+        return {}
+    var = "CARGO_TARGET_" + triple.upper().replace("-", "_") \
+        + "_RUSTFLAGS"
+    return {var: f"-C target-cpu={cpu}"}
+
+
 def installed_core(sysroot_dir, triple):
     lib = sysroot_dir / "lib" / "rustlib" / triple / "lib"
     return lib.is_dir() and any(lib.glob("libcore-*.rlib"))
@@ -127,6 +166,7 @@ def build_and_install(triple, crates, sysroot_dir, force=False):
             "edition = \"2021\"\n")
         (src / "lib.rs").write_text(probe_source(crates))
         env = dict(os.environ, RUSTC_BOOTSTRAP="1")
+        env.update(target_cpu_env(triple))
         cmd = toolchain_cmd("cargo") + [
             "build", "--release",
             "-Z", "build-std=" + ",".join(crates),

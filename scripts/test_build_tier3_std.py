@@ -80,6 +80,40 @@ class TableTest(unittest.TestCase):
             self.assertEqual(crates[0], "core")
             self.assertEqual(len(crates), len(set(crates)))
 
+    def test_increment2_entries(self):
+        self.assertEqual(bts.TIER3_STD["aarch64-unknown-linux-pauthtest"],
+                         ("core", "std", "panic_unwind"))
+        self.assertEqual(bts.TIER3_STD["amdgcn-amd-amdhsa"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["avr-none"], ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["riscv32e-unknown-none-elf"],
+                         ("core", "alloc"))
+
+
+class TargetCpuTest(unittest.TestCase):
+    def test_cpu_table_only_names_table_triples(self):
+        for triple in bts.TIER3_TARGET_CPU:
+            self.assertIn(triple, bts.TIER3_STD)
+
+    def test_env_scopes_rustflags_to_the_target(self):
+        self.assertEqual(
+            bts.target_cpu_env("amdgcn-amd-amdhsa"),
+            {"CARGO_TARGET_AMDGCN_AMD_AMDHSA_RUSTFLAGS":
+             "-C target-cpu=gfx900"})
+        self.assertEqual(
+            bts.target_cpu_env("avr-none"),
+            {"CARGO_TARGET_AVR_NONE_RUSTFLAGS":
+             "-C target-cpu=atmega328p"})
+
+    def test_env_empty_without_a_pinned_cpu(self):
+        self.assertEqual(bts.target_cpu_env("aarch64v8r-unknown-none"), {})
+        self.assertEqual(
+            bts.target_cpu_env("aarch64-unknown-linux-pauthtest"), {})
+        self.assertEqual(bts.target_cpu_env("riscv32e-unknown-none-elf"),
+                         {})
+
+
+class InstalledCoreTest(unittest.TestCase):
     def test_installed_core_detects_libcore(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
