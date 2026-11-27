@@ -184,6 +184,36 @@
 //!   and LLVM-pass records of that group need LLVM's own
 //!   tables, as recorded on Issue #509).
 //!
+//! - The packed-stack / backchain incompatibility of code
+//!   generation's function attributes
+//!   (`rustc_codegen_llvm::attributes::packed_stack_attr`,
+//!   computed for every function code generation defines):
+//!   on s390x with `-Zpacked-stack`, a function that has the
+//!   `backchain` target feature enabled -- by the session
+//!   (the target spec or `-C target-feature`) or by its own
+//!   `#[target_feature]` -- without the `soft-float`
+//!   feature is rejected, because LLVM cannot generate
+//!   valid function entry points for that combination
+//!   under the default ABI. The predicate reads only the
+//!   session's target and internal target features and the
+//!   function's own codegen attributes, all of which the
+//!   driver's session already carries, so the check below
+//!   (`packed_stack_finding`) replays it over the items
+//!   code generation would define (the collector walk's
+//!   instances plus the exported roots, the same item set
+//!   as the duplicate-symbol verdict). This closes the
+//!   `backchain_attr` revision of
+//!   tests/ui/target-feature/packedstack-combinations
+//!   (Issue #509): the session-carried revision of that
+//!   record is already rejected inside the reference
+//!   compilation's own minicore build, and the neighbouring
+//!   revisions -- packed-stack alone, and backchain with a
+//!   soft-float target -- stay accepted, as they are under
+//!   rustc. (Verified against the pinned rustc 1.100.0:
+//!   each rejection shape exits 0 under `--emit=metadata`
+//!   and 1 under `--emit=link`, and each neighbouring
+//!   acceptance exits 0 under both.)
+//!
 //! - Missing optimized MIR for a demanded instance of an
 //!   auxiliary crate (the collector's `NoOptimizedMir`, from
 //!   `should_codegen_locally` in rustc_monomorphize): when the
@@ -239,7 +269,8 @@
 //!   above that replay them cannot decide it: the
 //!   required-constant walk, the `check_mono_item` forces,
 //!   the duplicate-symbol, common-linkage, panic-runtime,
-//!   LTO / prefer-dynamic, target-cpu and dump verdicts, the
+//!   LTO / prefer-dynamic, target-cpu, dump and
+//!   packed-stack verdicts, the
 //!   unshimmed-intrinsic
 //!   verdict, and the body checks (SIMD / atomic / layout).
 //!   Each was verified against the pinned compiler to stay
@@ -1579,7 +1610,9 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// either, and the target-cpu session validation
 /// (`target_cpu_finding`), which needs no walk either.
 /// The dump verdict (`dump_symbol_finding`) needs no walk
-/// either.
+/// either. The packed-stack verdict
+/// (`packed_stack_finding`) runs over the walk's item set,
+/// like the duplicate-symbol verdict.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1619,6 +1652,7 @@ pub fn check_required_consts() -> Option<String> {
             lto_prefer_dynamic_finding(tcx),
             target_cpu_finding(tcx),
             dump_symbol_finding(tcx),
+            packed_stack_finding(tcx, &roots_only),
         ] {
             if let Some(finding) = finding {
                 note_check_mode_verdict(finding);
@@ -1671,6 +1705,7 @@ pub fn check_required_consts() -> Option<String> {
         .or_else(|| lto_prefer_dynamic_finding(tcx))
         .or_else(|| target_cpu_finding(tcx))
         .or_else(|| dump_symbol_finding(tcx))
+        .or_else(|| packed_stack_finding(tcx, &walk.visited))
 }
 
 /// The `check_mono_item` finding of the most recent
@@ -2226,6 +2261,116 @@ fn dump_symbol_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
                     dump.1
                 ));
             }
+        }
+    }
+    None
+}
+
+/// The packed-stack / backchain verdict, mirroring
+/// `packed_stack_attr` in rustc_codegen_llvm's function
+/// attribute computation, which runs for every function
+/// code generation defines: on s390x, when
+/// `-Zpacked-stack` is set, a function whose target
+/// features enable `backchain` without also enabling
+/// `soft-float` is an error ("`-Zpacked-stack` is
+/// incompatible with `backchain` target feature"),
+/// because LLVM cannot generate valid function entry
+/// points for the combination under the default ABI.
+/// A function's features are the session's internal
+/// target features (the target spec's defaults plus
+/// `-C target-feature`) merged with the function's own
+/// `#[target_feature]` list, exactly as the attribute
+/// computation reads them. The evidence is the session
+/// state and the codegen attributes of the items code
+/// generation would define -- the collector walk's
+/// instances plus the exported roots, the item set of
+/// the duplicate-symbol verdict -- so the replay fires
+/// for precisely the compilations rustc rejects this
+/// way, and stays silent on every other target, without
+/// `-Zpacked-stack`, and whenever `soft-float` is
+/// enabled alongside `backchain` (a soft-float target's
+/// spec enables it, which is what lifts the rejection
+/// for the record's `with_softfloat` revision).
+/// (Verified against the pinned rustc 1.100.0: the
+/// attribute-carried and session-carried shapes each
+/// exit 0 under `--emit=metadata` and 1 under
+/// `--emit=link`; packed-stack alone and the
+/// soft-float-target shape exit 0 under both.)
+fn packed_stack_finding<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    visited: &std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
+) -> Option<String> {
+    if tcx.sess.target.arch != rustc_target::spec::Arch::S390x
+        || !tcx.sess.opts.unstable_opts.packed_stack
+    {
+        return None;
+    }
+    let session_backchain =
+        tcx.sess.internal_target_features.contains(&rustc_span::sym::backchain);
+    let session_soft_float =
+        tcx.sess.internal_target_features.contains(&rustc_span::sym::soft_float);
+    // The item set, as in `duplicate_symbol_finding`: the
+    // walk's instances plus the local functions carrying
+    // an export attribute -- the collector roots its
+    // collection at the exported items, so an exported
+    // function is a mono item even in a library crate
+    // that nothing calls (the record's shape).
+    let mut items: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>> =
+        visited.clone();
+    for local_def_id in tcx.iter_local_def_id() {
+        let def_id = local_def_id.to_def_id();
+        if !matches!(
+            tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+        ) {
+            continue;
+        }
+        let attrs = tcx.codegen_fn_attrs(def_id);
+        let exported = attrs.symbol_name.is_some()
+            || attrs.flags.contains(
+                rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE,
+            );
+        if exported
+            && !tcx
+                .generics_of(def_id)
+                .requires_monomorphization(tcx)
+        {
+            items.insert(rustc_middle::ty::Instance::mono(tcx, def_id));
+        }
+    }
+    for instance in &items {
+        if !tcx.should_codegen_locally(*instance) {
+            continue;
+        }
+        let def_id = instance.def_id();
+        if !matches!(
+            tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Fn
+                | rustc_hir::def::DefKind::AssocFn
+                | rustc_hir::def::DefKind::Closure
+        ) {
+            continue;
+        }
+        let attrs = tcx.codegen_fn_attrs(def_id);
+        let have_backchain = session_backchain
+            || attrs
+                .target_features
+                .iter()
+                .any(|feature| feature.name == rustc_span::sym::backchain);
+        let have_soft_float = session_soft_float
+            || attrs
+                .target_features
+                .iter()
+                .any(|feature| feature.name == rustc_span::sym::soft_float);
+        if have_backchain && !have_soft_float {
+            return Some(format!(
+                "`-Zpacked-stack` is incompatible with \
+                 `backchain` target feature (rustc rejects \
+                 the combination when code generation \
+                 defines `{}`, whose target features enable \
+                 `backchain` without `soft-float`)",
+                tcx.def_path_str(def_id)
+            ));
         }
     }
     None
