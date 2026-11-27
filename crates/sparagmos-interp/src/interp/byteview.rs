@@ -350,14 +350,23 @@ impl<'a> Interpreter<'a> {
     /// more: it re-walks the flat position through the field
     /// tags itself). A tuple field step is not priced: a tuple's
     /// field offsets are the compiler's choice and are not
-    /// recorded.
+    /// recorded. The third result is the storage size of the
+    /// position the last step names, priced from the same
+    /// layout rows (a field's recorded size, an array element's
+    /// size, a subslice's span): it survives the steps the type
+    /// walk cannot follow — a field whose tag names no laid-out
+    /// instance, as a union field's does, ends the walk's type
+    /// but not its size. A downcast keeps the size of the
+    /// position it selects a variant of; a view step resets it,
+    /// the view's own type being the evidence there.
     fn projection_storage_offset(
         &self,
         base_ty: &Ty,
         prefix: &[RefProj],
-    ) -> Option<(usize, Option<Ty>)> {
+    ) -> Option<(usize, Option<Ty>, Option<usize>)> {
         let mut ty: Option<Ty> = Some(base_ty.clone());
         let mut off: usize = 0;
+        let mut size: Option<usize> = None;
         let mut variant: usize = 0;
         for step in prefix {
             match step {
@@ -373,8 +382,9 @@ impl<'a> Interpreter<'a> {
                             .unwrap_or_else(|| name.clone());
                         let rows = self.program().adt_field_layouts.get(&key)?;
                         let row = rows.get(variant)?;
-                        let &(field_off, _) = row.get(*i)?;
+                        let &(field_off, field_size) = row.get(*i)?;
                         off = off.checked_add(usize::try_from(field_off).ok()?)?;
+                        size = Some(usize::try_from(field_size).ok()?);
                         ty = self
                             .adt_field_tag(&key, variant, *i)
                             .filter(|tag| {
@@ -389,6 +399,7 @@ impl<'a> Interpreter<'a> {
                     Some(Ty::Array(elem, _)) => {
                         let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
                         off = off.checked_add(k.checked_mul(elem_size)?)?;
+                        size = Some(elem_size);
                         ty = Some((**elem).clone());
                     }
                     _ => return None,
@@ -404,12 +415,14 @@ impl<'a> Interpreter<'a> {
                     // `RefProj::View`): the steps after it
                     // price through the view's type.
                     ty = Some(view.clone());
+                    size = None;
                     variant = 0;
                 }
                 RefProj::Subslice { offset, len } => match &ty {
                     Some(Ty::Array(elem, _)) => {
                         let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
                         off = off.checked_add(offset.checked_mul(elem_size)?)?;
+                        size = Some(usize::try_from(*len).ok()?.checked_mul(elem_size)?);
                         ty = Some(Ty::Array(elem.clone(), u64::try_from(*len).ok()?));
                     }
                     _ => return None,
@@ -417,7 +430,7 @@ impl<'a> Interpreter<'a> {
                 _ => return None,
             }
         }
-        Some((off, ty))
+        Some((off, ty, size))
     }
 
     /// The flat byte position a byte-displaced projection
@@ -452,7 +465,7 @@ impl<'a> Interpreter<'a> {
         if !projection[at + 1..].is_empty() {
             return None;
         }
-        let (off, _) = self.projection_storage_offset(base_ty, &projection[..at])?;
+        let (off, ..) = self.projection_storage_offset(base_ty, &projection[..at])?;
         let flat = (off as i128).checked_add(disp)?.checked_add(extra)?;
         if flat < 0 {
             return Some(Err(flat));
@@ -1106,7 +1119,7 @@ impl<'a> Interpreter<'a> {
         {
             return None;
         }
-        let (pos, _) = self.projection_storage_offset(&base_ty, projection)?;
+        let (pos, ..) = self.projection_storage_offset(&base_ty, projection)?;
         let position_value =
             project_value(base.clone(), projection, &func, &place_desc).ok()?;
         // A position value that already IS a value of the
@@ -1424,7 +1437,7 @@ impl<'a> Interpreter<'a> {
             // are spliced at the position instead. A position
             // the shape already covers exactly (a plain scalar
             // store) keeps the whole-value store.
-            let (off, pos_ty) = self.projection_storage_offset(&base_ty, projection)?;
+            let (off, pos_ty, pos_size) = self.projection_storage_offset(&base_ty, projection)?;
             let position_value =
                 project_value(base.clone(), projection, &func, &place_desc).ok()?;
             let wider_scalar = matches!(
@@ -1457,6 +1470,22 @@ impl<'a> Interpreter<'a> {
                 {
                     return None;
                 }
+            }
+            // The type evidence above ends where the walk's
+            // type does — at a union field, whose tag names no
+            // laid-out instance (union layouts are not recorded
+            // in the field layout tables) — but the walk still
+            // priced the position's size out of the same layout
+            // rows the splice descends, and a shape covering
+            // that size exactly is the same whole-value store:
+            // splicing it rebuilds the position from its
+            // storage image, so a union position takes the byte
+            // form, which the payload-descent reads that a
+            // `MaybeUninit` place's readers perform cannot
+            // denominate (they carry no union table), where the
+            // plain store keeps the value's own form.
+            if pos_size.is_some_and(|s| s == width) {
+                return None;
             }
             if !wider_scalar && !aggregate {
                 return None;
@@ -1915,7 +1944,7 @@ impl<'a> Interpreter<'a> {
             (None, None) => None,
         };
         let Some(base_ty) = base_ty else { return false };
-        let Some((_, Some(Ty::Adt(name)))) =
+        let Some((_, Some(Ty::Adt(name)), _)) =
             self.projection_storage_offset(&base_ty, projection)
         else {
             return false;
