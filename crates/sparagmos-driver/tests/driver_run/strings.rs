@@ -4451,3 +4451,67 @@ fn run_mode_os_string_copy_from_wrapper_place() {
         "eq0: true\nlen0: 11\nlossy0: hello-world\n",
     );
 }
+
+const STRING_DRAIN_NEXT_BACK_STORAGE_SRC: &str = r#"
+fn main() {
+    let mut j = ["a", "b", "c"].join("/");
+    let mut dj = j.drain(0..1);
+    println!("{:?}", dj.next_back());
+    println!("{:?}", dj.next_back());
+    std::mem::forget(dj);
+    println!("[{}]", j);
+    let mut c = ["a/", "b/", "c"].concat();
+    let mut dc = c.drain(0..1);
+    println!("{:?}", dc.next_back());
+    println!("{:?}", dc.next_back());
+    std::mem::forget(dc);
+    println!("[{}]", c);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_storage_backed() {
+    // A drain over a join/concat-built string holds a `Chars`
+    // state whose byte pointers denote the string's own
+    // storage. The back step is served by the modelled state
+    // machine (as the front step is), which snapshots the
+    // remaining bytes through the pointers before stepping;
+    // the collected `Drain::next_back` body forwarded the
+    // stored storage-backed state to the `Chars` back step
+    // directly, and its snapshot reader only reads value
+    // snapshots. The drained range is the first byte, the one
+    // element whose stored form is plain, so the step is
+    // judged on the pointer form alone. The drain values are
+    // forgotten: the drop-side removal over a join/concat
+    // string is a separate consumer.
+    run_ok(
+        "string-drain-next-back-storage-backed",
+        STRING_DRAIN_NEXT_BACK_STORAGE_SRC,
+        "Some('a')\nNone\n[a/b/c]\nSome('a')\nNone\n[a/b/c]\n",
+    );
+}
+
+const STRING_DRAIN_NEXT_BACK_VALUE_SRC: &str = r#"
+fn main() {
+    let mut m = String::new();
+    m.push_str("a/b/c");
+    {
+        let mut d = m.drain(1..4);
+        println!("{:?}", d.next_back());
+    }
+    println!("[{}]", m);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_value_snapshot() {
+    // The same back step over a push-built string, whose
+    // drain state already denotes a value snapshot: the
+    // modelled route serves it identically, and the drain's
+    // drop still removes the stepped range.
+    run_ok(
+        "string-drain-next-back-value-snapshot",
+        STRING_DRAIN_NEXT_BACK_VALUE_SRC,
+        "Some('/')\n[ac]\n",
+    );
+}
