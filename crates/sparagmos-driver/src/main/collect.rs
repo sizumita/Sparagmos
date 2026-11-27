@@ -388,6 +388,36 @@ fn collect() -> ControlFlow<()> {
                                 // projection no monomorphization
                                 // could normalize, so nothing can
                                 // demand the definition either.
+                                // The array-length and repeat-count
+                                // reasons are the same shape one
+                                // level down: a length or count
+                                // written from the definition's
+                                // parameters (a parameter itself,
+                                // or a generic const expression
+                                // over them) has no target value
+                                // until monomorphization substitutes
+                                // it, so `eval_target_usize` refuses
+                                // it in the definition body -- the
+                                // `[value; N]` initializer of a
+                                // generic associated constant and
+                                // the `[0; A]` array of another are
+                                // the shapes of Issue #510. The
+                                // const-expression reason is the
+                                // same shape in type position: the
+                                // definition's own types mention a
+                                // const expression over its
+                                // parameters, which Stable MIR
+                                // cannot convert at all, generic or
+                                // not -- but a monomorphized use
+                                // substitutes the parameters first
+                                // and carries the evaluated value,
+                                // so the definition body is needed
+                                // by no one. (This accounting is
+                                // for the generic definition only;
+                                // a collected monomorphic instance
+                                // mentioning a const expression
+                                // keeps its crash verdict in
+                                // `mono_check`, unchanged.)
                                 // Account it `NotDemanded`, keeping
                                 // the parameter record; a failure
                                 // with any other reason mixed in
@@ -406,6 +436,12 @@ fn collect() -> ControlFlow<()> {
                                                         || r.starts_with(
                                                             sparagmos_driver::convert::UNNORMALIZABLE_PROJECTION_REASON,
                                                         )
+                                                        || r
+                                                            == "Ty::Array (length not evaluable)"
+                                                        || r
+                                                            == "Rvalue::Repeat (count not evaluable)"
+                                                        || r
+                                                            == sparagmos_driver::convert::CONST_EXPR_REASON
                                                 }) =>
                                         {
                                             Some(
