@@ -1599,6 +1599,7 @@ fn collect() -> ControlFlow<()> {
     // precedence), the collector verdicts `mono_check` replays
     // over the instances it collects (the required-constant
     // evaluation, the per-instance `check_mono_item` checks, the
+    // missing-MIR verdict for auxiliary crates, the
     // duplicate-symbol verdict, the common-linkage verdict, the
     // panic-runtime validation and the LTO / prefer-dynamic
     // session validation; also collection-time

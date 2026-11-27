@@ -653,6 +653,16 @@ pub(crate) struct AuxBuilt {
     /// also what the interpreter fell back to for every crate
     /// before this table existed.
     pub(crate) overflow_checks: bool,
+    /// Whether the build was metadata-only in native shape:
+    /// its own compile flags carried an `--emit` list with no
+    /// code-generating output (`--emit=metadata`, the
+    /// rmeta-test shape). A native metadata-only build encodes
+    /// no optimized MIR at all, which the missing-MIR verdict
+    /// replays (see `mono_check::set_aux_crates`); the
+    /// `-Zalways-encode-mir` this build adds encodes it
+    /// anyway, so the fact has to be recorded here, where the
+    /// flags are known.
+    pub(crate) native_metadata_only: bool,
 }
 
 /// The names under which a consumer may declare a built
@@ -912,6 +922,28 @@ pub(crate) fn compile_aux(
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let overflow_checks = super::session_overflow_checks(&cmd_args);
+    // Whether the build is metadata-only in native shape (see
+    // `AuxBuilt::native_metadata_only`): an `--emit` list is
+    // present and every output it names is one the metadata
+    // encoder does not count as code generation.
+    let native_metadata_only = {
+        let mut emit_lists: Vec<&str> = Vec::new();
+        let mut args = cmd_args.iter();
+        while let Some(arg) = args.next() {
+            if arg == "--emit" {
+                if let Some(value) = args.next() {
+                    emit_lists.push(value);
+                }
+            } else if let Some(value) = arg.strip_prefix("--emit=") {
+                emit_lists.push(value);
+            }
+        }
+        !emit_lists.is_empty()
+            && emit_lists.iter().all(|list| {
+                list.split(',')
+                    .all(|kind| matches!(kind, "metadata" | "dep-info" | "mir"))
+            })
+    };
     // Snapshot the directory's entries before the build runs:
     // which artifact a build produced is a fact of the build,
     // and the location scan below tells this build's products
@@ -1008,6 +1040,7 @@ pub(crate) fn compile_aux(
         artifact: if link { artifact } else { None },
         collect,
         overflow_checks,
+        native_metadata_only,
     })
 }
 
