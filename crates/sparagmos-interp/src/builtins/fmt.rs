@@ -4147,6 +4147,16 @@ impl<'a> Interpreter<'a> {
                 let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
                 return self.format_debug_seq_items(frames, &items, options, indent, open, close, &tys);
             }
+            // A string value read as the byte sequence it
+            // denotes (a `str` value a transmute or cast
+            // re-denominated as a byte slice): its elements
+            // are its UTF-8 bytes, exactly as for the byte
+            // form above.
+            Value::Str(text) => {
+                let items = byte_seq_items(text.as_bytes(), elem_ty);
+                let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
+                return self.format_debug_seq_items(frames, &items, options, indent, open, close, &tys);
+            }
             other => {
                 return Err(InterpError::type_mismatch(
                     "Debug sequence formatting",

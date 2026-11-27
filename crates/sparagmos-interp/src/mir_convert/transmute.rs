@@ -836,12 +836,30 @@ let inner = match (&src, target) {
             // UnsafeCell / MaybeUninit wrapper crossing stays
             // excluded, as for thin pointers: entering a wrapper
             // field is a place change, not a value identity.
+            // The one exception is a cast landing on a `str`
+            // pointee from a byte-slice pointee: a `str` value
+            // in this model is the string data itself, not the
+            // byte form, so that direction re-denominates (see
+            // `ir::Rvalue::BytesToStr`).
             (Some(s), t)
                 if is_fat_ptr_ty(s)
                     && is_fat_ptr_ty(t)
                     && !self.pointee_crosses_cell_wrapper(s, t) =>
             {
-                ir::Rvalue::Use(v.clone())
+                if matches!(ptr_pointee(t), Some(mir::Ty::Str))
+                    && matches!(
+                        ptr_pointee(s),
+                        Some(mir::Ty::Slice(elem))
+                            if matches!(
+                                **elem,
+                                mir::Ty::Uint(mir::UintTy::U8)
+                            )
+                    )
+                {
+                    ir::Rvalue::BytesToStr(v.clone())
+                } else {
+                    ir::Rvalue::Use(v.clone())
+                }
             }
             // Fat pointer <-> pointer to a DST-wrapper
             // struct (an ADT whose last field is the
@@ -912,14 +930,32 @@ let inner = match (&src, target) {
             // nothing — the `&[u8]` -> `&OsStr` step inside
             // `Component::as_os_str` is the shape that reaches
             // here, `is_fat_ptr_ty` not counting the DST structs
-            // as fat pointees.
+            // as fat pointees. The one exception is a cast
+            // landing on a `str` pointee: a `str` value in this
+            // model is the string data itself, not the byte
+            // form, so that direction re-denominates (see
+            // `ir::Rvalue::BytesToStr`).
             (Some(s), t) if self.is_byte_string_ptr_pair(s, t) => {
-                ir::Rvalue::Use(v.clone())
+                // A cast that lands on a `str` pointee from a
+                // byte-string pointee re-denominates the value
+                // as the string it denotes (see
+                // `ir::Rvalue::BytesToStr`); every other pair
+                // in the family carries over unchanged.
+                if matches!(ptr_pointee(t), Some(mir::Ty::Str))
+                    && !matches!(ptr_pointee(s), Some(mir::Ty::Str))
+                {
+                    ir::Rvalue::BytesToStr(v.clone())
+                } else {
+                    ir::Rvalue::Use(v.clone())
+                }
             }
             // Fat pointer between a `str` and a `[u8]` view of the
             // same bytes: both are stored over the same allocation
             // in this model (the `str::as_bytes` builtin relies on
-            // the same sharing), so the pair carries over unchanged.
+            // the same sharing), so the pair carries over unchanged
+            // -- except a cast landing on the `str` view, which
+            // re-denominates the value as the string it denotes
+            // (see `ir::Rvalue::BytesToStr`).
             (Some(s), t)
                 if is_fat_ptr_ty(s)
                     && is_fat_ptr_ty(t)
@@ -929,7 +965,13 @@ let inner = match (&src, target) {
                             if is_str_or_byte_slice(a) && is_str_or_byte_slice(b)
                     ) =>
             {
-                ir::Rvalue::Use(v.clone())
+                if matches!(ptr_pointee(t), Some(mir::Ty::Str))
+                    && !matches!(ptr_pointee(s), Some(mir::Ty::Str))
+                {
+                    ir::Rvalue::BytesToStr(v.clone())
+                } else {
+                    ir::Rvalue::Use(v.clone())
+                }
             }
             // Function pointer -> function pointer: the value
             // is the function identity, which does not depend on

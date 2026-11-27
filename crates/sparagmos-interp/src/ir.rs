@@ -1099,6 +1099,26 @@ pub enum Rvalue {
     /// storage are likewise unchanged; only the resulting
     /// pointer's element view differs.
     WrapSliceElems(Operand),
+    /// A transmute that lands on a `str` pointee from a
+    /// byte-string pointee (`[u8]`, `OsStr`, `Path`):
+    /// `core::str::from_utf8_unchecked`'s transmute is the
+    /// canonical case. Raw-pointer casts to a `str` pointee
+    /// do not emit this: a fat raw pointer's length metadata
+    /// is reinterpreted by later casts in the target's
+    /// denomination (the `*mut str` -> `*const [u16]`
+    /// crossing in cast-rfc0401), so the pointer keeps its
+    /// identity there and only the transmute -- whose result
+    /// is the string itself -- re-denominates. The operand
+    /// denotes the bytes;
+    /// the result is the string data value those bytes form
+    /// -- the shape this model holds a `str` over materialised
+    /// data in, and the shape its consumers (the string
+    /// builtins, the `fmt` engine) read. Bytes that are not
+    /// valid UTF-8 are undefined behaviour in the guest, so
+    /// the cast owes them nothing: the operand value is kept
+    /// unchanged there, and the cast introduces no failure of
+    /// its own.
+    BytesToStr(Operand),
     /// An integer-to-pointer `Transmute` cast: the mirror image of
     /// [`Rvalue::PtrToInt`]. The integer is an address in the
     /// model's synthetic address space, so the result is an
