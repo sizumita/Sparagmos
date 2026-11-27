@@ -565,8 +565,44 @@ impl<'a> Interpreter<'a> {
                                 direct = false;
                                 continue;
                             }
-                            crate::ir::UnwindAction::Terminate(_)
-                            | crate::ir::UnwindAction::Unreachable => {
+                            crate::ir::UnwindAction::Unreachable => {
+                                // The MIR `unwind unreachable` edge:
+                                // the panic at this block is itself a
+                                // nounwind panic -- the UB-check
+                                // assertions (invalid enum
+                                // construction, null pointer
+                                // dereference, misaligned pointer
+                                // dereference) whose core entry points
+                                // are `panic_nounwind_fmt` calls.
+                                // Codegen emits no landing pad and
+                                // raises no second panic: the panic's
+                                // own report (already printed by the
+                                // hook) is the only one, the
+                                // non-unwinding line follows, and the
+                                // run aborts. (A `Terminate` edge is
+                                // the different shape handled below:
+                                // a regular panic crossing a nounwind
+                                // boundary raises `panic_cannot_unwind`
+                                // as a second panic.) Under
+                                // `-C panic=abort` the panic's own
+                                // report is all that prints, as in
+                                // the `Terminate` arm.
+                                let InterpError::Panic { message, .. } = &panic else {
+                                    unreachable!("panic is a Panic")
+                                };
+                                if !self.config.panic_abort {
+                                    self.push_error_output(
+                                        "thread caused non-unwinding panic. aborting.\n",
+                                    );
+                                }
+                                return Err(InterpError::Abort {
+                                    message: format!(
+                                        "panic `{message}` is a nounwind panic in `{func}`: \
+                                         the run aborts"
+                                    ),
+                                });
+                            }
+                            crate::ir::UnwindAction::Terminate(_) => {
                                 let InterpError::Panic { message, .. } = &panic else {
                                     unreachable!("panic is a Panic")
                                 };
