@@ -231,6 +231,88 @@ fn take_resolution_inconclusive() -> bool {
     RESOLUTION_INCONCLUSIVE.with(|flag| flag.replace(false))
 }
 
+thread_local! {
+    /// Whether the projection walk in progress also judges
+    /// a projection by its self type being a parameter (see
+    /// `projection_self_is_parameter`): set by
+    /// `unnormalizable_projection_in_instance` for the
+    /// duration of its one judgment and cleared when it
+    /// returns, the way the resolution records are read and
+    /// cleared by the one judgment that consults them (see
+    /// `RESOLUTION_DEPTH_EXHAUSTED`). The body screen (see
+    /// `unnormalizable_projection_in_body`) never sets it:
+    /// a definition's own bodies mention projections over
+    /// the definition's parameters throughout, and posing
+    /// no query about them is not the body screen's call --
+    /// the judgment belongs to the instance screen, whose
+    /// instances are the ones the compiler's monomorphizing
+    /// queries would be posed for.
+    static PARAM_SELF_JUDGMENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Set whether the projection walk in progress applies the
+/// parameter-self judgment (see `PARAM_SELF_JUDGMENT`).
+fn set_param_self_judgment(active: bool) {
+    PARAM_SELF_JUDGMENT.with(|flag| flag.set(active));
+}
+
+/// Whether the projection walk in progress applies the
+/// parameter-self judgment (see `PARAM_SELF_JUDGMENT`).
+fn param_self_judgment_active() -> bool {
+    PARAM_SELF_JUDGMENT.with(|flag| flag.get())
+}
+
+/// Whether the projection's self type is a type parameter
+/// the ambient arguments do not bind. The first of a
+/// projection's generic arguments is its trait reference's
+/// self type; resolving it through the ambient arguments,
+/// the way the screen's walk resolves parameters, ends at
+/// a parameter no argument binds.
+///
+/// Such a projection cannot normalize in a
+/// fully-monomorphized typing environment: there is no
+/// implementation to select for an abstract self type and
+/// no caller bound to project through, so the compiler's
+/// non-trying `normalize_erasing_regions` fails on it the
+/// way it fails on a projection no implementation covers
+/// -- the query must not be posed. This is the shape a
+/// demand through an anonymous constant inside a generic
+/// function produces: the constant's instance carries the
+/// function's own parameters, and the associated function
+/// it calls is demanded with a projection over one of
+/// them (`MaybeUninit::<<R as Try>::Output>::uninit` in
+/// `core::array::try_from_fn` is the recorded case).
+/// rustc's own collector never poses the query either:
+/// it collects only concrete instances, and a projection
+/// over a parameter is resolved, if ever, at the concrete
+/// instantiation that substitutes the parameter away.
+fn projection_self_is_parameter(
+    alias: &rustc_public::ty::AliasTy,
+    ambient: Option<&GenericArgs>,
+) -> bool {
+    let Some(GenericArgKind::Type(self_ty)) = alias.args.0.first() else {
+        return false;
+    };
+    let mut ty = *self_ty;
+    // The step bound is a termination guard for a
+    // parameter the ambient arguments bind to itself (an
+    // identity instantiation), not evidence: running out
+    // of it reaches no judgment.
+    for _ in 0..16 {
+        match guarded_ty_kind(&ty) {
+            Some(TyKind::Param(param)) => {
+                match ambient.and_then(|a| a.0.get(param.index as usize)) {
+                    Some(GenericArgKind::Type(bound)) => ty = *bound,
+                    _ => return true,
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Resolve a type as far as the screen's own evidence
 /// reaches: parameters through the ambient arguments the
 /// way the screen's walk resolves them, and projections
@@ -1499,6 +1581,15 @@ fn projection_screen_ty_walk(
                     ));
                 }
             }
+            if alias_kind == SmirAliasKind::Projection
+                && param_self_judgment_active()
+                && projection_self_is_parameter(&alias, ambient)
+            {
+                return Some(format!(
+                    "{UNNORMALIZABLE_PROJECTION_REASON}: \
+                     {alias:?}'s self type is a parameter"
+                ));
+            }
             projection_screen_args(&alias.args, ambient, depth + 1, visited)
         }
         TyKind::RigidTy(r) => match r {
@@ -1701,7 +1792,12 @@ pub(crate) fn screen_question<T>(question: impl FnOnce() -> Option<T>) -> Option
 /// items during conversion — would ask the compiler to
 /// normalize a trait projection that cannot normalize in a
 /// fully-monomorphized typing environment, returning the
-/// recorded reason if so.
+/// recorded reason if so. Two judgments are made: a
+/// projection whose trait has no implementation at all
+/// (see `projection_cannot_normalize`), and a projection
+/// whose self type is a parameter no argument binds (see
+/// `projection_self_is_parameter`) — the second is this
+/// screen's alone, never the body screen's.
 ///
 /// Both queries normalize under
 /// `TypingEnv::fully_monomorphized` (reveal-all, no caller
@@ -1728,11 +1824,28 @@ pub(crate) fn screen_question<T>(question: impl FnOnce() -> Option<T>) -> Option
 pub fn unnormalizable_projection_in_instance(
     inst: &Instance,
 ) -> Option<String> {
-    screen_question(|| {
+    // The two walks are separate screen questions: asking
+    // a still-generic instance for its type can panic
+    // ("needs further instantiation", see
+    // `screen_question`), and that containment must not
+    // void the judgment the instance's own arguments
+    // already carry -- the arguments are where a demand
+    // through an anonymous constant leaves the enclosing
+    // function's parameters, the recorded shape of the
+    // parameter-self judgment.
+    set_param_self_judgment(true);
+    let result = screen_question(|| {
         let mut visited = HashMap::new();
-        projection_screen_ty(&inst.ty(), None, 0, &mut visited)
-            .or_else(|| projection_screen_args(&inst.args(), None, 0, &mut visited))
+        projection_screen_args(&inst.args(), None, 0, &mut visited)
     })
+    .or_else(|| {
+        screen_question(|| {
+            let mut visited = HashMap::new();
+            projection_screen_ty(&inst.ty(), None, 0, &mut visited)
+        })
+    });
+    set_param_self_judgment(false);
+    result
 }
 
 /// Whether a body mentions a projection that cannot

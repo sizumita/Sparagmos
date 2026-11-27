@@ -279,6 +279,70 @@ fn summary_mode_unnormalizable_projection_const_is_not_demanded() {
     );
 }
 
+const PROJECTION_PARAM_SELF_CONST_SRC: &str = r#"
+use std::mem::MaybeUninit;
+pub fn fill<T: Iterator, const N: usize>(_: T) -> [MaybeUninit<T::Item>; N] {
+    [const { MaybeUninit::uninit() }; N]
+}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_projection_over_parameter_const_is_not_demanded() {
+    // An anonymous constant inside a generic function whose
+    // body calls an associated function through a projection
+    // over the function's own parameter
+    // (`MaybeUninit::<T::Item>::uninit`, the shape of core's
+    // `array::try_from_fn`): converting the constant demands
+    // the callee instance, and materializing that instance's
+    // body poses a whole-body normalization of the projection
+    // in an empty typing environment, which overflows inside
+    // the compiler and poisons the whole conversion. The
+    // instance screen refuses the demand up front (the
+    // projection's self type is the parameter itself), the
+    // demanded instance is accounted skipped with the
+    // screen's reason, and the constant and the crate still
+    // convert.
+    let dir = temp_dir("projection-param-self-const");
+    let src = fixture(
+        &dir,
+        "projection_param_self_const.rs",
+        PROJECTION_PARAM_SELF_CONST_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "summary mode succeeds with the demand refused; stderr={stderr}"
+    );
+    let const_line = stdout
+        .lines()
+        .find(|l| l.contains("{constant#"))
+        .expect("summary lists the anonymous constant");
+    assert!(
+        const_line.contains("[converted]"),
+        "the anonymous constant converts: {const_line}"
+    );
+    let uninit_line = stdout
+        .lines()
+        .find(|l| l.contains("MaybeUninit"))
+        .expect("summary lists the demanded callee");
+    assert!(
+        uninit_line.contains("SKIPPED") && uninit_line.contains("does not normalize"),
+        "the projection callee is skipped with the screen's reason: {uninit_line}"
+    );
+    let target_line = stdout
+        .lines()
+        .find(|l| l.contains("target-crate converted:"))
+        .expect("summary reports the target crate");
+    assert!(
+        target_line.contains("skipped: 0"),
+        "the target crate converts with nothing skipped: {target_line}"
+    );
+}
+
 const UNNORMALIZABLE_PROJECTION_AUTO_TRAIT_MISMATCH_SRC: &str = r#"
 #![feature(trivial_bounds)]
 #![allow(trivial_bounds)]
