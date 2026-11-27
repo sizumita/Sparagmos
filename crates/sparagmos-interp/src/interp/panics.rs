@@ -579,6 +579,12 @@ impl<'a> Interpreter<'a> {
     /// shape for the style: the panic-machinery frames the
     /// panic's entry path implies, then the guest frames from
     /// the innermost out to the current thread's stack base.
+    /// In the short shape, while the entry frame is the stack
+    /// bottom, the trace ends with the shim frame `lang_start`
+    /// calls the entry through: it is the last frame std's
+    /// short printer shows below the entry. The short shape
+    /// also elides the frames inside a short-backtrace region
+    /// the way std's own printer does (see the `Short` arm).
     /// Frame source positions are not rendered (std prints one
     /// `at` line under each frame; the model's judging surface
     /// does not read them, and the snapshots that compare
@@ -655,13 +661,85 @@ impl<'a> Interpreter<'a> {
             }
             names.push(frame.func.clone());
         }
+        // Below the entry frame sits the shim `lang_start`
+        // calls the entry function pointer through: std's own
+        // traces show it under the entry, and in the short
+        // format it is the last frame printed (the frames under
+        // it are std's, inside the short-backtrace region
+        // `lang_start` wraps the call in). It belongs to the
+        // trace only while the entry frame itself is the stack
+        // bottom -- a report rendered after the entry returned
+        // (a `Termination` report's, an exit handler's) has no
+        // such frame under its own bottom. Only the short shape
+        // gains it: there the shim is exactly the last frame
+        // std prints, while the full shape's trace stays
+        // bounded at the guest stack (std's own full tail runs
+        // on into frames the model does not represent).
+        let entry_live = match self.entry_frame_id.get() {
+            Some(id) => frames.get(base).map(|fr| fr.id) == Some(id),
+            None => false,
+        };
+        if entry_live && matches!(style, ReportBacktrace::Short) {
+            names.push(
+                "<fn() as core::ops::function::FnOnce<()>>::call_once"
+                    .to_string(),
+            );
+        }
         let mut out = String::from("stack backtrace:
 ");
         match style {
             ReportBacktrace::Short => {
-                for (i, name) in names.iter().enumerate() {
-                    out.push_str(&format!("   {i}: {name}
-"));
+                // std's short format (its `_print_fmt` in
+                // sys/backtrace.rs): a frame whose name contains
+                // `__rust_end_short_backtrace` resumes printing
+                // and is itself not printed; while printing, a
+                // frame containing `__rust_begin_short_backtrace`
+                // suspends it, likewise unprinted; frames passed
+                // over while suspended are counted, and when
+                // printing resumes they are accounted by one
+                // `[... omitted N frames ...]` line -- except the
+                // first suspended run, whose line std suppresses.
+                // The modelled list starts where std's hook-side
+                // `__rust_end_short_backtrace` wrapper has just
+                // resumed printing (the panic-machinery frames are
+                // its visible start, and that wrapper's own run is
+                // the suppressed first one), so printing starts
+                // enabled with the first line already spent. The
+                // walk stops after 101 frames, as std's does.
+                let mut print = true;
+                let mut first_omit = false;
+                let mut omitted = 0usize;
+                let mut idx = 0usize;
+                for (walked, name) in names.iter().enumerate() {
+                    if walked > 100 {
+                        break;
+                    }
+                    if name.contains("__rust_end_short_backtrace") {
+                        print = true;
+                        continue;
+                    }
+                    if print
+                        && name.contains("__rust_begin_short_backtrace")
+                    {
+                        print = false;
+                        continue;
+                    }
+                    if !print {
+                        omitted += 1;
+                        continue;
+                    }
+                    if omitted > 0 {
+                        if !first_omit {
+                            out.push_str(&format!(
+                                "      [... omitted {omitted} frame{} ...]\n",
+                                if omitted > 1 { "s" } else { "" }
+                            ));
+                        }
+                        first_omit = false;
+                        omitted = 0;
+                    }
+                    out.push_str(&format!("   {idx}: {name}\n"));
+                    idx += 1;
                 }
                 out.push_str(
                     "note: Some details are omitted, run with `RUST_BACKTRACE=full` \

@@ -3125,6 +3125,115 @@ fn run_mode_backtrace_capture_follows_the_environment() {
     assert_eq!(stdout, "disabled backtrace\n");
 }
 
+const SHORT_BACKTRACE_SRC: &str = r#"
+#[inline(never)]
+fn __rust_begin_short_backtrace<T, F: FnOnce() -> T>(f: F) -> T {
+    let result = f();
+    std::hint::black_box(result)
+}
+
+#[inline(never)]
+fn __rust_end_short_backtrace<T, F: FnOnce() -> T>(f: F) -> T {
+    let result = f();
+    std::hint::black_box(result)
+}
+
+fn first() {
+    __rust_end_short_backtrace(|| second());
+}
+
+fn second() {
+    third();
+}
+
+fn third() {
+    __rust_begin_short_backtrace(|| fourth());
+}
+
+fn fourth() {
+    panic!("short trace");
+}
+
+fn main() {
+    first();
+}
+"#;
+
+#[test]
+fn run_mode_short_backtrace_elides_the_marked_region() {
+    // A guest program wrapping its call chain in the
+    // `__rust_begin_short_backtrace` /
+    // `__rust_end_short_backtrace` markers std's own runtime
+    // uses (the shape of tests/ui/panics/
+    // short-ice-remove-middle-frames.rs): the short report
+    // omits the marked region behind one omitted line, keeps
+    // sequential indices on the printed frames, prints neither
+    // marker frame, and ends with the `lang_start` shim frame
+    // under `main`.
+    let dir = temp_dir("short-backtrace");
+    let src = fixture(&dir, "short_backtrace.rs", SHORT_BACKTRACE_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "\nthread 'main' (1) panicked at {0}:27:5:\nshort trace\nstack backtrace:\n\
+             \u{20}  0: __rustc::rust_begin_unwind\n\
+             \u{20}  1: core::panicking::panic_fmt\n\
+             \u{20}  2: short_backtrace::fourth\n\
+             \u{20}  3: short_backtrace::third::{{closure#0}}\n\
+             \u{20}     [... omitted 3 frames ...]\n\
+             \u{20}  4: short_backtrace::first\n\
+             \u{20}  5: short_backtrace::main\n\
+             \u{20}  6: <fn() as core::ops::function::FnOnce<()>>::call_once\n\
+             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
+
+#[test]
+fn run_mode_full_backtrace_keeps_the_marked_region() {
+    // The full shape does not elide: every frame is listed,
+    // the marker frames included, and the trace stays bounded
+    // at the guest stack.
+    let dir = temp_dir("full-backtrace-markers");
+    let src = fixture(&dir, "short_backtrace.rs", SHORT_BACKTRACE_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .env("RUST_BACKTRACE", "full")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "\nthread 'main' (1) panicked at {0}:27:5:\nshort trace\nstack backtrace:\n\
+             \u{20}  0:     0x555555554000 - __rustc::rust_begin_unwind\n\
+             \u{20}  1:     0x555555554010 - core::panicking::panic_fmt\n\
+             \u{20}  2:     0x555555554020 - short_backtrace::fourth\n\
+             \u{20}  3:     0x555555554030 - short_backtrace::third::{{closure#0}}\n\
+             \u{20}  4:     0x555555554040 - short_backtrace::__rust_begin_short_backtrace\n\
+             \u{20}  5:     0x555555554050 - short_backtrace::third\n\
+             \u{20}  6:     0x555555554060 - short_backtrace::second\n\
+             \u{20}  7:     0x555555554070 - short_backtrace::first::{{closure#0}}\n\
+             \u{20}  8:     0x555555554080 - short_backtrace::__rust_end_short_backtrace\n\
+             \u{20}  9:     0x555555554090 - short_backtrace::first\n\
+             \u{20}  10:     0x5555555540a0 - short_backtrace::main\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
+
 const DOUBLE_FAIL_SRC: &str = r#"fn main() {
     struct Double;
 
