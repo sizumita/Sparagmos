@@ -4159,9 +4159,32 @@ impl<'a> Interpreter<'a> {
         // that may follow it.
         let mut path: Vec<usize> = Vec::new();
         let mut steps = projection;
-        while let Some((RefProj::Field(f), rest)) = steps.split_first() {
-            path.push(*f);
-            steps = rest;
+        // A union field step navigates to one field of the
+        // union exactly as a struct field step navigates to one
+        // field of the struct: the field-index path the
+        // conversion recorded (`field_elem_sizes` walks unions
+        // alongside structs) counts it, and a sequence held
+        // behind a union field -- the inline storage of a
+        // hand-written small-vector union, a
+        // `ManuallyDrop<MaybeUninit<[T; N]>>` -- denominates a
+        // pointer offset over it in its elements just as a
+        // sequence behind struct fields does (Issue #502).
+        // Without this, the offset over such a position was
+        // carried as a byte displacement, whose write spliced
+        // into the base element bytes and whose read found no
+        // value boundary.
+        loop {
+            match steps.split_first() {
+                Some((RefProj::Field(f), rest)) => {
+                    path.push(*f);
+                    steps = rest;
+                }
+                Some((RefProj::UnionField { idx, .. }, rest)) => {
+                    path.push(*idx);
+                    steps = rest;
+                }
+                _ => break,
+            }
         }
         let (cur, tail) = split_sequence_position(steps)?;
         if !path.is_empty() {
@@ -4186,11 +4209,62 @@ impl<'a> Interpreter<'a> {
             // for the field path, and the value held at the
             // path must actually be the element container, as
             // for the local case below.
-            let elem = body
+            let mut elem = body
                 .field_elem_sizes
                 .get(local)
                 .and_then(|sizes| sizes.get(&path))
                 .copied()?;
+            // A wrapper sequence field records the size of the
+            // sequence it wraps, not of its elements: the field
+            // at the path is a `MaybeUninit<[T; N]>` (the inline
+            // storage behind a union field, Issue #502), whose
+            // recorded element is the array as a whole, while a
+            // pointer derived from it is denominated in the
+            // array elements. The denomination that matches the
+            // offset is the one the conversion recorded deeper
+            // under the same field path -- through the wrapper
+            // fields (`MaybeUninit` keeps its value in field 1,
+            // a union payload, so the descent is not a uniform
+            // field-0 walk) -- provided it is the only deeper
+            // record denominated in the offset element size.
+            // The rebuilt projection keeps the original prefix:
+            // the index step the caller appends resolves through
+            // the wrappers exactly as the position original
+            // index step did, and the held-value container check
+            // below still judges the position itself.
+            if cur.is_some() && elem_size.is_some() && elem_size != Some(elem) {
+                if let Some(sizes) = body.field_elem_sizes.get(local) {
+                    // The descent crosses at most two wrapper
+                    // fields (the `MaybeUninit` value field and
+                    // the field it wraps), and every recorded
+                    // intermediate keeps the wrapped-whole
+                    // denomination: the size only changes at the
+                    // final step, where the sequence itself sits.
+                    // A record deeper in an unrelated field (the
+                    // fields of a `Vec` element type, say) fails
+                    // one of these and leaves the direct
+                    // denomination standing.
+                    let mut deeper: Vec<u64> = sizes
+                        .iter()
+                        .filter(|(recorded, size)| {
+                            recorded.len() > path.len()
+                                && recorded.len() <= path.len() + 2
+                                && recorded[..path.len()] == path[..]
+                                && Some(**size) == elem_size
+                                && (path.len() + 1..recorded.len()).all(|mid| {
+                                    sizes
+                                        .get(&recorded[..mid])
+                                        .is_none_or(|mid_size| *mid_size == elem)
+                                })
+                        })
+                        .map(|(_, size)| *size)
+                        .collect();
+                    deeper.dedup();
+                    if deeper.len() == 1 {
+                        elem = deeper[0];
+                    }
+                }
+            }
             let cur = match cur {
                 Some(c) => c,
                 None if !tail.is_empty() => 0,
@@ -4220,8 +4294,11 @@ impl<'a> Interpreter<'a> {
                     0
                 }
             };
-            let field_steps: Vec<RefProj> =
-                path.iter().map(|f| RefProj::Field(*f)).collect();
+            // The held value is read through the leading steps
+            // of the projection itself (a union step must stay a
+            // union step: its reading reinterprets the held
+            // field, where a plain field step would not).
+            let field_steps: Vec<RefProj> = projection[..path.len()].to_vec();
             let held = self.value_target_value(base?, &field_steps).ok()?;
             if !matches!(
                 held,
