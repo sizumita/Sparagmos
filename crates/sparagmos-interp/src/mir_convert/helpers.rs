@@ -418,6 +418,28 @@ pub(super) fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
 /// and pointers (fat when the pointee is unsized). Anything whose
 /// layout needs the compiler's layout computation — ADTs, tuples
 /// with more than one element, slices, `str` — yields `None`.
+/// Whether a `mir` pointee type is dynamically sized, when
+/// the type alone decides it: a slice, `str`, a trait object
+/// or a foreign type is unsized; a tuple's unsizedness is its
+/// tail's; every scalar, pointer, array of sized elements and
+/// function pointer is sized. An ADT's unsizedness lives in
+/// the driver's DST layout table, which this free function
+/// cannot see: it yields `None`, and the caller must consult
+/// `Converter::ty_layout` (which can) instead of guessing.
+pub(super) fn mir_pointee_unsized(ty: &mir::Ty) -> Option<bool> {
+    use mir::Ty as T;
+    Some(match ty {
+        T::Slice(_) | T::Str | T::Dynamic(..) | T::Foreign(_) => true,
+        T::Tuple(ts) => match ts.last() {
+            Some(tail) => mir_pointee_unsized(tail)?,
+            None => false,
+        },
+        T::Pat(inner, _) => mir_pointee_unsized(inner)?,
+        T::Adt(..) => return None,
+        _ => false,
+    })
+}
+
 pub(super) fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
     use mir::Ty as T;
     Some(match ty {
@@ -429,10 +451,10 @@ pub(super) fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
         T::Array(elem, mir::ArrayLen::Known(n)) => n.checked_mul(mir_ty_size(elem)?)?,
         T::Array(_, _) => return None,
         T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
-            if matches!(&**pointee, T::Slice(_) | T::Str | T::Dynamic(..)) {
-                16
-            } else {
-                8
+            match mir_pointee_unsized(pointee) {
+                Some(true) => 16,
+                Some(false) => 8,
+                None => return None,
             }
         }
         T::FnPtr(_) => 8,
@@ -472,13 +494,10 @@ pub(super) fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
                         (es.checked_mul(*n)?, ea)
                     }
                     T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
-                        if matches!(
-                            &**pointee,
-                            T::Slice(_) | T::Str | T::Dynamic(..)
-                        ) {
-                            (16, 8)
-                        } else {
-                            (8, 8)
+                        match mir_pointee_unsized(pointee) {
+                            Some(true) => (16, 8),
+                            Some(false) => (8, 8),
+                            None => return None,
                         }
                     }
                     T::FnPtr(_) => (8, 8),

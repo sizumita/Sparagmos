@@ -432,6 +432,34 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether `ty` is dynamically sized: a slice, `str`, a
+    /// trait object or a foreign type; a tuple whose tail is
+    /// unsized; or an ADT instance the driver recorded a DST
+    /// layout descriptor for (a struct or union whose tail
+    /// field is unsized, e.g. `Path`). A pointer or reference
+    /// to an unsized type is a fat pointer: it occupies two
+    /// words, not one.
+    pub(super) fn ty_is_unsized(&self, ty: &mir::Ty) -> bool {
+        use mir::Ty as T;
+        match ty {
+            T::Slice(_) | T::Str | T::Dynamic(..) | T::Foreign(_) => {
+                true
+            }
+            T::Tuple(ts) => ts
+                .last()
+                .is_some_and(|tail| self.ty_is_unsized(tail)),
+            T::Pat(inner, _) => self.ty_is_unsized(inner),
+            T::Adt(def, args) => {
+                let tag = crate::builtins::ty_tag(
+                    &mir::Ty::Adt(*def, args.clone()),
+                    self.names,
+                );
+                self.adt_dst_layouts.contains_key(&tag)
+            }
+            _ => false,
+        }
+    }
+
     /// The native `(size, align)` of a type whose layout is
     /// structurally known or recorded in the layout table:
     /// scalars by their width, arrays and tuples by composing
@@ -461,10 +489,7 @@ impl<'a> Converter<'a> {
                 (es.checked_mul(*n)?, ea)
             }
             T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
-                if matches!(
-                    &**pointee,
-                    T::Slice(_) | T::Str | T::Dynamic(..)
-                ) {
+                if self.ty_is_unsized(pointee) {
                     (16, 8)
                 } else {
                     (8, 8)

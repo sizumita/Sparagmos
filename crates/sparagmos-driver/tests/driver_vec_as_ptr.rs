@@ -93,6 +93,59 @@ fn main() {
 }
 
 #[test]
+fn run_mode_vec_buffers_have_disjoint_addresses() {
+    // Two vectors of large elements in one frame: their
+    // buffers' address ranges must not overlap (so the
+    // `copy_nonoverlapping` between them is well-defined),
+    // and positions within one buffer are exact element
+    // steps. (Regression: buffer positions used to price
+    // from the holding locals' slots, so the two ranges
+    // wholesale-overlapped and the copy's UB precondition
+    // false-fired — the driftsort-off-by-one shape.)
+    let stdout = run_ok(
+        "disjoint",
+        r#"
+fn main() {
+    let a = vec![[7u8; 8192]; 4];
+    let mut b = vec![[0u8; 8192]; 4];
+    let a0 = a.as_ptr() as usize;
+    let b0 = b.as_ptr() as usize;
+    assert!(a0 + 4 * 8192 <= b0 || b0 + 4 * 8192 <= a0, "ranges disjoint");
+    assert_eq!(unsafe { a.as_ptr().add(3) } as usize - a0, 3 * 8192);
+    unsafe { std::ptr::copy_nonoverlapping(a.as_ptr(), b.as_mut_ptr(), 4); }
+    assert_eq!(b[2][100], 7);
+    println!("ok");
+}
+"#,
+    );
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn run_mode_vec_ptr_forms_agree_on_the_address() {
+    // The same buffer reached through different forms —
+    // `as_ptr`, a slice's `as_ptr`, an element reference —
+    // has the one address; an empty vector's data pointer
+    // is the element type's dangling address.
+    let stdout = run_ok(
+        "forms",
+        r#"
+fn main() {
+    let v = vec![10, 20, 30];
+    let p = v.as_ptr();
+    assert_eq!(p, v.as_ptr());
+    assert_eq!(p, v.as_slice().as_ptr());
+    assert_eq!(p as usize, (&v[0] as *const i32) as usize);
+    let e: Vec<i32> = Vec::new();
+    assert_eq!(e.as_ptr() as usize, std::mem::align_of::<i32>());
+    println!("ok");
+}
+"#,
+    );
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
 fn run_mode_empty_vec_as_ptr() {
     let stdout = run_ok(
         "empty",
