@@ -165,6 +165,25 @@
 //!   relocation (a pointer constant is not a zero
 //!   initializer) or a non-zero byte.
 //!
+//! - The target-cpu session validation of code generation
+//!   (`rustc_codegen_ssa::codegen_crate`'s opening checks,
+//!   mirrored in `create_metadata` for AVR): rustc fatally
+//!   rejects a target whose spec sets `need_explicit_cpu`
+//!   when the session sets no `-C target-cpu`, and a
+//!   `-C target-cpu` the target spec lists in
+//!   `unsupported_cpus` ("known but unsupported"). Both
+//!   predicates read only session state -- the target spec
+//!   and the codegen options -- but rustc performs them as
+//!   code generation starts, which a metadata-only session
+//!   never reaches; the check below replays them over the
+//!   driver's own session state (see
+//!   `target_cpu_finding`). This is the same shape as the
+//!   LTO / prefer-dynamic replay above, and it closes the
+//!   last two records of the original class-L group that
+//!   are session-state predicates at all (the data-layout
+//!   and LLVM-pass records of that group need LLVM's own
+//!   tables, as recorded on Issue #509).
+//!
 //! - Check mode: when the compilation being judged is a
 //!   compiletest check compilation (`--emit=metadata` — a
 //!   `check-pass` / `check-fail` test, or an incremental
@@ -172,8 +191,9 @@
 //!   never run in the reference compilation, so the verdicts
 //!   above that replay them cannot decide it: the
 //!   required-constant walk, the `check_mono_item` forces,
-//!   the duplicate-symbol, common-linkage, panic-runtime and
-//!   LTO / prefer-dynamic verdicts, the unshimmed-intrinsic
+//!   the duplicate-symbol, common-linkage, panic-runtime,
+//!   LTO / prefer-dynamic and target-cpu verdicts, the
+//!   unshimmed-intrinsic
 //!   verdict, and the body checks (SIMD / atomic / layout).
 //!   Each was verified against the pinned compiler to stay
 //!   silent under `--emit=metadata` while firing in a full
@@ -1509,7 +1529,8 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// (`panic_runtime_finding`), which needs no walk, and the
 /// LTO / prefer-dynamic session validation
 /// (`lto_prefer_dynamic_finding`), which needs no walk
-/// either.
+/// either, and the target-cpu session validation
+/// (`target_cpu_finding`), which needs no walk either.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1547,6 +1568,7 @@ pub fn check_required_consts() -> Option<String> {
             common_linkage_finding(tcx),
             panic_runtime_finding(tcx),
             lto_prefer_dynamic_finding(tcx),
+            target_cpu_finding(tcx),
         ] {
             if let Some(finding) = finding {
                 note_check_mode_verdict(finding);
@@ -1581,6 +1603,7 @@ pub fn check_required_consts() -> Option<String> {
         .or_else(|| common_linkage_finding(tcx))
         .or_else(|| panic_runtime_finding(tcx))
         .or_else(|| lto_prefer_dynamic_finding(tcx))
+        .or_else(|| target_cpu_finding(tcx))
 }
 
 /// The `check_mono_item` finding of the most recent
@@ -1960,6 +1983,52 @@ fn lto_prefer_dynamic_finding(
              'bin' or 'cdylib' output)"
                 .to_string(),
         );
+    }
+    None
+}
+
+/// The target-cpu verdict over the session's own state,
+/// mirroring the two fatal checks `rustc_codegen_ssa`
+/// performs as code generation starts (`codegen_crate`,
+/// and `create_metadata` for the AVR explicit-cpu case):
+/// a target whose spec sets `need_explicit_cpu` has no
+/// default cpu, so a session that sets no `-C target-cpu`
+/// cannot codegen for it at all; and a `-C target-cpu`
+/// named in the target spec's `unsupported_cpus` list is
+/// known to the target but unsupported by it. Both
+/// predicates read only the target spec and the session's
+/// codegen options -- the same evidence the driver's
+/// session already carries -- so the replay is exact:
+/// it fires for precisely the sessions rustc rejects.
+/// (Verified against the pinned rustc 1.100.0: each
+/// rejection shape exits 0 under `--emit=metadata` and 1
+/// under `--emit=link`, and each neighbouring acceptance
+/// -- an explicit supported cpu -- exits 0 under both.)
+fn target_cpu_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
+    let target_cpu = &tcx.sess.opts.cg.target_cpu;
+    if tcx.sess.target.need_explicit_cpu && target_cpu.is_none() {
+        return Some(
+            "target requires explicitly specifying a cpu with \
+             `-C target-cpu` (rustc rejects a target whose spec \
+             requires an explicit cpu when the session sets none, \
+             at code generation)"
+                .to_string(),
+        );
+    }
+    if let Some(target_cpu) = target_cpu {
+        let listed = tcx
+            .sess
+            .target
+            .unsupported_cpus
+            .iter()
+            .any(|cpu| &**cpu == target_cpu.as_str());
+        if listed {
+            return Some(format!(
+                "target cpu `{target_cpu}` is known but unsupported \
+                 (rustc rejects a `-C target-cpu` the target spec \
+                 lists as unsupported, at code generation)"
+            ));
+        }
     }
     None
 }

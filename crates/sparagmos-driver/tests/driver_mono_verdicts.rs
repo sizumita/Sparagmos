@@ -22,6 +22,12 @@
 //! operand whose evaluation fails (E0080) is a compilation
 //! failure even though the operands live outside every body
 //! and no required-constant list names them. The
+//! The target-cpu session validation is pinned as well:
+//! rustc rejects, as code generation starts, a target whose
+//! spec requires an explicit cpu when none is set, and a
+//! `-C target-cpu` the target spec lists as unsupported --
+//! both over session state alone, so conversion accepted
+//! them. The
 //! LTO / prefer-dynamic session validation is pinned as well:
 //! rustc rejects `-C lto` with `-C prefer-dynamic` when every
 //! output of the crate is a 'staticlib', 'bin' or 'cdylib'
@@ -1218,6 +1224,142 @@ fn prefer_dynamic_without_lto_converts() {
         &src,
         &["--rustc-arg", "-Cprefer-dynamic"],
         false,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn explicit_target_cpu_required_avr_rejected() {
+    // The record's own shape (tests/ui/target-cpu/
+    // explicit-target-cpu, avr_nocpu revision): the AVR
+    // target spec sets `need_explicit_cpu`, so a session
+    // with no `-C target-cpu` is a fatal error when code
+    // generation starts; conversion must report the same
+    // failure.
+    let case = Case::new("target-cpu-required-avr");
+    let src = case.write(
+        "case.rs",
+        "#![feature(no_core)]\n\
+         #![no_core]\n\
+         #![crate_type = \"rlib\"]\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "--target=avr-none"],
+        true,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "target requires explicitly specifying a cpu with `-C target-cpu`"
+        ),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn explicit_target_cpu_required_amdgcn_rejected() {
+    // The other `need_explicit_cpu` target in the pinned
+    // tree (tests/ui/target-cpu/explicit-target-cpu,
+    // amdgcn_nocpu revision), same validation.
+    let case = Case::new("target-cpu-required-amdgcn");
+    let src = case.write(
+        "case.rs",
+        "#![feature(no_core)]\n\
+         #![no_core]\n\
+         #![crate_type = \"rlib\"]\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "--target=amdgcn-amd-amdhsa"],
+        true,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "target requires explicitly specifying a cpu with `-C target-cpu`"
+        ),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn explicit_target_cpu_supplied_converts() {
+    // The acceptance guarding the rejections above: the
+    // same target with an explicit cpu converts.
+    let case = Case::new("target-cpu-supplied-avr");
+    let src = case.write(
+        "case.rs",
+        "#![feature(no_core)]\n\
+         #![no_core]\n\
+         #![crate_type = \"rlib\"]\n",
+    );
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "--target=avr-none",
+            "--rustc-arg",
+            "-Ctarget-cpu=atmega328p",
+        ],
+        true,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn unsupported_target_cpu_rejected() {
+    // The record's own shape (tests/ui/target-cpu/
+    // unsupported-target-cpu): `sm_60` is in the NVPTX
+    // target spec's `unsupported_cpus` list, so rustc
+    // fatally rejects it when code generation starts;
+    // conversion must report the same failure.
+    let case = Case::new("target-cpu-unsupported-nvptx");
+    let src = case.write(
+        "case.rs",
+        "#![feature(no_core)]\n\
+         #![no_core]\n\
+         #![crate_type = \"rlib\"]\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "--target=nvptx64-nvidia-cuda",
+            "--rustc-arg",
+            "-Ctarget-cpu=sm_60",
+        ],
+        true,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("target cpu `sm_60` is known but unsupported"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn supported_target_cpu_converts() {
+    // The acceptance guarding the rejection above: a cpu
+    // the NVPTX spec does not list as unsupported converts.
+    let case = Case::new("target-cpu-supported-nvptx");
+    let src = case.write(
+        "case.rs",
+        "#![feature(no_core)]\n\
+         #![no_core]\n\
+         #![crate_type = \"rlib\"]\n",
+    );
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "--target=nvptx64-nvidia-cuda",
+            "--rustc-arg",
+            "-Ctarget-cpu=sm_70",
+        ],
+        true,
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
