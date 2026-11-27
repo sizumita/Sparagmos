@@ -4950,3 +4950,87 @@ fn run_mode_cow_from_owned_sources() {
         "deref=from string\nvlen=3\n"
     );
 }
+
+const OS_STR_DETACHED_DEREF_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    // The value `OsString::deref` produces for non-UTF-8
+    // bytes is a detached fat pointer over the byte tuple:
+    // the byte readers (length, encoded bytes, equality)
+    // read it directly, and the consumers that reborrow it
+    // (`to_str` through `from_utf8` over
+    // `as_encoded_bytes`, iteration over the encoded bytes)
+    // read the same bytes through the reborrowed pointer.
+    let os = OsString::from_vec(vec![b'a', 0xFF, b'b']);
+    let s: &OsStr = &os;
+    println!("len={}", s.len());
+    println!("empty={}", s.is_empty());
+    println!("enc={:?}", s.as_encoded_bytes());
+    println!("eq_self={}", s == s);
+    println!("to_str={:?}", s.to_str());
+    println!("lossy={}", s.to_string_lossy());
+    println!("debug={:?}", s);
+    println!("utf8={:?}", std::str::from_utf8(s.as_encoded_bytes()).map(|x| x.len()));
+    let mut sum = 0u32;
+    for x in s.as_encoded_bytes() {
+        sum += *x as u32;
+    }
+    println!("sum={}", sum);
+}
+"#;
+
+#[test]
+fn run_mode_os_str_detached_deref_consumers() {
+    run_ok(
+        "os-str-detached-deref-consumers",
+        OS_STR_DETACHED_DEREF_SRC,
+        "len=3\nempty=false\nenc=[97, 255, 98]\neq_self=true\nto_str=None\nlossy=a\u{FFFD}b\ndebug=\"a\\xFFb\"\nutf8=Err(Utf8Error { valid_up_to: 1, error_len: Some(1) })\nsum=450\n",
+    );
+}
+
+const OS_STR_DETACHED_DEREF_ORDER_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+
+fn main() {
+    // Ordering between two detached derefs (the operands
+    // reach the comparison as references to the stored fat
+    // pointers), sorting a vector of them, their `Debug`
+    // inside composite forms, and the same consumers over
+    // the detached values `parent` / `file_name` produce.
+    let a = OsString::from_vec(vec![b'a', 0xFF, b'b']);
+    let b = OsString::from_vec(vec![b'a', 0xFF, b'c']);
+    let sa: &OsStr = &a;
+    let sb: &OsStr = &b;
+    println!("eq={}", sa == sb);
+    println!("lt={}", sa < sb);
+    println!("gt={}", sb > sa);
+    println!("cmp={:?}", sa.cmp(sb));
+    println!("pcmp={:?}", sa.partial_cmp(sb));
+    let mut v: Vec<&OsStr> = vec![sb, sa];
+    v.sort();
+    println!("sorted={:?}", v);
+    println!("tuple={:?}", (sa, 1));
+    let mut pb = PathBuf::from(OsString::from_vec(vec![b'd', 0xFF]));
+    pb.push(OsString::from_vec(vec![b'a', 0xFF, b'b']));
+    let parent = pb.parent().unwrap();
+    println!("parent_tostr={:?}", parent.to_str());
+    println!("parent_debug={:?}", parent);
+    let fname = pb.file_name().unwrap();
+    println!("fname_tostr={:?}", fname.to_str());
+    println!("fname_debug={:?}", fname);
+    println!("fname_lt={}", fname < parent.as_os_str());
+}
+"#;
+
+#[test]
+fn run_mode_os_str_detached_deref_ordering() {
+    run_ok(
+        "os-str-detached-deref-ordering",
+        OS_STR_DETACHED_DEREF_ORDER_SRC,
+        "eq=false\nlt=true\ngt=true\ncmp=Less\npcmp=Some(Less)\nsorted=[\"a\\xFFb\", \"a\\xFFc\"]\ntuple=(\"a\\xFFb\", 1)\nparent_tostr=None\nparent_debug=\"d\\xFF\"\nfname_tostr=None\nfname_debug=\"a\\xFFb\"\nfname_lt=true\n",
+    );
+}
