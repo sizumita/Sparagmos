@@ -1436,6 +1436,28 @@ impl<'a> Interpreter<'a> {
                 position_value,
                 Value::Tuple(_) | Value::Enum { .. } | Value::Bytes(_) | Value::Str(_)
             );
+            // A shape covering the position exactly is a
+            // whole-value store of that position: the plain
+            // store denominates the value by the position's
+            // own type, while splicing the shape's flattened
+            // bytes through the base's byte layout rebuilds
+            // the position from its storage image and loses
+            // the denomination of any field whose byte
+            // layout is a bare scalar (a newtype payload
+            // stored through a dereference -- the
+            // `Capture::elem` store of an `assert!` capture
+            // -- comes back as the bare integer). The splice
+            // exists for a shape narrower than the position
+            // it lands in, whose whole-value store would
+            // replace more than the shape denotes.
+            if let Some(t) = &pos_ty {
+                if self
+                    .ty_size(t)
+                    .is_some_and(|s| s as usize == width)
+                {
+                    return None;
+                }
+            }
             if !wider_scalar && !aggregate {
                 return None;
             }
