@@ -6,7 +6,8 @@
 //! reinterpretation (width-crossing array regrouping at any
 //! total width, with per-element uninit propagation), the
 //! wrapped-array and `Simd<T, N>` storage crossings, the
-//! fat-pointer <-> DST-wrapper-struct identity, the
+//! fat-pointer <-> DST-wrapper-struct identity, the formatting
+//! of a DST struct str tail field, the
 //! (pointer, length) tuple <-> fat reference crossing, and
 //! the thin pointer <-> union crossing, and the raw-pointer
 //! cast regrouping of a slice's elements (a `[[u8; 3]; 2]`
@@ -452,6 +453,85 @@ fn main() {
 "#,
     );
     assert_eq!(stdout, "3\n1\n42\n5\n5\na\ne\n");
+}
+
+/// A fat pointer transmuted into a one-field DST-wrapper
+/// struct *value* (the wrapper is the pointer, in a struct),
+/// and back out: the field reads as the fat pointer it holds
+/// (length, elements), and the reverse transmute recovers
+/// the original fat pointer for both the tuple-struct and
+/// the named-field shapes.
+#[test]
+fn fat_ptr_value_wrapper_roundtrip() {
+    let stdout = run_ok(
+        "fat-value-wrapper",
+        "fat_value_wrapper.rs",
+        r#"
+struct W(*const [u8]);
+struct W2 {
+    p: *const [u8],
+}
+fn main() {
+    let s: &[u8] = &[7, 8, 9, 10];
+    let w: W = unsafe { std::mem::transmute(s) };
+    println!("{}", unsafe { (*w.0).len() });
+    println!("{}", unsafe { (*w.0)[2] });
+    let back: *const [u8] = unsafe { std::mem::transmute(w) };
+    println!("{}", unsafe { (*back).len() });
+    let w2: W2 = unsafe { std::mem::transmute(s) };
+    println!("{}", unsafe { (*w2.p).len() });
+    let back2: &[u8] = unsafe { std::mem::transmute(w2) };
+    println!("{}", back2.len());
+    println!("{}", back2[1]);
+}
+"#,
+    );
+    assert_eq!(stdout, "4\n9\n4\n4\n4\n8\n");
+}
+
+/// Formatting a DST struct's `str` tail field through a fmt
+/// argument: the field's storage is the sized twin's byte
+/// array, so the value reaches the fmt machinery in the
+/// array (element) form, which denotes the string under the
+/// field's declared type -- for `Display`, for `Debug`, and
+/// under padding alike. A wrapper transmuted directly from
+/// a `&str` formats its tail the same way.
+#[test]
+fn dst_str_tail_field_formats_as_string() {
+    let stdout = run_ok(
+        "dst-str-fmt",
+        "dst_str_fmt.rs",
+        r#"
+use std::mem;
+use std::ptr;
+struct Baz {
+    f1: usize,
+    f2: str,
+}
+struct Baz_ {
+    f1: usize,
+    f2: [u8; 5],
+}
+struct BazS {
+    f2: str,
+}
+fn main() {
+    unsafe {
+        let data: Box<Baz_> =
+            Box::new(Baz_ { f1: 42, f2: [97, 98, 99, 100, 101] });
+        let x: &Baz = mem::transmute(ptr::slice_from_raw_parts(&*data, 5));
+        println!("{}", &x.f2);
+        println!("{:?}", &x.f2);
+        println!("{:>8}", &x.f2);
+        let t: &str = "hello";
+        let y: &BazS = mem::transmute(t);
+        println!("{}", &y.f2);
+        println!("{:?}", &y.f2);
+    }
+}
+"#,
+    );
+    assert_eq!(stdout, "abcde\n\"abcde\"\n   abcde\nhello\n\"hello\"\n");
 }
 
 /// (pointer, length) tuple -> fat reference to a

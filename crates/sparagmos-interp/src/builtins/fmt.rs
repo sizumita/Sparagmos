@@ -2142,7 +2142,15 @@ impl<'a> Interpreter<'a> {
                         .or_else(|| self.string_from_element_form(value)),
                     },
                     Value::SparseVec { .. } => self.string_from_element_form(value),
-                    _ => None,
+                    // The array form, too: a `str` tail field of
+                    // a DST struct over a sized byte array (the
+                    // sized twin's storage) reaches the fmt
+                    // machinery as that array's value -- a tuple
+                    // of byte elements -- which denotes the
+                    // string exactly as the element form does.
+                    // Any other shape declines through
+                    // `string_from_element_form` itself.
+                    _ => self.string_from_element_form(value),
                 };
                 if let Some(text) = text {
                     let decoded = Value::Str(text);
