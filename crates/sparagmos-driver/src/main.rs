@@ -1336,6 +1336,7 @@ fn driver_main_inner() {
         edition: edition.clone(),
         aux: aux_specs.iter().map(render_aux_spec).collect(),
         rustc_args: rustc_args.clone(),
+        process_host: guest_process_host,
     };
     args.extend(rustc_args);
     if !aux_built.is_empty() {
