@@ -121,6 +121,18 @@ impl JitProgram {
     /// [`JitError::Unsupported`] if any function uses a construct
     /// outside the supported range — nothing is executed partially.
     pub fn compile(input: &MirProgramInput) -> Result<JitProgram, JitError> {
+        // The backend lowers x86_64 machine code and its entry
+        // trampoline is x86_64 assembly, so JIT compilation is
+        // refused outright on other hosts. The interpreter path is
+        // unaffected: the driver still builds and runs there.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = input;
+            return Err(JitError::Unsupported(format!(
+                "JIT compilation on {} (the JIT targets x86_64 only)",
+                std::env::consts::ARCH
+            )));
+        }
         let mut def_index: HashMap<mir::DefId, usize> = HashMap::new();
         for (i, f) in input.functions.iter().enumerate() {
             if let Some(def) = f.def_id {

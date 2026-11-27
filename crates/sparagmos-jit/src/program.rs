@@ -72,6 +72,7 @@ struct RetPair {
 /// count is `nargs`, and `args` must point to at least
 /// `max(nargs, 6)` readable words (the register words are loaded
 /// unconditionally).
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn call_entry(f: *const u8, args: *const i64, nargs: usize) -> RetPair {
     core::arch::naked_asm!(
@@ -127,6 +128,18 @@ unsafe extern "C" fn call_entry(f: *const u8, args: *const i64, nargs: usize) ->
         "pop rbp",
         "ret",
     )
+}
+
+/// Non-x86_64 hosts have no trampoline: the JIT lowers x86_64
+/// machine code, so executing it on another architecture is
+/// unsupported. This stub exists so the crate — and the driver,
+/// whose run / convert / debug paths are interpreter-only — builds
+/// on those hosts. [`crate::JitProgram::compile`] refuses with
+/// `JitError::Unsupported` there, so the stub is unreachable
+/// through the public path; it panics if reached directly.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe extern "C" fn call_entry(_f: *const u8, _args: *const i64, _nargs: usize) -> RetPair {
+    panic!("sparagmos-jit: JIT execution is supported only on x86_64")
 }
 
 /// Message index the generated code stores for a panic whose text
