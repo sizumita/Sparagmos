@@ -166,7 +166,16 @@ pub(crate) fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<
 /// kind, so the segments are computed under the same guard
 /// (see `guarded_ty_kind`) and an unspellable type carries no
 /// segments - its downcasts fall back to tag comparison.
+/// Also `None` for a type past the conversion size limit: the
+/// debug form is materialized in full, so an exponentially
+/// large type (the nested-closure shape of Issue #481) would
+/// render without bound - the guard there catches panics, not
+/// work. Such a type's bodies are refused for size anyway, so
+/// losing its segments loses nothing.
 pub(crate) fn type_id_segments(ty: &rustc_public::ty::Ty) -> Option<(u64, u64)> {
+    if !crate::reach::ty_within_expanded_size(ty, crate::reach::MAX_TY_EXPANDED_SIZE) {
+        return None;
+    }
     fn lane(bytes: &[u8], seed: u64) -> u64 {
         let mut h = seed;
         for b in bytes {
