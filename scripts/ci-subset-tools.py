@@ -359,11 +359,14 @@ def cmd_diff(args):
 
 #: Host classes for the partitioned measurement, by short name: the
 #: runner target whose environment model judges the class. The
-#: workflow enables linux-x86_64, linux-aarch64, darwin-aarch64
-#: and darwin-x86_64; the Windows classes are defined so the
-#: partition rule is complete, and their records stay in the
-#: residual class until they get jobs: they wait on the runner's
-#: process layer, which is POSIX only (see issue #517).
+#: workflow enables linux-x86_64, linux-aarch64, darwin-aarch64,
+#: darwin-x86_64 and windows-msvc; windows-gnu is defined so the
+#: partition rule is complete, and its records stay in the
+#: residual class until it gets jobs: it waits on a host
+#: toolchain entry of its own -- its host model is the pinned
+#: toolchain hosted on the gnu target, while the windows-latest
+#: jobs install the runner's native MSVC-hosted toolchain (see
+#: issue #517).
 HOST_CLASSES = {
     "linux-x86_64": "x86_64-unknown-linux-gnu",
     "linux-aarch64": "aarch64-unknown-linux-gnu",
@@ -380,7 +383,8 @@ HOST_CLASSES = {
 #: models admit is judged on the aarch64 class and darwin-x86_64
 #: keeps only the records its model alone admits.
 DEFAULT_PARTITION_CLASSES = ["linux-x86_64", "linux-aarch64",
-                             "darwin-aarch64", "darwin-x86_64"]
+                             "darwin-aarch64", "darwin-x86_64",
+                             "windows-msvc"]
 
 
 def _load_runner_module():

@@ -23,6 +23,12 @@
 //! guest reading its children's parent id observes this
 //! value.
 //!
+//! The `nftw` walk fabricates a Unix `stat` block from
+//! the host's Unix metadata, so it is modelled on Unix
+//! hosts only; on another host the call is declined as
+//! unsupported rather than answered with invented
+//! fields.
+//!
 //! The `nftw` walk's flag validation differs by binding
 //! version, the way glibc's does: the 2.2.5 binding
 //! predates validation and accepts any flag word, the
@@ -36,7 +42,9 @@
 //! crosses devices and always reports root-prefixed
 //! paths.
 
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt as _;
 
 use crate::error::{InterpError, InterpResult};
@@ -47,6 +55,7 @@ use crate::value::{RefTarget, Value};
 use super::*;
 
 const EBADF: i32 = 9;
+#[cfg(unix)]
 const EINVAL: i32 = 22;
 const EIO: i32 = 5;
 
@@ -54,19 +63,29 @@ const EIO: i32 = 5;
 const F_GETFD: i64 = 1;
 
 /// The `nftw` callback's entry-kind values (`tflag`).
+#[cfg(unix)]
 const FTW_F: i128 = 0;
+#[cfg(unix)]
 const FTW_D: i128 = 1;
+#[cfg(unix)]
 const FTW_DNR: i128 = 2;
+#[cfg(unix)]
 const FTW_NS: i128 = 3;
+#[cfg(unix)]
 const FTW_SL: i128 = 4;
+#[cfg(unix)]
 const FTW_DP: i128 = 5;
+#[cfg(unix)]
 const FTW_SLN: i128 = 6;
 
 /// The `nftw` flag bits the current glibc validates
 /// against (`FTW_PHYS | FTW_MOUNT | FTW_CHDIR |
 /// FTW_DEPTH | FTW_ACTIONRETVAL`).
+#[cfg(unix)]
 const NFTW_KNOWN_FLAGS: i128 = 1 | 2 | 4 | 8 | 16;
+#[cfg(unix)]
 const FTW_PHYS: i128 = 1;
+#[cfg(unix)]
 const FTW_DEPTH: i128 = 8;
 
 /// A numeric descriptor argument.
@@ -303,11 +322,9 @@ impl<'a> Interpreter<'a> {
     pub(super) fn exec_libc_pipe(
         &mut self,
         frames: &mut Vec<Frame>,
-        _name: &str,
+        name: &str,
         vals: &[Value],
     ) -> InterpResult<Value> {
-        use std::os::fd::FromRawFd as _;
-        use std::os::fd::IntoRawFd as _;
         let (reader, writer) = match std::io::pipe() {
             Ok(pair) => pair,
             Err(error) => {
@@ -316,13 +333,19 @@ impl<'a> Interpreter<'a> {
                 return Ok(Value::Int(-1));
             }
         };
-        // SAFETY: each pipe end owns its descriptor;
-        // `into_raw_fd` relinquishes it to the `File`
-        // constructed from it, which closes it on drop.
-        let read_file =
-            unsafe { std::fs::File::from_raw_fd(reader.into_raw_fd()) };
-        let write_file =
-            unsafe { std::fs::File::from_raw_fd(writer.into_raw_fd()) };
+        // Each pipe end enters the file model as a host
+        // `File` over the same pipe (the platform seam
+        // performs the host's transfer); a host that
+        // cannot make the transfer declines the call
+        // rather than inventing an answer.
+        let (Some(read_file), Some(write_file)) = (
+            crate::platform::file_from_pipe_reader(reader),
+            crate::platform::file_from_pipe_writer(writer),
+        ) else {
+            return Err(unsupported(format!(
+                "call to {name}: pipe is not modelled on this host platform"
+            )));
+        };
         let read_id = self.register_file(read_file);
         let write_id = self.register_file(write_file);
         let target = self.deref_value(frames, &vals[0])?;
@@ -364,6 +387,7 @@ impl<'a> Interpreter<'a> {
     /// binding, which performs no flag validation; the
     /// current binding rejects unknown flag bits with
     /// `EINVAL` before walking, as current glibc does.
+    #[cfg(unix)]
     pub(super) fn exec_libc_nftw(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -402,10 +426,28 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `nftw` on a non-Unix host: the walk's fabricated
+    /// `stat` block carries the host's Unix metadata,
+    /// which has no source here, so the call is declined
+    /// rather than answered with invented fields.
+    #[cfg(not(unix))]
+    pub(super) fn exec_libc_nftw(
+        &mut self,
+        _frames: &mut Vec<Frame>,
+        name: &str,
+        _vals: &[Value],
+        _legacy: bool,
+    ) -> InterpResult<Value> {
+        Err(unsupported(format!(
+            "call to {name}: nftw is not modelled on this host platform"
+        )))
+    }
+
     /// One entry of the walk: reports the entry to the
     /// callback (descending first or last for a directory
     /// per `FTW_DEPTH`) and returns the callback's stop
     /// verdict, if any.
+    #[cfg(unix)]
     fn nftw_entry(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -460,6 +502,7 @@ impl<'a> Interpreter<'a> {
     /// report and its children's, in name order (the
     /// native order is the directory's own, which no
     /// caller may rely on).
+    #[cfg(unix)]
     fn nftw_dir(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -513,6 +556,7 @@ impl<'a> Interpreter<'a> {
 
     /// Reports one entry and folds the callback's answer
     /// into the walk's stop verdict.
+    #[cfg(unix)]
     fn nftw_report(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -530,6 +574,7 @@ impl<'a> Interpreter<'a> {
     /// Invokes the guest callback for one entry with a
     /// fabricated path string, `stat` block and `FTW`
     /// struct in guest allocations.
+    #[cfg(unix)]
     fn nftw_callback(
         &mut self,
         frames: &mut Vec<Frame>,

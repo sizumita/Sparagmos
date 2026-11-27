@@ -36,11 +36,13 @@ name: Official Measurement
 # - the metric-2(b) pass is partitioned by host class
 #   (ci-subset-tools.py partition; docs/CI.md): the Linux x86_64
 #   class keeps the sharded measure jobs, and the other classes
-#   (linux-aarch64, darwin-aarch64, darwin-x86_64) are judged by
-#   the measure-host jobs on their native runners, so records
-#   conditioned on those hosts are attempted instead of recorded
-#   out of environment. (The Windows classes have no jobs yet:
-#   the runner's process layer is POSIX only, so their records
+#   (linux-aarch64, darwin-aarch64, darwin-x86_64, windows-msvc)
+#   are judged by the measure-host jobs on their native runners,
+#   so records conditioned on those hosts are attempted instead
+#   of recorded out of environment. (The windows-gnu class has
+#   no jobs yet: its host model is the pinned toolchain hosted
+#   on the gnu target, while the windows-latest jobs install
+#   the runner's native MSVC-hosted toolchain, so its records
 #   stay in the Linux residual class. Issue #517.)
 #   Metric 4 and metric 3 stay on the Linux host over the full
 #   survey: the JIT lowers x86_64 machine code, and metric 3's
@@ -250,20 +252,32 @@ jobs:
   # The other host classes' drivers, built natively on each
   # class's own runner: the driver is a rustc driver bound to its
   # host toolchain, so no class can run another class's build.
+  # The run steps use bash on every runner (Git Bash on Windows),
+  # and the Windows build's binary carries the .exe suffix the
+  # matrix names per class.
   build-host:
     name: build driver (${{ matrix.class }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
           - class: linux-aarch64
             runner: ubuntu-24.04-arm
+            bin: sparagmos-driver
           - class: darwin-aarch64
             runner: macos-15
+            bin: sparagmos-driver
           - class: darwin-x86_64
             runner: macos-15-intel
+            bin: sparagmos-driver
+          - class: windows-msvc
+            runner: windows-latest
+            bin: sparagmos-driver.exe
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -287,13 +301,13 @@ jobs:
         run: |
           cargo build --profile measure \
             --manifest-path crates/sparagmos-driver/Cargo.toml
-          ls -la crates/sparagmos-driver/target/measure/sparagmos-driver
+          ls -la crates/sparagmos-driver/target/measure/${{ matrix.bin }}
 
       - name: Upload driver
         uses: actions/upload-artifact@v4
         with:
           name: sparagmos-driver-${{ matrix.class }}
-          path: crates/sparagmos-driver/target/measure/sparagmos-driver
+          path: crates/sparagmos-driver/target/measure/${{ matrix.bin }}
           retention-days: 7
           if-no-files-found: error
 
@@ -828,12 +842,23 @@ jobs:
   # rustdoc artifact tree is NOT restored here: it is a
   # Linux-built tree, so a class record whose stage 4 needs it
   # records the same not-attempted verdict the Linux jobs record
-  # on a cache miss.
+  # on a cache miss. The run steps use bash on every runner (Git
+  # Bash on Windows), and the fetch step pins core.autocrlf off
+  # so the tree a Windows job clones is byte-identical to the
+  # other hosts' trees.
   measure-host:
     name: measure (${{ matrix.class }}) shard ${{ matrix.shard }}
     needs: [prepare, build-host]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 330
+    env:
+      # The downloaded driver artifact's file name (the Windows
+      # build carries the .exe suffix); overrides the workflow
+      # env's DRIVER_BIN for this job's classes.
+      DRIVER_BIN: ${{ github.workspace }}/.ci/driver/${{ matrix.bin }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -841,26 +866,42 @@ jobs:
           - class: linux-aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            bin: sparagmos-driver
             shard: 0
           - class: linux-aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            bin: sparagmos-driver
             shard: 1
           - class: darwin-aarch64
             target: aarch64-apple-darwin
             runner: macos-15
+            bin: sparagmos-driver
             shard: 0
           - class: darwin-aarch64
             target: aarch64-apple-darwin
             runner: macos-15
+            bin: sparagmos-driver
             shard: 1
           - class: darwin-x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
+            bin: sparagmos-driver
             shard: 0
           - class: darwin-x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
+            bin: sparagmos-driver
+            shard: 1
+          - class: windows-msvc
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            bin: sparagmos-driver.exe
+            shard: 0
+          - class: windows-msvc
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            bin: sparagmos-driver.exe
             shard: 1
     steps:
       - name: Checkout
@@ -949,14 +990,15 @@ jobs:
             ${{ env.SURVEY_JSON }}
           key: rust-survey-1.100.0-v4
 
-      # The cache service segments entries by runner, so the
-      # tree the Linux prepare job saved is not necessarily the
-      # entry a host class restores: on a miss this job fetches
-      # and widens the tree exactly as prepare does (and the
-      # cache step above then saves this host's entry under the
-      # same key for later runs).
+      # The cache service segments entries by runner (OS and
+      # architecture), so the tree the Linux prepare job saved
+      # is not necessarily the entry a host class restores: on
+      # a miss this job fetches and widens the tree exactly as
+      # prepare does (and the cache step above then saves this
+      # host's entry under the same key for later runs).
       - name: Fetch rust tree and generate survey (on cache miss)
         run: |
+          git config --global core.autocrlf false
           if [ ! -d "$RUST_SURVEY_DIR" ]; then
             python3 scripts/rustc-subset-survey.py --fetch \
               --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
