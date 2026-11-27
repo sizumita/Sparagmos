@@ -61,7 +61,8 @@ use std::rc::Rc;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     cast_place_ty, cast_src_ty, constant_ty, describe_resolved, eval_binary, eval_cast, eval_unary,
-    is_vec_adt_ty, navigate_mut_grow, operand_pointee_ty, project_value_ev,
+    is_vec_adt_ty, local_pointee_ty, navigate_mut_grow, operand_address_pointee_ty,
+    operand_pointee_ty, project_value_ev,
     transparent_wrapper_ty, Frame, Interpreter,
 };
 use crate::ir::{
@@ -817,12 +818,9 @@ impl<'a> Interpreter<'a> {
     fn dsrc_pointee_ty(body: &Body, src: &DSrc) -> Option<Ty> {
         match src {
             DSrc::Local(idx) | DSrc::MoveLocal(idx) => {
-                match body.local_ty(Local(*idx as usize)) {
-                    Some(Ty::Ref(inner)) => Some((**inner).clone()),
-                    _ => None,
-                }
+                local_pointee_ty(body, Local(*idx as usize))
             }
-            DSrc::Operand(op) => operand_pointee_ty(body, op),
+            DSrc::Operand(op) => operand_address_pointee_ty(body, op),
             DSrc::LocalProj { .. } | DSrc::MoveLocalProj { .. } | DSrc::Const(..) => None,
         }
     }

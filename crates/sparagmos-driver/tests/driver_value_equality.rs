@@ -49,6 +49,15 @@
 //!   (collected under the value demand), and the builtin's
 //!   address pricing must take its element width from the
 //!   comparison's own pointee tag.
+//! * `*const T::addr` (and its `*mut T` / `NonNull<T>`
+//!   siblings, and `expose_provenance`) on the same
+//!   collection-read pointers: core's body casts the pointer
+//!   to `*const ()` before transmuting it to an integer, so
+//!   the transmuted operand's declared pointee denominates
+//!   nothing and every element priced at the aggregate's
+//!   base. The price's leaf must be the pointee the erased
+//!   local's value carried before the cast, which the
+//!   executing body's own assignments prove.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -506,5 +515,83 @@ fn main() {
 }
 "#,
         "ptr-generic-ref-cmp ok",
+    );
+}
+
+#[test]
+fn vec_raw_pointer_addr_orders_by_address() {
+    assert_runs(
+        "vec-ptr-addr",
+        r#"
+use std::cmp::Ordering;
+fn main() {
+    let vals: [i32; 3] = [30, 20, 10];
+    // `addr()` erases the pointee inside core's body before
+    // the transmute to `usize`; the addresses of pointers
+    // read back from the vector must still be the element
+    // addresses, not the aggregate's base for all of them.
+    let p: Vec<*const i32> =
+        vals.iter().map(|v| v as *const i32).collect();
+    assert_eq!(p[2].addr().cmp(&p[0].addr()), Ordering::Greater);
+    assert_eq!(p[0].addr().cmp(&p[2].addr()), Ordering::Less);
+    assert!(p[2].addr() > p[1].addr());
+    assert!(p[1].addr() > p[0].addr());
+    assert_eq!(p[1].addr(), p[1].addr());
+    assert!(p[0].addr() != p[2].addr());
+    assert_eq!(p[2].addr() - p[0].addr(), 8);
+    // `expose_provenance` shares the erased body shape.
+    assert_eq!(
+        p[2].expose_provenance().cmp(&p[0].expose_provenance()),
+        Ordering::Greater
+    );
+    // The `*mut T` sibling body, at the wider element width.
+    let mvals: [u64; 3] = [30, 20, 10];
+    let m: Vec<*mut u64> =
+        mvals.iter().map(|v| v as *const u64 as *mut u64).collect();
+    assert_eq!(m[2].addr().cmp(&m[0].addr()), Ordering::Greater);
+    assert_eq!(m[2].addr() - m[0].addr(), 16);
+    // `NonNull::addr` reaches the same body through `as_ptr`.
+    let nn = std::ptr::NonNull::new(m[2]).unwrap();
+    let nn0 = std::ptr::NonNull::new(m[0]).unwrap();
+    assert_eq!(nn.addr().cmp(&nn0.addr()), Ordering::Greater);
+    // The same erasure in a user-written body: a generic
+    // helper whose `cast` call produces the erased local the
+    // transmute reads, and an inline cast in this body.
+    fn erase_addr<T>(q: *const T) -> usize {
+        q.cast::<()>() as usize
+    }
+    assert_eq!(
+        erase_addr(p[2]).cmp(&erase_addr(p[0])),
+        Ordering::Greater
+    );
+    assert_eq!(erase_addr(p[2]) - erase_addr(p[0]), 8);
+    let e2 = p[2].cast::<()>();
+    let e0 = p[0].cast::<()>();
+    assert_eq!((e2 as usize).cmp(&(e0 as usize)), Ordering::Greater);
+    println!("vec-ptr-addr ok");
+}
+"#,
+        "vec-ptr-addr ok",
+    );
+}
+
+#[test]
+fn zst_pointer_addr_stays_at_base() {
+    assert_runs(
+        "zst-ptr-addr",
+        r#"
+fn main() {
+    // A genuine `*const ()` denotes zero-width elements:
+    // every element of a zero-sized array is the base
+    // address, before and after the erasure chase.
+    let zs: [(); 3] = [(), (), ()];
+    let z2 = &zs[2] as *const ();
+    let z0 = &zs[0] as *const ();
+    assert_eq!(z2.addr(), z0.addr());
+    assert_eq!(z2 as usize, z0 as usize);
+    println!("zst-ptr-addr ok");
+}
+"#,
+        "zst-ptr-addr ok",
     );
 }
