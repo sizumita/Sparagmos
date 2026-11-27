@@ -626,14 +626,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
   a record that becomes attempted is judged by the existing
   stage-2 rules, and a core-only triple's ceiling is honest:
   a test file that uses std fails at the guest compile on
-  its merits. Two entries (amdgcn-amd-amdhsa, avr-none) are
-  built for a pinned `-C target-cpu` -- gfx900 and atmega328p,
-  the cpus the records naming those triples themselves
-  specify -- because those targets refuse to compile at all
-  without one; a record naming a different cpu for them
-  fails the guest compile with a target-cpu ABI mismatch.
-  The measure-host (darwin) jobs do not run this
-  step; the table's triples are judged in the Linux class.
+  its merits. The table's OS triples (aarch64 pauthtest,
+  sparc/mips/mips64 linux, hexagon musl, powerpc64 AIX,
+  i686 darwin, wasm64) are built with the full
+  `core,std,panic_unwind` set; its remaining triples
+  (aarch64v8r, amdgcn, avr, bpfeb, bpfel, msp430, riscv32e,
+  sparc-none) with `core,alloc`. Two entries
+  (amdgcn-amd-amdhsa, avr-none) are built for a pinned
+  `-C target-cpu` -- gfx900 and atmega328p, the cpus the
+  records naming those triples themselves specify --
+  because those targets refuse to compile at all without
+  one; a record naming a different cpu for them fails the
+  guest compile with a target-cpu ABI mismatch. The
+  measure-host (darwin) jobs do not run this step; the
+  table's triples are judged in the Linux class.
 
 ### Stage 4 (the rustdoc harness)
 
