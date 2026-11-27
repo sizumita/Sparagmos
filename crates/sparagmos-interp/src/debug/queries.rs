@@ -349,6 +349,13 @@ pub(super) fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
         return Some("*mut fn ()".to_string());
     }
     if let Some(tag) = &ev.tag {
+        // A function pointer whose recorded tag is the
+        // signature itself (the form the conversion records
+        // for a declared `fn(...)` type): gdb spells the type
+        // as a raw pointer to the signature.
+        if let Some(name) = fn_pointer_tag_name(tag) {
+            return Some(name);
+        }
         return Some(dwarf_type_name(&closure_env_name(tag)));
     }
     // A trailing cast step's spelled type, pointer layer
@@ -362,6 +369,40 @@ pub(super) fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
         }
     }
     ev.desc.as_ref().and_then(desc_type_name)
+}
+
+
+/// gdb's spelling of a function-pointer type whose recorded
+/// tag is the signature itself: `*mut ` and the signature
+/// with a space before its argument list (`fn()` becomes
+/// `*mut fn ()`, `unsafe fn(i32) -> bool` becomes
+/// `*mut unsafe fn (i32) -> bool`). `None` for any other
+/// tag -- in particular for the bare `FnPtr` kind name, whose
+/// spelling the caller handles separately.
+fn fn_pointer_tag_name(tag: &str) -> Option<String> {
+    let mut rest = tag;
+    let mut prefix = String::new();
+    loop {
+        if let Some(r) = rest.strip_prefix("unsafe ") {
+            prefix.push_str("unsafe ");
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("extern ") {
+            // The ABI is a quoted string: `extern "C" fn(..)`.
+            let quoted = r.strip_prefix('"')?;
+            let close = quoted.find('"')?;
+            prefix.push_str("extern ");
+            prefix.push_str(&r[..close + 2]);
+            prefix.push(' ');
+            rest = quoted[close + 1..].strip_prefix(' ')?;
+        } else {
+            break;
+        }
+    }
+    let args = rest.strip_prefix("fn")?;
+    if !args.starts_with('(') {
+        return None;
+    }
+    Some(format!("*mut {prefix}fn {args}"))
 }
 
 /// A rendering descriptor's type name, for the forms whose

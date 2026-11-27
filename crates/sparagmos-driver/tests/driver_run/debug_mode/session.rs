@@ -229,3 +229,54 @@ fn debug_mode_history_equality_at_fn_breakpoint_lldb() {
         "missing the comparison result in debug transcript: {stdout}"
     );
 }
+
+const DEBUG_PRINTF_SIZEOF_SRC: &str = r#"#[repr(C, packed)]
+struct Packed { x: i16, y: i32, z: i64 }
+fn _zzz() {}
+fn with_ptr(s: *const u8, len: i32) {
+    let _local0 = len - 1;
+    zzz();
+}
+fn zzz() {}
+fn main() {
+    let packed = Packed { x: 123, y: 234, z: 345 };
+    let fnptr: fn() = _zzz;
+    with_ptr(b"abcd\0".as_ptr(), 20);
+    zzz();
+}
+"#;
+
+#[test]
+fn debug_mode_printf_sizeof_and_fnptr_whatis() {
+    // The three session forms the debuginfo suite's
+    // printf/sizeof/whatis commands need: gdb `printf` reads
+    // the C string behind the pointer argument, `sizeof`
+    // reports the packed struct's laid-out size (2 + 4 + 8),
+    // and `whatis` of a declared `fn()` variable spells the
+    // raw-pointer form.
+    let dir = temp_dir("debug-printf-sizeof");
+    let src = fixture(&dir, "printf_sizeof.rs", DEBUG_PRINTF_SIZEOF_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 6\nbreak 13\nrun\nprintf \"s = \\\"%s\\\"\\n\", s\nprint len\ncontinue\nprint sizeof(packed)\nwhatis fnptr\ncontinue\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("s = \"abcd\""),
+        "printf output missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("$1 = 20"),
+        "print after printf must keep the first number: {stdout}"
+    );
+    assert!(
+        stdout.contains("$2 = 14"),
+        "sizeof of the packed struct missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("type = *mut fn ()"),
+        "fn-pointer whatis missing: {stdout}"
+    );
+}

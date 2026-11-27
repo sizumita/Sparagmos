@@ -1017,7 +1017,7 @@ impl<'a> Interpreter<'a> {
     /// [`Self::ty_size`], extended with the one composite the
     /// base table does not fold: a tuple's size from its
     /// fields' declaration-order layout.
-    pub(super) fn ty_size_full(&self, ty: &Ty) -> Option<u64> {
+    pub(crate) fn ty_size_full(&self, ty: &Ty) -> Option<u64> {
         if let Some(size) = self.ty_size(ty) {
             return Some(size);
         }

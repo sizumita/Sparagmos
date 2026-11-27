@@ -1,9 +1,10 @@
 //! Print-expression evaluation: resolving an expression against the stopped frame's scopes to a value and its descriptor.
 
 use crate::interp::{Frame, Interpreter};
+use crate::ir::{Body, DebugVarEntry, Program, ProjectionElem, Ty};
 use crate::value::{RefProj, Value};
 use super::desc::{Desc, field_desc, path_text, smart_pointer_pointee, tag_base_name};
-use super::parse::{ExprStep, ParsedExpr, parse_expr, split_comparison};
+use super::parse::{ExprStep, ParsedExpr, parse_expr, parse_sizeof_operand, split_comparison};
 use super::printers::{render_lldb_provider_line, render_pretty_gdb};
 use super::queries::{desc_type_name, expr_type_name, lldb_command_format_scalar, lldb_format_scalar, pointer_pointee};
 use super::render_gdb::{
@@ -64,6 +65,352 @@ pub(super) fn render_print(
             ctl.history.push(None);
             err_line(&e)
         }
+    }
+}
+
+/// Render one `printf` command: evaluate the argument
+/// expressions and format them into the format string, C
+/// style. The formatted text is output, not a print: it
+/// creates no history value and does not advance the print
+/// count. A failure -- an argument that does not evaluate,
+/// a directive outside the supported set -- is an explicit
+/// error line, never a guessed rendering.
+pub(super) fn render_printf(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    format: &str,
+    args: &[String],
+) -> Vec<String> {
+    match format_printf(interp, ctl, frames, format, args) {
+        Ok(text) => text.lines().map(str::to_string).collect(),
+        Err(e) => vec![format!("<error: {e}>")],
+    }
+}
+
+/// The supported printf conversions: `%d`/`%i`, `%u`, `%x`,
+/// `%X`, `%o` and `%c` over an integer argument read at its
+/// declared width; `%s` over a NUL-terminated byte string
+/// behind a pointer (or a string value itself); `%f`, `%e`
+/// and `%g` over a float (the exponential and `%g` forms
+/// follow Rust's rendering of the value); `%p` over a
+/// pointer; and `%%`. Flags, field width and precision are
+/// honoured; length modifiers are accepted and carry no
+/// information, as the values are stored at full width.
+fn format_printf(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    format: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let mut values: Vec<EvaluatedValue> = Vec::new();
+    for arg in args {
+        values.push(evaluate_expr(interp, ctl, frames, arg)?);
+    }
+    let chars: Vec<char> = format.chars().collect();
+    let mut out = String::new();
+    let mut arg_index = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i < chars.len() && chars[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let mut left = false;
+        let mut zero = false;
+        while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '#' | '0') {
+            match chars[i] {
+                '-' => left = true,
+                '0' => zero = true,
+                _ => {}
+            }
+            i += 1;
+        }
+        let mut width: Option<usize> = None;
+        if i < chars.len() && chars[i] == '*' {
+            let ev = printf_arg(&values, &mut arg_index)?;
+            let w = printf_int(ev)
+                .ok_or_else(|| "printf width argument is not an integer".to_string())?;
+            if w < 0 {
+                left = true;
+                width = Some(w.unsigned_abs() as usize);
+            } else {
+                width = Some(w as usize);
+            }
+            i += 1;
+        } else {
+            let mut digits = String::new();
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                digits.push(chars[i]);
+                i += 1;
+            }
+            if !digits.is_empty() {
+                width = Some(
+                    digits
+                        .parse()
+                        .map_err(|_| "bad printf field width".to_string())?,
+                );
+            }
+        }
+        let mut precision: Option<usize> = None;
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            if i < chars.len() && chars[i] == '*' {
+                let ev = printf_arg(&values, &mut arg_index)?;
+                let p = printf_int(ev).ok_or_else(|| {
+                    "printf precision argument is not an integer".to_string()
+                })?;
+                precision = if p < 0 { None } else { Some(p as usize) };
+                i += 1;
+            } else {
+                let mut digits = String::new();
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    digits.push(chars[i]);
+                    i += 1;
+                }
+                precision = Some(if digits.is_empty() {
+                    0
+                } else {
+                    digits
+                        .parse()
+                        .map_err(|_| "bad printf precision".to_string())?
+                });
+            }
+        }
+        while i < chars.len() && matches!(chars[i], 'h' | 'l' | 'q' | 'z' | 't' | 'j') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return Err("printf format ends inside a directive".to_string());
+        }
+        let conv = chars[i];
+        i += 1;
+        let rendered = match conv {
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' => {
+                let ev = printf_arg(&values, &mut arg_index)?;
+                format_int_directive(ev, conv, precision)?
+            }
+            's' => {
+                let ev = printf_arg(&values, &mut arg_index)?;
+                let mut text = printf_string(interp, frames, ev)?;
+                if let Some(p) = precision {
+                    text = text.chars().take(p).collect();
+                }
+                text
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let ev = printf_arg(&values, &mut arg_index)?;
+                format_float_directive(ev, conv, precision)?
+            }
+            'p' => {
+                let ev = printf_arg(&values, &mut arg_index)?;
+                let addr = crate::interp::synthetic_address(&ev.value)
+                    .or_else(|| printf_int_bits(ev).map(|(bits, _)| bits));
+                match addr {
+                    Some(addr) => format!("0x{addr:x}"),
+                    None => {
+                        return Err("printf %p argument is not a pointer".to_string());
+                    }
+                }
+            }
+            other => {
+                return Err(format!("printf directive `%{other}` is not supported"));
+            }
+        };
+        let zero_pad = zero
+            && matches!(
+                conv,
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+            );
+        out.push_str(&apply_printf_width(&rendered, width, left, zero_pad));
+    }
+    Ok(out)
+}
+
+/// Take the next printf argument, in directive order.
+fn printf_arg<'v>(
+    values: &'v [EvaluatedValue],
+    index: &mut usize,
+) -> Result<&'v EvaluatedValue, String> {
+    let ev = values
+        .get(*index)
+        .ok_or_else(|| "printf format has more directives than arguments".to_string());
+    *index += 1;
+    ev
+}
+
+/// An argument's bits and declared width, for the integer
+/// printf conversions: the stored value masked at the width
+/// its declared type records, as C reads the argument at its
+/// own type. Without a recorded integer type, the value's
+/// own width.
+fn printf_int_bits(ev: &EvaluatedValue) -> Option<(u128, u32)> {
+    let bits = match &ev.value {
+        Value::Int(v) => *v as u128,
+        Value::Uint(v) => *v,
+        Value::Bool(v) => u128::from(*v),
+        _ => return None,
+    };
+    let width = match &ev.desc {
+        Some(Desc::Int(name)) => match *name {
+            "i8" | "u8" => 8,
+            "i16" | "u16" => 16,
+            "i32" | "u32" => 32,
+            "i64" | "u64" | "isize" | "usize" => 64,
+            "i128" | "u128" => 128,
+            _ => return None,
+        },
+        Some(Desc::Char) => 32,
+        Some(Desc::Bool) => 8,
+        _ => 128,
+    };
+    Some((bits, width))
+}
+
+/// An argument's integer reading at its declared width,
+/// sign-extended when its declared type is signed.
+fn printf_int(ev: &EvaluatedValue) -> Option<i128> {
+    let (bits, width) = printf_int_bits(ev)?;
+    let signed = matches!(&ev.desc, Some(Desc::Int(name)) if name.starts_with('i'));
+    if width >= 128 {
+        return Some(if signed { bits as i128 } else if bits <= i128::MAX as u128 { bits as i128 } else { return None });
+    }
+    let mask = (1u128 << width) - 1;
+    let bits = bits & mask;
+    if signed && (bits >> (width - 1)) & 1 == 1 {
+        Some(bits as i128 - (1i128 << width))
+    } else {
+        Some(bits as i128)
+    }
+}
+
+fn format_int_directive(
+    ev: &EvaluatedValue,
+    conv: char,
+    precision: Option<usize>,
+) -> Result<String, String> {
+    let (bits, width) = printf_int_bits(ev)
+        .ok_or_else(|| "printf argument is not an integer".to_string())?;
+    let bits = if width >= 128 {
+        bits
+    } else {
+        bits & ((1u128 << width) - 1)
+    };
+    let core = match conv {
+        'd' | 'i' => {
+            let signed = matches!(&ev.desc, Some(Desc::Int(name)) if name.starts_with('i'));
+            let value = if !signed {
+                bits as i128
+            } else if width >= 128 {
+                bits as i128
+            } else if (bits >> (width - 1)) & 1 == 1 {
+                bits as i128 - (1i128 << width)
+            } else {
+                bits as i128
+            };
+            value.to_string()
+        }
+        'u' => bits.to_string(),
+        'x' => format!("{bits:x}"),
+        'X' => format!("{bits:X}"),
+        'o' => format!("{bits:o}"),
+        'c' => {
+            return char::from_u32(bits as u32)
+                .map(|c| c.to_string())
+                .ok_or_else(|| "printf %c argument is not a character".to_string());
+        }
+        _ => unreachable!(),
+    };
+    Ok(match precision {
+        Some(p) => pad_printf_digits(&core, p),
+        None => core,
+    })
+}
+
+/// An integer conversion's precision: the minimum digit
+/// count, zero-padded (after a leading sign).
+fn pad_printf_digits(core: &str, precision: usize) -> String {
+    let (sign, digits) = match core.strip_prefix('-') {
+        Some(d) => ("-", d),
+        None => ("", core),
+    };
+    if digits.len() >= precision {
+        return core.to_string();
+    }
+    format!("{sign}{}{digits}", "0".repeat(precision - digits.len()))
+}
+
+/// A `%s` argument's text: a string value itself, or the
+/// NUL-terminated bytes behind a pointer (the scan the C
+/// library's own string functions perform).
+fn printf_string(
+    interp: &Interpreter,
+    frames: &[Frame],
+    ev: &EvaluatedValue,
+) -> Result<String, String> {
+    if let Value::Str(text) = &ev.value {
+        return Ok(text.clone());
+    }
+    let bytes = interp
+        .read_c_str(frames, &ev.value)
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn format_float_directive(
+    ev: &EvaluatedValue,
+    conv: char,
+    precision: Option<usize>,
+) -> Result<String, String> {
+    let value = match &ev.value {
+        Value::Float(v) => *v,
+        Value::Int(v) => *v as f64,
+        Value::Uint(v) => *v as f64,
+        _ => return Err("printf argument is not a number".to_string()),
+    };
+    Ok(match conv {
+        'f' | 'F' => format!("{:.*}", precision.unwrap_or(6), value),
+        'e' => format!("{:.*e}", precision.unwrap_or(6), value),
+        'E' => format!("{:.*E}", precision.unwrap_or(6), value),
+        // `%g`: the shortest reading that round-trips, which
+        // agrees with C's outside its exponent thresholds.
+        _ => format!("{value}"),
+    })
+}
+
+/// Apply a directive's field width: spaces, or zeros after
+/// a leading sign for the numeric conversions.
+fn apply_printf_width(
+    text: &str,
+    width: Option<usize>,
+    left: bool,
+    zero: bool,
+) -> String {
+    let Some(width) = width else {
+        return text.to_string();
+    };
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    let pad = width - len;
+    if left {
+        format!("{text}{}", " ".repeat(pad))
+    } else if zero {
+        match text.strip_prefix('-') {
+            Some(rest) => format!("-{}{rest}", "0".repeat(pad)),
+            None => format!("{}{text}", "0".repeat(pad)),
+        }
+    } else {
+        format!("{}{text}", " ".repeat(pad))
     }
 }
 
@@ -164,6 +511,40 @@ pub(super) fn resolve_base(
     Err(format!("no variable `{}` in scope", expr.base))
 }
 
+/// Pick the debug variable entry a name refers to at the
+/// session's current stop, the way a debugger resolves a
+/// name: among the body's entries of that name, prefer the
+/// declaration whose recorded span contains the current line
+/// (the smallest such extent, as the innermost scope); the
+/// compiler records most entries with a point span at the
+/// declaration, so the general rule is the latest declaration
+/// at or before the current line -- the declaration in effect
+/// at the stop. With neither, the last declaration stands.
+fn pick_debug_var<'b>(
+    body: &'b Body,
+    ctl: &DebugControl,
+    name: &str,
+) -> Option<&'b DebugVarEntry> {
+    let named = body
+        .debug_vars
+        .iter()
+        .filter(|e| e.name == name)
+        .collect::<Vec<_>>();
+    let at_line = ctl.current_pos.map(|(_, line)| line).unwrap_or(0);
+    let containing = named
+        .iter()
+        .filter(|e| e.lines.0 != 0 && e.lines.0 <= at_line && at_line <= e.lines.1)
+        .min_by_key(|e| e.lines.1 - e.lines.0);
+    let declared = named
+        .iter()
+        .filter(|e| e.lines.0 != 0 && e.lines.0 <= at_line)
+        .max_by_key(|e| e.lines.0);
+    containing
+        .or_else(|| declared)
+        .copied()
+        .or_else(|| named.last().copied())
+}
+
 /// Resolve a print expression's base name against the selected
 /// frame's debug variable table. `Ok(None)` when the frame's
 /// body records no variable of that name (the caller then
@@ -181,34 +562,9 @@ fn resolve_local_base(
         .program()
         .get(&frame.func)
         .ok_or_else(|| format!("no body for frame `{}`", frame.func))?;
-    // Resolve the name the way a debugger does: among the
-    // body's entries of that name, prefer the declaration whose
-    // recorded span contains the current line (the smallest such
-    // extent, as the innermost scope); the compiler records most
-    // entries with a point span at the declaration, so the
-    // general rule is the latest declaration at or before the
-    // current line — the declaration in effect at the stop. With
-    // neither, the last declaration stands.
-    let entry = {
-        let named = body
-            .debug_vars
-            .iter()
-            .filter(|e| e.name == expr.base)
-            .collect::<Vec<_>>();
-        let at_line = ctl.current_pos.map(|(_, line)| line).unwrap_or(0);
-        let containing = named
-            .iter()
-            .filter(|e| e.lines.0 != 0 && e.lines.0 <= at_line && at_line <= e.lines.1)
-            .min_by_key(|e| e.lines.1 - e.lines.0);
-        let declared = named
-            .iter()
-            .filter(|e| e.lines.0 != 0 && e.lines.0 <= at_line)
-            .max_by_key(|e| e.lines.0);
-        containing
-            .or_else(|| declared)
-            .copied()
-            .or_else(|| named.last().copied())
-    };
+    // Resolve the name the way a debugger does (see
+    // `pick_debug_var`).
+    let entry = pick_debug_var(body, ctl, &expr.base);
     let Some(entry) = entry else {
         return Ok(None);
     };
@@ -266,22 +622,11 @@ fn resolve_local_base(
     }))
 }
 
-/// Resolve a print expression's base name against the
-/// program's statics: the name is a static key (a full item
-/// path), or the last segment of one (a plain name, as gdb
-/// resolves a static from any scope). The value is the
-/// static's current storage content — evaluating its
-/// `StaticRef` constant seeds the storage from the
-/// initializer on first touch, so a print before the program
-/// has touched the static reads the initial value, and a
-/// print after a write reads the written one.
-fn resolve_static_base(
-    interp: &Interpreter,
-    ctl: &DebugControl,
-    frames: &[Frame],
-    base: &str,
-) -> Option<EvaluatedValue> {
-    let program = interp.program();
+/// The static key a name refers to: an exact item-path
+/// match, or -- for a plain name, as gdb resolves a static
+/// from any scope -- the shortest key whose last segment is
+/// the name.
+fn static_key_for<'p>(program: &'p Program, base: &str) -> Option<&'p String> {
     let mut exact: Option<&String> = None;
     let mut by_segment: Option<&String> = None;
     for key in program.static_debug_tags.keys() {
@@ -299,7 +644,26 @@ fn resolve_static_base(
             }
         }
     }
-    let key = exact.or(by_segment)?;
+    exact.or(by_segment)
+}
+
+/// Resolve a print expression's base name against the
+/// program's statics: the name is a static key (a full item
+/// path), or the last segment of one (a plain name, as gdb
+/// resolves a static from any scope). The value is the
+/// static's current storage content — evaluating its
+/// `StaticRef` constant seeds the storage from the
+/// initializer on first touch, so a print before the program
+/// has touched the static reads the initial value, and a
+/// print after a write reads the written one.
+fn resolve_static_base(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    base: &str,
+) -> Option<EvaluatedValue> {
+    let program = interp.program();
+    let key = static_key_for(program, base)?;
     if !ctl.static_seeds.contains_key(key) {
         return None;
     }
@@ -1066,12 +1430,152 @@ fn apply_cast(
 
 /// Evaluate a print expression: resolve its base name, then
 /// apply its dereference, field, index and cast steps.
+/// The size a `sizeof(<expr>)` print reports: the operand's
+/// declared type, walked from its base over the expression's
+/// steps and priced by the interpreter's layout walk -- the
+/// same sizes the engine lays values out with, so a packed
+/// aggregate reports its packed size. The operand is not
+/// evaluated: a debugger's sizeof needs the type, not a value.
+fn expr_size_of(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    operand_text: &str,
+) -> Result<u64, String> {
+    let expr = parse_expr(operand_text)?;
+    let ty = expr_declared_ty(interp, ctl, frames, &expr, operand_text)?;
+    interp.ty_size_full(&ty).ok_or_else(|| {
+        format!("the size of `{operand_text}` is not determined by its declared type")
+    })
+}
+
+
+/// The declared type after one step of a debug variable
+/// entry's own projection (the value-model projection the
+/// conversion recorded for the entry's place): the steps
+/// whose result type the projection itself determines. A
+/// byte displacement and a union field reinterpret storage
+/// the declared types do not name, so they stay undetermined.
+fn ref_proj_step_ty(ty: &Ty, elem: &RefProj) -> Option<Ty> {
+    match elem {
+        RefProj::Field(index) => {
+            crate::interp::projection_step_ty(ty, &ProjectionElem::Field(*index))
+        }
+        RefProj::Index(index) => crate::interp::projection_step_ty(
+            ty,
+            &ProjectionElem::ConstantIndex {
+                offset: *index as u64,
+                from_end: false,
+            },
+        ),
+        RefProj::Downcast(variant) => {
+            crate::interp::projection_step_ty(ty, &ProjectionElem::Downcast(*variant))
+        }
+        RefProj::Subslice { len, .. } => match ty {
+            Ty::Array(elem, _) => Some(Ty::Array(elem.clone(), *len as u64)),
+            Ty::Slice(elem) => Some(Ty::Slice(elem.clone())),
+            _ => None,
+        },
+        RefProj::View(view) => Some(view.clone()),
+        RefProj::VecLen
+        | RefProj::UnionField { .. }
+        | RefProj::ByteOffset(_) => None,
+    }
+}
+
+/// The declared type of a print expression, for the steps
+/// whose result type the declaration alone determines: a
+/// dereference, a tuple field and an index follow the
+/// interpreter's own projection typing; a named field of an
+/// ADT and a cast spell their types in forms the layout
+/// tables do not key on, so they stay undetermined here.
+fn expr_declared_ty(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    expr: &ParsedExpr,
+    operand_text: &str,
+) -> Result<Ty, String> {
+    let undetermined =
+        || format!("the type of `{operand_text}` is not determined by its declaration");
+    let mut ty = base_declared_ty(interp, ctl, frames, expr).ok_or_else(undetermined)?;
+    for step in &expr.steps {
+        let next = match step {
+            ExprStep::Deref => {
+                crate::interp::projection_step_ty(&ty, &ProjectionElem::Deref)
+            }
+            ExprStep::Field(index) => {
+                crate::interp::projection_step_ty(&ty, &ProjectionElem::Field(*index))
+            }
+            ExprStep::Index(index) => crate::interp::projection_step_ty(
+                &ty,
+                &ProjectionElem::ConstantIndex {
+                    offset: *index as u64,
+                    from_end: false,
+                },
+            ),
+            ExprStep::FieldName(_) | ExprStep::Cast(_) => None,
+        };
+        ty = next.ok_or_else(undetermined)?;
+    }
+    Ok(ty)
+}
+
+/// The declared type of a print expression's base: a local's
+/// recorded type (walked over the debug variable entry's own
+/// projection), or a static's recorded type. A history value
+/// records no declared type, and a constant debug variable
+/// names none the layout walk can price.
+fn base_declared_ty(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    expr: &ParsedExpr,
+) -> Option<Ty> {
+    if expr.base.starts_with('$') {
+        return None;
+    }
+    if !expr.base.contains("::") && !frames.is_empty() {
+        let frame = frames.get(frames.len().saturating_sub(1 + ctl.selected_frame))?;
+        let body = interp.program().get(&frame.func)?;
+        if let Some(entry) = pick_debug_var(body, ctl, &expr.base) {
+            return match &entry.source {
+                crate::ir::DebugVar::Place(local, proj) => {
+                    let mut ty = body.local_tys.get(*local)?.clone();
+                    for elem in proj {
+                        ty = ref_proj_step_ty(&ty, elem)?;
+                    }
+                    Some(ty)
+                }
+                crate::ir::DebugVar::Constant(_) => None,
+            };
+        }
+    }
+    let program = interp.program();
+    let key = static_key_for(program, &expr.base)?;
+    program.static_tys.get(key).cloned()
+}
+
 pub(super) fn evaluate_expr(
     interp: &Interpreter,
     ctl: &DebugControl,
     frames: &[Frame],
     expr_text: &str,
 ) -> Result<EvaluatedValue, String> {
+    // `sizeof(<expr>)`: the size of the operand's declared
+    // type, as a `usize` value (see `expr_size_of`).
+    if let Some(operand) = parse_sizeof_operand(expr_text) {
+        let size = expr_size_of(interp, ctl, frames, operand)?;
+        return Ok(EvaluatedValue {
+            value: Value::Uint(u128::from(size)),
+            desc: Some(Desc::Int("usize")),
+            char: false,
+            tag: Some("usize".to_string()),
+            cast_type: None,
+            pending_cast: None,
+            pending_array_view: None,
+        });
+    }
     // A top-level comparison (the form the suite's history
     // checks print, `$1 == $2`): both sides are print
     // expressions of the ordinary grammar, and the result is

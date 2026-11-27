@@ -4,7 +4,7 @@ use crate::interp::{Frame, Interpreter};
 use crate::ir::{Body, Local, Program, SourceLine, Ty};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use super::evaluate::{EvaluatedValue, evaluate_print, render_print};
+use super::evaluate::{EvaluatedValue, evaluate_print, render_print, render_printf};
 use super::queries::{render_info_functions, render_info_locals, render_type_query};
 
 /// One command of a debugger session script, in the vocabulary the
@@ -27,6 +27,12 @@ pub enum DebugCommand {
     Finish,
     /// Print an expression's value (gdb `print`, lldb `v`).
     Print(DebugPrint),
+    /// Formatted output (gdb `printf "<fmt>", <args>`): the
+    /// format text with its escapes already decoded by the
+    /// script parser, and the argument expressions of the
+    /// session's print grammar. The formatted text enters
+    /// the transcript as output: it creates no history value.
+    Printf { format: String, args: Vec<String> },
     /// Select the frame expressions are evaluated in (0 =
     /// innermost), gdb `frame N` / lldb `frame select N`.
     FrameSelect(usize),
@@ -497,6 +503,10 @@ fn exec_session_command(
                 ctl.print_count += 1;
             }
         }
+        DebugCommand::Printf { format, args } => {
+            let lines = render_printf(interp, ctl, frames, format, args);
+            ctl.transcript.extend(lines);
+        }
         DebugCommand::WhatIs(print) => {
             let lines = render_type_query(interp, ctl, frames, print, false);
             ctl.transcript.extend(lines);
@@ -706,6 +716,7 @@ pub(crate) fn drive_hook(
             match ctl.script.pop_front() {
                 Some(
                     cmd @ (DebugCommand::Print(_)
+                    | DebugCommand::Printf { .. }
                     | DebugCommand::WhatIs(_)
                     | DebugCommand::Ptype(_)
                     | DebugCommand::Repr(_)

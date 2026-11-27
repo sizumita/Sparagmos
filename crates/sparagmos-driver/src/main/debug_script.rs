@@ -112,6 +112,16 @@ pub(crate) fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String
                 expr: rest.to_string(),
                 format: None,
             })),
+            "printf" => {
+                // gdb `printf "<fmt>", <args>`: the format is
+                // a C string literal (its escapes are decoded
+                // here, where the script grammar lives); the
+                // arguments are print expressions the session
+                // evaluates at the stop.
+                let (format, args) = parse_printf_args(rest)
+                    .ok_or_else(|| bad(&format!("bad printf `{rest}`")))?;
+                commands.push(DebugCommand::Printf { format, args });
+            }
             "whatis" => commands.push(DebugCommand::WhatIs(DebugPrint {
                 expr: rest.to_string(),
                 format: None,
@@ -158,4 +168,83 @@ pub(crate) fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String
         commands,
         pretty_printers,
     })
+}
+
+/// Parse the argument text of a session `printf` line: a C
+/// string literal (the format, with the usual backslash
+/// escapes decoded) followed by an optional comma-separated
+/// list of print expressions, split at top-level commas --
+/// an argument's own parentheses and brackets nest.
+fn parse_printf_args(rest: &str) -> Option<(String, Vec<String>)> {
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut format = String::new();
+    let mut i = 1;
+    loop {
+        match *bytes.get(i)? {
+            b'"' => {
+                i += 1;
+                break;
+            }
+            b'\\' => {
+                i += 1;
+                let escaped = *bytes.get(i)? as char;
+                i += 1;
+                match escaped {
+                    'n' => format.push('\n'),
+                    't' => format.push('\t'),
+                    'r' => format.push('\r'),
+                    '0' => format.push('\0'),
+                    other => format.push(other),
+                }
+            }
+            byte => {
+                // Copy the byte's whole UTF-8 sequence: the
+                // format text outside escapes is ordinary
+                // text (a directive's `%` included).
+                let ch_len = utf8_len(byte);
+                format.push_str(std::str::from_utf8(&bytes[i..i + ch_len]).ok()?);
+                i += ch_len;
+            }
+        }
+    }
+    let rest = rest[i..].trim();
+    if rest.is_empty() {
+        return Some((format, Vec::new()));
+    }
+    let args_text = rest.strip_prefix(',')?;
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (j, c) in args_text.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(args_text[start..j].trim().to_string());
+                start = j + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    args.push(args_text[start..].trim().to_string());
+    if args.iter().any(|a| a.is_empty()) {
+        return None;
+    }
+    Some((format, args))
+}
+
+/// The length of the UTF-8 sequence a leading byte starts.
+fn utf8_len(byte: u8) -> usize {
+    match byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
 }
