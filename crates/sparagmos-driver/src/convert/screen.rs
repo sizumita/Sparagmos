@@ -57,7 +57,8 @@ thread_local! {
 /// forbidden outright, and the compiler supplies the
 /// implementations from its own knowledge — every type
 /// implements `Pointee` with the metadata its kind carries,
-/// every enum implements `DiscriminantKind`, the sized
+/// every enum implements `DiscriminantKind`, the field
+/// representing types implement `Field`, the sized
 /// hierarchy and `Unsize` hold by construction. Such a
 /// trait's projections normalize for the self types the
 /// compiler assigns them to, table or no table, so the screen
@@ -90,6 +91,7 @@ fn trait_is_compiler_implemented(trait_def: rustc_public::DefId) -> bool {
             let core_compiler_trait = [
                 rustc_attr_ir::lang_items::LangItem::PointeeTrait,
                 rustc_attr_ir::lang_items::LangItem::DiscriminantKind,
+                rustc_attr_ir::lang_items::LangItem::Field,
                 rustc_attr_ir::lang_items::LangItem::Sized,
                 rustc_attr_ir::lang_items::LangItem::MetaSized,
                 rustc_attr_ir::lang_items::LangItem::PointeeSized,

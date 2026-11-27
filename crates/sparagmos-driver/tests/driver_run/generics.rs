@@ -1719,6 +1719,57 @@ fn run_mode_compiler_implemented_trait_discriminant_kind_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
 }
 
+const FIELD_PROJECTION_SRC: &str = r#"
+#![feature(field_projections)]
+use std::field::{Field, field_of};
+use std::mem::offset_of;
+use std::ptr;
+
+#[repr(C)]
+pub struct Struct {
+    a: i32,
+    b: i64,
+}
+
+fn project_ref<'a, T, F: Field<Base = T>>(r: &'a T) -> &'a F::Type {
+    unsafe { &*ptr::from_ref(r).byte_add(F::OFFSET).cast() }
+}
+
+fn main() {
+    assert_eq!(<field_of!(Struct, a)>::OFFSET, offset_of!(Struct, a));
+    assert_eq!(<field_of!(Struct, b)>::OFFSET, offset_of!(Struct, b));
+    let s = Struct { a: 42, b: 24 };
+    let a = project_ref::<Struct, field_of!(Struct, a)>(&s);
+    let b = project_ref::<Struct, field_of!(Struct, b)>(&s);
+    println!("{} {}", *a, *b);
+}
+"#;
+
+#[test]
+fn run_mode_compiler_implemented_trait_field_runs() {
+    // `Field` is implemented by the compiler itself, for
+    // the field representing types the `field_of!` macro
+    // expands to (core marks it
+    // `#[rustc_deny_explicit_impl]` and a lang item): no
+    // `impl` item ever records it, so the implementation
+    // table is empty for it, yet `<field_of!(Struct, a) as
+    // Field>::OFFSET` and `<F as Field>::Type` normalize.
+    // The unnormalizable-projection screen must not reject
+    // `main` over it -- natively the program prints
+    // `42 24` (this is the shape of
+    // tests/ui/field_representing_types/offset.rs).
+    let dir = temp_dir("field-projection");
+    let src = fixture(&dir, "field_projection.rs", FIELD_PROJECTION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Field projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 24\n");
+}
+
 // ----- generic function definitions (Lane BA) --------------------------------
 
 const GENERIC_CALLS_SRC: &str = r#"
