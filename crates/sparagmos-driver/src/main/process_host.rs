@@ -454,21 +454,6 @@ impl DriverProcessHost {
         }
         let mut stderr_file = None;
         if self_run {
-            // The nested run carries its arguments as
-            // command-line strings, and the interpreter's
-            // argument model holds text: an argument that is
-            // not valid UTF-8 cannot be carried without
-            // changing its bytes, so the invocation is
-            // unsupported rather than silently lossy (the
-            // artifact run's standing answer).
-            for arg in &request.args {
-                if std::str::from_utf8(arg).is_err() {
-                    return Err(HostErr::Failed(
-                        "spawning the guest program as a child: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
-                            .to_string(),
-                    ));
-                }
-            }
             static NEXT_FILE: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let file = std::env::temp_dir().join(format!(
@@ -498,9 +483,12 @@ impl DriverProcessHost {
                 .unwrap_or(&request.program);
             cmd.arg("--guest-program-name")
                 .arg(String::from_utf8_lossy(program_name).into_owned());
+            // The nested run's own argv carries the guest
+            // arguments as raw host strings, so an argument
+            // that is not valid UTF-8 reaches the child run
+            // unchanged (its argument parser reads `args_os`).
             for arg in &request.args {
-                cmd.arg("--guest-arg")
-                    .arg(String::from_utf8_lossy(arg).into_owned());
+                cmd.arg("--guest-arg").arg(os(arg));
             }
             stderr_file = Some(file);
         } else {

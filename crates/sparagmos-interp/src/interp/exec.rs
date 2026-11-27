@@ -321,9 +321,7 @@ impl<'a> Interpreter<'a> {
         }
         let mut argv_strings = vec![self.program_path().as_bytes().to_vec()];
         argv_strings.extend(
-            self.guest_args()
-                .iter()
-                .map(|arg| arg.as_bytes().to_vec()),
+            self.guest_args().iter().cloned(),
         );
         let argc = argv_strings.len() as i128;
         let argv = self.c_string_array(argv_strings);

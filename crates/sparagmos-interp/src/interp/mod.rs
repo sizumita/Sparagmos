@@ -205,11 +205,13 @@ pub struct InterpConfig {
     pub thread_stack_size: usize,
     /// The guest program's command-line arguments after argv[0]
     /// (the run-flags a test prescribes), as handed to the driver
-    /// through its `--guest-arg` options. The `env::args` /
-    /// `env::args_os` runtime support reads them from here;
-    /// argv[0] itself is the interpreter's policy, not part of
-    /// this list.
-    pub guest_args: Vec<String>,
+    /// through its `--guest-arg` options. The arguments are raw
+    /// bytes: a guest argument need not be valid UTF-8 (a
+    /// self-spawned child can carry one, see issue #515), and
+    /// the `env::args` / `env::args_os` runtime support reads
+    /// them from here; argv[0] itself is the interpreter's
+    /// policy, not part of this list.
+    pub guest_args: Vec<Vec<u8>>,
     /// The guest program's argv[0]: the path the program was
     /// invoked as. The driver sets it to the source path it was
     /// handed (the stand-in for the compiled binary's path: a
@@ -1547,7 +1549,7 @@ impl<'a> Interpreter<'a> {
 
     /// The guest program's command-line arguments after argv[0],
     /// as configured for this run (see [`InterpConfig::guest_args`]).
-    pub fn guest_args(&self) -> &[String] {
+    pub fn guest_args(&self) -> &[Vec<u8>] {
         &self.config.guest_args
     }
 

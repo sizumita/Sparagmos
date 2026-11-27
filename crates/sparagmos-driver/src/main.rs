@@ -730,6 +730,22 @@ fn reap_stale_scratch() {
     }
 }
 
+
+/// The raw bytes of one of this process's own argv entries:
+/// on Unix the entry itself; on other hosts the entries this
+/// driver receives are text, and the bytes are that text.
+fn os_bytes(arg: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        arg.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        arg.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 fn main() {
     reap_stale_scratch();
     let worker = std::thread::Builder::new()
@@ -755,7 +771,16 @@ fn driver_main() {
 }
 
 fn driver_main_inner() {
-    let argv: Vec<String> = std::env::args().collect();
+    // The driver's own options are text, but a `--guest-arg`
+    // value is a guest argument and need not be valid UTF-8
+    // (a self-spawned child can carry one unchanged, see
+    // issue #515): keep the raw `OsString` argv alongside the
+    // lossy text view the option matching uses.
+    let argv_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let argv: Vec<String> = argv_os
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     // The cargo rustc-wrapper shim (see `rustc_shim` in
     // tools.rs) is not a session mode: it converts one
     // compilation unit, records its verdict on a side
@@ -811,7 +836,8 @@ fn driver_main_inner() {
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
-    let mut guest_args: Vec<String> = Vec::new();
+    let mut guest_args: Vec<Vec<u8>> = Vec::new();
+    let mut guest_args_file: Option<String> = None;
     let mut i = if mode == Mode::Convert { 1 } else { 2 };
     while i < argv.len() {
         match argv[i].as_str() {
@@ -876,8 +902,16 @@ fn driver_main_inner() {
             }
             "--guest-arg" => {
                 i += 1;
-                guest_args.push(argv.get(i).cloned().unwrap_or_else(|| {
+                let raw = argv_os.get(i).unwrap_or_else(|| {
                     eprintln!("--guest-arg needs a value");
+                    exit_process(2);
+                });
+                guest_args.push(os_bytes(raw));
+            }
+            "--guest-args-file" => {
+                i += 1;
+                guest_args_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-args-file needs a path");
                     exit_process(2);
                 }));
             }
@@ -966,7 +1000,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--dep-info-verdict] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--dep-info-verdict] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--guest-args-file <path>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -996,6 +1030,23 @@ fn driver_main_inner() {
     let sysroot = sysroot
         .or_else(|| std::env::var("SPARAGMOS_SYSROOT").ok())
         .unwrap_or_else(|| env!("SPARAGMOS_BUILD_SYSROOT").to_string());
+
+    // A caller reconstructing a run whose guest arguments
+    // include a non-UTF-8 one hands them over in a file (the
+    // command line of a conversion subprocess is text in this
+    // driver's plumbing; see `write_guest_args_file`): the
+    // file's arguments are the run's, in order.
+    if let Some(path) = &guest_args_file {
+        match read_guest_args_file(std::path::Path::new(path)) {
+            Ok(args) => guest_args.extend(args),
+            Err(e) => {
+                eprintln!(
+                    "sparagmos-driver run: unsupported: cannot read the guest arguments file {path}: {e}"
+                );
+                exit_process(2);
+            }
+        }
+    }
 
     // The process host of a run that opted into real child
     // processes: assembled from this invocation's own shape,

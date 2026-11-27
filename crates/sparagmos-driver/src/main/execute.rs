@@ -57,7 +57,7 @@ fn own_stdout_sink() -> Option<sparagmos_interp::StdoutSink> {
 pub(crate) fn execute(
     c: &Collected,
     input: &str,
-    guest_args: &[String],
+    guest_args: &[Vec<u8>],
     overflow_checks: bool,
     panic_abort: bool,
     sigpipe: sparagmos_interp::SigpipeInit,
@@ -409,7 +409,7 @@ pub(crate) fn execute(
 pub(crate) fn execute_debug(
     c: &Collected,
     input: &str,
-    guest_args: &[String],
+    guest_args: &[Vec<u8>],
     overflow_checks: bool,
     panic_abort: bool,
     sigpipe: sparagmos_interp::SigpipeInit,
