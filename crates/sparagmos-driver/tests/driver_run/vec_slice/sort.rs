@@ -388,3 +388,46 @@ fn run_mode_merge_up_over_byte_storage_scratch() {
         "len 64 first 0 last 3015 wsum 3272656\n",
     );
 }
+
+const DRIFT_SORT_LARGE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = (0..5000).rev().collect();
+    v.sort();
+    println!("{} {} {}", v[0], v[2500], v[4999]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_large_input_crosses_the_drift_sqrt_threshold() {
+    // Past 4096 elements driftsort's run-length heuristic calls
+    // `sqrt_approx`, which has no demandable body of its own.
+    run_ok("drift-sort-large", DRIFT_SORT_LARGE_SRC, "0 2500 4999\n");
+}
+
+const SORT_ORD_VIOLATION_SRC: &str = r#"
+use std::cell::Cell;
+fn main() {
+    let flip = Cell::new(false);
+    let mut v: Vec<i32> = (0..50).collect();
+    v.sort_by(|a, b| {
+        flip.set(!flip.get());
+        if flip.get() { a.cmp(b) } else { b.cmp(a) }
+    });
+    println!("sorted {:?}", &v[..3]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_ord_violation_panics_with_core_message() {
+    let dir = temp_dir("sort-ord-violation");
+    let src = fixture(&dir, "sortviol.rs", SORT_ORD_VIOLATION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "user-provided comparison function does not correctly implement a total order"
+        ),
+        "stderr={stderr}"
+    );
+}

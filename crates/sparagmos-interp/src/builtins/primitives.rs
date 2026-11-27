@@ -109,6 +109,22 @@ pub(crate) fn primitives_lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::saturating_sub" | "core::intrinsics::saturating_sub" => {
             Builtin::SaturatingArith(SatOp::Sub)
         }
+        "std::intrinsics::exact_div" | "core::intrinsics::exact_div" => Builtin::ExactDiv,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the slice-sort helper surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn slice_sort_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::slice::sort::stable::drift::sqrt_approx" => Builtin::SqrtApprox,
         _ => return None,
     })
 }

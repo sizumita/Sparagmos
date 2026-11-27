@@ -3522,3 +3522,58 @@ fn run_mode_debug_format_derived_const_params() {
         "stdout={stdout}"
     );
 }
+
+const STR_SLICE_END_INSIDE_CHAR_SRC: &str = r#"
+fn main() {
+    let s = "héllo";
+    println!("{}", &s[1..2]);
+}
+"#;
+
+#[test]
+fn run_mode_str_slice_end_inside_char_panics_with_core_message() {
+    let dir = temp_dir("str-slice-boundary");
+    let src = fixture(&dir, "strslice.rs", STR_SLICE_END_INSIDE_CHAR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "end byte index 2 is not a char boundary; it is inside 'é' (bytes 1..3) of string"
+        ),
+        "stderr={stderr}"
+    );
+}
+
+const STR_SLICE_END_OUT_OF_BOUNDS_SRC: &str = r#"
+fn main() {
+    let s = "hello";
+    println!("{}", &s[3..10]);
+}
+"#;
+
+#[test]
+fn run_mode_str_slice_end_out_of_bounds_panics_with_core_message() {
+    let dir = temp_dir("str-slice-oob");
+    let src = fixture(&dir, "strslice_oob.rs", STR_SLICE_END_OUT_OF_BOUNDS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("end byte index 10 is out of bounds for string of length 5"),
+        "stderr={stderr}"
+    );
+}
+
+const STR_SLICE_UNICODE_SRC: &str = r#"
+fn main() {
+    let s = "héllo";
+    println!("{}", &s[0..1]);
+    println!("{}", &s[1..3]);
+}
+"#;
+
+#[test]
+fn run_mode_str_slice_on_char_boundaries() {
+    run_ok("str-slice-unicode", STR_SLICE_UNICODE_SRC, "h\né\n");
+}

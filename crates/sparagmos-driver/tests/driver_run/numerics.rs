@@ -455,3 +455,23 @@ fn run_mode_nonzero_formats_as_inner_scalar() {
         "dbg 42\ndisp 42\nhex 2a\nneg -3\nusz 7 list [42]\npad     42|42    |\n",
     );
 }
+
+const INT_LOG10_NONPOSITIVE_SRC: &str = r#"
+fn main() {
+    let n = -3i32;
+    println!("{}", n.ilog10());
+}
+"#;
+
+#[test]
+fn run_mode_int_log10_nonpositive_panics_with_core_message() {
+    let dir = temp_dir("int-log10-nonpositive");
+    let src = fixture(&dir, "ilog10.rs", INT_LOG10_NONPOSITIVE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("argument of integer logarithm must be positive"),
+        "stderr={stderr}"
+    );
+}

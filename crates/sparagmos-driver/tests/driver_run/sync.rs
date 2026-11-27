@@ -1801,3 +1801,17 @@ fn run_mode_rwlock_downgrade_releases_waiting_reader() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "downgrade ok\n");
 }
+
+const SPIN_LOOP_SRC: &str = r#"
+fn main() {
+    for _ in 0..5 {
+        std::hint::spin_loop();
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_spin_loop_completes() {
+    run_ok("spin-loop", SPIN_LOOP_SRC, "done\n");
+}

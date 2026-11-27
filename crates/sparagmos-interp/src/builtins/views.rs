@@ -907,11 +907,16 @@ impl<'a> Interpreter<'a> {
         // indices.
         let resolved = self.resolve_value(frames, receiver)?;
         if let Value::Str(text) = &resolved {
+            // A `str` range is judged by core's own
+            // `slice_error_fail`, not the slice wording: take
+            // the raw extent and let its branch order speak.
             let len = text.len();
-            let (start, end) = range_bounds(&kind, &bound, len)?;
+            let (start, end) = range_extent(&kind, &bound, len)?;
             return match text.get(start..end) {
                 Some(sub) => Ok(Value::Str(sub.to_string())),
-                None => Err(InterpError::panic(str_slice_error(text, start, end))),
+                None => Err(InterpError::panic(slice_error_fail_message(
+                    text, start, end,
+                ))),
             };
         }
         let (elems, len) = self.slice_elements_ref(frames, receiver)?;

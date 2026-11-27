@@ -751,6 +751,41 @@ pub(super) fn range_bounds(
     Ok((start, end))
 }
 
+/// The raw `(start, end)` a range index denotes, without
+/// `range_bounds`' validity judgement: the same extraction
+/// (inclusive ends normalised; an inclusive end of
+/// `usize::MAX` is still the overflow panic core's inclusive
+/// impl raises) for callers that judge the range themselves —
+/// the `str` index path defers to `slice_error_fail_message`.
+pub(super) fn range_extent(
+    kind: &RangeKindForIndex,
+    bound: &dyn Fn(usize) -> InterpResult<usize>,
+    len: usize,
+) -> InterpResult<(usize, usize)> {
+    use RangeKindForIndex::*;
+    Ok(match kind {
+        Full => (0, len),
+        Range => (bound(0)?, bound(1)?),
+        From => (bound(0)?, len),
+        To => (0, bound(0)?),
+        Inclusive => {
+            let start = bound(0)?;
+            let end = bound(1)?;
+            if end == usize::MAX {
+                return Err(InterpError::panic("range end index overflow".to_string()));
+            }
+            (start, end + 1)
+        }
+        ToInclusive => {
+            let end = bound(0)?;
+            if end == usize::MAX {
+                return Err(InterpError::panic("range end index overflow".to_string()));
+            }
+            (0, end + 1)
+        }
+    })
+}
+
 pub(super) enum RangeKindForIndex {
     Full,
     Range,
@@ -760,20 +795,39 @@ pub(super) enum RangeKindForIndex {
     ToInclusive,
 }
 
-/// core's message for a string slice index that is not a char
-/// boundary (`str::slice_error_fail`).
-pub(super) fn str_slice_error(text: &str, start: usize, end: usize) -> String {
-    for idx in [start, end] {
-        if idx != 0 && idx != text.len() && !text.is_char_boundary(idx) {
-            let lo = text[..idx].chars().next_back().map_or(0, |c| idx - c.len_utf8());
-            let ch = text[lo..].chars().next().expect("char at boundary");
-            let hi = lo + ch.len_utf8();
+/// The message core's `str::slice_error_fail(s, begin, end)`
+/// raises: a port of `slice_error_fail_rt`'s branch order —
+/// begin out of bounds, end out of bounds, a backwards range,
+/// then a non-boundary begin and a non-boundary end, each
+/// naming the containing char and its byte span; the
+/// fallthrough (an inclusive range whose end equals the
+/// length) reports the end as out of bounds, as core does.
+pub(super) fn slice_error_fail_message(s: &str, begin: usize, end: usize) -> String {
+    let len = s.len();
+    if begin > len {
+        return format!(
+            "start byte index {begin} is out of bounds for string of length {len}"
+        );
+    }
+    if end > len {
+        return format!(
+            "end byte index {end} is out of bounds for string of length {len}"
+        );
+    }
+    if begin > end {
+        return format!("byte range starts at {begin} but ends at {end}");
+    }
+    for (which, idx) in [("start", begin), ("end", end)] {
+        if !s.is_char_boundary(idx) {
+            let floor = (0..idx).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+            let ch = s[floor..].chars().next().expect("char at boundary");
+            let ceil = floor + ch.len_utf8();
             return format!(
-                "byte index {idx} is not a char boundary; it is inside {ch:?} (bytes {lo}..{hi}) of `{text}`"
+                "{which} byte index {idx} is not a char boundary; it is inside {ch:?} (bytes {floor}..{ceil}) of string"
             );
         }
     }
-    format!("byte index {start} is not a char boundary")
+    format!("end byte index {end} is out of bounds for string of length {len}")
 }
 
 pub(super) fn expect_index(value: &Value, name: &str) -> InterpResult<usize> {
@@ -1732,6 +1786,9 @@ pub(crate) fn cell_lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.contains("option::Option") && canonical.ends_with(">::take") => {
             Builtin::OptionTake
+        }
+        "std::cell::panic_already_borrowed" | "core::cell::panic_already_borrowed" => {
+            Builtin::PanicAlreadyBorrowed
         }
         _ => return None,
     })

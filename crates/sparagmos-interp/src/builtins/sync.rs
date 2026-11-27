@@ -1055,6 +1055,21 @@ pub(crate) fn thread_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// Registration fragment of the builtin name registry: the spin-hint surface.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn spin_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::core_arch::x86::sse2::pause" => Builtin::SpinPause,
+        _ => return None,
+    })
+}
+
 /// Registration fragment of the builtin name registry: the current-thread surface.
 ///
 /// One contiguous slice of the table that [`lookup`] chains in

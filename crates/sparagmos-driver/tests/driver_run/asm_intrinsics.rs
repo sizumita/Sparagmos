@@ -1327,3 +1327,36 @@ fn convert_mode_atomic_intrinsics_with_valid_types_convert() {
         "valid atomic monomorphizations must convert; stderr={stderr}"
     );
 }
+
+const EXACT_DIV_SRC: &str = r#"
+#![feature(core_intrinsics)]
+fn main() {
+    let a = unsafe { std::intrinsics::exact_div(84i32, 7) };
+    let b = unsafe { std::intrinsics::exact_div(-84i64, -7) };
+    let c = unsafe { std::intrinsics::exact_div(100u32, 10) };
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_exact_div_intrinsic() {
+    run_ok("exact-div", EXACT_DIV_SRC, "12 12 10\n");
+}
+
+const RAW_EQ_SRC: &str = r#"
+#![feature(core_intrinsics)]
+fn main() {
+    let a = [1u8, 2, 3];
+    let b = [1u8, 2, 3];
+    let c = [1u8, 2, 4];
+    let x = unsafe { std::intrinsics::raw_eq(&a, &b) };
+    let y = unsafe { std::intrinsics::raw_eq(&a, &c) };
+    let z = unsafe { std::intrinsics::raw_eq(&7u32, &7u32) };
+    println!("{x} {y} {z}");
+}
+"#;
+
+#[test]
+fn run_mode_raw_eq_intrinsic() {
+    run_ok("raw-eq", RAW_EQ_SRC, "true false true\n");
+}
