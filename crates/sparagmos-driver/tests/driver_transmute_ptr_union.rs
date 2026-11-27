@@ -175,3 +175,42 @@ fn main() {
     run_ok("union-ptr-opt", src, true, "true\n");
     run_ok("union-ptr", src, false, "true\n");
 }
+
+/// A union built through its integer field, transmuted out
+/// to a raw pointer: the union value holds the integer
+/// field and leaves the pointer slot uninit, so the crossing
+/// reads the live field's bits as the pointer's address --
+/// the same reinterpretation a union field read performs.
+#[test]
+fn union_built_through_int_field_into_raw_ptr() {
+    let src = r#"use std::mem::transmute;
+#[derive(Clone, Copy)]
+union U { p: *const u8, n: usize }
+fn main() {
+    let u = U { n: 123 };
+    let p: *mut u8 = unsafe { transmute(u) };
+    println!("{}", p as usize);
+}
+"#;
+    run_ok("union-int-ptr-opt", src, true, "123\n");
+    run_ok("union-int-ptr", src, false, "123\n");
+}
+
+/// A union built through its float field, transmuted out to
+/// a raw pointer: the pointer slot is uninit in the union
+/// value, and the crossing reinterprets the float field's
+/// bit pattern as the address.
+#[test]
+fn union_built_through_float_field_into_raw_ptr() {
+    let src = r#"use std::mem::transmute;
+#[derive(Clone, Copy)]
+union U { p: *const u8, f: f64 }
+fn main() {
+    let u = U { f: 1.0 };
+    let p: *const u8 = unsafe { transmute(u) };
+    println!("{}", p as usize == 0x3ff0000000000000usize);
+}
+"#;
+    run_ok("union-float-ptr-opt", src, true, "true\n");
+    run_ok("union-float-ptr", src, false, "true\n");
+}
