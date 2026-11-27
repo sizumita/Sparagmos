@@ -212,6 +212,17 @@ fn address_key(value: &Value) -> Option<String> {
         // over the same base but different concrete types are
         // different values' pointers in this model).
         Value::DynRef { base, concrete, .. } => format!("dyn:{base:?}:{concrete}"),
+        // A bare string or byte value is the data itself in
+        // this model (see `deref_value` in `interp/memory.rs`):
+        // a `&str` materialised as bare string data, such as a
+        // caller-location stamp's file string, reaches the
+        // pointer-address machinery (pointer-to-integer
+        // transmutes, the `core::ub_checks` predicates) as the
+        // data value, not as a reference to it. Its address
+        // identity is its contents, as a fat pointer over the
+        // same string already keys on the base's rendering.
+        Value::Str(text) => format!("str:{}:{text}", text.len()),
+        Value::Bytes(bytes) => format!("bytes:{}:{bytes:?}", bytes.len()),
         _ => return None,
     })
 }
@@ -817,6 +828,23 @@ fn synthetic_addresses_do_not_collide_at_scale() {
         let addr = synthetic_address(&v).expect("address");
         assert!(seen.insert(addr), "collision at allocation {id}");
     }
+}
+
+#[test]
+fn synthetic_address_of_bare_string_data_is_content_keyed() {
+    let a = Value::Str("probe::file.rs".to_string());
+    let b = Value::Str("probe::file.rs".to_string());
+    let c = Value::Str("probe::other.rs".to_string());
+    let addr = synthetic_address(&a).expect("bare str address");
+    assert_eq!(synthetic_address(&b), Some(addr));
+    assert_ne!(synthetic_address(&c), Some(addr));
+    assert_ne!(addr, 0);
+    let bytes = Value::Bytes(b"probe".to_vec());
+    assert!(synthetic_address(&bytes).is_some());
+    assert_ne!(
+        synthetic_address(&bytes),
+        synthetic_address(&Value::Str("probe".to_string()))
+    );
 }
 
 #[test]
