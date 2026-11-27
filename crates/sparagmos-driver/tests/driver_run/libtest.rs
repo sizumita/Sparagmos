@@ -1083,3 +1083,204 @@ fn run_mode_libtest_terse_output_matches_snapshot() {
         "stdout={stdout}"
     );
 }
+
+const SHOW_OUTPUT_SRC: &str = r#"
+#[test]
+fn a_prints() {
+    println!("hello-from-a");
+}
+#[test]
+fn b_quiet() {
+    assert_eq!(1 + 1, 2);
+}
+#[test]
+#[should_panic(expected = "boom")]
+fn c_no_panic() {
+    assert_eq!(2 + 2, 4);
+}
+"#;
+
+#[test]
+fn run_mode_libtest_show_output_successes_account() {
+    // Issue #532 (test-should-panic-failed-show-span family):
+    // under `--show-output` the pretty formatter closes the
+    // run with a successes account -- the header, one
+    // `---- name stdout ----` block per pass whose captured
+    // output is non-empty, the header again, and the passes'
+    // names sorted -- ahead of the failures account. The
+    // harness model printed no successes account at all, so
+    // every `--show-output` run's stdout mismatched the
+    // native run's.
+    let dir = temp_dir("libtest-show-output");
+    let src = fixture(&dir, "show_output.rs", SHOW_OUTPUT_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--show-output",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 3 tests\n\
+         test a_prints ... ok\n\
+         test b_quiet ... ok\n\
+         test c_no_panic - should panic ... FAILED\n\
+         \nsuccesses:\n\
+         \n\
+         ---- a_prints stdout ----\n\
+         hello-from-a\n\
+         \n\
+         \nsuccesses:\n\
+         \x20   a_prints\n\
+         \x20   b_quiet\n\
+         \nfailures:\n\
+         \n\
+         ---- c_no_panic stdout ----\n\
+         note: test did not panic as expected at $FILE:12:4\n\
+         \nfailures:\n\
+         \x20   c_no_panic\n\
+         \n\
+         test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+#[test]
+fn run_mode_libtest_show_output_nocapture_lists_names_only() {
+    // The same run under `--nocapture`: nothing is captured,
+    // so the successes account is the two headers and the
+    // name list alone (the passes' output flowed live).
+    let dir = temp_dir("libtest-show-output-nocapture");
+    let src = fixture(&dir, "show_output.rs", SHOW_OUTPUT_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--nocapture",
+            "--guest-arg",
+            "--show-output",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 3 tests\n\
+         test a_prints ... hello-from-a\n\
+         ok\n\
+         test b_quiet ... ok\n\
+         test c_no_panic - should panic ... FAILED\n\
+         \nsuccesses:\n\
+         \nsuccesses:\n\
+         \x20   a_prints\n\
+         \x20   b_quiet\n\
+         \nfailures:\n\
+         \n\
+         ---- c_no_panic stdout ----\n\
+         note: test did not panic as expected at $FILE:12:4\n\
+         \nfailures:\n\
+         \x20   c_no_panic\n\
+         \n\
+         test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+const SHOW_OUTPUT_PANICS_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "first")]
+fn a_first() {
+    panic!("first boom");
+}
+#[test]
+#[should_panic(expected = "second")]
+fn b_second() {
+    println!("b-out");
+    panic!("second boom");
+}
+#[test]
+fn c_fails() {
+    panic!("c boom");
+}
+"#;
+
+#[test]
+fn run_mode_libtest_show_output_should_panic_reports_spend_the_note() {
+    // A passing should-panic test's successes block carries
+    // its panic report, and the backtrace note rides on the
+    // process's first panic wherever it is accounted: the
+    // first should-panic pass's block carries it, the second
+    // pass's block and the later failure's section do not.
+    // The model used to compose a passing should-panic
+    // test's account from the report head alone while still
+    // spending the note, so the note vanished from the run
+    // entirely and the failure kept a copy of its own.
+    let dir = temp_dir("libtest-show-output-panics");
+    let src = fixture(&dir, "show_output_panics.rs", SHOW_OUTPUT_PANICS_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--show-output",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 3 tests\n\
+         test a_first - should panic ... ok\n\
+         test b_second - should panic ... ok\n\
+         test c_fails ... FAILED\n\
+         \nsuccesses:\n\
+         \n\
+         ---- a_first stdout ----\n\
+         \n\
+         thread 'a_first' ($TID) panicked at $FILE:5:5:\n\
+         first boom\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         \n\
+         ---- b_second stdout ----\n\
+         b-out\n\
+         \n\
+         thread 'b_second' ($TID) panicked at $FILE:11:5:\n\
+         second boom\n\
+         \n\
+         \nsuccesses:\n\
+         \x20   a_first\n\
+         \x20   b_second\n\
+         \nfailures:\n\
+         \n\
+         ---- c_fails stdout ----\n\
+         \n\
+         thread 'c_fails' ($TID) panicked at $FILE:15:5:\n\
+         c boom\n\
+         \n\
+         \nfailures:\n\
+         \x20   c_fails\n\
+         \n\
+         test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}

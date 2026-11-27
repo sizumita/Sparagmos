@@ -1641,6 +1641,12 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut failure_names: Vec<String> = Vec::new();
                 let mut failure_sections: Vec<String> = Vec::new();
+                // The passing tests' `--show-output` accounts
+                // (libtest's `ConsoleTestState::not_failures`):
+                // each pass's name and captured output, in run
+                // order, for the successes summary at the end
+                // of the run.
+                let mut success_accounts: Vec<(String, String)> = Vec::new();
                 // TerseFormatter's progress state (libtest's
                 // formatters/terse.rs): how many results have
                 // been reported, and the column the short results
@@ -1775,10 +1781,13 @@ impl<'a> Interpreter<'a> {
                     // nocapture mode has no section (its report
                     // went to the guest's stderr as it ran).
                     // For a test that panics as it was expected
-                    // to, the panic report without the backtrace
-                    // note: the json format's `--show-output`
-                    // account of a passing should-panic test is
-                    // its captured output plus this report.
+                    // to, the panic report its captured output
+                    // carries (the backtrace note included when
+                    // this panic is the process's first): the
+                    // `--show-output` accounts of a passing
+                    // should-panic test, in both the json and
+                    // the pretty formats, are its captured
+                    // output plus this report.
                     let mut pass_note: Option<String> = None;
                     let failure_body: Option<Option<String>> = match result {
                         Ok(_) => match test.should_panic {
@@ -1875,11 +1884,12 @@ impl<'a> Interpreter<'a> {
                                     }
                                 }
                                 ShouldPanic::Yes => {
-                                    pass_note = Some(panic_report_head(
+                                    pass_note = Some(panic_report_pass(
                                         test,
                                         self.current_thread_id(),
                                         self.panic_location(),
                                         &message,
+                                        backtrace_note_pending,
                                     ));
                                     None
                                 }
@@ -1952,11 +1962,12 @@ impl<'a> Interpreter<'a> {
                                             "{cap_out}{cap_err}{report}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
                                         )))
                                     } else if text.contains(expected.as_str()) {
-                                        pass_note = Some(panic_report_head(
+                                        pass_note = Some(panic_report_pass(
                                             test,
                                             self.current_thread_id(),
                                             self.panic_location(),
                                             &message,
+                                            backtrace_note_pending,
                                         ));
                                         None
                                     } else {
@@ -1991,8 +2002,9 @@ impl<'a> Interpreter<'a> {
                     if pass_note.is_some() {
                         // A should-panic test's expected panic
                         // is still a panic of the process: it
-                        // spends the note's one appearance even
-                        // though its own account omits it.
+                        // spends the note's one appearance (its
+                        // own account above carries the note
+                        // when it was still unspent).
                         backtrace_note_pending = false;
                     }
                     // Spend the backtrace note on the first
@@ -2018,6 +2030,23 @@ impl<'a> Interpreter<'a> {
                     match failure_body {
                         None => {
                             passed += 1;
+                            // The pass's `--show-output` account:
+                            // its captured output plus the report
+                            // of a panic it was expected to raise.
+                            // Under `--nocapture` nothing was
+                            // captured, so the account is empty
+                            // and the pass lists by name alone.
+                            success_accounts.push((
+                                test.name.clone(),
+                                if opts.nocapture {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "{cap_out}{cap_err}{}",
+                                        pass_note.as_deref().unwrap_or("")
+                                    )
+                                },
+                            ));
                             if opts.json {
                                 // With `--show-output`, a passing
                                 // test's event carries its
@@ -2141,6 +2170,40 @@ impl<'a> Interpreter<'a> {
                         event, passed, failed, ignored, filtered_out
                     ));
                 } else {
+                    if opts.show_output {
+                        // PrettyFormatter::write_successes:
+                        // libtest's `write_results` over the
+                        // run's not-failures -- the header, one
+                        // `---- name stdout ----` block per pass
+                        // whose captured output is non-empty
+                        // (in run order), the header again, and
+                        // the passes' names, sorted. It prints
+                        // whenever `--show-output` is set,
+                        // whether or not anything failed, ahead
+                        // of the failures account.
+                        self.push_output("\nsuccesses:\n");
+                        let mut success_stdouts = String::new();
+                        for (name, output) in &success_accounts {
+                            if !output.is_empty() {
+                                success_stdouts.push_str(&format!(
+                                    "---- {name} stdout ----\n{output}\n"
+                                ));
+                            }
+                        }
+                        if !success_stdouts.is_empty() {
+                            self.push_output("\n");
+                            self.push_output(&success_stdouts);
+                        }
+                        self.push_output("\nsuccesses:\n");
+                        let mut success_names: Vec<&str> = success_accounts
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect();
+                        success_names.sort_unstable();
+                        for name in success_names {
+                            self.push_output(&format!("    {name}\n"));
+                        }
+                    }
                     if !failure_names.is_empty() {
                         self.push_output("\nfailures:\n");
                         for section in &failure_sections {
