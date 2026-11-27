@@ -260,3 +260,275 @@ fn run_mode_async_closure_precise_capture_once_move() {
         "both captured fields are written through the environment reference"
     );
 }
+const PRECISE_CAPTURE_MOVE_MUT_DIRECT_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match unsafe { fut.as_mut().poll(ctx) } {
+            Poll::Pending => {}
+            Poll::Ready(t) => break t,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) { println!("{}", self.0); }
+}
+struct S { a: i32, b: Drop, c: Drop }
+
+async fn async_main() {
+    let s = &mut S { a: 1, b: Drop("fix me up"), c: Drop("untouched") };
+    let mut c = async move || {
+        s.a = 2;
+        let w = &mut s.b;
+        w.0 = "fixed";
+    };
+    let fut = c();
+    println!("after call");
+    fut.await;
+    println!("after await");
+}
+
+fn main() { block_on(async_main()); }
+"#;
+
+#[test]
+fn run_mode_async_closure_precise_capture_move_mut_direct_call() {
+    // The `async move` counterpart of the deref capture above,
+    // called directly (an `AsyncFnMut` call): the environment
+    // is the single `&mut S`, and no body in the program
+    // projects `S`'s fields - their accesses live in the
+    // closure's own body - so the capture plan's field types
+    // must come from the declared shape, not only from the
+    // projection-recovered table. Without a plan the created
+    // future holds the environment verbatim and its second
+    // field reads uninitialised.
+    let dir = temp_dir("async-precise-capture-move-mut-direct");
+    let src = fixture(
+        &dir,
+        "precise_capture_move_mut_direct.rs",
+        PRECISE_CAPTURE_MOVE_MUT_DIRECT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "precise capture of a moved &mut, called directly, must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after call\nafter await\nfixed\nuntouched\n",
+        "both captured fields are written through the derived references"
+    );
+}
+
+const PRECISE_CAPTURE_MOVE_MUT_SHIM_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match unsafe { fut.as_mut().poll(ctx) } {
+            Poll::Pending => {}
+            Poll::Ready(t) => break t,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) { println!("{}", self.0); }
+}
+struct S { a: i32, b: Drop, c: Drop }
+
+async fn call_mut(f: &mut impl AsyncFnMut()) { f().await }
+
+async fn async_main() {
+    let s = &mut S { a: 1, b: Drop("fix me up"), c: Drop("untouched") };
+    let mut c = async move || {
+        s.a = 2;
+        let w = &mut s.b;
+        w.0 = "fixed";
+    };
+    let fut = call_mut(&mut c);
+    println!("after call");
+    fut.await;
+    println!("after await");
+}
+
+fn main() { block_on(async_main()); }
+"#;
+
+#[test]
+fn run_mode_async_closure_precise_capture_move_mut_shim_call() {
+    // The same moved-`&mut` deref capture reached through a
+    // generic `AsyncFnMut` shim instead of a direct call: the
+    // plan computation does not depend on the call shape.
+    let dir = temp_dir("async-precise-capture-move-mut-shim");
+    let src = fixture(
+        &dir,
+        "precise_capture_move_mut_shim.rs",
+        PRECISE_CAPTURE_MOVE_MUT_SHIM_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "precise capture of a moved &mut through a shim must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after call\nafter await\nfixed\nuntouched\n",
+        "both captured fields are written through the derived references"
+    );
+}
+
+const PRECISE_CAPTURE_MOVE_GENERIC_POINTEE_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match unsafe { fut.as_mut().poll(ctx) } {
+            Poll::Pending => {}
+            Poll::Ready(t) => break t,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) { println!("{}", self.0); }
+}
+struct W<T> { x: T, d: Drop, z: Drop }
+
+async fn call_mut(f: &mut impl AsyncFnMut()) { f().await }
+
+async fn async_main() {
+    let w = &mut W { x: 3i32, d: Drop("dee"), z: Drop("zee") };
+    let mut c = async move || {
+        w.x = 4;
+        let r = &mut w.d;
+        r.0 = "dee fixed";
+    };
+    let fut = call_mut(&mut c);
+    println!("after call");
+    fut.await;
+    println!("after await");
+}
+
+fn main() { block_on(async_main()); }
+"#;
+
+#[test]
+fn run_mode_async_closure_precise_capture_move_generic_pointee() {
+    // The pointee is a generic instantiation (`W<i32>`): the
+    // shape fallback must substitute the instance's arguments
+    // for the definition's parameters before the borrowed
+    // types can match the declared fields.
+    let dir = temp_dir("async-precise-capture-move-generic");
+    let src = fixture(
+        &dir,
+        "precise_capture_move_generic.rs",
+        PRECISE_CAPTURE_MOVE_GENERIC_POINTEE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "precise capture through a generic pointee must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after call\nafter await\ndee fixed\nzee\n",
+        "both captured fields are written through the derived references"
+    );
+}
+
+const PRECISE_CAPTURE_MOVE_TWO_REFS_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match unsafe { fut.as_mut().poll(ctx) } {
+            Poll::Pending => {}
+            Poll::Ready(t) => break t,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) { println!("{}", self.0); }
+}
+struct S { a: i32, b: Drop, c: Drop }
+struct T { x: i32, y: Drop }
+
+async fn async_main() {
+    let s = &mut S { a: 1, b: Drop("fix me up"), c: Drop("untouched") };
+    let t = &mut T { x: 10, y: Drop("tee") };
+    let mut c = async move || {
+        s.a = 2;
+        let w = &mut s.b;
+        w.0 = "fixed";
+        t.x = 11;
+        let u = &mut t.y;
+        u.0 = "tee fixed";
+    };
+    let fut = c();
+    println!("after call");
+    fut.await;
+    println!("after await");
+}
+
+fn main() { block_on(async_main()); }
+"#;
+
+#[test]
+fn run_mode_async_closure_precise_capture_move_two_refs() {
+    // Two reference captures in one closure, each fanning out
+    // over its own pointee: the plan is per-capture, and the
+    // shape fallback serves every capture's pointee, not only
+    // the first.
+    let dir = temp_dir("async-precise-capture-move-two-refs");
+    let src = fixture(
+        &dir,
+        "precise_capture_move_two_refs.rs",
+        PRECISE_CAPTURE_MOVE_TWO_REFS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two fanned-out reference captures must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after call\nafter await\ntee fixed\nfixed\nuntouched\n",
+        "all captured fields are written through the derived references"
+    );
+}
