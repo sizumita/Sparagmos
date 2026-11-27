@@ -77,8 +77,6 @@ impl<'a> Interpreter<'a> {
             | S::SaturatingAdd
             | S::SaturatingSub
             | S::CarrylessMul
-            | S::FunnelShl
-            | S::FunnelShr
             | S::MaximumNumber
             | S::MinimumNumber => {
                 let a = simd_lanes(&vals[0])?;
@@ -87,6 +85,17 @@ impl<'a> Interpreter<'a> {
                 let mut out = Vec::with_capacity(a.len());
                 for (x, y) in a.iter().zip(b.iter()) {
                     out.push(simd_binop(op, x, y, info)?);
+                }
+                simd_wrap(&vals[0], out)
+            }
+            S::FunnelShl | S::FunnelShr => {
+                let a = simd_lanes(&vals[0])?;
+                let b = simd_lanes(&vals[1])?;
+                let shift = simd_lanes(&vals[2])?;
+                let info = self.simd_lane_info(tag0, &a);
+                let mut out = Vec::with_capacity(a.len());
+                for ((x, y), s) in a.iter().zip(b.iter()).zip(shift.iter()) {
+                    out.push(simd_funnel(op, x, y, s, info)?);
                 }
                 simd_wrap(&vals[0], out)
             }
@@ -736,8 +745,43 @@ fn simd_binop(
             }
             result
         }
+        _ => {
+            return Err(unsupported(
+                "this simd operation on integer lanes is not runtime-supported",
+            ))
+        }
+    };
+    Ok(wrap_simd_int(pattern, bits, signed))
+}
+
+/// One lane of a SIMD funnel shift: the two operands are
+/// concatenated (the first in the high half, the second in
+/// the low half) and the lane is the `bits`-wide window the
+/// shift selects from the double-width value — a left
+/// funnel shift takes the window at the top, a right funnel
+/// shift the one at the bottom. The shift is a lane of the
+/// call's third argument, taken modulo the lane width, as
+/// the hardware funnel-shift instructions take it.
+fn simd_funnel(
+    op: SimdOp,
+    a: &Value,
+    b: &Value,
+    shift: &Value,
+    info: (u32, bool, Option<u32>),
+) -> InterpResult<Value> {
+    use SimdOp as S;
+    let (bits, signed, float_bits) = info;
+    if float_bits.is_some() {
+        return Err(unsupported(
+            "simd funnel shift on float lanes is not runtime-supported",
+        ));
+    }
+    let mask = bit_mask(bits);
+    let pa = as_u128(a, "simd lane")? & mask;
+    let pb = as_u128(b, "simd lane")? & mask;
+    let s = (as_u128(shift, "simd lane")? % u128::from(bits)) as u32;
+    let pattern = match op {
         S::FunnelShl => {
-            let s = (pb % u128::from(bits)) as u32;
             if s == 0 {
                 pa
             } else {
@@ -745,18 +789,13 @@ fn simd_binop(
             }
         }
         S::FunnelShr => {
-            let s = (pb % u128::from(bits)) as u32;
             if s == 0 {
                 pb
             } else {
                 (pa << (bits - s)) | (pb >> s)
             }
         }
-        _ => {
-            return Err(unsupported(
-                "this simd operation on integer lanes is not runtime-supported",
-            ))
-        }
+        _ => unreachable!("simd_funnel called with a non-funnel operation"),
     };
     Ok(wrap_simd_int(pattern, bits, signed))
 }

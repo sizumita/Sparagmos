@@ -300,6 +300,14 @@ pub(crate) fn pointer_lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::align_of_val" | "core::intrinsics::align_of_val" => {
             Builtin::MemAlignOfVal
         }
+        // The vtable header loads: the size / alignment
+        // stored in the vtable a raw pointer denotes.
+        "std::intrinsics::vtable_size" | "core::intrinsics::vtable_size" => {
+            Builtin::VtableSize
+        }
+        "std::intrinsics::vtable_align" | "core::intrinsics::vtable_align" => {
+            Builtin::VtableAlign
+        }
         "std::intrinsics::fadd_fast" | "core::intrinsics::fadd_fast" => {
             Builtin::FastFloat(FastFloatOp::Add)
         }

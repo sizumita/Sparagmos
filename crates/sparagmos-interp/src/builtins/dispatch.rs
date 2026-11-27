@@ -2032,6 +2032,13 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 Ok(self.take_panic_hook())
             }
+            Builtin::PanicUpdateHook => {
+                arity(1)?;
+                self.update_panic_hook(
+                    vals.into_iter().next().expect("one argument"),
+                );
+                Ok(Value::Unit)
+            }
             Builtin::CallerLocation => {
                 // A `#[track_caller]` function's location is the
                 // one it received (bound to its synthetic local);
@@ -8475,6 +8482,18 @@ impl<'a> Interpreter<'a> {
                     Err(unsupported(format!(
                         "align_of_val for {tag} is not runtime-supported"
                     )))
+                }
+            }
+            Builtin::VtableSize | Builtin::VtableAlign => {
+                arity(1)?;
+                let want_align = kind == Builtin::VtableAlign;
+                match self.vtable_stored_layout(frames, &vals[0]) {
+                    Some((size, align)) => {
+                        Ok(Value::Uint(if want_align { align } else { size }))
+                    }
+                    None => Err(unsupported(
+                        "vtable_size/vtable_align for a pointer denoting no recorded vtable",
+                    )),
                 }
             }
             Builtin::FastFloat(op) => {

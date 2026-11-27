@@ -84,6 +84,7 @@ pub(crate) fn panic_hook_lookup(canonical: &str) -> Option<Builtin> {
         "std::panic::set_backtrace_style" => Builtin::PanicSetBacktraceStyle,
         "std::panic::always_abort" => Builtin::PanicAlwaysAbort,
         "std::panic::take_hook" => Builtin::PanicTakeHook,
+        "std::panic::update_hook" => Builtin::PanicUpdateHook,
         _ => return None,
     })
 }

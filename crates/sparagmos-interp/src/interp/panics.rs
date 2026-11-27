@@ -97,7 +97,19 @@ impl<'a> Interpreter<'a> {
                     fields: vec![Value::Str(String::new()), Value::Uint(0), Value::Uint(0)],
                 }))
             });
-        self.call_panic_hook(frames, message, payload.clone(), location, true);
+        self.call_panic_hook(
+            frames,
+            message,
+            payload.clone(),
+            location,
+            true,
+            HookReportCtx {
+                message: message.to_string(),
+                in_flight,
+                origin,
+                no_backtrace,
+            },
+        );
     }
 
     /// Install the guest's panic hook (see
@@ -123,6 +135,23 @@ impl<'a> Interpreter<'a> {
             .borrow_mut()
             .take()
             .unwrap_or_else(default_hook_value)
+    }
+
+    /// Install the hook `std::panic::update_hook` produces:
+    /// a chain marker carrying the update closure and the
+    /// hook in place before it (the default-hook marker when
+    /// none was installed). When the hook fires, the update
+    /// closure runs with the previous hook as its first
+    /// argument, exactly as std's own wrapper closure
+    /// presents the hook it captured (see
+    /// [`Interpreter::invoke_panic_hook`]).
+    pub(crate) fn update_panic_hook(&self, update: Value) {
+        let prev = self
+            .panic_hook
+            .borrow()
+            .clone()
+            .unwrap_or_else(default_hook_value);
+        *self.panic_hook.borrow_mut() = Some(updated_hook_value(update, prev));
     }
 
     /// Record the caller-location stamp of a panic being raised
@@ -754,7 +783,19 @@ thread '{name}' ({tid}) panicked:
                     Value::Uint(location.2 as u128),
                 ],
             }));
-            self.call_panic_hook(frames, message, None, stamp, false);
+            self.call_panic_hook(
+                frames,
+                message,
+                None,
+                stamp,
+                false,
+                HookReportCtx {
+                    message: message.to_string(),
+                    in_flight,
+                    origin: Some(PanicOrigin::PanicFn),
+                    no_backtrace: force_no_backtrace,
+                },
+            );
         } else {
             let head = self.panic_report_head_text(Some(location), message);
             self.push_error_output(&head);
@@ -772,9 +813,12 @@ thread '{name}' ({tid}) panicked:
     /// Call the guest's custom panic hook with a modelled
     /// `PanicHookInfo` (payload as a `dyn Any` reference, the
     /// location stamp, `can_unwind`). A panic raised by the
-    /// hook itself is discarded here: `fire_panic_hook` has
-    /// already printed the processing-panic abort lines for it
-    /// and marked the run for abort.
+    /// hook itself is discarded by the invocation: the fire
+    /// has already printed the processing-panic abort lines
+    /// for it and marked the run for abort. The panic's
+    /// report context is stashed for the invocation, so an
+    /// `update_hook` chain that bottoms out in the default
+    /// hook prints the default report from it.
     fn call_panic_hook(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -782,6 +826,7 @@ thread '{name}' ({tid}) panicked:
         payload: Option<PanicPayload>,
         location: Value,
         can_unwind: bool,
+        report: HookReportCtx,
     ) {
         let hook = self.panic_hook.borrow().clone();
         let Some(hook) = hook else { return };
@@ -809,24 +854,174 @@ thread '{name}' ({tid}) panicked:
             ],
         };
         let info_ref = Value::Ref(RefTarget::value(info));
-        let Ok((callable, _)) = self.dyn_callable(frames, &hook) else {
-            return;
-        };
+        let prev_ctx = self.hook_report_ctx.borrow_mut().replace(report);
         self.in_panic_hook = true;
-        let result =
-            self.call_callable_to_completion(frames, &callable, vec![info_ref]);
+        self.invoke_panic_hook(frames, &hook, info_ref);
         self.in_panic_hook = false;
-        // An abort raised inside the hook (a `resume_unwind`
-        // the in-hook check aborts, an `always_abort` resume)
-        // cannot travel back through this call — its result is
-        // discarded by design, as a hook's own failure is — so
-        // it is recorded on the run instead: the unwinder
-        // converts the in-flight panic into the abort when it
-        // sees the mark, which is the process abort std
-        // performs at the raise.
+        *self.hook_report_ctx.borrow_mut() = prev_ctx;
+    }
+
+    /// Invoke a panic hook value with a `PanicHookInfo`
+    /// reference: a plain hook value runs as the hook itself;
+    /// an `update_hook` chain link runs its update closure
+    /// with the previous hook as its first argument (the
+    /// closure then calls it — or not — through the `Fn`
+    /// dispatch, which routes back here for the model-side
+    /// markers); the default hook prints the default report
+    /// from the running panic's stashed report context.
+    pub(crate) fn invoke_panic_hook(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        hook: &Value,
+        info_ref: Value,
+    ) {
+        if is_default_hook(hook) {
+            self.print_hook_default_report(frames, &info_ref);
+            return;
+        }
+        if let Some((update, prev)) = updated_hook_parts(hook) {
+            let prev_ref = Value::Ref(RefTarget::value(prev));
+            self.call_hook_callable(frames, &update, vec![prev_ref, info_ref]);
+            return;
+        }
+        self.call_hook_callable(frames, hook, vec![info_ref]);
+    }
+
+    /// Call a hook-side callable value to completion: the
+    /// boxed `dyn Fn` the guest installed (its callable is
+    /// the value the fat pointer denotes), or an
+    /// `update_hook` closure handed over by value. The
+    /// outcome is discarded, as a hook's own failure is: an
+    /// abort raised inside the hook (a `resume_unwind` the
+    /// in-hook check aborts, an `always_abort` resume) cannot
+    /// travel back through this call, so it is recorded on
+    /// the run instead — the unwinder converts the in-flight
+    /// panic into the abort when it sees the mark, which is
+    /// the process abort std performs at the raise.
+    fn call_hook_callable(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        args: Vec<Value>,
+    ) {
+        let callable = match value {
+            Value::DynRef { .. } => match self.dyn_callable(frames, value) {
+                Ok((callable, _)) => callable,
+                Err(_) => return,
+            },
+            other => other.clone(),
+        };
+        let result = self.call_callable_to_completion(frames, &callable, args);
         if matches!(result, Err(InterpError::Abort { .. })) {
             self.hook_abort.set(true);
         }
+    }
+
+    /// Print the default panic report for the panic whose
+    /// hook is running, as the default hook does when an
+    /// `update_hook` chain bottoms out in it: the head from
+    /// the info's own location and the stashed message, then
+    /// the backtrace part the resolved style prescribes.
+    fn print_hook_default_report(&mut self, frames: &[Frame], info_ref: &Value) {
+        if self.panic_report_suppressed.get() {
+            return;
+        }
+        let location = self.hook_info_location(frames, info_ref);
+        let ctx = { self.hook_report_ctx.borrow().clone() };
+        match ctx {
+            Some(ctx) => {
+                let head = self.panic_report_head_text(location, &ctx.message);
+                self.push_error_output(&head);
+                self.print_report_backtrace_part(
+                    frames,
+                    ctx.in_flight,
+                    &ctx.origin,
+                    ctx.no_backtrace,
+                );
+            }
+            None => {
+                // No panic is being reported (a taken default
+                // hook called by hand): the info alone names
+                // the location, and its payload the message
+                // when the payload is a plain string.
+                let message =
+                    self.hook_info_message(frames, info_ref).unwrap_or_default();
+                let head = self.panic_report_head_text(location, &message);
+                self.push_error_output(&head);
+                self.print_report_backtrace_part(frames, 1, &None, false);
+            }
+        }
+    }
+
+    /// The value a `PanicHookInfo` reference denotes.
+    fn hook_info_value(&self, frames: &[Frame], info_ref: &Value) -> Option<Value> {
+        let resolved = self.deref_value(frames, info_ref).ok()?;
+        self.read_resolved(frames, &resolved).ok()
+    }
+
+    /// The location a modelled `PanicHookInfo` carries (its
+    /// second field, the raising panic's stamp), as a
+    /// `(file, line, column)` triple.
+    fn hook_info_location(
+        &self,
+        frames: &[Frame],
+        info_ref: &Value,
+    ) -> Option<(String, u64, u64)> {
+        let info = self.hook_info_value(frames, info_ref)?;
+        let Value::Enum { fields, .. } = info else {
+            return None;
+        };
+        let stamp = fields.get(1)?;
+        Self::location_of_stamp(stamp)
+    }
+
+    /// The message a modelled `PanicHookInfo` carries, when
+    /// its payload is a plain string value.
+    fn hook_info_message(&self, frames: &[Frame], info_ref: &Value) -> Option<String> {
+        let info = self.hook_info_value(frames, info_ref)?;
+        let Value::Enum { fields, .. } = info else {
+            return None;
+        };
+        let payload = fields.first()?;
+        let Value::DynRef { base, .. } = payload else {
+            return None;
+        };
+        let Value::Enum { fields, .. } = &**base else {
+            return None;
+        };
+        match fields.first()? {
+            Value::Str(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// The panic-hook marker a `Fn`-trait call's receiver
+    /// denotes, when it denotes one: the receiver read in
+    /// place (a peek — the call's own dispatch evaluates the
+    /// operand itself when this returns `None`), followed
+    /// through the reference layers an `Fn` call presents.
+    /// The marked calls are the `prev` invocations of
+    /// `update_hook` closures, which no guest body serves.
+    pub(crate) fn peek_panic_hook_receiver(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        receiver: &Operand,
+    ) -> Option<Value> {
+        let (mut value, _) = self.eval_callable(frames, body, receiver).ok()?;
+        for _ in 0..4 {
+            if is_panic_hook_marker(&value) {
+                return Some(value);
+            }
+            match value {
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    let resolved = self.deref_value(frames, &value).ok()?;
+                    value = self.read_resolved(frames, &resolved).ok()?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Mark the panic about to be raised as a resumed one (the

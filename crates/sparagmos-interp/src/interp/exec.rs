@@ -1049,6 +1049,27 @@ impl<'a> Interpreter<'a> {
                             ));
                         }
                     };
+                    // A call on a panic-hook marker value (the
+                    // default hook, or an `update_hook` chain
+                    // link): the `prev` invocation of an update
+                    // closure. No guest body serves it; the
+                    // hook machinery runs it synchronously, as
+                    // it runs the hook itself.
+                    if let Some(hook) =
+                        self.peek_panic_hook_receiver(frames, body, receiver)
+                    {
+                        let info_ref =
+                            arg_values.first().cloned().unwrap_or(Value::Unit);
+                        self.invoke_panic_hook(frames, &hook, info_ref);
+                        let Some(bb) = target else {
+                            return Err(InterpError::MissingContinuation {
+                                func: func_name.clone(),
+                            });
+                        };
+                        self.write_place(frames, body, destination, Value::Unit)?;
+                        Self::jump(frames, body, *bb)?;
+                        continue 'drive;
+                    }
                     // The callable value, and the environment
                     // argument a closure body expects as its first
                     // argument. For `call` / `call_mut` the receiver

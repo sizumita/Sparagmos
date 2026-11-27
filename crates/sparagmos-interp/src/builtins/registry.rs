@@ -820,6 +820,11 @@ pub enum Builtin {
     /// `std::panic::take_hook()`: take the panic hook, leaving
     /// the default in its place.
     PanicTakeHook,
+    /// `std::panic::update_hook(f)`: replace the panic hook
+    /// with a chain link that runs `f` with the previous hook
+    /// and the panic info (see
+    /// `Interpreter::update_panic_hook`).
+    PanicUpdateHook,
     /// `test::test_main_env_args(&[TestDescAndFn]) -> ExitCode`:
     /// the libtest entry point. The compiler-generated harness
     /// main calls a crate-local wrapper of this name, so the
@@ -1364,6 +1369,13 @@ pub enum Builtin {
     MemSizeOfVal,
     /// `std::mem::align_of_val(&value)`.
     MemAlignOfVal,
+    /// `core::intrinsics::vtable_size(ptr)`: the size
+    /// stored in the vtable the pointer denotes -- the
+    /// size of the concrete type the vtable is for.
+    VtableSize,
+    /// `core::intrinsics::vtable_align(ptr)`: the
+    /// alignment stored in the vtable the pointer denotes.
+    VtableAlign,
     /// A `*_fast` float intrinsic (`fadd_fast`, `fsub_fast`,
     /// `fmul_fast`, `fdiv_fast`, `frem_fast`): the ordinary
     /// floating-point operation. The `fast` contract only
