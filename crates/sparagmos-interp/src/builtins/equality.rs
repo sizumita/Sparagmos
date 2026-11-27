@@ -118,6 +118,28 @@ fn elem_shape_matches(value: &Value, elem_ty: &Ty) -> bool {
     }
 }
 
+/// Whether a resolved value is a bare pointee snapshot:
+/// the form a box's pointee takes when a consumer (a sort,
+/// above all) extracted it from the box -- a byte string, a
+/// string, a scalar, or an element sequence -- as opposed
+/// to an aggregate that might itself be a stored box or
+/// another modelled type's own form.
+fn is_bare_pointee_form(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Bytes(_)
+            | Value::Str(_)
+            | Value::Tuple(_)
+            | Value::SparseVec { .. }
+            | Value::Uint(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Float128(_)
+            | Value::Bool(_)
+            | Value::Unit
+    )
+}
+
 /// The pointee tag a `Box` type tag names: the first
 /// generic argument inside the `Box<..>` (the allocator
 /// argument follows it). `None` when the tag is not a box
@@ -381,10 +403,12 @@ impl<'a> Interpreter<'a> {
     /// does), which the structural comparison below reads as
     /// different values. Extracting each side's pointer and
     /// comparing those values compares the pointees in
-    /// whatever form each pointer carries. `None` when the
+    /// whatever form each pointer carries. A side whose
+    /// pointer cannot be extracted may still be the bare
+    /// pointee itself (see the match below). `None` when the
     /// comparison is not a same-type box comparison or a
-    /// side's pointer cannot be extracted, in which case the
-    /// ordinary comparison judges. A `Path` / `PathBuf`
+    /// side is neither a box nor a bare pointee, in which
+    /// case the ordinary comparison judges. A `Path` / `PathBuf`
     /// pointee keeps the ordinary path: its equality is
     /// component-wise, not the pointee's structural one.
     pub(crate) fn box_pointee_equal(
@@ -402,8 +426,34 @@ impl<'a> Interpreter<'a> {
         if pointee.contains("::path::Path") {
             return None;
         }
-        let pa = self.box_cmp_pointer(frames, a)?;
-        let pb = self.box_cmp_pointer(frames, b)?;
+        let pa = self.box_cmp_pointer(frames, a);
+        let pb = self.box_cmp_pointer(frames, b);
+        // One side may fail to extract because it is not a
+        // box at all but the bare pointee: an element move
+        // (a sort's rotation, above all) can leave a slot
+        // holding the pointee snapshot the box denoted, and
+        // a comparison between the stored box and that
+        // snapshot is still the pointees' comparison. A side
+        // that is neither a box nor a bare pointee form
+        // keeps the ordinary path.
+        let (pa, pb) = match (pa, pb) {
+            (Some(pa), Some(pb)) => (pa, pb),
+            (Some(ptr), None) => {
+                let bare = self.resolve_ref(frames, b).ok()?;
+                if !is_bare_pointee_form(&bare) {
+                    return None;
+                }
+                return Some(self.values_equal(frames, &ptr, b));
+            }
+            (None, Some(ptr)) => {
+                let bare = self.resolve_ref(frames, a).ok()?;
+                if !is_bare_pointee_form(&bare) {
+                    return None;
+                }
+                return Some(self.values_equal(frames, a, &ptr));
+            }
+            (None, None) => return None,
+        };
         // A slice pointee compares element-wise. The
         // element reading needs the element type the tag
         // names: a fat pointer of length 1 formed over the
@@ -426,6 +476,150 @@ impl<'a> Interpreter<'a> {
             }
         }
         Some(self.values_equal(frames, &pa, &pb))
+    }
+
+    /// Ordering of two `Box` values through their
+    /// pointees, the `PartialOrd` / `Ord` counterpart of
+    /// [`Self::box_pointee_equal`]: std's ordering impls for
+    /// `Box<T>` are the pointee's own, so the pair is
+    /// decided by the values the boxes' pointers denote, in
+    /// whatever form each side carries them.
+    ///
+    /// Two presentations reach this dispatch. A tagged call
+    /// (the call's own `Self` tag names the `Box`) mirrors
+    /// `box_pointee_equal`'s gating exactly, the `Path`
+    /// exclusion included: a path's ordering is
+    /// component-wise, not the pointee's byte order, and
+    /// belongs to the path dispatch, which runs before this
+    /// one; the box shortcut never decides a path
+    /// comparison, here as in equality. An untagged call --
+    /// one the converter kept in generic form, which is how
+    /// a sort over a `Vec<Box<T>>` compares -- carries no
+    /// type tags, and there the stored box itself is the
+    /// signal: the sort's rotation hands the comparison one
+    /// side as the box aggregate a collection slot holds and
+    /// the other as the bare pointee snapshot it extracted,
+    /// a pair the structural comparison below has no arm
+    /// for. When exactly one side is such a stored box (see
+    /// `stored_box_pointer`) and the other resolves to a
+    /// bare pointee form, substituting the box's pointer for
+    /// the box lets the ordinary comparison judge the pair.
+    /// A pair of stored boxes needs no substitution (the
+    /// structural comparison already descends through the
+    /// aggregates to the pointees), and a side that resolves
+    /// to an aggregate is never taken for a bare pointee, so
+    /// no other type's comparison is decided here.
+    pub(crate) fn box_pointee_cmp(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<Option<Ordering>>> {
+        if generic_args.is_empty() {
+            return self.box_mixed_cmp(frames, a, b, true, None);
+        }
+        let self_tag = generic_args.first()?;
+        if generic_args.len() > 1 && generic_args.get(1) != Some(self_tag) {
+            return None;
+        }
+        let pointee = box_pointee_tag(self_tag)?;
+        if pointee.contains("::path::Path") {
+            return None;
+        }
+        // A slice pointee orders element-wise (see
+        // `box_pointee_equal` for why the element reading
+        // needs the element type the tag names).
+        let elem_ty = pointee
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(ty_from_tag);
+        self.box_mixed_cmp(frames, a, b, false, elem_ty.as_ref())
+    }
+
+    /// The comparison of a box pair whose sides
+    /// independently present as a box (its pointer
+    /// extracted) or as the bare pointee (see
+    /// `box_pointee_cmp` for the presentations). With
+    /// `stored_only` the extraction is `stored_box_pointer`'s
+    /// (the untagged signal); otherwise it is
+    /// `box_cmp_pointer`'s, as in `box_pointee_equal`. Two
+    /// extracted pointers compare through their pointees --
+    /// element-wise under `elem_ty` when the pointee is a
+    /// slice -- and a pointer against a bare side compares
+    /// through the ordinary comparison, which resolves the
+    /// pointer to the same pointee the bare side snapshots.
+    /// A side that is neither keeps the ordinary comparison
+    /// in charge (`None`).
+    fn box_mixed_cmp(
+        &self,
+        frames: &[Frame],
+        a: &Value,
+        b: &Value,
+        stored_only: bool,
+        elem_ty: Option<&Ty>,
+    ) -> Option<InterpResult<Option<Ordering>>> {
+        let extract = |v: &Value| {
+            if stored_only {
+                self.stored_box_pointer(frames, v)
+            } else {
+                self.box_cmp_pointer(frames, v)
+            }
+        };
+        match (extract(a), extract(b)) {
+            (Some(pa), Some(pb)) => {
+                if let Some(elem_ty) = elem_ty {
+                    let ea = self.box_slice_elements(frames, &pa, elem_ty)?;
+                    let eb = self.box_slice_elements(frames, &pb, elem_ty)?;
+                    return Some(self.seq_cmp(frames, &ea, &eb));
+                }
+                Some(self.values_cmp(frames, &pa, &pb, None))
+            }
+            (Some(ptr), None) => {
+                let bare = self.resolve_ref(frames, b).ok()?;
+                if !is_bare_pointee_form(&bare) {
+                    return None;
+                }
+                Some(self.values_cmp(frames, &ptr, b, None))
+            }
+            (None, Some(ptr)) => {
+                let bare = self.resolve_ref(frames, a).ok()?;
+                if !is_bare_pointee_form(&bare) {
+                    return None;
+                }
+                Some(self.values_cmp(frames, a, &ptr, None))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// The pointer a stored box value denotes, when the
+    /// operand resolves to the box aggregate itself (the
+    /// form a collection slot holds): the same first-field
+    /// descent as [`Self::box_cmp_pointer`], except that a
+    /// value which is already a pointer (or a bare pointee)
+    /// is not a stored box and answers `None`. The descent
+    /// reaches a pointer only through the wrapper chain a
+    /// box is stored as; the other modelled string-like and
+    /// collection forms end at their element lists instead
+    /// (see `is_pathbuf_value`), so their comparisons are
+    /// never mistaken for a box's.
+    fn stored_box_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
+        let mut cur = self.resolve_ref(frames, arg).ok()?.into_owned();
+        if !matches!(cur, Value::Enum { .. }) {
+            return None;
+        }
+        loop {
+            match cur {
+                Value::Enum { fields, .. } if !fields.is_empty() => {
+                    cur = fields.into_iter().next()?;
+                }
+                ptr @ (Value::Ref(_)
+                | Value::FatRef { .. }
+                | Value::DynRef { .. }) => return Some(ptr),
+                _ => return None,
+            }
+        }
     }
 
     /// The elements of one side of a box-of-slice
