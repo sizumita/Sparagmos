@@ -14,7 +14,7 @@
 //!   `std::io::_print` and friends are builtins, so printing is
 //!   inside the supported range and the output is real);
 //! * the guest panics → exit 101, the stdout it produced before
-//!   the panic, the panic message on stderr;
+//!   the panic, std's default panic report on stderr;
 //! * anything the driver, the dump reader, or the JIT cannot handle
 //!   → [`UnsupportedReason::Feature`] with the concrete reason.
 //!
@@ -161,7 +161,13 @@ impl JitRunner {
                 let (stdout, stderr) = prog.guest_output();
                 Ok(RunResult {
                     stdout,
-                    stderr: format!("{stderr}panicked: {}", rec.message),
+                    stderr: format!(
+                        "{stderr}{}",
+                        sparagmos_jit::std_default_panic_report(
+                            &rec.message,
+                            rec.location.as_deref()
+                        )
+                    ),
                     exit_code: Some(101),
                 })
             }

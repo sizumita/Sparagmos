@@ -34,3 +34,4 @@ pub use builtins::{Builtin, BuiltinCtx, BuiltinTables, FloatOp, FmtDescriptor, F
 pub use memory::JitMemory;
 pub use mir_jit::{JitCallError, JitError, JitProgram, MirFunctionInput, MirProgramInput};
 pub use program::CompiledProgram;
+pub use sparagmos_runtime::error::std_default_panic_report;

@@ -205,3 +205,36 @@ fn jit_bounds_check_assert_message() {
         "index out of bounds: the len is 5 but the index is 10",
     );
 }
+
+#[test]
+fn jit_panic_report_is_std_default_shape() {
+    // #540: a guest panic under run-jit prints std's default
+    // panic report on stderr, not the JIT path's former invented
+    // `thread 'main' panicked: <msg>` line. The JIT records no
+    // location, so the head is the no-location form the
+    // interpreter also uses; with the backtrace environment off
+    // the report ends with the `RUST_BACKTRACE=1` note.
+    let dir = temp_dir("report-shape");
+    let file = fixture(&dir, "case.rs", "fn main() { panic!(\"quux\"); }\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run-jit")
+        .arg(&file)
+        .arg("--edition")
+        .arg("2021")
+        .env("RUST_BACKTRACE", "0")
+        .env_remove("RUST_LIB_BACKTRACE")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101), "expected exit 101");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr,
+        "\nthread 'main' (1) panicked:\nquux\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        "stderr must be exactly std's default panic report"
+    );
+    assert!(
+        !stderr.contains("panicked: quux"),
+        "the invented single-line form must not appear: {stderr}"
+    );
+}
