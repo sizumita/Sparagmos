@@ -302,6 +302,33 @@ fn dangling_displaced(align: u64, projection: &[RefProj]) -> u128 {
     base.checked_add_signed(sum).unwrap_or(base)
 }
 
+/// The byte offset of field `idx` of the aggregate at
+/// field path `path`, from the field layouts conversion
+/// recorded for the root local (see
+/// `ir::Body::local_field_layouts`): the sibling fields'
+/// (size, align) entries at that path, laid out in
+/// declaration order with alignment padding, exactly as
+/// [`Interpreter::tuple_layout`] lays out a tuple whose
+/// field types it can size. `None` when any sibling's
+/// layout was not recorded.
+fn recorded_field_offset(
+    layouts: &std::collections::HashMap<Vec<usize>, (u64, u64)>,
+    path: &[usize],
+    idx: usize,
+) -> Option<u64> {
+    let mut cursor: u128 = 0;
+    for i in 0..idx {
+        let mut key = path.to_vec();
+        key.push(i);
+        let &(size, align) = layouts.get(&key)?;
+        cursor = align_up_u128(cursor, align) + u128::from(size);
+    }
+    let mut key = path.to_vec();
+    key.push(idx);
+    let &(_, align) = layouts.get(&key)?;
+    u64::try_from(align_up_u128(cursor, align)).ok()
+}
+
 /// `value` rounded up to a multiple of `align` (a power of
 /// two, at least one).
 fn align_up_u128(value: u128, align: u64) -> u128 {
@@ -1168,10 +1195,39 @@ impl<'a> Interpreter<'a> {
                 })
             })
             .collect();
+        // A local whose declared size the type walk cannot
+        // recover (a bare ADT name denoting several recorded
+        // instances, or a composite of them): conversion
+        // recorded the size while the generic arguments were
+        // at hand (see `ir::Body::local_sizes`, and the root
+        // entry of `ir::Body::local_field_layouts`).
+        let sizes: Vec<Option<u64>> = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(i, size)| {
+                size.or_else(|| body.local_sizes.get(i).copied().flatten())
+                    .or_else(|| {
+                        body.local_field_layouts
+                            .get(i)
+                            .and_then(|m| m.get(&Vec::new()))
+                            .map(|&(size, _)| size)
+                    })
+            })
+            .collect();
         let aligns: Vec<u64> = body
             .local_tys
             .iter()
-            .map(|t| self.ty_align(t).unwrap_or(1))
+            .enumerate()
+            .map(|(i, t)| {
+                self.ty_align(t)
+                    .or_else(|| {
+                        body.local_field_layouts
+                            .get(i)
+                            .and_then(|m| m.get(&Vec::new()))
+                            .map(|&(_, align)| align)
+                    })
+                    .unwrap_or(1)
+            })
             .collect();
         let mut managed = vec![false; n];
         let mut any_storage = false;
@@ -1842,11 +1898,13 @@ impl<'a> Interpreter<'a> {
                 }
                 let layout = self.slot_layout(&func)?;
                 let slot = layout.slots.get(*local).copied()??;
-                let offset = self.projection_offset_with_root_elem(
+                let root_field_layouts = body.local_field_layouts.get(*local);
+                let offset = self.projection_offset_with_root_layout(
                     Some(root_ty),
                     projection,
                     leaf_ty,
                     root_elem_size,
+                    root_field_layouts,
                 )?;
                 displaced_price(base + u128::from(slot), offset)
             }
@@ -2238,10 +2296,41 @@ impl<'a> Interpreter<'a> {
         leaf_ty: Option<&Ty>,
         root_elem_size: Option<u64>,
     ) -> Option<i128> {
+        self.projection_offset_with_root_layout(
+            root_ty,
+            projection,
+            leaf_ty,
+            root_elem_size,
+            None,
+        )
+    }
+
+    /// [`Self::projection_offset_with_root_elem`] with the
+    /// field layouts conversion recorded for the root local
+    /// (see `ir::Body::local_field_layouts`): where the walk
+    /// cannot price a field step from the IR types (a field
+    /// whose type is a bare ADT name denoting several
+    /// recorded instances), the recorded (size, align) of
+    /// the step's sibling fields prices it in declaration
+    /// order, the order the value model stores aggregates
+    /// in.
+    fn projection_offset_with_root_layout(
+        &self,
+        root_ty: Option<&Ty>,
+        projection: &[RefProj],
+        leaf_ty: Option<&Ty>,
+        root_elem_size: Option<u64>,
+        root_field_layouts: Option<
+            &std::collections::HashMap<Vec<usize>, (u64, u64)>,
+        >,
+    ) -> Option<i128> {
         match root_ty {
-            Some(root) => {
-                self.projection_offset_forward(root, projection, root_elem_size)
-            }
+            Some(root) => self.projection_offset_forward(
+                root,
+                projection,
+                root_elem_size,
+                root_field_layouts,
+            ),
             None => self.projection_offset_backward(projection, leaf_ty),
         }
     }
@@ -2254,18 +2343,47 @@ impl<'a> Interpreter<'a> {
         root: &Ty,
         projection: &[RefProj],
         root_elem_size: Option<u64>,
+        root_field_layouts: Option<
+            &std::collections::HashMap<Vec<usize>, (u64, u64)>,
+        >,
     ) -> Option<i128> {
         let mut offset: i128 = 0;
         let mut cur = Some(WalkTy::Ty(root.clone()));
         let mut variant: u32 = 0;
+        // The field-index path from the root, valid while
+        // every step so far was a field step: the recorded
+        // field layouts are keyed by it.
+        let mut path: Vec<usize> = Vec::new();
+        let mut path_valid = true;
         for (step_idx, step) in projection.iter().enumerate() {
             match step {
                 RefProj::Field(idx) => {
-                    let c = cur.as_ref()?;
-                    offset += i128::from(self.field_offset(c, variant, *idx)?);
-                    cur = self.field_walk_ty(c, variant, *idx);
+                    let typed = cur
+                        .as_ref()
+                        .and_then(|c| self.field_offset(c, variant, *idx));
+                    let off = match typed {
+                        Some(off) => off,
+                        None => {
+                            if !path_valid {
+                                return None;
+                            }
+                            recorded_field_offset(
+                                root_field_layouts?,
+                                &path,
+                                *idx,
+                            )?
+                        }
+                    };
+                    offset += i128::from(off);
+                    if path_valid {
+                        path.push(*idx);
+                    }
+                    cur = cur.as_ref().and_then(|c| {
+                        self.field_walk_ty(c, variant, *idx)
+                    });
                 }
                 RefProj::Index(i) => {
+                    path_valid = false;
                     let c = cur.as_ref()?;
                     let Some((elem_size, elem_ty)) = self.sequence_elem(c)
                     else {
@@ -2293,6 +2411,7 @@ impl<'a> Interpreter<'a> {
                     cur = Some(elem_ty);
                 }
                 RefProj::Subslice { offset: o, .. } => {
+                    path_valid = false;
                     let c = cur.as_ref()?;
                     let Some((elem_size, _)) = self.sequence_elem(c) else {
                         // See the `Index` arm: the recorded
@@ -2314,9 +2433,11 @@ impl<'a> Interpreter<'a> {
                         i128::try_from(*o).ok()? * i128::from(elem_size);
                 }
                 RefProj::Downcast(v) => {
+                    path_valid = false;
                     variant = *v;
                 }
                 RefProj::UnionField { .. } => {
+                    path_valid = false;
                     // Every field of a union sits at its base;
                     // the position's type is not tracked past
                     // it, so a further structural step falls
@@ -2324,6 +2445,7 @@ impl<'a> Interpreter<'a> {
                     cur = None;
                 }
                 RefProj::ByteOffset(d) => {
+                    path_valid = false;
                     offset += *d;
                     // The position a byte displacement denotes
                     // has no tracked type: a further structural
@@ -2331,6 +2453,7 @@ impl<'a> Interpreter<'a> {
                     cur = None;
                 }
                 RefProj::View(view) => {
+                    path_valid = false;
                     // The recorded denomination (see
                     // `RefProj::View`) does not move the
                     // position; it denominates the steps
@@ -2460,7 +2583,7 @@ impl<'a> Interpreter<'a> {
                 ProjectionElem::Deref => return None,
             }
         }
-        let offset = self.projection_offset_forward(&pointee_ty, &steps, None)?;
+        let offset = self.projection_offset_forward(&pointee_ty, &steps, None, None)?;
         let addr = base.checked_add(offset)?;
         let thin = Value::Ref(RefTarget::Address(u64::try_from(addr).ok()?));
         // A pointer to an unsized pointee is fat: it carries the
@@ -5310,6 +5433,67 @@ mod ptr_equality_tests {
             std::cmp::Ordering::Greater => 2,
         };
         assert_eq!(cmp.0, Value::Enum { variant: want, fields: vec![] });
+    }
+
+    /// Fields of a tuple whose element type is a bare ADT
+    /// name denoting several recorded instances price from
+    /// the field layouts conversion recorded for the local:
+    /// the root local still gets a stack slot (its recorded
+    /// size), and each field sits at its declaration-order
+    /// offset, as natively (the `S<[u8; N]>` fields of
+    /// stdlib-unit-tests/raw-fat-ptr).
+    #[test]
+    fn recorded_field_layouts_price_ambiguous_adt_fields() {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("probe::S<[u8; 2]>".to_string(), (8, 4));
+        program
+            .adt_layouts
+            .insert("probe::S<[u8; 3]>".to_string(), (8, 4));
+        let mut body = Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Tuple(vec![
+                    Ty::Adt("probe::S".to_string()),
+                    Ty::Adt("probe::S".to_string()),
+                    Ty::Adt("probe::S".to_string()),
+                ]),
+            ],
+            vec![],
+        );
+        let mut layouts = std::collections::HashMap::new();
+        layouts.insert(Vec::new(), (24, 4));
+        layouts.insert(vec![0], (8, 4));
+        layouts.insert(vec![1], (8, 4));
+        layouts.insert(vec![2], (8, 4));
+        body.local_field_layouts = vec![Default::default(), layouts];
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert!(slots[1].is_some(), "the tuple local gets a slot");
+        let s_val = |n: u128| Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(n), Value::Bytes(vec![1, 2])],
+        };
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![
+                Value::Unit,
+                Value::Tuple(vec![s_val(7), s_val(10), s_val(4)]),
+            ],
+        )];
+        interp.register_frame_base(&[], 7, "probe::f");
+        let p0 = place_price(&interp, &frames, 1, vec![RefProj::Field(0)], None)
+            .expect("field 0 price");
+        let p1 = place_price(&interp, &frames, 1, vec![RefProj::Field(1)], None)
+            .expect("field 1 price");
+        let p2 = place_price(&interp, &frames, 1, vec![RefProj::Field(2)], None)
+            .expect("field 2 price");
+        assert_eq!(p1 - p0, 8);
+        assert_eq!(p2 - p1, 8);
     }
 
     /// A program with two `Vec<i32>` locals in one body,

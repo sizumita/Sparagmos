@@ -2465,6 +2465,19 @@ pub struct Body {
     /// denominated in the field type's element size. Empty for
     /// hand-built bodies.
     pub field_elem_sizes: Vec<std::collections::HashMap<Vec<usize>, u64>>,
+    /// The (size, align) of each field of each local's declared
+    /// type, keyed by local, then by the field-index path from
+    /// the local (the empty path denotes the local's own type),
+    /// conversion-computed (see `mir_convert`'s
+    /// `collect_field_layouts`). The field-path companion of
+    /// [`Self::local_sizes`]: a projection step into a field
+    /// whose type the IR renders as a bare ADT name denoting
+    /// several recorded instances cannot be priced from the
+    /// declared type alone; this table carries the layouts
+    /// conversion computed while the generic arguments were
+    /// still at hand. Empty for hand-built bodies.
+    pub local_field_layouts:
+        Vec<std::collections::HashMap<Vec<usize>, (u64, u64)>>,
     pub blocks: Vec<BasicBlockData>,
     /// Canonical values of the locals whose declared type is
     /// provably zero-sized, indexed by local (conversion-computed;
@@ -2528,6 +2541,7 @@ impl Body {
             local_sizes: Vec::new(),
             char_locals: Vec::new(),
             field_elem_sizes: Vec::new(),
+            local_field_layouts: Vec::new(),
             blocks,
             zst_locals: Vec::new(),
             zst_fields: Vec::new(),
