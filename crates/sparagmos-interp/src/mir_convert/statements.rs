@@ -2530,6 +2530,33 @@ impl<'a> Converter<'a> {
                         // `lookup`, so no collected body is ever
                         // displaced by them.
                         .or_else(|| crate::builtins::foreign_helper_lookup(&canonical))
+                        // A body-less foreign callee the crate
+                        // binds to a C symbol under a custom
+                        // `#[link_name]` — a renamed helper
+                        // (`strlen`), a versioned symbol
+                        // (`nftw@GLIBC_2.3.3`) — is identified
+                        // by that symbol rather than by its
+                        // Rust path: the driver recorded the
+                        // symbol for the declaration, and the
+                        // foreign-helper models name C symbols
+                        // directly. The unversioned prefix is
+                        // tried after the full symbol, so a
+                        // version-specific model wins when one
+                        // exists.
+                        .or_else(|| {
+                            let def = self.callee_def_id(func)?;
+                            let symbol = self.link_symbols.get(&def)?;
+                            crate::builtins::foreign_helper_lookup(symbol)
+                                .or_else(|| {
+                                    symbol
+                                        .split('@')
+                                        .next()
+                                        .filter(|base| base.len() != symbol.len())
+                                        .and_then(
+                                            crate::builtins::foreign_helper_lookup,
+                                        )
+                                })
+                        })
                         // A compiler intrinsic the guest crate
                         // declares itself (`#[rustc_intrinsic]`,
                         // the minicore shape) is named by its

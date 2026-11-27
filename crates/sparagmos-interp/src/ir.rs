@@ -2766,6 +2766,27 @@ pub struct Program {
     /// callee entered through the value observes is the
     /// declaration's, not the definition's.
     pub fn_link_aliases: HashMap<String, String>,
+    /// The program's link exports: a link symbol (a
+    /// `#[no_mangle]` / `#[export_name]` definition's
+    /// export name) maps to the program key of the one
+    /// converted body exporting it, when there is exactly
+    /// one. This is the table a native dynamic linker's
+    /// symbol lookup searches in the main program, and the
+    /// `dlsym` model answers from it (see
+    /// `builtins::libc_sys`). A symbol exported by no
+    /// converted body, or by several, is absent.
+    pub link_exports: HashMap<String, String>,
+    /// The link symbols of the program's body-less
+    /// declarations, keyed by the name a call names the
+    /// declaration under: a declaration bound to a C
+    /// symbol by `#[link_name]` (a renamed or versioned
+    /// symbol) is identified at conversion by that
+    /// symbol, and the run-time builtin dispatch resolves
+    /// the same symbol through this table (see
+    /// `builtins::dispatch`). Declarations with a
+    /// converted body are absent: their calls run the
+    /// body, never a model.
+    pub link_symbol_names: HashMap<String, String>,
     /// Converted impl-method bodies keyed by the rendered
     /// tag of their `Self` type: `(Self tag, trait path,
     /// method) -> program key`, holding only the triples

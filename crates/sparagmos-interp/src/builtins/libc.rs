@@ -65,6 +65,45 @@ extern "C" {
     /// faithful execution.
     #[link_name = "lgamma_r"]
     pub(super) fn host_lgamma_r(x: f64, signp: *mut std::ffi::c_int) -> f64;
+    /// The host C library's `sysconf`, backing
+    /// [`Builtin::LibcSysconf`]: the guest runs
+    /// in-process, so the host's configuration values
+    /// (page size, group maximum, ...) are the values the
+    /// guest observes.
+    #[link_name = "sysconf"]
+    pub(super) fn host_sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+    /// The host C library's `getuid`, backing
+    /// [`Builtin::LibcGetuid`]: this process's real user
+    /// id, the identity the in-process guest runs with.
+    #[link_name = "getuid"]
+    pub(super) fn host_getuid() -> std::ffi::c_uint;
+    /// The host C library's `getgid`, backing
+    /// [`Builtin::LibcGetgid`]: this process's real group
+    /// id.
+    #[link_name = "getgid"]
+    pub(super) fn host_getgid() -> std::ffi::c_uint;
+    /// The host C library's `clearenv`, backing
+    /// [`Builtin::LibcClearenv`]: the guest's environment
+    /// model is the host environment itself (the
+    /// enumeration and single-key builtins read and
+    /// mutate it directly), so clearing it here clears
+    /// the guest's environment.
+    #[link_name = "clearenv"]
+    pub(super) fn host_clearenv() -> std::ffi::c_int;
+    /// The host C library's `prctl`, backing
+    /// [`Builtin::LibcPrctl`]. The C function is
+    /// variadic; it is declared here with its full
+    /// five-word shape, and the builtin zero-pads the
+    /// arguments the guest's call did not supply, which
+    /// is the value a variadic callee reads for them.
+    #[link_name = "prctl"]
+    pub(super) fn host_prctl(
+        option: std::ffi::c_int,
+        arg2: std::ffi::c_ulong,
+        arg3: std::ffi::c_ulong,
+        arg4: std::ffi::c_ulong,
+        arg5: std::ffi::c_ulong,
+    ) -> std::ffi::c_int;
 }
 
 /// Registration fragment of the builtin name registry: the libc allocator surface.

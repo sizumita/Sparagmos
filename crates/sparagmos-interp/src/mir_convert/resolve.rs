@@ -775,6 +775,30 @@ fn convert_all_with(
             Some((name, target.clone()))
         })
         .collect();
+    // The link exports themselves, for the `dlsym` model:
+    // the unique export of each symbol whose body
+    // converted (the same uniqueness the converter's own
+    // table already enforces).
+    out.link_exports = conv
+        .link_exports
+        .iter()
+        .filter(|(_, target)| out.functions.contains_key(*target))
+        .map(|(symbol, target)| (symbol.clone(), target.clone()))
+        .collect();
+    // The link symbols of the declarations that stayed
+    // body-less, keyed by the name a call names them
+    // under, for the run-time dispatch's symbol fallback.
+    out.link_symbol_names = program
+        .link_symbols
+        .iter()
+        .filter_map(|(def, symbol)| {
+            let name = conv.body_key(def);
+            if out.functions.contains_key(&name) {
+                return None;
+            }
+            Some((name, symbol.clone()))
+        })
+        .collect();
     out.fn_shim_locations = [
         program.fn_shim_locations[0]
             .as_ref()

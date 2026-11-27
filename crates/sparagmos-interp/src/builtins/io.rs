@@ -540,9 +540,10 @@ impl<'a> Interpreter<'a> {
                 }
                 if stream_write_receiver(self_ty) {
                     if stream_is_stderr(self_ty) {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        self.push_error_output(&text);
-                        return Ok(io_result_ok(Value::Uint(bytes.len() as u128)));
+                        return match self.write_stderr_bytes(&bytes) {
+                            Ok(n) => Ok(io_result_ok(Value::Uint(n as u128))),
+                            Err(error) => Ok(io_result_err(host_io_error(&error))),
+                        };
                     }
                     return match self.write_stdout_partial(&bytes) {
                         Ok(n) => Ok(io_result_ok(Value::Uint(n as u128))),
@@ -564,9 +565,10 @@ impl<'a> Interpreter<'a> {
                 }
                 if stream_write_receiver(self_ty) {
                     if stream_is_stderr(self_ty) {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        self.push_error_output(&text);
-                        return Ok(io_result_ok(Value::Unit));
+                        return match self.write_stderr_bytes(&bytes) {
+                            Ok(_) => Ok(io_result_ok(Value::Unit)),
+                            Err(error) => Ok(io_result_err(host_io_error(&error))),
+                        };
                     }
                     return match self.write_stdout(&bytes) {
                         Ok(()) => Ok(io_result_ok(Value::Unit)),

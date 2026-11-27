@@ -135,6 +135,23 @@ impl<'a> Interpreter<'a> {
         // builtin-name consumer.
         let kind = lookup_qualified(name)
             .or_else(|| foreign_helper_lookup(name))
+            // A body-less declaration bound to a C symbol
+            // by `#[link_name]` was identified at
+            // conversion by that symbol; the baked name is
+            // the declaration's Rust path, so resolve the
+            // recorded symbol here too (the unversioned
+            // prefix after the full symbol, as at
+            // conversion).
+            .or_else(|| {
+                let symbol = self.program().link_symbol_names.get(name)?;
+                foreign_helper_lookup(symbol).or_else(|| {
+                    symbol
+                        .split('@')
+                        .next()
+                        .filter(|base| base.len() != symbol.len())
+                        .and_then(foreign_helper_lookup)
+                })
+            })
             .or_else(|| intrinsic_lookup(name))
             .or_else(|| fmt_trait_method(name))
             .or_else(|| net_trait_method(name))
@@ -266,7 +283,15 @@ impl<'a> Interpreter<'a> {
             Builtin::Eprint => {
                 arity(1)?;
                 let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
-                self.push_error_output(&text);
+                // std's `print_to` on the error stream
+                // panics when the write fails, as on the
+                // output stream (see `Builtin::Print`).
+                if let Err(error) = self.write_stderr_bytes(text.as_bytes()) {
+                    return Err(InterpError::Panic {
+                        message: format!("failed printing to stderr: {error}"),
+                        payload: None,
+                    });
+                }
                 Ok(Value::Unit)
             }
             Builtin::FfiIdentity => {
@@ -763,7 +788,20 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::Stdin => {
                 arity(0)?;
-                Ok(file_value(self.stdin_file_id()))
+                // The handle names what descriptor 0
+                // currently denotes: its file entry when
+                // rerouted, the stdin entry by default, and
+                // the null device while descriptor 0 is
+                // closed (std reads a closed stdin as
+                // end-of-file).
+                let id = match self.desc_route(0) {
+                    crate::interp::DescRoute::File(id) => id,
+                    crate::interp::DescRoute::Stdin => {
+                        self.stdin_file_id()
+                    }
+                    _ => self.null_file_id(),
+                };
+                Ok(file_value(id))
             }
             Builtin::StdStreamLock => {
                 arity(1)?;
@@ -2095,6 +2133,44 @@ impl<'a> Interpreter<'a> {
                 })
                 .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandUid => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let uid = as_u128(&vals[1], name)? as u32;
+                self.with_command(id, |state| {
+                    state.uid = Some(uid);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandGid => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let gid = as_u128(&vals[1], name)? as u32;
+                self.with_command(id, |state| {
+                    state.gid = Some(gid);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandGroups => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let (items, _) = self.slice_elements(frames, &vals[1])?;
+                let mut groups = Vec::with_capacity(items.len());
+                for item in &items {
+                    groups.push(as_u128(item, name)? as u32);
+                }
+                self.with_command(id, |state| {
+                    state.groups = Some(groups);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::FromRawFd => {
+                arity(1)?;
+                self.exec_from_raw_fd(frames, name, generic_args, &vals)
             }
             Builtin::ProcessCommandCwd => {
                 arity(2)?;
@@ -9624,6 +9700,78 @@ impl<'a> Interpreter<'a> {
             Builtin::ErrnoLocation => {
                 arity(0)?;
                 self.exec_errno_location()
+            }
+            Builtin::LibcSysconf => {
+                arity(1)?;
+                self.exec_libc_sysconf(frames, name, &vals)
+            }
+            Builtin::LibcGetuid => {
+                arity(0)?;
+                self.exec_libc_getuid()
+            }
+            Builtin::LibcGetgid => {
+                arity(0)?;
+                self.exec_libc_getgid()
+            }
+            Builtin::LibcGetpid => {
+                arity(0)?;
+                self.exec_libc_getpid()
+            }
+            Builtin::LibcClearenv => {
+                arity(0)?;
+                self.exec_libc_clearenv()
+            }
+            Builtin::LibcPrctl => {
+                if vals.is_empty() || vals.len() > 5 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 to 5 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                self.exec_libc_prctl(frames, name, &vals)
+            }
+            Builtin::LibcDlopen => {
+                arity(2)?;
+                self.exec_libc_dlopen(frames, name, &vals)
+            }
+            Builtin::LibcDlsym => {
+                arity(2)?;
+                self.exec_libc_dlsym(frames, name, &vals)
+            }
+            Builtin::LibcDup => {
+                arity(1)?;
+                self.exec_libc_dup(frames, name, &vals)
+            }
+            Builtin::LibcDup2 => {
+                arity(2)?;
+                self.exec_libc_dup2(frames, name, &vals)
+            }
+            Builtin::LibcClose => {
+                arity(1)?;
+                self.exec_libc_close(frames, name, &vals)
+            }
+            Builtin::LibcPipe => {
+                arity(1)?;
+                self.exec_libc_pipe(frames, name, &vals)
+            }
+            Builtin::LibcFcntl => {
+                if vals.len() < 2 || vals.len() > 3 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "2 to 3 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                self.exec_libc_fcntl(frames, name, &vals)
+            }
+            Builtin::LibcNftwLegacy => {
+                arity(4)?;
+                self.exec_libc_nftw(frames, name, &vals, true)
+            }
+            Builtin::LibcNftw => {
+                arity(4)?;
+                self.exec_libc_nftw(frames, name, &vals, false)
             }
             Builtin::AtomicCxchg => {
                 arity(3)?;
