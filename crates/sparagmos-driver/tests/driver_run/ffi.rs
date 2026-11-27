@@ -1544,3 +1544,57 @@ fn run_mode_extern_static_defined_in_aux_crate_resolves() {
         "stderr={stderr}"
     );
 }
+
+const THREAD_LOCAL_EXTERN_AUX_SRC: &str = r#"
+#![feature(thread_local)]
+
+use std::cell::Cell;
+
+#[no_mangle]
+#[thread_local]
+pub static FOO: Cell<u32> = Cell::new(3);
+"#;
+
+const THREAD_LOCAL_EXTERN_MAIN_SRC: &str = r#"
+#![feature(thread_local)]
+
+extern crate auxlib;
+
+use std::cell::Cell;
+
+extern "C" {
+    #[thread_local]
+    static FOO: Cell<u32>;
+}
+
+fn main() {
+    unsafe {
+        println!("foo={}", FOO.get());
+        FOO.set(9);
+        println!("foo2={}", FOO.get());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_thread_local_extern_static_defined_in_aux_resolves() {
+    // A thread-local foreign declaration whose symbol an
+    // auxiliary crate defines denotes the definition's
+    // thread-local storage (Issue #395): the declaration's
+    // `ThreadLocalRef` is recorded from the definition's
+    // initializer, so reads see the initializer and writes
+    // through the declaration stick, exactly as for a plain
+    // foreign static defined in the session.
+    let dir = temp_dir("thread-local-extern-static");
+    let aux = fixture(&dir, "auxlib.rs", THREAD_LOCAL_EXTERN_AUX_SRC);
+    let src = fixture(&dir, "case.rs", THREAD_LOCAL_EXTERN_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the defined thread-local import must resolve; stderr={stderr}"
+    );
+    assert_eq!(stdout, "foo=3\nfoo2=9\n", "stderr={stderr}");
+}

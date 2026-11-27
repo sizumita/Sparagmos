@@ -141,9 +141,25 @@ impl Converter {
         let Ok(def) = mir::mono::StaticDef::try_from(item.clone()) else {
             return;
         };
-        if static_is_foreign(&def) {
-            return;
-        }
+        // A foreign thread-local static (an `extern` block
+        // declaration) has no initializer of its own, but when
+        // a definition carrying the imported link symbol is
+        // part of the session (an auxiliary crate's
+        // `#[thread_local] #[no_mangle]` static, say), the
+        // declaration's storage IS the definition's storage,
+        // exactly as for a plain foreign static (see
+        // `foreign_static_seed`): record the definition's
+        // initializer under the declaration's id. A foreign
+        // thread-local with no definition in the session keeps
+        // no entry and stays the explicit error.
+        let def = if static_is_foreign(&def) {
+            match foreign_static_definition(&def) {
+                Some(definition) => definition,
+                None => return,
+            }
+        } else {
+            def
+        };
         // Seeding decodes a root constant (the initializer is
         // decoded at the root of `decode_const` just below), so
         // the evaluation in `static_initializer` starts from a
