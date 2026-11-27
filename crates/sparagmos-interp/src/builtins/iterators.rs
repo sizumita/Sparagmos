@@ -2111,6 +2111,120 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `Step::forward_checked(value, 1)` for an element
+    /// type the range machines do not step arithmetically:
+    /// the step is the guest's own `Step` implementation,
+    /// so it runs as a call to the converted
+    /// `<elem as std::iter::Step>::forward_checked` body
+    /// the impl scan names. The outer `Option` reports
+    /// whether the program holds that body as a dispatch
+    /// target at all (a body that was demanded but not
+    /// converted is not one, as in `impl_body_next_step`);
+    /// the inner one is the body's own result -- the
+    /// successor, or `None` where the step leaves the
+    /// element type's domain.
+    fn guest_step_forward_checked(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        elem: &str,
+        value: &Value,
+    ) -> InterpResult<Option<Option<Value>>> {
+        let Some(impl_name) =
+            self.scan_virtual_impl(elem, "std::iter::Step", "forward_checked")
+        else {
+            return Ok(None);
+        };
+        if self.program().get(&impl_name).is_none() {
+            return Ok(None);
+        }
+        let result =
+            self.call_sync(frames, &impl_name, vec![value.clone(), Value::Uint(1)])?;
+        Ok(Some(option_payload(result)?))
+    }
+
+    /// `Step::forward(value, 1)` for an element type the
+    /// range machines do not step arithmetically, run
+    /// against the guest's own converted `Step` bodies: an
+    /// overriding `forward` body when the program holds
+    /// one, and otherwise the trait default -- the checked
+    /// step's result, with the default's panic where the
+    /// checked step leaves the type's domain (the default
+    /// has no wrapping form, in any build). `Ok(None)` when
+    /// the program holds neither body.
+    fn guest_step_forward(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        elem: &str,
+        value: &Value,
+    ) -> InterpResult<Option<Value>> {
+        if let Some(impl_name) =
+            self.scan_virtual_impl(elem, "std::iter::Step", "forward")
+        {
+            if self.program().get(&impl_name).is_some() {
+                let result = self.call_sync(
+                    frames,
+                    &impl_name,
+                    vec![value.clone(), Value::Uint(1)],
+                )?;
+                return Ok(Some(result));
+            }
+        }
+        match self.guest_step_forward_checked(frames, elem, value)? {
+            Some(Some(next)) => Ok(Some(next)),
+            Some(None) => Err(InterpError::panic_str_payload(
+                "overflow in `Step::forward`",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// `Step::forward(value, 1)` for a `RangeFrom` /
+    /// `RangeFromIter` bound: the arithmetic step for an
+    /// element type the range machines serve, and the
+    /// guest-body step (see `guest_step_forward`) for a
+    /// user `Step` type. A user type whose `Step` bodies
+    /// the program does not hold keeps the range machines'
+    /// unsupported error.
+    fn range_step_forward_any(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        elem: &str,
+        value: &Value,
+        overflow_checks: bool,
+    ) -> InterpResult<Value> {
+        if range_elem_step_served(elem) {
+            return range_step_forward(value, elem, overflow_checks);
+        }
+        match self.guest_step_forward(frames, elem, value)? {
+            Some(next) => Ok(next),
+            None => Err(unsupported(format!(
+                "Iterator::next for {self_ty} is not runtime-supported"
+            ))),
+        }
+    }
+
+    /// `Step::forward_checked(value, 1)` for a range
+    /// bound: the counterpart of `range_step_forward_any`
+    /// for the checked step.
+    fn range_step_forward_checked_any(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        elem: &str,
+        value: &Value,
+    ) -> InterpResult<Option<Value>> {
+        if range_elem_step_served(elem) {
+            return range_step_forward_checked(value, elem);
+        }
+        match self.guest_step_forward_checked(frames, elem, value)? {
+            Some(result) => Ok(result),
+            None => Err(unsupported(format!(
+                "Iterator::next for {self_ty} is not runtime-supported"
+            ))),
+        }
+    }
+
     pub(crate) fn iterator_next_state(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3775,7 +3889,11 @@ impl<'a> Interpreter<'a> {
             // step prescribes. The successor is computed
             // first, exactly as core's `next` computes it
             // before yielding, so stepping at the maximum
-            // panics without yielding.
+            // panics without yielding. An element type the
+            // machines do not step arithmetically is a user
+            // `Step` implementation whose step is code: it
+            // runs through the guest-body fallback in
+            // `range_step_forward_any`.
             if fields.len() != 1 {
                 return Err(InterpError::type_mismatch(
                     "RangeFrom state",
@@ -3784,13 +3902,14 @@ impl<'a> Interpreter<'a> {
                 ));
             }
             let elem = range_elem_ty(self_ty);
-            if !range_elem_step_served(elem) {
-                return Err(unsupported(format!(
-                    "Iterator::next for {self_ty} is not runtime-supported"
-                )));
-            }
             let start = fields[0].clone();
-            let next = range_step_forward(&start, elem, self.overflow_checks_at(frames))?;
+            let next = self.range_step_forward_any(
+                frames,
+                self_ty,
+                elem,
+                &start,
+                self.overflow_checks_at(frames),
+            )?;
             (vec![next], some_value(start))
         } else if self_ty.starts_with("std::range::RangeFromIter<") {
             // The new range API's by-value iterator: the
@@ -3805,7 +3924,14 @@ impl<'a> Interpreter<'a> {
             // checked step when the stepping crate has
             // overflow checks (the maximum is yielded once,
             // with the flag set and the bound left in place)
-            // and the wrapping step when it does not.
+            // and the wrapping step when it does not. A
+            // user `Step` type's steps run through the
+            // same guest-body fallback as `RangeFrom`'s
+            // (see `range_step_forward_any`): its
+            // `forward` is the trait default, which panics
+            // at the domain end in every build, so the
+            // step without overflow checks is that forward
+            // step, not a wrap.
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
                     "RangeFromIter state",
@@ -3814,11 +3940,6 @@ impl<'a> Interpreter<'a> {
                 ));
             }
             let elem = range_elem_ty(self_ty);
-            if !range_elem_step_served(elem) {
-                return Err(unsupported(format!(
-                    "Iterator::next for {self_ty} is not runtime-supported"
-                )));
-            }
             let mut start = fields[0].clone();
             let exhausted = match &fields[1] {
                 Value::Bool(b) => *b,
@@ -3832,10 +3953,16 @@ impl<'a> Interpreter<'a> {
             };
             let overflow_checks = self.overflow_checks_at(frames);
             if exhausted {
-                start = range_step_forward(&start, elem, overflow_checks)?;
+                start = self.range_step_forward_any(
+                    frames,
+                    self_ty,
+                    elem,
+                    &start,
+                    overflow_checks,
+                )?;
             }
             if overflow_checks {
-                match range_step_forward_checked(&start, elem)? {
+                match self.range_step_forward_checked_any(frames, self_ty, elem, &start)? {
                     Some(next) => (
                         vec![next, Value::Bool(false)],
                         some_value(start),
@@ -3846,7 +3973,13 @@ impl<'a> Interpreter<'a> {
                     ),
                 }
             } else {
-                let next = range_step_forward(&start, elem, overflow_checks)?;
+                let next = self.range_step_forward_any(
+                    frames,
+                    self_ty,
+                    elem,
+                    &start,
+                    overflow_checks,
+                )?;
                 (vec![next, Value::Bool(false)], some_value(start))
             }
         } else if self_ty.starts_with("std::iter::Empty<") {

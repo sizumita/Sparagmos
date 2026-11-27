@@ -372,3 +372,103 @@ fn run_mode_range_from_iter_step_follows_the_stepping_crate() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const RANGE_FROM_USER_STEP_SRC: &str = r#"
+#![feature(step_trait)]
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+struct Twice(u32);
+
+impl std::iter::Step for Twice {
+    fn steps_between(_: &Self, _: &Self) -> (usize, Option<usize>) {
+        unimplemented!()
+    }
+
+    fn forward_checked(start: Self, n: usize) -> Option<Self> {
+        let mut x = start;
+        for _ in 0..n {
+            x = Twice(x.0 + 2);
+        }
+        Some(x)
+    }
+
+    fn forward_overflowing(start: Self, n: usize) -> (Self, bool) {
+        (Self::forward_checked(start, n).unwrap(), false)
+    }
+
+    fn backward_checked(_: Self, _: usize) -> Option<Self> {
+        unimplemented!()
+    }
+
+    fn backward_overflowing(_: Self, _: usize) -> (Self, bool) {
+        unimplemented!()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+struct Capped(u32);
+
+impl std::iter::Step for Capped {
+    fn steps_between(_: &Self, _: &Self) -> (usize, Option<usize>) {
+        unimplemented!()
+    }
+
+    fn forward_checked(start: Self, n: usize) -> Option<Self> {
+        if start.0 + (n as u32) > 3 {
+            None
+        } else {
+            Some(Capped(start.0 + n as u32))
+        }
+    }
+
+    fn forward_overflowing(start: Self, n: usize) -> (Self, bool) {
+        (Self::forward_checked(start, n).unwrap(), false)
+    }
+
+    fn backward_checked(_: Self, _: usize) -> Option<Self> {
+        unimplemented!()
+    }
+
+    fn backward_overflowing(_: Self, _: usize) -> (Self, bool) {
+        unimplemented!()
+    }
+}
+
+fn main() {
+    let mut it = Twice(1)..;
+    println!("{:?} {:?} {:?}", it.next(), it.next(), it.next());
+    let v: Vec<Twice> = (Twice(0)..).take(3).collect();
+    println!("{:?}", v);
+    let mut s = 0_u32;
+    for x in Twice(1).. {
+        if x.0 > 5 { break; }
+        s += x.0;
+    }
+    println!("sum {s}");
+    let new = std::range::RangeFrom::from(Twice(10)..);
+    let mut it = new.into_iter();
+    println!("{:?} {:?}", it.next(), it.next());
+    let r = std::panic::catch_unwind(|| {
+        let mut it = Capped(2)..;
+        assert_eq!(it.next().unwrap(), Capped(2));
+        let _ = it.next().unwrap();
+    });
+    println!("capped panics {}", r.is_err());
+}
+"#;
+
+/// A user `Step` type's range step is code, not
+/// arithmetic: the `RangeFrom` / `RangeFromIter` machines
+/// run the guest's converted `Step::forward` /
+/// `forward_checked` bodies (here stepping by two, which
+/// no arithmetic domain produces), and the trait
+/// default's panic ends a `RangeFrom` whose checked step
+/// leaves the type's domain.
+#[test]
+fn run_mode_range_from_user_step_type() {
+    run_ok(
+        "range-from-user-step",
+        RANGE_FROM_USER_STEP_SRC,
+        "Some(Twice(1)) Some(Twice(3)) Some(Twice(5))\n[Twice(0), Twice(2), Twice(4)]\nsum 9\nSome(Twice(10)) Some(Twice(12))\ncapped panics true\n",
+    );
+}
