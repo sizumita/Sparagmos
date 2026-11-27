@@ -914,10 +914,13 @@ impl<'a> Interpreter<'a> {
     /// whatever its index — the position's byte displacement is
     /// zero — so the identity key is hashed from the target with
     /// such positions normalised to the sequence's base (see
-    /// [`Self::canonical_target`]). Every other position keeps
-    /// the plain synthetic identity: the address returned here
-    /// differs from [`synthetic_address`]'s only where a
-    /// zero-sized element step was actually normalised.
+    /// [`Self::canonical_target`]), and a denominated trailing
+    /// element step converts to the byte displacement it
+    /// denotes, so the spellings of one position share one
+    /// address. Every other position keeps the plain synthetic
+    /// identity: the address returned here differs from
+    /// [`synthetic_address`]'s only where an element step was
+    /// actually normalised.
     /// `leaf_ty` is the declared pointee type of the operand the
     /// value was read from, when the caller knows it: it prices
     /// the normalisation of targets whose root type the
@@ -2487,8 +2490,8 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// The address identity key of a pointer value with
-    /// zero-sized element positions normalised (see
+    /// The address identity key of a pointer value with its
+    /// element positions normalised (see
     /// [`Self::pointer_address`]), together with the trailing
     /// byte displacement the key's slot is displaced by (see
     /// [`split_trailing_byte_offsets`]); `None` exactly when
@@ -2621,8 +2624,10 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// A reference target with its zero-sized element positions
-    /// normalised to the sequence base (see
+    /// A reference target with its element positions
+    /// normalised: zero-sized element positions to the sequence
+    /// base, and a denominated trailing element step to the
+    /// byte displacement it denotes (see
     /// [`Self::pointer_address`]). The walk that prices each
     /// element step starts from the root's declared type where
     /// the interpreter records one — a place's local type, a
@@ -2644,12 +2649,24 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             } => {
-                let root = frames
+                let body = frames
                     .iter()
                     .find(|f| f.id == *frame)
-                    .and_then(|f| self.program().functions.get(&f.func))
+                    .and_then(|f| self.program().functions.get(&f.func));
+                let root = body
                     .and_then(|body| body.local_tys.get(*local))
                     .cloned();
+                // The element size conversion recorded for
+                // the root local (see
+                // `ir::Body::local_elem_sizes`): the
+                // canonical walk denominates the root
+                // element step from it where the root type
+                // cannot, exactly as the arithmetic walk
+                // does (see
+                // `projection_offset_with_root_elem`).
+                let root_elem_size = body.and_then(|body| {
+                    body.local_elem_sizes.get(*local).copied().flatten()
+                });
                 // The stored root value vetoes a zero-sized
                 // reading of its positions: a value tree with
                 // scalar content belongs to a type of nonzero
@@ -2669,6 +2686,7 @@ impl<'a> Interpreter<'a> {
                             projection,
                             leaf_ty,
                             veto_zero,
+                            root_elem_size,
                         ),
                     },
                     None => target.clone(),
@@ -2683,6 +2701,7 @@ impl<'a> Interpreter<'a> {
                             projection,
                             leaf_ty,
                             false,
+                            None,
                         ),
                     },
                     None => target.clone(),
@@ -2721,19 +2740,47 @@ impl<'a> Interpreter<'a> {
     /// walked from the root type: an `Index` or `Subslice` step
     /// into a sequence whose element size is zero denotes the
     /// sequence's base position (its byte displacement is zero
-    /// whatever the index), so the step is dropped; every other
-    /// step is kept verbatim. A step the walk cannot price keeps
-    /// its index, and steps past a position whose type the walk
-    /// cannot determine are kept as well: the walk prices a step
-    /// only from the type at that step.
+    /// whatever the index), so the step is dropped; a trailing
+    /// element step whose element size the walk denominates
+    /// denotes the sequence base displaced by index x element
+    /// size, so it converts to a trailing [`RefProj::ByteOffset`]
+    /// — the form [`split_trailing_byte_offsets`] absorbs into
+    /// the (key, offset) pair — and positions spelled `Index`,
+    /// `Subslice` then `Index(0)`, or a plain byte displacement
+    /// over the same base share one key and offset (stage 2 of
+    /// the cross-form identity design; see
+    /// [`Self::canonical_target`]). Every other step is kept
+    /// verbatim: a step in the middle of a projection is part of
+    /// the target's identity, and a step the walk cannot price
+    /// keeps its index, as do steps past a position whose type
+    /// the walk cannot determine: the walk prices a step only
+    /// from the type at that step. The denomination chain for an
+    /// element step mirrors the arithmetic walk's (see
+    /// [`Self::projection_offset_with_root_elem`]): the root
+    /// walk's own element size, then — for the root step only —
+    /// the recorded root element size (`root_elem_size`). The
+    /// operand's pointee type is not a denomination source for
+    /// the conversion: its only claim here stays the guarded
+    /// zero claim of [`Self::trailing_zero_ok`], since generic
+    /// machinery compares positions through `*const ()` casts
+    /// whose pointee denominates nothing, and a nonzero
+    /// conversion from an unguarded leaf claim would split one
+    /// position into two keys under a wrong denomination.
     fn canonical_projection(
         &self,
         root: &WalkTy,
         projection: &[RefProj],
         leaf_ty: Option<&Ty>,
         veto_zero: bool,
+        root_elem_size: Option<u64>,
     ) -> Vec<RefProj> {
         let mut out = Vec::with_capacity(projection.len());
+        // The denominated element size of each step in `out`
+        // that is an element step (`None` for other steps and
+        // for element steps the walk could not denominate):
+        // the trailing-step conversion below prices from it.
+        let mut out_elem_sizes: Vec<Option<u64>> =
+            Vec::with_capacity(projection.len());
         let mut cur: Option<WalkTy> = Some(root.clone());
         let mut variant: u32 = 0;
         for (i, step) in projection.iter().enumerate() {
@@ -2741,9 +2788,11 @@ impl<'a> Interpreter<'a> {
                 RefProj::Downcast(v) => {
                     variant = *v;
                     out.push(step.clone());
+                    out_elem_sizes.push(None);
                 }
                 RefProj::Field(idx) => {
                     out.push(step.clone());
+                    out_elem_sizes.push(None);
                     cur = match cur {
                         Some(c) => self.field_walk_ty(&c, variant, *idx),
                         None => None,
@@ -2756,6 +2805,16 @@ impl<'a> Interpreter<'a> {
                         Some((size, next)) => (size, Some(next)),
                         None => (None, None),
                     };
+                    // The recorded root element size
+                    // denominates the root step when the walk
+                    // from the root type cannot — the record
+                    // exists precisely because the IR root
+                    // type drops the generic arguments the
+                    // size is computed from (see
+                    // `projection_offset_with_root_elem`).
+                    if size.is_none() && i == 0 {
+                        size = root_elem_size;
+                    }
                     // The trailing step may still be priced
                     // from the operand's declared pointee type
                     // when the walk from the root cannot price
@@ -2775,6 +2834,7 @@ impl<'a> Interpreter<'a> {
                     }
                     if size != Some(0) {
                         out.push(step.clone());
+                        out_elem_sizes.push(size);
                     }
                     if matches!(step, RefProj::Index(_)) {
                         cur = next;
@@ -2787,6 +2847,7 @@ impl<'a> Interpreter<'a> {
                     // steps after it for this walk as it
                     // does for the byte view.
                     out.push(step.clone());
+                    out_elem_sizes.push(None);
                     cur = Some(WalkTy::Ty(view.clone()));
                     variant = 0;
                 }
@@ -2794,8 +2855,34 @@ impl<'a> Interpreter<'a> {
                 | RefProj::UnionField { .. }
                 | RefProj::VecLen => {
                     out.push(step.clone());
+                    out_elem_sizes.push(None);
                     cur = None;
                 }
+            }
+        }
+        // The trailing-step conversion (see the doc above):
+        // only the trailing step converts — a converted step
+        // whose displacement is zero denotes the sequence
+        // base itself and vanishes, exposing the step before
+        // it to the same conversion (the `Subslice` then
+        // `Index(0)` spelling of a position).
+        loop {
+            let (count, size) =
+                match (out.last(), out_elem_sizes.last().copied().flatten()) {
+                    (Some(RefProj::Index(k)), Some(s)) => (*k, s),
+                    (Some(RefProj::Subslice { offset, .. }), Some(s)) => {
+                        (*offset, s)
+                    }
+                    _ => break,
+                };
+            let Ok(count) = i128::try_from(count) else { break };
+            let disp = count * i128::from(size);
+            out.pop();
+            out_elem_sizes.pop();
+            if disp != 0 {
+                out.push(RefProj::ByteOffset(disp));
+                out_elem_sizes.push(None);
+                break;
             }
         }
         out
@@ -2855,18 +2942,43 @@ impl<'a> Interpreter<'a> {
     /// operand's pointee type `leaf`: the trailing `Index` /
     /// `Subslice` step is denominated in `leaf`'s element size
     /// (the element type itself for a thin pointer, the element
-    /// of an array or slice pointee), and is dropped when that
-    /// size is zero. Steps before it are kept verbatim: walking
-    /// backwards cannot price them.
+    /// of an array or slice pointee), is dropped when that
+    /// size is zero, and otherwise converts to the byte
+    /// displacement it denotes (stage 2 of the cross-form
+    /// identity design; see [`Self::canonical_projection`]) —
+    /// trusting the leaf for the conversion is the same trust
+    /// the zero-size drop already places in it. A step the leaf
+    /// cannot denominate is kept verbatim, as are steps before
+    /// the trailing one: walking backwards cannot price them.
     fn canonical_projection_bwd(&self, projection: &[RefProj], leaf: &Ty) -> Vec<RefProj> {
         let elem_size = self.leaf_elem_size(leaf);
         let mut out: Vec<RefProj> = Vec::with_capacity(projection.len());
         let mut priced = true;
         for step in projection.iter().rev() {
             match step {
-                RefProj::Index(_) | RefProj::Subslice { .. } if priced => {
-                    if elem_size != Some(0) {
-                        out.push(step.clone());
+                RefProj::Index(k) | RefProj::Subslice { offset: k, .. }
+                    if priced =>
+                {
+                    match elem_size {
+                        // A zero-sized element step denotes
+                        // the sequence base: dropped, as
+                        // before.
+                        Some(0) => {}
+                        Some(size) => {
+                            let disp = i128::try_from(*k)
+                                .ok()
+                                .map(|k| k * i128::from(size));
+                            match disp {
+                                // A zero displacement denotes
+                                // the base itself: dropped.
+                                Some(0) => {}
+                                Some(d) => {
+                                    out.push(RefProj::ByteOffset(d))
+                                }
+                                None => out.push(step.clone()),
+                            }
+                        }
+                        None => out.push(step.clone()),
                     }
                     priced = false;
                 }
@@ -4934,5 +5046,270 @@ mod ptr_equality_tests {
             .expect("p3");
         assert_eq!(p0, 4, "an empty buffer's base is the element alignment");
         assert_eq!(p3, 4 + 12, "later positions displace from the same base");
+    }
+
+    /// The canonical (key, offset) of a place target in the
+    /// probe frame (see [`Interpreter::canonical_address_key`]).
+    fn place_canonical_key(
+        interp: &Interpreter,
+        frames: &[Frame],
+        local: usize,
+        projection: Vec<RefProj>,
+        leaf: Option<&Ty>,
+    ) -> (String, i128) {
+        interp
+            .canonical_address_key(
+                frames,
+                &Value::Ref(RefTarget::Place {
+                    frame: 7,
+                    local,
+                    projection,
+                }),
+                leaf,
+            )
+            .expect("canonical key")
+    }
+
+    /// Stage 2 of the cross-form identity design: in the
+    /// canonical domain, a trailing element step the walk
+    /// denominates converts to the byte displacement it
+    /// denotes, so the `Index`, `Subslice` then `Index(0)`,
+    /// and plain byte-displacement spellings of one position
+    /// share one (key, offset); distinct positions and
+    /// distinct roots stay distinct.
+    #[test]
+    fn canonical_trailing_element_step_converts() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(vec![], TerminatorKind::Return);
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 8),
+                Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 8),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let elems = (0..8).map(|_| Value::Uint(0)).collect::<Vec<_>>();
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![
+                Value::Unit,
+                Value::Tuple(elems.clone()),
+                Value::Tuple(elems),
+            ],
+        )];
+        let by_index = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Index(2)],
+            None,
+        );
+        let by_subslice = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![
+                RefProj::Subslice { offset: 2, len: 3 },
+                RefProj::Index(0),
+            ],
+            None,
+        );
+        let by_byte_offset = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::ByteOffset(8)],
+            None,
+        );
+        assert_eq!(
+            by_index, by_subslice,
+            "subslice+index spells the index position"
+        );
+        assert_eq!(
+            by_index, by_byte_offset,
+            "byte displacement spells the index position"
+        );
+        assert_eq!(by_index.1, 8, "the offset is index x element size");
+        let other_pos = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Index(3)],
+            None,
+        );
+        assert_eq!(other_pos.0, by_index.0, "same root key");
+        assert_eq!(other_pos.1, 12, "distinct positions keep distinct offsets");
+        let other_root = place_canonical_key(
+            &interp,
+            &frames,
+            2,
+            vec![RefProj::Index(2)],
+            None,
+        );
+        assert_ne!(other_root.0, by_index.0, "distinct roots keep distinct keys");
+        assert_eq!(other_root.1, 8);
+    }
+
+    /// The recorded root element size denominates the root
+    /// step in the canonical walk where the root type cannot
+    /// (a bare ADT name denoting several recorded instances),
+    /// exactly as it does in the arithmetic walk; without the
+    /// record the step keeps its index verbatim — today's key.
+    #[test]
+    fn canonical_root_step_uses_the_recorded_elem_size() {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("probe::Seq<i32>".to_string(), (12, 4));
+        program
+            .adt_layouts
+            .insert("probe::Seq<u8>".to_string(), (3, 1));
+        let block = BasicBlockData::new(vec![], TerminatorKind::Return);
+        let mut body = Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Adt("probe::Seq".to_string()),
+                Ty::Adt("probe::Seq".to_string()),
+            ],
+            vec![block],
+        );
+        body.local_elem_sizes = vec![None, Some(4), None];
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![Value::Unit, Value::Tuple(vec![]), Value::Tuple(vec![])],
+        )];
+        let recorded = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Index(3)],
+            None,
+        );
+        assert_eq!(
+            recorded.1, 12,
+            "the recorded size denominates the root step"
+        );
+        let unrecorded = place_canonical_key(
+            &interp,
+            &frames,
+            2,
+            vec![RefProj::Index(3)],
+            None,
+        );
+        assert_eq!(unrecorded.1, 0, "no displacement is absorbed");
+        assert!(
+            unrecorded.0.contains("Index(3)"),
+            "an undenominable step keeps its index in the key: {}",
+            unrecorded.0
+        );
+    }
+
+    /// Only the trailing element step converts: an element
+    /// step in the middle of a projection stays structural
+    /// (part of the target's identity), while a trailing one
+    /// after a field step converts as usual.
+    #[test]
+    fn canonical_mid_projection_step_stays_structural() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(vec![], TerminatorKind::Return);
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Array(
+                    Box::new(Ty::Tuple(vec![Ty::Uint(UintTy::U32)])),
+                    4,
+                ),
+                Ty::Tuple(vec![Ty::Array(
+                    Box::new(Ty::Uint(UintTy::U32)),
+                    4,
+                )]),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![Value::Unit, Value::Tuple(vec![]), Value::Tuple(vec![])],
+        )];
+        let mid = place_canonical_key(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Index(1), RefProj::Field(0)],
+            None,
+        );
+        assert_eq!(mid.1, 0);
+        assert!(
+            mid.0.contains("Index(1)"),
+            "a mid-projection element step stays in the key: {}",
+            mid.0
+        );
+        let trailing = place_canonical_key(
+            &interp,
+            &frames,
+            2,
+            vec![RefProj::Field(0), RefProj::Index(2)],
+            None,
+        );
+        let trailing_bytes = place_canonical_key(
+            &interp,
+            &frames,
+            2,
+            vec![RefProj::Field(0), RefProj::ByteOffset(8)],
+            None,
+        );
+        assert_eq!(trailing, trailing_bytes);
+        assert_eq!(trailing.1, 8);
+    }
+
+    /// The backward walk (allocation and value roots, whose
+    /// root type is not recorded) converts its trailing
+    /// element step from the leaf's element size, drops a
+    /// zero-sized one as before, and keeps a step the leaf
+    /// cannot denominate verbatim.
+    #[test]
+    fn canonical_bwd_trailing_step_converts_from_the_leaf() {
+        let program = Program::new();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![]));
+        let key_of = |projection: Vec<RefProj>, leaf: Option<&Ty>| {
+            interp
+                .canonical_address_key(
+                    &[],
+                    &Value::Ref(RefTarget::Alloc { id, projection }),
+                    leaf,
+                )
+                .expect("canonical key")
+        };
+        let elem = Ty::Uint(UintTy::U32);
+        let by_index = key_of(vec![RefProj::Index(2)], Some(&elem));
+        let by_bytes = key_of(vec![RefProj::ByteOffset(8)], Some(&elem));
+        assert_eq!(by_index, by_bytes);
+        assert_eq!(by_index.1, 8);
+        // A zero-sized leaf drops the step to the base, as
+        // before the conversion existed.
+        let zero = key_of(
+            vec![RefProj::Index(5)],
+            Some(&Ty::Array(Box::new(Ty::Unit), 0)),
+        );
+        assert_eq!(zero.1, 0);
+        assert_eq!(zero.0, by_bytes.0, "the position merges into the base key");
+        // A leaf that denominates nothing keeps the step.
+        let unknown = key_of(
+            vec![RefProj::Index(2)],
+            Some(&Ty::Adt("probe::Unrecorded".to_string())),
+        );
+        assert_eq!(unknown.1, 0);
+        assert!(unknown.0.contains("Index(2)"));
     }
 }
