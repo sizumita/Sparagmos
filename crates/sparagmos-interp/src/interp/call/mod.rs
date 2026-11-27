@@ -489,6 +489,23 @@ impl<'a> Interpreter<'a> {
                 return Some(Ok((key, receiver)));
             }
         }
+        // A method the compiler itself resolved without the
+        // vtable -- a `final` trait method is the case in
+        // point: it cannot be overridden, so a call through
+        // the trait object names the trait's own body with
+        // `Self` set to the trait object type, and conversion
+        // stored exactly that body under the callee's plain
+        // name (its receiver type is the trait object itself,
+        // naming this trait). That body is not one concrete
+        // type's instance standing in for a dispatch -- it
+        // is the very instance the call denotes -- so decline
+        // here and let the caller take the direct path with
+        // the fat pointer as the receiver.
+        if let Some(body) = self.program.get(func) {
+            if body_receiver_is_trait_object(body, trait_path) {
+                return None;
+            }
+        }
         if traits.iter().any(|t| t == trait_path) {
             return Some(Err(InterpError::UnsupportedDynamicDispatch {
                 method: func.to_string(),
@@ -1545,6 +1562,34 @@ fn fn_result_materialized(value: Value) -> Value {
         }
         _ => value,
     }
+}
+
+/// Whether a body's receiver (its first argument) is the
+/// trait object type naming `trait_path`: the receiver type,
+/// with reference and raw-pointer layers peeled, is a `dyn`
+/// type whose bounds name the trait (under either the
+/// `std::` or the `core::` spelling). A body of this shape
+/// stored under a trait method's plain name is the method's
+/// own body monomorphised at the trait object -- the
+/// instance a `final` method's call through the object
+/// denotes -- not a concrete type's instance.
+fn body_receiver_is_trait_object(body: &crate::ir::Body, trait_path: &str) -> bool {
+    let mut ty = body.local_tys.get(1);
+    while let Some(Ty::Ref(inner)) = ty {
+        ty = Some(inner);
+    }
+    let Some(Ty::Dynamic(bounds)) = ty else {
+        return false;
+    };
+    bounds.iter().any(|b| {
+        b == trait_path
+            || b.strip_prefix("std::").map_or(false, |rest| {
+                format!("core::{rest}") == trait_path
+            })
+            || b.strip_prefix("core::").map_or(false, |rest| {
+                format!("std::{rest}") == trait_path
+            })
+    })
 }
 
 fn ref_shaped_receiver(value: Value) -> Value {
