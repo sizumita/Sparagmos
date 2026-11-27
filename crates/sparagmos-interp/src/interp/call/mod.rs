@@ -311,7 +311,16 @@ impl<'a> Interpreter<'a> {
         if trait_path.is_empty() || method.is_empty() {
             return None;
         }
-        if !traits.iter().any(|t| t == trait_path) {
+        // The vtable's trait list and the callee name can
+        // render the same I/O trait with either prefix
+        // (`std::io::Write` / `core::io::Write`); compare
+        // with the prefix normalised away.
+        let spell = |p: &str| {
+            p.strip_prefix("core::io::")
+                .map(|rest| format!("std::io::{rest}"))
+                .unwrap_or_else(|| p.to_string())
+        };
+        if !traits.iter().any(|t| spell(t) == spell(trait_path)) {
             return None;
         }
         let generic_args = vec![concrete.clone()];

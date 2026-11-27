@@ -1405,6 +1405,8 @@ impl<'a> Interpreter<'a> {
         name: &str,
         vals: Vec<Value>,
     ) -> InterpResult<Value> {
+        let name_cow = crate::builtins::io_spelling(name);
+        let name = &*name_cow;
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
                 Ok(())

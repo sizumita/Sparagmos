@@ -1559,6 +1559,12 @@ impl<'a> Converter<'a> {
             return Ok(None);
         };
         let canonical = crate::builtins::canonical_name(&name);
+        // The same trait item also renders with the defining
+        // crate's `core::io` prefix (a `#![no_std]` guest, or a
+        // call reached through core's machinery); divert and
+        // record it under the `std::io` spelling the execution
+        // side matches.
+        let canonical = crate::builtins::io_spelling(&canonical).into_owned();
         const TRAIT_METHODS: &[&str] = &[
             "std::io::Read::read",
             "std::io::Read::read_exact",
@@ -1591,6 +1597,7 @@ impl<'a> Converter<'a> {
                 .strip_prefix("&mut ")
                 .or_else(|| self_ty.strip_prefix("&"))
                 .unwrap_or(self_ty);
+            let self_ty = crate::builtins::self_ty_key(self_ty);
             self_ty == "std::net::TcpStream"
                 && matches!(
                     canonical.as_str(),
