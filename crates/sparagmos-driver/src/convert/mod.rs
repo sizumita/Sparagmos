@@ -265,6 +265,13 @@ pub struct Converter {
     /// the interpreter with the converted program, whose seed
     /// table the `lookup_slow` runtime model reads them from.
     pub extra_static_seeds: sm::ExtraStaticSeeds,
+    /// The program's pre-main constructors: the names of the
+    /// collected bodies the initialiser-section statics name,
+    /// in the order the sections run them (see
+    /// [`Converter::note_init_constructors`]). Handed to the
+    /// interpreter with the converted program, which runs
+    /// them before the entry point in run mode.
+    pub init_constructors: Vec<String>,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, keyed by the rendered instance
     /// name (see `sm::AdtInstanceShapes`). Handed to the

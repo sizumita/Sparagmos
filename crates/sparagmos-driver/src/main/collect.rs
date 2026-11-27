@@ -1673,6 +1673,14 @@ fn collect() -> ControlFlow<()> {
         conv.note_unicode_data_tables();
     }
 
+    // The initialiser sections' constructors (see
+    // `Converter::note_init_constructors`): recorded for
+    // every compilation, naming only bodies the collection
+    // above holds.
+    let body_name_set: std::collections::HashSet<&str> =
+        body_def_names.iter().map(|name| name.as_str()).collect();
+    conv.note_init_constructors(&body_name_set);
+
     let verdict_failed = compile_error.is_some();
 
     let entry_def_id = entry_point_def_id(&mut conv, &items, &body_def_ids);
@@ -1731,6 +1739,7 @@ fn collect() -> ControlFlow<()> {
         env_debug_shapes: conv.env_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
         extra_static_seeds: conv.extra_static_seeds.clone(),
+        init_constructors: conv.init_constructors.clone(),
         static_tys: conv.static_tys_mir.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),

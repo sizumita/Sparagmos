@@ -47,6 +47,12 @@ impl<'a> Interpreter<'a> {
                 format!("{} argument(s)", args.len()),
             ));
         }
+        // The program's pre-main constructors run before the
+        // entry point, in section order, as the platform runs
+        // the initialiser sections before `main` (see
+        // [`ir::Program::init_constructors`]).
+        self.run_init_constructors()?;
+
         let mut locals = vec![Value::Uninit; body.local_count()];
         for (i, arg) in args.into_iter().enumerate() {
             locals[i + 1] = arg;
@@ -253,6 +259,112 @@ impl<'a> Interpreter<'a> {
         let result = self.drive_inner(frames, stop_depth);
         self.drive_depth -= 1;
         result
+    }
+
+    /// Run the program's pre-main constructors once, in the
+    /// recorded order: the function bodies the initialiser
+    /// sections (`.init_array` and its platform spellings)
+    /// name, which the platform calls before `main`. Each
+    /// constructor is called to completion on an empty frame
+    /// stack with the platform's argument triple -- `argc`,
+    /// `argv`, `envp` -- fabricated from the run's own
+    /// arguments and environment, truncated to the body's
+    /// declared argument count (a constructor declaring fewer
+    /// parameters is unaffected by the rest, as under the C
+    /// ABI). A constructor whose body the program does not
+    /// hold is skipped, the policy the exit handlers follow.
+    /// A panic may not unwind out of an `extern "C"`
+    /// constructor -- natively the process aborts, its report
+    /// already printed by the panic machinery -- so a
+    /// constructor's panic becomes the run's abort.
+    fn run_init_constructors(&mut self) -> InterpResult<()> {
+        if self.program.init_constructors.is_empty() {
+            return Ok(());
+        }
+        let ctors = self.program.init_constructors.clone();
+        let mut frames: Vec<Frame> = Vec::new();
+        for name in &ctors {
+            let Some(body) = self.program.get(name) else {
+                continue;
+            };
+            let args = self.init_ctor_args(body.arg_count);
+            let callable = Value::FnPtr(name.clone());
+            match self.call_callable_to_completion(&mut frames, &callable, args) {
+                Ok(_) => {}
+                Err(InterpError::Panic { message, .. }) => {
+                    return Err(InterpError::Abort {
+                        message: format!(
+                            "pre-main constructor `{name}` panicked: {message}"
+                        ),
+                    });
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// The argument vector of one pre-main constructor call:
+    /// the platform's `(argc, argv, envp)` triple, truncated
+    /// to the constructor's declared argument count and
+    /// padded with null pointers past the triple (a
+    /// constructor declaring more parameters reads past the
+    /// platform's own arguments, which the platform leaves
+    /// undefined). `argv` and `envp` are fabricated C string
+    /// arrays -- the run's program path and guest arguments,
+    /// and the inherited environment the `env` builtins
+    /// themselves read -- held in fresh allocations the
+    /// constructor reads through ordinary memory operations.
+    fn init_ctor_args(&mut self, arg_count: usize) -> Vec<Value> {
+        if arg_count == 0 {
+            return Vec::new();
+        }
+        let mut argv_strings = vec![self.program_path().as_bytes().to_vec()];
+        argv_strings.extend(
+            self.guest_args()
+                .iter()
+                .map(|arg| arg.as_bytes().to_vec()),
+        );
+        let argc = argv_strings.len() as i128;
+        let argv = self.c_string_array(argv_strings);
+        let env_strings: Vec<Vec<u8>> = std::env::vars_os()
+            .map(|(key, value)| {
+                let mut entry = os_str_bytes(&key);
+                entry.push(b'=');
+                entry.extend_from_slice(&os_str_bytes(&value));
+                entry
+            })
+            .collect();
+        let envp = self.c_string_array(env_strings);
+        let mut args = vec![Value::Int(argc), argv, envp];
+        args.truncate(arg_count);
+        while args.len() < arg_count {
+            args.push(Value::Ref(RefTarget::Null));
+        }
+        args
+    }
+
+    /// Allocate a NUL-terminated array of pointers to
+    /// NUL-terminated byte strings, the shape of `argv` and
+    /// `envp` at process start, and return a pointer to it.
+    fn c_string_array(&mut self, strings: Vec<Vec<u8>>) -> Value {
+        let mut pointers: Vec<Value> = strings
+            .into_iter()
+            .map(|mut bytes| {
+                bytes.push(0);
+                let id = self.alloc_insert(Value::Bytes(bytes));
+                Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                })
+            })
+            .collect();
+        pointers.push(Value::Ref(RefTarget::Null));
+        let id = self.alloc_insert(Value::Tuple(pointers));
+        Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        })
     }
 
     fn drive_inner(
@@ -3700,4 +3812,20 @@ impl<'a> Interpreter<'a> {
             }),
         }
     }
+}
+
+/// The bytes of an OS string, for the fabricated `envp`:
+/// exact on Unix, lossy elsewhere (the environment the
+/// `env` builtins read is the host's own).
+#[cfg(unix)]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+/// The bytes of an OS string, for the fabricated `envp`
+/// (non-Unix form; see the Unix form above).
+#[cfg(not(unix))]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
 }
