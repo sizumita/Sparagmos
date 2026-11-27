@@ -1172,6 +1172,48 @@ impl Converter {
         result.ok().flatten()
     }
 
+    /// Whether the function operand at `operand_span` names
+    /// the callee of the call whose terminator span is
+    /// `term_span`: in the call's own source text, the first
+    /// non-whitespace character after the operand is the
+    /// argument list's `(`. A genuine call — a free or
+    /// associated function path, a method name — is written
+    /// that way. A compiler-rewritten call can instead carry
+    /// a moved argument in the function position: the
+    /// `const_eval_select` substitution moves the runtime
+    /// branch operand into a direct call, keeping the
+    /// operand's argument span, and that operand is followed
+    /// by the enclosing call's `)` or `,`. For such a call the
+    /// location the compiler names is the terminator's own
+    /// span (the original call expression), not the operand's.
+    /// `None` when the source text cannot adjudicate (no
+    /// compiler context, a span with no snippet, an operand
+    /// outside the terminator span or in another file): the
+    /// caller keeps its standing assumption.
+    pub(crate) fn operand_opens_call(
+        &self,
+        operand_span: rustc_public::ty::Span,
+        term_span: rustc_public::ty::Span,
+    ) -> Option<bool> {
+        if operand_span.get_filename() != term_span.get_filename() {
+            return None;
+        }
+        let tcx = compiler_tcx()?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let term_i = rustc_public::rustc_internal::internal(tcx, term_span);
+            let op_i = rustc_public::rustc_internal::internal(tcx, operand_span);
+            if op_i.lo() < term_i.lo() || op_i.hi() > term_i.hi() {
+                return None;
+            }
+            let snippet =
+                tcx.sess.source_map().span_to_snippet(term_i).ok()?;
+            let offset = (op_i.hi().0 - term_i.lo().0) as usize;
+            let after = snippet.get(offset..)?;
+            Some(after.chars().find(|ch| !ch.is_whitespace()) == Some('('))
+        }));
+        result.ok().flatten()
+    }
+
     /// The (filename, lines) of a statement span as the
     /// compiler's own debuginfo reports them: the span is first
     /// walked outward through its macro expansion chain to the

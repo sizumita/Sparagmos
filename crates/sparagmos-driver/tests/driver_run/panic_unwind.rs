@@ -1452,6 +1452,57 @@ fn run_mode_caller_location_track_caller_at_optimized_mir() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
 }
 
+const CALLER_LOCATION_CONST_EVAL_SELECT_SRC: &str = r#"
+#![feature(core_intrinsics)]
+
+#[track_caller]
+fn uhoh() {
+    let loc = std::panic::Location::caller();
+    assert_eq!(loc.line(), 25);
+    assert_eq!(loc.column(), 5);
+}
+
+const fn c() {}
+
+struct S;
+
+impl S {
+    #[track_caller]
+    fn m(&self) {
+        let loc = std::panic::Location::caller();
+        assert_eq!(loc.line(), 26);
+        assert_eq!(loc.column(), 7);
+    }
+}
+
+fn main() {
+    std::intrinsics::const_eval_select((), c, uhoh);
+    S.m();
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_const_eval_select_names_the_call() {
+    // The compiler rewrites a `const_eval_select` call into a
+    // direct call of the runtime branch, with the branch
+    // operand in the function position keeping its argument
+    // span (here column 47 of the call line): the caller
+    // location of the branch is the original call expression
+    // (line 25, column 5), not the argument. An ordinary
+    // method call in the same guest keeps naming the method
+    // name (line 26, column 7).
+    let dir = temp_dir("caller-location-const-eval-select");
+    let src = fixture(
+        &dir,
+        "caller_location_const_eval_select.rs",
+        CALLER_LOCATION_CONST_EVAL_SELECT_SRC,
+    );
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout} stderr={stderr}");
+}
+
 const CALLER_LOCATION_SRC: &str = r#"
 #[track_caller]
 fn here() -> u32 {
