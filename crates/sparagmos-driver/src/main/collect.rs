@@ -1509,8 +1509,9 @@ fn collect() -> ControlFlow<()> {
     // precedence), the collector verdicts `mono_check` replays
     // over the instances it collects (the required-constant
     // evaluation, the per-instance `check_mono_item` checks, the
-    // duplicate-symbol verdict, the common-linkage verdict and
-    // the panic-runtime validation; also collection-time
+    // duplicate-symbol verdict, the common-linkage verdict, the
+    // panic-runtime validation and the LTO / prefer-dynamic
+    // session validation; also collection-time
     // errors, so they come next), the unshimmed-intrinsic
     // verdict over the converted bodies (a codegen-stage
     // rejection, gated like the collector verdicts so it cannot

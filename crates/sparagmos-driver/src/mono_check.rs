@@ -110,6 +110,17 @@
 //!   computation's static path produces (see
 //!   `panic_runtime_finding`).
 //!
+//! - The LTO / prefer-dynamic session validation: rustc
+//!   rejects `-C lto` (thin or fat) combined with
+//!   `-C prefer-dynamic` when every output the crate produces
+//!   is one LTO is performed for -- 'staticlib', 'bin' and
+//!   'cdylib' ("cannot prefer dynamic linking when performing
+//!   LTO"). The validation reads only the session's options
+//!   and crate types, but rustc performs it as code generation
+//!   starts, which a metadata-only session never reaches; the
+//!   check below replays it over the driver's own session
+//!   state (see `lto_prefer_dynamic_finding`).
+//!
 //! - Calls to intrinsics that must be overridden but are not
 //!   (rustc_codegen_ssa's code generation raises an internal
 //!   error — "intrinsic ... must be overridden by codegen
@@ -1476,7 +1487,10 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// (`generic_export_finding`), the duplicate-symbol verdict
 /// over the collected items (`duplicate_symbol_finding`), and
 /// the panic-runtime validation of the crate graph
-/// (`panic_runtime_finding`), which needs no walk.
+/// (`panic_runtime_finding`), which needs no walk, and the
+/// LTO / prefer-dynamic session validation
+/// (`lto_prefer_dynamic_finding`), which needs no walk
+/// either.
 pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     // A lint error recorded at a body materialization is a
@@ -1507,6 +1521,7 @@ pub fn check_required_consts() -> Option<String> {
         .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
         .or_else(|| common_linkage_finding(tcx))
         .or_else(|| panic_runtime_finding(tcx))
+        .or_else(|| lto_prefer_dynamic_finding(tcx))
 }
 
 /// The `check_mono_item` finding of the most recent
@@ -1784,6 +1799,48 @@ fn common_linkage_finding<'tcx>(tcx: rustc_middle::ty::TyCtxt<'tcx>) -> Option<S
                 tcx.def_path_str(def_id)
             ));
         }
+    }
+    None
+}
+
+/// The LTO / prefer-dynamic verdict, over the session's own
+/// option state (see the module documentation): LTO is
+/// requested (`-C lto` thin or fat), dynamic linking is
+/// preferred, and every crate type the session produces is
+/// an output LTO is performed for. A crate type outside
+/// that set lifts the rejection exactly as it does under
+/// rustc: an rlib output carries its bitcode to a later
+/// link, so no LTO link of this crate happens, and a dylib
+/// or proc-macro output is rejected separately, for using
+/// LTO at all without `-Zdylib-lto`.
+fn lto_prefer_dynamic_finding(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> Option<String> {
+    use rustc_structures::CrateType;
+
+    if !tcx.sess.opts.cg.prefer_dynamic
+        || tcx.sess.lto() == rustc_session::config::Lto::No
+    {
+        return None;
+    }
+    let types = tcx.crate_types();
+    let lto_outputs_only = !types.is_empty()
+        && types.iter().all(|ty| {
+            matches!(
+                ty,
+                CrateType::Executable
+                    | CrateType::StaticLib
+                    | CrateType::Cdylib
+            )
+        });
+    if lto_outputs_only {
+        return Some(
+            "cannot prefer dynamic linking when performing LTO \
+             (rustc rejects `-C lto` with `-C prefer-dynamic` \
+             when every output of the crate is a 'staticlib', \
+             'bin' or 'cdylib' output)"
+                .to_string(),
+        );
     }
     None
 }

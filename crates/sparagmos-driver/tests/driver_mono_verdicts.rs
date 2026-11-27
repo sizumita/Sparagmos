@@ -21,7 +21,13 @@
 //! emitting the assembly evaluates them unconditionally, so an
 //! operand whose evaluation fails (E0080) is a compilation
 //! failure even though the operands live outside every body
-//! and no required-constant list names them. The driver now
+//! and no required-constant list names them. The
+//! LTO / prefer-dynamic session validation is pinned as well:
+//! rustc rejects `-C lto` with `-C prefer-dynamic` when every
+//! output of the crate is a 'staticlib', 'bin' or 'cdylib'
+//! output, over the session's options alone, but only as
+//! code generation starts, so conversion accepted the
+//! combination. The driver now
 //! replays the verdicts in `mono_check`; each
 //! test below pins one rejection and the nearby acceptance that
 //! guards it against over-rejection. A rejected compilation
@@ -1090,4 +1096,129 @@ fn global_asm_const_operands_accepted() {
     );
     let (code, _stdout, stderr) = case.convert(&src, &[], false);
     assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn lto_prefer_dynamic_rejected() {
+    // The record's own shape (tests/ui/lto/issue-11154):
+    // `-C lto -C prefer-dynamic` on a binary crate. rustc
+    // rejects the combination when code generation starts;
+    // conversion must report the same failure.
+    let case = Case::new("lto-prefer-dynamic");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "-C",
+            "--rustc-arg",
+            "lto",
+            "--rustc-arg",
+            "-C",
+            "--rustc-arg",
+            "prefer-dynamic",
+        ],
+        false,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("cannot prefer dynamic linking when performing LTO"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn lto_thin_prefer_dynamic_rejected() {
+    // Thin LTO is LTO for this validation as well.
+    let case = Case::new("lto-thin-prefer-dynamic");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Clto=thin", "--rustc-arg", "-Cprefer-dynamic"],
+        false,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("cannot prefer dynamic linking when performing LTO"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn lto_prefer_dynamic_staticlib_cdylib_rejected() {
+    // A library crate whose outputs are only LTO outputs
+    // (staticlib + cdylib) is rejected the same way.
+    let case = Case::new("lto-prefer-dynamic-lib-outputs");
+    let src = case.write("case.rs", "pub fn f() {}\n");
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "--crate-type=staticlib",
+            "--rustc-arg",
+            "--crate-type=cdylib",
+            "--rustc-arg",
+            "-Clto",
+            "--rustc-arg",
+            "-Cprefer-dynamic",
+        ],
+        false,
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("cannot prefer dynamic linking when performing LTO"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn lto_prefer_dynamic_rlib_converts() {
+    // The acceptance guarding the rejections above: an rlib
+    // output lifts the rejection, because no LTO link of
+    // this crate happens -- the bitcode travels to a later
+    // link.
+    let case = Case::new("lto-prefer-dynamic-rlib");
+    let src = case.write("case.rs", "pub fn f() {}\n");
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--rustc-arg",
+            "--crate-type=rlib",
+            "--rustc-arg",
+            "-Clto",
+            "--rustc-arg",
+            "-Cprefer-dynamic",
+        ],
+        false,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn lto_without_prefer_dynamic_converts() {
+    // LTO alone is an ordinary compilation.
+    let case = Case::new("lto-only");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Clto"],
+        false,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn prefer_dynamic_without_lto_converts() {
+    // Prefer-dynamic alone is an ordinary compilation.
+    let case = Case::new("prefer-dynamic-only");
+    let src = case.write("case.rs", "fn main() {}\n");
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "-Cprefer-dynamic"],
+        false,
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
