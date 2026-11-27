@@ -609,6 +609,27 @@ denominator. Runs on every push to `main` and on manual dispatch.
   compiletest on the stable channel): `htmldocck.py` refuses to
   start without it.
 
+- Tier-3 target std completion (Issue #516): the toolchain
+  install carries every target rustup distributes for 1.100.0
+  (119 triples), but a record whose compile-flags name a
+  tier-3 triple with no prebuilt std in the channel would
+  still be refused by the runner's installed-target screening
+  (`installed_targets()` in rustc-subset-run.py scans the
+  sysroot). For the triples in `scripts/build-tier3-std.py`'s
+  table, the judging jobs (here and in flip-diff) build the
+  std from source with the pinned compiler itself
+  (`-Z build-std` over the toolchain's own rust-src, under
+  RUSTC_BOOTSTRAP=1, in the release profile) and install the
+  rlibs into the sysroot before the run; the installed
+  directory is cached between runs. The std must come from
+  the pinned compiler: rustc refuses rlibs whose metadata
+  another compiler version produced. Judging is unchanged --
+  a record that becomes attempted is judged by the existing
+  stage-2 rules, and a core-only triple's ceiling is honest:
+  a test file that uses std fails at the guest compile on
+  its merits. The measure-host (darwin) jobs do not run this
+  step; the table's triples are judged in the Linux class.
+
 ### Stage 4 (the rustdoc harness)
 
 Stage 4 attempts the `rustdoc-check` records (1,735) for the
