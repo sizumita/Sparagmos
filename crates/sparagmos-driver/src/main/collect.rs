@@ -642,6 +642,39 @@ fn collect() -> ControlFlow<()> {
                 }
             }
             Err(reason) => {
+                // A local body whose fetch died on the tail-call
+                // terminator is retried through the internal
+                // materialization that rewrites the tail call as
+                // a call and a return (see
+                // `convert::tail_call_erased_body`), the same
+                // retry the demand fetch applies. A retry that
+                // cannot produce a body falls through to the
+                // named skip below.
+                if reason == sparagmos_driver::convert::TAIL_CALL_REASON {
+                    if let Some(body) =
+                        sparagmos_driver::convert::with_body_materialization(
+                            &instance.name(),
+                            || {
+                                sparagmos_driver::convert::tail_call_erased_body(
+                                    &instance,
+                                )
+                            },
+                        )
+                    {
+                        convert_local_body(
+                            &mut conv,
+                            &mut report,
+                            &mut bodies,
+                            &mut body_def_ids,
+                            &mut body_def_names,
+                            &mut seed_bodies,
+                            name,
+                            def_id,
+                            body,
+                        );
+                        continue;
+                    }
+                }
                 if reason
                     == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
                 {
