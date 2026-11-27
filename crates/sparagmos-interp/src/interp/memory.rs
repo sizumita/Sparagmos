@@ -2347,6 +2347,105 @@ impl<'a> Interpreter<'a> {
         step_ty_across(Some(self.program()), Some(root_ty), &projection[..=pos])
     }
 
+    /// The flat-storage splice (see the offer in
+    /// [`Self::write_resolved_typed`]): a scalar `value`
+    /// written through a pointer at the byte storage an
+    /// allocation or static root holds as [`Value::Bytes`].
+    /// The storage is its own denomination -- its bytes are
+    /// the value -- so no recorded type or layout is needed
+    /// to price the write (the byte view above declines a
+    /// root with no type on record, which is how the
+    /// fabricated storages -- a signal frame, a process
+    /// argument string -- arrive here): the projection's
+    /// steps are byte steps (a byte offset, or an index into
+    /// the flat storage, the only element denomination it
+    /// has), and the write's width is the pointee's declared
+    /// width when the caller's evidence names a scalar, else
+    /// the one byte a byte value carries. The splice applies
+    /// only when the whole width lands inside the storage;
+    /// anything else declines and the ordinary paths judge
+    /// the write, so an out-of-range displaced write keeps
+    /// the projection error it has today. A non-scalar value
+    /// declines: a value that denotes the storage itself (a
+    /// fresh byte string, an aggregate) is a whole-value
+    /// write, which the arms below apply by replacement, as
+    /// a direct assignment to the storage's own place does.
+    /// Element blocks decline: their base pointer denotes
+    /// element 0 of the element tuple, a denomination the
+    /// allocation arm below already applies.
+    fn bytes_storage_splice(
+        &self,
+        target: &Resolved,
+        value: &Value,
+        root_ty: Option<&Ty>,
+    ) -> Option<InterpResult<()>> {
+        let projection: &[RefProj] = match target {
+            Resolved::Alloc { id, projection } => {
+                if self.is_elem_block(*id) {
+                    return None;
+                }
+                projection
+            }
+            Resolved::Static { projection, .. } => projection,
+            _ => return None,
+        };
+        // The projection's byte position: every step over a
+        // flat storage is a byte step.
+        let mut pos: usize = 0;
+        for step in projection {
+            pos = match step {
+                RefProj::ByteOffset(d) if *d >= 0 => pos.checked_add(*d as usize)?,
+                RefProj::Index(i) => pos.checked_add(*i)?,
+                _ => return None,
+            };
+        }
+        // The write's width and bits: the pointee's declared
+        // scalar width when the caller's evidence names one,
+        // else the single byte a byte value carries.
+        let (bits, width) = match root_ty.and_then(scalar_shape_of_ty) {
+            Some(shape) if shape.bits() % 8 == 0 => {
+                let width = (shape.bits() / 8) as usize;
+                if width == 0 || width > 16 {
+                    return None;
+                }
+                (self.flatten_scalar(value, &shape).ok()?, width)
+            }
+            _ => (u128::from(value_as_storage_byte(value)?), 1),
+        };
+        let end = pos.checked_add(width)?;
+        match target {
+            Resolved::Alloc { id, .. } => {
+                let mut store = self.allocs.borrow_mut();
+                let slot = store.get_mut(id)?;
+                let Value::Bytes(bytes) = slot else {
+                    return None;
+                };
+                if end > bytes.len() {
+                    return None;
+                }
+                for k in 0..width {
+                    bytes[pos + k] = ((bits >> (8 * k)) & 0xff) as u8;
+                }
+                Some(Ok(()))
+            }
+            Resolved::Static { name, .. } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store.get_mut(name)?;
+                let Value::Bytes(bytes) = slot else {
+                    return None;
+                };
+                if end > bytes.len() {
+                    return None;
+                }
+                for k in 0..width {
+                    bytes[pos + k] = ((bits >> (8 * k)) & 0xff) as u8;
+                }
+                Some(Ok(()))
+            }
+            _ => unreachable!("the target kinds were matched above"),
+        }
+    }
+
     /// [`Self::write_resolved`] with the caller's type evidence:
     /// `root_ty`, the declared type of the value at the target's
     /// root (for an allocation target, its pointee type), is
@@ -2376,6 +2475,15 @@ impl<'a> Interpreter<'a> {
             if let Some(written) = self.view_write(frames, target, &value) {
                 return written;
             }
+        }
+        // A scalar write through a pointer into the flat
+        // byte storage a target root holds as `Value::Bytes`
+        // splices into the storage at the projection's byte
+        // position (see `bytes_storage_splice`); the splice
+        // declines the writes that are not that shape, which
+        // fall to the paths below unchanged.
+        if let Some(spliced) = self.bytes_storage_splice(target, &value, root_ty) {
+            return spliced;
         }
         let grow = matches!(target, Resolved::Alloc { .. });
         let mut pending = Some(value);
@@ -3508,5 +3616,205 @@ mod write_bound_tests {
                 fields: vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])],
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod bytes_storage_splice_tests {
+    use super::*;
+
+    /// A scalar write through a pointer at the base of a
+    /// flat byte storage splices the byte in: the storage
+    /// keeps its form and its other bytes (the whole-value
+    /// replacement this fixes made the allocation hold the
+    /// scalar itself, after which every displaced access to
+    /// the string failed).
+    #[test]
+    fn bare_byte_write_splices_into_bytes_alloc() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(90))
+            .unwrap();
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"Zello".to_vec())));
+        // The spliced storage still answers its element
+        // reads, the read side's flat denomination.
+        let at1 = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &at1).unwrap(),
+            Value::Uint(101)
+        );
+        // A typed byte write (the caller's pointee evidence
+        // names i8) splices the same way.
+        let ty = Ty::Int(crate::ir::IntTy::I8);
+        interp
+            .write_resolved_typed(&mut frames, &target, Value::Int(65), Some(&ty))
+            .unwrap();
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"Aello".to_vec())));
+    }
+
+    /// A byte write displaced into the storage (a write
+    /// through `p.add(1)`) splices at the displacement
+    /// instead of failing the projection.
+    #[test]
+    fn displaced_byte_write_splices_into_bytes_alloc() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(1)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(65))
+            .unwrap();
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"hAllo".to_vec())));
+    }
+
+    /// An indexed byte write (the sequential-write shape a
+    /// bulk byte fill takes) splices at the index.
+    #[test]
+    fn indexed_byte_write_splices_into_bytes_alloc() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(2)],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(65))
+            .unwrap();
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"heAlo".to_vec())));
+    }
+
+    /// A wider scalar write at the base splices its whole
+    /// declared width, little-endian, not just its low byte
+    /// and not the whole storage.
+    #[test]
+    fn wider_scalar_write_splices_at_the_declared_width() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![],
+        };
+        let ty = Ty::Uint(crate::ir::UintTy::U16);
+        interp
+            .write_resolved_typed(&mut frames, &target, Value::Uint(0x1234), Some(&ty))
+            .unwrap();
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Bytes(vec![0x34, 0x12, b'l', b'l', b'o']))
+        );
+    }
+
+    /// A write whose width lands past the storage's end
+    /// declines the splice: the ordinary path keeps the
+    /// projection error it gives today, and the storage is
+    /// untouched.
+    #[test]
+    fn out_of_range_byte_write_keeps_the_projection_error() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(5)],
+        };
+        let result = interp.write_resolved(&mut frames, &target, Value::Int(65));
+        assert!(result.is_err(), "out-of-range write must error: {result:?}");
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"hello".to_vec())));
+    }
+
+    /// A whole-value write to the storage (a fresh byte
+    /// string, an aggregate) still replaces it: only scalar
+    /// writes denominate as bytes of the storage.
+    #[test]
+    fn whole_value_write_to_bytes_alloc_still_replaces() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Bytes(b"world!".to_vec()))
+            .unwrap();
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Bytes(b"world!".to_vec()))
+        );
+        interp
+            .write_resolved(
+                &mut frames,
+                &target,
+                Value::Tuple(vec![Value::Int(1)]),
+            )
+            .unwrap();
+        assert_eq!(
+            interp.alloc_value(id),
+            Some(Value::Tuple(vec![Value::Int(1)]))
+        );
+    }
+
+    /// The same denomination at a static root: a scalar
+    /// write through a pointer at a byte-string static's
+    /// base splices instead of replacing the static's value.
+    #[test]
+    fn bare_byte_write_splices_into_bytes_static() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        interp
+            .statics
+            .borrow_mut()
+            .insert("S".to_string(), Value::Bytes(b"hello".to_vec()));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Static {
+            name: "S".to_string(),
+            projection: vec![],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(90))
+            .unwrap();
+        assert_eq!(
+            interp.static_base("S").unwrap(),
+            Value::Bytes(b"Zello".to_vec())
+        );
+    }
+
+    /// A scalar write at the base of an allocation holding
+    /// an aggregate is not the splice's shape: the existing
+    /// whole-value semantics stand.
+    #[test]
+    fn scalar_write_to_aggregate_alloc_is_not_spliced() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![Value::Int(1), Value::Int(2)]));
+        let mut frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![],
+        };
+        interp
+            .write_resolved(&mut frames, &target, Value::Int(7))
+            .unwrap();
+        assert_eq!(interp.alloc_value(id), Some(Value::Int(7)));
     }
 }
