@@ -9761,7 +9761,7 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::LibcClearenv => {
                 arity(0)?;
-                self.exec_libc_clearenv()
+                self.exec_libc_clearenv(name)
             }
             Builtin::LibcPrctl => {
                 if vals.is_empty() || vals.len() > 5 {

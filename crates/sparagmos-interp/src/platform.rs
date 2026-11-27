@@ -21,7 +21,14 @@
 //! facilities the model uses: descriptor duplication of
 //! the standard input and of a listening socket, Unix mode
 //! permissions, and symlink creation (one operation on
-//! Unix; two on Windows, split by the target's kind).
+//! Unix; two on Windows, split by the target's kind). The
+//! same treatment covers the libc calls that exist only
+//! on some Unix hosts (`prctl`, `clearenv`): a host whose
+//! libc has no such call reports `None`, and the caller
+//! names the operation unsupported — an unconditional
+//! extern declaration would leave the symbol undefined
+//! at link time on those hosts (macOS libc exports
+//! neither).
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -222,4 +229,78 @@ pub(crate) fn listener_socket_read(
         std::io::ErrorKind::Unsupported,
         "libc::read on a listening socket is not modelled on this host platform",
     ))
+}
+/// The host C library's `prctl`, backing the libc
+/// builtin of the same name: a Linux-only process
+/// control call, so hosts without it report `None` and
+/// the caller names the operation unsupported. Where it
+/// exists, the C function is variadic; it is declared
+/// here with its full five-word shape, and the caller
+/// zero-pads the arguments the guest's call did not
+/// supply, which is the value a variadic callee reads
+/// for them.
+#[cfg(target_os = "linux")]
+pub(crate) fn host_prctl(
+    option: std::ffi::c_int,
+    arg2: std::ffi::c_ulong,
+    arg3: std::ffi::c_ulong,
+    arg4: std::ffi::c_ulong,
+    arg5: std::ffi::c_ulong,
+) -> Option<std::ffi::c_int> {
+    extern "C" {
+        #[link_name = "prctl"]
+        fn prctl(
+            option: std::ffi::c_int,
+            arg2: std::ffi::c_ulong,
+            arg3: std::ffi::c_ulong,
+            arg4: std::ffi::c_ulong,
+            arg5: std::ffi::c_ulong,
+        ) -> std::ffi::c_int;
+    }
+    Some(unsafe { prctl(option, arg2, arg3, arg4, arg5) })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn host_prctl(
+    option: std::ffi::c_int,
+    arg2: std::ffi::c_ulong,
+    arg3: std::ffi::c_ulong,
+    arg4: std::ffi::c_ulong,
+    arg5: std::ffi::c_ulong,
+) -> Option<std::ffi::c_int> {
+    let _ = (option, arg2, arg3, arg4, arg5);
+    None
+}
+
+/// The host C library's `clearenv`, backing the libc
+/// builtin of the same name: a glibc/BSD libc extension
+/// with no macOS or Windows equivalent, so hosts without
+/// it report `None` and the caller names the operation
+/// unsupported. The guest's environment model is the
+/// host environment itself (the enumeration and
+/// single-key builtins read and mutate it directly), so
+/// where the call exists, clearing it here clears the
+/// guest's environment.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
+    extern "C" {
+        #[link_name = "clearenv"]
+        fn clearenv() -> std::ffi::c_int;
+    }
+    Some(unsafe { clearenv() })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
+    None
 }
