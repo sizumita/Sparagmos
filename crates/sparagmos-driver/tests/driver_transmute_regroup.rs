@@ -199,6 +199,39 @@ fn main() {
     assert_eq!(stdout, expected);
 }
 
+/// A one-field wrapper over an array transmuted into
+/// another such wrapper, beyond the 128-bit whole-shape
+/// budget: Mu64([u64; 4]) -> Mf64([f64; 4]) (256 bits).
+/// Neither side is an array, so the array arms cannot see
+/// the pair; the bit-stream reinterpretation over the two
+/// payload streams is the only conversion.
+#[test]
+fn wrapper_to_wrapper_regroups_beyond_128_bits() {
+    let stdout = run_ok(
+        "wrapper-to-wrapper",
+        "wrapper_to_wrapper.rs",
+        r#"
+struct Mu64([u64; 4]);
+struct Mf64([f64; 4]);
+fn main() {
+    let m = Mu64([0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000, 0, 0x8000_0000_0000_0000]);
+    let f: Mf64 = unsafe { std::mem::transmute(m) };
+    println!("{}", f.0[0]);
+    println!("{}", f.0[1]);
+    println!("{}", f.0[2]);
+    println!("{}", f.0[3]);
+    let back: Mu64 = unsafe { std::mem::transmute(f) };
+    println!("{:x}", back.0[0]);
+    println!("{:x}", back.0[3]);
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "1\n2\n0\n-0\n3ff0000000000000\n8000000000000000\n"
+    );
+}
+
 /// Uninit propagation per element: lanes 10 and 11 of the
 /// source are uninit, so exactly target lane 5 is poisoned;
 /// every other lane reads back bit-exact, and reading the

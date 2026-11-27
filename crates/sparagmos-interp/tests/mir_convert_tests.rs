@@ -4049,6 +4049,63 @@ fn transmute_zero_sized_constant_into_zst_array() {
     );
 }
 
+
+// A constant array operand transmuted into an array of a
+// wider element, beyond the 128-bit whole-shape budget:
+// the constant carries no place type, so the source reading
+// is the type recorded for it, and the bit-stream
+// reinterpretation regroups its narrower leaves.
+#[test]
+fn transmute_constant_array_regroups_beyond_128_bits() {
+    // fn f() -> u32 { _1 = transmute(const [u16; 16]) as [u32; 8];
+    //                 _0 = copy _1[3]; return }
+    // Lane 3 is the little-endian regrouping of source
+    // elements 6 (low half) and 7 (high half).
+    let src_ty = mir::Ty::Array(Box::new(u16_ty()), mir::ArrayLen::Known(16));
+    let dst_ty = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(8));
+    let fields: Vec<mir::ConstValue> = (0..16u128)
+        .map(|i| {
+            mir::ConstValue::Scalar(mir::Scalar::Int {
+                data: 0x101 * i + 1,
+                size: 2,
+            })
+        })
+        .collect();
+    let mut konst = mir::Constant::from_value(mir::ConstValue::Tuple(fields));
+    konst.ty = Some(src_ty);
+    let elem3 = mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset: 3,
+            min_length: 8,
+            from_end: false,
+        }],
+    };
+    let body = mir::Body::new(
+        decls(&[u32_ty(), dst_ty.clone()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    transmute(mir::Operand::Constant(Box::new(konst)), dst_ty),
+                ),
+                assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(elem3))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    let lo = 0x101u32 * 6 + 1;
+    let hi = 0x101u32 * 7 + 1;
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("constant array regroup transmute runs"),
+        Value::Uint(u128::from(lo | (hi << 16)))
+    );
+}
+
 const WRAP1_DEF: mir::DefId = mir::DefId::new(0, 81);
 
 fn wrap1_ty() -> mir::Ty {
