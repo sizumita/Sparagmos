@@ -188,6 +188,30 @@ fn raw_pointer_subject_pointee(generic_args: &[String]) -> Option<Ty> {
     ty_from_tag(pointee.trim())
 }
 
+/// Whether a comparison call's own type tags name a dyn raw
+/// pointer as the comparison's subject: the `Self` tag (the
+/// first generic argument), with one leading reference layer
+/// stripped, opens with `*const dyn ` / `*mut dyn `. Dyn
+/// pointers are wide: their native equality and ordering are
+/// over the (data address, vtable) pair, which
+/// `comparison_subject_is_raw_pointer` deliberately leaves
+/// to the ordinary path -- but the ordinary path compares
+/// pointees, which is neither word, so the raw-pointer arms
+/// judge dyn subjects by that pair instead (see
+/// `raw_pointer_operand_key`).
+pub(crate) fn comparison_subject_is_dyn_pointer(generic_args: &[String]) -> bool {
+    let Some(tag) = generic_args.first() else {
+        return false;
+    };
+    let tag = tag
+        .strip_prefix("&mut ")
+        .or_else(|| tag.strip_prefix('&'))
+        .unwrap_or(tag);
+    tag.strip_prefix("*const ")
+        .or_else(|| tag.strip_prefix("*mut "))
+        .is_some_and(|pointee| pointee.starts_with("dyn "))
+}
+
 /// How many reference layers one operand of a raw-pointer
 /// comparison sits behind: the call passes a reference to
 /// the compared value, and when the subject is itself a
@@ -307,6 +331,21 @@ impl<'a> Interpreter<'a> {
         leaf_ty: Option<&Ty>,
         layers: usize,
     ) -> Option<u128> {
+        let compared = self.raw_pointer_operand_compared(frames, value, layers)?;
+        self.pointer_address(frames, &compared, leaf_ty)
+    }
+
+    /// The pointer value an operand of a raw-pointer
+    /// comparison denotes, after dereferencing the layers
+    /// the call passes it behind (see
+    /// `raw_pointer_operand_layers`). `None` when a layer
+    /// cannot be read.
+    fn raw_pointer_operand_compared(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        layers: usize,
+    ) -> Option<Value> {
         let mut compared = value.clone();
         for _ in 0..layers {
             compared = match &compared {
@@ -317,7 +356,30 @@ impl<'a> Interpreter<'a> {
                 _ => break,
             };
         }
-        self.pointer_address(frames, &compared, leaf_ty)
+        Some(compared)
+    }
+
+    /// The comparison key of one operand of a dyn raw-pointer
+    /// comparison (see `comparison_subject_is_dyn_pointer`):
+    /// the data address and the vtable word, the two words
+    /// native wide-pointer equality and ordering are defined
+    /// over. `None` when the operand does not denote a dyn
+    /// pointer or its address cannot be derived.
+    fn raw_pointer_operand_key(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        layers: usize,
+    ) -> Option<(u128, u128)> {
+        let compared = self.raw_pointer_operand_compared(frames, value, layers)?;
+        let Value::DynRef {
+            concrete, traits, ..
+        } = &compared
+        else {
+            return None;
+        };
+        let addr = self.pointer_address(frames, &compared, None)?;
+        Some((addr, crate::interp::vtable_word(concrete, traits)))
     }
 
     /// Raw-pointer equality under the type's own `PartialEq`
@@ -336,6 +398,12 @@ impl<'a> Interpreter<'a> {
         a: &Value,
         b: &Value,
     ) -> Option<bool> {
+        if comparison_subject_is_dyn_pointer(generic_args) {
+            let layers = raw_pointer_operand_layers(generic_args);
+            let x = self.raw_pointer_operand_key(frames, a, layers)?;
+            let y = self.raw_pointer_operand_key(frames, b, layers)?;
+            return Some(x == y);
+        }
         if !comparison_subject_is_raw_pointer(generic_args) {
             return None;
         }
@@ -358,15 +426,52 @@ impl<'a> Interpreter<'a> {
         a: &Value,
         b: &Value,
     ) -> Option<Option<Ordering>> {
+        if comparison_subject_is_dyn_pointer(generic_args) {
+            let layers = raw_pointer_operand_layers(generic_args);
+            let x = self.raw_pointer_operand_key(frames, a, layers)?;
+            let y = self.raw_pointer_operand_key(frames, b, layers)?;
+            return Some(Some(x.cmp(&y)));
+        }
         if !comparison_subject_is_raw_pointer(generic_args) {
             return None;
         }
         let pointee = raw_pointer_subject_pointee(generic_args);
         let layers = raw_pointer_operand_layers(generic_args);
-        let x = self
-            .raw_pointer_operand_address(frames, a, pointee.as_ref(), layers)?;
-        let y = self
-            .raw_pointer_operand_address(frames, b, pointee.as_ref(), layers)?;
+        let compared_a = self.raw_pointer_operand_compared(frames, a, layers)?;
+        let compared_b = self.raw_pointer_operand_compared(frames, b, layers)?;
+        let x = self.pointer_address(frames, &compared_a, pointee.as_ref())?;
+        let y = self.pointer_address(frames, &compared_b, pointee.as_ref())?;
+        // Two positions of one storage whose addresses the
+        // model could not price arithmetically (a field of a
+        // tuple of same-named ADT instances, whose sizes the
+        // bare type names leave ambiguous) fall back to
+        // hashed addresses, whose order is arbitrary -- but
+        // natively the positions have a definite order, and
+        // the guest asserts it (the fields of one aggregate
+        // in declaration order). The binary operators consult
+        // the position order in exactly this case (see
+        // `eval_binary`); the builtin comparison does the
+        // same. Address-identical pointers keep the address
+        // verdict, as there.
+        if x != y {
+            fn target_of<'v>(v: &'v Value) -> Option<&'v RefTarget> {
+                match v {
+                    Value::Ref(t) => Some(t),
+                    Value::FatRef { base, .. } | Value::DynRef { base, .. } => {
+                        match &**base {
+                            Value::Ref(t) => Some(t),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            if let (Some(ta), Some(tb)) = (target_of(&compared_a), target_of(&compared_b)) {
+                if let Some(ord) = crate::interp::positional_order(ta, tb) {
+                    return Some(Some(ord));
+                }
+            }
+        }
         Some(Some(x.cmp(&y)))
     }
 
@@ -1020,6 +1125,47 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 other => return Ok(other),
             }
             return Ok(Some(la.cmp(&lb)));
+        }
+        // Pointer pairs the resolution below cannot judge: an
+        // address-only or null pointer denotes no data to
+        // resolve to, and a dyn fat pointer's ordering is over
+        // its two words, not its pointee -- the pair a raw
+        // wide pointer transmuted to a word array compares by,
+        // above all. Both order by the (data address, metadata
+        // word) key the binary operators use (see
+        // `eval_binary`): the metadata word is a dyn pointer's
+        // vtable identity, and a thin side of a mixed pair
+        // drops the word, as there. This is the ordering
+        // counterpart of the address arm `values_equal` has
+        // always had; without it these pairs fell through to
+        // the structural match and its type-mismatch error.
+        let pointer_key = |v: &Value| -> Option<(u128, Option<u128>)> {
+            match v {
+                Value::Ref(RefTarget::Null) => Some((0, None)),
+                Value::DynRef {
+                    concrete, traits, ..
+                } => self
+                    .pointer_address(frames, v, None)
+                    .map(|addr| (addr, Some(crate::interp::vtable_word(concrete, traits)))),
+                Value::Ref(_) | Value::FnPtr(_) | Value::Closure { .. } => {
+                    self.pointer_address(frames, v, None).map(|addr| (addr, None))
+                }
+                _ => None,
+            }
+        };
+        if matches!(a, Value::DynRef { .. })
+            || matches!(b, Value::DynRef { .. })
+            || matches!(a, Value::Ref(RefTarget::Address(_)) | Value::Ref(RefTarget::Null))
+            || matches!(b, Value::Ref(RefTarget::Address(_)) | Value::Ref(RefTarget::Null))
+        {
+            if let (Some(x), Some(y)) = (pointer_key(a), pointer_key(b)) {
+                let (x, y) = match (x, y) {
+                    ((addr, Some(_)), (other, None)) => ((addr, None), (other, None)),
+                    ((addr, None), (other, Some(_))) => ((addr, None), (other, None)),
+                    pair => pair,
+                };
+                return Ok(Some(x.cmp(&y)));
+            }
         }
         let a_byte_tail = is_byte_tail_ref(a);
         let b_byte_tail = is_byte_tail_ref(b);
