@@ -115,12 +115,23 @@ pub struct Converter {
     /// Vtable identities minted while decoding constants: for
     /// each `ConstValue::VTablePtr` identity number, the
     /// (concrete type, principal trait) pair it denotes, in the
-    /// form the interpreter's `DynRef` values carry. Handed to
-    /// the interpreter with the converted program: a vtable
+    /// form the interpreter's `DynRef` values carry, with the
+    /// concrete type's `TypeId` segments and the vtable's
+    /// compiler-resolved method instance names. Handed to the
+    /// interpreter with the converted program: a vtable
     /// pointer that reaches it as a bare address (recovered
     /// from a metadata aggregate, or read back from a stored
     /// header word) resolves through this table.
-    pub vtable_identities: HashMap<u64, (sm::Ty, Vec<String>, Option<(u64, u64)>)>,
+    pub vtable_identities:
+        HashMap<u64, (sm::Ty, Vec<String>, Option<(u64, u64)>, Vec<String>)>,
+    /// Memoised vtable resolutions: the compiler-resolved
+    /// method instance names of one trait reference, keyed by
+    /// the reference's debug rendering (the same key the dyn
+    /// demand pass dedups by). Vtable resolution crosses into
+    /// the compiler per reference, and one (concrete, trait)
+    /// pair is named by many casts and constants across the
+    /// program's bodies.
+    pub vtable_methods_cache: HashMap<String, Vec<String>>,
     /// Vtable trait references named by the constants decoded
     /// so far, in the order their identities were first
     /// recorded: a vtable formed inside a constant (a

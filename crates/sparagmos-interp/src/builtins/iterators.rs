@@ -2256,6 +2256,7 @@ impl<'a> Interpreter<'a> {
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
         } = &state
         {
             // The pointer to the concrete value: the base
@@ -2290,6 +2291,7 @@ impl<'a> Interpreter<'a> {
                     traits: traits.clone(),
                     drop_glue: drop_glue.clone(),
                     type_id: *type_id,
+                    vtable_methods: vtable_methods.clone(),
                 },
                 item,
             ));

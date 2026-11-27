@@ -119,6 +119,21 @@ pub struct Body {
     /// driver's walk could not name (the cast then carries no
     /// segments, as before).
     pub unsize_type_ids: Vec<(u32, Place, (u64, u64))>,
+    /// The compiler-resolved vtable method instance names of
+    /// each unsizing cast to a `dyn` target in this body,
+    /// recorded by the driver from the cast's own trait
+    /// references (whose self type still carries the region
+    /// structure conversion erases from the rendered concrete
+    /// tag), keyed like [`Body::unsize_type_ids`]: the entry
+    /// names the one cast statement that writes that place in
+    /// that block. The interpreter's conversion reads the entry
+    /// when it builds the cast's vtable identity, so a virtual
+    /// call through the formed pointer dispatches by the
+    /// vtable the compiler itself resolved for the cast rather
+    /// than by matching the erased concrete tag against impl
+    /// spellings. Empty for hand-built bodies and for casts
+    /// whose vtable the driver could not resolve.
+    pub unsize_vtable_methods: Vec<(u32, Place, Vec<String>)>,
 }
 impl Body {
     pub fn new(
@@ -136,6 +151,7 @@ impl Body {
             source_lines: Vec::new(),
             coverage_owners: Vec::new(),
             unsize_type_ids: Vec::new(),
+            unsize_vtable_methods: Vec::new(),
         }
     }
     pub fn return_ty(&self) -> Option<&Ty> {

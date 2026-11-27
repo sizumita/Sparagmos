@@ -1342,6 +1342,7 @@ impl<'a> Interpreter<'a> {
             traits: identity.traits.clone(),
             drop_glue: identity.glue.clone().map(Box::new),
             type_id: identity.type_id,
+            vtable_methods: identity.vtable_methods.clone(),
         })
     }
 
@@ -1393,6 +1394,7 @@ impl<'a> Interpreter<'a> {
                 traits,
                 drop_glue,
                 type_id,
+                vtable_methods,
                 ..
             } => Some(Value::DynRef {
                 base: Box::new(base),
@@ -1400,6 +1402,7 @@ impl<'a> Interpreter<'a> {
                 traits: traits.clone(),
                 drop_glue: drop_glue.clone(),
                 type_id: *type_id,
+                vtable_methods: vtable_methods.clone(),
             }),
             _ => {
                 let id = self.vtable_id_in_metadata(meta)?;

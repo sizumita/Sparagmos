@@ -3583,6 +3583,9 @@ impl<'a> Interpreter<'a> {
                             // Runtime recovery has no conversion-time
                             // segment source: tag comparison applies.
                             type_id: None,
+                            // Nor a vtable resolution source:
+                            // dispatch matches spellings, as before.
+                            vtable_methods: Vec::new(),
                         });
                     }
                     None => {}

@@ -1320,6 +1320,7 @@ impl<'a> Interpreter<'a> {
                         ],
                         drop_glue: None,
                         type_id: payload.type_id,
+                        vtable_methods: Vec::new(),
                     })),
                     // The joined thread is blocked and no
                     // scheduling round can unblock it: the join
@@ -6284,6 +6285,7 @@ impl<'a> Interpreter<'a> {
                         drop_glue: self
                             .payload_drop_glue(&payload.ty)
                             .map(Box::new),
+                        vtable_methods: Vec::new(),
                         type_id: payload.type_id,
                     }),
                     other => Err(InterpError::type_mismatch(

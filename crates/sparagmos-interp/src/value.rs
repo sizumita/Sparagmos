@@ -425,6 +425,18 @@ pub enum Value {
         /// the call site recorded the target type's segments too.
         /// `None` when the forming site could not name them.
         type_id: Option<(u64, u64)>,
+        /// The vtable's method instance names, attached where
+        /// the value was formed (an unsizing cast, a decoded
+        /// constant, a vtable identity): the compiler resolved
+        /// them for this pointer's own (concrete type, bounds)
+        /// pair, whose vtable they are the entries of. `concrete`
+        /// erases the regions that distinguish two impls of one
+        /// trait for a pair of region variants of one type, so
+        /// virtual dispatch consults these names before it
+        /// matches the erased tag against impl spellings.
+        /// Empty when the forming site could not resolve the
+        /// vtable (dispatch then matches spellings, as before).
+        vtable_methods: Vec<String>,
     },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
@@ -604,9 +616,9 @@ impl Value {
                 Value::FatRef { base: bb, len: lb },
             ) => la == lb && ba.bit_identical(bb),
             (
-                Value::DynRef { base: ba, concrete: ca, traits: ta, drop_glue: ga, type_id: ia },
-                Value::DynRef { base: bb, concrete: cb, traits: tb, drop_glue: gb, type_id: ib },
-            ) => ca == cb && ta == tb && ga == gb && ia == ib && ba.bit_identical(bb),
+                Value::DynRef { base: ba, concrete: ca, traits: ta, drop_glue: ga, type_id: ia, vtable_methods: ma },
+                Value::DynRef { base: bb, concrete: cb, traits: tb, drop_glue: gb, type_id: ib, vtable_methods: mb },
+            ) => ca == cb && ta == tb && ga == gb && ia == ib && ma == mb && ba.bit_identical(bb),
             (
                 Value::ErasedBlock { bytes: ba, relocs: ra },
                 Value::ErasedBlock { bytes: bb, relocs: rb },

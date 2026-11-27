@@ -24,6 +24,7 @@ impl<'a> Converter<'a> {
         rv: &mir::Rvalue,
         dest_ty: Option<&mir::Ty>,
         site_type_id: Option<(u64, u64)>,
+        site_vtable_methods: Option<Vec<String>>,
     ) -> Result<ir::Rvalue, ConvertError> {
         use mir::Rvalue as R;
         Ok(match rv {
@@ -190,6 +191,7 @@ impl<'a> Converter<'a> {
                                                 traits,
                                                 glue: None,
                                                 type_id: None,
+                                                vtable_methods: Vec::new(),
                                             },
                                         )
                                     }
@@ -211,6 +213,10 @@ impl<'a> Converter<'a> {
                                                 traits,
                                                 glue,
                                                 type_id: site_type_id,
+                                                vtable_methods:
+                                                    site_vtable_methods
+                                                        .clone()
+                                                        .unwrap_or_default(),
                                             },
                                         )
                                     }

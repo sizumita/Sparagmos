@@ -3366,12 +3366,13 @@ pub(crate) fn ptr_cast_units_value(
             base: Box::new(ptr_cast_units_value(*base, from_size, typed_alloc)),
             len,
         },
-        Value::DynRef { base, concrete, traits, drop_glue, type_id } => Value::DynRef {
+        Value::DynRef { base, concrete, traits, drop_glue, type_id, vtable_methods } => Value::DynRef {
             base: Box::new(ptr_cast_units_value(*base, from_size, typed_alloc)),
             concrete,
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
         },
         other => other,
     }

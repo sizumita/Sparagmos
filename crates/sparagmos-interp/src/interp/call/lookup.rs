@@ -325,6 +325,66 @@ pub(crate) fn parse_coroutine_key(key: &str) -> Option<(String, String, Vec<Stri
     Some((parent, seg.to_string(), args))
 }
 
+/// Whether a recorded vtable method instance name (see
+/// `Value::DynRef::vtable_methods`) is the entry a call to
+/// `method` of the trait at `trait_path` dispatches through,
+/// given the bounds the pointer currently answers to
+/// (`traits`): the name must be an instance of that trait and
+/// that method, and no current bound may name the same trait
+/// under different generic arguments -- an upcast to another
+/// instantiation of the trait answers to that instantiation's
+/// vtable, not to the one the name was recorded from. A bound
+/// naming the trait without arguments, and a name recorded
+/// without arguments, are each compatible with the other's
+/// spelling: neither distinguishes instantiations the other
+/// names. The `std` / `core` spellings of one trait path are
+/// interchangeable, as in the bounds step of the dispatch.
+pub(super) fn vtable_entry_answers(
+    name: &str,
+    trait_path: &str,
+    method: &str,
+    traits: &[String],
+) -> bool {
+    let Some(rest) = name.strip_suffix(&format!(">::{method}")) else {
+        return false;
+    };
+    // `rest` is `<{self} as {trait}`: the trait segment
+    // follows the last ` as ` (a Self spelling can itself
+    // contain one, inside a qualified path argument).
+    let Some((_, seg)) = rest.rsplit_once(" as ") else {
+        return false;
+    };
+    let (seg_path, seg_args) = match seg.split_once('<') {
+        Some((path, args)) => (path, Some(args)),
+        None => (seg, None),
+    };
+    let path_matches = seg_path == trait_path
+        || trait_path
+            .strip_prefix("std::")
+            .is_some_and(|r| seg_path == format!("core::{r}"))
+        || trait_path
+            .strip_prefix("core::")
+            .is_some_and(|r| seg_path == format!("std::{r}"));
+    if !path_matches {
+        return false;
+    }
+    for bound in traits {
+        let (bound_path, bound_args) = match bound.split_once('<') {
+            Some((path, args)) => (path, Some(args)),
+            None => (bound.as_str(), None),
+        };
+        if bound_path != seg_path {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (seg_args, bound_args) {
+            if a != b {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The spellings of a rendered type with trailing generic
 /// arguments dropped from its outermost argument list, longest
 /// first: `a::W<X, Y, Z>` yields `a::W<X, Y>`, then `a::W<X>`,

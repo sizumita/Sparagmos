@@ -976,6 +976,7 @@ thread '{name}' ({tid}) panicked:
                     ],
                     drop_glue: None,
                     type_id: payload.type_id,
+                    vtable_methods: Vec::new(),
                 },
                 location,
                 Value::Bool(can_unwind),
