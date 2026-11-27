@@ -678,3 +678,37 @@ fn run_mode_hash_map_debug_format() {
         "empty {}\none {1: 10}\nstrkey {\"a\": 1}\nset {7}\nvecval {1: [1, 2]}\npretty {\n    1: 10,\n}\ndefault {}\n"
     );
 }
+const HASHSET_LARGE_CLONE_SRC: &str = r#"
+use std::collections::HashSet;
+
+fn main() {
+    let mut s: HashSet<i32> = HashSet::new();
+    for i in 0..1200 {
+        s.insert(i);
+    }
+    let t = s.clone();
+    println!("len={} sum={}", t.len(), t.iter().sum::<i32>());
+    println!("has0={} has1199={} has1200={}", t.contains(&0), t.contains(&1199), t.contains(&1200));
+    let mut b: Box<[i32]> = vec![0; 1200].into_boxed_slice();
+    for i in 0..1200 {
+        b[i] = (i * 2) as i32;
+    }
+    println!("boxed sum={}", b.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_hashset_large_clone_and_boxed_writes() {
+    // Regression for #399: filling and copying a large hash
+    // table writes single elements into a large buffer one by
+    // one; the pointer-crossing probe on each projected write
+    // must not re-read (clone) the whole buffer per element,
+    // which made such programs cost superlinearly per step.
+    // The clone and the element-by-element boxed-slice fill
+    // exercise exactly that write shape and must stay correct.
+    run_ok(
+        "hashset-large-clone",
+        HASHSET_LARGE_CLONE_SRC,
+        "len=1200 sum=719400\nhas0=true has1199=true has1200=false\nboxed sum=1438800\n",
+    );
+}
