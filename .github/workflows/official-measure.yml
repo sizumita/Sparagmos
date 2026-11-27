@@ -58,6 +58,8 @@ name: Official Measurement
 # trial run.
 
 on:
+  schedule:
+    - cron: "17 */2 * * *"
   push:
     branches: [main]
   workflow_dispatch:
