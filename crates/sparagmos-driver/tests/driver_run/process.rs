@@ -13,6 +13,61 @@ fn run_driver_with_process_host(src: &Path) -> Output {
         .expect("failed to run sparagmos-driver")
 }
 
+/// Run the driver with the process host, killing it once
+/// `timeout` elapses: the guard for the read-before-wait
+/// stdio tests below, whose guest reads a child's wired
+/// stream to its end before waiting on the child. A wiring
+/// regression makes that read block forever (the bytes sit
+/// undelivered, or a duplicated writer end never closes),
+/// and the test must fail with the captured output, not
+/// hang the suite.
+fn run_driver_with_process_host_timeout(
+    src: &Path,
+    extra: &[&str],
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Output {
+    let stdout_path = dir.join("driver-stdout.txt");
+    let stderr_path = dir.join("driver-stderr.txt");
+    let stdout_file = std::fs::File::create(&stdout_path).unwrap();
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .arg("--guest-process-host")
+        .args(extra)
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+        .expect("failed to run sparagmos-driver");
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "driver did not finish within {timeout:?}: \
+                         the guest blocked (stdout: {:?}, stderr: {:?})",
+                        std::fs::read_to_string(&stdout_path)
+                            .unwrap_or_default(),
+                        std::fs::read_to_string(&stderr_path)
+                            .unwrap_or_default(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    };
+    Output {
+        status,
+        stdout: std::fs::read(&stdout_path).unwrap(),
+        stderr: std::fs::read(&stderr_path).unwrap(),
+    }
+}
+
 const PROCESS_EXIT_SRC: &str = r#"
 fn main() {
     println!("before");
@@ -1107,6 +1162,197 @@ fn run_mode_process_host_stdio_from_file_and_child_handles() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "stdio-from-ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// Spawn-time stdio wiring (issue #511, the rustc record
+// `tests/ui/process/issue-30490.rs`): a stream the guest
+// wires to a file -- here, the other end of a pipe the
+// guest itself holds -- is wired through the host at
+// spawn, so a guest reading the pipe before waiting on
+// the child observes the child's bytes while it runs and
+// end-of-file when it ends. The earlier shape collected
+// the stream and relayed it when the child's end was
+// observed, so the read below saw an empty, unfinished
+// stream (and a relay that keeps a duplicated writer end
+// open past the child's end makes it block forever: the
+// timeout-guarded runner above is the deadlock guard).
+// The libc descriptor calls live in an auxiliary crate,
+// as in the `libc::read` test above.
+// ---------------------------------------------------------------------------
+
+const STDIO_SWAP_AUX_SRC: &str = r#"
+#![feature(rustc_private)]
+extern crate libc;
+
+pub const STDOUT: i32 = libc::STDOUT_FILENO;
+pub const STDERR: i32 = libc::STDERR_FILENO;
+
+/// `libc::pipe`: the (reader, writer) descriptor pair.
+pub fn pipe() -> (i32, i32) {
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    (fds[0], fds[1])
+}
+
+pub fn dup(fd: i32) -> i32 {
+    unsafe { libc::dup(fd) }
+}
+
+pub fn dup2(old: i32, new: i32) -> i32 {
+    unsafe { libc::dup2(old, new) }
+}
+
+pub fn close(fd: i32) -> i32 {
+    unsafe { libc::close(fd) }
+}
+"#;
+
+const STDIO_SWAP_SRC: &str = r#"
+extern crate stdio_swap_probe as probe;
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--child" {
+        std::io::stdout().write_all(b"child stdout\n").unwrap();
+        std::io::stderr().write_all(b"child stderr\n").unwrap();
+        return;
+    }
+    let me = std::env::current_exe().unwrap();
+
+    let stdout_backup = probe::dup(probe::STDOUT);
+    let stderr_backup = probe::dup(probe::STDERR);
+    assert!(stdout_backup > -1 && stderr_backup > -1);
+
+    let (out_reader, out_writer) = probe::pipe();
+    let (err_reader, err_writer) = probe::pipe();
+    assert!(probe::dup2(out_writer, probe::STDOUT) > -1);
+    assert!(probe::dup2(err_writer, probe::STDERR) > -1);
+    // Close any duplicates of the writer ends, or the
+    // reads below never see end-of-file.
+    assert_eq!(probe::close(out_writer), 0);
+    assert_eq!(probe::close(err_writer), 0);
+
+    std::io::stdout().write_all(b"parent stdout\n").unwrap();
+    std::io::stderr().write_all(b"parent stderr\n").unwrap();
+
+    // The child's stdio is this process's own (swapped)
+    // descriptors, crossed: its stdout is the stderr pipe,
+    // its stderr the stdout pipe.
+    let mut child = Command::new(&me)
+        .arg("--child")
+        .stdin(Stdio::inherit())
+        .stdout(unsafe { Stdio::from_raw_fd(probe::STDERR) })
+        .stderr(unsafe { Stdio::from_raw_fd(probe::STDOUT) })
+        .spawn()
+        .unwrap();
+
+    // The `Stdio`s took over (and closed) descriptors 1
+    // and 2, so restore them from the backups.
+    assert!(probe::dup2(stdout_backup, probe::STDOUT) > -1);
+    assert!(probe::dup2(stderr_backup, probe::STDERR) > -1);
+
+    // Both pipes are read to their end BEFORE the child is
+    // waited on: its bytes must arrive while it runs, and
+    // end-of-file must follow its exit.
+    let mut read = String::new();
+    let mut f: File = unsafe { FromRawFd::from_raw_fd(out_reader) };
+    f.read_to_string(&mut read).unwrap();
+    assert_eq!(read, "parent stdout\nchild stderr\n");
+
+    read.clear();
+    let mut f: File = unsafe { FromRawFd::from_raw_fd(err_reader) };
+    f.read_to_string(&mut read).unwrap();
+    assert_eq!(read, "parent stderr\nchild stdout\n");
+
+    assert!(child.wait().unwrap().success());
+    println!("stdio-swap-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_spawn_stdio_swap_read_before_wait() {
+    let dir = temp_dir("proc-host-stdio-swap");
+    let aux = fixture(&dir, "stdio_swap_probe.rs", STDIO_SWAP_AUX_SRC);
+    let src = fixture(&dir, "stdio_swap.rs", STDIO_SWAP_SRC);
+    let spec = format!("stdio_swap_probe={}", aux.display());
+    let out = run_driver_with_process_host_timeout(
+        &src,
+        &["--aux", &spec],
+        &dir,
+        std::time::Duration::from_secs(120),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "stdio-swap-ok\n");
+}
+
+const STDIO_PIPE_READ_SRC: &str = r#"
+extern crate stdio_swap_probe as probe;
+
+use std::fs::File;
+use std::io::Read;
+use std::process::{Command, Stdio};
+
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
+
+fn main() {
+    let dir = std::env::args().nth(1).unwrap();
+    let in_path = format!("{dir}/pipe-in.txt");
+    std::fs::write(&in_path, b"through-the-pipe\n").unwrap();
+
+    let (reader, writer) = probe::pipe();
+    let infile = File::open(&in_path).unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::from(infile))
+        .stdout(unsafe { Stdio::from_raw_fd(writer) })
+        .spawn()
+        .unwrap();
+    // The `Stdio` took over the writer descriptor (the
+    // model does not observe its drop), so close this
+    // process's copy, or the read below never sees
+    // end-of-file.
+    assert_eq!(probe::close(writer), 0);
+
+    // Read the pipe to its end BEFORE waiting on the
+    // child: the bytes arrive while it runs, and
+    // end-of-file follows its exit.
+    let mut read = String::new();
+    let mut f: File = unsafe { FromRawFd::from_raw_fd(reader) };
+    f.read_to_string(&mut read).unwrap();
+    assert_eq!(read, "through-the-pipe\n");
+    assert!(child.wait().unwrap().success());
+    println!("stdio-pipe-read-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_spawn_pipe_read_before_wait() {
+    let dir = temp_dir("proc-host-stdio-pipe-read");
+    let aux = fixture(&dir, "stdio_swap_probe.rs", STDIO_SWAP_AUX_SRC);
+    let src = fixture(&dir, "stdio_pipe_read.rs", STDIO_PIPE_READ_SRC);
+    let spec = format!("stdio_swap_probe={}", aux.display());
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let out = run_driver_with_process_host_timeout(
+        &src,
+        &["--aux", &spec, "--guest-arg", &dir_arg],
+        &dir,
+        std::time::Duration::from_secs(120),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "stdio-pipe-read-ok\n"
+    );
 }
 
 const PROCESS_HOST_FAILURE_SRC: &str = r#"

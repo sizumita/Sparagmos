@@ -43,6 +43,14 @@ pub(crate) struct HostChild {
     /// stderr is the guest's own stream, handed to the
     /// interpreter at spawn, so there is nothing to drain.
     diag: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// A self-child's guest-stderr relay: the thread
+    /// carrying the guest-stderr stream into the file the
+    /// guest wired the child's stderr to, when it wired one
+    /// (see `ProcessHostOps::spawn`). It owns the relay's
+    /// duplicate of the wired end and drops it when the
+    /// stream ends, which is what delivers end-of-file to a
+    /// guest reading the other end of a pipe it wired.
+    relay: Option<std::thread::JoinHandle<()>>,
     /// A self-child's guest-stderr channel file (the guest
     /// reads the stream fed from it through the interpreter;
     /// see `guest_stderr_stream`); removed once the child's
@@ -142,6 +150,23 @@ fn drain_pipe<R: std::io::Read>(mut pipe: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = pipe.read_to_end(&mut buf);
     buf
+}
+
+/// Carry one stream into a file until the stream ends:
+/// the relay a file-wired stream of a spawned self-child
+/// runs on (see `ProcessHostOps::spawn`). The target is
+/// the relay's own duplicate of the wired end; dropping it
+/// when the source ends is what delivers end-of-file to a
+/// reader of the other end of a pipe the guest wired the
+/// stream to, so no duplicated writer end may outlive the
+/// relay.
+fn relay_stream(
+    mut source: std::fs::File,
+    mut target: std::fs::File,
+) {
+    use std::io::Write as _;
+    let _ = std::io::copy(&mut source, &mut target);
+    let _ = target.flush();
 }
 
 /// The guest-visible stderr stream of a spawned self-child:
@@ -564,6 +589,7 @@ impl DriverProcessHost {
         &self,
         entry: &mut HostChild,
         status: std::process::ExitStatus,
+        join_relay: bool,
     ) -> Result<i32, sparagmos_interp::ProcessHostError> {
         use sparagmos_interp::ProcessHostError as HostErr;
         let exit_code = host_exit_code(status);
@@ -575,6 +601,19 @@ impl DriverProcessHost {
                 .unwrap_or_default();
             if let Some(file) = &entry.stderr_file {
                 let _ = std::fs::remove_file(file);
+            }
+            if join_relay {
+                // A blocking wait leaves no relay in flight:
+                // the wired stream's last bytes have reached
+                // the guest's file and the relay's duplicate
+                // of its end is closed, as a native wait
+                // leaves the child's ends closed with it.
+                // (The relay ends once the diagnostic drain
+                // has completed, which the join above has
+                // already observed.)
+                if let Some(relay) = entry.relay.take() {
+                    let _ = relay.join();
+                }
             }
             if let Some(reason) =
                 self_run_failure(exit_code, &drained)
@@ -610,9 +649,51 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         use sparagmos_interp::ProcessHostError as HostErr;
         let (mut cmd, self_run, stderr_file) =
             self.assemble(&request)?;
-        cmd.stdin(wire_stdio(request.stdin))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.stdin(wire_stdio(request.stdin));
+        // A stream the guest wired to a file is wired into
+        // the child directly, at spawn: its bytes move
+        // through the guest's file while the child runs --
+        // a guest reading the other end of a pipe it wired
+        // observes them, and end-of-file, as the child
+        // produces them, not a collection delivered when
+        // the child's end is observed. `Stdio::from` takes
+        // the request's duplicate of the wired end; the
+        // spawn dups it into the child and this process
+        // keeps no copy of it, so no duplicated writer end
+        // outlives the child. Any other stream is piped and
+        // its end handed to the interpreter, as before.
+        let mut stdout_wired = false;
+        match request.stdout {
+            sparagmos_interp::ProcessStdio::Fd(file) => {
+                cmd.stdout(std::process::Stdio::from(file));
+                stdout_wired = true;
+            }
+            _ => {
+                cmd.stdout(std::process::Stdio::piped());
+            }
+        }
+        // A self-child's stderr is the exception: the
+        // nested process's own stderr is the diagnostic
+        // pipe, and its guest stderr arrives through the
+        // channel file, so a wired file is served by a
+        // relay carrying that stream into the file (see
+        // below) rather than by the child's descriptor.
+        let mut stderr_target = None;
+        let mut stderr_wired = false;
+        match request.stderr {
+            sparagmos_interp::ProcessStdio::Fd(file) => {
+                if self_run {
+                    stderr_target = Some(file);
+                    cmd.stderr(std::process::Stdio::piped());
+                } else {
+                    cmd.stderr(std::process::Stdio::from(file));
+                    stderr_wired = true;
+                }
+            }
+            _ => {
+                cmd.stderr(std::process::Stdio::piped());
+            }
+        }
         if self_run {
             // The guest-stderr channel file exists before the
             // child starts, so the stream feeding the guest
@@ -625,8 +706,12 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         let mut child = cmd.spawn().map_err(HostErr::Io)?;
         let pid = child.id();
         let stdin = child.stdin.take().map(pipe_file);
-        let stdout = child.stdout.take().map(pipe_file);
-        let (stderr, diag) = if self_run {
+        let stdout = if stdout_wired {
+            None
+        } else {
+            child.stdout.take().map(pipe_file)
+        };
+        let (stderr, diag, relay) = if self_run {
             let pipe = child.stderr.take().expect("piped stderr");
             // The diagnostic stream closes when the nested
             // process ends; the drain's completion is what
@@ -647,9 +732,26 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             let guest = stderr_file.as_ref().and_then(|file| {
                 guest_stderr_stream(file, diag_done)
             });
-            (guest, Some(drain))
+            match (guest, stderr_target) {
+                (Some(tail), Some(target)) => {
+                    // The guest wired this child's stderr to
+                    // a file: the guest-stderr stream is
+                    // relayed into it while the child runs,
+                    // on a thread owning the request's
+                    // duplicate of the wired end, dropped
+                    // when the stream ends (see
+                    // `relay_stream`).
+                    let relay = std::thread::spawn(move || {
+                        relay_stream(tail, target)
+                    });
+                    (None, Some(drain), Some(relay))
+                }
+                (guest, _) => (guest, Some(drain), None),
+            }
+        } else if stderr_wired {
+            (None, None, None)
         } else {
-            (child.stderr.take().map(pipe_file), None)
+            (child.stderr.take().map(pipe_file), None, None)
         };
         let id = {
             let mut next = self.next.lock().unwrap();
@@ -662,6 +764,7 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             HostChild {
                 child,
                 diag,
+                relay,
                 stderr_file,
                 self_run,
                 exit: None,
@@ -686,20 +789,56 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         use sparagmos_interp::ProcessHostError as HostErr;
         let (mut cmd, self_run, stderr_file) =
             self.assemble(&request)?;
-        cmd.stdin(wire_stdio(request.stdin))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.stdin(wire_stdio(request.stdin));
+        // A stream the guest wired to a file is wired into
+        // the child directly, as at spawn (see `spawn`): its
+        // bytes move through the guest's file while the
+        // child runs and the collected half of the outcome
+        // is empty, as std's collected output for a wired
+        // stream is. A self-child's stderr keeps the
+        // channel-file path (see `finalize`): the nested
+        // process's own stderr is the diagnostic pipe.
+        let mut stdout_wired = false;
+        match request.stdout {
+            sparagmos_interp::ProcessStdio::Fd(file) => {
+                cmd.stdout(std::process::Stdio::from(file));
+                stdout_wired = true;
+            }
+            _ => {
+                cmd.stdout(std::process::Stdio::piped());
+            }
+        }
+        let mut stderr_wired = false;
+        match request.stderr {
+            sparagmos_interp::ProcessStdio::Fd(file)
+                if !self_run =>
+            {
+                cmd.stderr(std::process::Stdio::from(file));
+                stderr_wired = true;
+            }
+            _ => {
+                cmd.stderr(std::process::Stdio::piped());
+            }
+        }
         let mut child = cmd.spawn().map_err(HostErr::Io)?;
-        let out_pipe = child.stdout.take().expect("piped stdout");
-        let err_pipe = child.stderr.take().expect("piped stderr");
-        let stdout =
-            std::thread::spawn(move || drain_pipe(out_pipe));
-        let stderr =
-            std::thread::spawn(move || drain_pipe(err_pipe));
+        let stdout = if stdout_wired {
+            None
+        } else {
+            let out_pipe =
+                child.stdout.take().expect("piped stdout");
+            Some(std::thread::spawn(move || drain_pipe(out_pipe)))
+        };
+        let stderr = if stderr_wired {
+            None
+        } else {
+            let err_pipe =
+                child.stderr.take().expect("piped stderr");
+            Some(std::thread::spawn(move || drain_pipe(err_pipe)))
+        };
         let status = child.wait().map_err(HostErr::Io)?;
         let mut entry = RunChild {
-            stdout: Some(stdout),
-            stderr: Some(stderr),
+            stdout,
+            stderr,
             stderr_file,
             self_run,
         };
@@ -719,7 +858,7 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
             return Ok(code);
         }
         let status = entry.child.wait().map_err(HostErr::Io)?;
-        self.observe_end(entry, status)
+        self.observe_end(entry, status, true)
     }
 
     fn try_wait(
@@ -737,7 +876,7 @@ impl sparagmos_interp::ProcessHostOps for DriverProcessHost {
         match entry.child.try_wait().map_err(HostErr::Io)? {
             None => Ok(None),
             Some(status) => {
-                self.observe_end(entry, status).map(Some)
+                self.observe_end(entry, status, false).map(Some)
             }
         }
     }
