@@ -751,6 +751,9 @@ pub(super) fn spawn_gate_error(
     interception: Option<&crate::interp::ToolInterception>,
     state: &crate::interp::CommandState,
 ) -> Option<Value> {
+    if let Some(error) = process_spawn_intrinsic_error(state) {
+        return Some(error);
+    }
     if let Some(interception) = interception {
         if interception.programs.iter().any(|p| p == &state.program) {
             return None;
@@ -759,7 +762,17 @@ pub(super) fn spawn_gate_error(
     process_spawn_error(state)
 }
 
-fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
+/// The spawn errors std's own preparation produces from
+/// the command itself, before any program is looked up: a
+/// NUL anywhere in the invocation, and a working directory
+/// that does not name a directory. These hold whoever
+/// carries the spawn out -- the host's runner for a claimed
+/// program starts its subprocess under the same directory
+/// and with the same strings, and can only fail the whole
+/// run where the native spawn returns the error.
+fn process_spawn_intrinsic_error(
+    state: &crate::interp::CommandState,
+) -> Option<Value> {
     if state.saw_nul {
         return Some(io_simple_error_value(ERROR_KIND_INVALID_INPUT));
     }
@@ -774,6 +787,13 @@ fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
             Ok(_) => return Some(io_os_error_value(ERRNO_NOT_A_DIRECTORY)),
             Err(_) => return Some(io_os_error_value(ERRNO_NOT_FOUND)),
         }
+    }
+    None
+}
+
+fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
+    if let Some(error) = process_spawn_intrinsic_error(state) {
+        return Some(error);
     }
     match resolve_program(state) {
         Ok(_) => None,
@@ -1430,6 +1450,7 @@ pub(crate) fn command_lookup(canonical: &str) -> Option<Builtin> {
         "std::sys::process::unix::common::Command::stdout" => Builtin::ProcessCommandStdio,
         "std::sys::process::unix::common::Command::stderr" => Builtin::ProcessCommandStdio,
         "std::sys::process::unix::unix::Command::spawn" => Builtin::ProcessSpawn,
+        "std::sys::process::unix::unix::Command::exec" => Builtin::ProcessCommandExec,
         "std::env::current_exe" => Builtin::CurrentExe,
         "std::process::id" => Builtin::ProcessId,
         _ => return None,
@@ -1458,7 +1479,12 @@ pub(crate) fn command_api_lookup(canonical: &str) -> Option<Builtin> {
         "std::os::unix::process::CommandExt::uid" => Builtin::ProcessCommandUid,
         "std::os::unix::process::CommandExt::gid" => Builtin::ProcessCommandGid,
         "std::os::unix::process::CommandExt::groups" => Builtin::ProcessCommandGroups,
+        "std::os::unix::process::CommandExt::arg0" => Builtin::ProcessCommandArg0,
+        "std::sys::process::unix::common::Command::set_arg_0" => {
+            Builtin::ProcessCommandArg0
+        }
         "std::process::Command::spawn" => Builtin::ProcessSpawn,
+        "std::os::unix::process::CommandExt::exec" => Builtin::ProcessCommandExec,
         "std::process::Command::output" => Builtin::ProcessOutput,
         "std::process::Command::status" => Builtin::ProcessSpawn,
         "std::process::Child::wait" => Builtin::ProcessChildWait,

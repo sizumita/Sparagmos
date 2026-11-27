@@ -2375,6 +2375,23 @@ impl<'a> Interpreter<'a> {
                 .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 Ok(vals.into_iter().next().expect("arity checked"))
             }
+            Builtin::ProcessCommandArg0 => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let arg0 = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.argv0 = Some(arg0);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                // The sys setter returns unit; the public
+                // `CommandExt::arg0` returns the command
+                // itself for chaining.
+                if name.contains("set_arg_0") {
+                    Ok(Value::Unit)
+                } else {
+                    Ok(vals.into_iter().next().expect("arity checked"))
+                }
+            }
             Builtin::FromRawFd => {
                 arity(1)?;
                 self.exec_from_raw_fd(frames, name, generic_args, &vals)
@@ -2680,6 +2697,104 @@ impl<'a> Interpreter<'a> {
                             Some(Err(error)) => Ok(err_result(error)),
                             None => Err(unsupported(format!(
                                 "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
+                                String::from_utf8_lossy(&state.program)
+                            ))),
+                        }
+                    }
+                }
+            }
+            Builtin::ProcessCommandExec => {
+                // The public entry passes only the receiver;
+                // the sys entry also passes the default stdio
+                // (`Stdio::Inherit` from `CommandExt::exec`),
+                // which the model's routing already assumes.
+                if vals.len() != 1 && vals.len() != 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let state = self
+                    .command_snapshot(id)
+                    .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                match spawn_gate_error(self.tool_interception(), &state) {
+                    // `exec` returns the `io::Error` itself,
+                    // not a `Result`: a failure to start the
+                    // program is the call's normal return.
+                    Some(error) => Ok(error),
+                    None => {
+                        check_stdio_modelled(&state)?;
+                        let outcome = match tool_outcome(
+                            self.tool_interception(),
+                            &state,
+                            false,
+                        )? {
+                            Some(outcome) => Some(Ok(outcome)),
+                            None => self.host_outcome(&state, false)?,
+                        };
+                        match outcome {
+                            Some(Ok(outcome)) => {
+                                // The program replaces the guest:
+                                // what it prints joins the
+                                // guest's own streams (the
+                                // streams whose configuration
+                                // inherits them), and the run
+                                // ends with the program's exit
+                                // code, as the replaced process's
+                                // own end would.
+                                match stdio_route(state.stdout_stdio, false) {
+                                    // The relay goes through
+                                    // the guest's own stdout
+                                    // write path, not the
+                                    // captured-output buffer:
+                                    // the replaced process's
+                                    // stdout IS the guest's
+                                    // descriptor 1, routing and
+                                    // write-through sink
+                                    // included (a run the
+                                    // process host re-ran as a
+                                    // child streams it to the
+                                    // parent's pipe). A write
+                                    // failure there cannot
+                                    // change the outcome: the
+                                    // program has already run
+                                    // to its end.
+                                    StdioRoute::Relay => {
+                                        let _ = self.write_stdout(&outcome.stdout);
+                                    }
+                                    StdioRoute::File => {
+                                        self.write_stdio_file(
+                                            state.stdout_stdio,
+                                            &outcome.stdout,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                match stdio_route(state.stderr_stdio, false) {
+                                    StdioRoute::Relay => {
+                                        self.push_error_output(
+                                            &String::from_utf8_lossy(
+                                                &outcome.stderr,
+                                            ),
+                                        );
+                                    }
+                                    StdioRoute::File => {
+                                        self.write_stdio_file(
+                                            state.stderr_stdio,
+                                            &outcome.stderr,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                Err(InterpError::ProcessExit {
+                                    code: outcome.exit_code,
+                                })
+                            }
+                            Some(Err(error)) => Ok(error),
+                            None => Err(unsupported(format!(
+                                "replacing the process with program `{}` is not runtime-supported (the process model does not start child processes)",
                                 String::from_utf8_lossy(&state.program)
                             ))),
                         }

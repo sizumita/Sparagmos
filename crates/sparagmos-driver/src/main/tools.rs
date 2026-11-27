@@ -2209,6 +2209,12 @@ pub(crate) struct SelfRunContext {
     pub(crate) edition: String,
     pub(crate) aux: Vec<String>,
     pub(crate) rustc_args: Vec<String>,
+    /// Whether this run serves real child processes (the
+    /// `--guest-process-host` flag): a self-spawn child run
+    /// is the same program in the same role, so it serves
+    /// them too -- the process host's own self-spawn route
+    /// passes the flag to its children the same way.
+    pub(crate) process_host: bool,
 }
 
 /// Run the guest program itself for a spawn the interpreter
@@ -2291,6 +2297,9 @@ pub(crate) fn self_run(
     // this spawn wired as its stdout, as a native child's
     // would (see `InterpConfig::stdout_sink`).
     tail.push("--guest-stdout-passthrough".to_string());
+    if ctx.process_host {
+        tail.push("--guest-process-host".to_string());
+    }
     // The arguments travel as command-line strings, or in
     // an arguments file when one is not valid UTF-8, as in
     // `artifact_run` (see `push_guest_args`).

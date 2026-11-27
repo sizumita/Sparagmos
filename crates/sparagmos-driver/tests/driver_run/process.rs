@@ -2334,3 +2334,120 @@ fn run_mode_process_host_status_piped_large_output() {
         "process-host-status-drain-ok\n"
     );
 }
+
+const ARG0_SRC: &str = r#"
+use std::env;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        // Child mode: report the argv[0] this run was given.
+        println!("argv0={}", args[0]);
+        return;
+    }
+    let me = env::current_exe().unwrap();
+    let out = Command::new(&me)
+        .arg("child")
+        .arg0("a-custom-name")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "argv0=a-custom-name\n"
+    );
+    println!("arg0-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_arg0() {
+    let dir = temp_dir("proc-host-arg0");
+    let src = fixture(&dir, "process_host_arg0.rs", ARG0_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "arg0-ok\n");
+}
+
+const EXEC_SRC: &str = r#"
+use std::env;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "child" => println!("child-ran"),
+            "exec-self" => {
+                let me = env::current_exe().unwrap();
+                let err = Command::new(&me).arg("child").exec();
+                panic!("exec returned: {err}");
+            }
+            "exec-echo" => {
+                let err = Command::new("echo")
+                    .arg("passed")
+                    .env_clear()
+                    .exec();
+                panic!("exec returned: {err}");
+            }
+            "exec-missing" => {
+                let err = Command::new("/path/to/nowhere").exec();
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+                println!("passed");
+            }
+            "exec-nul" => {
+                let me = env::current_exe().unwrap();
+                let err = Command::new(&me).arg("bad\0").exec();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                println!("passed");
+            }
+            "exec-bad-cwd" => {
+                let me = env::current_exe().unwrap();
+                let err = Command::new(&me)
+                    .current_dir("/path/to/nowhere")
+                    .exec();
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+                println!("passed");
+            }
+            _ => panic!("unknown mode"),
+        }
+        return;
+    }
+    let me = env::current_exe().unwrap();
+    // The exec'd program replaces the child run: its output
+    // is the child run's output, and the run ends with the
+    // program's exit code.
+    let out = Command::new(&me).arg("exec-self").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "child-ran\n");
+    // A real program exec'd from inside a self-spawn child
+    // run: the child run serves it through its own process
+    // host, as the parent run serves the child.
+    let out = Command::new(&me).arg("exec-echo").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "passed\n");
+    // A failed exec returns the error and the guest runs on.
+    for mode in ["exec-missing", "exec-nul", "exec-bad-cwd"] {
+        let out = Command::new(&me).arg(mode).output().unwrap();
+        assert!(out.status.success(), "{mode}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "passed\n",
+            "{mode}"
+        );
+    }
+    println!("exec-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_exec() {
+    let dir = temp_dir("proc-host-exec");
+    let src = fixture(&dir, "process_host_exec.rs", EXEC_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "exec-ok\n");
+}

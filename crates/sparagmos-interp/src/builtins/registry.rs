@@ -962,6 +962,13 @@ pub enum Builtin {
     /// self, &[u32])`: record the child's supplementary
     /// groups on the command.
     ProcessCommandGroups,
+    /// `std::os::unix::process::CommandExt::arg0(&mut self,
+    /// arg) -> &mut Self` and the sys setter it forwards to,
+    /// `std::sys::process::unix::common::Command::set_arg_0
+    /// (&mut self, &OsStr)`: record the child's argv[0] on
+    /// the command; the spawn request already carries it to
+    /// the process host.
+    ProcessCommandArg0,
     /// `std::os::fd::FromRawFd::from_raw_fd(i32) -> Self`:
     /// build the handle value of the `Self` type (a
     /// `File`, a `Stdio`) around a guest descriptor
@@ -982,6 +989,16 @@ pub enum Builtin {
     /// host started and report its exit status (see
     /// `ProcessSpawn` for how a `Child` handle comes to be).
     ProcessChildWait,
+    /// `std::os::unix::process::CommandExt::exec(&mut self)
+    /// -> io::Error` and the sys entry it forwards to,
+    /// `std::sys::process::unix::unix::Command::exec(&mut
+    /// self, Stdio) -> io::Error`: replace the guest process
+    /// with the command's program. On failure the `io::Error`
+    /// is returned to the guest; on success the program runs
+    /// through the process host with the guest's streams and
+    /// the run ends with the program's exit code, as the
+    /// replaced process's own end would be reported.
+    ProcessCommandExec,
     /// `std::process::Child::try_wait(&mut self) ->
     /// io::Result<Option<ExitStatus>>`: the child's exit status
     /// if it has already ended, `None` while it runs.
