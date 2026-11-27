@@ -5239,3 +5239,54 @@ fn run_mode_from_cow_to_counted() {
         "\"x\" \"owned-str\" [1, 2] [3, 4] \"y\" \"owned-os\" \"z\" \"w\"\n",
     );
 }
+
+const OS_STRING_REAL_AGGREGATE_AS_REF_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+
+fn main() {
+    let mut s = OsString::with_capacity(16);
+    s.push("hello");
+    s.push("-world");
+    let r: &OsStr = s.as_ref();
+    println!("len={}", r.len());
+    println!("lossy={}", r.to_string_lossy());
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_as_ref() {
+    // An `OsString` built by `with_capacity` plus `push` is
+    // stored in its real aggregate form (its bytes behind the
+    // buffer's raw pointer); viewing it as an `&OsStr`
+    // through `AsRef` reads the bytes through that buffer,
+    // like the deref, equality and format consumers do.
+    run_ok(
+        "os-string-real-aggregate-as-ref",
+        OS_STRING_REAL_AGGREGATE_AS_REF_SRC,
+        "len=11\nlossy=hello-world\n",
+    );
+}
+
+const STRING_JOIN_AS_REF_SRC: &str = r#"
+fn main() {
+    let s = ["foo", "bar", "baz"].join("/");
+    let r: &str = s.as_ref();
+    println!("joined={} len={}", r, r.len());
+    let b: &[u8] = s.as_ref();
+    println!("bytes={:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_string_join_as_ref_views() {
+    // A `String` built by `slice::join` is stored as the
+    // element form whose elements past the first copied
+    // slice keep the `MaybeUninit` union form; viewing it
+    // as an `&str` (or as a byte slice) through `AsRef`
+    // denominates that form as the string it holds.
+    run_ok(
+        "string-join-as-ref-views",
+        STRING_JOIN_AS_REF_SRC,
+        "joined=foo/bar/baz len=11\nbytes=[102, 111, 111, 47, 98, 97, 114, 47, 98, 97, 122]\n",
+    );
+}

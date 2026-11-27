@@ -1338,6 +1338,55 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// The bytes an owned string-like value denotes in the
+    /// forms the pure shape reading in `view_value_as` cannot
+    /// reach, read by the accessor for its type: `String`
+    /// through `string_from_real_aggregate` (the buffer behind
+    /// a reference) or `string_from_element_form` (the element
+    /// form whose elements keep the `MaybeUninit` union form
+    /// -- the readings `resolve_string` composes), `OsString`
+    /// through `os_string_bytes_any`, `PathBuf` through
+    /// `path_buf_bytes_any`. Any other type, or a value in any
+    /// other form, returns `None` and leaves the caller's
+    /// ordinary judgement to stand.
+    fn real_form_string_bytes(
+        &self,
+        frames: &[Frame],
+        base_ty: &str,
+        value: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        match base_ty {
+            "std::string::String" | "alloc::string::String" => {
+                if let Some(text) =
+                    self.string_from_real_aggregate(frames, value)?
+                {
+                    return Ok(Some(text.into_bytes()));
+                }
+                if let Value::Enum {
+                    variant: 0,
+                    fields,
+                } = value
+                {
+                    if fields.len() == 1 {
+                        if let Some(text) =
+                            self.string_from_element_form(&fields[0])
+                        {
+                            return Ok(Some(text.into_bytes()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "std::ffi::OsString" | "std::ffi::OsStr" => {
+                self.os_string_bytes_any(frames, value)
+            }
+            "std::path::PathBuf" | "std::path::Path" => {
+                self.path_buf_bytes_any(frames, value)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The value-level view behind `as_ref_view`: `value` is the
     /// receiver's data (references already followed), `base_ty`
     /// its type, `target_ty` the view's type.
@@ -1378,9 +1427,43 @@ impl<'a> Interpreter<'a> {
                         // around the buffer around the byte
                         // vector, the shape `pathbuf_value`
                         // builds): the view is the byte string at
-                        // the bottom of the wrapper chain.
-                        match string_aggregate_bytes(&value) {
-                            Some(bytes) => Ok(Value::Bytes(bytes)),
+                        // the bottom of the wrapper chain. The
+                        // pure shape reading denominates the
+                        // modelled forms; the forms it cannot
+                        // reach -- the real aggregate form, whose
+                        // buffer sits behind a reference, and a
+                        // `String` element form whose elements
+                        // keep the `MaybeUninit` union form --
+                        // go through the readers that follow
+                        // those shapes, as the byte accessors
+                        // and the equality comparisons already do.
+                        let bytes = match string_aggregate_bytes(&value) {
+                            Some(bytes) => Some(bytes),
+                            None => {
+                                self.real_form_string_bytes(frames, base_ty, &value)?
+                            }
+                        };
+                        match bytes {
+                            Some(bytes) => {
+                                // A `String`'s view is the string
+                                // itself: the consumers of an
+                                // `&str` read string data, and a
+                                // byte-string view of a `String`
+                                // is refused as a string argument
+                                // downstream. The OS-string and
+                                // path views stay byte strings.
+                                if matches!(
+                                    base_ty,
+                                    "std::string::String" | "alloc::string::String"
+                                ) {
+                                    if let Ok(text) =
+                                        String::from_utf8(bytes.clone())
+                                    {
+                                        return Ok(Value::Str(text));
+                                    }
+                                }
+                                Ok(Value::Bytes(bytes))
+                            }
                             None => Err(InterpError::type_mismatch(
                                 what,
                                 "string data",
