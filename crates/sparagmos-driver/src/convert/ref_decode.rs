@@ -252,6 +252,43 @@ impl Converter {
         }
     }
 
+    /// Decode a reference whose pointee is a coroutine-closure
+    /// (async closure) value -- the shape of the promoted
+    /// constant an async-closure call takes
+    /// (`const _promoted: &{async closure}`).
+    ///
+    /// The pointee type's kind cannot be asked through Stable
+    /// MIR (see `guarded_ty_kind`), so the closure's definition
+    /// and upvars tuple are read through the compiler context
+    /// (see `coroutine_closure_const_parts`). A constant can
+    /// only name a closure value whose captures are all
+    /// zero-sized -- a value with sized captures is created by
+    /// an aggregate at runtime, never by a constant -- and a
+    /// zero-sized capture's unique value is exactly what the
+    /// closure constant form carries (no environment), the
+    /// same form a zero-sized coroutine-closure type constant
+    /// takes (see the `TyConstKind::ZSTValue` conversion).
+    /// The definition is recorded as an async closure so the
+    /// interpreter routes calls through it as one. Anything
+    /// else (not a coroutine-closure pointee, an upvars layout
+    /// that cannot be asked, sized captures) stays undecoded.
+    fn decode_coroutine_closure_ref(
+        &mut self,
+        inner: &rustc_public::ty::Ty,
+    ) -> Option<sm::ConstValue> {
+        let (def, _args, upvars) = coroutine_closure_const_parts(inner)?;
+        let size = guarded_query(|| match upvars.layout() {
+            Ok(l) => Some(l.shape().size.bytes()),
+            Err(_) => None,
+        })??;
+        if size != 0 {
+            return None;
+        }
+        let d = self.def_id(def);
+        self.async_closure_defs.insert(d);
+        Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Closure(d))))
+    }
+
     pub(crate) fn decode_ref(
         &mut self,
         inner: &rustc_public::ty::Ty,
@@ -270,11 +307,15 @@ impl Converter {
             self.clear_alloc_caches();
         }
         // A pointee type passing through a coroutine-closure
-        // type cannot be asked its kind (see `guarded_ty_kind`)
-        // and has no decodable value form; the caller keeps the
-        // `ByRef` identity instead.
+        // type cannot be asked its kind (see `guarded_ty_kind`).
+        // When the pointee is the coroutine closure (async
+        // closure) value itself it still has an exact value
+        // form -- the callable, as for a plain closure constant
+        // (see `decode_coroutine_closure_ref`); any other type
+        // passing through one has no decodable value form and
+        // the caller keeps the `ByRef` identity instead.
         if guarded_ty_kind(inner).is_none() {
-            return None;
+            return self.decode_coroutine_closure_ref(inner);
         }
         // A `dyn` pointee makes the pointer a fat pointer: the
         // second word is the vtable, whose provenance names the
