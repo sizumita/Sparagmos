@@ -4698,3 +4698,28 @@ fn run_mode_join_built_string_retain_and_drain_drop() {
         "a//c\nb/c\na/ Some('b')\na/ \n",
     );
 }
+
+const VEC_FROM_JOIN_SRC: &str = r#"
+fn main() {
+    // `Vec<u8>: From<String>` is `String::into_bytes`: the
+    // bytes of a join-built (real aggregate) string as the
+    // vector's elements, consumable downstream like any
+    // other byte vector.
+    let v: Vec<u8> = Vec::from(["ab", "cd"].join("-"));
+    println!("{}|{:?}", v.len(), v);
+    let w: Vec<u8> = ["a", "b"].join("/").into();
+    println!("{:?}", w);
+    let back = String::from_utf8(v).unwrap();
+    println!("{}", back);
+    println!("vec-from-join-ok");
+}
+"#;
+
+#[test]
+fn run_mode_vec_u8_from_join_built_string() {
+    run_ok(
+        "vec-from-join",
+        VEC_FROM_JOIN_SRC,
+        "5|[97, 98, 45, 99, 100]\n[97, 47, 98]\nab-cd\nvec-from-join-ok\n",
+    );
+}
