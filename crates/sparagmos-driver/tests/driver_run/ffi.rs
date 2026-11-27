@@ -1461,3 +1461,86 @@ fn run_mode_aux_extern_crate_libc_compiles() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
     assert_eq!(stdout, "answer ok\n", "stderr={stderr}");
 }
+
+const EXTERN_WEAK_UNDEFINED_SRC: &str = r#"
+#![feature(linkage)]
+extern "C" {
+    #[linkage = "extern_weak"]
+    static MISSING: *const u32;
+}
+fn main() {
+    let p = unsafe { MISSING };
+    println!("null={}", p.is_null());
+}
+"#;
+
+#[test]
+fn run_mode_extern_weak_undefined_static_reads_null() {
+    // An `extern_weak` import with no definition anywhere in
+    // the session denotes the undefined weak symbol, whose
+    // address is the null address: taking the declaration's
+    // value reads the null pointer, not uninitialized storage.
+    run_ok(
+        "extern-weak-undefined",
+        EXTERN_WEAK_UNDEFINED_SRC,
+        "null=true\n",
+    );
+}
+
+const LINKAGE_AUX_SRC: &str = r#"
+#[no_mangle]
+pub static foo: isize = 3;
+
+pub fn bar() {}
+
+pub fn get_foo() -> isize {
+    unsafe { foo }
+}
+"#;
+
+const LINKAGE_MAIN_SRC: &str = r#"
+#![feature(linkage)]
+extern crate auxlib as other;
+
+extern "C" {
+    #[linkage = "extern_weak"]
+    static foo: *const isize;
+    #[linkage = "extern_weak"]
+    static never_defined: *mut isize;
+}
+
+fn main() {
+    other::bar();
+    unsafe {
+        println!("defined={} value={}", !foo.is_null(), *foo);
+        *(foo as *mut isize) = 9;
+        println!("after={}", other::get_foo());
+        println!("missing={}", never_defined.is_null());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_defined_in_aux_crate_resolves() {
+    // A foreign declaration whose symbol an auxiliary crate
+    // defines denotes the definition's one storage: the
+    // declaration's value is the definition's address, reads
+    // through it see the initializer, and a write through it
+    // is visible to the defining crate. A second declaration
+    // with no definition in the session reads as null.
+    let dir = temp_dir("extern-static-defined");
+    let aux = fixture(&dir, "auxlib.rs", LINKAGE_AUX_SRC);
+    let src = fixture(&dir, "case.rs", LINKAGE_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the defined import must resolve; stderr={stderr}"
+    );
+    assert_eq!(
+        stdout, "defined=true value=3\nafter=9\nmissing=true\n",
+        "stderr={stderr}"
+    );
+}

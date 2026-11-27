@@ -90,12 +90,84 @@ impl Converter {
         }
     }
 
+    /// The store seed for a foreign static `def` (see
+    /// `decode_foreign_static_ref`): the value the
+    /// declaration's storage holds before the program runs.
+    ///
+    /// A foreign declaration imports a link symbol; when a
+    /// definition carrying that symbol is part of the session
+    /// (an auxiliary crate's `#[no_mangle]` static, say), the
+    /// declaration's storage IS the definition's storage, so
+    /// the seed is a reference to the definition carrying the
+    /// definition's own initializer — reads and writes through
+    /// the declaration land in the one storage, exactly as
+    /// they do natively. A declaration importing its symbol
+    /// weakly (`#[linkage = "extern_weak"]`) with no definition
+    /// in the session denotes the undefined weak symbol, whose
+    /// address is the null address: the seed is the null
+    /// pointer. Any other foreign static — a C library's
+    /// variable — has no initializer the session can know, and
+    /// its seed stays uninitialised: address-only uses keep
+    /// working, and a read of the contents is the
+    /// uninitialised-read error it honestly is.
+    fn foreign_static_seed(
+        &mut self,
+        def: &mir::mono::StaticDef,
+        depth: usize,
+    ) -> sm::ConstValue {
+        let def_id = self.crate_def_id(def);
+        let definition = match self.foreign_static_defs.get(&def_id) {
+            Some(found) => found.clone(),
+            None => {
+                let found = foreign_static_definition(def);
+                self.foreign_static_defs.insert(def_id, found.clone());
+                found
+            }
+        };
+        if let Some(definition) = definition {
+            if let Some(init) = self.static_initializer(&definition) {
+                let def_ty = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| definition.ty()),
+                );
+                if let Ok(def_ty) = def_ty {
+                    // Record the definition's declared type the
+                    // way the static arm of `decode_ref` records
+                    // a directly referenced foreign-crate
+                    // static's, so the definition's own seed
+                    // registration sees the whole-static type.
+                    let defn_id = self.crate_def_id(&definition);
+                    if !definition.krate().is_local
+                        && !self.static_tys.contains_key(&defn_id)
+                    {
+                        self.note_static_ty(&definition, def_ty.clone());
+                    }
+                    if let Some(seed) = self.decode_static_ref(
+                        &definition,
+                        &def_ty,
+                        &init,
+                        0,
+                        depth + 1,
+                    ) {
+                        return seed;
+                    }
+                }
+            }
+        }
+        if static_is_extern_weak(def) {
+            return sm::ConstValue::NullPtr;
+        }
+        sm::ConstValue::Uninit
+    }
+
     /// Decode a reference whose provenance names a foreign
     /// static (an item of an `extern` block). A foreign static
     /// has no initializer to decode — asking the compiler for
     /// one ICEs (see `static_is_foreign`) — so the reference
-    /// denotes the static's program-level storage with an
-    /// uninitialized seed: address-only uses (the common case:
+    /// denotes the static's program-level storage with the
+    /// seed `foreign_static_seed` decides: a reference to the
+    /// definition when the session contains one, the null
+    /// pointer for an undefined weak import, an uninitialized
+    /// seed otherwise. Address-only uses (the common case:
     /// `addr_of!`, raw-pointer casts, comparisons) observe the
     /// storage's identity, writes through a mutable reference
     /// land in the store like any other static's, and reads of
@@ -169,9 +241,10 @@ impl Converter {
                 // whole static.
                 let projection =
                     self.static_offset_path(&def.ty(), target_off, inner, depth)?;
+                let seed = self.foreign_static_seed(def, depth);
                 Some(sm::ConstValue::StaticRef {
                     def: def_id,
-                    value: Box::new(sm::ConstValue::Uninit),
+                    value: Box::new(seed),
                     projection,
                     len: None,
                 })

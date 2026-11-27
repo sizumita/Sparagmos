@@ -490,6 +490,14 @@ pub struct Converter {
     /// element. Shares the byte cap and the root-clear discipline of
     /// `alloc_cache` (see `clear_alloc_caches`).
     static_inits: std::collections::HashMap<sm::DefId, std::rc::Rc<Allocation>>,
+    /// Definitions resolving foreign statics, keyed by the
+    /// foreign static's Sparagmos def id (see
+    /// `foreign_static_definition` in `statics`): the search
+    /// enumerates every crate's statics, so its outcome — a
+    /// definition or none — is computed once per foreign
+    /// static a program names.
+    foreign_static_defs:
+        std::collections::HashMap<sm::DefId, Option<mir::mono::StaticDef>>,
     /// Total bytes held in `alloc_cache` and `static_inits`.
     alloc_cache_bytes: usize,
     /// Memoised decodes of allocated constants, keyed by the
