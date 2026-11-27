@@ -475,6 +475,98 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The declared type of the whole position `target`
+    /// denotes, when the copy machinery can name it: a whole
+    /// place's declared local type, a whole allocation's
+    /// recorded creation type, a whole static's recorded type.
+    /// A projected target denotes the position its projection
+    /// names (a sequence element, a field), whose value the
+    /// read has already denominated, and an element block's
+    /// slots are its elements by construction, so both are
+    /// `None` here: no denomination is owed for them.
+    fn copy_source_place_ty(&self, frames: &[Frame], target: &Resolved) -> Option<Ty> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } if projection.is_empty() => frames
+                .get(*frame_pos)
+                .and_then(|f| self.program.get(&f.func))
+                .and_then(|b| b.local_ty(Local(*local)))
+                .cloned(),
+            Resolved::Alloc { id, projection }
+                if projection.is_empty() && !self.is_elem_block(*id) =>
+            {
+                self.alloc_ty(*id)
+            }
+            Resolved::Static { name, projection } if projection.is_empty() => {
+                self.program.static_tys.get(name).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The first element a `src_single` copy moves, and
+    /// whether it was peeled out of a wrapper the source
+    /// pointer names. The pointer names the element itself
+    /// whenever the source target denotes the element (an
+    /// element position, or a whole place / allocation /
+    /// static OF the element type): the value found there IS
+    /// the element, in whatever form it stands -- its own
+    /// one-field layers are part of the element (an
+    /// `OsString`'s `Buf` layer, its buffer's `NonNull`), not
+    /// a wrapper around it, so the snapshot keeps the value
+    /// whole. (The shape-based unwrap cannot tell those layers
+    /// from a wrapper: it peeled an `OsString` element down to
+    /// its inner `Vec`, and neither the destination-side
+    /// rewrap -- which counts the destination's old occupant's
+    /// chain, a different form of the same type -- nor the
+    /// sequence write rebuilt them, so the copied element was
+    /// a hybrid no consumer recognises: equality against an
+    /// intact element answered false, and `Deref` / `cmp`
+    /// stopped on it.) Only a whole position of a DIFFERENT
+    /// type wraps the element (a transparent wrapper place a
+    /// cast pointer names): the element is its field-0 core,
+    /// reached by descending while the denoting type differs
+    /// from the element type, walking the declared field
+    /// types, so the descent stops at the element type and
+    /// never enters the element's own layers. A shape the
+    /// walk cannot denominate keeps the shape-based core
+    /// (`copy_unwrap`), as before.
+    fn copy_snapshot_first(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        value: &Value,
+        elem: &Ty,
+    ) -> (Value, bool) {
+        let Some(place_ty) = self.copy_source_place_ty(frames, target) else {
+            return (value.clone(), false);
+        };
+        if place_ty == *elem {
+            return (value.clone(), false);
+        }
+        let mut current_ty = place_ty;
+        let mut current = value;
+        while current_ty != *elem {
+            let Some(field_ty) = self.adt_field_ty(&current_ty, 0, 0) else {
+                return (self.copy_unwrap(value).clone(), true);
+            };
+            match current {
+                Value::Enum {
+                    variant: 0,
+                    fields,
+                } if fields.len() == 1 => {
+                    current = &fields[0];
+                    current_ty = field_ty;
+                }
+                _ => return (self.copy_unwrap(value).clone(), true),
+            }
+        }
+        (current.clone(), true)
+    }
+
     /// `elem` is the copy's element type when the call site knows
     /// it (both call paths take it from the pointer operands'
     /// declared types); with `None` the copy reads the element
@@ -711,6 +803,13 @@ impl<'a> Interpreter<'a> {
                 // packs over).
                 let packed_elems = elem
                     .and_then(|e| self.packed_scalar_elems(&src_base, e, n));
+                // Whether the first element's snapshot was
+                // peeled out of a wrapper the source pointer
+                // names (see `copy_snapshot_first`): only a
+                // peeled element is ever rewrapped at the
+                // destination; an element the source denotes
+                // directly is stored as it stands.
+                let mut first_peeled = true;
                 let elems: Vec<Value> = if let Some(packed) = packed_elems {
                     packed
                 } else if src_single {
@@ -722,7 +821,14 @@ impl<'a> Interpreter<'a> {
                             elems.push(maybe_uninit_form(unit));
                         }
                     } else {
-                        elems.push(self.copy_unwrap(&src_base).clone());
+                        let (first, peeled) = match elem {
+                            Some(ty) => {
+                                self.copy_snapshot_first(frames, &src_target, &src_base, ty)
+                            }
+                            None => (self.copy_unwrap(&src_base).clone(), true),
+                        };
+                        first_peeled = peeled;
+                        elems.push(first);
                         for i in 1..n {
                             elems.push(self.read_seq_at_with_elem(frames, &src_target, i, elem)?);
                         }
@@ -826,7 +932,7 @@ impl<'a> Interpreter<'a> {
                     let cur_is_element = match &dst_place_ty {
                         Some(_) => dst_place_ty.as_ref() == elem || !src_single,
                         None => match elem {
-                            Some(_) => !src_single,
+                            Some(_) => !src_single || !first_peeled,
                             None => true,
                         },
                     };
