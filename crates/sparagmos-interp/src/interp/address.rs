@@ -4334,12 +4334,6 @@ impl<'a> Interpreter<'a> {
             if !held_is_container {
                 return None;
             }
-            if !matches!(
-                held.as_ref(),
-                Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
-            ) {
-                return None;
-            }
             return Some((path.len(), cur, i128::from(elem), tail.to_vec()));
         }
         let elem = match body.local_tys.get(local)? {
