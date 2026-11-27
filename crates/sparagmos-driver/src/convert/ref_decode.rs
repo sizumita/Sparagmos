@@ -838,7 +838,48 @@ impl Converter {
                 len: None,
             });
         };
-        let projection = self.static_offset_path(&static_ty, target_off, inner, depth)?;
+        let projection = match self.static_offset_path(&static_ty, target_off, inner, depth) {
+            Some(path) => path,
+            None => {
+                // A reference denoting the base of a static whose
+                // declared type is a scalar leaf -- a raw pointer,
+                // a reference, an integer, a float, a bool, a
+                // char, a function pointer -- has no projection
+                // to determine: the value tree is a single leaf,
+                // so offset 0 is the whole value and the empty
+                // path denotes it, whatever view type the pointer
+                // carries. The offset-path descent above models
+                // references *into* a structured value (a field of
+                // a struct static, an element of an array static);
+                // a pointer *stored in* a scalar static whose
+                // provenance names a static's base -- the shape of
+                // `static S: *const u8 = &S as *const u8`, and of
+                // a byte pointer to any scalar static stored in
+                // another static's initializer -- asks the other
+                // question, and answering it with the snapshot
+                // fallback in `decode_ref` drops the provenance
+                // the pointer's identity lives in (the snapshot's
+                // bytes are the zero word the address slot holds
+                // without it). Structured declared types keep the
+                // snapshot here: at their base a narrower view
+                // type is a prefix view, and the empty path would
+                // claim the whole aggregate. A depth refusal is
+                // not a projection failure either and keeps it.
+                if target_off == 0
+                    && depth <= MAX_CONST_DEPTH
+                    && !matches!(
+                        static_ty.kind(),
+                        TyKind::RigidTy(
+                            RigidTy::Adt(..) | RigidTy::Tuple(..) | RigidTy::Array(..)
+                        )
+                    )
+                {
+                    Vec::new()
+                } else {
+                    return None;
+                }
+            }
+        };
         // A reference back to this static from inside its own
         // seed decode closes an initializer cycle: the seed
         // cannot be decoded by value (the decode would recurse
