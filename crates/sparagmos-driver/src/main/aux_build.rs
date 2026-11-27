@@ -886,6 +886,12 @@ pub(crate) fn compile_aux(
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let overflow_checks = super::session_overflow_checks(&cmd_args);
+    // Snapshot the directory's entries before the build runs:
+    // which artifact a build produced is a fact of the build,
+    // and the location scan below tells this build's products
+    // apart from artifacts earlier builds of a same-named crate
+    // left in the shared directory by comparing stamps.
+    let dir_before = snapshot_dir(aux_dir);
     let out = cmd
         .output()
         .map_err(|e| format!("failed to run rustc for auxiliary crate `{name}`: {e}"))?;
@@ -906,8 +912,26 @@ pub(crate) fn compile_aux(
     // `-` after the name can only be that separator: crate names
     // never contain one (declared names forbid it, and file
     // stems had theirs replaced with underscores).
+    // The ranking is deterministic, which the scan this
+    // replaces was not: it kept the first directory entry on
+    // (group, extension) ties, so for a set of same-named crates
+    // distinguished only by extra-filename (the crateresolve
+    // crates) every build could be handed the SAME artifact --
+    // one candidate where rustc must see three and refuse with
+    // E0464 -- whenever the filesystem's readdir order happened
+    // to favour it, and a stale artifact could likewise be
+    // bound for other duplicate-name sets. Entries this build
+    // produced (absent from the pre-build snapshot, or
+    // restamped by it) rank first; an exact
+    // lib<name><extra-filename> match for the suffix this
+    // build's own command line carried ranks next (with no
+    // suffix in play, the plain lib<name>. shape keeps its
+    // historical preference over the suffixed one); the
+    // extension preference and finally the file name settle
+    // what remains, so the pick never depends on readdir order.
+    let suffix = extra_filename_suffix(&cmd_args);
     let mut artifact: Option<std::path::PathBuf> = None;
-    let mut best_rank = (u8::MAX, u8::MAX);
+    let mut best_rank = (u8::MAX, u8::MAX, u8::MAX, String::new());
     if let Ok(entries) = std::fs::read_dir(aux_dir) {
         for entry in entries.flatten() {
             let fname = entry.file_name().to_string_lossy().into_owned();
@@ -924,8 +948,19 @@ pub(crate) fn compile_aux(
                 Some("so") | Some("dylib") | Some("dll") => 2,
                 _ => continue,
             };
-            if (group, ext) < best_rank {
-                best_rank = (group, ext);
+            let produced = match dir_before.get(&fname) {
+                Some(before) if *before == entry_stamp(&entry) => 1,
+                _ => 0,
+            };
+            let exact = match &suffix {
+                Some(suffix) => {
+                    u8::from(!fname.starts_with(&format!("lib{effective_name}{suffix}.")))
+                }
+                None => group,
+            };
+            let rank = (produced, exact, ext, fname.clone());
+            if rank < best_rank {
+                best_rank = rank;
                 artifact = Some(entry.path());
             }
         }
@@ -948,4 +983,62 @@ pub(crate) fn compile_aux(
         collect,
         overflow_checks,
     })
+}
+
+/// The stamp identifying one directory entry's current
+/// contents: its modification time and length. A build that
+/// (re)writes an artifact restamps it, so comparing the stamps
+/// taken before and after a build tells the build's own
+/// products from files it left untouched.
+type DirStamp = (Option<std::time::SystemTime>, u64);
+
+fn entry_stamp(entry: &std::fs::DirEntry) -> DirStamp {
+    match entry.metadata() {
+        Ok(md) => (md.modified().ok(), md.len()),
+        Err(_) => (None, 0),
+    }
+}
+
+/// The entries of `dir` by file name, stamped as `entry_stamp`
+/// describes. An unreadable directory snapshots as empty, in
+/// which case every post-build entry counts as produced.
+fn snapshot_dir(dir: &std::path::Path) -> std::collections::HashMap<String, DirStamp> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            out.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                entry_stamp(&entry),
+            );
+        }
+    }
+    out
+}
+
+/// The `-C extra-filename=<suffix>` value a command line
+/// carries, in any of the spellings rustc accepts (`-C` /
+/// `--codegen`, joined to the value or as the next argument);
+/// the last one wins, as in rustc itself.
+fn extra_filename_suffix(args: &[String]) -> Option<String> {
+    let mut suffix = None;
+    let mut codegen_next = false;
+    for arg in args {
+        let value = if codegen_next {
+            codegen_next = false;
+            Some(arg.as_str())
+        } else if arg == "-C" || arg == "--codegen" {
+            codegen_next = true;
+            None
+        } else if let Some(value) = arg.strip_prefix("--codegen=") {
+            Some(value)
+        } else {
+            arg.strip_prefix("-C")
+        };
+        if let Some(value) = value {
+            if let Some(s) = value.strip_prefix("extra-filename=") {
+                suffix = Some(s.to_string());
+            }
+        }
+    }
+    suffix
 }

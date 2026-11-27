@@ -664,6 +664,102 @@ fn run_mode_aux_extra_filename_artifact() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "v=5\n");
 }
 
+const AUX_DUP_NAME_SRC_1: &str = r#"
+//@ compile-flags: -C extra-filename=-1
+#![crate_name = "crateresolve1"]
+#![crate_type = "lib"]
+pub fn f() -> isize { 10 }
+"#;
+
+const AUX_DUP_NAME_SRC_2: &str = r#"
+//@ compile-flags: -C extra-filename=-2
+#![crate_name = "crateresolve1"]
+#![crate_type = "lib"]
+pub fn f() -> isize { 20 }
+"#;
+
+const AUX_DUP_NAME_SRC_3: &str = r#"
+//@ compile-flags: -C extra-filename=-3
+#![crate_name = "crateresolve1"]
+#![crate_type = "lib"]
+pub fn f() -> isize { 30 }
+"#;
+
+const AUX_DUP_NAME_MAIN_SRC: &str = r#"
+extern crate crateresolve1;
+fn main() {}
+"#;
+
+#[test]
+fn run_mode_aux_duplicate_name_extra_filename_rejected() {
+    // Three auxiliary crates share one crate name and are
+    // distinguished only by `-C extra-filename` (the
+    // crateresolve shape behind tests/ui/error-codes/E0464.rs
+    // and E0523.rs): the main compilation must see all three
+    // artifacts as separate candidates and refuse with E0464.
+    // The artifact location used to keep the first directory
+    // entry on ranking ties, so on a filesystem whose readdir
+    // order favoured it every build was handed the SAME
+    // artifact -- one candidate, no error -- and the two
+    // records flipped with the machine they ran on.
+    let dir = temp_dir("aux-dup-name");
+    let aux1 = fixture(&dir, "crateresolve1-1.rs", AUX_DUP_NAME_SRC_1);
+    let aux2 = fixture(&dir, "crateresolve1-2.rs", AUX_DUP_NAME_SRC_2);
+    let aux3 = fixture(&dir, "crateresolve1-3.rs", AUX_DUP_NAME_SRC_3);
+    let src = fixture(&dir, "dupmain.rs", AUX_DUP_NAME_MAIN_SRC);
+    let out = run_driver_with_aux(
+        &src,
+        &[
+            ("crateresolve1_1", &aux1),
+            ("crateresolve1_2", &aux2),
+            ("crateresolve1_3", &aux3),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "duplicate candidates must fail the compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("E0464") && stderr.contains("multiple candidates"),
+        "the failure is the duplicate-candidate refusal: {stderr}"
+    );
+}
+
+#[test]
+fn run_mode_aux_distinct_names_with_extra_filename_bind_their_own() {
+    // Positive control for the duplicate-name case above:
+    // distinct crate names that each carry an extra-filename
+    // still bind their OWN artifacts -- the values differ, so a
+    // crossed binding would print the wrong sum.
+    let dir = temp_dir("aux-distinct-extra-filename");
+    let aux_a = fixture(
+        &dir,
+        "ponda.rs",
+        "//@ compile-flags: -C extra-filename=-a\npub fn val() -> i32 { 3 }\n",
+    );
+    let aux_b = fixture(
+        &dir,
+        "pondb.rs",
+        "//@ compile-flags: -C extra-filename=-b\npub fn val() -> i32 { 4 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "distmain.rs",
+        "extern crate ponda;\nextern crate pondb;\n\
+         fn main() { println!(\"sum={}\", ponda::val() + pondb::val()); }\n",
+    );
+    let out = run_driver_with_aux(&src, &[("ponda", &aux_a), ("pondb", &aux_b)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "distinct-name extra-filename artifacts must bind; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sum=7\n");
+}
+
 #[test]
 fn run_mode_aux_modified_binding_stays_out_of_prelude() {
     // Lane CI round 2: an `aux-crate:` binding with modifiers
