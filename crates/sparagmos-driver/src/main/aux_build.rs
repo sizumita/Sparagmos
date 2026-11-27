@@ -388,7 +388,7 @@ fn sysroot_host_target(sysroot: &str) -> Option<String> {
     Some(host)
 }
 
-fn sysroot_extern_pins(
+pub(crate) fn sysroot_extern_pins(
     sysroot: &str,
     src_text: &str,
 ) -> Vec<(String, std::path::PathBuf, std::path::PathBuf)> {

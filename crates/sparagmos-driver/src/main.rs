@@ -1308,6 +1308,45 @@ fn driver_main_inner() {
             }
         }
     }
+    // Pin the sysroot crates the main source itself declares
+    // that the sysroot offers ambiguously (sysroot_extern_pins):
+    // the same disambiguation the auxiliary builds get. A main
+    // source that declares an extern crate libc item itself — the
+    // tests/ui/runtime/on-broken-pipe/inherit.rs record does,
+    // to install SIG_IGN for SIGPIPE through libc::signal
+    // — otherwise fails its front end with E0464 (multiple
+    // candidates for the crate) in a rustup sysroot carrying
+    // the rustc-dev component, before any guest code runs. A
+    // name already bound above (an auxiliary crate, a prebuilt
+    // library, a caller --extern) keeps that binding.
+    {
+        let main_text = std::fs::read_to_string(&input).unwrap_or_default();
+        let mut bound: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut args_iter = args.iter();
+        while let Some(a) = args_iter.next() {
+            if a == "--extern" {
+                if let Some(spec) = args_iter.next() {
+                    if let Some((name, _)) = spec.split_once('=') {
+                        bound.insert(name.to_string());
+                    }
+                }
+            } else if let Some(spec) = a.strip_prefix("--extern=") {
+                if let Some((name, _)) = spec.split_once('=') {
+                    bound.insert(name.to_string());
+                }
+            }
+        }
+        for (name, rmeta, rlib) in sysroot_extern_pins(&sysroot, &main_text) {
+            if bound.contains(&name) {
+                continue;
+            }
+            args.push("--extern".to_string());
+            args.push(format!("{name}={}", rmeta.display()));
+            args.push("--extern".to_string());
+            args.push(format!("{name}={}", rlib.display()));
+        }
+    }
     // The compiler runs in-process, under two disciplines:
     // - A panic raised inside Stable MIR conversion (the
     //   `unimplemented!()`s hit by explicit tail calls, async
