@@ -4511,3 +4511,91 @@ fn run_mode_byte_displaced_ptr_access_into_union_uninit_storage() {
         "ok 10 20\n",
     );
 }
+
+const WRAPPED_MAYBEUNINIT_BYTE_DISPLACED_UNALIGNED_WRITE_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+struct W { arr: ManuallyDrop<MaybeUninit<[u32; 2]>> }
+fn main() {
+    let mut w = W { arr: ManuallyDrop::new(MaybeUninit::new([0xFFFF_FFFF; 2])) };
+    unsafe {
+        let b = ((*w.arr).as_mut_ptr() as *mut u8).add(1) as *mut u32;
+        std::ptr::write_unaligned(b, 0);
+        let arr = (*w.arr).assume_init_ref();
+        assert_eq!(arr[0], 0x0000_00FF);
+        assert_eq!(arr[1], 0xFFFF_FF00);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_wrapped_maybeuninit_byte_displaced_unaligned_write_lands() {
+    // Issue #501, the byte-denominated form: a one-byte
+    // displacement over the `ManuallyDrop<MaybeUninit<[u32; 2]>>`
+    // storage (a `*mut u8` advance, cast back to `*mut u32` for
+    // an unaligned whole-pointee write) was absorbed into
+    // element index 1 by the value-shape absorption, which
+    // denominated the array's elements in the offset's byte
+    // unit: the four-byte write landed whole over the second
+    // element and the denoted bytes were never written. The
+    // offset's denomination is now checked against the
+    // declared sequence at the position, so the displacement
+    // is carried as a byte offset and the byte view splices
+    // the pointee's declared width at the true byte position.
+    let dir = temp_dir("wrapped-maybeuninit-byte-displaced-unaligned-write");
+    let src = fixture(
+        &dir,
+        "wrapped_maybeuninit_byte_displaced_unaligned_write.rs",
+        WRAPPED_MAYBEUNINIT_BYTE_DISPLACED_UNALIGNED_WRITE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the byte-displaced write must land at the true byte position; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const WRAPPED_MAYBEUNINIT_BYTE_ADD_WRITE_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+struct W { arr: ManuallyDrop<MaybeUninit<[u32; 2]>> }
+fn main() {
+    let mut w = W { arr: ManuallyDrop::new(MaybeUninit::new([0xFFFF_FFFF; 2])) };
+    unsafe {
+        let b = ((*w.arr).as_mut_ptr() as *mut u8).add(4) as *mut u32;
+        *b = 9;
+        let arr = (*w.arr).assume_init_ref();
+        assert_eq!(arr[0], 0xFFFF_FFFF);
+        assert_eq!(arr[1], 9);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_wrapped_maybeuninit_byte_add_write_lands() {
+    // Issue #501, the element-boundary byte form: a four-byte
+    // displacement denominated in bytes over the same wrapped
+    // storage denotes the second element, but the store was
+    // judged displaced from a value boundary and declined.
+    // Carried as a byte offset, the byte view prices the
+    // position through the wrapper fields and the write lands
+    // on the denoted element at the pointee's declared width,
+    // leaving the first element untouched.
+    let dir = temp_dir("wrapped-maybeuninit-byte-add-write");
+    let src = fixture(
+        &dir,
+        "wrapped_maybeuninit_byte_add_write.rs",
+        WRAPPED_MAYBEUNINIT_BYTE_ADD_WRITE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the byte-denominated whole-element write must land; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
