@@ -9409,7 +9409,7 @@ impl<'a> Interpreter<'a> {
                     _ => {
                         let x = self.deref_value(frames, &vals[0])?;
                         let y = self.deref_value(frames, &vals[1])?;
-                        self.pointer_distance(&x, &y, generic_args)?
+                        self.pointer_distance(frames, &x, &y, generic_args)?
                     }
                 };
                 match d {

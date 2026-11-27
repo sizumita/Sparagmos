@@ -567,6 +567,37 @@ impl<'a> Interpreter<'a> {
         (current.clone(), true)
     }
 
+    /// The denomination a sequence element read out of storage
+    /// takes for a copy whose element type is `elem`: an element
+    /// stored in a `MaybeUninit` slot arrives in the union form
+    /// over its payload — the slot's own denomination — while
+    /// the copy moves the payload itself, denominated in the
+    /// element type. The judgement mirrors the single-element
+    /// path's (`copy_unwrap` over `value_fits_ty`): the wrapper
+    /// peels only when the wrapped value is not itself a value
+    /// of the element type but its core is, so a genuine
+    /// one-field aggregate element (which fits its ADT type as
+    /// it stands) is never peeled. A union over uninitialized
+    /// content denominates to the uninitialized marker: an
+    /// untouched slot's payload is uninitialized content, not a
+    /// value of the element type.
+    fn copy_denominate(&self, unit: Value, elem: Option<&Ty>) -> Value {
+        let Some(ty) = elem else {
+            return unit;
+        };
+        if value_fits_ty(&unit, ty) {
+            return unit;
+        }
+        let core = self.copy_unwrap(&unit);
+        if matches!(core, Value::Uninit) {
+            return Value::Uninit;
+        }
+        if value_fits_ty(core, ty) {
+            return core.clone();
+        }
+        unit
+    }
+
     /// `elem` is the copy's element type when the call site knows
     /// it (both call paths take it from the pointer operands'
     /// declared types); with `None` the copy reads the element
@@ -830,7 +861,9 @@ impl<'a> Interpreter<'a> {
                         first_peeled = peeled;
                         elems.push(first);
                         for i in 1..n {
-                            elems.push(self.read_seq_at_with_elem(frames, &src_target, i, elem)?);
+                            let unit =
+                                self.read_seq_at_with_elem(frames, &src_target, i, elem)?;
+                            elems.push(self.copy_denominate(unit, elem));
                         }
                     }
                     elems
@@ -851,7 +884,7 @@ impl<'a> Interpreter<'a> {
                         let unit = if mu_elem {
                             maybe_uninit_form(unit)
                         } else {
-                            unit
+                            self.copy_denominate(unit, elem)
                         };
                         elems.push(unit);
                     }

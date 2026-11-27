@@ -5459,7 +5459,7 @@ impl<'a> Interpreter<'a> {
         let front = self.deref_value(frames, front).ok()?;
         let end = self.deref_value(frames, end).ok()?;
         let args = [elem_tag.to_string()];
-        let distance = self.pointer_distance(&end, &front, &args).ok()??;
+        let distance = self.pointer_distance(frames, &end, &front, &args).ok()??;
         u64::try_from(distance).ok()
     }
 
