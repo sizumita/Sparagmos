@@ -29,7 +29,11 @@
 //! names the operation unsupported — an unconditional
 //! extern declaration would leave the symbol undefined
 //! at link time on those hosts (macOS libc exports
-//! neither).
+//! neither). The same holds for the calls that exist on
+//! every Unix host but not on Windows (`sysconf`,
+//! `getuid`, `getgid`): Windows has no user/group id
+//! space and its libc has no `sysconf` key space, so
+//! there is no equivalent to answer with.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -303,6 +307,67 @@ pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
     target_os = "dragonfly"
 )))]
 pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
+    None
+}
+
+/// The host C library's `sysconf`, backing the libc
+/// builtin of the same name: the guest runs in-process,
+/// so the host's configuration values (page size, group
+/// maximum, ...) are the values the guest observes. The
+/// call exists on every Unix host; Windows libc has no
+/// `sysconf` and no `_SC_*` key space to answer in, so
+/// a non-Unix host reports `None` and the caller names
+/// the operation unsupported — answering a key would
+/// mean inventing a key numbering the host never gave.
+#[cfg(unix)]
+pub(crate) fn host_sysconf(name: std::ffi::c_int) -> Option<std::ffi::c_long> {
+    extern "C" {
+        #[link_name = "sysconf"]
+        fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+    }
+    Some(unsafe { sysconf(name) })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_sysconf(name: std::ffi::c_int) -> Option<std::ffi::c_long> {
+    let _ = name;
+    None
+}
+
+/// The host C library's `getuid`, backing the libc
+/// builtin of the same name: this process's real user
+/// id, the identity the in-process guest runs with.
+/// Windows has no user id space, so a non-Unix host
+/// reports `None` and the caller names the operation
+/// unsupported.
+#[cfg(unix)]
+pub(crate) fn host_getuid() -> Option<std::ffi::c_uint> {
+    extern "C" {
+        #[link_name = "getuid"]
+        fn getuid() -> std::ffi::c_uint;
+    }
+    Some(unsafe { getuid() })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_getuid() -> Option<std::ffi::c_uint> {
+    None
+}
+
+/// The host C library's `getgid`, backing the libc
+/// builtin of the same name: this process's real group
+/// id (see [`host_getuid`]).
+#[cfg(unix)]
+pub(crate) fn host_getgid() -> Option<std::ffi::c_uint> {
+    extern "C" {
+        #[link_name = "getgid"]
+        fn getgid() -> std::ffi::c_uint;
+    }
+    Some(unsafe { getgid() })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_getgid() -> Option<std::ffi::c_uint> {
     None
 }
 

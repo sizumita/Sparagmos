@@ -21,7 +21,11 @@
 //! process's own id, which is also the parent the
 //! process model spawns the guest's children from, so a
 //! guest reading its children's parent id observes this
-//! value.
+//! value. On a host without those calls (Windows has no
+//! user/group id space and no `sysconf`), `sysconf`,
+//! `getuid` and `getgid` are declined as unsupported
+//! through the platform seam; `getpid` is answered from
+//! `std::process::id` on every host.
 //!
 //! The `nftw` walk fabricates a Unix `stat` block from
 //! the host's Unix metadata, so it is modelled on Unix
@@ -111,15 +115,21 @@ impl<'a> Interpreter<'a> {
     /// guest observes the host process's configuration.
     /// A `-1` answer leaves the host `errno` in the
     /// guest's cell, the way the native call leaves it
-    /// for the caller to inspect.
+    /// for the caller to inspect. Hosts whose libc has
+    /// no `sysconf` (Windows) name the call unsupported
+    /// through the platform seam.
     pub(super) fn exec_libc_sysconf(
         &mut self,
         frames: &mut Vec<Frame>,
-        _name: &str,
+        name: &str,
         vals: &[Value],
     ) -> InterpResult<Value> {
         let which = as_i128(&vals[0], "sysconf")? as std::ffi::c_int;
-        let result = unsafe { host_sysconf(which) };
+        let result = crate::platform::host_sysconf(which).ok_or_else(|| {
+            unsupported(format!(
+                "call to {name}: sysconf is not modelled on this host platform"
+            ))
+        })?;
         if result == -1 {
             let code = std::io::Error::last_os_error()
                 .raw_os_error()
@@ -132,15 +142,27 @@ impl<'a> Interpreter<'a> {
     }
 
     /// `uid_t getuid(void)`: the host process's real
-    /// user id, which the guest shares.
-    pub(super) fn exec_libc_getuid(&mut self) -> InterpResult<Value> {
-        Ok(Value::Uint(unsafe { host_getuid() } as u128))
+    /// user id, which the guest shares. Hosts with no
+    /// user id space (Windows) name the call unsupported
+    /// through the platform seam.
+    pub(super) fn exec_libc_getuid(&mut self, name: &str) -> InterpResult<Value> {
+        match crate::platform::host_getuid() {
+            Some(id) => Ok(Value::Uint(id as u128)),
+            None => Err(unsupported(format!(
+                "call to {name}: getuid is not modelled on this host platform"
+            ))),
+        }
     }
 
     /// `gid_t getgid(void)`: the host process's real
-    /// group id.
-    pub(super) fn exec_libc_getgid(&mut self) -> InterpResult<Value> {
-        Ok(Value::Uint(unsafe { host_getgid() } as u128))
+    /// group id (see `exec_libc_getuid`).
+    pub(super) fn exec_libc_getgid(&mut self, name: &str) -> InterpResult<Value> {
+        match crate::platform::host_getgid() {
+            Some(id) => Ok(Value::Uint(id as u128)),
+            None => Err(unsupported(format!(
+                "call to {name}: getgid is not modelled on this host platform"
+            ))),
+        }
     }
 
     /// `pid_t getpid(void)`: the driver process's own
