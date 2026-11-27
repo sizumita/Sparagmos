@@ -7264,6 +7264,44 @@ impl<'a> Interpreter<'a> {
                 )?;
                 Ok(Value::Unit)
             }
+            Builtin::VecSpecExtend => {
+                arity(2)?;
+                // The callee's generic arguments are the target
+                // `Vec` type, the element type, and the iterator
+                // type, which is the stepping dispatch key. Only
+                // the `vec::IntoIter` instance reaches this arm;
+                // conversion yields every other instance to its
+                // collected body.
+                let iter_ty = generic_args.get(2).map(String::as_str).unwrap_or("");
+                let target = self.deref_value(frames, &vals[0])?;
+                match self.read_resolved(frames, &target)? {
+                    Value::Enum { .. } | Value::SparseVec { .. } => {}
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "SpecExtend::spec_extend",
+                            "vector value",
+                            other.kind_name(),
+                        ))
+                    }
+                }
+                let (items, _) = self.drain_iterator(
+                    frames,
+                    iter_ty,
+                    vals.into_iter().nth(1).expect("arity checked"),
+                )?;
+                let elem_tag = generic_args.get(1).map(String::as_str).unwrap_or("");
+                let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
+                self.vec_append_resolved(
+                    frames,
+                    &target,
+                    &items,
+                    "SpecExtend::spec_extend",
+                    &uninit_elem,
+                    elem_size,
+                )?;
+                Ok(Value::Unit)
+            }
             Builtin::VecFromIterNested => {
                 arity(1)?;
                 // The trait's generic arguments are the element

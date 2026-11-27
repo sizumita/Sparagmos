@@ -956,6 +956,14 @@ pub(crate) fn vec_lookup(canonical: &str) -> Option<Builtin> {
         {
             Builtin::VecExtendTrusted
         }
+        // The `Vec` extend specialization entry: only the
+        // `vec::IntoIter` instance is served by the builtin;
+        // conversion yields the rest to their collected
+        // bodies (see `Builtin::VecSpecExtend`).
+        "std::vec::spec_extend::SpecExtend::spec_extend"
+        | "alloc::vec::spec_extend::SpecExtend::spec_extend" => {
+            Builtin::VecSpecExtend
+        }
         "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter" => {
             Builtin::VecFromIterNested
         }

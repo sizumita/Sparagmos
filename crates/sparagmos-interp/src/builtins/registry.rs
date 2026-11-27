@@ -1240,6 +1240,22 @@ pub enum Builtin {
     /// performed here by stepping the iterator with the same
     /// machinery `Iterator::next` uses.
     VecExtendTrusted,
+    /// `SpecExtend::spec_extend(&mut vec, iter)` for the
+    /// `vec::IntoIter` instance: append every remaining item
+    /// of the source iterator. The collected specialization
+    /// body projects the iterator's real buffer fields
+    /// (`as_slice`, inlined into it, reads the `ptr` / `end`
+    /// pair), which the builtin-produced iterator state form
+    /// does not carry, so it cannot run against that state;
+    /// the observable semantics are the appends themselves,
+    /// performed here by draining the source with the same
+    /// machinery `Iterator::next` uses -- the native body
+    /// moves the elements out and forgets the rest
+    /// dealloc-only, which a full drain reproduces. Only this
+    /// instance is served: conversion yields every other
+    /// instance to its collected body (see
+    /// `consumer_prefers_body` in mir_convert).
+    VecSpecExtend,
     /// `SpecFromIterNested::from_iter(iter) -> Vec<T>`: build a
     /// vector from every item the iterator yields. The collected
     /// body has `Vec::with_capacity` inlined into it and drives
