@@ -185,3 +185,98 @@ fn coverage_run_aux_crate_home_used_generic_has_no_unexecuted_subview() {
         "the never-used generic renders unexecuted:\n{report}"
     );
 }
+
+const WRITE_MACRO_FMT_SRC: &str = r#"
+struct DebugTest;
+
+impl std::fmt::Debug for DebugTest {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "cool")?;
+        for _i in 0..10 {
+            write!(f, "cool")?;
+        }
+        Ok(())
+    }
+}
+
+fn main() {
+    println!("{:?}", DebugTest);
+}
+"#;
+
+/// A guest `fmt` body that writes through the `write!` macro:
+/// at opt-level 2 core's `Formatter::write_fmt` is inlined into
+/// the body, which then reads the formatter's own fields -- the
+/// `buf` trait object (field 1), whose `Write` dispatch must
+/// land in the same capture the body's direct `write_str` calls
+/// use. The record this bounds is the coverage suite's
+/// `iffy/loops_branches` (and `iffy/issue-84561`).
+#[test]
+fn coverage_run_write_macro_in_fmt_body_reaches_the_capture() {
+    let dir = temp_dir("coverage-write-macro-fmt");
+    let src = fixture(&dir, "write_macro_fmt.rs", WRITE_MACRO_FMT_SRC);
+    let out = run_coverage(&src, &[], &[]);
+    assert!(
+        out.status.success(),
+        "coverage-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        line_count(&report, "fn fmt(&self, f: &mut std::fmt::Formatter)").as_deref(),
+        Some("1"),
+        "the fmt body executed once:\n{report}"
+    );
+    assert_eq!(
+        line_count(&report, "for _i in 0..10 {").as_deref(),
+        Some("1"),
+        "the loop header executed once:\n{report}"
+    );
+}
+
+const FORMATTER_OPTIONS_SRC: &str = r#"
+struct AltTest;
+
+impl std::fmt::Debug for AltTest {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "alt")?;
+        }
+        write!(f, "cool")
+    }
+}
+
+fn main() {
+    println!("{:#?}", AltTest);
+    println!("{:?}", AltTest);
+}
+"#;
+
+/// A guest `fmt` body that reads its formatter's options
+/// through an inlined accessor (`Formatter::alternate` reads
+/// the options' flag word): the options field (field 0) is
+/// synthesized from the capture the placeholder seeded, so the
+/// `{:#?}` call takes the alternate branch and the plain
+/// `{:?}` call does not.
+#[test]
+fn coverage_run_fmt_body_reads_the_captured_options() {
+    let dir = temp_dir("coverage-formatter-options");
+    let src = fixture(&dir, "formatter_options.rs", FORMATTER_OPTIONS_SRC);
+    let out = run_coverage(&src, &[], &[]);
+    assert!(
+        out.status.success(),
+        "coverage-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        line_count(&report, "write!(f, \"alt\")?;").as_deref(),
+        Some("1"),
+        "only the alternate call writes the alt text:\n{report}"
+    );
+    assert_eq!(
+        line_count(&report, "fn fmt(&self, f: &mut std::fmt::Formatter)").as_deref(),
+        Some("2"),
+        "the fmt body executed for both placeholders:\n{report}"
+    );
+}
