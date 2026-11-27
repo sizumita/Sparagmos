@@ -617,6 +617,66 @@ fn main() {
 }
 "#;
 
+const THREAD_PARK_SRC: &str = r#"
+use std::thread;
+use std::time::Duration;
+fn main() {
+    let t = thread::current();
+    let h = thread::spawn(move || {
+        t.unpark();
+    });
+    thread::park();
+    println!("unparked");
+    thread::park_timeout(Duration::from_millis(10));
+    println!("timeout done");
+    h.join().unwrap();
+}
+"#;
+
+#[test]
+fn run_mode_thread_park_and_timeout() {
+    // `std::thread::park` / `park_timeout` have no MIR body in
+    // the pinned std, and `Thread::unpark`'s body cannot run
+    // over the model's id-handle thread values: the three are
+    // served by the interpreter's per-thread park token. The
+    // first park consumes the spawned thread's unpark; the
+    // timed park returns with no unparker left.
+    run_ok("thread-park", THREAD_PARK_SRC, "unparked\ntimeout done\n");
+}
+
+const THREAD_PARK_PRESET_SRC: &str = r#"
+use std::sync::mpsc;
+use std::thread;
+fn main() {
+    thread::current().unpark();
+    thread::park();
+    println!("preset ok");
+    let (tx, rx) = mpsc::channel();
+    let h = thread::spawn(move || {
+        tx.send(thread::current()).unwrap();
+        thread::park();
+        println!("child resumed");
+        42
+    });
+    let child = rx.recv().unwrap();
+    child.unpark();
+    assert_eq!(h.join().unwrap(), 42);
+    println!("all done");
+}
+"#;
+
+#[test]
+fn run_mode_thread_park_preset_token_and_spawned_parker() {
+    // A token set before the park is consumed by it (no wait),
+    // and a spawned thread parked inside its own run is
+    // suspended and resumed by the main thread's unpark.
+    run_ok(
+        "thread-park-preset",
+        THREAD_PARK_PRESET_SRC,
+        "preset ok\nchild resumed\nall done\n",
+    );
+}
+
 #[test]
 fn run_mode_thread_name() {
     run_ok(

@@ -104,6 +104,23 @@ fn float_method(canonical: &str) -> Option<Builtin> {
     Some(Builtin::FloatMethod { f32, op })
 }
 
+pub fn fmt_trait_method(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::fmt::Display::fmt" | "core::fmt::Display::fmt" => Builtin::FmtMethod(F::Display),
+        "std::fmt::UpperHex::fmt" | "core::fmt::UpperHex::fmt" => {
+            Builtin::FmtMethod(F::UpperHex)
+        }
+        _ => return None,
+    })
+}
+
+pub fn net_trait_method(canonical: &str) -> Option<Builtin> {
+    match canonical {
+        "std::net::ToSocketAddrs::to_socket_addrs" => Some(Builtin::ToSocketAddrs),
+        _ => None,
+    }
+}
+
 fn float_method_named(method: &str) -> Option<FloatOp> {
     let op = match method {
         "is_nan" => O::IsNan,
@@ -152,6 +169,14 @@ class RegistryTests(unittest.TestCase):
             "core::unicode::unicode_data::white_space::lookup_slow"))
         self.assertFalse(reg.lookup(
             "core::unicode::unicode_data::alphabetic::lookup"))
+        # The trait-method tables outside `lookup` resolve too:
+        # conversion's external-callee path serves these names
+        # for a callee with no converted body.
+        self.assertTrue(reg.lookup("std::fmt::UpperHex::fmt"))
+        self.assertTrue(reg.lookup("core::fmt::Display::fmt"))
+        self.assertTrue(
+            reg.lookup("std::net::ToSocketAddrs::to_socket_addrs"))
+        self.assertFalse(reg.lookup("std::fmt::Pointer::fmt"))
         # lookup_qualified strips leading segments; lookup does not.
         self.assertFalse(reg.lookup("vendor::std::io::_print"))
         self.assertTrue(reg.lookup_qualified("vendor::std::io::_print"))
@@ -187,6 +212,21 @@ class RegistryTests(unittest.TestCase):
             'canonical.matches("::to_uppercase")')
         with self.assertRaises(ValueError):
             cov.BuiltinRegistry(bad)
+
+    def test_comptime_intrinsics(self):
+        reg = cov.BuiltinRegistry(
+            FIXTURE_BUILTINS, {"offset_of", "type_name"})
+        # A `#[rustc_comptime]` intrinsic under an intrinsics
+        # path is served by constant evaluation; the trait
+        # method of the same bare name is a different item and
+        # stays unserved, as do the run-time intrinsics.
+        self.assertTrue(reg.lookup("std::intrinsics::offset_of"))
+        self.assertTrue(reg.lookup("core::intrinsics::type_name"))
+        self.assertFalse(reg.lookup("std::any::Any::type_id"))
+        self.assertFalse(reg.lookup("std::intrinsics::abort"))
+        # Without the set (the default), nothing extra resolves.
+        plain = cov.BuiltinRegistry(FIXTURE_BUILTINS)
+        self.assertFalse(plain.lookup("std::intrinsics::offset_of"))
 
     def test_real_builtins_rs(self):
         src = cov.read_builtins_source(
@@ -231,6 +271,26 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(reg.lookup("core::f128::<impl f128>::powf"))
         self.assertFalse(reg.lookup(
             "core::unicode::unicode_data::white_space::lookup_slow"))
+        # The trait-method tables are read from the same source:
+        # every `core::fmt` trait method and the ToSocketAddrs
+        # method resolve even though `lookup` never names them.
+        self.assertIn("std::fmt::UpperHex::fmt", reg.trait_methods)
+        self.assertTrue(reg.lookup("std::fmt::UpperHex::fmt"))
+        self.assertTrue(reg.lookup("core::fmt::Pointer::fmt"))
+        self.assertTrue(
+            reg.lookup("std::net::ToSocketAddrs::to_socket_addrs"))
+        # The driver's comptime-intrinsic set, read from its own
+        # source: the two compile-time-only intrinsics resolve,
+        # the `Any` trait method of a colliding bare name does
+        # not.
+        comptime = cov.read_comptime_intrinsics(
+            REPO_ROOT / "crates/sparagmos-driver/src/mono_check.rs")
+        self.assertIn("offset_of", comptime)
+        self.assertIn("type_name", comptime)
+        reg2 = cov.BuiltinRegistry(src, comptime)
+        self.assertTrue(reg2.lookup("std::intrinsics::offset_of"))
+        self.assertTrue(reg2.lookup("std::intrinsics::type_name"))
+        self.assertFalse(reg2.lookup("std::any::Any::type_id"))
 
 
 FIXTURE_DUMP = """sparagmos-mir-dump v0

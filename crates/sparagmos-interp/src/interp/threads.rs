@@ -29,6 +29,23 @@ impl<'a> Interpreter<'a> {
         self.current_thread.get()
     }
 
+    /// Set the park token of the thread `id` (the model of
+    /// `Thread::unpark`): a later `park` / `park_timeout` of
+    /// that thread consumes it instead of waiting; repeated
+    /// unparks coalesce into the one token, as in std.
+    pub(crate) fn set_park_token(&self, id: u64) {
+        self.park_notified.borrow_mut().insert(id);
+    }
+
+    /// Take the executing thread's park token, reporting
+    /// whether it was set (the consumption at the heart of
+    /// `std::thread::park` / `park_timeout`).
+    pub(crate) fn take_park_token(&self) -> bool {
+        self.park_notified
+            .borrow_mut()
+            .remove(&self.current_thread_id())
+    }
+
     /// Whether the currently executing thread may end its
     /// activation as a suspension (see
     /// [`InterpError::Suspended`]): only a spawned thread

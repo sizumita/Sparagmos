@@ -497,6 +497,47 @@ impl<'a> Interpreter<'a> {
         Ok(word != expected)
     }
 
+    /// `std::thread::park` / `park_timeout`: wait for the
+    /// executing thread's park token (see the `park_notified`
+    /// field), consuming it. The wait drives the cooperative
+    /// scheduler exactly like [`Self::futex_wait`]: rounds run
+    /// the pending threads (one of which may unpark this
+    /// thread); a round that makes no progress leaves nothing
+    /// that could still set the token, so a timed wait returns
+    /// (its bound has, in the model's terms, elapsed) and an
+    /// unbounded wait takes the [`Self::block_or_suspend`]
+    /// outcome. Re-execution after a suspension re-checks the
+    /// token first, so no wakeup is lost.
+    pub(super) fn thread_park(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        timeout: Option<(u64, u64)>,
+        name: &str,
+    ) -> InterpResult<Value> {
+        if self.take_park_token() {
+            return Ok(Value::Unit);
+        }
+        if timeout == Some((0, 0)) {
+            return Ok(Value::Unit);
+        }
+        loop {
+            self.tick_step()?;
+            let (_, progressed) = self.schedule_round(frames)?;
+            if self.take_park_token() {
+                return Ok(Value::Unit);
+            }
+            if !progressed {
+                if timeout.is_some() {
+                    return Ok(Value::Unit);
+                }
+                return Err(self.block_or_suspend(
+                    name,
+                    "the thread is parked and no pending thread can unpark it",
+                ));
+            }
+        }
+    }
+
     /// `Sender::send` / `SyncSender::send`: enqueue the value,
     /// running pending threads while a bounded channel is full
     /// (the sender would block; the threads it waits for run
@@ -1088,6 +1129,9 @@ pub(crate) fn thread_api_lookup(canonical: &str) -> Option<Builtin> {
         "std::thread::Thread::name" => Builtin::ThreadName,
         "std::thread::sleep" | "std::thread::sleep_ms" => Builtin::ThreadSleep,
         "std::thread::yield_now" => Builtin::ThreadYield,
+        "std::thread::park" => Builtin::ThreadPark,
+        "std::thread::park_timeout" => Builtin::ThreadParkTimeout,
+        "std::thread::Thread::unpark" => Builtin::ThreadUnpark,
         _ => return None,
     })
 }
