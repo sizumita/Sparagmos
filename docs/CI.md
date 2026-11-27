@@ -670,7 +670,10 @@ denominator. Runs on every push to `main` and on manual dispatch.
   mips/mipsel/mips64/mips64el and the mipsisa r6 variants,
   sparc linux, hexagon musl, powerpc gnuspe and powerpc64
   AIX, riscv32gc linux, fuchsia, hermit, the Apple
-  ios/watchos/darwin triples, the uwp windows-gnu pair,
+  ios/watchos/darwin/tvos triples (including the arm64e,
+  arm64_32 and x86_64h variants), the windows family
+  (uwp windows-gnu and windows-msvc, win7 gnu/msvc, the
+  thumbv7a windows-msvc pair and pc-cygwin),
   wasm64) are built with the full `core,std,panic_unwind`
   set; its remaining triples -- the bare-metal family
   (aarch64 trusty and both v8r float variants, amdgcn, avr,
@@ -684,7 +687,13 @@ denominator. Runs on every push to `main` and on manual dispatch.
   records naming those triples themselves specify --
   because those targets refuse to compile at all without
   one; a record naming a different cpu for them fails the
-  guest compile with a target-cpu ABI mismatch. The measure-host jobs do not run this
+  guest compile with a target-cpu ABI mismatch. The
+  table also covers every triple named by the all-targets
+  census records targets-macho.rs and targets-pe.rs, so
+  those two records are attempted; the remaining blocked
+  compile-check records are the three naming
+  xtensa-esp32-none-elf and targets-elf.rs, which names
+  135 further triples. The measure-host jobs do not run this
   step; the table's triples are judged in the Linux class.
 
 ### Stage 4 (the rustdoc harness)

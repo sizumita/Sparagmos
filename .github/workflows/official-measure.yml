@@ -647,10 +647,15 @@ jobs:
           path: |
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-trusty
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-uwp-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64_be-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64_32-apple-watchos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-darwin
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-ios
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-tvos
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabihf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv5te-none-eabi
@@ -664,6 +669,9 @@ jobs:
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i386-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-apple-darwin
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-win7-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-win7-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-mti-none-elf
@@ -701,10 +709,19 @@ jobs:
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv4t-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv5te-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv7a-pc-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv7a-uwp-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/wasm64-unknown-unknown
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-apple-tvos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-apple-watchos-sim
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-pc-cygwin
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-unknown-hermit
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-gnu
-          key: tier3-std-1.100.0-v4
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-win7-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-win7-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64h-apple-darwin
+          key: tier3-std-1.100.0-v5
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py
@@ -960,10 +977,15 @@ jobs:
           path: |
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-trusty
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-uwp-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64_be-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64_32-apple-watchos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-darwin
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-ios
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/arm64e-apple-tvos
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabihf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv5te-none-eabi
@@ -977,6 +999,9 @@ jobs:
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i386-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-apple-darwin
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-win7-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-win7-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-mti-none-elf
@@ -1014,10 +1039,19 @@ jobs:
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv4t-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv5te-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv7a-pc-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv7a-uwp-windows-msvc
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/wasm64-unknown-unknown
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-apple-tvos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-apple-watchos-sim
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-pc-cygwin
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-unknown-hermit
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-gnu
-          key: tier3-std-1.100.0-v4
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-win7-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-win7-windows-msvc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64h-apple-darwin
+          key: tier3-std-1.100.0-v5
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py

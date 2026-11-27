@@ -171,14 +171,39 @@ class TableTest(unittest.TestCase):
         self.assertEqual(bts.TIER3_STD["thumbv5te-none-eabi"],
                          ("core", "alloc"))
 
+    def test_increment5_entries(self):
+        full = ("core", "std", "panic_unwind")
+        self.assertEqual(bts.TIER3_STD["aarch64-uwp-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["arm64_32-apple-watchos"], full)
+        self.assertEqual(bts.TIER3_STD["arm64e-apple-darwin"], full)
+        self.assertEqual(bts.TIER3_STD["arm64e-apple-ios"], full)
+        self.assertEqual(bts.TIER3_STD["arm64e-apple-tvos"], full)
+        self.assertEqual(bts.TIER3_STD["i686-uwp-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["i686-win7-windows-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["i686-win7-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["thumbv7a-pc-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["thumbv7a-uwp-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-apple-tvos"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-apple-watchos-sim"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-pc-cygwin"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-uwp-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-win7-windows-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-win7-windows-msvc"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64h-apple-darwin"], full)
+
     def test_table_entry_set_is_the_union(self):
         self.assertEqual(set(bts.TIER3_STD), {
             "aarch64-unknown-linux-pauthtest",
             "aarch64-unknown-trusty",
+            "aarch64-uwp-windows-msvc",
             "aarch64_be-unknown-linux-gnu",
             "aarch64v8r-unknown-none",
             "aarch64v8r-unknown-none-softfloat",
             "amdgcn-amd-amdhsa",
+            "arm64_32-apple-watchos",
+            "arm64e-apple-darwin",
+            "arm64e-apple-ios",
+            "arm64e-apple-tvos",
             "armebv7r-none-eabi",
             "armebv7r-none-eabihf",
             "armv5te-none-eabi",
@@ -192,6 +217,9 @@ class TableTest(unittest.TestCase):
             "i386-apple-ios",
             "i686-apple-darwin",
             "i686-uwp-windows-gnu",
+            "i686-uwp-windows-msvc",
+            "i686-win7-windows-gnu",
+            "i686-win7-windows-msvc",
             "m68k-unknown-linux-gnu",
             "m68k-unknown-none-elf",
             "mips-mti-none-elf",
@@ -229,9 +257,18 @@ class TableTest(unittest.TestCase):
             "sparc-unknown-none-elf",
             "thumbv4t-none-eabi",
             "thumbv5te-none-eabi",
+            "thumbv7a-pc-windows-msvc",
+            "thumbv7a-uwp-windows-msvc",
             "wasm64-unknown-unknown",
+            "x86_64-apple-tvos",
+            "x86_64-apple-watchos-sim",
+            "x86_64-pc-cygwin",
             "x86_64-unknown-hermit",
             "x86_64-uwp-windows-gnu",
+            "x86_64-uwp-windows-msvc",
+            "x86_64-win7-windows-gnu",
+            "x86_64-win7-windows-msvc",
+            "x86_64h-apple-darwin",
         })
 
 
