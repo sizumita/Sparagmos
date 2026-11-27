@@ -375,12 +375,94 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// The `--aux` specs a run of `artifact` hands its
-    /// subprocess: the specs its build recorded, each
-    /// resolved against the dependency version that
-    /// build bound (see `ToolArtifact::aux_pins`).
-    fn artifact_aux_specs(&self, artifact: &ToolArtifact) -> Vec<String> {
-        self.pinned_aux_specs(&artifact.aux_specs, &artifact.aux_pins)
+    /// The `--aux` specs a conversion tail hands its
+    /// subprocess, each resolved against the dependency
+    /// version its build bound (see
+    /// `ToolArtifact::aux_pins`), and carrying the binding
+    /// designations the flat list alone cannot express,
+    /// plus the designations for the conversion's own
+    /// input (returned as the `--aux-bind` values).
+    ///
+    /// `specs`/`pins` are a bound list as
+    /// `bind_artifact_with_deps` produced it (or an
+    /// artifact's recorded list): each spec's owner is
+    /// recovered through `artifact_for_spec`, and the
+    /// owner's own recorded dependencies -- the versions
+    /// its build bound -- become the spec's `;need=`
+    /// designations (see `AuxSpec::needs`), naming the
+    /// list entries those dependencies stand at by their
+    /// pinned paths. When one name in the list is built
+    /// from several sources, every spec under that name
+    /// also gains a `;uniq=` token (see `AuxSpec::uniq`),
+    /// so the builds' artifacts stand under distinct
+    /// files instead of overwriting one another.
+    ///
+    /// `top_level` names the list positions the caller's
+    /// own invocation bound directly (its explicit
+    /// `--extern` arguments and its `extern crate`
+    /// bindings), with the names it bound them under:
+    /// those are the input's designations, returned as
+    /// (name, pinned source path) pairs. An artifact run,
+    /// whose invocation is gone, recovers the roots from
+    /// the recorded list itself (see `artifact_run`).
+    fn designated_aux_specs(
+        &self,
+        specs: &[String],
+        pins: &[(std::path::PathBuf, SourceTree)],
+        top_level: &[(String, usize)],
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let mut out = self.pinned_aux_specs(specs, pins);
+        let pinned_path = |spec: &str| -> String {
+            let rest = spec.split_once('=').map(|(_, r)| r).unwrap_or("");
+            rest.split(';').next().unwrap_or("").to_string()
+        };
+        let paths: Vec<String> = out.iter().map(|s| pinned_path(s)).collect();
+        // Uniqueness tokens for names this list builds
+        // from several distinct specs (the same name at
+        // the same path under different attributes is a
+        // distinct build too: its artifact would stand
+        // under the same file name).
+        let mut by_name: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, spec) in specs.iter().enumerate() {
+            by_name
+                .entry(spec.split('=').next().unwrap_or(""))
+                .or_default()
+                .push(i);
+        }
+        for idxs in by_name.values() {
+            let distinct: std::collections::HashSet<&str> =
+                idxs.iter().map(|&i| out[i].as_str()).collect();
+            if distinct.len() > 1 {
+                for &i in idxs {
+                    out[i].push_str(&format!(";uniq={i}"));
+                }
+            }
+        }
+        // Per-spec dependency designations, from each
+        // spec owner's recorded bindings.
+        for i in 0..specs.len() {
+            let Some(owner) = pins
+                .get(i)
+                .and_then(|pin| self.artifact_for_spec(&specs[i], pin))
+            else {
+                continue;
+            };
+            let deps: Vec<String> =
+                owner.aux_specs.iter().cloned().collect();
+            for dep_spec in &deps {
+                let Some(j) = specs.iter().position(|s| s == dep_spec) else {
+                    continue;
+                };
+                let dep_name = dep_spec.split('=').next().unwrap_or("");
+                out[i].push_str(&format!(";need={dep_name}={}", paths[j]));
+            }
+        }
+        let binds = top_level
+            .iter()
+            .map(|(name, idx)| (name.clone(), paths[*idx].clone()))
+            .collect();
+        (out, binds)
     }
 
     /// The recorded artifact a bound `--aux` spec denotes:
@@ -1205,6 +1287,13 @@ pub(crate) fn tool_run(
     // -- and the artifact it records -- keeps the
     // dependency builds it actually named.
     let mut aux_pins: Vec<(std::path::PathBuf, SourceTree)> = Vec::new();
+    // The list positions this invocation itself bound
+    // (its explicit `--extern` arguments and the
+    // `extern crate` scan below), with the names it
+    // bound them under: the input's own binding
+    // designations, handed to the conversion as
+    // `--aux-bind` (see `designated_aux_specs`).
+    let mut top_level: Vec<(String, usize)> = Vec::new();
     let mut emits: Vec<(String, Option<String>)> = Vec::new();
     let mut out_file: Option<String> = None;
     let mut out_dir: Option<String> = None;
@@ -1306,6 +1395,12 @@ pub(crate) fn tool_run(
                                 &mut aux,
                                 &mut aux_pins,
                             );
+                            if let Some(idx) = aux
+                                .iter()
+                                .position(|s| s == &aux_spec_for(&name, &art))
+                            {
+                                top_level.push((name.clone(), idx));
+                            }
                         }
                         None => {
                             // A real file (a sysroot or prebuilt
@@ -1469,6 +1564,11 @@ pub(crate) fn tool_run(
                 &mut aux,
                 &mut aux_pins,
             );
+            if let Some(idx) =
+                aux.iter().position(|s| s == &aux_spec_for(&art.name, &art))
+            {
+                top_level.push((art.name.clone(), idx));
+            }
         }
     }
 
@@ -1491,9 +1591,15 @@ pub(crate) fn tool_run(
         "--edition".to_string(),
         edition.clone(),
     ];
-    for spec in registry.pinned_aux_specs(&aux, &aux_pins) {
+    let (bound_specs, aux_binds) =
+        registry.designated_aux_specs(&aux, &aux_pins, &top_level);
+    for spec in &bound_specs {
         tail.push("--aux".to_string());
-        tail.push(spec);
+        tail.push(spec.clone());
+    }
+    for (name, path) in &aux_binds {
+        tail.push("--aux-bind".to_string());
+        tail.push(format!("{name}={path}"));
     }
     for tok in &forward {
         tail.push("--rustc-arg".to_string());
@@ -2105,9 +2211,47 @@ pub(crate) fn artifact_run(
         tail.push("--edition".to_string());
         tail.push(edition.clone());
     }
-    for spec in registry.artifact_aux_specs(&artifact) {
+    // The recorded list's roots: the entries no other
+    // entry's build recorded as a dependency -- the ones
+    // the binary's own invocation bound directly, whose
+    // designations the run replays (see
+    // `designated_aux_specs`). A root another root also
+    // depended on would read as a dependency here; that
+    // shape is unreachable for a binary that exists,
+    // since binding two builds of one name directly is
+    // E0464 in the build itself.
+    let mut is_dependency = vec![false; artifact.aux_specs.len()];
+    for (j, spec) in artifact.aux_specs.iter().enumerate() {
+        let deps: Vec<String> = artifact
+            .aux_pins
+            .get(j)
+            .and_then(|pin| registry.artifact_for_spec(spec, pin))
+            .map(|owner| owner.aux_specs.clone())
+            .unwrap_or_default();
+        for dep in &deps {
+            if let Some(k) = artifact.aux_specs.iter().position(|s| s == dep) {
+                if k != j {
+                    is_dependency[k] = true;
+                }
+            }
+        }
+    }
+    let roots: Vec<(String, usize)> = artifact
+        .aux_specs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !is_dependency[*i])
+        .map(|(i, spec)| (spec.split('=').next().unwrap_or("").to_string(), i))
+        .collect();
+    let (bound_specs, aux_binds) =
+        registry.designated_aux_specs(&artifact.aux_specs, &artifact.aux_pins, &roots);
+    for spec in &bound_specs {
         tail.push("--aux".to_string());
-        tail.push(spec);
+        tail.push(spec.clone());
+    }
+    for (name, path) in &aux_binds {
+        tail.push("--aux-bind".to_string());
+        tail.push(format!("{name}={path}"));
     }
     for tok in &artifact.rustc_args {
         tail.push("--rustc-arg".to_string());
@@ -2208,6 +2352,7 @@ pub(crate) struct SelfRunContext {
     pub(crate) input: String,
     pub(crate) edition: String,
     pub(crate) aux: Vec<String>,
+    pub(crate) aux_binds: Vec<String>,
     pub(crate) rustc_args: Vec<String>,
     /// Whether this run serves real child processes (the
     /// `--guest-process-host` flag): a self-spawn child run
@@ -2280,6 +2425,10 @@ pub(crate) fn self_run(
     for spec in &ctx.aux {
         tail.push("--aux".to_string());
         tail.push(spec.clone());
+    }
+    for bind in &ctx.aux_binds {
+        tail.push("--aux-bind".to_string());
+        tail.push(bind.clone());
     }
     for tok in &ctx.rustc_args {
         tail.push("--rustc-arg".to_string());
@@ -2362,9 +2511,9 @@ pub(crate) fn self_run(
 }
 
 /// Render an `--aux` spec back to its command-line spelling
-/// (`<name>=<file.rs>` with its `;crate-type=` / `;edition=`
-/// attributes), for replays of this run's invocation (see
-/// [`SelfRunContext`]).
+/// (`<name>=<file.rs>` with its `;crate-type=` / `;edition=` /
+/// `;need=` / `;uniq=` attributes), for replays of this run's
+/// invocation (see [`SelfRunContext`]).
 pub(crate) fn render_aux_spec(spec: &AuxSpec) -> String {
     let mut out = format!("{}={}", spec.name, spec.path);
     if let Some(crate_type) = &spec.crate_type {
@@ -2377,6 +2526,16 @@ pub(crate) fn render_aux_spec(spec: &AuxSpec) -> String {
     }
     if spec.force_unstable {
         out.push_str(";force-unstable=yes");
+    }
+    for (need_name, need_path) in &spec.needs {
+        out.push_str(";need=");
+        out.push_str(need_name);
+        out.push('=');
+        out.push_str(need_path);
+    }
+    if let Some(uniq) = &spec.uniq {
+        out.push_str(";uniq=");
+        out.push_str(uniq);
     }
     out
 }

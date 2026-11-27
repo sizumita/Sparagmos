@@ -2242,3 +2242,84 @@ fn run_mode_tool_interception_deleted_dylib_fails_the_run() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "dylib existence guest ok\n", "stderr={stderr}");
 }
+
+const SAME_STEM_GUEST_SRC: &str = r##"
+use std::process::Command;
+
+fn main() {
+    // The harness passes the tool program's path as the first
+    // guest argument; every compile request below is answered
+    // by the driver's own conversion machinery.
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // Two versions of one crate name, `dependency`: v1's
+    // `Marker` is a tuple struct, v2's is a unit struct.
+    std::fs::write(
+        "dependency-1.rs",
+        "#![crate_name = \"dependency\"]\n#![crate_type = \"rlib\"]\npub struct Marker(pub u32);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        "dependency-2.rs",
+        "#![crate_name = \"dependency\"]\n#![crate_type = \"rlib\"]\npub struct Marker;\n",
+    )
+    .unwrap();
+    // The re-export crate constructs v2's `Marker` as a unit
+    // struct: it builds only against v2.
+    std::fs::write(
+        "dep-2-reexport.rs",
+        "#![crate_name = \"foo\"]\n#![crate_type = \"rlib\"]\nextern crate dependency;\npub use dependency::Marker;\npub fn marker() -> Marker { Marker }\n",
+    )
+    .unwrap();
+    // The consumer directly passes v1 and uses its tuple
+    // constructor: it builds only if `dependency` binds the
+    // directly passed v1, not the v2 reached transitively
+    // through the re-export crate.
+    std::fs::write(
+        "consumer.rs",
+        "extern crate dependency;\nextern crate dep_2_reexport;\nfn main() { let m = dependency::Marker(3); let _ = m.0; let _v = dep_2_reexport::marker(); }\n",
+    )
+    .unwrap();
+
+    let out = Command::new(&rustc)
+        .args(["--edition=2021", "--crate-type=rlib", "--out-dir", ".", "dependency-1.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dep1 failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&rustc)
+        .args(["--edition=2021", "--crate-type=rlib", "-Cextra-filename=2", "--out-dir", ".", "dependency-2.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dep2 failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&rustc)
+        .args(["--edition=2021", "--crate-type=rlib", "--extern", "dependency=libdependency2.rlib", "--out-dir", ".", "dep-2-reexport.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "re-export failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&rustc)
+        .args(["--edition=2021", "--extern", "dependency=libdependency.rlib", "--extern", "dep_2_reexport=libfoo.rlib", "--out-dir", ".", "consumer.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "consumer failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    println!("same-stem guest ok");
+}
+"##;
+
+#[test]
+fn run_mode_tool_interception_binds_direct_extern_over_transitive_same_stem() {
+    let dir = temp_dir("tool-same-stem");
+    let src = fixture(&dir, "same_stem_guest.rs", SAME_STEM_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "same-stem guest ok\n", "stderr={stderr}");
+}
