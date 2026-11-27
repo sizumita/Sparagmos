@@ -11,13 +11,16 @@ for 119 triples of the 1.100.0 channel; the remaining known
 triples are tier-3 targets with no prebuilt std at all, so every
 record naming one stays "not attempted (compile-flags)". The
 table below covers every triple that blocks more than one
-record: at the latest official measurement before the fourth
-increment, 57 compile-check records were still blocked by
-triples outside the table, and that increment's 43 entries make
-51 of them attemptable. The six records that remain blocked
-name xtensa-esp32-none-elf (three; that backend cannot build
-even core, see below) or are all-targets census tests naming
-~200 triples apiece, most of them one-offs. For those triples the only source of a std the pinned
+record, plus (fifth increment) every triple named by the two
+all-targets census records whose missing sets are small:
+tests/assembly-llvm/targets/targets-macho.rs (seven Apple
+variant triples) and targets-pe.rs (ten Windows variant
+triples), which become attemptable once those 17 entries are
+installed. Of the six records still blocked after the fourth
+increment, those two are now covered; four remain blocked:
+three name xtensa-esp32-none-elf (that backend cannot build
+even core, see below) and targets-elf.rs names 135 further
+triples, most of them one-off exotic-OS spellings. For those triples the only source of a std the pinned
 compiler will accept is the compiler itself: rustc refuses rlibs
 whose metadata another compiler version produced, so the std
 must be built by the pinned 1.100.0 compiler from its own
@@ -46,7 +49,10 @@ instead of staying unattempted. The OS triples in the table
 mips/mipsel/mips64/mips64el and the mipsisa r6 variants,
 sparc linux, hexagon musl, powerpc gnuspe and powerpc64
 AIX, riscv32gc linux, fuchsia, hermit, the Apple
-ios/watchos/darwin triples, the uwp windows-gnu pair,
+ios/watchos/darwin/tvos triples (including the arm64e,
+arm64_32 and x86_64h variants), the windows family
+(uwp windows-gnu and windows-msvc, win7 gnu/msvc, the
+thumbv7a windows-msvc pair and pc-cygwin),
 wasm64) carry the full `core,std,panic_unwind` set, matching
 what a distributed std for those targets would provide. Apart from the two targets
 called out below, no entry needs an explicit `-C target-cpu`
@@ -80,10 +86,15 @@ TOOLCHAIN = "1.100.0"
 TIER3_STD = {
     "aarch64-unknown-linux-pauthtest": ("core", "std", "panic_unwind"),
     "aarch64-unknown-trusty": ("core", "alloc"),
+    "aarch64-uwp-windows-msvc": ("core", "std", "panic_unwind"),
     "aarch64_be-unknown-linux-gnu": ("core", "std", "panic_unwind"),
     "aarch64v8r-unknown-none": ("core", "alloc"),
     "aarch64v8r-unknown-none-softfloat": ("core", "alloc"),
     "amdgcn-amd-amdhsa": ("core", "alloc"),
+    "arm64_32-apple-watchos": ("core", "std", "panic_unwind"),
+    "arm64e-apple-darwin": ("core", "std", "panic_unwind"),
+    "arm64e-apple-ios": ("core", "std", "panic_unwind"),
+    "arm64e-apple-tvos": ("core", "std", "panic_unwind"),
     "armebv7r-none-eabi": ("core", "alloc"),
     "armebv7r-none-eabihf": ("core", "alloc"),
     "armv5te-none-eabi": ("core", "alloc"),
@@ -97,6 +108,9 @@ TIER3_STD = {
     "i386-apple-ios": ("core", "std", "panic_unwind"),
     "i686-apple-darwin": ("core", "std", "panic_unwind"),
     "i686-uwp-windows-gnu": ("core", "std", "panic_unwind"),
+    "i686-uwp-windows-msvc": ("core", "std", "panic_unwind"),
+    "i686-win7-windows-gnu": ("core", "std", "panic_unwind"),
+    "i686-win7-windows-msvc": ("core", "std", "panic_unwind"),
     "m68k-unknown-linux-gnu": ("core", "alloc"),
     "m68k-unknown-none-elf": ("core", "alloc"),
     "mips-mti-none-elf": ("core", "alloc"),
@@ -134,9 +148,18 @@ TIER3_STD = {
     "sparc-unknown-none-elf": ("core", "alloc"),
     "thumbv4t-none-eabi": ("core", "alloc"),
     "thumbv5te-none-eabi": ("core", "alloc"),
+    "thumbv7a-pc-windows-msvc": ("core", "std", "panic_unwind"),
+    "thumbv7a-uwp-windows-msvc": ("core", "std", "panic_unwind"),
     "wasm64-unknown-unknown": ("core", "std", "panic_unwind"),
+    "x86_64-apple-tvos": ("core", "std", "panic_unwind"),
+    "x86_64-apple-watchos-sim": ("core", "std", "panic_unwind"),
+    "x86_64-pc-cygwin": ("core", "std", "panic_unwind"),
     "x86_64-unknown-hermit": ("core", "std", "panic_unwind"),
     "x86_64-uwp-windows-gnu": ("core", "std", "panic_unwind"),
+    "x86_64-uwp-windows-msvc": ("core", "std", "panic_unwind"),
+    "x86_64-win7-windows-gnu": ("core", "std", "panic_unwind"),
+    "x86_64-win7-windows-msvc": ("core", "std", "panic_unwind"),
+    "x86_64h-apple-darwin": ("core", "std", "panic_unwind"),
 }
 
 # triple -> the `-C target-cpu` its build-std run must carry.
