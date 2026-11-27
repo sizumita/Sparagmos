@@ -412,17 +412,38 @@ impl<'a> Interpreter<'a> {
                 )),
             });
         }
-        let text = match self.string_from_real_aggregate(frames, &stored)? {
-            Some(text) => Some(text),
-            None => string_aggregate_bytes(&stored)
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        };
+        let text = self.string_text_of_stored(frames, &stored)?;
         let mut text = text.ok_or_else(|| {
             InterpError::type_mismatch(name, "string value", stored.kind_name())
         })?;
         let result = f(&mut text)?;
         self.write_resolved(frames, target, Value::Str(text))?;
         Ok(result)
+    }
+
+    /// The text a stored (non-abstract) string value denotes,
+    /// through the same reader composition `resolve_string`
+    /// applies to operand values: the real aggregate form, the
+    /// element form (the shape a `join` / `concat` result takes
+    /// once it is stored in a place -- the vector as an element
+    /// list whose elements past the first keep the
+    /// `MaybeUninit` union wrapper the buffer's spare-capacity
+    /// region stores), and the plain aggregate byte shapes.
+    /// Any other shape returns `None` and leaves the caller's
+    /// ordinary judgement to stand.
+    pub(super) fn string_text_of_stored(
+        &self,
+        frames: &[Frame],
+        stored: &Value,
+    ) -> InterpResult<Option<String>> {
+        if let Some(text) = self.string_from_real_aggregate(frames, stored)? {
+            return Ok(Some(text));
+        }
+        if let Some(text) = self.string_from_element_form(stored) {
+            return Ok(Some(text));
+        }
+        Ok(string_aggregate_bytes(stored)
+            .and_then(|bytes| String::from_utf8(bytes).ok()))
     }
 
     /// The text of the string stored at `target`, read through
@@ -439,11 +460,7 @@ impl<'a> Interpreter<'a> {
         if let Value::Str(text) = stored {
             return Ok(text);
         }
-        let text = match self.string_from_real_aggregate(frames, &stored)? {
-            Some(text) => Some(text),
-            None => string_aggregate_bytes(&stored)
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        };
+        let text = self.string_text_of_stored(frames, &stored)?;
         text.ok_or_else(|| {
             InterpError::type_mismatch(name, "string value", stored.kind_name())
         })
