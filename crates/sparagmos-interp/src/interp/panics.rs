@@ -675,11 +675,23 @@ impl<'a> Interpreter<'a> {
         // std prints, while the full shape's trace stays
         // bounded at the guest stack (std's own full tail runs
         // on into frames the model does not represent).
+        // The shim frame is the compilation's own, not the
+        // guest's: an optimising build inlines it into
+        // `__rust_begin_short_backtrace`, where it leaves no
+        // frame of its own, so the native trace ends at the
+        // entry -- unless the build carries debug info, which
+        // lets the printer reconstruct the inlined frame.
+        // The driver resolves that visibility from the
+        // compilation's flags (see
+        // `InterpConfig::entry_shim_visible`).
         let entry_live = match self.entry_frame_id.get() {
             Some(id) => frames.get(base).map(|fr| fr.id) == Some(id),
             None => false,
         };
-        if entry_live && matches!(style, ReportBacktrace::Short) {
+        if entry_live
+            && self.entry_shim_visible()
+            && matches!(style, ReportBacktrace::Short)
+        {
             names.push(
                 "<fn() as core::ops::function::FnOnce<()>>::call_once"
                     .to_string(),

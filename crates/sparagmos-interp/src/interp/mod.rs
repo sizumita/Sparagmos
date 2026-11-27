@@ -242,6 +242,20 @@ pub struct InterpConfig {
     /// non-unwinding line) never appears. Defaults to `false`
     /// (the unwind strategy).
     pub panic_abort: bool,
+    /// Whether the entry shim frame (the
+    /// `<fn() as FnOnce<()>>::call_once` frame `lang_start`
+    /// calls the entry function pointer through) appears
+    /// below the entry frame in a short backtrace, as the
+    /// driver resolved it from the compilation's flags.
+    /// Natively the shim is a real frame in an unoptimised
+    /// build; an optimising build inlines it into
+    /// `__rust_begin_short_backtrace`, where it leaves no
+    /// frame of its own unless debug info lets the
+    /// backtrace printer reconstruct the inlined frame.
+    /// The frame is therefore visible exactly when the
+    /// build is unoptimised or carries debug info.
+    /// Defaults to `true` (the unoptimised shape).
+    pub entry_shim_visible: bool,
     /// The guest's `SIGPIPE` setup, as the driver
     /// resolved it from the compilation's flags (see
     /// [`SigpipeInit`]). The disposition it names is
@@ -284,6 +298,7 @@ impl Default for InterpConfig {
             program_path: String::new(),
             overflow_checks: true,
             panic_abort: false,
+            entry_shim_visible: true,
             sigpipe: SigpipeInit::Default,
             tool_interception: None,
             process_host: None,
@@ -1562,6 +1577,13 @@ impl<'a> Interpreter<'a> {
     /// (see the `overflow_checks` field of `InterpConfig`).
     pub fn overflow_checks(&self) -> bool {
         self.config.overflow_checks
+    }
+
+    /// Whether the entry shim frame appears below the
+    /// entry frame in a short backtrace (see the
+    /// `entry_shim_visible` field of `InterpConfig`).
+    pub fn entry_shim_visible(&self) -> bool {
+        self.config.entry_shim_visible
     }
 
     /// The overflow-checks setting in force for an operation

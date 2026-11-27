@@ -3250,6 +3250,81 @@ fn run_mode_short_backtrace_elides_the_marked_region() {
     );
 }
 
+const PLAIN_PANIC_SRC: &str = r#"
+fn main() {
+    panic!("explicit panic");
+}
+"#;
+
+#[test]
+fn run_mode_short_backtrace_ends_at_main_when_optimised_without_debuginfo() {
+    // The shape of tests/ui/panics/issue-47429-short-backtraces.rs
+    // and runtime-switch.rs: an optimised build without debug
+    // info inlines the `lang_start` entry shim into
+    // `__rust_begin_short_backtrace`, so std's short trace ends
+    // at the entry frame -- no `call_once` frame is printed.
+    let dir = temp_dir("short-backtrace-optimised");
+    let src = fixture(&dir, "plain_panic.rs", PLAIN_PANIC_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .args(["--rustc-arg", "-O", "--rustc-arg", "-Cdebuginfo=0"])
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "\nthread 'main' (1) panicked at {0}:3:5:\nexplicit panic\nstack backtrace:\n\
+             \u{20}  0: __rustc::rust_begin_unwind\n\
+             \u{20}  1: core::panicking::panic_fmt\n\
+             \u{20}  2: plain_panic::main\n\
+             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
+
+#[test]
+fn run_mode_short_backtrace_keeps_entry_shim_when_unoptimised_or_debuggable() {
+    // The two shapes in which the native trace does show the
+    // entry shim below `main`: an unoptimised build (the shim
+    // is a real frame) and an optimised build with debug info
+    // (the printer reconstructs the inlined frame).
+    for (tag, extra) in [
+        ("plain", Vec::new()),
+        ("debuginfo", vec!["--rustc-arg", "-O", "--rustc-arg", "-Cdebuginfo=2"]),
+    ] {
+        let dir = temp_dir(&format!("short-backtrace-shim-{tag}"));
+        let src = fixture(&dir, "plain_panic.rs", PLAIN_PANIC_SRC);
+        let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+            .arg("run")
+            .arg(&src)
+            .args(&extra)
+            .env("RUST_BACKTRACE", "1")
+            .output()
+            .expect("failed to run sparagmos-driver");
+        assert_eq!(out.status.code(), Some(101), "tag={tag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "\nthread 'main' (1) panicked at {0}:3:5:\nexplicit panic\nstack backtrace:\n\
+                 \u{20}  0: __rustc::rust_begin_unwind\n\
+                 \u{20}  1: core::panicking::panic_fmt\n\
+                 \u{20}  2: plain_panic::main\n\
+                 \u{20}  3: <fn() as core::ops::function::FnOnce<()>>::call_once\n\
+                 note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n",
+                src.display()
+            )
+            .as_str(),
+            "tag={tag}"
+        );
+    }
+}
+
 #[test]
 fn run_mode_full_backtrace_keeps_the_marked_region() {
     // The full shape does not elide: every frame is listed,
