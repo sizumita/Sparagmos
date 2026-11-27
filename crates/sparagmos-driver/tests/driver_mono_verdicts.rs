@@ -1543,3 +1543,27 @@ fn deep_but_finite_instantiation_converts() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
+
+#[test]
+fn trait_method_no_mangle_accepted() {
+    // `#[no_mangle]` on a trait method declaration is inert:
+    // rustc warns the attribute cannot be used on trait items
+    // and its `InvalidNoMangleItems` lint never visits them,
+    // so the generic-export verdict must not reject the crate
+    // for it (the shape of
+    // tests/ui/feature-gates/issue-43106-gating-of-builtin-attrs.rs).
+    // The free-function rejections above pin the other side.
+    let case = Case::new("trait-no-mangle");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         trait Tr {\n\
+             #[no_mangle]\n\
+             fn foo();\n\
+             #[no_mangle]\n\
+             fn bar() {}\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
