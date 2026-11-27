@@ -960,13 +960,17 @@ impl Converter {
                     // allocation from `offset`, so the work is
                     // bounded by bytes the host already holds.
                     // A zero stride proves nothing about the
-                    // count, so zero-sized elements keep the
-                    // bound and stay undecoded. Zero-sized
-                    // descendants of a nonzero-stride element
-                    // are not bounded by the byte count either;
-                    // the shared expansion budget spent by
-                    // every recursive decode bounds those (see
-                    // `MAX_CONST_TOTAL_ELEMS`).
+                    // count either, so a zero-sized element
+                    // type takes the replication path below:
+                    // one decode replicated to the declared
+                    // count, charged to the shared expansion
+                    // budget, which is what bounds a declared
+                    // count decoupled from the allocation.
+                    // Zero-sized descendants of a nonzero-stride
+                    // element are not bounded by the byte count
+                    // either; the shared expansion budget spent
+                    // by every recursive decode bounds those
+                    // (see `MAX_CONST_TOTAL_ELEMS`).
                     if stride.bytes() == 1
                         && matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
                     {
@@ -1000,7 +1004,29 @@ impl Converter {
                     }
                     let stride_bytes = stride.bytes();
                     if stride_bytes == 0 {
-                        return None;
+                        // A zero-sized element type stores
+                        // nothing per element: every element
+                        // reads the same zero bytes at the base,
+                        // so one decode replicated to the
+                        // declared count is the exact value --
+                        // the same rule the slice decoder
+                        // applies to a zero-sized element slice
+                        // in `decode_ref`. The replication is
+                        // charged to the shared expansion budget
+                        // before it is built: a declared count
+                        // the budget cannot cover (the resource
+                        // concern behind the element-wise bound)
+                        // stays undecoded, as does an element
+                        // whose own decode fails.
+                        if !self.spend_const_budget(count as usize) {
+                            return None;
+                        }
+                        let elem_value =
+                            self.decode_const(&elem, alloc, offset, depth + 1)?;
+                        return Some(sm::ConstValue::Tuple(vec![
+                            elem_value;
+                            count as usize
+                        ]));
                     }
                     let total = (count as u128).checked_mul(stride_bytes as u128)?;
                     if offset as u128 + total > alloc.bytes.len() as u128 {
