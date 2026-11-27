@@ -310,7 +310,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
-          components: rustc-dev
+          components: rustc-dev, rust-src
           # Install every target rustup distributes for the
           # pinned toolchain: the subset runner screens a
           # record's compile-flags --target against the sysroot's
@@ -445,6 +445,28 @@ jobs:
             x86_64-unknown-none,
             x86_64-unknown-redox,
             x86_64-unknown-uefi
+
+      # Tier-3 std completion (Issue #516): for triples the
+      # 1.100.0 channel does not distribute, build std from
+      # source with the pinned compiler itself and install it
+      # into this sysroot, so the runner's installed-target
+      # screening admits the records that name them. The
+      # installed sysroot directory is cached; on a hit the
+      # build script sees the std already present and skips.
+      # When the script's TIER3_STD table changes, bump the
+      # cache key version.
+      - name: Resolve sysroot
+        id: sysroot
+        run: echo "path=$(rustup run 1.100.0 rustc --print sysroot)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache tier-3 std sysroots
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+          key: tier3-std-1.100.0-v1-aarch64v8r-unknown-none-core-alloc
+
+      - name: Build tier-3 std from source
+        run: python3 scripts/build-tier3-std.py
 
       - name: Restore rust source tree
         uses: actions/cache@v4
@@ -542,7 +564,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
-          components: rustc-dev
+          components: rustc-dev, rust-src
           # Install every target rustup distributes for the
           # pinned toolchain: the subset runner screens a
           # record's compile-flags --target against the sysroot's
@@ -677,6 +699,28 @@ jobs:
             x86_64-unknown-none,
             x86_64-unknown-redox,
             x86_64-unknown-uefi
+
+      # Tier-3 std completion (Issue #516): for triples the
+      # 1.100.0 channel does not distribute, build std from
+      # source with the pinned compiler itself and install it
+      # into this sysroot, so the runner's installed-target
+      # screening admits the records that name them. The
+      # installed sysroot directory is cached; on a hit the
+      # build script sees the std already present and skips.
+      # When the script's TIER3_STD table changes, bump the
+      # cache key version.
+      - name: Resolve sysroot
+        id: sysroot
+        run: echo "path=$(rustup run 1.100.0 rustc --print sysroot)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache tier-3 std sysroots
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+          key: tier3-std-1.100.0-v1-aarch64v8r-unknown-none-core-alloc
+
+      - name: Build tier-3 std from source
+        run: python3 scripts/build-tier3-std.py
 
       - name: Restore rust source tree
         uses: actions/cache@v4
