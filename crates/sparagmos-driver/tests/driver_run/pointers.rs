@@ -4095,3 +4095,78 @@ fn run_mode_nonnull_addr_round_trip() {
     // reaches the same pointee.
     run_ok("nonnull-addr", NONNULL_ADDR_SRC, "nonnull addr ok\n");
 }
+
+const PACKED_ENUM_STRIDE_SRC: &str = r#"
+#[repr(packed)]
+struct Packed<T: Copy>(#[allow(dead_code)] T);
+
+impl<T: Copy> Copy for Packed<T> {}
+impl<T: Copy> Clone for Packed<T> {
+    fn clone(&self) -> Self { *self }
+}
+
+fn sanity_check_size<T: Copy>(one: T) {
+    let two = [one, one];
+    let stride = (&two[1] as *const _ as usize) - (&two[0] as *const _ as usize);
+    let (size, align) = (std::mem::size_of::<T>(), std::mem::align_of::<T>());
+    assert_eq!(stride, size);
+    assert_eq!(size % align, 0);
+    println!("stride {stride}");
+}
+
+fn main() {
+    sanity_check_size((Some(Packed((&(), 0))), true));
+
+    type PackedRefAndBool<'a> = (Packed<&'a ()>, bool);
+    sanity_check_size::<Option<PackedRefAndBool>>(Some((Packed(&()), true)));
+
+    assert_eq!(std::mem::align_of::<Option<PackedRefAndBool>>(), 1);
+    assert_eq!(std::mem::size_of::<Option<PackedRefAndBool>>(),
+               std::mem::size_of::<PackedRefAndBool>());
+    println!("packed enum stride ok");
+}
+"#;
+
+#[test]
+fn run_mode_packed_enum_element_stride() {
+    // The element addresses of an array local whose element
+    // type the IR type cannot size (a tuple holding an ADT
+    // whose bare name denotes several recorded instances, an
+    // `Option` of a packed struct) price arithmetically from
+    // the element size conversion recorded for the local, so
+    // the stride between adjacent elements is the element's
+    // size -- the shape of
+    // tests/ui/packed/packed-struct-optimized-enum.rs, whose
+    // subtraction used to fall back to synthetic-hash prices
+    // and overflow.
+    run_ok(
+        "packed-enum-stride",
+        PACKED_ENUM_STRIDE_SRC,
+        "stride 17\nstride 9\npacked enum stride ok\n",
+    );
+}
+
+const TUPLE_ELEMENT_STRIDE_SRC: &str = r#"
+fn stride<T: Copy>(one: T) -> usize {
+    let two = [one, one];
+    (&two[1] as *const _ as usize) - (&two[0] as *const _ as usize)
+}
+
+fn main() {
+    println!("tuple {}", stride((7u32, true)));
+    println!("nested {}", stride([(1u16, 2u8), (3, 4)]));
+}
+"#;
+
+#[test]
+fn run_mode_tuple_element_stride() {
+    // Adjacent elements of an array of tuples (or of arrays of
+    // tuples) price at the element's size: the offset walk
+    // sizes tuple elements through the full layout walk, not
+    // only the scalar-size table.
+    run_ok(
+        "tuple-element-stride",
+        TUPLE_ELEMENT_STRIDE_SRC,
+        "tuple 8\nnested 8\n",
+    );
+}
