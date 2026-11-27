@@ -352,6 +352,73 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Recover the receiver of a trait-method call whose MIR
+    /// operand is the dereference of a fat-pointer place
+    /// (`move (*_9)`, `_9: *const dyn Trait`): the shape of a
+    /// by-value `Self` vtable call, where the compiler's shim
+    /// loads the value out of the data pointer before calling
+    /// the method body, so the evaluated argument is the concrete
+    /// value alone and the (concrete type, trait) pair the
+    /// dispatch lookup needs stayed on the pointer the operand
+    /// dereferenced. When the head place's value is a `dyn` fat
+    /// pointer and the call does not already dispatch, rewrite
+    /// the first argument as that fat pointer with the loaded
+    /// value as its data pointer, provided the rewritten call
+    /// resolves as a dispatch: the lookup reads the vtable
+    /// identity from the fat pointer, and the receiver shaping
+    /// in `start_call` then hands the impl body the value itself
+    /// (a by-value `self`) or a reference to it (a `&self`).
+    /// Any other shape leaves the arguments untouched, so the
+    /// call keeps the outcome it had.
+    pub(crate) fn recover_deref_dyn_receiver(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        func: &str,
+        args: &[Operand],
+        arg_values: &mut [Value],
+    ) {
+        let Some(Operand::Move(place) | Operand::Copy(place)) = args.first() else {
+            return;
+        };
+        if !matches!(place.projection.last(), Some(ProjectionElem::Deref)) {
+            return;
+        }
+        if self.virtual_call_target(func, arg_values).is_some() {
+            return;
+        }
+        let head = Place {
+            local: place.local,
+            projection: place.projection[..place.projection.len() - 1].to_vec(),
+        };
+        let Ok(head_value) = self.read_place(frames, body, &head) else {
+            return;
+        };
+        let Value::DynRef {
+            concrete,
+            traits,
+            drop_glue,
+            ..
+        } = head_value
+        else {
+            return;
+        };
+        let Some(loaded) = arg_values.first().cloned() else {
+            return;
+        };
+        let swapped = Value::DynRef {
+            base: Box::new(loaded),
+            concrete,
+            traits,
+            drop_glue,
+        };
+        let mut probe = arg_values.to_vec();
+        probe[0] = swapped.clone();
+        if matches!(self.virtual_call_target(func, &probe), Some(Ok(_))) {
+            arg_values[0] = swapped;
+        }
+    }
+
     /// Resolve a call that has no body under its own name against
     /// a `dyn` receiver: the vtable lookup, with the fat pointer's
     /// (concrete type, trait) pair standing in for the vtable.

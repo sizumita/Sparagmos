@@ -45,6 +45,14 @@
 //!   vtable's demand, or a trait default the impl does not
 //!   override has no converted body to dispatch to
 //!   (tests/ui/custom_test_frameworks/dynamic.rs).
+//! * A by-value `Self` trait method is called through the
+//!   vtable shim, whose MIR receiver is the value loaded out of
+//!   the fat pointer (`move (*_9)`): the dispatch must recover
+//!   the (concrete type, trait) pair from the pointer the
+//!   operand dereferenced, and the `drop_in_place` shim the
+//!   compiler emits for the box afterwards (its pointee moved
+//!   out) walks the wrapper chain's marker fields on the fat
+//!   pointer value (tests/ui/unsized-locals/track-caller-vtable-shim.rs).
 //! * A closure `Self` is spelled with the compiler's span
 //!   form (`{closure@<file>:16:17: 16:23}`) in the impl
 //!   instance key but with the definition path's indexed
@@ -370,6 +378,40 @@ fn main() {
 }
 "#;
 
+const BY_VALUE_SELF_DYN_SRC: &str = r#"
+#![feature(unsized_fn_params)]
+#![allow(internal_features)]
+
+trait TrackedByValue {
+    #[track_caller]
+    fn consume(self, expected_line: u32);
+}
+
+impl TrackedByValue for u8 {
+    fn consume(self, expected_line: u32) {
+        assert_eq!(self, 7);
+        assert_eq!(std::panic::Location::caller().line(), expected_line);
+    }
+}
+
+trait PlainByValue {
+    fn take(self) -> u32;
+}
+
+struct Wrap(u32);
+impl PlainByValue for Wrap {
+    fn take(self) -> u32 { self.0 + 1 }
+}
+
+fn main() {
+    let obj = Box::new(7_u8) as Box<dyn TrackedByValue>;
+    obj.consume(line!());
+    let w = Box::new(Wrap(41)) as Box<dyn PlainByValue>;
+    assert_eq!(w.take(), 42);
+    println!("ok");
+}
+"#;
+
 #[test]
 fn dyn_call_on_reference_self_impl() {
     // The impl instance key spells the `Self` type with its
@@ -657,5 +699,12 @@ fn dyn_call_picks_the_bound_instance_among_supertrait_upcasts() {
 fn dyn_default_method_on_const_formed_trait_object() {
     let dir = temp_dir("dyn-const-formed");
     let src = fixture(&dir, "main.rs", CONST_FORMED_TABLE_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+#[test]
+fn dyn_call_by_value_self_through_box() {
+    let dir = temp_dir("dyn-by-value-self");
+    let src = fixture(&dir, "main.rs", BY_VALUE_SELF_DYN_SRC);
     assert_ok(&run_driver(&src));
 }

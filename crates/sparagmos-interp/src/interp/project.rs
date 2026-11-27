@@ -1969,6 +1969,18 @@ pub(crate) fn project_value_ev(
                 // `Unique`): in this model the `DynRef` *is* that
                 // pointer, metadata included.
                 Value::DynRef { .. } if *idx == 0 => value,
+                // The wrapper's remaining fields are zero-sized
+                // markers (a `Unique`'s `PhantomData`, a `Box`'s
+                // allocator), as for a thin pointer below: the
+                // model keeps no storage for them, so the step
+                // yields the marker value itself. (The converted
+                // `drop_in_place` shim for a `Box<dyn _>` walks
+                // exactly these fields after a by-value trait
+                // call moved the pointee out.)
+                Value::DynRef { .. } => Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
                 // The same wrapper chain for a thin pointer: a
                 // `Box`'s field 0 is its `Unique`, whose field 0
                 // is the `NonNull`, whose field 0 is the raw
@@ -3384,6 +3396,27 @@ pub(crate) fn project_value_ref_ev<'a>(
                         return project_value_ref(base, &sub, func, place);
                     }
                     Value::DynRef { .. } if *idx == 0 => cur,
+                    // The wrapper's zero-sized marker fields, as
+                    // for a thin pointer below (a `Unique`'s
+                    // `PhantomData`, a `Box`'s allocator): the
+                    // `DynRef` *is* the wrapper's pointer field,
+                    // so the chain's remaining fields are markers
+                    // the model keeps no storage for; the step
+                    // materializes the marker value as an owned
+                    // value, like the `Ref` marker arm below.
+                    Value::DynRef { .. } => {
+                        let owned = Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        };
+                        if tail.is_empty() {
+                            return Ok(Cow::Owned(owned));
+                        }
+                        return Ok(Cow::Owned(
+                            project_value_ref(&owned, tail, func, place)?
+                                .into_owned(),
+                        ));
+                    }
                     // The thin-pointer wrapper chain, as in
                     // `project_value`: a `Box`'s field 0 is its
                     // `Unique`, whose field 0 is the `NonNull`,
