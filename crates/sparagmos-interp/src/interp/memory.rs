@@ -2908,48 +2908,72 @@ impl<'a> Interpreter<'a> {
         // path canonicalises it, so the steps walked are the
         // steps the store will navigate.
         let effective;
-        let (root, projection): (Resolved, &[RefProj]) = match target {
+        let projection: &[RefProj] = match target {
             Resolved::Alloc { id, projection } => {
                 effective = self.elem_block_projection(*id, projection);
-                (
-                    Resolved::Alloc {
-                        id: *id,
-                        projection: Vec::new(),
-                    },
-                    &effective,
-                )
+                &effective
             }
-            Resolved::Place {
-                frame_pos,
-                local,
-                projection,
-            } => (
-                Resolved::Place {
-                    frame_pos: *frame_pos,
-                    local: *local,
-                    projection: Vec::new(),
-                },
-                projection,
-            ),
-            Resolved::Static { name, projection } => (
-                Resolved::Static {
-                    name: name.clone(),
-                    projection: Vec::new(),
-                },
-                projection,
-            ),
+            Resolved::Place { projection, .. } => projection,
+            Resolved::Static { projection, .. } => projection,
             Resolved::Value(..) => return None,
         };
         if projection.is_empty() {
             return None;
         }
-        let root_value = self.read_resolved(frames, &root).ok()?;
+        // The root value the walk starts from, borrowed from
+        // its store rather than read owned: this probe runs on
+        // every projected write, and an owned read of the root
+        // clones the whole aggregate or allocation each time --
+        // a sequence of single-element writes into a large
+        // buffer (a hash table's bucket array, copied bucket by
+        // bucket) then pays the buffer's whole size per element
+        // written, which is the superlinear per-step cost the
+        // long-running hash-table programs met (issue #399).
+        // The borrowed walk sees exactly the value the owned
+        // read produced: a root holding the uninitialised
+        // marker is the one case the owned read does not hand
+        // back -- it fails, or substitutes a place local's
+        // zero-sized value -- so both are reproduced here.
+        let alloc_store;
+        let static_store;
+        let zst_root;
+        let root_value: &Value = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let stored = frame.locals.get(*local)?;
+                if *stored == Value::Uninit {
+                    zst_root = self.zst_local_value(frame, *local)?;
+                    &zst_root
+                } else {
+                    stored
+                }
+            }
+            Resolved::Static { name, .. } => {
+                static_store = self.statics.borrow();
+                let stored = static_store.get(name)?;
+                if *stored == Value::Uninit {
+                    return None;
+                }
+                stored
+            }
+            Resolved::Alloc { id, .. } => {
+                alloc_store = self.allocs.borrow();
+                let stored = alloc_store.get(id)?;
+                if *stored == Value::Uninit {
+                    return None;
+                }
+                stored
+            }
+            Resolved::Value(..) => unreachable!(),
+        };
         // The walk, staged exactly as `project_value_ref_t`
         // stages it: a step that materialises a value (a
         // sub-slice, a union field) stages it in `stage`, and
         // the walk continues into the staged value.
         let mut stage: Option<Value> = None;
-        let mut cur: &Value = &root_value;
+        let mut cur: &Value = root_value;
         for (i, step) in projection.iter().enumerate() {
             if matches!(step, RefProj::Index(_)) {
                 // The pointer this step crosses, when its input
