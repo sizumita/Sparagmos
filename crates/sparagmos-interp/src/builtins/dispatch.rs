@@ -3999,7 +3999,7 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let bytes = if name == "std::ffi::OsString::to_string_lossy" {
                     let pointee = self.resolve_value(frames, &vals[0])?;
-                    os_string_bytes(&pointee).ok_or_else(|| {
+                    self.os_string_bytes_any(frames, &pointee)?.ok_or_else(|| {
                         InterpError::type_mismatch(
                             format!("builtin {name}"),
                             "an OS string value",
@@ -4037,7 +4037,7 @@ impl<'a> Interpreter<'a> {
                         entry.kind_name(),
                     )
                 })?;
-                let bytes = path_buf_bytes(&path).ok_or_else(|| {
+                let bytes = self.path_buf_bytes_any(frames, &path)?.ok_or_else(|| {
                     InterpError::type_mismatch(
                         format!("builtin {name}"),
                         "a directory entry holding a path buffer",
@@ -4808,7 +4808,15 @@ impl<'a> Interpreter<'a> {
                     // string itself or a reference to it.
                     let bytes = match string_aggregate_bytes(&value) {
                         Some(bytes) => bytes,
-                        None => self.path_bytes_of(frames, &value)?.0,
+                        // An owned source in its real aggregate
+                        // form (an `OsString` the converted
+                        // bodies built through raw-pointer
+                        // writes) reads through the accessor
+                        // that follows its buffer pointer.
+                        None => match self.os_string_bytes_any(frames, &value)? {
+                            Some(bytes) => bytes,
+                            None => self.path_bytes_of(frames, &value)?.0,
+                        },
                     };
                     Ok(pathbuf_value(&bytes))
                 } else if target == "std::process::Stdio"
@@ -4905,7 +4913,7 @@ impl<'a> Interpreter<'a> {
                     // buffer holds, in the shape a path over the
                     // same bytes denotes (see `sub_path_value`).
                     let pointee = self.resolve_value(frames, &vals[0])?;
-                    let bytes = path_buf_bytes(&pointee).ok_or_else(|| {
+                    let bytes = self.path_buf_bytes_any(frames, &pointee)?.ok_or_else(|| {
                         InterpError::type_mismatch(
                             "Deref::deref for PathBuf",
                             "a path buffer value",
@@ -4918,7 +4926,7 @@ impl<'a> Interpreter<'a> {
                     // bytes as the slice value, the same shape
                     // `PathBuf`'s deref produces.
                     let pointee = self.resolve_value(frames, &vals[0])?;
-                    let bytes = os_string_bytes(&pointee).ok_or_else(|| {
+                    let bytes = self.os_string_bytes_any(frames, &pointee)?.ok_or_else(|| {
                         InterpError::type_mismatch(
                             "Deref::deref for OsString",
                             "an OS string value",

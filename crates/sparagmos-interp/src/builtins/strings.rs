@@ -337,6 +337,17 @@ impl<'a> Interpreter<'a> {
         {
             return Ok(bytes);
         }
+        // The same owned values in their real aggregate form
+        // (a buffer the converted bodies filled through
+        // raw-pointer writes, as `OsString::with_capacity`
+        // plus `push` builds) read through the accessor that
+        // follows the buffer pointer.
+        if let Some(bytes) = self.os_string_bytes_any(frames, &resolved0)? {
+            return Ok(bytes);
+        }
+        if let Some(bytes) = self.path_buf_bytes_any(frames, &resolved0)? {
+            return Ok(bytes);
+        }
         let mut resolved = resolved0;
         // The path and OS-string values of this model wrap the
         // string data in one-field aggregates (`PathBuf`
