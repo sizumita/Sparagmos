@@ -4002,14 +4002,16 @@ fn run_mode_invalid_enum_construction_reports_core_message() {
     // valid range trips the `CheckEnums` assertion; the report
     // must carry core's run-time-formatted message (the source
     // value in hex), not the baked kind text.
+    // The assertion is nounwind by design: the guest aborts (134)
+    // after the single report, exactly as native rustc 1.100.0 does.
     let dir = temp_dir("invalid-enum");
     let src = fixture(&dir, "invalid_enum.rs", INVALID_ENUM_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(101),
-        "guest panic must exit 101; stderr={stderr}"
+        Some(134),
+        "the nounwind validity assert must abort the guest (134); stderr={stderr}"
     );
     assert!(
         stderr.contains("trying to construct an enum from an invalid value 0x7"),
