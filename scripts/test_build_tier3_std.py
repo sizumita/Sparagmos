@@ -108,24 +108,130 @@ class TableTest(unittest.TestCase):
         self.assertEqual(bts.TIER3_STD["sparc-unknown-none-elf"],
                          ("core", "alloc"))
 
+    def test_increment4_entries(self):
+        full = ("core", "std", "panic_unwind")
+        self.assertEqual(bts.TIER3_STD["aarch64_be-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["armv7k-apple-watchos"], full)
+        self.assertEqual(bts.TIER3_STD["armv7s-apple-ios"], full)
+        self.assertEqual(bts.TIER3_STD["csky-unknown-linux-gnuabiv2"], full)
+        self.assertEqual(bts.TIER3_STD["i386-apple-ios"], full)
+        self.assertEqual(bts.TIER3_STD["i686-uwp-windows-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["mips-unknown-linux-musl"], full)
+        self.assertEqual(bts.TIER3_STD["mips-unknown-linux-uclibc"], full)
+        self.assertEqual(bts.TIER3_STD["mips64-openwrt-linux-musl"], full)
+        self.assertEqual(bts.TIER3_STD["mips64-unknown-linux-muslabi64"], full)
+        self.assertEqual(bts.TIER3_STD["mips64el-unknown-linux-gnuabi64"], full)
+        self.assertEqual(bts.TIER3_STD["mips64el-unknown-linux-muslabi64"], full)
+        self.assertEqual(bts.TIER3_STD["mipsel-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["mipsel-unknown-linux-musl"], full)
+        self.assertEqual(bts.TIER3_STD["mipsel-unknown-linux-uclibc"], full)
+        self.assertEqual(bts.TIER3_STD["mipsel-unknown-netbsd"], full)
+        self.assertEqual(bts.TIER3_STD["mipsisa32r6-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["mipsisa32r6el-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["mipsisa64r6-unknown-linux-gnuabi64"], full)
+        self.assertEqual(bts.TIER3_STD["mipsisa64r6el-unknown-linux-gnuabi64"], full)
+        self.assertEqual(bts.TIER3_STD["powerpc-unknown-linux-gnuspe"], full)
+        self.assertEqual(bts.TIER3_STD["riscv32gc-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["riscv32gc-unknown-linux-musl"], full)
+        self.assertEqual(bts.TIER3_STD["riscv64gc-unknown-fuchsia"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-unknown-hermit"], full)
+        self.assertEqual(bts.TIER3_STD["x86_64-uwp-windows-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["aarch64-unknown-trusty"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["aarch64v8r-unknown-none-softfloat"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["armebv7r-none-eabi"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["armebv7r-none-eabihf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["armv5te-none-eabi"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["m68k-unknown-linux-gnu"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["m68k-unknown-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["mips-mti-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["mipsel-mti-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["mipsel-sony-psp"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["mipsel-sony-psx"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["mipsel-unknown-none"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["riscv32em-unknown-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["riscv32emc-unknown-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["s390x-unknown-none-softfloat"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["thumbv4t-none-eabi"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["thumbv5te-none-eabi"],
+                         ("core", "alloc"))
+
     def test_table_entry_set_is_the_union(self):
         self.assertEqual(set(bts.TIER3_STD), {
             "aarch64-unknown-linux-pauthtest",
+            "aarch64-unknown-trusty",
+            "aarch64_be-unknown-linux-gnu",
             "aarch64v8r-unknown-none",
+            "aarch64v8r-unknown-none-softfloat",
             "amdgcn-amd-amdhsa",
+            "armebv7r-none-eabi",
+            "armebv7r-none-eabihf",
+            "armv5te-none-eabi",
+            "armv7k-apple-watchos",
+            "armv7s-apple-ios",
             "avr-none",
             "bpfeb-unknown-none",
             "bpfel-unknown-none",
+            "csky-unknown-linux-gnuabiv2",
             "hexagon-unknown-linux-musl",
+            "i386-apple-ios",
             "i686-apple-darwin",
+            "i686-uwp-windows-gnu",
+            "m68k-unknown-linux-gnu",
+            "m68k-unknown-none-elf",
+            "mips-mti-none-elf",
             "mips-unknown-linux-gnu",
+            "mips-unknown-linux-musl",
+            "mips-unknown-linux-uclibc",
+            "mips64-openwrt-linux-musl",
             "mips64-unknown-linux-gnuabi64",
+            "mips64-unknown-linux-muslabi64",
+            "mips64el-unknown-linux-gnuabi64",
+            "mips64el-unknown-linux-muslabi64",
+            "mipsel-mti-none-elf",
+            "mipsel-sony-psp",
+            "mipsel-sony-psx",
+            "mipsel-unknown-linux-gnu",
+            "mipsel-unknown-linux-musl",
+            "mipsel-unknown-linux-uclibc",
+            "mipsel-unknown-netbsd",
+            "mipsel-unknown-none",
+            "mipsisa32r6-unknown-linux-gnu",
+            "mipsisa32r6el-unknown-linux-gnu",
+            "mipsisa64r6-unknown-linux-gnuabi64",
+            "mipsisa64r6el-unknown-linux-gnuabi64",
             "msp430-none-elf",
+            "powerpc-unknown-linux-gnuspe",
             "powerpc64-ibm-aix",
             "riscv32e-unknown-none-elf",
+            "riscv32em-unknown-none-elf",
+            "riscv32emc-unknown-none-elf",
+            "riscv32gc-unknown-linux-gnu",
+            "riscv32gc-unknown-linux-musl",
+            "riscv64gc-unknown-fuchsia",
+            "s390x-unknown-none-softfloat",
             "sparc-unknown-linux-gnu",
             "sparc-unknown-none-elf",
+            "thumbv4t-none-eabi",
+            "thumbv5te-none-eabi",
             "wasm64-unknown-unknown",
+            "x86_64-unknown-hermit",
+            "x86_64-uwp-windows-gnu",
         })
 
 
@@ -171,3 +277,41 @@ class InstalledCoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkflowCacheTest(unittest.TestCase):
+    """The workflows' tier-3 cache blocks must enumerate exactly
+    the table's triples: a triple missing from a cache path list
+    is rebuilt on every run, and a stale path wastes cache on a
+    triple the build no longer installs. All cache keys must
+    agree, so a table change bumps every block at once."""
+
+    WORKFLOWS = {
+        "flip-diff.yml": 1,
+        "official-measure.yml": 2,
+    }
+
+    def _workflow(self, name):
+        path = (Path(__file__).parent.parent / ".github" /
+                "workflows" / name)
+        return path.read_text()
+
+    def test_cache_paths_match_table(self):
+        import re
+        for name, blocks in self.WORKFLOWS.items():
+            text = self._workflow(name)
+            triples = re.findall(
+                r"/lib/rustlib/(\S+)$", text, re.M)
+            self.assertEqual(set(triples), set(bts.TIER3_STD),
+                             name)
+            self.assertEqual(len(triples),
+                             blocks * len(bts.TIER3_STD), name)
+
+    def test_cache_keys_agree(self):
+        import re
+        keys = set()
+        for name in self.WORKFLOWS:
+            keys.update(re.findall(
+                r"key: (tier3-std-\S+)$", self._workflow(name),
+                re.M))
+        self.assertEqual(len(keys), 1)

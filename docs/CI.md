@@ -635,12 +635,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
   a record that becomes attempted is judged by the existing
   stage-2 rules, and a core-only triple's ceiling is honest:
   a test file that uses std fails at the guest compile on
-  its merits. The table's OS triples (aarch64 pauthtest,
-  sparc/mips/mips64 linux, hexagon musl, powerpc64 AIX,
-  i686 darwin, wasm64) are built with the full
-  `core,std,panic_unwind` set; its remaining triples
-  (aarch64v8r, amdgcn, avr, bpfeb, bpfel, msp430, riscv32e,
-  sparc-none) with `core,alloc`. Two entries
+  its merits. The table's OS triples (the linux
+  gnu/musl/uclibc family across aarch64, csky,
+  mips/mipsel/mips64/mips64el and the mipsisa r6 variants,
+  sparc linux, hexagon musl, powerpc gnuspe and powerpc64
+  AIX, riscv32gc linux, fuchsia, hermit, the Apple
+  ios/watchos/darwin triples, the uwp windows-gnu pair,
+  wasm64) are built with the full `core,std,panic_unwind`
+  set; its remaining triples -- the bare-metal family
+  (aarch64 trusty and both v8r float variants, amdgcn, avr,
+  bpf, msp430, the arm/mips/mipsel/riscv -none targets,
+  s390x none-softfloat, sparc-none) and m68k linux, whose
+  full std fails inside its LLVM backend -- with
+  `core,alloc`. xtensa-esp32-none-elf stays outside the
+  table: its backend cannot build even core. Two entries
   (amdgcn-amd-amdhsa, avr-none) are built for a pinned
   `-C target-cpu` -- gfx900 and atmega328p, the cpus the
   records naming those triples themselves specify --
