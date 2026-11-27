@@ -17,12 +17,32 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'sta
 /// toolchain) panics with the non-string `ExplicitBug` marker
 /// for every validation failure, and reporting that site as a
 /// bare non-string payload leaves the failure bucket opaque
-/// (Issue #395). Any other site keeps the plain non-string
-/// form; the location `panic_reason` appends still identifies
-/// it.
+/// (Issue #395). Two further sites the conversion classifies
+/// by location elsewhere (`convert::captured_panic_is_*`) get
+/// their names here as well, so an escaped panic from either
+/// is readable in the report: the trait solver's overflow in
+/// whole-body normalization after erasing regions
+/// (`rustc_middle/src/ty/normalize_erasing_regions.rs:202`),
+/// and the constant-expression normalization bug site
+/// (`rustc_middle/src/mir/consts.rs:338`). Any other site
+/// keeps the plain non-string form; the location
+/// `panic_reason` appends still identifies it. Every named
+/// form keeps the `(panic with a non-string payload)`
+/// suffix: the conversion's classifiers key on the payload
+/// kind through that suffix
+/// (`convert::message_is_non_string_payload`), so a name
+/// added here must keep it.
 fn non_string_payload_for(file: &str, line: u32) -> String {
     if file.ends_with("rustc_mir_transform/src/validate.rs") && line == 81 {
         "MIR validation failure (panic with a non-string payload)".to_string()
+    } else if file.ends_with("rustc_middle/src/ty/normalize_erasing_regions.rs")
+        && line == 202
+    {
+        "type normalization overflow (panic with a non-string payload)"
+            .to_string()
+    } else if file.ends_with("rustc_middle/src/mir/consts.rs") && line == 338 {
+        "constant-expression normalization failure (panic with a non-string payload)"
+            .to_string()
     } else {
         "panic with a non-string payload".to_string()
     }
@@ -643,6 +663,21 @@ mod tests {
                 82,
             ),
             "panic with a non-string payload"
+        );
+        assert_eq!(
+            non_string_payload_for(
+                "/rustc-dev/0ef1bc386/compiler/rustc_middle/src/ty/\
+                 normalize_erasing_regions.rs",
+                202,
+            ),
+            "type normalization overflow (panic with a non-string payload)"
+        );
+        assert_eq!(
+            non_string_payload_for(
+                "/rustc-dev/0ef1bc386/compiler/rustc_middle/src/mir/consts.rs",
+                338,
+            ),
+            "constant-expression normalization failure (panic with a non-string payload)"
         );
     }
 

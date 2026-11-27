@@ -90,6 +90,16 @@ pub type ExtraStaticSeeds = std::collections::HashMap<String, StaticSeedDef>;
 /// value-shape behaviour.
 pub type StaticTys = std::collections::HashMap<DefId, Ty>;
 
+/// Declared alignments of a program's statics, in bytes, keyed
+/// by the `DefId` of the static item: the alignment the item's
+/// own attributes demand (`#[rustc_align_static(N)]`), which can
+/// exceed the declared type's alignment. Only statics carrying
+/// such an attribute have an entry; every other static's
+/// alignment is its type's. The interpreter prices a static's
+/// synthetic address from the greater of the two, as a native
+/// linker places the storage at the greater alignment.
+pub type StaticAligns = std::collections::HashMap<DefId, u64>;
+
 /// Layout of one monomorphic ADT instance: `(size, align)` in bytes,
 /// as computed by the compiler's own layout query (so `repr(C)`,
 /// `repr(packed)`, `repr(align)` and enum tag placement are already

@@ -67,6 +67,7 @@ pub(crate) fn build_program(
     program.extra_static_seeds = c.extra_static_seeds.clone();
     program.init_constructors = c.init_constructors.clone();
     program.static_tys = c.static_tys.clone();
+    program.static_aligns = c.static_aligns.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
     program.mat_plans = c.mat_plans.clone();

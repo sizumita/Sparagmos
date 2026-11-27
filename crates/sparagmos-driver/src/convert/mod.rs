@@ -297,6 +297,10 @@ pub struct Converter {
     /// handed to the interpreter with the program (see
     /// `sparagmos_mir::StaticTys`).
     pub static_tys_mir: sm::StaticTys,
+    /// Declared alignments of the statics recorded so far
+    /// (`note_static_ty`), for the interpreter (see
+    /// `sparagmos_mir::StaticAligns`).
+    pub static_aligns: sm::StaticAligns,
     /// Definition-location stamps of the `#[track_caller]`
     /// instances registered so far, keyed by the instance's
     /// Sparagmos `DefId` (see `note_track_caller_instance`).

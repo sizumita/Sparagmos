@@ -1813,12 +1813,45 @@ impl<'a> Interpreter<'a> {
         if let Some(p) = self.static_prices.borrow().get(name) {
             return *p;
         }
-        let (size, align) = match self.program().static_tys.get(name) {
+        // A thread-local storage's key names its owning thread
+        // before the static's own name (see `tls_store_key`); the
+        // program's tables are keyed by the static's name alone.
+        let base_name = name
+            .strip_prefix("\u{1}tls\u{1}")
+            .and_then(|rest| rest.split_once('\u{1}').map(|(_, n)| n))
+            .unwrap_or(name);
+        let (size, align) = match self.program().static_tys.get(base_name) {
             Some(ty) => (
                 self.ty_size_full(ty).unwrap_or(0),
                 self.ty_align(ty).unwrap_or(8),
             ),
             None => (0, 8),
+        };
+        // A foreign static whose seed is a whole-static
+        // reference to another static (the in-session
+        // definition its import binds to, see the driver's
+        // `foreign_static_seed`) denotes that definition's
+        // storage: its address is the definition's address,
+        // not a slot of its own.
+        if let Some(Constant::StaticRef {
+            name: other,
+            projection,
+            len: None,
+        }) = self.program().static_seeds.get(base_name)
+        {
+            if other != base_name && projection.is_empty() {
+                return self.static_price(other);
+            }
+        }
+        // The alignment the static's own attributes demand can
+        // exceed its type's (`#[rustc_align_static(N)]`): a
+        // native linker places the storage at the greater
+        // alignment, and a guest that checks the address of such
+        // a static (or of a foreign declaration bound to its
+        // storage) observes exactly that.
+        let align = match self.program().static_aligns.get(base_name) {
+            Some(declared) => align.max(*declared),
+            None => align,
         };
         let price = align_up_u128(self.static_cursor.get(), align);
         self.static_cursor

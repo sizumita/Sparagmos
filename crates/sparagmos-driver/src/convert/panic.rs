@@ -92,6 +92,20 @@ pub fn clear_captured_panic() {
     }
 }
 
+/// Whether a panic record's message part is a non-string
+/// payload: either the plain form, or one of the named forms
+/// the panic hook gives a known site
+/// (`main::panic_guard::non_string_payload_for` renders a
+/// named non-string payload as
+/// `"<name> (panic with a non-string payload)"`). The
+/// classifiers below key on the payload kind through this
+/// predicate, never on one exact rendering, so naming a new
+/// site in the hook cannot silently unclassify its panics.
+fn message_is_non_string_payload(message: &str) -> bool {
+    message == "panic with a non-string payload"
+        || message.ends_with("(panic with a non-string payload)")
+}
+
 /// Whether a panic hook record (the text
 /// [`record_captured_panic`] stores: the payload text plus the
 /// panic location) is the compiler's own bug machinery
@@ -119,7 +133,7 @@ pub fn captured_panic_is_compiler_bug(text: &str) -> bool {
     let Some((message, location)) = text.split_once(" (panicked at ") else {
         return false;
     };
-    if message != "panic with a non-string payload" {
+    if !message_is_non_string_payload(message) {
         return false;
     }
     let Some(compiler) = location.split("/compiler/").nth(1) else {
@@ -154,7 +168,7 @@ pub fn captured_panic_is_const_expr_normalize(text: &str) -> bool {
     let Some((message, location)) = text.split_once(" (panicked at ") else {
         return false;
     };
-    message == "panic with a non-string payload"
+    message_is_non_string_payload(message)
         && location.contains("rustc_middle/src/mir/consts.rs:338:")
 }
 
@@ -869,6 +883,28 @@ mod tests {
             "{DEV}/rustc_middle/src/ty/layout.rs:1411:17"
         ));
         assert!(!captured_panic_is_const_expr_normalize(&other_site));
+    }
+
+    /// The panic hook names the non-string payloads of known
+    /// sites (Issue #395's diagnosability work), so their
+    /// records carry `"<name> (panic with a non-string
+    /// payload)"` as the message part. The classifiers key on
+    /// the payload kind, not the exact rendering, so a named
+    /// record classifies exactly as the plain form did: the
+    /// const-expr site is still the const-expr class and
+    /// still a compiler bug, and the normalization overflow
+    /// keeps its named verdict (not a bug).
+    #[test]
+    fn named_non_string_payloads_keep_their_classification() {
+        let const_expr = format!("constant-expression normalization failure (panic with a non-string payload) (panicked at {DEV}/rustc_middle/src/mir/consts.rs:338:25)");
+        assert!(captured_panic_is_const_expr_normalize(&const_expr));
+        assert!(captured_panic_is_compiler_bug(&const_expr));
+        let overflow = format!("type normalization overflow (panic with a non-string payload) (panicked at {DEV}/rustc_middle/src/ty/normalize_erasing_regions.rs:202:17)");
+        assert!(!captured_panic_is_compiler_bug(&overflow));
+        assert!(captured_panic_is_normalize_overflow(&overflow));
+        let validator = format!("MIR validation failure (panic with a non-string payload) (panicked at {DEV}/rustc_mir_transform/src/validate.rs:81:24)");
+        assert!(!captured_panic_is_compiler_bug(&validator));
+        assert!(captured_panic_is_mir_validator_fail(&validator));
     }
 
     /// The const-expr witness list is append-only and scoped

@@ -1831,6 +1831,7 @@ fn collect() -> ControlFlow<()> {
         extra_static_seeds: conv.extra_static_seeds.clone(),
         init_constructors: conv.init_constructors.clone(),
         static_tys: conv.static_tys_mir.clone(),
+        static_aligns: conv.static_aligns.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
         mat_plans: conv.mat_plans.clone(),

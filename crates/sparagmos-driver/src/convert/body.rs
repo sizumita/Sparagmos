@@ -43,6 +43,7 @@ impl Converter {
             instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
             static_tys_mir: sm::StaticTys::new(),
+            static_aligns: sm::StaticAligns::new(),
             track_caller_defs: HashMap::new(),
             track_caller_decl_pending: Vec::new(),
             fn_abis: HashMap::new(),
@@ -116,6 +117,15 @@ impl Converter {
         let mir_ty = self.ty(&ty);
         self.static_tys_mir.insert(id, mir_ty);
         self.static_tys.insert(id, ty);
+        // The static's own alignment attribute, when it carries
+        // one: the interpreter prices the storage's address from
+        // it (see `sparagmos_mir::StaticAligns`). Asked here,
+        // where every recorded static passes, so statics the
+        // decoders record (foreign-crate and foreign items
+        // included) are covered as well as the scan's.
+        if let Some(align) = static_declared_align(&def.def_id()) {
+            self.static_aligns.insert(id, align);
+        }
     }
 
     /// Record the definition of the thread-local static `item`
