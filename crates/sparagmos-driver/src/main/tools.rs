@@ -394,6 +394,19 @@ impl ToolRegistry {
         spec: &str,
         pin: &(std::path::PathBuf, SourceTree),
     ) -> Option<ToolArtifact> {
+        self.entry_for_spec(spec, pin).map(|(_, a)| a)
+    }
+
+    /// The registry entry a bound `--aux` spec denotes,
+    /// with the output path the entry stands under: the
+    /// path the dependency's build produced its file at,
+    /// which is where a later run of a dependent artifact
+    /// looks for the file (see `missing_dynamic_dependency`).
+    fn entry_for_spec(
+        &self,
+        spec: &str,
+        pin: &(std::path::PathBuf, SourceTree),
+    ) -> Option<(std::path::PathBuf, ToolArtifact)> {
         let name = spec.split('=').next().unwrap_or("");
         self.entries
             .lock()
@@ -401,7 +414,43 @@ impl ToolRegistry {
             .iter()
             .filter(|(_, a)| a.source == pin.0)
             .find(|(_, a)| aux_spec_for(name, a) == spec)
-            .map(|(_, a)| cloned_artifact(a))
+            .map(|(p, a)| (p.clone(), cloned_artifact(a)))
+    }
+
+    /// The recorded dynamic-library dependency of
+    /// `artifact` a native loader would fail to find: the
+    /// first of the artifact's recorded dependencies, in
+    /// the order the loader reaches them (a dependent
+    /// before the libraries it itself needs -- the
+    /// recorded order reversed), whose crate type the
+    /// loader loads at run time (`dylib` / `cdylib`) and
+    /// whose file no longer stands at the path its build
+    /// produced it at. A statically linked dependency (an
+    /// rlib) is not the loader's concern: its code stands
+    /// in the binary itself, and removing its file after
+    /// the build changes nothing a run can observe, so it
+    /// is never reported here. `None` when every recorded
+    /// dynamic dependency still stands.
+    fn missing_dynamic_dependency(
+        &self,
+        artifact: &ToolArtifact,
+    ) -> Option<std::path::PathBuf> {
+        for (spec, pin) in artifact
+            .aux_specs
+            .iter()
+            .zip(artifact.aux_pins.iter())
+            .rev()
+        {
+            let Some((path, dep)) = self.entry_for_spec(spec, pin) else {
+                continue;
+            };
+            if matches!(dep.crate_type.as_deref(), Some("dylib") | Some("cdylib"))
+                && !path.is_file()
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
@@ -1682,6 +1731,12 @@ fn record_shim_verdict(rustc: &str, rest: &[String]) {
 /// subprocess enters once its conversion is done, so the
 /// program itself runs where the recipe invoked it.
 ///
+/// One part of a run does answer to the file system as
+/// it now stands: the dynamic libraries the binary's
+/// link consumed must still stand where their builds
+/// left them, as a native loader requires of the binary
+/// it loads (see `ToolRegistry::missing_dynamic_dependency`).
+///
 /// The lookup path the interpreter's spawn resolution
 /// settled on is read against the directory that
 /// resolution ran in -- this process's own working
@@ -1805,6 +1860,34 @@ pub(crate) fn artifact_run(
         return Err(format!(
             "tool interception: artifact `{program}` is not a binary this run produced"
         ));
+    }
+    // The loader's share of the run: a native binary names
+    // the dynamic libraries its link consumed, and the
+    // loader refuses the execution when one of them no
+    // longer stands where the build left it -- the failure
+    // a recipe observes when it removes a dylib from a
+    // chain and runs the binary again. The recorded
+    // program itself is reconstructed from the registry
+    // regardless of the file system as it now stands (see
+    // the doc comment above), so this is the one part of a
+    // run the file system as it now stands decides; answer
+    // it the way the loader does, as the run's own failure
+    // (the loader's exit code and diagnostic on the
+    // program's stderr), not as an invocation this harness
+    // cannot serve.
+    if let Some(missing) = registry.missing_dynamic_dependency(&artifact) {
+        let lib = missing
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| missing.display().to_string());
+        return Ok(sparagmos_interp::ToolRunOutcome {
+            exit_code: 127,
+            stdout: Vec::new(),
+            stderr: format!(
+                "{program}: error while loading shared libraries: {lib}: cannot open shared object file: No such file or directory\n"
+            )
+            .into_bytes(),
+        });
     }
     // The recorded program's stderr gets its own channel,
     // so nothing of it is filtered or rewritten on its way

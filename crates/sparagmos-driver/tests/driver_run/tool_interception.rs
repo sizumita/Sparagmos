@@ -2039,3 +2039,100 @@ fn run_mode_tool_interception_dep_info_verdict() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "dep-info guest ok\n", "stderr={stderr}");
 }
+
+const DYLIB_EXISTENCE_GUEST_SRC: &str = r##"
+use std::process::Command;
+
+fn build(rustc: &str, name: &str, src: &str) {
+    std::fs::write(format!("{name}.rs"), src).unwrap();
+    let out = Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg(format!("{name}.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build of {name} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // A binary linked against a recorded dylib runs while
+    // the library stands. Once the recipe removes the
+    // library, the run is the loader's failure, as a
+    // native execution reports it: a failure status and a
+    // diagnostic naming the library that is gone.
+    build(
+        &rustc,
+        "chainlib",
+        "#![crate_type = \"dylib\"]\npub fn v() -> u32 { 7 }\n",
+    );
+    build(
+        &rustc,
+        "useslib",
+        "extern crate chainlib; fn main() { println!(\"v={}\", chainlib::v()); }\n",
+    );
+    let out = Command::new(dir.join("useslib")).output().unwrap();
+    assert!(out.status.success(), "first run of useslib failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "v=7\n");
+
+    std::fs::remove_file("libchainlib.so").unwrap();
+    let out = Command::new(dir.join("useslib")).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "run of useslib survived its library's removal"
+    );
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("libchainlib.so"),
+        "loader diagnostic does not name the library: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A statically linked dependency is not the loader's
+    // concern: removing its rlib after the build changes
+    // nothing a run can observe.
+    build(&rustc, "staticlib", "#![crate_type = \"rlib\"]\npub fn w() -> u32 { 9 }\n");
+    build(
+        &rustc,
+        "usesstatic",
+        "extern crate staticlib; fn main() { println!(\"w={}\", staticlib::w()); }\n",
+    );
+    let out = Command::new(dir.join("usesstatic")).output().unwrap();
+    assert!(out.status.success(), "first run of usesstatic failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "w=9\n");
+
+    std::fs::remove_file("libstaticlib.rlib").unwrap();
+    let out = Command::new(dir.join("usesstatic")).output().unwrap();
+    assert!(
+        out.status.success(),
+        "run of usesstatic broke with its rlib removed"
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "w=9\n");
+
+    println!("dylib existence guest ok");
+}
+"##;
+
+#[test]
+fn run_mode_tool_interception_deleted_dylib_fails_the_run() {
+    let dir = temp_dir("tool-dylib-existence");
+    let src = fixture(&dir, "dylib_existence_guest.rs", DYLIB_EXISTENCE_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "dylib existence guest ok\n", "stderr={stderr}");
+}
