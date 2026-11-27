@@ -1148,6 +1148,50 @@ class KnownBugScopeTests(unittest.TestCase):
             self.assertIsNone(run.known_bug_carry_scope(
                 self.rec("tests/ui/codegen/missing.rs"), rust_dir))
 
+    def test_carry_scope_sees_revision_scoped_directives(self):
+        # view(None) alone cannot classify either file: in the
+        # first the known-bug directive is scoped to rev1, in
+        # the second the run mode is scoped as well. The
+        # carry-through aggregates revisions the way
+        # fill_result_revisions does, so it consults every
+        # declared revision's view.
+        with __import__("tempfile").TemporaryDirectory() as td:
+            rust_dir = Path(td)
+            p = rust_dir / "tests" / "ui" / "codegen" / "t.rs"
+            p.parent.mkdir(parents=True)
+            rec = self.rec("tests/ui/codegen/t.rs")
+            p.write_text("//@ revisions: rev1\n"
+                         "//@ run-pass\n"
+                         "//@[rev1] known-bug: #107975\n"
+                         "fn main() {}\n")
+            scope = run.known_bug_carry_scope(rec, rust_dir)
+            self.assertIsNotNone(scope)
+            self.assertEqual(scope[1],
+                             "not attempted (known-bug)")
+            p.write_text("//@ revisions: rev1\n"
+                         "//@[rev1] known-bug: #107975\n"
+                         "//@[rev1] run-pass\n"
+                         "fn main() {}\n")
+            scope = run.known_bug_carry_scope(rec, rust_dir)
+            self.assertIsNotNone(scope)
+            self.assertEqual(scope[1],
+                             "not attempted (known-bug)")
+
+    def test_carry_scope_ignores_undeclared_revisions(self):
+        # A directive scoped to a revision the file does not
+        # declare never applies under compiletest, so it does
+        # not classify the record either.
+        with __import__("tempfile").TemporaryDirectory() as td:
+            rust_dir = Path(td)
+            p = rust_dir / "tests" / "ui" / "codegen" / "t.rs"
+            p.parent.mkdir(parents=True)
+            p.write_text("//@ revisions: rev1\n"
+                         "//@ run-pass\n"
+                         "//@[other] known-bug: #107975\n"
+                         "fn main() {}\n")
+            self.assertIsNone(run.known_bug_carry_scope(
+                self.rec("tests/ui/codegen/t.rs"), rust_dir))
+
     def process_fixture(self, body):
         tmp = Path(self.enterContext(__import__("tempfile")
                                      .TemporaryDirectory()))
@@ -1177,6 +1221,38 @@ class KnownBugScopeTests(unittest.TestCase):
         self.assertEqual(res["bucket"],
                          "not attempted (known-bug)")
         self.assertIn("#107975", res["reason"])
+
+    def test_process_test_multi_file_record_is_classified(self):
+        # The classification says what the verdict is, so it
+        # is recorded before stage 1's multi-file scope
+        # exclusion: a multi-file codegen known-bug record
+        # keeps the known-bug bucket instead of the generic
+        # out-of-scope one.
+        rust_dir, rec = self.process_fixture(
+            "//@ known-bug: #107975\n//@ run-pass\n"
+            "fn main() {}\n")
+        rec["single_file"] = False
+        res = self.run_stubbed(rec, rust_dir)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (known-bug)")
+
+    def test_process_test_revision_view_is_classified_before_screening(self):
+        # Per revision, the classification is consulted before
+        # flag screening (as on the unrevisioned path): rev1's
+        # flags would be screened (--print replaces the
+        # compilation), but its verdict is the known-bug one.
+        rust_dir, rec = self.process_fixture(
+            "//@ revisions: rev1\n"
+            "//@ compile-flags: --print cfg\n"
+            "//@[rev1] known-bug: #107975\n"
+            "//@[rev1] run-pass\n"
+            "fn main() {}\n")
+        res = self.run_stubbed(rec, rust_dir)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (known-bug)")
+        self.assertIn("rev1", res["reason"])
 
     def test_process_test_records_the_bucket_under_jit(self):
         # The classification is consulted on the shared
