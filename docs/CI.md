@@ -231,6 +231,19 @@ denominator. Runs on every push to `main` and on manual dispatch.
   the driver never links): the record is judged by
   conversion completeness, the stage-2 contract that checks
   no stderr annotations for any record.
+- A pretty-suite view is judged by its printed output the
+  same way (issue #548): the conversion runs with the
+  `-Zunpretty=<mode>` argument compiletest supplies and its
+  compiler stdout captured, and a passing exit outcome is
+  refined by compiletest's Pretty verdict -- for a
+  `//@ pp-exact` view the captured output must equal the
+  expected text (the named file, or the test source for a
+  bare `pp-exact`), otherwise the printing must converge
+  (a second printing round over the first round's output
+  reproduces it), and unless the view declares
+  `//@ pretty-compare-only` the printed source must then
+  typecheck under conversion. A capture that was not
+  produced fails the view rather than passing it silently.
 - An executed run's verdict follows compiletest's own for the
   run (runtest/ui.rs): the run's exit must classify as the
   mode requires (run-pass: pass class, exit 0; run-fail:
