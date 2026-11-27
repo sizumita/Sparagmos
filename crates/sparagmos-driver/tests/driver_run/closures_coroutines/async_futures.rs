@@ -255,3 +255,223 @@ fn run_mode_async_drop_box_allocator_state_discriminant() {
         "the run must print the native stdout; stderr={stderr}"
     );
 }
+
+const ASYNC_CLOSURE_UNPOLLED_DROP_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+struct DropMe(i32);
+impl Drop for DropMe {
+    fn drop(&mut self) {
+        println!("{} was dropped", self.0);
+    }
+}
+
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(ctx) {
+            return v;
+        }
+    }
+}
+
+async fn call_once(f: impl AsyncFnOnce()) {
+    println!("before call");
+    let fut = Box::pin(f());
+    println!("after call");
+    drop(fut);
+    println!("future dropped");
+}
+
+fn main() {
+    block_on(async {
+        let d = DropMe(42);
+        let async_closure = async move || {
+            let d = &d;
+            println!("called");
+        };
+
+        call_once(async_closure).await;
+        println!("after");
+    });
+}
+"#;
+
+#[test]
+fn run_mode_unpolled_async_closure_future_drops_capture() {
+    // The future an `async_call_once` creates is dropped without
+    // ever being polled: its captures, moved into the future's
+    // unresumed state, must drop there. The closure body is never
+    // converted, so no projection evidence names the unresumed
+    // state's fields; the drop plan comes from the future type's
+    // own declared state-0 fields (the call arguments followed by
+    // the captures). Mirrors tests/ui/async-await/async-closures/
+    // drop.rs, whose expected stdout this reproduces.
+    let dir = temp_dir("async-closure-unpolled-drop");
+    let src = fixture(&dir, "async_closure_unpolled_drop.rs", ASYNC_CLOSURE_UNPOLLED_DROP_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the run must complete; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before call\nafter call\n42 was dropped\nfuture dropped\nafter\n",
+        "the unpolled future's capture must drop exactly once, in order; stderr={stderr}"
+    );
+}
+
+const ASYNC_CLOSURE_VALUE_DROP_SRC: &str = r#"
+struct DropMe(i32);
+impl Drop for DropMe {
+    fn drop(&mut self) {
+        println!("{} was dropped", self.0);
+    }
+}
+
+fn main() {
+    let d = DropMe(43);
+    let c = async move || {
+        let r = &d;
+        println!("called {}", r.0);
+    };
+    drop(c);
+    println!("closure dropped");
+}
+"#;
+
+#[test]
+fn run_mode_dropped_async_closure_value_drops_capture() {
+    // An explicit `std::mem::drop` of an async closure value: the
+    // value's place type is the unit placeholder (the
+    // coroutine-closure type's kind is unaskable through Stable
+    // MIR), so the drop glue is planned from the body's creation
+    // aggregate, as the `Drop` terminator conversion already does
+    // for a placeholder-typed place.
+    let dir = temp_dir("async-closure-value-drop");
+    let src = fixture(&dir, "async_closure_value_drop.rs", ASYNC_CLOSURE_VALUE_DROP_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the run must complete; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "43 was dropped\nclosure dropped\n",
+        "the dropped closure's capture must drop inside the drop; stderr={stderr}"
+    );
+}
+
+const ASYNC_CLOSURE_POLLED_DROP_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+struct DropMe(i32);
+impl Drop for DropMe {
+    fn drop(&mut self) {
+        println!("{} was dropped", self.0);
+    }
+}
+
+struct PendingOnce {
+    done: bool,
+}
+impl Future for PendingOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        if self.done {
+            Poll::Ready(())
+        } else {
+            self.done = true;
+            Poll::Pending
+        }
+    }
+}
+
+use std::pin::Pin;
+
+async fn call_once_susp(f: impl AsyncFnOnce()) {
+    let mut fut = Box::pin(f());
+    let ctx = &mut Context::from_waker(Waker::noop());
+    match fut.as_mut().poll(ctx) {
+        Poll::Pending => println!("pending"),
+        Poll::Ready(()) => println!("ready"),
+    }
+    drop(fut);
+    println!("future dropped");
+}
+
+async fn call_once_done(f: impl AsyncFnOnce()) {
+    let mut fut = Box::pin(f());
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match fut.as_mut().poll(ctx) {
+            Poll::Pending => println!("pending"),
+            Poll::Ready(()) => break,
+        }
+    }
+    drop(fut);
+    println!("future dropped");
+}
+
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(ctx) {
+            return v;
+        }
+    }
+}
+
+fn main() {
+    println!("before susp");
+    let d = DropMe(47);
+    block_on(call_once_susp(async move || {
+        let r = &d;
+        println!("start {}", r.0);
+        PendingOnce { done: false }.await;
+        println!("resumed {}", r.0);
+    }));
+    println!("after susp");
+    println!("before done");
+    let e = DropMe(48);
+    block_on(call_once_done(async move || {
+        let r = &e;
+        println!("ran {}", r.0);
+    }));
+    println!("after done");
+}
+"#;
+
+#[test]
+fn run_mode_polled_async_closure_future_drops_capture_once() {
+    // The suspended and completed states of an `async_call_once`
+    // future: a suspended future's capture drops when the future
+    // is dropped; a completed future's capture already dropped
+    // inside the final poll and must not drop again. Guards the
+    // unresumed-state planning against double-drops in the states
+    // that were already dropped correctly.
+    let dir = temp_dir("async-closure-polled-drop");
+    let src = fixture(&dir, "async_closure_polled_drop.rs", ASYNC_CLOSURE_POLLED_DROP_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the run must complete; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before susp\nstart 47\npending\n47 was dropped\nfuture dropped\nafter susp\nbefore done\nran 48\n48 was dropped\nfuture dropped\nafter done\n",
+        "each capture must drop exactly once; stderr={stderr}"
+    );
+}

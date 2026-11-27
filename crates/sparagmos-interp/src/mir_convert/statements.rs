@@ -2044,6 +2044,33 @@ impl<'a> Converter<'a> {
         let dropped_ty = self
             .operand_place_ty(body, arg)
             .or_else(|| raw_generic_args.first().cloned());
+        // A coroutine-closure value's place type is the unit
+        // placeholder, whose glue is trivial; the value's own glue
+        // is its captures' glue. When the argument is the bare
+        // local this body's coroutine-closure aggregate created,
+        // plan the drop from the aggregate, exactly as a plain
+        // closure type's glue is planned from its capture tuple -
+        // the same recovery the `Drop` terminator conversion
+        // applies to a placeholder-typed place.
+        let dropped_ty = match &dropped_ty {
+            Some(t) if matches!(t, mir::Ty::Tuple(ts) if ts.is_empty()) => {
+                let local = match arg {
+                    mir::Operand::Copy(place) | mir::Operand::Move(place)
+                        if place.projection.is_empty() =>
+                    {
+                        Some(place.local.index())
+                    }
+                    _ => None,
+                };
+                local
+                    .and_then(|l| coroutine_closure_creation(body, l))
+                    .map(|(def, upvars)| {
+                        mir::Ty::Closure(def, vec![mir::Ty::Tuple(upvars)])
+                    })
+                    .or_else(|| dropped_ty.clone())
+            }
+            _ => dropped_ty,
+        };
         let glue = dropped_ty
             .as_ref()
             .and_then(|t| self.drop_glue(t))

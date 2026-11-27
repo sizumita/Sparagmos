@@ -1307,6 +1307,51 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             }
             plans.push(self.one_variant_fields(def, args, v, false)?);
         }
+        // An async closure's future is a coroutine type carrying
+        // the closure's own generic arguments: the closure kind
+        // first, and the unresumed state's field types - the call
+        // arguments followed by the captures, in the order the
+        // call shim stores them - as the last argument's tuple.
+        // The closure body is never converted (a body mentioning
+        // the coroutine-closure type cannot be converted through
+        // Stable MIR), so for the owning (`async_call_once`)
+        // instantiation no projection evidence names the unresumed
+        // state's fields, and the evidence plan above leaves the
+        // state empty even though the value holds every field.
+        // Plan the unresumed state from the type's own declaration
+        // instead, when the evidence plan drops nothing: a value
+        // in the unresumed state has not run, so every declared
+        // field is still live in it. (For the borrowing
+        // instantiations the declared fields are references, whose
+        // plans are trivial, so this changes nothing there; where
+        // evidence does plan the state, it agrees with the
+        // declaration and stands.)
+        if matches!(plans.first(), Some(P::Trivial)) {
+            if let (Some(mir::Ty::Int(_)), Some(mir::Ty::Tuple(declared))) =
+                (args.first(), args.last())
+            {
+                let declared = declared.clone();
+                let mut field_plans = Vec::with_capacity(declared.len());
+                let mut planned_all = true;
+                for field_ty in &declared {
+                    match self.plan(field_ty) {
+                        Some(plan) => field_plans.push(plan),
+                        None => {
+                            planned_all = false;
+                            break;
+                        }
+                    }
+                }
+                if planned_all
+                    && field_plans.iter().any(|plan| *plan != P::Trivial)
+                {
+                    plans[0] = P::Fields {
+                        fields: field_plans,
+                        complete: true,
+                    };
+                }
+            }
+        }
         // When the driver recorded the instance's storage-slot
         // map, the conversion rewrote the body's state-field
         // projections to bare slot fields, so at run time the
