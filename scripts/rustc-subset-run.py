@@ -6428,6 +6428,15 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     args = []
     if revision is not None:
         args += revision_args(view, revision, all_revisions)
+    elif not view.has("no-auto-check-cfg"):
+        # compiletest appends the auto --check-cfg to every run,
+        # revision or not (compose_and_run_compiler): a run with
+        # no revision has no `--cfg` to add, but the check-cfg
+        # still applies -- it is what activates the session's
+        # unexpected-cfg checking, which check-fail expectations
+        # like cfg/suggest-alternative-name-on-target rest on
+        # (issue #509).
+        args += ["--check-cfg", "cfg(test,FALSE)"]
     aux_libs = []
     if view.has("add-minicore"):
         mc_args, mc_libs, mc_err = minicore_test_args(
