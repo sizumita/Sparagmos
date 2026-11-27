@@ -2993,6 +2993,70 @@ fn run_mode_str_lines_zst_fn_composed() {
         "[\"THREE\", \"FOUR\"]\nsum=3\n",
     );
 }
+
+const STR_LINES_ADAPTER_INNER_SRC: &str = r#"
+fn main() {
+    let out = String::from("{\"a\":1}\n{\"b\":2}\n");
+    for (line, n) in out.lines().zip(1..) {
+        println!("{n}: {line}");
+    }
+    let pairs: Vec<(&str, i32)> = "x\ny".lines().zip(1..).collect();
+    println!("{pairs:?}");
+    for (i, l) in "p\nq".lines().enumerate() {
+        println!("{i}={l}");
+    }
+    for s in ["", "\n", "a\r\nb\r\n", "a\nb", "a\n\nb\n"] {
+        let v: Vec<(&str, usize)> = s.lines().zip(0..).collect();
+        println!("{v:?}");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_str_lines_adapter_inner() {
+    // `Lines` stepped as the inner iterator of an adapter:
+    // `Zip` and `Enumerate` step their inner iterators
+    // through the state-level entry (`next_on_state`), which
+    // had no routing for the one-field wrapper iterators, so
+    // a `Lines` under an adapter hit the unsupported verdict
+    // even though the in-place and back steps already routed
+    // it. The first loop is the run-make recipe shape
+    // (libtest-json zips the lines of captured output with
+    // line numbers); the edge cases pin `Lines` semantics
+    // through the adapter path (empty input yields nothing,
+    // a lone newline yields one empty line, CRLF endings
+    // lose both bytes, a missing trailing newline still
+    // yields the last line, consecutive newlines yield the
+    // empty line between them).
+    run_ok(
+        "str-lines-adapter-inner",
+        STR_LINES_ADAPTER_INNER_SRC,
+        "1: {\"a\":1}\n2: {\"b\":2}\n[(\"x\", 1), (\"y\", 2)]\n0=p\n1=q\n[]\n[(\"\", 0)]\n[(\"a\", 0), (\"b\", 1)]\n[(\"a\", 0), (\"b\", 1)]\n[(\"a\", 0), (\"\", 1), (\"b\", 2)]\n",
+    );
+}
+
+const STR_SPLIT_WHITESPACE_ADAPTER_INNER_SRC: &str = r#"
+fn main() {
+    let sw: Vec<(&str, usize)> = "  a  b\tc ".split_whitespace().zip(0..).collect();
+    println!("{sw:?}");
+    let saw: Vec<(&str, usize)> = "  a  b\tc ".split_ascii_whitespace().zip(0..).collect();
+    println!("{saw:?}");
+}
+"#;
+
+#[test]
+fn run_mode_str_split_whitespace_adapter_inner() {
+    // The sibling one-field wrappers under the same
+    // state-level step: `SplitWhitespace` and
+    // `SplitAsciiWhitespace` zipped with a counter reach
+    // their wrapped `Filter` / `Map` states through the
+    // same `next_on_state` routing as `Lines`.
+    run_ok(
+        "str-split-whitespace-adapter-inner",
+        STR_SPLIT_WHITESPACE_ADAPTER_INNER_SRC,
+        "[(\"a\", 0), (\"b\", 1), (\"c\", 2)]\n[(\"a\", 0), (\"b\", 1), (\"c\", 2)]\n",
+    );
+}
 const CHAR_ESCAPE_SRC: &str = r#"
 fn main() {
     println!("debug-lit={}", 'a'.escape_debug().collect::<String>());

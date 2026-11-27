@@ -3849,6 +3849,23 @@ impl<'a> Interpreter<'a> {
             // serves directly.
             return self.iterator_next_state(frames, self_ty, state.clone());
         }
+        if Self::lines_map_ty(self_ty).is_some()
+            || Self::split_whitespace_filter_ty(self_ty).is_some()
+            || Self::split_ascii_whitespace_map_ty(self_ty).is_some()
+            || Self::slice_split_ascii_whitespace_filter_ty(self_ty).is_some()
+        {
+            // The one-field `str` / slice wrapper iterators'
+            // step is the wrapped adapter's (see `lines_map_ty`
+            // and its siblings); it belongs here because the
+            // adapter arms below step their inner iterators
+            // through this entry (a `Zip` over a `str::Lines`
+            // reaches the wrapper only from here). The
+            // delegation cannot recurse: `iterator_next_state`
+            // serves these types by stepping the field under
+            // the adapter tag, which this function's own arms
+            // serve directly.
+            return self.iterator_next_state(frames, self_ty, state.clone());
+        }
         if is_char_escape_ty(self_ty) {
             // The `char` escape iterators' step lives in
             // `step_escape_inner` (the `EscapeIterInner`
