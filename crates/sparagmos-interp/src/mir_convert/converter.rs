@@ -121,6 +121,15 @@ pub(super) struct Converter<'a> {
     /// takes `&self`; `convert_all` merges each round's table
     /// into the program's (see `ir::Program::static_seeds`).
     pub(super) static_seeds: std::cell::RefCell<HashMap<String, (u8, ir::Constant)>>,
+    /// Payload types of the program's `panic_any` call sites,
+    /// keyed by the call's payload type tag (the first
+    /// generic-argument tag the call records, which is the
+    /// string the raised payload carries as its type). Behind
+    /// a `RefCell` because terminator conversion takes
+    /// `&self`; the glue itself is built in `convert_all`,
+    /// once conversion has settled (see
+    /// `ir::Program::payload_drop_glues`).
+    pub(super) payload_tys: std::cell::RefCell<HashMap<String, mir::Ty>>,
     /// The bodies a body-less extern declaration can bind to,
     /// by link symbol: symbol -> program key, holding only the
     /// symbols exactly one converted body exports (a symbol
@@ -254,6 +263,7 @@ impl<'a> Converter<'a> {
             link_symbols: &program.link_symbols,
             static_tys: &program.static_tys,
             static_seeds: std::cell::RefCell::new(HashMap::new()),
+            payload_tys: std::cell::RefCell::new(HashMap::new()),
             link_exports,
             coverage_by_symbol: program
                 .coverage

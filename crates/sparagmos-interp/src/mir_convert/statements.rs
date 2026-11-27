@@ -2604,6 +2604,25 @@ impl<'a> Converter<'a> {
                         } else {
                             None
                         };
+                        // A `panic_any` call raises its argument
+                        // as the panic's payload: record the
+                        // payload type under the tag the call
+                        // records for it, so `convert_all` can
+                        // build the glue the payload's drop runs
+                        // (see `ir::Program::payload_drop_glues`).
+                        // A payload raised any other way keeps
+                        // the shape-judged drop it has today.
+                        if kind == crate::builtins::Builtin::PanicAny {
+                            if let (Some(tag), Some(ty)) = (
+                                generic_args.first(),
+                                raw_generic_args.first(),
+                            ) {
+                                self.payload_tys
+                                    .borrow_mut()
+                                    .entry(tag.clone())
+                                    .or_insert_with(|| ty.clone());
+                            }
+                        }
                         // The `PartialOrd` / `Ord` comparison
                         // builtins compare values structurally; for
                         // an enum `Self` type that comparison must

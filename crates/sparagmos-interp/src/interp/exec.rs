@@ -90,6 +90,31 @@ impl<'a> Interpreter<'a> {
                 other => break other,
             }
         };
+        // An uncaught panic out of the entry is `lang_start`'s
+        // catch: the catch consumes the panic (a panic the
+        // payload's disposal raises is a fresh one, counted
+        // and reported as its own), and before the report, the
+        // exit handlers or the TLS teardown run, the payload
+        // is disposed of (see `dispose_uncaught_payload`) --
+        // natively that drop precedes all of them, and its
+        // own panic aborts the run in place of the original
+        // panic's exit.
+        let result = match result {
+            Err(InterpError::Panic { message, payload }) => {
+                self.note_panic_consumed();
+                let outcome = match &payload {
+                    Some(payload) => {
+                        self.dispose_uncaught_payload(&mut frames, payload)
+                    }
+                    None => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => Err(InterpError::Panic { message, payload }),
+                    Err(e) => Err(e),
+                }
+            }
+            other => other,
+        };
         // The termination report applies here: after the entry
         // has returned, before its thread's TLS teardown (see
         // [`Interpreter::run_with_report`]).

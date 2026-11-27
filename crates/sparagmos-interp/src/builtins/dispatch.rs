@@ -6087,11 +6087,16 @@ impl<'a> Interpreter<'a> {
                             "std::any::Any".to_string(),
                             "std::marker::Send".to_string(),
                         ],
-                        // Fabricated by the interpreter, not formed
-                        // by an unsizing cast: no accounted glue
-                        // travels with it, and its drop is judged
-                        // by shape (see `DropPlan::Dyn`).
-                        drop_glue: None,
+                        // Fabricated by the interpreter, not
+                        // formed by an unsizing cast: the glue
+                        // it carries is the payload type's own,
+                        // from the program's payload table (see
+                        // `ir::Program::payload_drop_glues`); a
+                        // payload type with no entry keeps the
+                        // shape-judged drop (see `DropPlan::Dyn`).
+                        drop_glue: self
+                            .payload_drop_glue(&payload.ty)
+                            .map(Box::new),
                     }),
                     other => Err(InterpError::type_mismatch(
                         format!("builtin {name}"),

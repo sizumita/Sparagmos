@@ -2545,6 +2545,18 @@ pub struct Program {
     /// header word stored ahead of a thin pointer's pointee --
     /// resolves to a `DynRef` through this table.
     pub vtable_identities: std::collections::HashMap<u64, VTableIdentity>,
+    /// Drop glue of the types a panic payload can carry, keyed
+    /// by the type tag a `panic_any` call records for its
+    /// payload (the call's first generic-argument tag, the same
+    /// string the payload itself carries as its type). Built at
+    /// conversion from the payload types of the program's
+    /// `panic_any` call sites whose glue can be accounted for;
+    /// a payload type with no entry keeps the shape-judged drop
+    /// an interpreter-fabricated payload box has always had.
+    /// The interpreter runs an entry's glue when a caught
+    /// payload's box is dropped and when `lang_start` disposes
+    /// of an uncaught `main` panic's payload.
+    pub payload_drop_glues: Vec<(String, DropGlue)>,
     /// Per-variant field byte layouts of the program's
     /// monomorphic ADT instances, keyed like `adt_layouts`, as
     /// recorded by the driver (see
