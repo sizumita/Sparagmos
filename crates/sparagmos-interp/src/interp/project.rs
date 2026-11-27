@@ -42,6 +42,33 @@ impl<'a> Interpreter<'a> {
         let mut cur_ty = root_ty;
         let mut i = 0;
         while i < projection.len() {
+            // A captured `Formatter`'s options field (field 0),
+            // synthesized from the capture's state: the segment
+            // projectors are type-free and have no capture in
+            // reach, so the step is applied here, where the
+            // interpreter's formatter table is. The synthesized
+            // value is the `FormattingOptions` struct in the
+            // model's ADT shape: flags, width, precision, in
+            // core's field order. A finished capture leaves the
+            // step to the segment path, which keeps its error.
+            if let (Value::Formatter(id), RefProj::Field(0)) =
+                (&value, &projection[i])
+            {
+                if let Some(capture) = self.formatter_snapshot(*id) {
+                    value = Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Uint(capture.flags as u128),
+                            Value::Uint(capture.width as u128),
+                            Value::Uint(capture.precision as u128),
+                        ],
+                    };
+                    cur_ty =
+                        stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, 0);
+                    i += 1;
+                    continue;
+                }
+            }
             if let RefProj::UnionField { idx, table } = projection[i] {
                 value = self.union_field_read(value, idx, table, func, place)?;
                 cur_ty = stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, idx);
@@ -98,6 +125,29 @@ impl<'a> Interpreter<'a> {
         let mut cur_ty = root_ty;
         let mut i = 0;
         while i < projection.len() {
+            // A captured `Formatter`'s options field, as in
+            // `project_value_t`: the synthesized
+            // `FormattingOptions` value is staged as an owned
+            // intermediate and the walk continues into it.
+            if let (Value::Formatter(id), RefProj::Field(0)) =
+                (cur, &projection[i])
+            {
+                if let Some(capture) = self.formatter_snapshot(*id) {
+                    stage = Some(Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Uint(capture.flags as u128),
+                            Value::Uint(capture.width as u128),
+                            Value::Uint(capture.precision as u128),
+                        ],
+                    });
+                    cur = stage.as_ref().expect("staged options value");
+                    cur_ty =
+                        stepped_field_ty(Some(self.program()), cur_ty.as_ref(), 0, 0);
+                    i += 1;
+                    continue;
+                }
+            }
             if let RefProj::UnionField { idx, table } = projection[i] {
                 let next = self.union_field_read(cur.clone(), idx, table, func, place)?;
                 stage = Some(next);
@@ -2433,6 +2483,32 @@ pub(crate) fn project_value_ev(
                         .cloned()
                         .unwrap_or(Value::Uninit)
                 }
+                // A captured `core::fmt::Formatter` (see
+                // `Value::Formatter`): the model holds no storage
+                // for the struct, but a converted body that
+                // inlined a `Formatter` method (core's
+                // `write_fmt`, inlined at opt-level 2, is the
+                // shape the coverage suite reaches) walks its
+                // fields directly. Field 1 is the
+                // `buf: &mut dyn Write`: the capture itself is
+                // the sink in this model, so the step yields the
+                // trait object over the capture, whose `Write`
+                // dispatch the dyn fmt-write model in `call`
+                // serves. Field 0 (the `FormattingOptions`) is
+                // synthesized by the interpreter's typed
+                // projectors from the capture's state; the
+                // type-free projector has no capture in reach
+                // and keeps the mismatch for it.
+                Value::Formatter(id) if *idx == 1 => Value::DynRef {
+                    base: Box::new(Value::Ref(RefTarget::value(
+                        Value::Formatter(id),
+                    ))),
+                    concrete: "core::fmt::Formatter".to_string(),
+                    traits: vec!["std::fmt::Write".to_string()],
+                    drop_glue: None,
+                    type_id: None,
+                    vtable_methods: Vec::new(),
+                },
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
@@ -3858,6 +3934,25 @@ pub(crate) fn project_value_ref_ev<'a>(
                         if *idx == 0 =>
                     {
                         cur
+                    }
+                    Value::Formatter(_) => {
+                        // The captured `Formatter`'s synthesized
+                        // `buf` field, as in `project_value`: the
+                        // projection materializes the trait object
+                        // as an owned value and any remaining steps
+                        // project into it.
+                        let owned = project_value(
+                            cur.clone(),
+                            std::slice::from_ref(step),
+                            func,
+                            place,
+                        )?;
+                        if tail.is_empty() {
+                            return Ok(Cow::Owned(owned));
+                        }
+                        return Ok(Cow::Owned(
+                            project_value_ref(&owned, tail, func, place)?.into_owned(),
+                        ));
                     }
                     Value::FmtArguments(_) => {
                         // The modelled `fmt::Arguments` fields are

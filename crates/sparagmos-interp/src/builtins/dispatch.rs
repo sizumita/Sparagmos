@@ -977,14 +977,27 @@ impl<'a> Interpreter<'a> {
                         dyn_value.kind_name(),
                     ));
                 };
-                let Some(impl_name) = self.scan_virtual_impl(
+                // A `Formatter`'s own `buf` trait object (the
+                // trait object the `Formatter` field projection
+                // in `project` synthesizes): the capture itself
+                // is the sink in this model, so the pieces are
+                // delivered straight into it below, as
+                // `Formatter::write_str` forwards them to its
+                // `buf` -- there is no collected `write_str`
+                // impl to call, and none is needed.
+                let formatter_sink = self.formatter_id_of(frames, &base).ok();
+                let impl_name = match self.scan_virtual_impl(
                     &concrete,
                     "core::fmt::Write",
                     "write_str",
-                ) else {
-                    return Err(unsupported(format!(
-                        "fmt::write output type {concrete} has no collected write_str impl"
-                    )));
+                ) {
+                    Some(name) => name,
+                    None if formatter_sink.is_some() => String::new(),
+                    None => {
+                        return Err(unsupported(format!(
+                            "fmt::write output type {concrete} has no collected write_str impl"
+                        )));
+                    }
                 };
                 let receiver = match &*base {
                     Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
@@ -999,6 +1012,10 @@ impl<'a> Interpreter<'a> {
                 let coerced = self.coerce_arguments(frames, &vals[1], name)?;
                 let (parts, failure) = self.format_arguments_parts(frames, &coerced, 0);
                 for part in parts {
+                    if let Some(id) = formatter_sink {
+                        self.formatter_push(id, &part);
+                        continue;
+                    }
                     let wrote = self.call_sync(
                         frames,
                         &impl_name,
