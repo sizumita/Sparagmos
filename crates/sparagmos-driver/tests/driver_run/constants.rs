@@ -3371,3 +3371,54 @@ fn run_mode_const_extracted_bool_char_ref_fmt() {
         "true\ntrue\nz\n'z'\n",
     );
 }
+
+// ----- stored pointers to scalar statics (address identity stage 3) ---------
+
+const SELF_POINTER_STATIC_SRC: &str = r#"
+static mut S: *const u8 = unsafe { &S as *const *const u8 as *const u8 };
+fn main() {
+    unsafe {
+        assert_eq!(S, *(S as *const *const u8));
+        println!("ok");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_self_pointer_static_identity() {
+    // A static whose initializer is a pointer back to itself:
+    // the seed decode must keep the stored pointer's identity
+    // (a reference to the static's own storage), so the pointer
+    // read back out of the storage compares equal to the
+    // pointer the storage holds. A byte snapshot of the seed
+    // loses the provenance -- the address slot's bytes are zero
+    // without it -- and the equality stops as a form mismatch.
+    run_ok("self-pointer-static", SELF_POINTER_STATIC_SRC, "ok\n");
+}
+
+const SCALAR_STATIC_BYTE_POINTER_SRC: &str = r#"
+static N: u32 = 7;
+static mut P: *const u8 = &N as *const u32 as *const u8;
+fn main() {
+    unsafe {
+        assert_eq!(P, &N as *const u32 as *const u8);
+        assert_eq!(*P, 7);
+        println!("ok");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_scalar_static_byte_pointer_identity() {
+    // A byte pointer to a scalar static, stored in another
+    // static's initializer: the stored pointer denotes the
+    // scalar static's storage base even though its pointee type
+    // is not the static's declared type, so it prices and reads
+    // as that storage (the byte read observes the stored value's
+    // first byte, not a zeroed snapshot word).
+    run_ok(
+        "scalar-static-byte-pointer",
+        SCALAR_STATIC_BYTE_POINTER_SRC,
+        "ok\n",
+    );
+}
