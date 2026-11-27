@@ -502,6 +502,57 @@ fn run_mode_pathbuf_construction_and_mutation() {
     );
 }
 
+const PATHBUF_FROM_JOIN_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+fn main() {
+    // A `String` a converted body built -- slice `join` and
+    // `concat` go through `join_generic_copy` -- is the real
+    // aggregate form, its buffer elements in the `MaybeUninit`
+    // union form; the generic `From` conversions read it
+    // through the string readers like every other string
+    // consumer.
+    let p = PathBuf::from(["a", "b"].join("/"));
+    println!("{}|{:?}|{}", p.display(), p, p.as_os_str().len());
+    let p1 = PathBuf::from(["a/b"].join("/"));
+    println!("{}", p1.display());
+    let empty: Vec<&str> = Vec::new();
+    let pe = PathBuf::from(empty.join("/"));
+    println!("[{}]", pe.display());
+    let pc = PathBuf::from(["foo", "bar"].concat());
+    println!("{}", pc.display());
+    let pi: PathBuf = ["a", "b"].join("/").into();
+    println!("{}", pi.display());
+    let o = OsString::from(["foo", "bar", "baz"].join("/"));
+    println!("{}|{}", o.to_string_lossy(), o.len());
+    let om = OsString::from(["\u{3b1}", "\u{3b2}"].concat());
+    println!("{}|{}", om.to_string_lossy(), om.len());
+    // The modelled form keeps working.
+    let pm = PathBuf::from(String::from("a/b"));
+    println!("{}", pm.display());
+    println!("from-join-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_and_osstring_from_join_built_string() {
+    let dir = temp_dir("pathbuf-from-join");
+    let src = fixture(&dir, "pathbuf_from_join.rs", PATHBUF_FROM_JOIN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "PathBuf/OsString from a join-built String run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/b|\"a/b\"|3\na/b\n[]\nfoobar\na/b\nfoo/bar/baz|11\n\u{3b1}\u{3b2}|4\na/b\nfrom-join-ok\n",
+        "From<String> over the real aggregate form matches native"
+    );
+}
+
 // ---- Lane JL: one io::Error representation (issue #173) ----
 // Every io::Error producer (the fs layer, the process model,
 // From<ErrorKind>) builds the bitpacked `Repr` layout std's own

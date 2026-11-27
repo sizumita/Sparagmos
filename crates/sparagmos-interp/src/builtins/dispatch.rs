@@ -4284,25 +4284,21 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if target == "std::path::PathBuf" && source == "std::string::String" {
                     // `PathBuf: From<String>` moves the string's
-                    // bytes into the path.
-                    match &value {
-                        Value::Str(s) => Ok(pathbuf_value(s.as_bytes())),
-                        other => Err(InterpError::type_mismatch(
-                            "From::from to PathBuf",
-                            "string value",
-                            other.kind_name(),
-                        )),
-                    }
+                    // bytes into the path. The string arrives in
+                    // whichever form its producer built -- the
+                    // string value itself, or the real aggregate
+                    // a converted body hands back (`slice::join`
+                    // and `concat` build one through
+                    // `join_generic_copy`, its buffer elements in
+                    // the `MaybeUninit` union form) -- so the
+                    // bytes are read through the string readers,
+                    // as at every other string consumer.
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(pathbuf_value(text.as_bytes()))
                 } else if target == "std::ffi::OsString" && source == "std::string::String" {
                     // `OsString: From<String>` likewise.
-                    match &value {
-                        Value::Str(s) => Ok(os_string_value(s.as_bytes())),
-                        other => Err(InterpError::type_mismatch(
-                            "From::from to OsString",
-                            "string value",
-                            other.kind_name(),
-                        )),
-                    }
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(os_string_value(text.as_bytes()))
                 } else if target == "std::ffi::OsString"
                     && (source == "&std::ffi::OsStr" || source == "std::ffi::OsStr")
                 {
@@ -4316,6 +4312,27 @@ impl<'a> Interpreter<'a> {
                     // `PathBuf: From<&Path>` clones the path.
                     let bytes = self.path_bytes(frames, &value)?;
                     Ok(pathbuf_value(&bytes))
+                } else if target.starts_with("std::vec::Vec<")
+                    && generic_first_arg(target, "std::vec::Vec<") == Some("u8")
+                    && source == "std::string::String"
+                {
+                    // `Vec<u8>: From<String>` is
+                    // `String::into_bytes` by definition: the
+                    // string's bytes as the vector's element
+                    // form, read through the string readers like
+                    // the `into_bytes` model itself (the string
+                    // may arrive in the real aggregate form a
+                    // converted body built, as in the `PathBuf`
+                    // arm above).
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: text
+                            .into_bytes()
+                            .into_iter()
+                            .map(|b| Value::Uint(b as u128))
+                            .collect(),
+                    })
                 } else if target.starts_with("std::vec::Vec<") {
                     // `Vec::from([T; N])`: the array's elements become
                     // the vector's.
