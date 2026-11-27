@@ -5599,3 +5599,99 @@ fn run_mode_smart_pointer_str_vec_sort() {
         "rc=[\"banana\", \"pear\"]\narc=[\"banana\", \"pear\"]\n",
     );
 }
+
+const BOXED_STR_SORT_MIXED_SRC: &str = r#"
+fn main() {
+    // Sorts of three or more `Box<str>` elements: the
+    // sort's rotations hand the comparison the mixed
+    // presentation -- one side the stored box aggregate,
+    // the other the bare `str` snapshot a temporary holds
+    // -- which the box-pointee comparison machinery
+    // decides through the pointees.
+    let mut v: Vec<Box<str>> = vec!["ape".into(), "bee".into(), "cat".into()];
+    v.sort();
+    println!("p1={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["ape".into(), "cat".into(), "bee".into()];
+    v.sort();
+    println!("p2={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["bee".into(), "ape".into(), "cat".into()];
+    v.sort();
+    println!("p3={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["bee".into(), "cat".into(), "ape".into()];
+    v.sort();
+    println!("p4={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["cat".into(), "ape".into(), "bee".into()];
+    v.sort();
+    println!("p5={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["cat".into(), "bee".into(), "ape".into()];
+    v.sort();
+    println!("p6={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into(), "fig".into()];
+    v.sort();
+    println!("five={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["kiwi".into(), "kiwi".into(), "apple".into(), "kiwi".into(), "apple".into()];
+    v.sort();
+    println!("dup={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "banana".into(), "kiwi".into(), "apple".into(), "plum".into(), "fig".into()];
+    v.sort_unstable();
+    println!("unstable={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["one".into(), "two".into(), "three".into(), "four".into(), "five".into(), "six".into(), "seven".into(), "eight".into()];
+    v.sort_unstable();
+    println!("unstable8={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.sort_by(|a, b| a.cmp(b));
+    println!("by-cmp={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.sort_by(|a, b| b.cmp(a));
+    println!("by-rev={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["ccc".into(), "a".into(), "bb".into(), "dddd".into(), "e".into()];
+    v.sort_by_key(|s| s.len());
+    println!("by-len={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_sort_mixed_pairs() {
+    run_ok(
+        "boxed-str-vec-sort-mixed-pairs",
+        BOXED_STR_SORT_MIXED_SRC,
+        "p1=[\"ape\", \"bee\", \"cat\"]\np2=[\"ape\", \"bee\", \"cat\"]\np3=[\"ape\", \"bee\", \"cat\"]\np4=[\"ape\", \"bee\", \"cat\"]\np5=[\"ape\", \"bee\", \"cat\"]\np6=[\"ape\", \"bee\", \"cat\"]\nfive=[\"apple\", \"fig\", \"kiwi\", \"pear\", \"plum\"]\ndup=[\"apple\", \"apple\", \"kiwi\", \"kiwi\", \"kiwi\"]\nunstable=[\"apple\", \"banana\", \"fig\", \"kiwi\", \"pear\", \"plum\"]\nunstable8=[\"eight\", \"five\", \"four\", \"one\", \"seven\", \"six\", \"three\", \"two\"]\nby-cmp=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nby-rev=[\"plum\", \"pear\", \"kiwi\", \"apple\"]\nby-len=[\"a\", \"e\", \"bb\", \"ccc\", \"dddd\"]\n",
+    );
+}
+
+const BOXED_STR_SORT_AFTER_MOVEMENT_SRC: &str = r#"
+fn main() {
+    // Sorts fed by movement shapes whose elements no
+    // comparison has touched yet, and whole-vector
+    // comparisons of the sorted results: the elements
+    // arrive at the sort in the forms reversal and
+    // rotation left them in.
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.reverse();
+    println!("rev={:?}", v);
+    v.sort();
+    println!("rev-sorted={:?}", v);
+    let mut w: Vec<Box<str>> = vec!["dog".into(), "ape".into(), "cat".into(), "bee".into()];
+    w.rotate_left(1);
+    println!("rotl={:?}", w);
+    w.sort();
+    println!("rotl-sorted={:?}", w);
+    let mut x: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into(), "fig".into()];
+    let mut y: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into(), "fig".into()];
+    x.sort();
+    y.sort();
+    println!("eq={} pcmp={:?} slice-eq={}", x == y, x.partial_cmp(&y), x.as_slice() == y.as_slice());
+    let a: Box<str> = "same".into();
+    let b: Box<str> = "same".into();
+    println!("box-eq={} box-lt={}", a == b, a < b);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_sort_after_movement() {
+    run_ok(
+        "boxed-str-vec-sort-after-movement",
+        BOXED_STR_SORT_AFTER_MOVEMENT_SRC,
+        "rev=[\"plum\", \"apple\", \"kiwi\", \"pear\"]\nrev-sorted=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nrotl=[\"ape\", \"cat\", \"bee\", \"dog\"]\nrotl-sorted=[\"ape\", \"bee\", \"cat\", \"dog\"]\neq=true pcmp=Some(Equal) slice-eq=true\nbox-eq=true box-lt=false\n",
+    );
+}
