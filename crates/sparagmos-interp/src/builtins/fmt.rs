@@ -2604,6 +2604,27 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A byte-form scalar: a scalar read out of byte-form
+        // storage (a constant allocation's pointee, above all)
+        // reaches formatting as the allocation's bytes from the
+        // scalar on, while the tag still names the scalar type.
+        // The scalar those bytes denote is the value formatting
+        // runs on -- the reading the equality, ordering and
+        // `SwitchInt` points make of the same form -- so
+        // denominate it here, where every trait route below
+        // sees the scalar (and every recursive subvalue, which
+        // re-enters this function, inherits the reading). A
+        // byte string whose tag names no scalar (a slice, an
+        // array, a byte-string wrapper type) keeps the byte
+        // form the routes below serve.
+        let denominated;
+        let value = match denominate_bytes_scalar(value, pointee_tag(ty)) {
+            Some(scalar) => {
+                denominated = scalar;
+                &denominated
+            }
+            None => value,
+        };
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(
@@ -4709,6 +4730,46 @@ fn byte_seq_items(bytes: &[u8], elem: &str) -> Vec<Value> {
         bytes.iter().map(|b| Value::Int(*b as i8 as i128)).collect()
     } else {
         bytes.iter().map(|b| Value::Uint(*b as u128)).collect()
+    }
+}
+
+/// The scalar a byte-form value denotes under a scalar type
+/// tag, if the tag names one: the string's leading bytes read
+/// at the tag's width -- unsigned for the unsigned types and
+/// for `char` (whose renderers read the code point off the
+/// unsigned form), sign-extended for the signed types, a
+/// truth value for `bool`. The string is the scalar's own
+/// storage or an allocation snapshot that starts at the
+/// scalar, so the scalar's bytes lead it in both shapes. A
+/// string shorter than the width denotes no scalar and
+/// answers `None`, as does a tag naming no scalar type.
+fn denominate_bytes_scalar(value: &Value, tag: &str) -> Option<Value> {
+    let Value::Bytes(_) = value else {
+        return None;
+    };
+    let (width, signed) = match tag {
+        "u8" => (1, false),
+        "u16" => (2, false),
+        "u32" => (4, false),
+        "u64" | "usize" => (8, false),
+        "u128" => (16, false),
+        "i8" => (1, true),
+        "i16" => (2, true),
+        "i32" => (4, true),
+        "i64" | "isize" => (8, true),
+        "i128" => (16, true),
+        "bool" => {
+            return value
+                .bytes_prefix_as_uint(1)
+                .map(|b| Value::Bool(b != 0))
+        }
+        "char" => return value.bytes_prefix_as_uint(4).map(Value::Uint),
+        _ => return None,
+    };
+    if signed {
+        value.bytes_prefix_as_int(width).map(Value::Int)
+    } else {
+        value.bytes_prefix_as_uint(width).map(Value::Uint)
     }
 }
 
