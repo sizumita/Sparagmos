@@ -172,7 +172,8 @@ use rustc_public::ItemKind;
 use sparagmos_driver::convert::{
     args_mention_params, clear_captured_panic, closure_kind, coroutine_closure_args,
     peek_captured_panic, record_captured_panic, stable_mir_panic_reason,
-    take_captured_panic, Converter, CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON,
+    take_captured_panic, take_compiler_crash, Converter, CONST_EXPR_REASON,
+    COROUTINE_CLOSURE_TYPE_REASON,
     INSTANCE_CONST_REASON, TAIL_CALL_REASON, UNSAFE_BINDER_REASON,
 };
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
@@ -1274,6 +1275,14 @@ fn driver_main_inner() {
     let collected = take();
     match (result, collected) {
         (Ok(()), Some(c)) => {
+            // A compiler crash a verdict authority
+            // established during collection (see
+            // `convert::note_compiler_crash`) pre-empts the
+            // compilation-failure report below: the
+            // compilation died on the compiler's own bug.
+            if let Some(crash) = take_compiler_crash() {
+                report_escaped_panic(&crash, exec_mode, mode);
+            }
             if let Some(e) = &c.compile_error {
                 eprintln!("sparagmos-driver: compilation failed: {e}");
                 // Same contract as a front-end failure: exit 1 in

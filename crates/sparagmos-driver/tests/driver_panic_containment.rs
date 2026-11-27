@@ -1,7 +1,14 @@
 //! Panic containment and speculative-query discipline: the
 //! driver must never panic (exit 101) on guest input, and a
 //! speculative compiler query that the reference compilation
-//! never poses must not fail a program rustc accepts.
+//! never poses must not fail a program rustc accepts. The
+//! boundary has a second side: when the compiler's own bug
+//! machinery fires inside work the verdict itself decides —
+//! materializing or forcing a body the collector collects —
+//! containment must not downgrade it to a clean failure
+//! either; the verdict is the compiler crash (exit 101) the
+//! reference compilation reports. The fixtures at the end of
+//! this file pin both sides of that boundary (Issue #509).
 //!
 //! The fixtures are the shapes of the compile-check records of
 //! Issue #510: screens asking a still-generic instance for its
@@ -363,4 +370,267 @@ fn aux_revision_cfg_reaches_aux_build() {
         stderr.contains("cannot find function `f`"),
         "expected an E0425 for the configured-out item, got: {stderr}"
     );
+}
+
+/// The shape of tests/crashes/121575.rs: materializing the
+/// body of the recursive `PrimRec` instance makes the
+/// compiler's own session raise its pinned ICE (normalizing
+/// a `ConstKind::Expr` is unimplemented in the compiler).
+/// The same run first contains an unrelated compiler panic
+/// from a speculative layout probe (the `std::fmt::Write`
+/// dummy-binder panic); the crash verdict must name the
+/// pinned ICE, not the probe panic, and must not be
+/// downgraded to the materialization-diagnostics failure
+/// the run used to end with.
+const CRASH_MATERIALIZE_RS: &str = r##"
+#![feature(generic_const_exprs)]
+
+use std::array;
+
+trait PrimRec<const N: usize, const O: usize> {
+    fn eval(&self, x: [usize; N]) -> [usize; O];
+}
+
+struct Zero;
+
+impl<const N: usize> PrimRec<N, 1> for Zero {
+    fn eval(&self, _: [usize; N]) -> [usize; 1] {
+        [0]
+    }
+}
+
+struct Const(usize);
+
+impl<const N: usize> PrimRec<N, 1> for Const {
+    fn eval(&self, _: [usize; N]) -> [usize; 1] {
+        [self.0]
+    }
+}
+
+struct S;
+
+impl PrimRec<1, 1> for S {
+    fn eval(&self, x: [usize; 1]) -> [usize; 1] {
+        [x[0] + 1]
+    }
+}
+
+struct Proj<const I: usize>;
+
+impl<const N: usize, const I: usize> PrimRec<N, 1> for Proj<I> {
+    fn eval(&self, x: [usize; N]) -> [usize; 1] {
+        [x[I]]
+    }
+}
+
+struct Merge<const N: usize, const O1: usize, const O2: usize, A: PrimRec<N, O1>, B: PrimRec<N, O2>>(
+    A,
+    B,
+);
+
+fn concat<const M: usize, const N: usize>(a: [usize; M], b: [usize; N]) -> [usize; M + N] {
+    array::from_fn(|i| if i < M { a[i] } else { b[i - M] })
+}
+
+impl<const N: usize, const O1: usize, const O2: usize, A: PrimRec<N, O1>, B: PrimRec<N, O2>>
+    PrimRec<N, { O1 + O2 }> for Merge<N, O1, O2, A, B>
+{
+    fn eval(&self, x: [usize; N]) -> [usize; O1 + O2] {
+        concat(self.0.eval(x), self.1.eval(x))
+    }
+}
+
+struct Compose<const N: usize, const I: usize, const O: usize, A: PrimRec<N, I>, B: PrimRec<I, O>>(
+    A,
+    B,
+);
+
+impl<const N: usize, const I: usize, const O: usize, A: PrimRec<N, I>, B: PrimRec<I, O>>
+    PrimRec<N, O> for Compose<N, I, O, A, B>
+{
+    fn eval(&self, x: [usize; N]) -> [usize; O] {
+        self.1.eval(self.0.eval(x))
+    }
+}
+
+struct Rec<const N: usize, const O: usize, Base: PrimRec<N, O>, F: PrimRec<{ O + (N + 1) }, O>>(
+    Base,
+    F,
+);
+
+fn tail<const N: usize>(x: [usize; N + 1]) -> [usize; N] {
+    array::from_fn(|i| x[i + 1])
+}
+
+fn cons<const N: usize>(x: usize, xs: [usize; N]) -> [usize; N + 1] {
+    array::from_fn(|i| if i == 0 { x } else { xs[i - 1] })
+}
+
+impl<const N: usize, const O: usize, Base: PrimRec<N, O>, F: PrimRec<{ O + (N + 1) }, O>>
+    PrimRec<{ N + 1 }, O> for Rec<N, O, Base, F>
+{
+    fn eval(&self, x: [usize; N + 1]) -> [usize; O] {
+        match (x[0], tail(x)) {
+            (0, x) => self.0.eval(x),
+            (y, x) => {
+                let xy = cons(y - 1, x);
+                let input = concat(self.eval(xy), xy);
+                self.1.eval(input)
+            }
+        }
+    }
+}
+
+fn main() {
+    let one = Compose(Zero, S);
+    dbg!(one.eval([]));
+    let add: Rec<1, 1, Proj<0>, Compose<3, 1, 1, Proj<0>, S>> =
+        Rec(Proj::<0>, Compose(Proj::<0>, S));
+    dbg!(add.eval([3, 2]));
+}
+"##;
+
+#[test]
+fn compiler_bug_in_collected_materialization_is_a_crash() {
+    let (code, _stdout, stderr) = convert("crash_materialize", CRASH_MATERIALIZE_RS, &[], &[]);
+    assert_eq!(code, Some(101), "stderr: {stderr}");
+    assert!(
+        stderr.contains("mir/consts.rs:338"),
+        "the crash report must name the pinned ICE: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ty/predicate.rs"),
+        "the earlier probe panic must not be the reported crash: {stderr}"
+    );
+}
+
+/// The shape of tests/crashes/138008.rs: the verdict's
+/// per-instance force asks the compiler for the root
+/// function's ABI, whose layout query raises the compiler's
+/// pinned ICE for the `repr(simd)` type. The force is the
+/// collector's own, so the verdict is a crash, not the bare
+/// compilation failure the run used to end with.
+const CRASH_FN_ABI_RS: &str = r##"
+#![feature(repr_simd)]
+const C: usize = 16;
+
+#[repr(simd)]
+pub struct Foo([u8; C]);
+pub unsafe fn foo(a: Foo) {}
+"##;
+
+#[test]
+fn compiler_bug_in_collector_fn_abi_force_is_a_crash() {
+    let (code, _stdout, stderr) = convert(
+        "crash_fn_abi",
+        CRASH_FN_ABI_RS,
+        &["--crate-type=lib", "-Copt-level=0"],
+        &[],
+    );
+    assert_eq!(code, Some(101), "stderr: {stderr}");
+    assert!(
+        stderr.contains("ty/layout.rs:1411"),
+        "the crash report must name the pinned ICE: {stderr}"
+    );
+}
+
+/// The shape of tests/crashes/139120.rs: the verdict's walk
+/// mentions an unsize cast to `&dyn FooFn`, and resolving
+/// the vtable's instance for the function-pointer impl
+/// raises the compiler's pinned ICE. The vtable allocation
+/// is a force of the walk itself, so the verdict is a
+/// crash, not the bare compilation failure the run used to
+/// end with.
+const CRASH_VTABLE_RS: &str = r##"
+pub trait Foo {
+    type Bar<'a>;
+}
+
+pub struct FooImpl {}
+
+impl Foo for FooImpl {
+    type Bar<'a> = ();
+}
+
+pub trait FooFn {
+    fn bar(&self);
+}
+
+impl<T: Foo> FooFn for fn(T, T::Bar<'_>) {
+    fn bar(&self) {}
+}
+
+fn foo<T: Foo>(f: fn(T, T::Bar<'_>)) {
+    let _: &dyn FooFn = &f;
+}
+
+fn main() {
+    foo(|_: FooImpl, _| {});
+}
+"##;
+
+#[test]
+fn compiler_bug_in_collector_vtable_force_is_a_crash() {
+    let (code, _stdout, stderr) = convert("crash_vtable", CRASH_VTABLE_RS, &[], &[]);
+    assert_eq!(code, Some(101), "stderr: {stderr}");
+    assert!(
+        stderr.contains("ty/instance.rs:640"),
+        "the crash report must name the pinned ICE: {stderr}"
+    );
+}
+
+/// The shape of tests/crashes/54888.rs: the run contains
+/// the `std::fmt::Write` dummy-binder compiler panic inside
+/// a speculative layout probe and converts successfully.
+/// The panic is a string-payload compiler panic on a probe
+/// the reference compilation never runs; it must keep its
+/// verdict (a successful conversion).
+const PROBE_FMT_RS: &str = r##"
+#![feature(unsize, coerce_unsized)]
+
+use std::{
+    ops::CoerceUnsized,
+    marker::Unsize,
+};
+
+#[repr(C)]
+struct Ptr<T: ?Sized>(Box<T>);
+
+impl<T: ?Sized, U: ?Sized> CoerceUnsized<Ptr<U>> for Ptr<T>
+where
+    T: Unsize<U>,
+{}
+
+
+fn main() {
+    let foo = Ptr(Box::new(5)) as Ptr<dyn std::any::Any>;
+}
+"##;
+
+#[test]
+fn speculative_probe_panics_keep_their_verdict() {
+    let (code, _stdout, stderr) = convert("probe_fmt", PROBE_FMT_RS, &[], &[]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+/// The shape of tests/crashes/154367.rs: the run contains
+/// compiler-location panics with string payloads — the
+/// bridge's unimplemented unsafe-binder conversion on a
+/// speculative screen, and the symbol mangler's
+/// `unimplemented!()` for the unsafe-binder type inside the
+/// verdict pass's own duplicate-symbol check. Neither is
+/// the compiler's bug machinery, and the program converts;
+/// both must keep that verdict.
+const PROBE_MANGLING_RS: &str = r##"
+#![feature(unsafe_binders)]
+
+fn main() { panic::<unsafe<'a> &'a ()>(); }
+fn panic<T>() { panic!() }
+"##;
+
+#[test]
+fn compiler_site_string_panics_keep_their_verdict() {
+    let (code, _stdout, stderr) =
+        convert("probe_mangling", PROBE_MANGLING_RS, &["-Copt-level=0"], &[]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
 }
