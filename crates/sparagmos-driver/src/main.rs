@@ -789,6 +789,7 @@ fn driver_main_inner() {
     let mut aux_env_scrub: Vec<String> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
+    let mut compiletest_check_mode = false;
     let mut coverage_color = false;
     let mut dump_path: Option<String> = None;
     let mut compiler_stdout: Option<String> = None;
@@ -931,6 +932,9 @@ fn driver_main_inner() {
             "--guest-process-host" => {
                 guest_process_host = true;
             }
+            "--compiletest-check-mode" => {
+                compiletest_check_mode = true;
+            }
             "--coverage-color" => {
                 coverage_color = true;
             }
@@ -949,7 +953,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -966,6 +970,16 @@ fn driver_main_inner() {
         eprintln!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--dump <path>]");
         exit_process(2);
     };
+    // A compiletest check compilation (`--emit=metadata`)
+    // never runs the monomorphization collector or code
+    // generation, so the codegen-level verdicts in
+    // `mono_check` must not decide it (see
+    // `mono_check::set_check_mode`). The flag is honoured
+    // only in the compilation-verdict modes; the executing
+    // modes never consult those verdicts.
+    sparagmos_driver::mono_check::set_check_mode(
+        compiletest_check_mode && mode.is_compile_verdict(),
+    );
     let sysroot = sysroot
         .or_else(|| std::env::var("SPARAGMOS_SYSROOT").ok())
         .unwrap_or_else(|| env!("SPARAGMOS_BUILD_SYSROOT").to_string());

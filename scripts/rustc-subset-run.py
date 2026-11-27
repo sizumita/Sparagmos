@@ -5353,6 +5353,8 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
                         capture_stdout=print_view,
+                        check_mode=compiletest_check_mode(
+                            rec["suite"], view),
                         **({"jit": True} if jit else {}))
     if jit:
         verdict, reason, bucket = judge_jit_compile(expectation, conv)
@@ -5742,6 +5744,34 @@ def compile_expectation(suite, header):
     return "success"
 
 
+def compiletest_check_mode(suite, view):
+    """Whether compiletest compiles this view with a check
+    compilation (`--emit=metadata`), so the reference
+    compilation never runs the monomorphization collector or
+    code generation and codegen-level verdicts cannot decide
+    it (issue #509).
+
+    UI views: `check-pass` / `check-fail`, or no pass/fail/run
+    directive at all (compiletest's UI default is check-fail).
+    `build-pass` / `build-fail` and the run modes are full
+    builds. Incremental revisions: `cpass` is a check
+    compilation, the b*/r* kinds are builds. Every other suite
+    is compiled in build mode (or not by rustc at all).
+    """
+    if suite in ("ui", "ui-fulldeps"):
+        if run_mode(view) is not None:
+            return False
+        if view.has("run-fail-or-crash"):
+            return False
+        if view.has("build-pass") or view.has("build-fail"):
+            return False
+        return True
+    if suite == "incremental":
+        revision = getattr(view, "revision", None)
+        return bool(revision) and revision.startswith("cpass")
+    return False
+
+
 def stage2_blocker(view, rec):
     """Why one revision view of a compile-check record is not
     attempted in stage 2, or None.
@@ -5811,7 +5841,8 @@ _TARGET_NOT_DEMANDED_RE = re.compile(
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
                  env_extra=None, env_remove=(), jit=False,
-                 aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 aux_env_scrub=(), capture_stdout=False, aux_libs=(),
+                 check_mode=False):
     """Run the driver in convert-only mode and parse its report.
 
     `aux_libs` are prebuilt library auxiliaries as (name, path,
@@ -5847,6 +5878,12 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     code 2 means the compilation succeeded but JIT lowering is
     unsupported — it is not a compiler crash.
 
+    With `check_mode=True` the driver is handed
+    `--compiletest-check-mode`: the view is one compiletest
+    compiles with `--emit=metadata`, so the driver's
+    codegen-level verdicts are reported as notes instead of
+    deciding the compilation (issue #509).
+
     With `capture_stdout=True` the driver is handed
     `--compiler-stdout <path>` and the result also carries
     compiler_stdout (the text the embedded compiler printed to
@@ -5878,6 +5915,8 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
             prefix="subset-capture-")
         capture_path = os.path.join(capture_td.name, "stdout.txt")
         argv += ["--compiler-stdout", capture_path]
+    if check_mode:
+        argv += ["--compiletest-check-mode"]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
@@ -6601,6 +6640,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
                         capture_stdout=print_view,
+                        check_mode=compiletest_check_mode(
+                            rec["suite"], view),
                         **({"jit": True} if jit else {}))
     declared = view.values("failure-status")
     declared_status = int(declared[-1].strip()) if declared else None

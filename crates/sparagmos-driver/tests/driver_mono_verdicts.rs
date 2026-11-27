@@ -1266,3 +1266,71 @@ fn abandoned_force_ice_diagnostic_discounted() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
+
+#[test]
+fn duplicate_export_name_is_a_note_in_check_mode() {
+    // A duplicate export symbol is a codegen-level verdict
+    // (the partitioning check): under `--emit=metadata` the
+    // pinned compiler accepts the crate, so in check mode the
+    // verdict is reported as a note and the compilation
+    // succeeds (Issue #509).
+    let case = Case::new("dupe-export-check");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         #[export_name = \"fail\"]\npub fn a() {}\n\
+         #[export_name = \"fail\"]\npub fn b() {}\n",
+    );
+    let (code, _stdout, stderr) =
+        case.convert(&src, &["--compiletest-check-mode"], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("not applied in check mode"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("already defined"), "stderr={stderr}");
+}
+
+#[test]
+fn simd_abi_check_is_not_a_verdict_in_check_mode() {
+    // The ABI check is a `check_mono_item` finding: in check
+    // mode the collector walk does not run, so the same call
+    // the verdict rejects in a full build converts cleanly
+    // (Issue #509).
+    let case = Case::new("simd-abi-check");
+    let src = case.write(
+        "case.rs",
+        "#![feature(portable_simd)]\n#![feature(simd_ffi)]\n\
+         use std::arch::x86_64::*;\n\
+         unsafe extern \"C\" fn f(_: __m256) {}\n\
+         fn main() { unsafe { let x: __m256 = std::mem::transmute([0.0f32; 8]); f(x); } }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(
+        &src,
+        &[
+            "--compiletest-check-mode",
+            "--rustc-arg",
+            "-Ctarget-feature=-avx",
+        ],
+        true,
+    );
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn generic_export_name_still_rejected_in_check_mode() {
+    // The generic-export verdict is metadata-visible: the
+    // pinned compiler rejects the crate under
+    // `--emit=metadata` too, so check mode keeps it a verdict
+    // (Issue #509).
+    let case = Case::new("generic-export-check");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"rlib\"]\n\
+         #[export_name = \"foo\"]\npub fn foo<T>() {}\n",
+    );
+    let (code, _stdout, stderr) =
+        case.convert(&src, &["--compiletest-check-mode"], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("must be mangled"), "stderr={stderr}");
+}

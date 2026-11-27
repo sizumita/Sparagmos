@@ -1521,7 +1521,10 @@ fn collect() -> ControlFlow<()> {
     // layouts, types too big for the target architecture), and
     // finally the deferred `check_mono_item` verdict the
     // collector walk recorded, whose rejections the body checks
-    // sometimes name more precisely. A
+    // sometimes name more precisely. In a compiletest check
+    // compilation the codegen-level verdicts among these are
+    // diverted to notes instead of deciding the compilation
+    // (see `mono_check::set_check_mode`). A
     // failure here fails the whole compilation, the way the
     // corresponding rustc error does. The body scan covers the
     // Stable MIR bodies conversion walked (local seeds, demanded
@@ -1542,10 +1545,28 @@ fn collect() -> ControlFlow<()> {
             if !COMPILE_VERDICT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            sparagmos_driver::mono_check::check_intrinsic_overrides(&alias_sources)
+            sparagmos_driver::mono_check::divert_check_mode(
+                sparagmos_driver::mono_check::check_intrinsic_overrides(&alias_sources),
+            )
         })
-        .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources))
+        .or_else(|| {
+            sparagmos_driver::mono_check::divert_check_mode(
+                sparagmos_driver::mono_check::check_bodies(&alias_sources),
+            )
+        })
         .or_else(|| sparagmos_driver::mono_check::take_mono_item_finding());
+
+    // The codegen-level verdicts a check compilation
+    // computed but did not apply, reported for the record
+    // (see `mono_check::set_check_mode`).
+    if sparagmos_driver::mono_check::check_mode() {
+        for note in sparagmos_driver::mono_check::take_check_mode_notes() {
+            eprintln!(
+                "sparagmos-driver: note: codegen-level verdict not applied \
+                 in check mode: {note}"
+            );
+        }
+    }
 
     // The coverage mapping table of an instrumented
     // compilation: captured from the compiler's own mono
