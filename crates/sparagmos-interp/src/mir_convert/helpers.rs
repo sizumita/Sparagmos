@@ -596,6 +596,24 @@ pub(super) fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
     if self_base == self_name {
         return true;
     }
+    // A closure type is spelled two ways that share no text:
+    // an impl key's `Self` section uses the compiler's span
+    // spelling (`{closure@<file>:16:17: 16:23}`), while a
+    // rendered type tag names the definition path's indexed
+    // segment (`main::{closure#0}`). Neither spelling carries
+    // the other's discriminant -- the span has no index and
+    // the tag no span -- so the two are equated only under
+    // the caller's uniqueness contract: the scans using this
+    // match resolve nothing when two distinct candidates
+    // match, so two closures holding impls of one trait
+    // method in one program stay unresolved rather than
+    // mis-dispatched.
+    if self_part.starts_with("{closure@") && self_part.ends_with('}') {
+        let segment = self_name.rsplit("::").next().unwrap_or(self_name);
+        if segment.starts_with("{closure#") && segment.ends_with('}') {
+            return true;
+        }
+    }
     // When both sides carry a crate path they must agree exactly;
     // the short-name comparison is only for a side that omits it
     // (the generic-definition spelling above).
