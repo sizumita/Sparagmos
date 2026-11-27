@@ -1387,6 +1387,16 @@ pub enum Builtin {
     StrStartsWith,
     /// See `StrContains`.
     StrEndsWith,
+    /// `str::trim_matches` / `trim_start_matches` /
+    /// `trim_end_matches` (`(&str, pattern) -> &str`): the
+    /// pattern trim, served by the `StrContains` dispatch arm
+    /// (the pattern resolution is shared). The collected
+    /// bodies run core's searcher machinery, whose
+    /// per-character stepping hands the nested search a
+    /// scalar where the string data belongs, so the trim is
+    /// computed on the resolved strings directly, like the
+    /// searches beside it.
+    StrTrimMatches(TrimSide),
     /// `std::iter::empty()`: an empty iterator.
     IterEmpty,
     /// `Index::index(&container, idx) -> &elem`.

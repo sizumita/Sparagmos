@@ -8158,7 +8158,10 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 self.btree_values_value(frames, &vals[0])
             }
-            Builtin::StrContains | Builtin::StrStartsWith | Builtin::StrEndsWith => {
+            Builtin::StrContains
+            | Builtin::StrStartsWith
+            | Builtin::StrEndsWith
+            | Builtin::StrTrimMatches(_) => {
                 arity(2)?;
                 let text_of = |v: &Value| -> InterpResult<String> {
                     match self.resolve_value(frames, v)? {
@@ -8371,9 +8374,50 @@ impl<'a> Interpreter<'a> {
                 };
                 let result = match needle {
                     Needle::Text(t) => match kind {
-                        Builtin::StrContains => haystack.contains(&t),
-                        Builtin::StrStartsWith => haystack.starts_with(&t),
-                        _ => haystack.ends_with(&t),
+                        Builtin::StrContains => {
+                            Value::Bool(haystack.contains(&t))
+                        }
+                        Builtin::StrStartsWith => {
+                            Value::Bool(haystack.starts_with(&t))
+                        }
+                        Builtin::StrEndsWith => {
+                            Value::Bool(haystack.ends_with(&t))
+                        }
+                        Builtin::StrTrimMatches(side) => {
+                            // Repeatedly strip the text pattern
+                            // from the selected end(s): core's
+                            // searcher semantics for a text
+                            // pattern reach exactly the span
+                            // between the leading and trailing
+                            // runs of non-overlapping matches
+                            // anchored at the ends. An empty
+                            // pattern strips nothing.
+                            let mut s = haystack.as_str();
+                            if !t.is_empty() {
+                                if matches!(
+                                    side,
+                                    TrimSide::Start | TrimSide::Both
+                                ) {
+                                    while let Some(rest) =
+                                        s.strip_prefix(t.as_str())
+                                    {
+                                        s = rest;
+                                    }
+                                }
+                                if matches!(
+                                    side,
+                                    TrimSide::End | TrimSide::Both
+                                ) {
+                                    while let Some(rest) =
+                                        s.strip_suffix(t.as_str())
+                                    {
+                                        s = rest;
+                                    }
+                                }
+                            }
+                            Value::Str(s.to_string())
+                        }
+                        _ => unreachable!(),
                     },
                     needle => {
                         // Per-character needles: consult the
@@ -8514,7 +8558,7 @@ impl<'a> Interpreter<'a> {
                         // the drop glue it feeds) is owed on that
                         // path too -- the callee's cleanup drops a
                         // by-value predicate however the call ends.
-                        let outcome: InterpResult<bool> = (|| match kind {
+                        let outcome: InterpResult<Value> = (|| match kind {
                             Builtin::StrContains => {
                                 let mut found = false;
                                 for c in haystack.chars() {
@@ -8523,16 +8567,63 @@ impl<'a> Interpreter<'a> {
                                         break;
                                     }
                                 }
-                                Ok(found)
+                                Ok(Value::Bool(found))
                             }
                             Builtin::StrStartsWith => match haystack.chars().next() {
-                                Some(c) => test(c),
-                                None => Ok(false),
+                                Some(c) => Ok(Value::Bool(test(c)?)),
+                                None => Ok(Value::Bool(false)),
                             },
-                            _ => match haystack.chars().next_back() {
-                                Some(c) => test(c),
-                                None => Ok(false),
+                            Builtin::StrEndsWith => match haystack.chars().next_back() {
+                                Some(c) => Ok(Value::Bool(test(c)?)),
+                                None => Ok(Value::Bool(false)),
                             },
+                            Builtin::StrTrimMatches(side) => {
+                                // The trimmed span runs from the
+                                // first character the test rejects
+                                // (scanning from the selected
+                                // start) to the end of the last
+                                // character it rejects (scanning
+                                // from the selected end): core's
+                                // first/last reject spans. A side
+                                // whose scan rejects nothing
+                                // contributes the empty span at
+                                // that end.
+                                let mut start = 0usize;
+                                let mut end = haystack.len();
+                                if matches!(
+                                    side,
+                                    TrimSide::Start | TrimSide::Both
+                                ) {
+                                    start = haystack.len();
+                                    for (i, c) in haystack.char_indices() {
+                                        if !test(c)? {
+                                            start = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if matches!(
+                                    side,
+                                    TrimSide::End | TrimSide::Both
+                                ) {
+                                    end = start;
+                                    for (i, c) in
+                                        haystack.char_indices().rev()
+                                    {
+                                        if i < start {
+                                            break;
+                                        }
+                                        if !test(c)? {
+                                            end = i + c.len_utf8();
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(Value::Str(
+                                    haystack[start..end].to_string(),
+                                ))
+                            }
+                            _ => unreachable!(),
                         })();
                         if let Some(id) = pred_alloc {
                             // The call consumed the predicate:
@@ -8576,7 +8667,7 @@ impl<'a> Interpreter<'a> {
                         outcome?
                     }
                 };
-                Ok(Value::Bool(result))
+                Ok(result)
             }
             Builtin::SliceWindows => {
                 arity(2)?;
