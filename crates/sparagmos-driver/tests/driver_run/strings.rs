@@ -447,6 +447,62 @@ fn run_mode_boxed_str_from_cow() {
     );
 }
 
+const COW_SLICE_DEREF_SRC: &str = r#"
+use std::borrow::Cow;
+
+fn total_len(c: &Cow<'_, [&str]>) -> usize {
+    c.len()
+}
+
+fn main() {
+    let owned: Cow<'_, [&str]> = Cow::Owned(vec!["alpha\n", "beta\n", "gamma\n"]);
+    println!("owned len: {}", total_len(&owned));
+    let s: &[&str] = &owned;
+    println!("first: {}", s[0]);
+    println!("joined: {}", s.join("|"));
+    let mut count = 0;
+    for line in &*owned {
+        count += 1;
+        println!("line {count}: {line:?} eq_one: {}", *line == "alpha\n");
+    }
+    let borrowed: Cow<'_, [&str]> = Cow::Borrowed(&["x\n", "y\n"]);
+    println!("borrowed len: {}", total_len(&borrowed));
+    let text: Cow<'_, str> = Cow::Owned(String::from("hello"));
+    println!("text len: {} slice: {} starts: {}", text.len(), &text[1..3], text.starts_with("he"));
+    let borrowed_text: Cow<'_, str> = Cow::Borrowed("world");
+    println!("borrowed text len: {}", borrowed_text.len());
+    let bytes: Cow<'_, [u8]> = Cow::Owned(vec![10u8, 20, 30]);
+    println!("bytes len: {}", bytes.len());
+    let bs: &[u8] = &bytes;
+    println!("bytes sum: {} second: {}", bs.iter().map(|b| *b as u32).sum::<u32>(), bs[1]);
+    println!("cow slice deref ok");
+}
+"#;
+
+#[test]
+fn run_mode_cow_slice_deref() {
+    // `Cow`'s `Deref` builtin decided the string case by
+    // substring: a `Cow<[&str]>` (the shape `similar`'s line
+    // tokenizer hands to its diff) was read as a string target
+    // and the owned `Vec<&str>` went to the string readers,
+    // which refused it. The borrowed-type parameter must be
+    // exactly `str` for the string case; a slice target derefs
+    // to the fat reference over the owned vector.
+    let dir = temp_dir("cow-slice-deref");
+    let src = fixture(&dir, "cow_slice_deref.rs", COW_SLICE_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cow slice deref must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "owned len: 3\nfirst: alpha\n\njoined: alpha\n|beta\n|gamma\n\nline 1: \"alpha\\n\" eq_one: true\nline 2: \"beta\\n\" eq_one: false\nline 3: \"gamma\\n\" eq_one: false\nborrowed len: 2\ntext len: 5 slice: el starts: true\nborrowed text len: 5\nbytes len: 3\nbytes sum: 60 second: 20\ncow slice deref ok\n"
+    );
+}
+
 const DEBUG_FORMAT_MUT_VEC_SLICE_SRC: &str = r#"
 #[derive(Debug)]
 struct Named { x: i32, name: String }

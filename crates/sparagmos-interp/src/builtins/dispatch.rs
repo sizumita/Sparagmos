@@ -4975,7 +4975,14 @@ impl<'a> Interpreter<'a> {
                     // owned variant's field is the owned value
                     // (`String` / `Vec<_>`), whose deref is the
                     // same data read as the target — for a string
-                    // target that is the string data itself.
+                    // target that is the string data itself. The
+                    // string case is decided by the Cow's own
+                    // borrowed-type parameter being exactly `str`:
+                    // a borrowed type that merely mentions `str`
+                    // (a slice of `str`, `OsStr`, `CStr`) is a
+                    // different target, and its owned value
+                    // derefs as itself.
+                    let borrowed_ty = last_generic_param(self_ty);
                     let cow = self.resolve_value(frames, &vals[0])?;
                     match cow {
                         Value::Enum { variant, mut fields, .. }
@@ -4984,9 +4991,39 @@ impl<'a> Interpreter<'a> {
                             let field = fields.pop().expect("len checked");
                             if variant == 0 {
                                 Ok(field)
-                            } else if self_ty.contains("str") {
+                            } else if borrowed_ty.as_deref() == Some("str") {
                                 let s = self.resolve_string(frames, &field)?;
                                 Ok(Value::Str(s))
+                            } else if borrowed_ty.as_deref().is_some_and(|b| {
+                                b.starts_with('[') && b.ends_with(']')
+                            }) {
+                                // A slice target: the deref is
+                                // the fat reference over the owned
+                                // vector, the shape `Vec`'s own
+                                // deref produces — a reference to
+                                // the Cow's field when the Cow
+                                // lives in a place (so writes land
+                                // in the Cow), the field value
+                                // itself for a detached Cow.
+                                let len = field.len().ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        "Deref::deref for Cow",
+                                        "array value",
+                                        field.kind_name(),
+                                    )
+                                })?;
+                                let base = match self.place_projected_ref(
+                                    frames,
+                                    &vals[0],
+                                    RefProj::Field(0),
+                                )? {
+                                    Some(reference) => reference,
+                                    None => field,
+                                };
+                                Ok(Value::FatRef {
+                                    base: Box::new(base),
+                                    len,
+                                })
                             } else {
                                 Ok(field)
                             }
