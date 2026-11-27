@@ -3070,9 +3070,15 @@ impl<'a> Interpreter<'a> {
     /// (`Box`, `Rc`, `Arc`), which std defines as forwarding to
     /// the pointee: shape the pointee value the way the `dyn`
     /// formatting path shapes its base, then format it with the
-    /// element type as the tag. `None` when the type is not one
-    /// of the wrappers or the value does not have the wrapper's
-    /// shape, in which case the existing behaviour stands.
+    /// element type as the tag. A value that does not have the
+    /// wrapper's stored shape is the pointee itself in the
+    /// storage form a move leaves behind (the extracted
+    /// snapshot the copy machinery stores in the slot in place
+    /// of the wrapper aggregate): it formats under the element
+    /// tag directly, the same licence `format_num_wrapper`
+    /// takes for a scalar under a wrapper tag. `None` when the
+    /// type is not one of the wrappers, in which case the
+    /// existing behaviour stands.
     fn format_pointer_wrapper(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3108,8 +3114,12 @@ impl<'a> Interpreter<'a> {
                 // (`Box::from_raw`'s product) instead holds its
                 // `Unique` at field 0, beside the allocator field:
                 // its pointee reference is the box's data pointer.
+                // A value in any other form is the pointee itself
+                // in storage form (see the doc comment above).
                 let Value::Enum { fields, .. } = value else {
-                    return Ok(None);
+                    return Ok(Some(self.format_value(
+                        frames, value, trait_, elem, options, indent,
+                    )?));
                 };
                 if fields.len() == 1 {
                     fields[0].clone()
@@ -3144,7 +3154,11 @@ impl<'a> Interpreter<'a> {
                         return Ok(None);
                     }
                 } else {
-                    return Ok(None);
+                    // The pointee itself in storage form, as in
+                    // the `Box` arm above.
+                    return Ok(Some(self.format_value(
+                        frames, value, trait_, elem, options, indent,
+                    )?));
                 }
             }
         };

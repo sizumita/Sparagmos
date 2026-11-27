@@ -4336,6 +4336,98 @@ fn run_mode_boxed_slice_cmp_and_sort() {
     );
 }
 
+const BOXED_OS_STR_VEC_DEBUG_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    let mut v: Vec<Box<std::ffi::OsStr>> = vec![
+        OsString::from("pear").into_boxed_os_str(),
+        OsString::from("banana").into_boxed_os_str(),
+        OsString::from("kiwi").into_boxed_os_str(),
+    ];
+    println!("pre={:?}", v);
+    v.sort();
+    println!("sorted={:?}", v);
+    println!("pretty={:#?}", v);
+    let mut w: Vec<Box<std::ffi::OsStr>> = vec![
+        OsString::from("pear").into_boxed_os_str(),
+        OsString::from("banana").into_boxed_os_str(),
+    ];
+    w.swap(0, 1);
+    println!("swapped={:?}", w);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_os_str_vec_debug_after_move() {
+    // A move through the sort machinery (or a `swap`) leaves
+    // the extracted pointee snapshot in the element slot in
+    // place of the box aggregate: formatting the vector then
+    // hands the formatter the bare byte value under the
+    // `Box<OsStr>` tag. The formatter treats a value without
+    // the wrapper's stored shape as the pointee itself in
+    // storage form and renders it under the element tag, so
+    // the moved elements debug as the OS strings they are.
+    run_ok(
+        "boxed-os-str-vec-debug-after-move",
+        BOXED_OS_STR_VEC_DEBUG_SRC,
+        "pre=[\"pear\", \"banana\", \"kiwi\"]\nsorted=[\"banana\", \"kiwi\", \"pear\"]\npretty=[\n    \"banana\",\n    \"kiwi\",\n    \"pear\",\n]\nswapped=[\"banana\", \"pear\"]\n",
+    );
+}
+
+const BOXED_SLICE_VEC_DEBUG_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<Box<[u8]>> = vec![
+        vec![1u8, 9].into_boxed_slice(),
+        vec![0u8, 5].into_boxed_slice(),
+        vec![1u8, 2].into_boxed_slice(),
+    ];
+    println!("pre={:?}", v);
+    v.sort();
+    println!("sorted={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_vec_debug_after_sort() {
+    // The slice-pointee form of the same storage-form
+    // presentation: an element the sort moved sits in its
+    // slot as the bare tuple of its elements under the
+    // `Box<[u8]>` tag, and debugs as the slice it denotes,
+    // not as a tuple.
+    run_ok(
+        "boxed-slice-vec-debug-after-sort",
+        BOXED_SLICE_VEC_DEBUG_SRC,
+        "pre=[[1, 9], [0, 5], [1, 2]]\nsorted=[[0, 5], [1, 2], [1, 9]]\n",
+    );
+}
+
+const BOXED_OS_STR_NONUTF8_DEBUG_SRC: &str = r#"
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    let mut v: Vec<Box<std::ffi::OsStr>> = vec![
+        OsString::from_vec(vec![b'z', 0xff, b'a']).into_boxed_os_str(),
+        OsString::from_vec(vec![b'a', 0x80]).into_boxed_os_str(),
+    ];
+    v.sort();
+    println!("sorted={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_os_str_nonutf8_debug_after_sort() {
+    // The storage-form rendering is the host `OsStr`
+    // `Debug`: non-UTF-8 bytes of a moved element escape
+    // exactly as an unmoved element's do.
+    run_ok(
+        "boxed-os-str-nonutf8-debug-after-sort",
+        BOXED_OS_STR_NONUTF8_DEBUG_SRC,
+        "sorted=[\"a\\x80\", \"z\\xFFa\"]\n",
+    );
+}
+
 const SORT_STRING_ELEMENTS_SRC: &str = r#"
 fn main() {
     // Sorting more than twenty `String` elements takes the
