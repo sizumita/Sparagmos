@@ -16,6 +16,44 @@ pub(crate) fn absolutize_path(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// The passthrough stdout sink: an owned clone of this
+/// process's own stdout, which the interpreter writes the
+/// guest's stdout through (see the `stdout_sink` field's
+/// note in `execute`). The clone goes through the
+/// platform's own handle type -- a Unix file descriptor,
+/// a Windows handle -- and names the same stream either
+/// way.
+#[cfg(unix)]
+fn own_stdout_sink() -> Option<sparagmos_interp::StdoutSink> {
+    use std::os::fd::AsFd as _;
+    std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(|fd| {
+            sparagmos_interp::StdoutSink(std::sync::Arc::new(std::fs::File::from(fd)))
+        })
+}
+
+#[cfg(windows)]
+fn own_stdout_sink() -> Option<sparagmos_interp::StdoutSink> {
+    use std::os::windows::io::AsHandle as _;
+    std::io::stdout()
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(|handle| {
+            sparagmos_interp::StdoutSink(std::sync::Arc::new(
+                std::fs::File::from(handle),
+            ))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn own_stdout_sink() -> Option<sparagmos_interp::StdoutSink> {
+    None
+}
+
 pub(crate) fn execute(
     c: &Collected,
     input: &str,
@@ -130,16 +168,7 @@ pub(crate) fn execute(
         // parent arranged, and a parent that has closed it
         // must be observable to the guest, as natively.
         stdout_sink: if guest_stdout_passthrough {
-            use std::os::fd::AsFd as _;
-            std::io::stdout()
-                .as_fd()
-                .try_clone_to_owned()
-                .ok()
-                .map(|fd| {
-                    sparagmos_interp::StdoutSink(std::sync::Arc::new(
-                        std::fs::File::from(fd),
-                    ))
-                })
+            own_stdout_sink()
         } else {
             None
         },

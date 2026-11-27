@@ -737,6 +737,13 @@ pub struct Interpreter<'a> {
     /// otherwise pays a full-table scan for every scheduling
     /// decision (issue #399).
     pending_threads: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// The ids of the threads whose park token is currently
+    /// set: `Thread::unpark` inserts the target's id,
+    /// `std::thread::park` / `park_timeout` remove the
+    /// executing thread's id when they consume the token (see
+    /// the `ThreadPark` builtin). One token per thread, as in
+    /// std: repeated unparks before a park coalesce.
+    park_notified: std::cell::RefCell<HashSet<u64>>,
     /// The id the next spawned thread gets.
     next_thread: std::cell::RefCell<u64>,
     /// Thread-local destructors registered through std's
@@ -1178,6 +1185,7 @@ impl<'a> Interpreter<'a> {
             pending_threads: std::cell::RefCell::new(
                 std::collections::BTreeSet::new(),
             ),
+            park_notified: std::cell::RefCell::new(HashSet::new()),
             next_thread: std::cell::RefCell::new(2),
             tls_dtors: std::cell::RefCell::new(HashMap::new()),
             signal_actions: std::cell::RefCell::new(sigpipe_actions),

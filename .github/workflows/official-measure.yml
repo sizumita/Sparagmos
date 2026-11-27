@@ -501,23 +501,66 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-trusty
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64_be-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabihf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv5te-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv7k-apple-watchos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv7s-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/avr-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfeb-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfel-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/csky-unknown-linux-gnuabiv2
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/hexagon-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i386-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-apple-darwin
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-mti-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-uclibc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-openwrt-linux-musl
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-unknown-linux-muslabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64el-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64el-unknown-linux-muslabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-mti-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-sony-psp
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-sony-psx
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-uclibc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-netbsd
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa32r6-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa32r6el-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa64r6-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa64r6el-unknown-linux-gnuabi64
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/msp430-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/powerpc-unknown-linux-gnuspe
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/powerpc64-ibm-aix
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32e-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32em-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32emc-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32gc-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32gc-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv64gc-unknown-fuchsia
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/s390x-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv4t-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv5te-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/wasm64-unknown-unknown
-          key: tier3-std-1.100.0-v3
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-unknown-hermit
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-gnu
+          key: tier3-std-1.100.0-v4
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py
@@ -771,23 +814,66 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-trusty
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64_be-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armebv7r-none-eabihf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv5te-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv7k-apple-watchos
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/armv7s-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/avr-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfeb-unknown-none
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfel-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/csky-unknown-linux-gnuabiv2
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/hexagon-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i386-apple-ios
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-apple-darwin
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-uwp-windows-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/m68k-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-mti-none-elf
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-uclibc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-openwrt-linux-musl
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-unknown-linux-muslabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64el-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64el-unknown-linux-muslabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-mti-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-sony-psp
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-sony-psx
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-linux-uclibc
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-netbsd
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsel-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa32r6-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa32r6el-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa64r6-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mipsisa64r6el-unknown-linux-gnuabi64
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/msp430-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/powerpc-unknown-linux-gnuspe
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/powerpc64-ibm-aix
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32e-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32em-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32emc-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32gc-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32gc-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv64gc-unknown-fuchsia
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/s390x-unknown-none-softfloat
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-linux-gnu
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv4t-none-eabi
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/thumbv5te-none-eabi
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/wasm64-unknown-unknown
-          key: tier3-std-1.100.0-v3
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-unknown-hermit
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/x86_64-uwp-windows-gnu
+          key: tier3-std-1.100.0-v4
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py

@@ -1388,6 +1388,43 @@ impl<'a> Interpreter<'a> {
                 self.drain_threads(frames)?;
                 Ok(Value::Unit)
             }
+            Builtin::ThreadPark => {
+                arity(0)?;
+                self.thread_park(frames, None, name)
+            }
+            Builtin::ThreadParkTimeout => {
+                arity(1)?;
+                let resolved = self.resolve_value(frames, &vals[0])?;
+                // The model reads only whether the bound is
+                // zero (a poll of the token) or not: every
+                // non-zero bound ends the wait at the same
+                // point (see `thread_park`), so a duration
+                // whose shape the reader does not recognise
+                // stands in as an arbitrary non-zero bound.
+                let timeout = match duration_pair(&resolved) {
+                    Some((secs, nanos)) => {
+                        (secs.max(0) as u64, nanos.max(0) as u64)
+                    }
+                    None => (0, 1),
+                };
+                self.thread_park(frames, Some(timeout), name)
+            }
+            Builtin::ThreadUnpark => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let thread = self.read_resolved(frames, &target)?;
+                match channel_handle_id(&thread) {
+                    Some(id) => {
+                        self.set_park_token(id);
+                        Ok(Value::Unit)
+                    }
+                    None => Err(InterpError::type_mismatch(
+                        "Thread::unpark",
+                        "a thread value",
+                        thread.kind_name(),
+                    )),
+                }
+            }
             Builtin::ThreadBuilderNew => {
                 arity(0)?;
                 Ok(Value::Enum {

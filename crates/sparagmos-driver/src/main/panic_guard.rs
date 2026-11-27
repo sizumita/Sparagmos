@@ -521,7 +521,7 @@ impl Drop for StdoutToStderr {
 /// and measured on Linux; the descriptor swap has no portable
 /// equivalent there).
 #[cfg(not(unix))]
-struct StdoutToStderr;
+pub(crate) struct StdoutToStderr;
 
 #[cfg(not(unix))]
 impl StdoutToStderr {

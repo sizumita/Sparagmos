@@ -372,6 +372,22 @@ def read_file_io_unconditional(source):
     return names
 
 
+def read_comptime_intrinsics(path):
+    """The bare names of the pinned core's `#[rustc_comptime]`
+    intrinsics, read from the `comptime_intrinsic` verdict in the
+    driver's mono_check.rs (the same source the driver's own
+    judgement uses). A missing file or a changed shape is a hard
+    error, like every other source this tool reads."""
+    if not path.exists():
+        raise ValueError(
+            f"builtins: comptime-intrinsic source not found: {path}")
+    body = _fn_body(path.read_text(), "fn comptime_intrinsic(name")
+    names = set(re.findall(r'"([^"\n]+)"', body))
+    if not names:
+        raise ValueError("builtins: no comptime intrinsic names found")
+    return names
+
+
 class BuiltinRegistry:
     """The interpreter's builtin support, read from the builtins module.
 
@@ -402,9 +418,23 @@ class BuiltinRegistry:
     helper whose shape no longer matches these expectations, is a
     hard error so a future change to the builtins module cannot
     silently drift this tool.
+
+    Two serving paths live outside `lookup` and are modelled from
+    their own tables in the same source: `fmt_trait_method` and
+    `net_trait_method`, the exact-name lookups conversion's
+    external-callee path consults for a callee already known to
+    have no converted body — exactly the situation of a name this
+    tool counts (a collected body would make the name executable
+    on the body side instead). And the `#[rustc_comptime]`
+    intrinsics (the bare-name set the driver's own verdict reads
+    from `comptime_intrinsic` in its mono_check.rs, passed to the
+    constructor): a call to one that survives into a converted
+    body sits inside a constant and was resolved by constant
+    evaluation during that conversion, so the name is served by
+    construction and can never be called at run time.
     """
 
-    def __init__(self, source):
+    def __init__(self, source, comptime_intrinsics=()):
         start = source.find("pub fn lookup")
         if start == -1:
             raise ValueError("builtins: pub fn lookup not found")
@@ -464,9 +494,21 @@ class BuiltinRegistry:
             _fn_body(source, "fn float_method(canonical"),
             self.float_methods, self.float128_methods)
         self.file_io_names = read_file_io_unconditional(source)
+        # The exact-name trait-method tables conversion's
+        # external-callee path consults for body-less callees
+        # (see the class docstring): the `core::fmt` trait
+        # methods and `ToSocketAddrs::to_socket_addrs`.
+        self.trait_methods = set()
+        for sig in ("fn fmt_trait_method(canonical",
+                    "fn net_trait_method(canonical"):
+            self.trait_methods |= set(re.findall(
+                r'"([^"\n]+)"\s*(?:\||=>)', _fn_body(source, sig)))
+        if not self.trait_methods:
+            raise ValueError("builtins: no trait-method names found")
+        self.comptime_intrinsics = set(comptime_intrinsics)
 
     def lookup(self, canonical):
-        if canonical in self.exact:
+        if canonical in self.exact or canonical in self.trait_methods:
             return True
         for terms in self.guards:
             ok = True
@@ -488,7 +530,13 @@ class BuiltinRegistry:
         if canonical in self.file_io_names:
             return True
         return self._unicode_lookup_slow(canonical) \
-            or self._float_method(canonical)
+            or self._float_method(canonical) \
+            or self._comptime_intrinsic(canonical)
+
+    def _comptime_intrinsic(self, canonical):
+        if "::intrinsics::" not in canonical:
+            return False
+        return canonical.rsplit("::", 1)[-1] in self.comptime_intrinsics
 
     def _unicode_lookup_slow(self, canonical):
         if not canonical.endswith("::lookup_slow"):
@@ -706,7 +754,11 @@ def main(argv=None):
     ap.add_argument("--only", help="comma-separated path substrings to keep")
     args = ap.parse_args(argv)
 
-    registry = BuiltinRegistry(read_builtins_source(args.builtins_rs))
+    mono_check_rs = (args.builtins_rs.parents[2] / "sparagmos-driver"
+                     / "src" / "mono_check.rs")
+    registry = BuiltinRegistry(
+        read_builtins_source(args.builtins_rs),
+        read_comptime_intrinsics(mono_check_rs))
     tasks = []
     for f in sorted(args.corpus_dir.glob("*.rs")):
         tasks.append((str(f), "corpus", str(args.driver_bin), args.timeout))
@@ -727,7 +779,9 @@ def main(argv=None):
           f"{len(registry.float128_methods)}, "
           f"unicode modules: {len(registry.unicode_modules)}, "
           f"guards: range_inclusive_new={registry.range_inclusive_new}, "
-          f"to_uppercase={registry.to_uppercase})")
+          f"to_uppercase={registry.to_uppercase}, "
+          f"trait methods: {len(registry.trait_methods)}, "
+          f"comptime intrinsics: {len(registry.comptime_intrinsics)})")
 
     records = []
     with concurrent.futures.ThreadPoolExecutor(

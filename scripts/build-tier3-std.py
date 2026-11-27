@@ -9,8 +9,15 @@ against the triples that have a std in the sysroot
 `<sysroot>/lib/rustlib/*/lib`). rustup distributes prebuilt std
 for 119 triples of the 1.100.0 channel; the remaining known
 triples are tier-3 targets with no prebuilt std at all, so every
-record naming one stays "not attempted (compile-flags)" (158
-records). For those triples the only source of a std the pinned
+record naming one stays "not attempted (compile-flags)". The
+table below covers every triple that blocks more than one
+record: at the latest official measurement before the fourth
+increment, 57 compile-check records were still blocked by
+triples outside the table, and that increment's 43 entries make
+51 of them attemptable. The six records that remain blocked
+name xtensa-esp32-none-elf (three; that backend cannot build
+even core, see below) or are all-targets census tests naming
+~200 triples apiece, most of them one-offs. For those triples the only source of a std the pinned
 compiler will accept is the compiler itself: rustc refuses rlibs
 whose metadata another compiler version produced, so the std
 must be built by the pinned 1.100.0 compiler from its own
@@ -24,17 +31,24 @@ debug-assertion behaviour under the guest, which is a judging
 difference, not just a size one.
 
 Each table entry needs one green build-std run as its entry
-ticket: per-triple buildability varies (full std for
-m68k-unknown-linux-gnu, for example, fails inside LLVM codegen
-with this compiler, so that triple stays blocked regardless of
-this pipeline). Core-only triples (the `-none` family and
-similar) have no std to build; `core,alloc` is their ceiling,
-and records whose test files use std then fail at the guest
-compile on their merits instead of staying unattempted. The
-OS triples in the table (sparc/mips/mips64 linux, hexagon
-musl, powerpc64 AIX, i686 darwin, wasm64) carry the full
-`core,std,panic_unwind` set, matching what a distributed std
-for those targets would provide. Apart from the two targets
+ticket: per-triple buildability varies. Full std for
+m68k-unknown-linux-gnu fails inside LLVM codegen with this
+compiler (`Cannot select` in std's main_thread), so that
+triple is registered with the `core,alloc` set that does
+build; xtensa-esp32-none-elf fails the same way inside
+compiler_builtins, so not even core builds for it and it
+stays blocked regardless of this pipeline. Core-only triples
+(the `-none` family and similar) have no std to build;
+`core,alloc` is their ceiling, and records whose test files
+use std then fail at the guest compile on their merits
+instead of staying unattempted. The OS triples in the table
+(the linux gnu/musl/uclibc family across aarch64, csky,
+mips/mipsel/mips64/mips64el and the mipsisa r6 variants,
+sparc linux, hexagon musl, powerpc gnuspe and powerpc64
+AIX, riscv32gc linux, fuchsia, hermit, the Apple
+ios/watchos/darwin triples, the uwp windows-gnu pair,
+wasm64) carry the full `core,std,panic_unwind` set, matching
+what a distributed std for those targets would provide. Apart from the two targets
 called out below, no entry needs an explicit `-C target-cpu`
 to build: each entry's ticket build ran without one.
 
@@ -64,22 +78,65 @@ TOOLCHAIN = "1.100.0"
 # every set (build-std requires it as the root). Order inside a
 # set does not matter; build-std resolves the dependency closure.
 TIER3_STD = {
-    "aarch64v8r-unknown-none": ("core", "alloc"),
     "aarch64-unknown-linux-pauthtest": ("core", "std", "panic_unwind"),
+    "aarch64-unknown-trusty": ("core", "alloc"),
+    "aarch64_be-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "aarch64v8r-unknown-none": ("core", "alloc"),
+    "aarch64v8r-unknown-none-softfloat": ("core", "alloc"),
     "amdgcn-amd-amdhsa": ("core", "alloc"),
+    "armebv7r-none-eabi": ("core", "alloc"),
+    "armebv7r-none-eabihf": ("core", "alloc"),
+    "armv5te-none-eabi": ("core", "alloc"),
+    "armv7k-apple-watchos": ("core", "std", "panic_unwind"),
+    "armv7s-apple-ios": ("core", "std", "panic_unwind"),
     "avr-none": ("core", "alloc"),
     "bpfeb-unknown-none": ("core", "alloc"),
     "bpfel-unknown-none": ("core", "alloc"),
+    "csky-unknown-linux-gnuabiv2": ("core", "std", "panic_unwind"),
     "hexagon-unknown-linux-musl": ("core", "std", "panic_unwind"),
+    "i386-apple-ios": ("core", "std", "panic_unwind"),
     "i686-apple-darwin": ("core", "std", "panic_unwind"),
+    "i686-uwp-windows-gnu": ("core", "std", "panic_unwind"),
+    "m68k-unknown-linux-gnu": ("core", "alloc"),
+    "m68k-unknown-none-elf": ("core", "alloc"),
+    "mips-mti-none-elf": ("core", "alloc"),
     "mips-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "mips-unknown-linux-musl": ("core", "std", "panic_unwind"),
+    "mips-unknown-linux-uclibc": ("core", "std", "panic_unwind"),
+    "mips64-openwrt-linux-musl": ("core", "std", "panic_unwind"),
     "mips64-unknown-linux-gnuabi64": ("core", "std", "panic_unwind"),
+    "mips64-unknown-linux-muslabi64": ("core", "std", "panic_unwind"),
+    "mips64el-unknown-linux-gnuabi64": ("core", "std", "panic_unwind"),
+    "mips64el-unknown-linux-muslabi64": ("core", "std", "panic_unwind"),
+    "mipsel-mti-none-elf": ("core", "alloc"),
+    "mipsel-sony-psp": ("core", "alloc"),
+    "mipsel-sony-psx": ("core", "alloc"),
+    "mipsel-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "mipsel-unknown-linux-musl": ("core", "std", "panic_unwind"),
+    "mipsel-unknown-linux-uclibc": ("core", "std", "panic_unwind"),
+    "mipsel-unknown-netbsd": ("core", "std", "panic_unwind"),
+    "mipsel-unknown-none": ("core", "alloc"),
+    "mipsisa32r6-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "mipsisa32r6el-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "mipsisa64r6-unknown-linux-gnuabi64": ("core", "std", "panic_unwind"),
+    "mipsisa64r6el-unknown-linux-gnuabi64": ("core", "std", "panic_unwind"),
     "msp430-none-elf": ("core", "alloc"),
+    "powerpc-unknown-linux-gnuspe": ("core", "std", "panic_unwind"),
     "powerpc64-ibm-aix": ("core", "std", "panic_unwind"),
     "riscv32e-unknown-none-elf": ("core", "alloc"),
+    "riscv32em-unknown-none-elf": ("core", "alloc"),
+    "riscv32emc-unknown-none-elf": ("core", "alloc"),
+    "riscv32gc-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "riscv32gc-unknown-linux-musl": ("core", "std", "panic_unwind"),
+    "riscv64gc-unknown-fuchsia": ("core", "std", "panic_unwind"),
+    "s390x-unknown-none-softfloat": ("core", "alloc"),
     "sparc-unknown-linux-gnu": ("core", "std", "panic_unwind"),
     "sparc-unknown-none-elf": ("core", "alloc"),
+    "thumbv4t-none-eabi": ("core", "alloc"),
+    "thumbv5te-none-eabi": ("core", "alloc"),
     "wasm64-unknown-unknown": ("core", "std", "panic_unwind"),
+    "x86_64-unknown-hermit": ("core", "std", "panic_unwind"),
+    "x86_64-uwp-windows-gnu": ("core", "std", "panic_unwind"),
 }
 
 # triple -> the `-C target-cpu` its build-std run must carry.
