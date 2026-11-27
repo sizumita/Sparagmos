@@ -721,3 +721,63 @@ fn const_expr_normalize_in_materialization_keeps_its_verdict() {
         "the target crate converts: {stdout}"
     );
 }
+
+/// The shape of
+/// tests/ui/traits/next-solver/overflow/dont-lower-depth-for-witness-and-rigid-opaque.rs
+/// (Issue #510): the crate's `#![recursion_limit = "6"]` is
+/// calibrated for its own type-checking queries under
+/// `-Znext-solver`. Conversion's layout tables pose a layout
+/// query the reference compilation never poses (for
+/// `core::task::wake::ExtData<'a>`, inside the nested async
+/// bodies' types), which increases the query depth by 8 and
+/// fails with the "queries overflow the depth limit!"
+/// diagnostic. The layout query is auxiliary -- the type
+/// simply gets no layout entry -- so its failure, which
+/// arrives as a session diagnostic rather than a panic, must
+/// be discounted with the query: left standing in the
+/// session's error count it falsely rejects a program rustc
+/// accepts. The program converts.
+const NEXT_SOLVER_DEPTH_RS: &str = r##"
+#![recursion_limit = "6"]
+
+async fn foo1() {}
+
+async fn foo2() {
+    foo1().await
+}
+async fn foo3() {
+    foo2().await
+}
+async fn foo4() {
+    foo3().await
+}
+
+async fn foo5() {
+    foo4().await
+}
+
+fn assert_send<T: Send>(_: T) {}
+
+fn main() {
+    assert_send(foo5());
+}
+"##;
+
+#[test]
+fn layout_query_depth_overflow_is_discounted() {
+    let (code, stdout, stderr) = convert(
+        "next_solver_depth",
+        NEXT_SOLVER_DEPTH_RS,
+        &["-Znext-solver"],
+        &[],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("compilation failed"),
+        "a failed auxiliary layout query must not fail the compilation: {stderr}"
+    );
+    assert!(
+        stdout.contains("fn next_solver_depth::main:"),
+        "the target crate converts: {stdout}"
+    );
+}

@@ -150,6 +150,52 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Run one speculative layout query (`Ty::layout`) for the
+/// layout tables, discounting the diagnostics of a failed
+/// query.
+///
+/// The layout recorders pose the compiler's layout query for
+/// types the reference compilation may never lay out in that
+/// form: the tables are auxiliary -- a type whose layout the
+/// query cannot give simply gets no entry and stays
+/// unsupported -- so a failed query must never fail the
+/// conversion. Panic containment alone does not achieve that:
+/// a query that fails by diagnostic rather than by panic (the
+/// query-depth limit is the standing shape: a crate whose
+/// `#![recursion_limit]` is calibrated for its own
+/// type-checking queries, like the next-solver overflow test
+/// whose async bodies make conversion pose a layout query for
+/// `core::task::wake::ExtData<'a>` at +8 depth, is rejected
+/// with "queries overflow the depth limit!") returns `Err`
+/// after emitting the error into the session, and left
+/// standing in the session's error count that one report
+/// fails the whole compilation of a program rustc accepts
+/// (Issue #510). The discount follows the materialization
+/// discipline: when the query failed (by error or by panic)
+/// and the session's error count grew during it, the count
+/// is reset. A successful query keeps whatever it emitted,
+/// exactly as before.
+pub fn guarded_layout(
+    ty: &rustc_public::ty::Ty,
+) -> Option<rustc_public::abi::Layout> {
+    let dcx = compiler_tcx().map(|tcx| tcx.dcx());
+    let errors_before = dcx.map(|d| d.err_count());
+    let result = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| ty.layout()),
+    );
+    match result {
+        Ok(Ok(layout)) => Some(layout),
+        _ => {
+            if let (Some(dcx), Some(before)) = (dcx, errors_before) {
+                if dcx.err_count() > before {
+                    dcx.reset_err_count();
+                }
+            }
+            None
+        }
+    }
+}
+
 thread_local! {
     /// Keys of the bodies whose materialization emitted
     /// evaluation diagnostics that `with_body_materialization`
