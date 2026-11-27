@@ -1051,6 +1051,17 @@ impl Converter {
     /// reference records nothing, exactly as the dyn demand
     /// pass treats it. Results are memoised per reference (see
     /// `Converter::vtable_methods_cache`).
+    ///
+    /// A reference that still mentions a generic parameter is
+    /// never resolved: it arises from an unsizing cast inside a
+    /// generic body, where the cast's "concrete" type is the
+    /// parameter itself (or contains it), and asking the
+    /// compiler for its vtable ICEs in instance resolution
+    /// (`failed to resolve instance for <&T as Debug>::fmt`).
+    /// The ICE diagnostic is emitted into the session before
+    /// any containment can downgrade it, so the whole
+    /// compilation fails; such a reference records nothing and
+    /// dispatch keeps the pre-existing resolution chain.
     pub(super) fn vtable_method_names(
         &mut self,
         tr: &rustc_public::ty::TraitRef,
@@ -1058,6 +1069,12 @@ impl Converter {
         let key = format!("{tr:?}");
         if let Some(names) = self.vtable_methods_cache.get(&key) {
             return names.clone();
+        }
+        let tr_args = tr.args();
+        if args_mention_params(&tr_args) {
+            self.vtable_methods_cache
+                .insert(key, Vec::new());
+            return Vec::new();
         }
         let mut names: Vec<String> = Vec::new();
         let mut queue =
