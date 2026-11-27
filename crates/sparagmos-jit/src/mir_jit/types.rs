@@ -39,6 +39,12 @@ pub struct MirProgramInput {
     pub functions: Vec<MirFunctionInput>,
     pub names: HashMap<mir::DefId, String>,
     pub adt_discriminants: mir::AdtDiscriminants,
+    /// The program-wide source-file table the bodies'
+    /// `source_lines` index into: a panic site's recorded
+    /// location is resolved through it. Empty for inputs built
+    /// without source information (their panic records then
+    /// carry no location).
+    pub source_files: Vec<String>,
 }
 
 /// Why a program did not compile on the JIT path.
@@ -152,6 +158,7 @@ impl JitProgram {
             .collect();
         let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants, &input.names);
         let mut messages = MsgTable::default();
+        let mut locations = MsgTable::default();
         let mut places = MsgTable::default();
         let mut statics = StaticsTable::default();
         let mut tables = BuiltinTables::default();
@@ -165,6 +172,8 @@ impl JitProgram {
                 &input.adt_discriminants,
                 &layouts,
                 &mut messages,
+                &mut locations,
+                &input.source_files,
                 &mut places,
                 &mut statics,
                 &mut tables,
@@ -184,6 +193,7 @@ impl JitProgram {
             &ir_funcs,
             messages.into_vec(),
             places.into_vec(),
+            locations.into_vec(),
             statics.into_vec(),
             tables,
         )?;

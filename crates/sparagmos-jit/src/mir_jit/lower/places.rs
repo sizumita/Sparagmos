@@ -530,14 +530,17 @@ impl<'a> FnLower<'a> {
                 lhs: IrOperand::Value(idx_v),
                 rhs: IrOperand::Const(0),
             });
+            let loc = self.cur_loc;
             self.branch_unless(
                 ok,
                 vec![Instr::PanicNegativeIndex {
                     index: IrOperand::Value(idx_v),
                     place,
+                    loc,
                 }],
             );
         }
+        let loc = self.cur_loc;
         self.guard_cmp(
             IrBinOp::LtU,
             idx_v,
@@ -545,6 +548,7 @@ impl<'a> FnLower<'a> {
             vec![Instr::PanicIndexOob {
                 len: IrOperand::Value(len_v),
                 index: IrOperand::Value(idx_v),
+                loc,
             }],
         );
     }
@@ -559,6 +563,7 @@ impl<'a> FnLower<'a> {
         let len_v = self.len_value(&check.len);
         let end_v = if check.from_end {
             let to_v = self.const_slot(check.to);
+            let loc = self.cur_loc;
             self.guard_cmp(
                 IrBinOp::LeU,
                 to_v,
@@ -566,6 +571,7 @@ impl<'a> FnLower<'a> {
                 vec![Instr::PanicRangeEnd {
                     end: IrOperand::Value(to_v),
                     len: IrOperand::Value(len_v),
+                    loc,
                 }],
             );
             let d = self.fresh();
@@ -580,6 +586,7 @@ impl<'a> FnLower<'a> {
             self.const_slot(check.to)
         };
         let from_v = self.const_slot(check.from);
+        let loc = self.cur_loc;
         self.guard_cmp(
             IrBinOp::LeU,
             from_v,
@@ -587,9 +594,11 @@ impl<'a> FnLower<'a> {
             vec![Instr::PanicSliceIndex {
                 from: IrOperand::Value(from_v),
                 end: IrOperand::Value(end_v),
+                loc,
             }],
         );
         if !check.from_end {
+            let loc = self.cur_loc;
             self.guard_cmp(
                 IrBinOp::LeU,
                 end_v,
@@ -597,6 +606,7 @@ impl<'a> FnLower<'a> {
                 vec![Instr::PanicRangeEnd {
                     end: IrOperand::Value(end_v),
                     len: IrOperand::Value(len_v),
+                    loc,
                 }],
             );
         }

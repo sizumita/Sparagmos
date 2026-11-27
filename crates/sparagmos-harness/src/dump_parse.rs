@@ -154,6 +154,9 @@ pub fn parse_dump(text: &str) -> Result<ParsedDump, DumpError> {
             functions,
             names: def_names,
             adt_discriminants: Default::default(),
+            // The dump carries no source-file table, so JIT
+            // panic records from a dump carry no location.
+            source_files: Vec::new(),
         },
         skipped,
     })

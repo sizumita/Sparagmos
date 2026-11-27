@@ -193,6 +193,11 @@ pub enum ShiftOp128 {
 
 /// One instruction. Every instruction that produces a value names its
 /// destination value explicitly.
+/// A panic site with no known source position: the `loc` field
+/// of the panic instructions carries this instead of an index
+/// into the program's panic-location table.
+pub const NO_LOCATION: u32 = u32::MAX;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instr {
     /// `dst = imm`
@@ -285,8 +290,14 @@ pub enum Instr {
     /// immediately. Callers are expected to follow a call with
     /// [`Instr::CheckPanic`] so the panic propagates to the entry
     /// point instead of execution continuing with dummy values.
+    /// `loc` indexes the program's panic-location table (the
+    /// `file:line:col` strings the front end resolved from the
+    /// panic site's source position), or is [`NO_LOCATION`] when
+    /// the site has no known position; the recorded panic carries
+    /// it so the default panic report can name the location, as
+    /// std's does.
     /// Program compiles only, like [`Instr::Call`].
-    Panic { msg: u32 },
+    Panic { msg: u32, loc: u32 },
     /// If the program's panic flag is set, return from the current
     /// function immediately (propagating a guest panic raised by a
     /// callee). Otherwise a no-op. Program compiles only.
@@ -296,7 +307,7 @@ pub enum Instr {
     /// bounds: the len is {len} but the index is {index}". The message is formatted
     /// by a helper in the program layer into a scratch buffer and
     /// then recorded through the usual panic path. Program compiles only.
-    PanicIndexOob { len: Operand, index: Operand },
+    PanicIndexOob { len: Operand, index: Operand, loc: u32 },
     /// Guest panic with the negative-index message, whose text
     /// depends on the runtime index and on the place being indexed:
     /// "index out of bounds: negative index {index} used for
@@ -304,17 +315,17 @@ pub enum Instr {
     /// the message is formatted by a helper in the program layer
     /// into a scratch buffer and then recorded through the usual
     /// panic path. Program compiles only.
-    PanicNegativeIndex { index: Operand, place: u32 },
+    PanicNegativeIndex { index: Operand, place: u32, loc: u32 },
     /// Guest panic with the sub-slice range-end message: "range
     /// end index {end} out of range for slice of length {len}",
     /// formatted at run time like [`Instr::PanicIndexOob`].
     /// Program compiles only.
-    PanicRangeEnd { end: Operand, len: Operand },
+    PanicRangeEnd { end: Operand, len: Operand, loc: u32 },
     /// Guest panic with the sub-slice inverted-range message:
     /// "slice index starts at {from} but ends at {end}", formatted
     /// at run time like [`Instr::PanicIndexOob`]. Program compiles
     /// only.
-    PanicSliceIndex { from: Operand, end: Operand },
+    PanicSliceIndex { from: Operand, end: Operand, loc: u32 },
     /// `dst = lhs op rhs` on floating-point values of format `kind`.
     /// Operands and the result are bit patterns in their slots (see
     /// the module docs); for the comparison forms the result is the

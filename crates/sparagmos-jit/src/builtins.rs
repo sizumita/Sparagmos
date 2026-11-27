@@ -808,13 +808,23 @@ impl BuiltinCtx {
     /// read. Without a wired panic path (unit tests) the message is
     /// simply dropped and the dummy words returned.
     fn fail(&mut self, msg: &str) -> HostRet {
+        self.fail_at(msg, u64::MAX)
+    }
+
+    /// Like [`BuiltinCtx::fail`], but the panic records the
+    /// source location the front end resolved for the panic
+    /// site: `loc` is an index into the program's panic-location
+    /// table, written to the panic context's location word
+    /// (`u64::MAX` when the site has no known position).
+    fn fail_at(&mut self, msg: &str, loc: u64) -> HostRet {
         if !self.panic_flag.is_null() {
             let bytes = msg.as_bytes();
             let n = bytes.len().min(120);
             // Safety: `scratch` is the program's 128-byte scratch
             // buffer (8 length bytes + message), wired by the
             // program layer; `panic_flag` is the program's panic
-            // context (flag word, then message-index word). Both
+            // context (flag word, message-index word, then the
+            // location-index word). Both
             // outlive every host call of the owning program.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -826,6 +836,7 @@ impl BuiltinCtx {
                 sparagmos_runtime::ffi::sparagmos_panic(self.scratch.add(8), n);
                 *self.panic_flag = 1;
                 *self.panic_flag.add(1) = u64::MAX;
+                *self.panic_flag.add(2) = loc;
             }
         }
         HostRet::one(0)
@@ -1632,31 +1643,36 @@ extern "C" fn host_str_eq(
 /// (`panic_nounwind_fmt`, `panic_fmt`): the message is the
 /// formatted arguments; the call raises the guest panic with
 /// it and never returns a value.
-fn fail_with_arguments(ctx: &mut BuiltinCtx, handle: i64, what: &str) -> HostRet {
+fn fail_with_arguments(ctx: &mut BuiltinCtx, handle: i64, what: &str, loc: i64) -> HostRet {
     let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
-        return ctx.fail(&format!("{what} of a value that is not fmt::Arguments"));
+        return ctx.fail_at(
+            &format!("{what} of a value that is not fmt::Arguments"),
+            loc as u64,
+        );
     };
     let data = data.clone();
     match format_arguments(ctx, &data) {
-        Ok(text) => ctx.fail(&text),
-        Err(m) => ctx.fail(&m),
+        Ok(text) => ctx.fail_at(&text, loc as u64),
+        Err(m) => ctx.fail_at(&m, loc as u64),
     }
 }
 
 /// `core::panicking::panic_nounwind_fmt(Arguments, bool)`:
 /// the message is the formatted arguments; the call raises the
 /// guest panic with it and never returns a value. Arguments:
-/// (arguments handle, _, _, _, _).
+/// (arguments handle, location index, _, _, _) — the location
+/// index is the front end's panic-location table index for the
+/// call site (-1 for none).
 extern "C" fn host_panic_nounwind_fmt(
     ctx: *mut BuiltinCtx,
     handle: i64,
-    _a: i64,
+    loc: i64,
     _b: i64,
     _c: i64,
     _d: i64,
 ) -> HostRet {
     let ctx = unsafe { &mut *ctx };
-    fail_with_arguments(ctx, handle, "panic_nounwind_fmt")
+    fail_with_arguments(ctx, handle, "panic_nounwind_fmt", loc)
 }
 
 /// `std::rt::panic_fmt(Arguments)` /
@@ -1664,36 +1680,38 @@ extern "C" fn host_panic_nounwind_fmt(
 /// formatted arguments, exactly as for `panic_nounwind_fmt`
 /// (the nounwind flag only controls native backtrace capture,
 /// which no guest program can observe). Arguments:
-/// (arguments handle, _, _, _, _).
+/// (arguments handle, location index, _, _, _).
 extern "C" fn host_panic_fmt(
     ctx: *mut BuiltinCtx,
     handle: i64,
-    _a: i64,
+    loc: i64,
     _b: i64,
     _c: i64,
     _d: i64,
 ) -> HostRet {
     let ctx = unsafe { &mut *ctx };
-    fail_with_arguments(ctx, handle, "panic_fmt")
+    fail_with_arguments(ctx, handle, "panic_fmt", loc)
 }
 
 /// `core::panicking::panic(&str)` and the `&str` panic entries
 /// that share its shape (`panic_nounwind`, `expect_failed`):
 /// the message is the string itself; the call raises the guest
 /// panic with it and never returns a value. Arguments:
-/// (string pointer, string length, _, _, _).
+/// (string pointer, string length, location index, _, _) — the
+/// location index is the front end's panic-location table
+/// index for the call site (-1 for none).
 extern "C" fn host_panic_str(
     ctx: *mut BuiltinCtx,
     ptr: i64,
     len: i64,
-    _a: i64,
+    loc: i64,
     _b: i64,
     _c: i64,
 ) -> HostRet {
     let ctx = unsafe { &mut *ctx };
     match read_str(ptr, len) {
-        Ok(text) => ctx.fail(&text),
-        Err(m) => ctx.fail(&m),
+        Ok(text) => ctx.fail_at(&text, loc as u64),
+        Err(m) => ctx.fail_at(&m, loc as u64),
     }
 }
 

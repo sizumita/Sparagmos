@@ -164,6 +164,12 @@ pub(super) struct FnLower<'a> {
     discriminants: &'a mir::AdtDiscriminants,
     layouts: &'a AdtLayouts,
     messages: &'a mut MsgTable,
+    /// Panic location strings (`file:line:col` of a panic site),
+    /// interned like `messages`.
+    locations: &'a mut MsgTable,
+    /// The program-wide source-file table the body's
+    /// `source_lines` index into.
+    source_files: &'a [String],
     /// Place strings for the negative-index panic, interned like
     /// `messages`.
     places: &'a mut MsgTable,
@@ -186,6 +192,20 @@ pub(super) struct FnLower<'a> {
     /// The segment currently being filled and its block id.
     cur_id: u32,
     cur: Vec<Instr>,
+    /// The panic-location table index of the statement or
+    /// terminator currently being lowered (its source position,
+    /// resolved through `source_files`), or
+    /// [`crate::ir::NO_LOCATION`] when the position is unknown.
+    /// Panic sites lowered from here record it.
+    cur_loc: u32,
+    /// Like `cur_loc`, for the panic *entry* calls (`panic_fmt`
+    /// and kin): std's `#[track_caller]` propagation reports the
+    /// location the entry received from its caller, which the
+    /// JIT cannot recover when the call site sits inside a
+    /// library body (the entry's own frame is the library's), so
+    /// a library call site records no location instead of the
+    /// library's own position.
+    cur_entry_loc: u32,
 }
 
 impl<'a> FnLower<'a> {
@@ -197,6 +217,8 @@ impl<'a> FnLower<'a> {
         discriminants: &'a mir::AdtDiscriminants,
         layouts: &'a AdtLayouts,
         messages: &'a mut MsgTable,
+        locations: &'a mut MsgTable,
+        source_files: &'a [String],
         places: &'a mut MsgTable,
         statics: &'a mut StaticsTable,
         tables: &'a mut BuiltinTables,
@@ -210,6 +232,8 @@ impl<'a> FnLower<'a> {
             discriminants,
             layouts,
             messages,
+            locations,
+            source_files,
             places,
             statics,
             tables,
@@ -219,6 +243,8 @@ impl<'a> FnLower<'a> {
             blocks: Vec::new(),
             cur_id: 0,
             cur: Vec::new(),
+            cur_loc: crate::ir::NO_LOCATION,
+            cur_entry_loc: crate::ir::NO_LOCATION,
         }
     }
 
@@ -290,11 +316,70 @@ impl<'a> FnLower<'a> {
     }
 
     /// A fresh block that panics with the given message and never
-    /// returns.
+    /// returns. The panic records the current site's location
+    /// (`cur_loc`).
     fn panic_block(&mut self, msg: u32) -> u32 {
+        let loc = self.cur_loc;
         let id = self.new_block();
-        self.seal_block(id, vec![Instr::Panic { msg }], IrTerminator::Unreachable);
+        self.seal_block(
+            id,
+            vec![Instr::Panic { msg, loc }],
+            IrTerminator::Unreachable,
+        );
         id
+    }
+
+    /// Intern one source position as a panic-location string
+    /// (`file:line:col`, the shape std's report head carries),
+    /// or [`crate::ir::NO_LOCATION`] when the position is
+    /// unknown or its file is outside the program's table.
+    fn intern_location(&mut self, sl: mir::SourceLine) -> u32 {
+        if !sl.is_known() {
+            return crate::ir::NO_LOCATION;
+        }
+        let Some(file) = self.source_files.get(sl.file as usize) else {
+            return crate::ir::NO_LOCATION;
+        };
+        self.locations
+            .intern(&format!("{}:{}:{}", file, sl.line, sl.col))
+    }
+
+    /// Whether a source file is one of the toolchain's library
+    /// sources (the same test the interpreter's call-site stamp
+    /// applies).
+    fn is_library_source(file: &str) -> bool {
+        file.contains("/library/core/")
+            || file.contains("/library/std/")
+            || file.contains("/library/alloc/")
+    }
+
+    /// Point the current panic locations at one statement's or
+    /// terminator's source position (see `cur_loc` /
+    /// `cur_entry_loc`).
+    fn set_cur_loc(&mut self, sl: mir::SourceLine) {
+        self.cur_loc = self.intern_location(sl);
+        self.cur_entry_loc = if sl.is_known()
+            && self
+                .source_files
+                .get(sl.file as usize)
+                .is_some_and(|f| Self::is_library_source(f))
+        {
+            crate::ir::NO_LOCATION
+        } else {
+            self.cur_loc
+        };
+    }
+
+    /// The current panic-entry location as a host-call argument
+    /// word: the location index, or -1 when there is none (the
+    /// host layer stores it as the panic context's location
+    /// word, where `u64::MAX` means none).
+    pub(super) fn entry_loc_arg(&self) -> i64 {
+        if self.cur_entry_loc == crate::ir::NO_LOCATION {
+            -1
+        } else {
+            self.cur_entry_loc as i64
+        }
     }
 
     pub(super) fn run(mut self) -> Result<IrFunction, JitError> {
@@ -363,8 +448,15 @@ impl<'a> FnLower<'a> {
         for (i, bb) in body.basic_blocks.iter().enumerate() {
             self.cur_id = i as u32;
             self.cur = Vec::new();
-            for stmt in &bb.statements {
+            let block_lines = body.source_lines.get(i);
+            for (si, stmt) in bb.statements.iter().enumerate() {
+                if let Some(sl) = block_lines.and_then(|l| l.statements.get(si)) {
+                    self.set_cur_loc(*sl);
+                }
                 self.lower_statement(&stmt.kind)?;
+            }
+            if let Some(sl) = block_lines.map(|l| l.terminator) {
+                self.set_cur_loc(sl);
             }
             match &bb.terminator {
                 Some(term) => self.lower_terminator(&term.kind)?,

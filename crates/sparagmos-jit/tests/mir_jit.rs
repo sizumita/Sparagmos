@@ -161,6 +161,7 @@ fn build_with_table(
             .collect(),
         names: names.clone(),
         adt_discriminants: table.clone(),
+        source_files: Vec::new(),
     };
     let interp_in = common::interp_program(
         specs
@@ -1062,6 +1063,7 @@ fn unsupported_constructs_report_reasons() {
         functions: vec![float_fn],
         names: HashMap::new(),
         adt_discriminants: Default::default(),
+        source_files: Vec::new(),
     })
     .expect_err("f16 must be unsupported");
     match err {
@@ -1094,6 +1096,7 @@ fn unsupported_constructs_report_reasons() {
         }],
         names,
         adt_discriminants: Default::default(),
+        source_files: Vec::new(),
     })
     .expect("a program whose only flaw is an unservable call still compiles");
     match jit.call("caller", &[]) {
@@ -1603,6 +1606,7 @@ fn repeat_beyond_frame_bound_is_unsupported() {
         functions: vec![f],
         names: HashMap::new(),
         adt_discriminants: Default::default(),
+        source_files: Vec::new(),
     })
     .expect_err("an array past the frame bound must be unsupported");
     match err {
@@ -2288,6 +2292,7 @@ fn jit_compile(specs: &[FnSpec]) -> Result<JitProgram, JitError> {
             .collect(),
         names,
         adt_discriminants: Default::default(),
+        source_files: Vec::new(),
     })
 }
 
