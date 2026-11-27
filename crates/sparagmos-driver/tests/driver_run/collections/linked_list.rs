@@ -136,3 +136,58 @@ fn run_mode_linked_list_adapter_collect_into_vec() {
         "cloned=[1, 2, 3]\nchint (3, Some(3))\ncopied=[1, 2, 3]\nmapped=[2, 3, 4]\nbig=40 117\nownedmapped=40 2380\n"
     );
 }
+
+const LINKED_LIST_STR_ELEMENT_SRC: &str = r#"
+use std::collections::LinkedList;
+use std::cell::Cell;
+
+struct Elem<'a> {
+    mark: u32,
+    name: &'a str,
+    contents: Cell<Option<&'a LinkedList<Elem<'a>>>>,
+}
+
+fn main() {
+    let mut ll: LinkedList<Elem> = LinkedList::new();
+    ll.push_back(Elem { mark: 1, name: "ll0", contents: Cell::new(None) });
+    ll.push_back(Elem { mark: 2, name: "ll1", contents: Cell::new(None) });
+    for e in ll.iter() {
+        e.contents.set(Some(&ll));
+    }
+    let f = ll.front().unwrap();
+    println!("front {} {}", f.mark, f.name);
+    println!("front link {}", f.contents.get().is_some());
+    let b = ll.back().unwrap();
+    println!("back {} {}", b.mark, b.name);
+    for e in ll.iter() {
+        println!("elem {} {}", e.mark, e.name);
+    }
+    println!("len {}", ll.len());
+}
+"#;
+
+#[test]
+fn run_mode_linked_list_str_named_self_ref_elements() {
+    // A LinkedList whose elements carry a `&str` field and a
+    // self-reference set after insertion (the dropck legal
+    // cycles shape): the node storage is written through a
+    // `MaybeUninit` pointer and read back through the
+    // retargeted node pointer, so the read side must enter
+    // the union wrapper around the node. The entry judgment
+    // weighs whether the stored field is the pointee's own
+    // complete value; a payload whose `&str` field is stored
+    // as a bare string value must still judge complete.
+    let dir = temp_dir("linked_list_str_elements");
+    let src = fixture(&dir, "linked_list_str_elements.rs", LINKED_LIST_STR_ELEMENT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "LinkedList of &str-carrying self-referential elements must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "front 1 ll0\nfront link true\nback 2 ll1\nelem 1 ll0\nelem 2 ll1\nlen 2\n"
+    );
+}

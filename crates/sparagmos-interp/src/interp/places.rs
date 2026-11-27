@@ -2029,6 +2029,17 @@ impl<'a> Interpreter<'a> {
             return matches!(value, Value::Tuple(_) | Value::Bytes(_) | Value::Str(_));
         }
         if tag.starts_with('&') || tag.starts_with('*') {
+            // A bare string value is the stored form of an
+            // `&str` field (the same representation
+            // `value_fits_ty` blesses for a reference-to-`str`
+            // position): the element is the string data,
+            // re-formed as a reference by the declared type on
+            // ordinary reads, so it is a plausible value of a
+            // reference-to-`str` field alongside the reference
+            // forms themselves.
+            if matches!(value, Value::Str(_)) && tag_pointee(tag) == Some("str") {
+                return true;
+            }
             return matches!(
                 value,
                 Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
@@ -2937,6 +2948,24 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
         }
     }
     None
+}
+
+/// The pointee a reference type tag denotes: the tag past
+/// the leading `&` / `*`, an optional `mut` / `const` of a
+/// raw pointer, and an optional lifetime (`&'static str`
+/// denotes `str`, as do `&str` and `*const str`).
+fn tag_pointee(tag: &str) -> Option<&str> {
+    let rest = tag.strip_prefix('&').or_else(|| tag.strip_prefix('*'))?;
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix("mut ")
+        .or_else(|| rest.strip_prefix("const "))
+        .unwrap_or(rest);
+    let rest = match rest.strip_prefix('\'') {
+        Some(lt) => lt.split_once(' ').map_or(lt, |(_, tail)| tail),
+        None => rest,
+    };
+    Some(rest.trim())
 }
 
 /// A resolved target descended through a one-field wrapper's
