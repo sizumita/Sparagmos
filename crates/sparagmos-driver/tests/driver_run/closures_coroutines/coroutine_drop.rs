@@ -217,3 +217,123 @@ fn run_mode_coroutine_two_yield_tuple_drop_runs_placed_element_dtor() {
         "the yielded value drops at the resume statement, the placed element at the drop"
     );
 }
+
+// ----- async closure values stored in a coroutine's saved storage ----------
+
+const CLOSURE_IN_COROUTINE_BLOCK_ON: &str = r#"
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake};
+
+struct Nop;
+
+impl Wake for Nop {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let waker = Arc::new(Nop).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) {
+        println!("{}", self.0);
+    }
+}
+
+struct S {
+    a: i32,
+    b: Drop,
+    c: Drop,
+}
+"#;
+
+#[test]
+fn run_mode_async_closure_in_coroutine_storage_drops_captures_at_scope_end() {
+    // An async closure created inside an async fn and live
+    // across an await is stored in the enclosing coroutine's
+    // saved storage; the transformed body creates it at, and
+    // drops it through, a state-field projection whose type is
+    // the unit placeholder the driver records for a
+    // coroutine-closure type. The drop must still be planned
+    // from the creation aggregate, so the captured field's
+    // destructor runs at the end of the block - the same output
+    // a plain frame produces for the same closure value.
+    let src = format!(
+        r#"{CLOSURE_IN_COROUTINE_BLOCK_ON}
+async fn async_main() {{
+    {{
+        let mut s = S {{ a: 1, b: Drop("fix me up"), c: Drop("untouched") }};
+        let mut c = async move || {{
+            s.a = 2;
+            let w = &mut s.b;
+            w.0 = "fixed";
+        }};
+        s.c.0 = "uncaptured";
+        let fut = c();
+        println!("after call");
+        fut.await;
+        println!("after await");
+    }}
+    println!("end");
+}}
+
+fn main() {{
+    block_on(async_main());
+}}
+"#
+    );
+    run_ok_edition(
+        "async-closure-in-coroutine-scope-end-drop",
+        &src,
+        "after call\nafter await\nfixed\nuncaptured\nend\n",
+    );
+}
+
+#[test]
+fn run_mode_mem_drop_of_async_closure_in_coroutine_storage_drops_captures() {
+    // The explicit `std::mem::drop` form of the same shape: the
+    // call's argument is staged through a move temporary, and
+    // the glue recovery traces it back to the state-field
+    // projection the creation aggregate wrote, so the captured
+    // field's destructor runs at the `drop` call.
+    let src = format!(
+        r#"{CLOSURE_IN_COROUTINE_BLOCK_ON}
+async fn async_main() {{
+    let mut s = S {{ a: 1, b: Drop("fix me up"), c: Drop("untouched") }};
+    let mut c = async move || {{
+        s.a = 2;
+        let w = &mut s.b;
+        w.0 = "fixed";
+    }};
+    s.c.0 = "uncaptured";
+    let fut = c();
+    println!("after call");
+    fut.await;
+    drop(c);
+    println!("after drop");
+}}
+
+fn main() {{
+    block_on(async_main());
+    println!("end");
+}}
+"#
+    );
+    run_ok_edition(
+        "async-closure-in-coroutine-mem-drop",
+        &src,
+        "after call\nfixed\nafter drop\nuncaptured\nend\n",
+    );
+}
