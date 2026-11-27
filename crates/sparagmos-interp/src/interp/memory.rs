@@ -2043,6 +2043,31 @@ impl<'a> Interpreter<'a> {
         self.read_resolved_ref_typed(frames, target, None)
     }
 
+    /// [`read_resolved`] for a caller that only inspects the
+    /// value -- its form, its length, the shape of a field --
+    /// and never consumes it: the borrowed read where it can
+    /// judge the position, so an aggregate the caller only
+    /// looks at is lent, not cloned; the owned read where the
+    /// borrowed one declines, so the value seen is the owned
+    /// read's in every case the borrowed read cannot judge.
+    /// The judgment reads of place resolution (the storage /
+    /// wrapper probes of the dereference walk), the fat-length
+    /// fallback of borrow formation, the raw-parts base
+    /// denomination, and the vector append form check read
+    /// through this: a probe that cloned the whole buffer on
+    /// every element access made every access cost the
+    /// buffer's length.
+    pub(crate) fn read_resolved_peek<'x>(
+        &self,
+        frames: &'x [Frame],
+        target: &Resolved,
+    ) -> InterpResult<Cow<'x, Value>> {
+        match self.read_resolved_ref(frames, target) {
+            Ok(value) => Ok(value),
+            Err(_) => self.read_resolved(frames, target).map(Cow::Owned),
+        }
+    }
+
     /// [`read_resolved_ref`] with the declared type of the
     /// place being read (see [`read_resolved_typed`]).
     pub(crate) fn read_resolved_ref_typed<'x>(
