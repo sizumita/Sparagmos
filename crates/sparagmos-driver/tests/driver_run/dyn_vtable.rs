@@ -213,3 +213,35 @@ fn dyn_call_on_closure_self_via_blanket_fn_impl() {
     let src = fixture(&dir, "main.rs", CLOSURE_SELF_DYN_SRC);
     assert_ok(&run_driver(&src));
 }
+
+const FN_ITEM_SELF_DYN_SRC: &str = r#"
+use std::marker::PhantomData;
+
+trait Trait {
+    fn method(&self) -> u32;
+}
+impl<F, R> Trait for (F, PhantomData<R>)
+where
+    F: Fn() -> R,
+{
+    fn method(&self) -> u32 { 42 }
+}
+
+fn ret_i32() -> i32 { 3 }
+fn ret_unit() {}
+fn ret_opaque() -> impl Sized {}
+
+fn main() {
+    assert_eq!((&(ret_i32, PhantomData) as &dyn Trait).method(), 42);
+    assert_eq!((&(ret_unit, PhantomData) as &dyn Trait).method(), 42);
+    assert_eq!((&(ret_opaque, PhantomData) as &dyn Trait).method(), 42);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_call_on_fn_item_self_via_blanket_impl() {
+    let dir = temp_dir("dyn-fn-item-self");
+    let src = fixture(&dir, "main.rs", FN_ITEM_SELF_DYN_SRC);
+    assert_ok(&run_driver(&src));
+}
