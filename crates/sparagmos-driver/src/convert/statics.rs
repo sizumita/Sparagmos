@@ -329,6 +329,14 @@ impl Converter {
         let mut crates = vec![rustc_public::local_crate()];
         crates.extend(rustc_public::external_crates());
         for def in crates.iter().flat_map(|krate| crate_statics(krate)) {
+            // An anonymous static the compiler generated
+            // for a nested allocation cannot be asked for
+            // its type (see `static_is_nested`), and it
+            // cannot name a constructor either: skip it
+            // before any question is asked of it.
+            if static_is_nested(&def) {
+                continue;
+            }
             // An initialiser section holds function pointers:
             // any other static shape cannot name a
             // constructor, and asking after its section is
@@ -440,6 +448,30 @@ pub(crate) fn static_is_extern_weak(def: &mir::mono::StaticDef) -> bool {
             tcx.codegen_fn_attrs(internal).import_linkage
                 == Some(rustc_attr_ir::Linkage::ExternalWeak),
         )
+    })
+    .unwrap_or(false)
+}
+
+/// Whether the static is an anonymous one the compiler
+/// generated for a nested allocation inside another
+/// item's initialiser (the promoted temporary of
+/// `static X: &T = &expr;`): its HIR node is synthetic
+/// and the compiler's `type_of` has no case for it — it
+/// ICEs, and the bug diagnostic the ICE emits fails the
+/// compilation even though the panic itself is
+/// contained, so the question must not be asked at all.
+/// A generated static cannot name a pre-main
+/// constructor either: an initialiser section comes
+/// from a `#[link_section]` attribute on a named item,
+/// which a generated def never carries.
+fn static_is_nested(def: &mir::mono::StaticDef) -> bool {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        match tcx.def_kind(internal) {
+            rustc_hir::def::DefKind::Static { nested, .. } => Some(nested),
+            _ => Some(false),
+        }
     })
     .unwrap_or(false)
 }
