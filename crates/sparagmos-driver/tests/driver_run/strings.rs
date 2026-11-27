@@ -4515,3 +4515,83 @@ fn run_mode_string_drain_next_back_value_snapshot() {
         "Some('/')\n[ac]\n",
     );
 }
+
+const JOIN_BUILT_MUTATE_SRC: &str = r#"
+use std::cmp::Ordering;
+use std::path::PathBuf;
+fn main() {
+    let mut s = ["a", "b"].join("/");
+    s.push('x');
+    println!("{}", s);
+    s.push_str("yz");
+    println!("{}", s);
+    let mut c = ["a", "b"].concat();
+    c.push('x');
+    println!("{}", c);
+    assert_eq!(s, "a/bxyz");
+    assert_eq!(s.len(), 6);
+    assert_eq!(s.cmp(&String::from("a/bxyz")), Ordering::Equal);
+    let p = PathBuf::from(s.clone());
+    println!("{:?}", p);
+    let mut i = ["he", "llo"].join("");
+    i.insert(0, 'X');
+    i.insert_str(6, "!");
+    println!("{}", i);
+    let mut r = ["a", "b", "c"].join("/");
+    r.replace_range(0..1, "z");
+    let ch = r.remove(4);
+    println!("{} {}", r, ch);
+    let mut a = ["a", "b"].join("/");
+    a += "zz";
+    println!("{}", a);
+}
+"#;
+
+#[test]
+fn run_mode_join_built_string_mutations() {
+    // A `join` / `concat` result stored in a place is the
+    // vector's element form (the elements past the first keep
+    // the `MaybeUninit` union wrapper), which the mutation
+    // path's place read must denominate like the operand
+    // readers do; the write-back is the abstract form, so the
+    // downstream readers (equality, ordering, `PathBuf::from`)
+    // see the mutated text. The expected text is native output.
+    run_ok(
+        "join-built-mutate",
+        JOIN_BUILT_MUTATE_SRC,
+        "a/bx\na/bxyz\nabx\n\"a/bxyz\"\nXhello!\nz/b/ c\na/bzz\n",
+    );
+}
+
+const JOIN_BUILT_TEXT_AT_SRC: &str = r#"
+fn main() {
+    let mut l = ["a", "b", "c"].join("/");
+    l.retain(|ch| ch != 'b');
+    println!("{}", l);
+    let mut m = ["a", "b", "c"].join("/");
+    {
+        let _dr = m.drain(0..2);
+    }
+    println!("{}", m);
+    let mut t = ["a", "b", "c"].join("/");
+    t.truncate(3);
+    let p = t.pop();
+    println!("{} {:?}", t, p);
+    let tail = t.split_off(2);
+    println!("{} {}", t, tail);
+}
+"#;
+
+#[test]
+fn run_mode_join_built_string_retain_and_drain_drop() {
+    // The read-only place read behind `retain` (and the
+    // removal a dropped `Drain` performs through the mutation
+    // path) shares the mutation read's composition, so a
+    // stored `join` result serves both. The expected text is
+    // native output.
+    run_ok(
+        "join-built-text-at",
+        JOIN_BUILT_TEXT_AT_SRC,
+        "a//c\nb/c\na/ Some('b')\na/ \n",
+    );
+}
