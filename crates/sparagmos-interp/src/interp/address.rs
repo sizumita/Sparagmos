@@ -4160,6 +4160,71 @@ mod panic_report_tests {
         interp.fire_panic_hook(&mut frames, 0, "boom", &None);
         assert_eq!(interp.error_output(), "");
     }
+
+    /// The short shape follows std's printer across a
+    /// short-backtrace region: the marker frames are not
+    /// printed, the frames suspended between them are
+    /// accounted by one omitted line, and the printed frames
+    /// keep sequential indices. No shim frame is appended:
+    /// the entry frame is not live in this rendering (no
+    /// `run_with_report` entry is on the stack), as for a
+    /// report rendered after `main` returned.
+    #[test]
+    fn short_backtrace_elides_the_region_between_the_markers() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        // `BacktraceStyle::Short` (variant 0 in std's order).
+        interp.set_backtrace_style(Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        });
+        note_str_panic(&interp);
+        let mut frames = vec![
+            report_frame("guest::main"),
+            report_frame("guest::first"),
+            report_frame("guest::__rust_end_short_backtrace"),
+            report_frame("guest::first::{closure#0}"),
+            report_frame("guest::second"),
+            report_frame("guest::third"),
+            report_frame("guest::__rust_begin_short_backtrace"),
+            report_frame("guest::third::{closure#0}"),
+            report_frame("guest::fourth"),
+        ];
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        assert_eq!(
+            interp.error_output(),
+            "\nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n\
+             stack backtrace:\n   0: __rustc::rust_begin_unwind\n   1: core::panicking::panic_fmt\n   2: core::panicking::panic\n   3: guest::fourth\n   4: guest::third::{closure#0}\n      [... omitted 3 frames ...]\n   5: guest::first\n   6: guest::main\n\
+             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n"
+        );
+    }
+
+    /// The omitted line is singular for a one-frame region.
+    #[test]
+    fn short_backtrace_omitted_line_is_singular_for_one_frame() {
+        let program = Program::new();
+        let mut interp = Interpreter::new(&program);
+        interp.set_backtrace_style(Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        });
+        note_str_panic(&interp);
+        let mut frames = vec![
+            report_frame("guest::main"),
+            report_frame("guest::outer"),
+            report_frame("guest::__rust_end_short_backtrace"),
+            report_frame("guest::hidden"),
+            report_frame("guest::__rust_begin_short_backtrace"),
+            report_frame("guest::visible"),
+        ];
+        interp.fire_panic_hook(&mut frames, 0, "boom", &None);
+        assert_eq!(
+            interp.error_output(),
+            "\nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n\
+             stack backtrace:\n   0: __rustc::rust_begin_unwind\n   1: core::panicking::panic_fmt\n   2: core::panicking::panic\n   3: guest::visible\n      [... omitted 1 frame ...]\n   4: guest::outer\n   5: guest::main\n\
+             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n"
+        );
+    }
 }
 
 

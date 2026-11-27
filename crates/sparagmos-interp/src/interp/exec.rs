@@ -52,6 +52,7 @@ impl<'a> Interpreter<'a> {
             locals[i + 1] = arg;
         }
         let entry_id = self.fresh_frame_id();
+        self.entry_frame_id.set(Some(entry_id));
         self.register_frame_base(&[], entry_id, entry);
         let stack_bytes = self.charge_stack(&[], self.frame_stack_bytes(body))?;
         let mut frames: Vec<Frame> = vec![Frame {
@@ -144,7 +145,7 @@ impl<'a> Interpreter<'a> {
         // destructors (the registrations wrap
         // `__cxa_thread_atexit`, whose entries run at exit),
         // whatever the entry's outcome was.
-        match self.run_tls_dtors(&mut frames, 1) {
+        let result = match self.run_tls_dtors(&mut frames, 1) {
             Ok(()) => result,
             Err(InterpError::Panic { .. }) => {
                 // A panic in an entry-thread TLS destructor: as
@@ -158,7 +159,9 @@ impl<'a> Interpreter<'a> {
                 })
             }
             Err(e) => Err(e),
-        }
+        };
+        self.entry_frame_id.set(None);
+        result
     }
 
     /// Drive the frame stack until the frame at depth `base`

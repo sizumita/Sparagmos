@@ -695,6 +695,13 @@ pub struct Interpreter<'a> {
     /// stack), so a rendered backtrace stops there. Set by
     /// `run_thread`; the entry thread's base is 0.
     thread_stack_base: std::cell::Cell<usize>,
+    /// The frame id of the entry frame `run_with_report`
+    /// pushed for the program entry, while that frame is live:
+    /// a rendered backtrace whose stack bottom is this frame
+    /// continues with the `lang_start` shim frame std's own
+    /// traces show below the entry (see `render_backtrace`).
+    /// `None` outside the entry's execution.
+    entry_frame_id: std::cell::Cell<Option<u64>>,
     /// The debugger session's control state, when this run is
     /// driven by the debugger interface ([`crate::debug`]): the
     /// drive loop consults it at every source-line change. `None`
@@ -1178,6 +1185,7 @@ impl<'a> Interpreter<'a> {
             last_panic_no_backtrace: std::cell::Cell::new(false),
             last_panic_origin: std::cell::RefCell::new(None),
             thread_stack_base: std::cell::Cell::new(0),
+            entry_frame_id: std::cell::Cell::new(None),
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
