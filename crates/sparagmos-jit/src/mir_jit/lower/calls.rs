@@ -1807,6 +1807,15 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Builtin::PanicAssertFailed => {
+                // The converter appends the caller-location
+                // stamp to this `#[track_caller]` builtin (the
+                // interpreter's registry counts it among the
+                // location consumers); the stamp is not one of
+                // the four declared arguments and the host
+                // report does not use it, so a trailing fifth
+                // argument is dropped, as the other panic entry
+                // points drop theirs.
+                let args = if args.len() == 5 { &args[..4] } else { args };
                 if args.len() != 4 {
                     return Err(self.err("assert_failed with wrong arity"));
                 }
