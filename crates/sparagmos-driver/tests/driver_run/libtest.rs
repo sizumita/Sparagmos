@@ -270,6 +270,89 @@ fn run_mode_libtest_harness_output_fidelity() {
 
 }
 
+const LIBTEST_SP_FAIL_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "hello")]
+fn wrong_msg() { panic!("bye"); }
+#[test]
+#[should_panic(expected = "message")]
+fn non_string() { std::panic::panic_any(123); }
+"#;
+
+#[test]
+fn run_mode_libtest_nocapture_failure_sections_carry_notes_only() {
+    let dir = temp_dir("libtest-nocapture-sections");
+    let src = fixture(&dir, "spfail.rs", LIBTEST_SP_FAIL_SRC);
+    // Under `--nocapture` the panic reports go to the guest's
+    // stderr as the panics run, and the failure sections on
+    // stdout carry the harness's notes alone - no copy of the
+    // report. The non-string note names the payload by its
+    // `TypeId`, in std's form.
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--nocapture",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(
+        stdout.contains(
+            "---- non_string stdout ----\nnote: expected panic with string value,\n found non-string value: `TypeId(0x"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "---- wrong_msg stdout ----\nnote: panic did not contain expected string\n      panic message: \"bye\"\n expected substring: \"hello\""
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("panicked at"),
+        "the panic reports must not leak into the sections: stdout={stdout}"
+    );
+    assert!(
+        stderr.contains("thread 'non_string' (1) panicked at ")
+            && stderr.contains("Box<dyn Any>")
+            && stderr.contains("thread 'wrong_msg' (1) panicked at "),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_libtest_capture_failure_sections_carry_the_report() {
+    let dir = temp_dir("libtest-capture-sections");
+    let src = fixture(&dir, "spfail.rs", LIBTEST_SP_FAIL_SRC);
+    // In capture mode the same failures' sections carry the
+    // captured panic report ahead of the note, as the native
+    // harness's captured sections do.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--test-threads=1"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(
+        stdout.contains("thread 'non_string' (1) panicked at ")
+            && stdout.contains("found non-string value: `TypeId(0x"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("thread 'wrong_msg' (1) panicked at ")
+            && stdout.contains("note: panic did not contain expected string"),
+        "stdout={stdout}"
+    );
+    assert!(stderr.is_empty(), "stderr={stderr}");
+}
+
 const LIBTEST_JSON_SRC: &str = r#"
 #[test]
 fn a() {
