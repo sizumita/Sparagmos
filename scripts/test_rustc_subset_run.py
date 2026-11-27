@@ -5159,6 +5159,96 @@ class Stage3ProcedureTests(unittest.TestCase):
             self.assertIn("cargo", out["reason"])
             self.assertEqual(calls, [])
 
+    def make_shim_rec(self):
+        self.test_dir = (self.rust_dir / "tests" / "run-make-cargo"
+                         / "same-crate-name-and-macro-name")
+        self.test_dir.mkdir(parents=True)
+        self.rec = {"suite": "run-make-cargo",
+                    "path": "tests/run-make-cargo/"
+                            "same-crate-name-and-macro-name",
+                    "nature": "procedure", "single_file": False,
+                    "ffi": False, "env_excluded": False}
+        self.write_recipe()
+
+    def run_shim_procedure(self, guest_res, verdicts_text):
+        """fill_result_procedure for a cargo-shim record, with
+        the guest run stubbed to leave `verdicts_text` in the
+        side channel (None: the channel is never written)."""
+        calls = []
+
+        def fake_run_cmd(argv, **kw):
+            calls.append((argv, kw))
+            if "-o" in argv:
+                return {"exit_code": 0, "stdout": "", "stderr": "",
+                        "timeout": False}
+            if str(argv[0]).endswith("rmake"):
+                return {"exit_code": 0, "stdout": "", "stderr": "",
+                        "timeout": False}
+            if verdicts_text is not None:
+                Path(kw["env_extra"]
+                     ["SPARAGMOS_CARGO_SHIM_VERDICTS"]).write_text(
+                         verdicts_text)
+            return guest_res
+
+        out = {"status": "not-attempted", "reason": "", "bucket": ""}
+        with unittest.mock.patch.object(run, "run_cmd", fake_run_cmd), \
+                unittest.mock.patch.object(
+                    run, "ensure_stage3_support",
+                    lambda rd: (Path("/flat"),
+                                Path("/flat/librun_make_support.rlib"))), \
+                unittest.mock.patch.object(
+                    run, "stage3_toolchain_paths",
+                    lambda: {"rustc": "/tc/rustc",
+                             "rustdoc": "/tc/rustdoc",
+                             "cargo": "/tc/cargo",
+                             "sysroot_lib": "/tc/lib",
+                             "target_lib": "/tc/target-lib"}), \
+                unittest.mock.patch.object(run, "rustc_cmd",
+                                           lambda: ["rustc"]):
+            run.fill_result_procedure(self.rec, self.rust_dir,
+                                      Path("/driver"), out)
+        return out, calls
+
+    def test_cargo_shim_record_passes_when_every_unit_converts(self):
+        self.make_shim_rec()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, calls = self.run_shim_procedure(
+            ok, "converted\tmylib\tmylib.rs\n"
+                "converted\tconsumer\tconsumer.rs\n")
+        self.assertEqual(out["status"], "pass")
+        guest_argv, guest_kw = calls[-1]
+        self.assertIn("--guest-process-host", guest_argv)
+        self.assertIn("RUSTC_WRAPPER", guest_kw["env_extra"])
+        self.assertIn("SPARAGMOS_CARGO_SHIM_VERDICTS",
+                      guest_kw["env_extra"])
+
+    def test_cargo_shim_record_fails_when_a_unit_does_not_convert(self):
+        self.make_shim_rec()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, _ = self.run_shim_procedure(
+            ok, "converted\tmylib\tmylib.rs\n"
+                "failed\tconsumer\tconsumer.rs\n")
+        self.assertEqual(out["status"], "fail")
+        self.assertIn("did not convert", out["reason"])
+
+    def test_cargo_shim_record_fails_without_any_verdict(self):
+        self.make_shim_rec()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, _ = self.run_shim_procedure(ok, None)
+        self.assertEqual(out["status"], "fail")
+        self.assertIn("no compilation units", out["reason"])
+
+    def test_cargo_shim_driver_unsupported_stays_unsupported(self):
+        self.make_shim_rec()
+        unsup = {"exit_code": 2, "stdout": "",
+                 "stderr": "sparagmos-driver run: unsupported: no\n",
+                 "timeout": False}
+        out, _ = self.run_shim_procedure(unsup, None)
+        self.assertEqual(out["status"], "unsupported")
+
     def test_native_failure_is_a_plain_failure(self):
         self.write_recipe()
         bad = {"exit_code": 1, "stdout": "",

@@ -105,6 +105,50 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The outcome of running this command to completion,
+    /// for the entry points that collect one (`status` /
+    /// `output`): the tool interception answers first -- a
+    /// named tool program through its runner, any other
+    /// program through the fallback (the artifacts this run
+    /// produced) -- and a program the fallback cannot carry
+    /// is the process host's to serve when the run
+    /// configured one, the same consult-interception-first,
+    /// host-for-the-rest order `spawn` uses (which never
+    /// consults the interception at all). A named program's
+    /// runner error is authoritative (the tool ran and
+    /// reported it cannot be carried out); the fallback's
+    /// rejection of a program it does not know is not --
+    /// with no host configured it stands as the run's
+    /// unsupported error, exactly as before.
+    pub(super) fn tool_or_host_outcome(
+        &self,
+        state: &crate::interp::CommandState,
+        output_captured: bool,
+    ) -> InterpResult<Option<Result<crate::interp::ToolRunOutcome, Value>>> {
+        match tool_outcome(self.tool_interception(), state, output_captured) {
+            Ok(Some(outcome)) => Ok(Some(Ok(outcome))),
+            Ok(None) => self.host_outcome(state, output_captured),
+            Err(e) => {
+                let named = self.tool_interception().is_some_and(
+                    |interception| {
+                        interception
+                            .programs
+                            .iter()
+                            .any(|p| p == &state.program)
+                    },
+                );
+                if !named && self.process_host().is_some() {
+                    match self.host_outcome(state, output_captured)? {
+                        Some(outcome) => Ok(Some(outcome)),
+                        None => Err(e),
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Start this command's program through the process host
     /// and register the child, returning the guest's
     /// `io::Result<Child>` value. `None` when no host is

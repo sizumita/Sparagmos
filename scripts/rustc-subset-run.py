@@ -186,6 +186,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -7151,6 +7152,46 @@ STAGE3_NATIVE_TIMEOUT = 300
 STAGE3_TIMEOUT = 600
 STAGE3_SUPPORT_TIMEOUT = 1800
 
+# The cargo-driven records stage 3 attempts under the
+# convert-and-delegate shim (issue #359): the guest's real
+# cargo runs through the process host with the driver as
+# cargo's RUSTC_WRAPPER, converting every compilation unit
+# and delegating it to the real rustc for real artifacts.
+# The remaining cargo-suite records stay out of stage-3
+# scope (see fill_result_procedure).
+# tests/run-make-cargo/panic-strategies is the next member
+# once its recipe runs: the recipe's first statement builds
+# a run_make_support TempDir, and a call to
+# std::env::temp_dir from inside the support library's
+# converted bodies stops as an unknown function today
+# (a direct call from the recipe itself is served by the
+# EnvTempDir builtin); the timing question behind it --
+# three build-std conversions of std inside the 600s
+# stage-3 budget -- is still open behind that stop.
+STAGE3_CARGO_SHIM_RECORDS = {
+    "tests/run-make-cargo/same-crate-name-and-macro-name",
+}
+
+
+def _cargo_shim_verdicts(path):
+    """The per-unit verdicts the stage-3 cargo shim recorded.
+
+    One line per compilation unit the guest's cargo
+    performed, `<verdict>\\t<crate name>\\t<input>` (see the
+    driver's `rustc_shim`). Returns (units, bad): the
+    recorded lines and the subset that did not convert -- a
+    line whose verdict word is not `converted`, including a
+    malformed line, which is not evidence of a conversion.
+    A missing file reads as no units.
+    """
+    units = []
+    if path is not None and Path(path).exists():
+        for line in Path(path).read_text(errors="replace").splitlines():
+            if line.strip():
+                units.append(line)
+    bad = [u for u in units if u.split("\t")[0] != "converted"]
+    return units, bad
+
 _stage3_lock = threading.Lock()
 _stage3_support = None       # (flat_dir, support_rlib) once built
 _stage3_support_error = None
@@ -7355,17 +7396,27 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
     pass, the driver's named-unsupported exit 2 is an
     unsupported result, and any other exit is a failure.
 
-    The cargo suites (run-make-cargo, build-std) are not
-    attempted at all: their recipes drive cargo itself, and
+    The cargo suites (run-make-cargo, build-std) are mostly
+    not attempted: their recipes drive cargo itself, and
     cargo orchestration -- workspace resolution, build-script
     and proc-macro processes, and the real compiler artifacts
     (rmeta/rlib, object files) cargo consumes -- is outside
-    what the harness models (the interpreter's process model
-    starts no child processes, and the conversion machinery's
-    artifacts are registry placeholders, not files a real
-    tool chain can consume). They are recorded as out of
-    stage-3 scope, like the revisions and no-recipe cases
-    (issue #359).
+    what the interception model answers (the conversion
+    machinery's artifacts are registry placeholders, not
+    files a real tool chain can consume). They are recorded
+    as out of stage-3 scope, like the revisions and
+    no-recipe cases (issue #359). The exceptions are the
+    records named in STAGE3_CARGO_SHIM_RECORDS, attempted
+    under the convert-and-delegate shim (issue #359): the
+    guest run additionally configures the process host, so
+    the recipe's cargo runs as a real host process, with the
+    driver as cargo's RUSTC_WRAPPER -- every compilation
+    unit cargo performs is converted by the driver (its
+    verdict appended to a side channel) and then delegated
+    to the real rustc, which produces the real artifacts the
+    recipe's assertions inspect. Such a record passes only
+    when the native run passed, the guest run exits 0, and
+    every recorded unit converted.
     """
     out["stage"] = 3
     test_dir = rust_dir / rec["path"]
@@ -7388,7 +7439,9 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
         out["reason"] = "recipe declares revisions (stage 3 runs the plain recipe only)"
         out["bucket"] = "out of stage-3 scope (revisions)"
         return
-    if rec["suite"] in ("run-make-cargo", "build-std"):
+    cargo_shim = rec["path"] in STAGE3_CARGO_SHIM_RECORDS
+    if rec["suite"] in ("run-make-cargo", "build-std") \
+            and not cargo_shim:
         out["reason"] = (
             "recipe drives cargo (suite " + rec["suite"] + "); "
             "cargo orchestration is not modelled by the stage-3 "
@@ -7445,11 +7498,29 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
             return
         guest_env = dict(env)
         guest_env.update(BOOTSTRAP_ENV)
+        driver_argv = [str(driver_bin), "run", str(rmake_rs),
+                       "--edition", "2024",
+                       "--aux-lib", f"run_make_support={rlib}",
+                       "--tool-program", paths["rustc"]]
+        verdicts_path = None
+        if cargo_shim:
+            # The convert-and-delegate shim (issue #359): the
+            # process host lets the recipe's cargo run for
+            # real, and the wrapper script puts this driver in
+            # cargo's RUSTC_WRAPPER seat for the guest run
+            # only (the native oracle above ran unwrapped).
+            driver_argv.append("--guest-process-host")
+            verdicts_path = td / "cargo-shim-verdicts.txt"
+            shim_path = td / "sparagmos-rustc-shim"
+            shim_path.write_text(
+                "#!/bin/sh\nexec {} rustc-shim \"$@\"\n".format(
+                    shlex.quote(os.path.abspath(driver_bin))))
+            shim_path.chmod(0o755)
+            guest_env["RUSTC_WRAPPER"] = str(shim_path)
+            guest_env["SPARAGMOS_CARGO_SHIM_VERDICTS"] = \
+                str(verdicts_path)
         got = run_cmd(
-            [str(driver_bin), "run", str(rmake_rs),
-             "--edition", "2024",
-             "--aux-lib", f"run_make_support={rlib}",
-             "--tool-program", paths["rustc"]],
+            driver_argv,
             timeout=STAGE3_TIMEOUT, cwd=guest_out, env_extra=guest_env,
             mem_limit_mb=DRIVER_MEM_LIMIT_MB)
         if got["timeout"]:
@@ -7464,6 +7535,24 @@ def fill_result_procedure(rec, rust_dir, driver_bin, out):
             out["bucket"] = "memory limit"
             return
         if got["exit_code"] == 0:
+            if cargo_shim:
+                units, bad = _cargo_shim_verdicts(verdicts_path)
+                if not units:
+                    out["status"] = "fail"
+                    out["reason"] = (
+                        "cargo shim recorded no compilation units "
+                        "(the RUSTC_WRAPPER did not reach the "
+                        "guest's cargo)")
+                    out["bucket"] = bucket_reason(out["reason"])
+                    return
+                if bad:
+                    out["status"] = "fail"
+                    out["reason"] = (
+                        f"cargo shim: {len(bad)} of {len(units)} "
+                        f"compilation units did not convert "
+                        f"(first: {bad[0]})")
+                    out["bucket"] = bucket_reason(out["reason"])
+                    return
             out["status"] = "pass"
             return
         if got["exit_code"] == 2:

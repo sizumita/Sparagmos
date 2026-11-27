@@ -746,6 +746,14 @@ fn driver_main() {
 
 fn driver_main_inner() {
     let argv: Vec<String> = std::env::args().collect();
+    // The cargo rustc-wrapper shim (see `rustc_shim` in
+    // tools.rs) is not a session mode: it converts one
+    // compilation unit, records its verdict on a side
+    // channel, and delegates to the real compiler, all
+    // before any session starts.
+    if argv.get(1).map(|a| a.as_str()) == Some("rustc-shim") {
+        exit_process(rustc_shim(&argv[2..]));
+    }
     let mode = match argv.get(1).map(|a| a.as_str()) {
         Some("run") => Mode::Run,
         Some("coverage-map") => Mode::CoverageMap,

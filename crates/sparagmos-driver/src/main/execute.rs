@@ -109,19 +109,20 @@ pub(crate) fn execute(
         overflow_checks,
         panic_abort,
         sigpipe,
-        // Real child processes in any run that named no
-        // tool programs: a recipe's invocations are the
-        // tool runner's to answer, and its runs configure
-        // no host. The self-spawn interception installed
-        // above claims only the guest's own argv[0] name;
-        // every other program is the host's to serve (the
-        // interpreter consults the interception first and
-        // the host for the rest), so the two coexist here.
-        process_host: if tool_programs.is_empty() {
-            process_host.clone()
-        } else {
-            None
-        },
+        // Real child processes coexist with tool
+        // interception in any run that configured a host:
+        // the interception is consulted first (the named
+        // tool programs through the runner, the artifacts
+        // this run produced through the fallback), and a
+        // program neither claims is the host's to serve.
+        // A run naming tool programs and configuring a
+        // host together is how a recipe drives a real
+        // orchestrator (cargo) whose own compiler
+        // invocations the run still answers for -- the
+        // stage-3 cargo shim (issue #359). A run with no
+        // host configured keeps the interception's
+        // standing answers for everything it claims.
+        process_host: process_host.clone(),
         tool_interception,
         // A run the process model re-ran as a child (see
         // `self_run`) writes the guest's stdout through to
