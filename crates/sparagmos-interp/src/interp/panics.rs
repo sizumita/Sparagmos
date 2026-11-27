@@ -6,6 +6,54 @@ use crate::error::{InterpError, InterpResult};
 use crate::value::{PanicPayload, RefTarget, Value};
 
 impl<'a> Interpreter<'a> {
+    /// The drop glue of a panic payload type, from the
+    /// program's conversion-built table (see
+    /// `ir::Program::payload_drop_glues`): the glue a caught
+    /// payload's box carries and the glue `lang_start`'s
+    /// disposal of an uncaught payload runs. `None` for a
+    /// payload type conversion could not account for (or
+    /// whose glue is trivial): its drop stays shape-judged.
+    pub(crate) fn payload_drop_glue(&self, ty: &str) -> Option<crate::ir::DropGlue> {
+        self.program
+            .payload_drop_glues
+            .iter()
+            .find(|(tag, _)| tag == ty)
+            .map(|(_, glue)| glue.clone())
+    }
+
+    /// Dispose of an uncaught entry panic's payload, as
+    /// `lang_start` does natively: the payload is dropped
+    /// through its concrete type's glue (see
+    /// [`Interpreter::payload_drop_glue`]), inside the
+    /// equivalent of a nested `catch_unwind` -- a panic out
+    /// of the destructor is caught here and reported as the
+    /// fatal runtime error std's `rtabort!` prints, and the
+    /// run aborts. A payload type with no recorded glue has
+    /// no destructor the model can run: nothing is owed.
+    /// Returning `Ok` leaves the original panic as the run's
+    /// outcome.
+    pub(crate) fn dispose_uncaught_payload(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        payload: &PanicPayload,
+    ) -> InterpResult<()> {
+        let Some(glue) = self.payload_drop_glue(&payload.ty) else {
+            return Ok(());
+        };
+        match self.drop_value_sync(frames, (*payload.value).clone(), &glue) {
+            Ok(()) => Ok(()),
+            Err(InterpError::Panic { .. }) => {
+                self.push_error_output(
+                    "fatal runtime error: drop of the panic payload panicked, aborting\n",
+                );
+                Err(InterpError::Abort {
+                    message: "drop of the panic payload panicked".to_string(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Run the panic hook for a freshly raised panic, before
     /// unwinding begins: with no custom hook installed, print
     /// std's default report (see

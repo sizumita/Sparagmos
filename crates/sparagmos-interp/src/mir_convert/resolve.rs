@@ -630,6 +630,25 @@ fn convert_all_with(
             )
         })
         .collect();
+    // The drop glue of the types the program's `panic_any`
+    // call sites raise as payloads, keyed by the tag each call
+    // records for its payload type (see
+    // `ir::Program::payload_drop_glues`): a payload type whose
+    // glue cannot be accounted for, or whose glue is trivial,
+    // gets no entry and keeps the shape-judged drop an
+    // interpreter-fabricated payload box has today.
+    out.payload_drop_glues = conv
+        .payload_tys
+        .borrow()
+        .iter()
+        .filter_map(|(tag, ty)| {
+            let glue = DropGlueBuilder::build(&conv, ty)?;
+            if glue.root == ir::DropPlan::Trivial {
+                return None;
+            }
+            Some((tag.clone(), glue))
+        })
+        .collect();
     out.adt_field_layouts = program.adt_field_layouts.clone();
     out.adt_tag_layouts = program.adt_tag_layouts.clone();
     out.adt_niches = program.adt_niches.clone();

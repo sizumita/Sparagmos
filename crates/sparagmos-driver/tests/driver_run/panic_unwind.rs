@@ -3385,3 +3385,216 @@ fn run_mode_generic_assert_captures_render_like_core() {
         "capture renderings match core's"
     );
 }
+
+const CAUGHT_PAYLOAD_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicBool, Ordering};
+static DROPPED: AtomicBool = AtomicBool::new(false);
+struct Bomb;
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        DROPPED.store(true, Ordering::SeqCst);
+    }
+}
+fn main() {
+    let p = std::panic::catch_unwind(|| std::panic::panic_any(Bomb)).unwrap_err();
+    drop(p);
+    println!("dropped = {}", DROPPED.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_caught_payload_drop_runs_payload_destructor() {
+    // The `Box<dyn Any>` a `catch_unwind` hands back carries the
+    // payload type's own drop glue (recorded at the `panic_any`
+    // call site): dropping it runs the concrete destructor, not
+    // just a shape-judged disposal.
+    let dir = temp_dir("caughtpayloaddrop");
+    let src = fixture(&dir, "caughtpayloaddrop.rs", CAUGHT_PAYLOAD_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a caught panic terminates normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dropped = true\n",
+        "the payload's destructor ran when the payload was dropped"
+    );
+}
+
+const CAUGHT_PAYLOAD_FIELDS_SRC: &str = r#"
+use std::sync::atomic::{AtomicBool, Ordering};
+static DROPPED: AtomicBool = AtomicBool::new(false);
+struct Bomb;
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        DROPPED.store(true, Ordering::SeqCst);
+    }
+}
+struct Pair {
+    _s: String,
+    _b: Bomb,
+}
+fn main() {
+    let p = std::panic::catch_unwind(|| {
+        std::panic::panic_any(Pair { _s: String::from("x"), _b: Bomb });
+    })
+    .unwrap_err();
+    drop(p);
+    println!("bomb dropped = {}", DROPPED.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_caught_payload_drop_runs_field_destructors() {
+    // The payload glue is the payload type's full drop plan:
+    // a payload with no destructor of its own still drops its
+    // fields when the caught payload is dropped.
+    let dir = temp_dir("caughtpayloadfields");
+    let src = fixture(&dir, "caughtpayloadfields.rs", CAUGHT_PAYLOAD_FIELDS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a caught panic terminates normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bomb dropped = true\n",
+        "the payload's field destructors ran with the payload drop"
+    );
+}
+
+const UNCAUGHT_PAYLOAD_SRC: &str = r#"
+struct Bomb;
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        eprintln!("bomb dropped");
+    }
+}
+fn main() {
+    std::panic::panic_any(Bomb);
+}
+"#;
+
+#[test]
+fn run_mode_uncaught_payload_disposed_before_exit() {
+    // `lang_start` catches an uncaught main panic and drops the
+    // payload before the process exits: the payload's
+    // destructor runs (after the panic report, as natively)
+    // and the exit stays the panic's 101.
+    let dir = temp_dir("uncaughtpayload");
+    let src = fixture(&dir, "uncaughtpayload.rs", UNCAUGHT_PAYLOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "an uncaught panic still exits 101; stderr={stderr}"
+    );
+    let report = stderr.find("panicked at").expect("panic report printed");
+    let dropped = stderr
+        .find("bomb dropped")
+        .expect("the payload's destructor ran during disposal");
+    assert!(
+        report < dropped,
+        "the disposal follows the panic report: {stderr}"
+    );
+}
+
+const EXPLODY_PAYLOAD_SRC: &str = r#"
+struct Bomb;
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        std::panic::panic_any(Bomb);
+    }
+}
+fn main() {
+    std::panic::panic_any(Bomb);
+}
+"#;
+
+#[test]
+fn run_mode_payload_drop_panic_aborts_with_fatal_line() {
+    // When the entry disposal's payload drop itself panics,
+    // the runtime aborts: the disposal panic's own report
+    // prints, then the fatal line, and the run ends as a
+    // crash (128 + SIGABRT), not as a second unwinding.
+    let dir = temp_dir("explodypayload");
+    let src = fixture(&dir, "explodypayload.rs", EXPLODY_PAYLOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a panicking payload disposal aborts the run; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("panicked at").count(),
+        2,
+        "both the main panic and the disposal panic report: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "fatal runtime error: drop of the panic payload panicked, aborting"
+        ),
+        "the runtime's fatal line closes the stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "run mode keeps stdout clean: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+const GUEST_DROP_THEN_DISPOSAL_SRC: &str = r#"
+struct Bomb;
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        std::panic::panic_any(Bomb);
+    }
+}
+fn main() {
+    let p = std::panic::catch_unwind(|| std::panic::panic_any(Bomb)).unwrap_err();
+    drop(p);
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_guest_payload_drop_panic_then_disposal_panic_aborts() {
+    // The guest drops a caught payload whose destructor
+    // panics: that panic unwinds to the entry, whose disposal
+    // drops *its* payload, whose destructor panics again.
+    // All three panics report (the disposal panic is a fresh
+    // panic, not a resumption of the guest drop's), then the
+    // fatal line aborts the run.
+    let dir = temp_dir("guestdropdisposal");
+    let src = fixture(&dir, "guestdropdisposal.rs", GUEST_DROP_THEN_DISPOSAL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "the disposal panic aborts the run; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("panicked at").count(),
+        3,
+        "the caught panic, the guest drop panic and the disposal panic all report: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "fatal runtime error: drop of the panic payload panicked, aborting"
+        ),
+        "the runtime's fatal line closes the stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "main never resumes after the drop panic: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

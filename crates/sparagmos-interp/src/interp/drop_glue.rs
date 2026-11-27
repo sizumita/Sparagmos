@@ -432,7 +432,21 @@ impl<'a> Interpreter<'a> {
         session.completion = GlueCompletion::UnwindCleanup;
         match self.run_glue_session(frames, session, cont.sessions) {
             Ok(()) => Ok(GlueCleanupFlow::Suspended),
-            Err(e @ InterpError::Panic { .. }) => Ok(GlueCleanupFlow::Completed(e)),
+            Err(e @ InterpError::Panic { .. }) => {
+                // The session's completion marked the stashed
+                // panic as resumed (`resume_signaled`), but that
+                // flag's only reader is the drive loop's take
+                // when a panic surfaces from a block -- the
+                // unwinding loop that receives the panic here
+                // owns its continuation and never reads it.
+                // Left set, it would leak into the next drive
+                // region and suppress a fresh panic's hook
+                // there (a panic raised by a later detached
+                // drive, such as the entry payload disposal,
+                // would print no report).
+                self.resume_signaled = false;
+                Ok(GlueCleanupFlow::Completed(e))
+            }
             Err(e) => Err(e),
         }
     }
