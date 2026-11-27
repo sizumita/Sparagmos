@@ -57,3 +57,85 @@ fn run_mode_sort_many_short_runs() {
          len=400 sum=619800 first=0 at100=1000 last=3099 sorted=true\n",
     );
 }
+
+const OSSTR_REF_SORT_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    let a = OsString::from_vec(b"alpha".to_vec());
+    let b = OsString::from_vec(b"bravo".to_vec());
+    let c = OsString::from_vec(b"charlie".to_vec());
+    let d = OsString::from_vec(b"delta".to_vec());
+    let ra: &OsStr = &a;
+    let rb: &OsStr = &b;
+    let rc: &OsStr = &c;
+    let rd: &OsStr = &d;
+    let mut v: Vec<&OsStr> = vec![rd, ra, rc, rb];
+    v.sort();
+    for e in &v {
+        println!("{:?} len={} bytes={:?}", e, e.len(), e.as_encoded_bytes());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_sort_vec_osstr_refs_utf8() {
+    // Regression for the defect pinned on #513 (comment
+    // 7224146657): a `Vec<&OsStr>` whose elements are UTF-8
+    // (the `Str` value form) broke in the sort's element
+    // moves -- the two-element case stopped with `type
+    // mismatch in assignment: expected Ref(Adt("std::ffi::
+    // OsStr")), found unsigned integer`, and longer inputs
+    // corrupted an element that a later comparison then met
+    // as a string against an unsigned integer. The copy
+    // machinery judged a single-element source by shape
+    // alone, and a `Str` value did not count as a value of
+    // the `&OsStr` element type, so the copy read the
+    // string's first byte as the element. (`&str` elements,
+    // `&[u8]` elements and the non-UTF-8 `FatRef` form of
+    // `&OsStr` all sorted fine.) The post-sort reads (`len`,
+    // `as_encoded_bytes`, `Debug`) pin the moved elements'
+    // contents, not just the ordering.
+    run_ok(
+        "sort-vec-osstr-refs-utf8",
+        OSSTR_REF_SORT_SRC,
+        "\"alpha\" len=5 bytes=[97, 108, 112, 104, 97]\n\
+         \"bravo\" len=5 bytes=[98, 114, 97, 118, 111]\n\
+         \"charlie\" len=7 bytes=[99, 104, 97, 114, 108, 105, 101]\n\
+         \"delta\" len=5 bytes=[100, 101, 108, 116, 97]\n",
+    );
+}
+
+const PATH_REF_SORT_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn main() {
+    let a = PathBuf::from("alpha");
+    let b = PathBuf::from("beta");
+    let z = PathBuf::from("zeta");
+    let pa: &Path = &a;
+    let pb: &Path = &b;
+    let pz: &Path = &z;
+    let mut v: Vec<&Path> = vec![pz, pb, pa];
+    v.sort();
+    for e in &v {
+        println!("{:?} len={}", e, e.as_os_str().len());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_sort_vec_path_refs_utf8() {
+    // The `&Path` pointee shares the `&OsStr` representation
+    // (a UTF-8 value is the `Str` form), so a `Vec<&Path>`
+    // sort crossed the same element-move judgement and
+    // failed the same way.
+    run_ok(
+        "sort-vec-path-refs-utf8",
+        PATH_REF_SORT_SRC,
+        "\"alpha\" len=5\n\
+         \"beta\" len=4\n\
+         \"zeta\" len=4\n",
+    );
+}

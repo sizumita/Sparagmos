@@ -1983,6 +1983,22 @@ pub(crate) fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
         (Value::Str(_), Ty::Ref(pointee)) if matches!(&**pointee, Ty::Str) => {
             true
         }
+        // The unsized byte-string ADT pointees share that
+        // representation: a UTF-8 `&OsStr` / `&Path` value is
+        // the string data itself in this model (its non-UTF-8
+        // form is a `FatRef`, which the reference arm below
+        // covers), so a `Str` value under a reference to one
+        // of those types is one element, not a byte sequence
+        // to index into. Without this arm the copy machinery
+        // judged a single-element `&OsStr` source by shape
+        // alone and read its first byte as the element (the
+        // `Vec<&OsStr>` sort failure pinned on #513).
+        (Value::Str(_), Ty::Ref(pointee)) => match &**pointee {
+            Ty::Adt(name) => {
+                name == "std::ffi::OsStr" || name == "std::path::Path"
+            }
+            _ => false,
+        },
         (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }, Ty::Ref(_)) => {
             true
         }
