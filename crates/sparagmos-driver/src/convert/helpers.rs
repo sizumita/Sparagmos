@@ -655,8 +655,19 @@ pub(crate) fn ty_mentions_coroutine(ty: &rustc_public::ty::Ty) -> bool {
             _ => false,
         })
     }
-    match ty.kind() {
+    // A type whose kind cannot be asked passes through a
+    // coroutine-closure type (see `guarded_ty_kind`), so it
+    // mentions a coroutine closure by construction. Every
+    // caller treats `true` as "never query this type's
+    // layout", which is the conservative answer for such a
+    // type as well: its layout question is exactly the one
+    // that is not total.
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return true;
+    };
+    match kind {
         TyKind::RigidTy(RigidTy::Coroutine(..)) => true,
+        TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => true,
         TyKind::RigidTy(RigidTy::Adt(_, args)) => args_mention(&args),
         TyKind::RigidTy(RigidTy::Closure(_, args)) => args_mention(&args),
         TyKind::RigidTy(RigidTy::Tuple(tys)) => tys.iter().any(ty_mentions_coroutine),

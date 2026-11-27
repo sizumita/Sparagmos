@@ -334,3 +334,62 @@ fn main() {{
     );
     assert_run("generic", &src, "apply ready: 42\n");
 }
+
+#[test]
+fn async_closure_inside_adt_wrappers() {
+    // An async closure whose type is nested inside another
+    // type (an `Option`, a struct field, a `Box`) converts and
+    // runs like a bare one: the field-layout recording of the
+    // wrapper ADT must not ask the closure type's kind, which
+    // Stable MIR cannot answer — asking it used to reject the
+    // whole body that merely mentioned such a wrapper.
+    let src = format!(
+        r#"{POLL_PRELUDE}
+struct Holder<F> {{ f: F }}
+
+fn main() {{
+    let v = 3;
+    let h = Holder {{ f: async move |x: i32| x * v }};
+    match poll_once((h.f)(7)) {{
+        Poll::Ready(n) => println!("field: {{}}", n),
+        Poll::Pending => println!("field: pending"),
+    }}
+    let o = Some(async move |x: i32| x + v);
+    match o {{
+        Some(f) => match poll_once(f(1)) {{
+            Poll::Ready(n) => println!("option: {{}}", n),
+            Poll::Pending => println!("option: pending"),
+        }},
+        None => println!("option: none"),
+    }}
+    let b = Box::new(async move |x: i32| x + v);
+    drop(b);
+    println!("boxed: dropped");
+}}
+"#
+    );
+    assert_run("wrappers", &src, "field: 21\noption: 4\nboxed: dropped\n");
+}
+
+#[test]
+fn async_closure_nested_option_in_struct() {
+    // The wrapper nesting composes: an async closure inside
+    // an `Option` inside a struct field is taken out and
+    // called, exactly as in the bare-local shape.
+    let src = format!(
+        r#"{POLL_PRELUDE}
+struct Holder<F> {{ f: Option<F> }}
+
+fn main() {{
+    let v = 9;
+    let mut h = Holder {{ f: Some(async move |x: i32| x + v) }};
+    let f = h.f.take().unwrap();
+    match poll_once(f(1)) {{
+        Poll::Ready(n) => println!("nested: {{}}", n),
+        Poll::Pending => println!("nested: pending"),
+    }}
+}}
+"#
+    );
+    assert_run("nested", &src, "nested: 10\n");
+}

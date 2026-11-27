@@ -559,7 +559,10 @@ impl Converter {
                 // the field reads the tuple's fields at the
                 // recorded offsets, and the instantiated
                 // tuple type may occur in no body.
-                if matches!(fty.kind(), TyKind::RigidTy(RigidTy::Tuple(_))) {
+                if matches!(
+                    guarded_ty_kind(&fty),
+                    Some(TyKind::RigidTy(RigidTy::Tuple(_)))
+                ) {
                     let _ = self.ty(&fty);
                 }
                 // A field type mentioning a coroutine is never
