@@ -3135,3 +3135,133 @@ fn main() {
 fn run_mode_partial_init_union_constant() {
     run_ok("partial-init-union-const", PARTIAL_INIT_UNION_CONST_SRC, "1\n");
 }
+
+// ----- byte-form scalar comparisons (Issue #513) ----------------------------
+//
+// A byte-sized pointee extracted from a constant array by a CTFE
+// match reaches comparisons in its byte form: the constant
+// reference denotes it by the allocation's bytes from the
+// pointee on. Equality, ordering and `SwitchInt` must read the
+// scalar those bytes denote, not refuse the form or fold the
+// whole tail.
+
+const CONST_EXTRACTED_REF_EQ_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct N(u8);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+const C3: Option<&'static u8> = if let [_, _, N(x), _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+
+fn main() {
+    let runtime = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+    assert_eq!(C, runtime);
+    assert_eq!(runtime, C);
+    let runtime3 = if let [_, _, N(x), _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+    assert_eq!(C3, runtime3);
+    println!("equal");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_ref_equality() {
+    run_ok("const-extracted-ref-eq", CONST_EXTRACTED_REF_EQ_SRC, "equal\n");
+}
+
+const CONST_EXTRACTED_REF_NE_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct N(u8);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+
+fn main() {
+    let runtime = if let [N(x), .., _] = &[N(9), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+    assert_ne!(C, runtime);
+    println!("unequal");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_ref_inequality() {
+    run_ok("const-extracted-ref-ne", CONST_EXTRACTED_REF_NE_SRC, "unequal\n");
+}
+
+const CONST_EXTRACTED_I8_REF_EQ_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct K(i8);
+
+const C: Option<&'static i8> = if let [K(x), .., _] = &[K(-1), K(2), K(3), K(4)] as &[K] { Some(x) } else { None };
+
+fn main() {
+    let runtime = if let [K(x), .., _] = &[K(-1), K(2), K(3), K(4)] as &[K] { Some(x) } else { None };
+    assert_eq!(C, runtime);
+    println!("equal");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_i8_ref_equality() {
+    run_ok("const-extracted-i8-ref-eq", CONST_EXTRACTED_I8_REF_EQ_SRC, "equal\n");
+}
+
+const CONST_EXTRACTED_BOOL_REF_EQ_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct B(bool);
+
+const C: Option<&'static bool> = if let [B(x), .., _] = &[B(true), B(false), B(true), B(false)] as &[B] { Some(x) } else { None };
+
+fn main() {
+    let runtime = if let [B(x), .., _] = &[B(true), B(false), B(true), B(false)] as &[B] { Some(x) } else { None };
+    assert_eq!(C, runtime);
+    println!("equal");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_bool_ref_equality() {
+    run_ok("const-extracted-bool-ref-eq", CONST_EXTRACTED_BOOL_REF_EQ_SRC, "equal\n");
+}
+
+const CONST_EXTRACTED_REF_ORD_SRC: &str = r#"
+#[derive(PartialEq, PartialOrd, Debug, Clone)]
+struct N(u8);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+
+fn main() {
+    let runtime = if let [N(x), .., _] = &[N(2), N(3), N(4), N(5)] as &[N] { Some(x) } else { None };
+    assert!(C < runtime);
+    assert!(runtime > C);
+    println!("ordered");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_ref_ordering() {
+    run_ok("const-extracted-ref-ord", CONST_EXTRACTED_REF_ORD_SRC, "ordered\n");
+}
+
+const CONST_EXTRACTED_SWITCH_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct N(u8);
+#[derive(PartialEq, Debug, Clone)]
+struct K(i8);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+const D: Option<&'static i8> = if let [K(x), .., _] = &[K(-1), K(2), K(3), K(4)] as &[K] { Some(x) } else { None };
+
+fn main() {
+    match *C.unwrap() {
+        1 => println!("one"),
+        _ => println!("other"),
+    }
+    match *D.unwrap() {
+        -1 => println!("neg"),
+        _ => println!("other"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_scalar_switch() {
+    run_ok("const-extracted-switch", CONST_EXTRACTED_SWITCH_SRC, "one\nneg\n");
+}

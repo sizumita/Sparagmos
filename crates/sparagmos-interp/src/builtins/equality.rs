@@ -46,6 +46,25 @@ fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
 }
 
 
+/// Whether a value is a reference over a byte-form value with
+/// no projection: the snapshot form a byte-sized pointee's
+/// constant reference takes. The driver's pointer decode
+/// denotes such a pointee (a `u8` / `i8` / `bool` whose
+/// allocation extends past it -- an element of a constant
+/// array, above all) by the allocation's bytes from the
+/// pointee on, so the scalar the reference denotes is the
+/// byte string's first byte and the remaining bytes are its
+/// siblings, not part of the value. A wider scalar's
+/// reference decodes to the scalar itself, never to this
+/// form, so the first byte is the whole story here.
+fn is_byte_tail_ref(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Ref(RefTarget::Value(base, proj))
+            if proj.is_empty() && matches!(&**base, Value::Bytes(_))
+    )
+}
+
 /// Whether a comparison call's own type tags name a thin raw
 /// pointer as the comparison's subject: the `Self` tag (the
 /// first generic argument), with one leading reference layer
@@ -512,6 +531,8 @@ impl<'a> Interpreter<'a> {
                 return Ok(x == y);
             }
         }
+        let a_byte_tail = is_byte_tail_ref(a);
+        let b_byte_tail = is_byte_tail_ref(b);
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
         let a = unwrap_scalar_form(a, &b);
@@ -633,6 +654,61 @@ impl<'a> Interpreter<'a> {
                                 })
                         {
                             return Ok(text == other_text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A scalar in its byte form against the same scalar in
+        // its integer form: the pointee of a CTFE-extracted
+        // reference, above all, against the integer the same
+        // value takes when built at runtime. Two byte shapes
+        // denote a scalar, and the reading is exact for each:
+        // a bare byte string IS the scalar's storage (a byte
+        // view of exactly the scalar), read whole as its
+        // little-endian representation; a byte string a
+        // byte-sized pointee's reference resolved to (see
+        // `is_byte_tail_ref`, the flags captured before
+        // resolution above) is the allocation from the pointee
+        // on, and the scalar is its first byte -- read unsigned
+        // against an unsigned partner, sign-extended against a
+        // signed one, as a truth value against a boolean one,
+        // the partner's form naming the pointee's type, as the
+        // two sides of one comparison share one source type.
+        // A byte string of no scalar width falls through to
+        // the structural comparison and its mismatch verdict,
+        // as before.
+        for (side, other, tail) in [
+            (&*a, &*b, a_byte_tail),
+            (&*b, &*a, b_byte_tail),
+        ] {
+            if matches!(side, Value::Bytes(_)) {
+                match other {
+                    Value::Uint(y) => {
+                        let v = if tail {
+                            side.bytes_prefix_as_uint(1)
+                        } else {
+                            side.bytes_as_uint()
+                        };
+                        if let Some(v) = v {
+                            return Ok(v == *y);
+                        }
+                    }
+                    Value::Int(y) => {
+                        let v = if tail {
+                            side.bytes_prefix_as_int(1)
+                        } else {
+                            side.bytes_as_int()
+                        };
+                        if let Some(v) = v {
+                            return Ok(v == *y);
+                        }
+                    }
+                    Value::Bool(y) if tail => {
+                        if let Value::Bytes(bytes) = side {
+                            let first = bytes.first().copied().unwrap_or(0);
+                            return Ok((first != 0) == *y);
                         }
                     }
                     _ => {}
@@ -900,6 +976,8 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
             return Ok(Some(la.cmp(&lb)));
         }
+        let a_byte_tail = is_byte_tail_ref(a);
+        let b_byte_tail = is_byte_tail_ref(b);
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
         let a = unwrap_scalar_form(a, &b);
@@ -946,6 +1024,41 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                     _ => continue,
                 };
                 return Ok(Some(if flip { ord.reverse() } else { ord }));
+            }
+        }
+        // A scalar in its byte form orders as the integer it
+        // denotes, against the same scalar in its integer form
+        // (see `values_equal` for the two byte shapes and why
+        // each reading is exact). A byte string of no scalar
+        // width falls through to the structural comparison and
+        // its mismatch verdict, as before.
+        for (side, other, flip, tail) in [
+            (&*a, &*b, false, a_byte_tail),
+            (&*b, &*a, true, b_byte_tail),
+        ] {
+            if matches!(side, Value::Bytes(_)) {
+                let ord = match other {
+                    Value::Uint(y) => {
+                        let v = if tail {
+                            side.bytes_prefix_as_uint(1)
+                        } else {
+                            side.bytes_as_uint()
+                        };
+                        v.map(|v| v.cmp(y))
+                    }
+                    Value::Int(y) => {
+                        let v = if tail {
+                            side.bytes_prefix_as_int(1)
+                        } else {
+                            side.bytes_as_int()
+                        };
+                        v.map(|v| v.cmp(y))
+                    }
+                    _ => None,
+                };
+                if let Some(ord) = ord {
+                    return Ok(Some(if flip { ord.reverse() } else { ord }));
+                }
             }
         }
         Ok(match (&*a, &*b) {
