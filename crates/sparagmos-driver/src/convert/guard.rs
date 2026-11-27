@@ -97,6 +97,13 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
     // The bug-witness snapshot for the crash registry below:
     // taken before the fetch, diffed after it.
     let witnesses_before = compiler_bug_witness_len();
+    // The const-expr-normalize snapshot (see
+    // `captured_panic_is_const_expr_normalize`): a firing of
+    // that site inside this fetch is the fetch's own artifact
+    // -- Stable MIR's body builder eagerly evaluates constants
+    // the native pipeline never evaluates as values -- so it
+    // decides neither registry below.
+    let const_expr_before = const_expr_normalize_witness_len();
     // Contained, not handled: a panic out of the fetch keeps its
     // payload for the driver's own containment layers, but the
     // diagnostics emitted before it belong to the same
@@ -110,6 +117,8 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
     // a compiler crash, the verdict native reaches when its
     // own materialization of a collected body dies on the
     // compiler's bug (see `materialization_bug`).
+    let const_expr_fired =
+        const_expr_normalize_witness_since(const_expr_before).is_some();
     if !key.is_empty() {
         if let Some(record) = compiler_bug_witness_since(witnesses_before) {
             MATERIALIZATION_BUGS.with(|map| {
@@ -120,11 +129,18 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
         }
     }
     if dcx.err_count() > errors_before {
-        let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
-        if non_lint_after && !non_lint_before {
-            note_materialization_emission(key);
-        } else {
-            note_materialization_lint(key);
+        // A const-expr-normalize firing (see above) explains
+        // the growth on its own: the ICE diagnostic the site
+        // emits is discounted with the panic, and neither
+        // registry records the fetch. Any other growth keeps
+        // the standing discipline.
+        if !const_expr_fired {
+            let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
+            if non_lint_after && !non_lint_before {
+                note_materialization_emission(key);
+            } else {
+                note_materialization_lint(key);
+            }
         }
         dcx.reset_err_count();
     }
@@ -170,6 +186,7 @@ thread_local! {
 pub fn materialization_bug(key: &str) -> Option<String> {
     MATERIALIZATION_BUGS.with(|map| map.borrow().get(key).cloned())
 }
+
 
 fn note_materialization_emission(key: &str) {
     if key.is_empty() {

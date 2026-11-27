@@ -634,3 +634,83 @@ fn compiler_site_string_panics_keep_their_verdict() {
         convert("probe_mangling", PROBE_MANGLING_RS, &["-Copt-level=0"], &[]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
 }
+
+/// The shape of
+/// tests/ui/const-generics/generic_const_exprs/poly-const-uneval-ice-106423.rs
+/// (Issue #510): generic const expressions appear in types
+/// (`[(); N * 2 + 1]: Sized`) and in an associated constant
+/// built by repeating another constant. Stable MIR's body
+/// builder eagerly evaluates such constants when it
+/// materializes a body, and `Const::eval` dies on a
+/// `ty::ConstKind::Expr` with the compiler's bug machinery
+/// (mir/consts.rs:338) -- an evaluation the native pipeline
+/// never performs on a type-level const, for a program rustc
+/// accepts. The firing is contained inside the fetch, and
+/// neither its ICE diagnostic nor its bug record may decide
+/// the verdict; the verdict pass's own symbol naming of an
+/// item whose arguments mention the same const expression is
+/// contained the same way. The program converts.
+const POLY_CONST_RS: &str = r##"
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+#![allow(unused)]
+
+use core::mem::MaybeUninit;
+
+pub struct Arr<T, const N: usize> {
+    v: [MaybeUninit<T>; N],
+}
+
+impl<T, const N: usize> Arr<T, N> {
+    const ELEM: MaybeUninit<T> = MaybeUninit::uninit();
+    const INIT: [MaybeUninit<T>; N] = [Self::ELEM; N];
+
+    fn new() -> Self {
+        Arr { v: Self::INIT }
+    }
+}
+
+pub struct BaFormatFilter<const N: usize> {}
+
+pub enum DigitalFilter<const N: usize>
+where
+    [(); N * 2 + 1]: Sized,
+    [(); N * 2]: Sized,
+{
+    Ba(BaFormatFilter<{ N * 2 + 1 }>),
+}
+
+pub fn iirfilter_st_copy<const N: usize, const M: usize>(_: [f32; M]) -> DigitalFilter<N>
+where
+    [(); N * 2 + 1]: Sized,
+    [(); N * 2]: Sized,
+{
+    let zpk = zpk2tf_st(&Arr::<f32, { N * 2 }>::new(), &Arr::<f32, { N * 2 }>::new());
+    DigitalFilter::Ba(zpk)
+}
+
+pub fn zpk2tf_st<const N: usize>(_z: &Arr<f32, N>, _p: &Arr<f32, N>) -> BaFormatFilter<{ N + 1 }>
+where
+    [(); N + 1]: Sized,
+{
+    BaFormatFilter {}
+}
+
+fn main() {
+    iirfilter_st_copy::<4, 2>([10., 50.]);
+}
+"##;
+
+#[test]
+fn const_expr_normalize_in_materialization_keeps_its_verdict() {
+    let (code, stdout, stderr) = convert("poly_const", POLY_CONST_RS, &[], &[]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("compilation failed"),
+        "a contained const-expr firing must not fail the compilation: {stderr}"
+    );
+    assert!(
+        stdout.contains("fn poly_const::main:"),
+        "the target crate converts: {stdout}"
+    );
+}

@@ -1803,12 +1803,30 @@ fn duplicate_symbol_finding<'tcx>(
         if !tcx.should_codegen_locally(*instance) {
             continue;
         }
-        let symbol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The naming runs under the resolution containment
+        // (see `convert::with_instance_resolution_contained`):
+        // the walk's item set is broader than the set the
+        // native partitioning names -- it visits instances
+        // for their constants, including ones whose generic
+        // arguments still mention a const expression the
+        // mangler cannot print (`ty::ConstKind::Expr`, Issue
+        // #510) -- and a naming failure there, by panic or by
+        // diagnostic, must leave no trace in the session: the
+        // item simply takes no part in the check, as the
+        // contract above states. A panic's hook record is
+        // consumed for the same reason (the discipline
+        // `link_symbol_of` follows).
+        let (symbol, _emitted) = crate::convert::with_instance_resolution_contained(|| {
             tcx.symbol_name(*instance).name.to_string()
-        }));
-        if let Ok(symbol) = symbol {
-            if duplicate.is_none() && !seen.insert(symbol.clone()) {
-                duplicate = Some(symbol);
+        });
+        match symbol {
+            Ok(symbol) => {
+                if duplicate.is_none() && !seen.insert(symbol.clone()) {
+                    duplicate = Some(symbol);
+                }
+            }
+            Err(_payload) => {
+                let _ = crate::convert::take_captured_panic();
             }
         }
     }
@@ -1837,13 +1855,25 @@ fn duplicate_symbol_finding<'tcx>(
         let entry_name: &str = tcx.sess.target.entry_name.as_ref();
         let declared = tcx.iter_local_def_id().any(|local_def_id| {
             let def_id = local_def_id.to_def_id();
-            tcx.is_foreign_item(def_id)
-                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tcx.symbol_name(rustc_middle::ty::Instance::mono(tcx, def_id))
-                    .name
-                    .to_string()
-            }))
-            .is_ok_and(|symbol| symbol == entry_name)
+            if !tcx.is_foreign_item(def_id) {
+                return false;
+            }
+            // Same containment as the duplicate count above:
+            // a declaration the compiler cannot name takes no
+            // part in the check and leaves no trace.
+            let (symbol, _emitted) =
+                crate::convert::with_instance_resolution_contained(|| {
+                    tcx.symbol_name(rustc_middle::ty::Instance::mono(tcx, def_id))
+                        .name
+                        .to_string()
+                });
+            match symbol {
+                Ok(symbol) => symbol == entry_name,
+                Err(_payload) => {
+                    let _ = crate::convert::take_captured_panic();
+                    false
+                }
+            }
         });
         if seen.contains(entry_name) || declared {
             return Some(format!(
@@ -2937,8 +2967,31 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         if let Some(record) = crate::convert::materialization_bug(&key)
             .or_else(|| crate::convert::materialization_bug(&def_key))
         {
-            self.crash = Some(record);
-            return;
+            if crate::convert::captured_panic_is_const_expr_normalize(&record)
+                && !key.contains('{')
+                && !def_key.contains('{')
+            {
+                // A const-expr-normalize record for an instance
+                // whose own generic arguments mention no const
+                // expression is not a crash verdict (Issue
+                // #510): the firing is an artifact of Stable
+                // MIR materializing the body -- it eagerly
+                // evaluates the type-level const expressions of
+                // the body's where-clauses, which the native
+                // pipeline never evaluates as values -- so the
+                // check falls through to the diagnostics
+                // registries below, which the fetch likewise
+                // left untouched for this firing. An instance
+                // whose own arguments do mention a const
+                // expression (the `{ N + 1 }` trait argument of
+                // the crash-materialize shape) is one the
+                // native collector itself cannot collect
+                // without normalizing that expression, and the
+                // record keeps its crash verdict.
+            } else {
+                self.crash = Some(record);
+                return;
+            }
         }
         {
             if crate::convert::materialization_emitted(&key)
