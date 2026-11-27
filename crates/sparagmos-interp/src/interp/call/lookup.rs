@@ -447,14 +447,165 @@ pub(super) fn parse_impl_block_key(base: &str) -> Option<(String, String, String
     ))
 }
 
+
+/// The spelling of a type name with every function-item type
+/// in it replaced by the item's own path. The compiler spells
+/// a function item's type as its signature followed by the
+/// definition path in braces (`fn() -> i32 {crate::f}`, or
+/// `fn() {crate::g}` for a unit return), while a rendered
+/// concrete type names the item directly (`crate::f` in place
+/// of the whole signature). The two spellings denote the same
+/// type in different positions of one `Self` section — a tuple
+/// element, a generic argument — so canonicalising the
+/// signature form away lets the spellings of one type compare
+/// equal. A signature whose return type carries braces of its
+/// own is left as it stands: the annotation cannot be told
+/// apart from the return type there, and the spelling simply
+/// stays unmatched, as before. Mirrors the copy of the same
+/// name in `mir_convert::helpers`.
+fn fn_item_spelling(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = String::with_capacity(name.len());
+    let mut rest = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some((item, end)) = fn_item_at(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        out.push_str(&name[rest..i]);
+        out.push_str(item);
+        rest = end;
+        i = end;
+    }
+    out.push_str(&name[rest..]);
+    out
+}
+
+/// If a function-item type spelling starts at byte `start`
+/// of `bytes`, return the item's path and the byte just past
+/// the spelling. The spelling is the item's signature —
+/// optional `unsafe` / `extern ".."` qualifiers, the argument
+/// list, an optional return type — followed by the definition
+/// path in braces.
+fn fn_item_at(bytes: &[u8], start: usize) -> Option<(&str, usize)> {
+    // A type can begin here only at a boundary of the
+    // enclosing spelling (so the `fn` inside an identifier
+    // such as `callfn` is not read as a signature).
+    if start > 0 && !matches!(bytes[start - 1], b'(' | b',' | b'<' | b'[' | b' ') {
+        return None;
+    }
+    let mut p = start;
+    // The qualifiers, in either order (`unsafe extern "C"
+    // fn` is the current spelling, `extern "C" unsafe fn`
+    // the older one).
+    for _ in 0..2 {
+        if bytes[p..].starts_with(b"unsafe ") {
+            p += "unsafe ".len();
+        } else if bytes[p..].starts_with(b"extern ") {
+            let quote = p + "extern ".len();
+            if bytes.get(quote) != Some(&b'"') {
+                return None;
+            }
+            let close = bytes[quote + 1..].iter().position(|&c| c == b'"')? + quote + 1;
+            if bytes.get(close + 1) != Some(&b' ') {
+                return None;
+            }
+            p = close + 2;
+        } else {
+            break;
+        }
+    }
+    if !bytes[p..].starts_with(b"fn(") {
+        return None;
+    }
+    // The argument list, balanced.
+    let mut depth = 0usize;
+    let mut q = p + 2;
+    loop {
+        match bytes.get(q)? {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        q += 1;
+    }
+    q += 1; // past ')'
+    // The annotation: directly after the argument list, or
+    // past a return type. A return type carrying braces of
+    // its own ends the parse (see `fn_item_spelling`).
+    let ann = if bytes[q..].starts_with(b" {") {
+        q + 1
+    } else if bytes[q..].starts_with(b" -> ") {
+        let mut j = q + 4;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(j)? {
+                b'-' if bytes.get(j + 1) == Some(&b'>') => j += 1,
+                b'(' | b'[' | b'<' => depth += 1,
+                b')' | b']' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                b'>' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                b'{' => {
+                    if bytes[j - 1] != b' ' {
+                        return None;
+                    }
+                    break;
+                }
+                b',' | b';' | b'}' if depth == 0 => return None,
+                _ => {}
+            }
+            j += 1;
+        }
+        j
+    } else {
+        return None;
+    };
+    // `bytes[ann]` is '{': the path runs to the closing '}'.
+    let inner = &bytes[ann + 1..];
+    let close = inner.iter().position(|&c| c == b'}')?;
+    let path = &inner[..close];
+    if path.is_empty()
+        || !path.iter().all(|&c| {
+            c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'.' | b'<' | b'>' | b'#')
+        })
+    {
+        return None;
+    }
+    let path = std::str::from_utf8(path).ok()?;
+    Some((path, ann + 1 + close + 1))
+}
+
 /// Whether an impl key's `Self` section denotes `name`: the name
 /// itself, or the name with a generic argument list appended; the
-/// crate prefix may be omitted on a side that carries none.
+/// crate prefix may be omitted on a side that carries none. A
+/// function item inside the type may be spelled by its signature
+/// on one side and by its path on the other (see
+/// `fn_item_spelling`).
 pub(super) fn impl_self_matches(self_part: &str, name: &str) -> bool {
     // The section and the queried name can be the very same
     // rendering (a `Self` that is itself an impl-path type,
     // whose base the `<` split below cannot recover).
     if self_part == name {
+        return true;
+    }
+    // The two sides can also differ only in how a function
+    // item inside the type is spelled.
+    if fn_item_spelling(self_part) == fn_item_spelling(name) {
         return true;
     }
     let self_base = self_part.split('<').next().unwrap_or(self_part);
@@ -502,8 +653,11 @@ pub(super) fn impl_self_matches(self_part: &str, name: &str) -> bool {
 /// (`std::alloc::Global`), which rendered names spell out
 /// and instance keys elide. Argument lists are processed at
 /// every nesting level; a list emptied by the removals is
-/// dropped with its brackets.
+/// dropped with its brackets. Function-item types are first
+/// canonicalised to the item's path (see `fn_item_spelling`),
+/// which the two sides spell differently.
 pub(super) fn normalize_impl_self(name: &str) -> String {
+    let name = &fn_item_spelling(name);
     fn list(chars: &[char], start: usize) -> (String, usize) {
         // `chars[start]` is '<': render the argument list
         // (possibly to nothing) and return the index just
