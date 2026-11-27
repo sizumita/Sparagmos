@@ -1883,16 +1883,53 @@ impl<'a> Interpreter<'a> {
                                         }
                                     };
                                     if !is_string {
-                                        let ty = payload
+                                        // libtest's note names the
+                                        // payload by its `TypeId`
+                                        // (the caught payload's
+                                        // `TypeId`, formatted with
+                                        // `{:?}`): when the raise
+                                        // recorded the payload
+                                        // type's TypeId segments,
+                                        // render them in std's own
+                                        // form - the segments are
+                                        // this model's identity for
+                                        // the type, standing in for
+                                        // the compiler's hash.
+                                        // Without recorded segments
+                                        // the model has no identity
+                                        // to name and keeps the
+                                        // type's rendered name.
+                                        let ty = match payload
                                             .as_ref()
-                                            .map(|p| p.ty.clone())
-                                            .unwrap_or_default();
-                                        let report = panic_report_full(
-                                            test,
-                                            self.current_thread_id(),
-                                            self.panic_location(),
-                                            &message,
-                                        );
+                                            .and_then(|p| p.type_id)
+                                        {
+                                            Some((hi, lo)) => format!(
+                                                "TypeId(0x{hi:016x}{lo:016x})"
+                                            ),
+                                            None => payload
+                                                .as_ref()
+                                                .map(|p| p.ty.clone())
+                                                .unwrap_or_default(),
+                                        };
+                                        // The report the section
+                                        // synthesises in capture
+                                        // mode; in nocapture mode
+                                        // it already went to the
+                                        // guest's stderr as the
+                                        // panic ran (the push
+                                        // above), and the native
+                                        // section carries the note
+                                        // alone.
+                                        let report = if opts.nocapture {
+                                            String::new()
+                                        } else {
+                                            panic_report_full(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        };
                                         Some(Some(format!(
                                             "{cap_out}{cap_err}{report}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
                                         )))
@@ -1905,12 +1942,25 @@ impl<'a> Interpreter<'a> {
                                         ));
                                         None
                                     } else {
-                                        let report = panic_report_full(
-                                            test,
-                                            self.current_thread_id(),
-                                            self.panic_location(),
-                                            &message,
-                                        );
+                                        // The report the section
+                                        // synthesises in capture
+                                        // mode; in nocapture mode
+                                        // it already went to the
+                                        // guest's stderr as the
+                                        // panic ran (the push
+                                        // above), and the native
+                                        // section carries the note
+                                        // alone.
+                                        let report = if opts.nocapture {
+                                            String::new()
+                                        } else {
+                                            panic_report_full(
+                                                test,
+                                                self.current_thread_id(),
+                                                self.panic_location(),
+                                                &message,
+                                            )
+                                        };
                                         Some(Some(format!(
                                             "{cap_out}{cap_err}{report}note: panic did not contain expected string\n      panic message: \"{text}\"\n expected substring: \"{expected}\""
                                         )))
