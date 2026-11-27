@@ -707,6 +707,15 @@ impl<'a> Interpreter<'a> {
                     // the file-io model, when the method is one
                     // it serves for the receiver's concrete type
                     // (see `dyn_file_io_target`).
+                    // A by-value `Self` vtable call reaches here
+                    // with the receiver already loaded out of the
+                    // fat pointer it was called through (see
+                    // `recover_deref_dyn_receiver`): restore the
+                    // fat pointer so the vtable check below can
+                    // dispatch through it.
+                    self.recover_deref_dyn_receiver(
+                        frames, body, func, args, &mut arg_values,
+                    );
                     let vt = self.virtual_call_target(func, &arg_values);
                     let fallback = if vt.is_none() {
                         self.builtin_name_fallback(func)
@@ -782,6 +791,15 @@ impl<'a> Interpreter<'a> {
                             // program may be served by the file-io
                             // model instead (see
                             // `dyn_file_io_target`).
+                            // As in the direct-call arm: a
+                            // by-value `Self` vtable call through
+                            // a function value may reach here with
+                            // the receiver already loaded out of
+                            // its fat pointer (see
+                            // `recover_deref_dyn_receiver`).
+                            self.recover_deref_dyn_receiver(
+                                frames, body, &name, args, &mut arg_values,
+                            );
                             let vt = self.virtual_call_target(&name, &arg_values);
                             let fallback = if vt.is_none() {
                                 self.builtin_name_fallback(&name)
