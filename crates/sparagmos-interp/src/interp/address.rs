@@ -1205,13 +1205,33 @@ impl<'a> Interpreter<'a> {
             .into_iter()
             .enumerate()
             .map(|(i, size)| {
-                size.or_else(|| body.local_sizes.get(i).copied().flatten())
-                    .or_else(|| {
-                        body.local_field_layouts
-                            .get(i)
-                            .and_then(|m| m.get(&Vec::new()))
-                            .map(|&(size, _)| size)
-                    })
+                // A `Vec` local takes no slot from the
+                // recorded sizes: its positions are
+                // denominated in the buffer and identity
+                // domains (see `vec_buffer_price`), and a
+                // slot would re-denominate its root — the
+                // spelling the vector's data pointers
+                // carry, as the base of the slice fat
+                // references over it — as stack storage,
+                // walking buffer-sized ranges over
+                // neighbouring slots.
+                let vec_local = matches!(
+                    body.local_tys.get(i),
+                    Some(Ty::Adt(name))
+                        if name.as_str() == "std::vec::Vec"
+                            || name.as_str() == "alloc::vec::Vec"
+                );
+                if vec_local {
+                    size
+                } else {
+                    size.or_else(|| body.local_sizes.get(i).copied().flatten())
+                        .or_else(|| {
+                            body.local_field_layouts
+                                .get(i)
+                                .and_then(|m| m.get(&Vec::new()))
+                                .map(|&(size, _)| size)
+                        })
+                }
             })
             .collect();
         let aligns: Vec<u64> = body
@@ -5655,6 +5675,46 @@ mod ptr_equality_tests {
             .expect("field 2 price");
         assert_eq!(p1 - p0, 8);
         assert_eq!(p2 - p1, 8);
+    }
+
+    /// A `Vec` local takes no slot from the recorded
+    /// sizes, even when conversion recorded one while the
+    /// generic arguments were at hand: the bare `Vec` name
+    /// denotes both recorded instances, so the type walk
+    /// cannot size it, and the recorded fallback must not
+    /// re-denominate the local's root — the spelling the
+    /// vector's data pointers carry — as stack storage.
+    /// (The guest shape is two vectors of different
+    /// element types in one body, as in
+    /// `run_mode_sort_ub_check_zero_size_paths`: slotting
+    /// both roots priced a ten-element copy between the
+    /// two buffers as a 32-byte-apart stack range and
+    /// tripped the copy precondition.)
+    #[test]
+    fn recorded_sizes_do_not_slot_vec_locals() {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("std::vec::Vec<i32>".to_string(), (24, 8));
+        program
+            .adt_layouts
+            .insert("std::vec::Vec<()>".to_string(), (24, 8));
+        let mut body = Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Adt("std::vec::Vec".to_string()),
+                Ty::Adt("std::vec::Vec".to_string()),
+            ],
+            vec![],
+        );
+        body.local_sizes = vec![None, Some(24), Some(24)];
+        program.add_function(body);
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(slots[1], None, "a Vec local takes no recorded slot");
+        assert_eq!(slots[2], None, "a Vec local takes no recorded slot");
     }
 
     /// A program with two `Vec<i32>` locals in one body,
