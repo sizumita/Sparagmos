@@ -1629,6 +1629,29 @@ class JudgeCompileTests(unittest.TestCase):
                           skipped=None))
         self.assertEqual(status, "pass")
 
+    def test_crash_unevidenced_101_fails(self):
+        # The driver also exits 101 when one of its own panics
+        # escapes the compiler run (a Stable MIR conversion
+        # panic, the driver thread panic): that abnormal exit
+        # is not a reproduction of the reference compiler
+        # crash, so without an internal compiler error in the
+        # output the crash expectation is not met.
+        status, reason, bucket = run.judge_compile(
+            "crash", conv(exit_code=101, converted=None,
+                          skipped=None))
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "compiler crash not evidenced")
+        self.assertIn("internal compiler error", reason)
+
+    def test_crash_signal_death_passes(self):
+        # Death by signal is the compiler process crashing,
+        # which is compiletest's crashes condition itself; it
+        # needs no further evidence.
+        status, _r, _b = run.judge_compile(
+            "crash", conv(exit_code=-11, converted=None,
+                          skipped=None))
+        self.assertEqual(status, "pass")
+
     def test_crash_no_longer_crashes(self):
         self.assertEqual(
             run.judge_compile("crash", conv())[0], "fail")
@@ -5009,8 +5032,19 @@ class JudgeJitCompileTests(unittest.TestCase):
                          "expected failure but conversion succeeded")
 
     def test_crash_reproduced_passes(self):
-        c = conv(exit_code=101, jit_compiled=None, jit_reason="")
+        c = conv(exit_code=101, ice=True, jit_compiled=None,
+                 jit_reason="")
         self.assertEqual(run.judge_jit_compile("crash", c)[0], "pass")
+
+    def test_crash_unevidenced_101_fails(self):
+        # Metric 4 judges crashes through judge_compile, so the
+        # same evidence rule applies: an exit 101 with no
+        # internal compiler error in the output is the driver
+        # own escaped panic, not a reproduced crash.
+        c = conv(exit_code=101, jit_compiled=None, jit_reason="")
+        status, _r, bucket = run.judge_jit_compile("crash", c)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "compiler crash not evidenced")
 
     def test_crash_exit2_is_not_a_crash(self):
         # In jit-compile mode exit 2 is the defined JIT-unsupported

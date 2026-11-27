@@ -5660,7 +5660,13 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # `//@ dont-check-failure-status` opts the test out of the comparison).
 # A crashes test
 # passes when the compilation crashes the driver process the way it
-# crashes rustc under compiletest (exit code other than 0 or 1).
+# crashes rustc under compiletest (exit code other than 0 or 1),
+# with one evidence requirement: an exit code of 101 passes only
+# when the output carries an internal compiler error, because the
+# driver also exits 101 for its own escaped panics, and counting
+# those would credit the driver-side abnormal exit as a reproduced
+# crash (the same evidence rule the declared failure status 101
+# and the run-crash verdict apply).
 #
 # Per-test compile-flags are forwarded to the driver's embedded
 # rustc, screened for flags that would replace the compilation
@@ -6172,6 +6178,14 @@ def judge_compile(expectation, conv, declared_status=None,
     `dont_check_status` the test opts out of the status
     comparison, as in compiletest, and only the clean-rejection
     ground applies.
+
+    For the "crash" expectation (the crashes suite), compiletest's
+    condition is an exit code other than 0 or 1, but an exit code
+    of 101 additionally requires the internal-compiler-error
+    evidence in the conversion report (`ice`): the driver exits
+    101 both for the embedded compiler's crash and for its own
+    escaped panics, and only the former reproduces the crash the
+    test expects.
     """
     if conv.get("mem_exceeded"):
         return ("fail",
@@ -6257,6 +6271,27 @@ def judge_compile(expectation, conv, declared_status=None,
                 "rejection on a failure-expecting test",
                 "compiler crash on failure-expecting test")
     if expectation == "crash":
+        if code == 101 and not conv.get("ice"):
+            # Convert mode defines exit 101 for a compiler crash,
+            # but the code alone does not evidence one: the driver
+            # also exits 101 when one of its own panics escapes
+            # the compiler run (a Stable MIR conversion panic, the
+            # driver thread panic), and that is the driver-side
+            # abnormal exit, not a reproduction of the reference
+            # compiler crash. As for a declared failure status
+            # of 101 (above) and for run-crash (guest_crash_
+            # evidenced), the verdict requires the crash evidence
+            # the conversion reports: an internal compiler error
+            # in the output. Any other crash-class outcome (death
+            # by signal, reported as a negative code) is the
+            # compiler process crashing, which is compiletest
+            # condition itself, and needs no further evidence.
+            return ("fail",
+                    "driver exited 101 without an internal "
+                    "compiler error in its output, so the crash "
+                    "is not evidenced as the reference compiler "
+                    "own internal error",
+                    "compiler crash not evidenced")
         if code not in (0, 1):
             return ("pass", "", "")
         if code == 0:
