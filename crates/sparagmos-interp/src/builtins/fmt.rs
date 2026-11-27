@@ -2177,6 +2177,20 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A fat pointer whose tag names one of the std
+        // byte-string wrapper types denotes that wrapper's
+        // content, not a slice (an `&OsStr` value is a fat
+        // pointer over its bytes): the string-content
+        // rendering judges those types for every other value
+        // form, and the slice arm below would otherwise
+        // pre-empt it for this one form.
+        if matches!(value, Value::FatRef { .. }) {
+            if let Some(text) =
+                self.format_string_content(frames, value, trait_, ty, options)?
+            {
+                return Ok(text);
+            }
+        }
         if let Value::FatRef { base, .. } = value {
             // A slice value: only Debug is defined for it (a list).
             if trait_ != FmtTrait::Debug {

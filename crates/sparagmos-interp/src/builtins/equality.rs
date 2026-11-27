@@ -1384,6 +1384,24 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 return self.seq_cmp(frames, &ea, &eb);
             }
         }
+        // A side that resolves to a self-contained fat value
+        // (a slice constant or materialised sub-slice held in
+        // a local) orders as a slice against the other side's
+        // elements: the entry arm above sees only a fat value
+        // handed over directly, but a reference to a stored
+        // fat pointer -- the shape a reborrowed `&OsStr`
+        // takes -- resolves to the fat value itself, and the
+        // pair is the slice comparison the entry arm performs
+        // (the same post-resolution arm `values_equal` has).
+        if matches!(&*a, Value::FatRef { .. }) || matches!(&*b, Value::FatRef { .. }) {
+            let (ea, la) = self.slice_elements_ref(frames, &a)?;
+            let (eb, lb) = self.slice_elements_ref(frames, &b)?;
+            match self.elems_cmp(frames, &ea, &eb)? {
+                Some(Ordering::Equal) => {}
+                other => return Ok(other),
+            }
+            return Ok(Some(la.cmp(&lb)));
+        }
         // A `String` in its real aggregate form denotes the
         // string its buffer holds (see
         // `string_from_real_aggregate`): against a string side

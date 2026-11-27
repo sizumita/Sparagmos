@@ -704,6 +704,20 @@ impl<'a> Interpreter<'a> {
                     {
                         SliceElems::Values(Cow::Owned(vec![base.into_owned()]))
                     }
+                    // A base that resolves to a fat pointer
+                    // itself (a reborrow of a stored slice
+                    // value -- the shape the `&self.inner`
+                    // bodies, `as_encoded_bytes` above all,
+                    // produce over a stored `&OsStr`): the
+                    // outer pointer denotes the inner slice's
+                    // elements, so read them through the inner
+                    // pointer's own element reading, truncated
+                    // to the outer length as the plain reading
+                    // below truncates.
+                    Value::FatRef { .. } => {
+                        let (inner, _) = self.slice_elements(frames, base.as_ref())?;
+                        SliceElems::Values(Cow::Owned(inner)).truncated(*len as usize)
+                    }
                     _ => elements_of(base)?.truncated(*len as usize),
                 };
                 let elems = match self.seq_snapshot_key(frames, value) {
