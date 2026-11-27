@@ -38,6 +38,13 @@
 //!   virtual lookup must decline such a call so the direct
 //!   path runs that body with the fat pointer as receiver
 //!   (tests/ui/traits/final/dyn-compat.rs).
+//! * A trait object formed inside a constant -- a static's
+//!   initializer or a promoted constant such as the generated
+//!   test harness's tests array -- is named by no body cast;
+//!   decoding the constant's fat pointer must record the
+//!   vtable's demand, or a trait default the impl does not
+//!   override has no converted body to dispatch to
+//!   (tests/ui/custom_test_frameworks/dynamic.rs).
 //! * A closure `Self` is spelled with the compiler's span
 //!   form (`{closure@<file>:16:17: 16:23}`) in the impl
 //!   instance key but with the definition path's indexed
@@ -295,6 +302,27 @@ fn main() {
     assert_eq!((&(ret_i32, PhantomData) as &dyn Trait).method(), 42);
     assert_eq!((&(ret_unit, PhantomData) as &dyn Trait).method(), 42);
     assert_eq!((&(ret_opaque, PhantomData) as &dyn Trait).method(), 42);
+    println!("ok");
+}
+"#;
+
+const CONST_FORMED_TABLE_SRC: &str = r#"
+trait Testable {
+    fn name(&self) -> u32;
+    fn run(&self) -> bool { true }
+    fn subtests(&self) -> u32 { 0 }
+}
+struct AllFoo(u32);
+impl Testable for AllFoo {
+    fn name(&self) -> u32 { self.0 }
+    fn subtests(&self) -> u32 { 2 }
+}
+fn tests() -> &'static [&'static dyn Testable] { &[&AllFoo(7)] }
+fn main() {
+    let t = tests()[0];
+    assert!(t.run());
+    assert_eq!(t.name(), 7);
+    assert_eq!(t.subtests(), 2);
     println!("ok");
 }
 "#;
@@ -622,5 +650,12 @@ fn main() {
 fn dyn_call_picks_the_bound_instance_among_supertrait_upcasts() {
     let dir = temp_dir("dyn-bound-instance");
     let src = fixture(&dir, "main.rs", MULTI_INSTANCE_SUPERTRAIT_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+#[test]
+fn dyn_default_method_on_const_formed_trait_object() {
+    let dir = temp_dir("dyn-const-formed");
+    let src = fixture(&dir, "main.rs", CONST_FORMED_TABLE_SRC);
     assert_ok(&run_driver(&src));
 }
