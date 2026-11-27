@@ -413,6 +413,19 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `--compiletest-check-mode` for such views; build-mode
   views (build-pass / build-fail / run modes) and every
   other suite keep the full verdict chain.
+- A failure-expecting compile-check test whose expected
+  failure is the collector's missing-MIR error (an item its
+  home crate did not encode optimized MIR for) is judged
+  against the auxiliary crates the driver built for the
+  record: those builds carry `-Zalways-encode-mir`, so
+  their metadata encodes MIR a native build would have
+  left out, and the walk replays the native encoding rule
+  for them -- a metadata-only auxiliary build encodes
+  nothing, and otherwise an item is reported only on
+  conclusive evidence (demanded from a local body, not a
+  trait impl item, under a non-public module). Prebuilt
+  libraries and sysroot crates keep the truthful metadata
+  answer, which the collector hook itself raises.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact

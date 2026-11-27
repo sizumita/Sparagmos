@@ -1093,6 +1093,11 @@ fn driver_main_inner() {
             // main compilation's own setting for prebuilt
             // libraries when it publishes the table (below).
             overflow_checks: true,
+            // A prebuilt artifact is a native build: its
+            // metadata answers MIR availability truthfully,
+            // so the missing-MIR verdict never replays for it
+            // (it is not published either; see below).
+            native_metadata_only: false,
         })
         .collect();
     let mut visible: Vec<AuxBuilt> = prebuilt.clone();
@@ -1125,6 +1130,20 @@ fn driver_main_inner() {
             }
         }
     }
+    // Publish the auxiliary crates this process built for
+    // the missing-MIR verdict (see
+    // `mono_check::set_aux_crates`): their metadata encodes
+    // MIR under `-Zalways-encode-mir` that a native build
+    // would have left out, so the verdict replays the native
+    // encoding rule for them. The prebuilt libraries are not
+    // published: their artifacts are native builds whose
+    // metadata answers truthfully.
+    sparagmos_driver::mono_check::set_aux_crates(
+        aux_built
+            .iter()
+            .map(|b| (b.name.clone(), b.native_metadata_only))
+            .collect(),
+    );
     aux_built.extend(prebuilt);
     let collect_names: Vec<String> = aux_built
         .iter()

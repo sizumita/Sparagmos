@@ -184,6 +184,33 @@
 //!   and LLVM-pass records of that group need LLVM's own
 //!   tables, as recorded on Issue #509).
 //!
+//! - Missing optimized MIR for a demanded instance of an
+//!   auxiliary crate (the collector's `NoOptimizedMir`, from
+//!   `should_codegen_locally` in rustc_monomorphize): when the
+//!   collector must monomorphize an instance locally and its
+//!   home crate did not encode the item's optimized MIR, rustc
+//!   fails fatally. For crates rustc built itself the metadata
+//!   answers `is_mir_available` truthfully and the collector
+//!   hook raises that fatal on its own. The crates this driver
+//!   builds as auxiliaries are the exception: they are
+//!   compiled with `-Zalways-encode-mir` (the main session
+//!   must find their bodies to convert them), so their
+//!   metadata encodes MIR a native build would have left out
+//!   -- the MIR of items outside the home crate's reachable
+//!   set (the encoder's `should_encode_mir` rule), and every
+//!   MIR at all when the auxiliary's own build was
+//!   metadata-only. The walk replays the native rule for the
+//!   auxiliary crates (see `missing_mir_finding`): a
+//!   metadata-only auxiliary encodes nothing, and for the
+//!   rest an item is reported only on conclusive evidence --
+//!   the demand arrived from a local body (an item the home
+//!   crate's reachability visitor reaches is demanded through
+//!   the home crate's own bodies), the item is not a trait
+//!   impl item (those are seeded into the reachable set with
+//!   their trait), and a module on its ancestor chain is not
+//!   public. Anything not conclusive is treated as encoded:
+//!   the check only narrows, never widens.
+//!
 //! - Check mode: when the compilation being judged is a
 //!   compiletest check compilation (`--emit=metadata` — a
 //!   `check-pass` / `check-fail` test, or an incremental
@@ -1581,6 +1608,8 @@ pub fn check_required_consts() -> Option<String> {
         tcx,
         visited: std::collections::HashSet::new(),
         visited_allocs: std::collections::HashSet::new(),
+        demanded_from_local: std::collections::HashSet::new(),
+        processing_local: true,
         queue: std::collections::VecDeque::new(),
         finding: None,
         crash: None,
@@ -1694,6 +1723,41 @@ pub fn divert_check_mode(finding: Option<String>) -> Option<String> {
 /// `note_check_mode_verdict`), drained.
 pub fn take_check_mode_notes() -> Vec<String> {
     std::mem::take(&mut *CHECK_MODE_NOTES.lock().unwrap())
+}
+
+/// The auxiliary crates this driver process built for the
+/// compilation being judged, as (metadata crate name, the
+/// build was metadata-only in native shape) pairs, published
+/// by the driver before the main compilation runs (see
+/// `set_aux_crates`). The missing-MIR verdict consults it:
+/// only these crates can carry the `-Zalways-encode-mir`
+/// encoding the auxiliary builds use, so only for them does
+/// `is_mir_available` answer more than a native build's
+/// metadata would.
+static AUX_CRATES: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Publish the auxiliary crates built for this compilation
+/// (see `AUX_CRATES`). Called once per driver run, before the
+/// main compilation's session starts; a later call replaces
+/// the list.
+pub fn set_aux_crates(crates: Vec<(String, bool)>) {
+    *AUX_CRATES.lock().unwrap() = crates;
+}
+
+/// Whether the named crate is one this process built as an
+/// auxiliary, and if so whether its native build was
+/// metadata-only (`--emit=metadata` among its own compile
+/// flags: no output the encoder counts as code generation,
+/// so a native metadata carries no optimized MIR at all).
+/// `None` for every other crate, whose metadata answers
+/// `is_mir_available` truthfully.
+fn aux_native_metadata_only(crate_name: &str) -> Option<bool> {
+    AUX_CRATES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| name == crate_name)
+        .map(|(_, metadata_only)| *metadata_only)
 }
 
 /// The exported-symbol verdict over the crate's export roots,
@@ -2449,6 +2513,18 @@ struct RequiredConstWalk<'tcx> {
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     visited: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
     visited_allocs: std::collections::HashSet<rustc_middle::mir::interpret::AllocId>,
+    /// Instances some local-crate processing demanded (a
+    /// mention, a constant chase or a root of the local
+    /// crate): the missing-MIR verdict's demand-origin
+    /// evidence (see `missing_mir_finding`). An instance
+    /// demanded only through another upstream crate's bodies
+    /// is not in this set.
+    demanded_from_local: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
+    /// Whether the instance currently being processed is a
+    /// local-crate instance; `enqueue` reads it to maintain
+    /// `demanded_from_local`. True while the roots are
+    /// collected (the roots are the local crate's own).
+    processing_local: bool,
     queue: std::collections::VecDeque<(
         rustc_middle::ty::Instance<'tcx>,
         std::rc::Rc<std::collections::HashMap<rustc_span::def_id::DefId, usize>>,
@@ -2656,6 +2732,9 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         }
         if self.visited.len() >= MAX_REQUIRED_CONST_WALK {
             return;
+        }
+        if self.processing_local {
+            self.demanded_from_local.insert(instance);
         }
         if self.visited.insert(instance) {
             self.queue
@@ -2878,8 +2957,106 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             .ok()
     }
 
+    /// The collector's missing-MIR verdict for an instance of
+    /// a crate this driver built as an auxiliary (see the
+    /// module note): `Some` when the collector's own predicate
+    /// chain says the instance must be monomorphized locally
+    /// (`should_codegen_locally` in rustc_monomorphize, up to
+    /// its MIR-availability test) and the item's optimized MIR
+    /// is conclusively one a native build of the auxiliary
+    /// would not have encoded (the `should_encode_mir` rule in
+    /// rustc_metadata without `-Zalways-encode-mir`). The
+    /// finding is the walk's own; the session's availability
+    /// answer is never consulted for the verdict itself,
+    /// because the auxiliary's metadata always answers true.
+    fn missing_mir_finding(
+        &self,
+        instance: rustc_middle::ty::Instance<'tcx>,
+    ) -> Option<String> {
+        let tcx = self.tcx;
+        let def_id = instance.def.def_id_if_not_guaranteed_local_codegen()?;
+        // The encoder's MIR group: functions, methods and
+        // closures. Constructors are the collector's own
+        // exception, and statics are never monomorphized from
+        // an upstream crate (the chain below excludes both:
+        // constructors are not in this kind set, and a static
+        // is reachable-non-generic or foreign in every shape
+        // that reaches here).
+        if !matches!(
+            tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Fn
+                | rustc_hir::def::DefKind::AssocFn
+                | rustc_hir::def::DefKind::Closure
+        ) {
+            return None;
+        }
+        if tcx.is_foreign_item(def_id) || def_id.is_local() {
+            return None;
+        }
+        // The collector links these instead of monomorphizing
+        // them locally, so their MIR is never demanded.
+        if tcx.is_reachable_non_generic(def_id)
+            || instance.upstream_monomorphization(tcx).is_some()
+        {
+            return None;
+        }
+        // Only the crates this process built as auxiliaries
+        // can carry the always-encode-mir lie; every other
+        // crate's metadata answers truthfully, and a truthful
+        // absence already fails through the collector hook in
+        // the gate below.
+        let metadata_only =
+            aux_native_metadata_only(tcx.crate_name(def_id.krate).as_str())?;
+        let native_encoded = if metadata_only {
+            // A metadata-only native build encodes no
+            // optimized MIR at all (the encoder's rule needs
+            // an output code generation counts).
+            false
+        } else if !self.demanded_from_local.contains(&instance) {
+            // Demanded only through upstream bodies: an item
+            // in the home crate's reachable set is demanded
+            // exactly that way (the reachability visitor
+            // follows the bodies of the items it seeds), so
+            // nothing here is conclusive.
+            true
+        } else if is_trait_impl_item(tcx, def_id) {
+            // Impl items are seeded into the reachable set
+            // with their trait; their encoding does not turn
+            // on the module evidence below.
+            true
+        } else {
+            !has_nonpublic_module_ancestor(tcx, def_id)
+        };
+        if native_encoded {
+            return None;
+        }
+        use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
+        let key = with_resolve_crate_name!(with_no_trimmed_paths!(
+            tcx.def_path_str_with_args(instance.def.def_id(), instance.args)
+        ));
+        Some(format!(
+            "missing optimized MIR for `{key}` in the crate `{}` \
+             (rustc reports this when the collector must \
+             monomorphize an item whose optimized MIR its home \
+             crate did not encode)",
+            tcx.crate_name(def_id.krate),
+        ))
+    }
+
     fn process(&mut self, instance: rustc_middle::ty::Instance<'tcx>) {
         let tcx = self.tcx;
+        self.processing_local = instance.def.def_id().is_local();
+        // The collector's missing-MIR verdict for auxiliary
+        // crates (see `missing_mir_finding`): it precedes the
+        // codegen-locally gate below, whose own hook raises
+        // the fatal only from truthful metadata, and an
+        // auxiliary's metadata is not truthful.
+        if self.finding.is_none() {
+            if let Some(finding) = self.missing_mir_finding(instance) {
+                self.finding = Some(finding);
+                return;
+            }
+        }
         // The collector only walks instances it would codegen
         // locally: a foreign instance's constants were evaluated
         // when its home crate was compiled (or never, if it was
@@ -3443,6 +3620,48 @@ fn required_const_finding(
 /// its result on item bodies; shim bodies may carry no recording,
 /// so for those the recording is reproduced here from the same
 /// input the pass would read.
+/// Whether `def_id` is a trait's own associated item or an
+/// item of a trait impl: those are seeded into a crate's
+/// reachable set with their trait, so the module evidence of
+/// `missing_mir_finding` does not decide their encoding.
+fn is_trait_impl_item(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    def_id: rustc_span::def_id::DefId,
+) -> bool {
+    if !matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::AssocFn) {
+        return false;
+    }
+    matches!(
+        tcx.associated_item(def_id).container,
+        rustc_middle::ty::AssocContainer::Trait
+            | rustc_middle::ty::AssocContainer::TraitImpl(_)
+    )
+}
+
+/// Whether some module on `def_id`'s ancestor chain in its
+/// home crate is not public: the item then cannot be named
+/// from outside the crate through any path, so only a mention
+/// from a reachable body or signature could have put it in
+/// the reachable set the metadata encoder consults.
+fn has_nonpublic_module_ancestor(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    def_id: rustc_span::def_id::DefId,
+) -> bool {
+    let mut cur = def_id;
+    while let Some(parent) = tcx.opt_parent(cur) {
+        if matches!(tcx.def_kind(parent), rustc_hir::def::DefKind::Mod)
+            && !matches!(
+                tcx.visibility(parent),
+                rustc_middle::ty::Visibility::Public
+            )
+        {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 struct MentionScan<'a, 'tcx> {
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &'a rustc_middle::mir::Body<'tcx>,
