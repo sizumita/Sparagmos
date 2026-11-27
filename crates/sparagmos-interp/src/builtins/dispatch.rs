@@ -6,7 +6,7 @@ use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    box_alloc_pointer, channel_handle_id, float_to_int,
+    box_alloc_pointer, channel_handle_id, float_to_int, layered_wrapper_pointer,
     float_to_uint, rc_handle_id,
     round_to_f16, synthetic_address,
     FmtBuilderKind, FmtBuilderState,
@@ -4316,7 +4316,69 @@ impl<'a> Interpreter<'a> {
                         generic_args.get(1).map(String::as_str).unwrap_or(""),
                     )
                 };
-                let value = vals.into_iter().next().expect("arity checked");
+                let mut value = vals.into_iter().next().expect("arity checked");
+                // A counted handle built from a `Cow<'_, B>`
+                // (`Rc<B>: From<Cow<'_, B>>` and the `Arc` twin,
+                // for the string-like and slice pointees): the
+                // conversion is the borrowed form of `B` for the
+                // `Borrowed` variant and the owned form for the
+                // `Owned` variant, so unwrap the Cow to its held
+                // field and re-name the source after the variant
+                // before the arms below dispatch on it. Any other
+                // Cow source keeps its shape and falls through to
+                // the unsupported error below.
+                let cow_source;
+                let source = if let Some(pointee) = [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .find_map(|prefix| generic_first_arg(target, prefix))
+                {
+                    if (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                        && last_generic_param(source).as_deref() == Some(pointee)
+                    {
+                        match self.resolve_value(frames, &value) {
+                            Ok(Value::Enum { variant, mut fields })
+                                if fields.len() == 1 =>
+                            {
+                                let field = fields.pop().expect("len checked");
+                                cow_source = if variant == 0 {
+                                    format!("&{pointee}")
+                                } else if pointee == "str" {
+                                    "std::string::String".to_string()
+                                } else if pointee == "std::ffi::OsStr" {
+                                    "std::ffi::OsString".to_string()
+                                } else if pointee == "std::path::Path" {
+                                    "std::path::PathBuf".to_string()
+                                } else if pointee == "std::ffi::CStr" {
+                                    "std::ffi::CString".to_string()
+                                } else if is_slice_tag(pointee) {
+                                    format!(
+                                        "std::vec::Vec<{}>",
+                                        &pointee[1..pointee.len() - 1]
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                if cow_source.is_empty() {
+                                    source
+                                } else {
+                                    value = field;
+                                    &cow_source
+                                }
+                            }
+                            _ => source,
+                        }
+                    } else {
+                        source
+                    }
+                } else {
+                    source
+                };
                 // The reflexive impl (`impl<T> From<T> for T`) is
                 // the identity by definition; collected code names
                 // it whenever a generic conversion is instantiated
@@ -5119,6 +5181,37 @@ impl<'a> Interpreter<'a> {
                         ));
                     };
                     Ok(self.rc_new_handle(text))
+                } else if [
+                    "std::rc::Rc<",
+                    "alloc::rc::Rc<",
+                    "std::sync::Arc<",
+                    "alloc::sync::Arc<",
+                ]
+                .iter()
+                .any(|prefix| generic_first_arg(target, prefix).is_some())
+                {
+                    // The remaining `From` impls for a counted
+                    // handle (see `rc_from_value`): the generic
+                    // `From<Box<T>>` and the `OsStr` / `Path` /
+                    // `CStr` families' borrowed and owned forms.
+                    // The counted-slice and counted-string arms
+                    // above serve their own pointees first, and
+                    // `From<T>` is the arm before them.
+                    let pointee = [
+                        "std::rc::Rc<",
+                        "alloc::rc::Rc<",
+                        "std::sync::Arc<",
+                        "alloc::sync::Arc<",
+                    ]
+                    .iter()
+                    .find_map(|prefix| generic_first_arg(target, prefix))
+                    .expect("the arm condition found a pointee");
+                    match self.rc_from_value(frames, pointee, source, value)? {
+                        Some(handle) => Ok(handle),
+                        None => Err(unsupported(format!(
+                            "From::from from {source} to {target} is not runtime-supported"
+                        ))),
+                    }
                 } else if target == "std::path::PathBuf"
                     && (source.starts_with("std::borrow::Cow<")
                         || source.starts_with("alloc::borrow::Cow<"))
@@ -10963,6 +11056,157 @@ impl<'a> Interpreter<'a> {
             }
         };
         Ok(cow(0, field))
+    }
+
+    /// The pointee a box value holds, taken out of the box:
+    /// a builtin-built box unboxes directly (its allocation is
+    /// released); a box a converted std body built is the
+    /// layered wrapper aggregate (a `Unique` over a `NonNull`
+    /// over the pointer, the allocator as a sibling field), so
+    /// its pointer chain is followed to the pointee instead
+    /// \u2014 the counted-slice arm's fallback, generalised. A
+    /// fat pointer over a self-contained element tuple resolves
+    /// to itself; its base is the pointee.
+    pub(super) fn box_pointee(&self, frames: &[Frame], value: &Value) -> Option<Value> {
+        if let Some(pointee) = self.unbox_take(value) {
+            return Some(pointee);
+        }
+        let pointer = layered_wrapper_pointer(value)?;
+        match self.resolve_value(frames, &pointer) {
+            Ok(Value::FatRef { base, .. }) if matches!(*base, Value::Tuple(_)) => Some(*base),
+            Ok(pointee) => Some(pointee),
+            Err(_) => None,
+        }
+    }
+
+    /// std's remaining `From` impls for a reference-counted
+    /// handle, whose pointee the counted string / counted slice
+    /// arms do not serve (see the `Builtin::FromFrom` arm that
+    /// calls this): the generic `From<Box<T>>` — the box's
+    /// pointee moves into the handle uncloned, the box's
+    /// allocation released — and the borrowed / owned forms
+    /// of the `OsStr`, `Path` and `CStr` families, whose pointee
+    /// is cloned into the handle in the family's stored form
+    /// (the byte string for `OsStr` / `Path`, the shape the
+    /// boxed OS string stores; the element tuple, terminator
+    /// included, for `CStr`, the shape a `CString` buffer and a
+    /// counted slice both store). Any other (pointee, source)
+    /// pair is not a conversion std provides for a counted
+    /// handle and yields `None`.
+    pub(super) fn rc_from_value(
+        &self,
+        frames: &[Frame],
+        pointee: &str,
+        source: &str,
+        value: Value,
+    ) -> InterpResult<Option<Value>> {
+        // The generic `From<Box<T>>`, gated on the source type
+        // naming the box over exactly this pointee: a value's
+        // shape alone cannot decide (a vector's value has the
+        // same one-field shape as a box aggregate — see the
+        // counted-slice arm's note).
+        let boxed_source = generic_first_arg(source, "std::boxed::Box<") == Some(pointee)
+            || generic_first_arg(source, "alloc::boxed::Box<") == Some(pointee);
+        if boxed_source {
+            // A `Box<dyn Trait>` source: the box's value is the
+            // unsizing cast's `DynRef` over the box aggregate
+            // (or carries it at the bottom of its wrapper
+            // chain). The handle is built over the concrete
+            // pointee the box held and the cast's vtable record
+            // moves onto the handle \u2014 the shape the
+            // handle-level coercion of an `Rc::new` value
+            // produces, whose drop runs through that record.
+            let dyn_source = match &value {
+                d @ Value::DynRef { .. } => Some(d.clone()),
+                _ => match layered_wrapper_pointer(&value) {
+                    Some(d @ Value::DynRef { .. }) => Some(d),
+                    _ => None,
+                },
+            };
+            if let Some(Value::DynRef {
+                base,
+                concrete,
+                traits,
+                drop_glue,
+                type_id,
+                vtable_methods,
+            }) = dyn_source
+            {
+                return Ok(match self.box_pointee(frames, &base) {
+                    Some(pointee) => Some(Value::DynRef {
+                        base: Box::new(self.rc_new_handle(pointee)),
+                        concrete,
+                        traits,
+                        drop_glue,
+                        type_id,
+                        vtable_methods,
+                    }),
+                    None => None,
+                });
+            }
+            return Ok(self
+                .box_pointee(frames, &value)
+                .map(|pointee| self.rc_new_handle(pointee)));
+        }
+        match pointee {
+            "std::ffi::OsStr" => {
+                if source == "&std::ffi::OsStr" {
+                    // The borrowed form: the bytes are cloned
+                    // into the handle; the source is not
+                    // consumed.
+                    let bytes = self.os_str_bytes(frames, &value)?;
+                    Ok(Some(self.rc_new_handle(Value::Bytes(bytes))))
+                } else if source == "std::ffi::OsString" {
+                    let bytes = self.os_string_bytes_any(frames, &value)?.ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "From::from to a counted OsStr",
+                            "an OS string value",
+                            value.kind_name(),
+                        )
+                    })?;
+                    Ok(Some(self.rc_new_handle(Value::Bytes(bytes))))
+                } else {
+                    Ok(None)
+                }
+            }
+            "std::path::Path" => {
+                if source == "&std::path::Path" {
+                    let bytes = self.path_bytes(frames, &value)?;
+                    Ok(Some(self.rc_new_handle(Value::Bytes(bytes))))
+                } else if source == "std::path::PathBuf" {
+                    let bytes = self.path_buf_bytes_any(frames, &value)?.ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "From::from to a counted Path",
+                            "a path buffer value",
+                            value.kind_name(),
+                        )
+                    })?;
+                    Ok(Some(self.rc_new_handle(Value::Bytes(bytes))))
+                } else {
+                    Ok(None)
+                }
+            }
+            "std::ffi::CStr" => {
+                // `arg_bytes` reads the C string's slice,
+                // terminator included, in both source shapes:
+                // the borrowed fat reference directly, and the
+                // owned `CString` through its deref shape.
+                let bytes = if source == "&std::ffi::CStr" {
+                    self.arg_bytes(frames, &value)?
+                } else if source == "std::ffi::CString" {
+                    let fat = self.c_string_deref(frames, &value)?;
+                    self.arg_bytes(frames, &fat)?
+                } else {
+                    return Ok(None);
+                };
+                let elems: Vec<Value> = bytes
+                    .iter()
+                    .map(|b| Value::Uint(u128::from(*b)))
+                    .collect();
+                Ok(Some(self.rc_new_handle(Value::Tuple(elems))))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The `IntoIterator::into_iter` value transformation: the
