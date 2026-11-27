@@ -1165,3 +1165,66 @@ fn main() {
 fn run_mode_map_call_once_through_mut_ref() {
     run_ok("map-call-once-ref", MAP_CALL_ONCE_SRC, "map call_once ok\n");
 }
+
+
+const PEEKABLE_CONSUMER_SRC: &str = r#"
+struct Count {
+    next: u32,
+    end: u32,
+}
+
+impl Iterator for Count {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.next < self.end {
+            let v = self.next;
+            self.next += 1;
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+fn main() {
+    let input: Vec<i32> = vec![1, 2, 3, 4];
+    let out: Vec<i32> = input.iter().cloned().peekable().collect();
+    println!("collect {out:?}");
+    let mut p = input.iter().cloned().peekable();
+    assert_eq!(p.peek(), Some(&1));
+    let rest: Vec<i32> = p.collect();
+    println!("peeked {rest:?}");
+    let n = input.iter().cloned().peekable().count();
+    println!("count {n}");
+    let s: i32 = input.iter().cloned().peekable().sum();
+    println!("sum {s}");
+    let guest: Vec<u32> = Count { next: 0, end: 3 }.peekable().collect();
+    println!("guest {guest:?}");
+}
+"#;
+
+#[test]
+fn run_mode_peekable_owned_consumers() {
+    // An owned `Peekable` handed to a consumer builtin: the
+    // `into_iter` call is the blanket identity (a `Peekable`
+    // is its own iterator), and the consumer's drain steps the
+    // adapter through its collected core `next` body -- the
+    // modelled state machine has no `Peekable` arm, since the
+    // state carries the peeked slot no builtin-produced state
+    // has, so the demand pass converts the body for the
+    // machine's unclaimed-tag fallback (the same route a
+    // guest-defined iterator takes). Before, the run stopped
+    // at `IntoIterator::into_iter for std::iter::Peekable<...>`
+    // as not runtime-supported.
+    let dir = temp_dir("peekable-consumers");
+    let src = fixture(&dir, "peekableconsumers.rs", PEEKABLE_CONSUMER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "collect [1, 2, 3, 4]\npeeked [1, 2, 3, 4]\ncount 4\nsum 10\nguest [0, 1, 2]\n",
+        "stdout={stdout}"
+    );
+}

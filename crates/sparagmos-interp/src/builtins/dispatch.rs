@@ -9780,6 +9780,7 @@ impl<'a> Interpreter<'a> {
             || self_ty.starts_with("std::iter::Enumerate<")
             || self_ty.starts_with("std::iter::Copied<")
             || self_ty.starts_with("std::iter::Cloned<")
+            || self_ty.starts_with("std::iter::Peekable<")
             || self_ty.starts_with("std::iter::Take<")
             || self_ty.starts_with("std::iter::Skip<")
             || self_ty.starts_with("std::iter::Chain<")
