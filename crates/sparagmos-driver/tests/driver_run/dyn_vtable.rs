@@ -67,6 +67,16 @@
 //!   for, so the lookup tries the bound's spelling as a
 //!   candidate key before scanning (tests/ui/traits/
 //!   trait-upcasting/correct-supertrait-substitution.rs).
+//! * A borrow whose type is a trait object, of a place
+//!   that is not itself a fat pointer -- the unsized tail
+//!   of a DST struct behind a fat pointer (`&(*x).ptr`), a
+//!   field behind a raw trait-object pointer, a match's
+//!   `ref` binding of a DST field, the pointee of a
+//!   reference-counted trait object -- forms no
+//!   vtable-carrying value when the place is resolved, so
+//!   the borrow's `dyn` identity is recovered from the fat
+//!   pointer attached to the place (see
+//!   `Interpreter::dyn_borrow_source`).
 //! * A `Self` carrying a function pointer with a concrete
 //!   region (`Foo<fn(&'static u8)>`) renders in the fat
 //!   pointer's concrete tag with the region dropped
@@ -688,6 +698,36 @@ fn main() {
 }
 "#;
 
+const DST_TAIL_SRC: &str = r#"
+trait ToBar {
+    fn to_val(&self) -> isize;
+}
+struct Bar1 {
+    f: isize,
+}
+impl ToBar for Bar1 {
+    fn to_val(&self) -> isize {
+        self.f
+    }
+}
+struct Fat<T: ?Sized> {
+    f1: isize,
+    ptr: T,
+}
+fn foo(x: &Fat<dyn ToBar>) -> isize {
+    let y = &x.ptr;
+    x.ptr.to_val() + y.to_val() + x.f1
+}
+fn main() {
+    let f1 = Fat {
+        f1: 5,
+        ptr: Bar1 { f: 21 },
+    };
+    assert_eq!(foo(&f1), 47);
+    println!("ok");
+}
+"#;
+
 #[test]
 fn dyn_call_picks_the_bound_instance_among_supertrait_upcasts() {
     let dir = temp_dir("dyn-bound-instance");
@@ -706,5 +746,165 @@ fn dyn_default_method_on_const_formed_trait_object() {
 fn dyn_call_by_value_self_through_box() {
     let dir = temp_dir("dyn-by-value-self");
     let src = fixture(&dir, "main.rs", BY_VALUE_SELF_DYN_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+#[test]
+fn dyn_borrow_of_dst_tail_field_dispatches() {
+    let dir = temp_dir("dyn-dst-tail");
+    let src = fixture(&dir, "main.rs", DST_TAIL_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const DST_RAW_FIELD_SRC: &str = r#"
+trait Trait {
+    fn foo(&self) -> isize;
+}
+struct A {
+    f: isize,
+}
+impl Trait for A {
+    fn foo(&self) -> isize {
+        self.f
+    }
+}
+struct Foo<T: ?Sized> {
+    f: T,
+}
+fn main() {
+    let p = Foo { f: A { f: 42 } };
+    let o: *const Foo<dyn Trait> = &p;
+    let r = unsafe { (&*o).f.foo() };
+    assert_eq!(r, 42);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_borrow_of_raw_dst_field_dispatches() {
+    let dir = temp_dir("dyn-dst-raw-field");
+    let src = fixture(&dir, "main.rs", DST_RAW_FIELD_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const MATCH_DST_SRC: &str = r#"
+trait Get {
+    fn get(&self) -> i32;
+}
+impl Get for i32 {
+    fn get(&self) -> i32 {
+        *self
+    }
+}
+struct Foo<T: ?Sized> {
+    a: i32,
+    inner: T,
+}
+fn check_trait_obj(val: &Foo<dyn Get>) -> i32 {
+    match *val {
+        Foo { a, ref inner } => a + inner.get(),
+    }
+}
+fn main() {
+    let foo: &Foo<dyn Get> = &Foo { a: 32, inner: 32 };
+    assert_eq!(check_trait_obj(foo), 64);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_match_ref_binding_dispatches() {
+    let dir = temp_dir("dyn-match-ref-binding");
+    let src = fixture(&dir, "main.rs", MATCH_DST_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const ARC_BOUND_REMOVAL_SRC: &str = r#"
+use std::sync::Arc;
+trait Foo {
+    fn get(&self) -> [u8; 2];
+}
+impl Foo for [u8; 2] {
+    fn get(&self) -> [u8; 2] {
+        *self
+    }
+}
+fn unsize_nested(x: Arc<dyn Foo + Send>) -> Arc<dyn Foo> {
+    x
+}
+fn main() {
+    let x: Arc<dyn Foo + Send> = Arc::new([3, 4]);
+    assert_eq!(unsize_nested(x).get(), [3, 4]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_arc_bound_removal_dispatches() {
+    let dir = temp_dir("dyn-arc-bound-removal");
+    let src = fixture(&dir, "main.rs", ARC_BOUND_REMOVAL_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const WRAPPED_DST_FIELD_SRC: &str = r#"
+trait Foo {
+    fn get(&self) -> [u8; 2];
+}
+impl Foo for [u8; 2] {
+    fn get(&self) -> [u8; 2] {
+        *self
+    }
+}
+struct Bar<T: ?Sized>(T);
+fn unsize_fat_ptr<'a>(x: &'a Bar<dyn Foo + Send + 'a>) -> &'a Bar<dyn Foo + 'a> {
+    x
+}
+fn main() {
+    let x: Box<Bar<dyn Foo + Send>> = Box::new(Bar([1, 2]));
+    assert_eq!(unsize_fat_ptr(&*x).0.get(), [1, 2]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_borrow_of_wrapped_dst_field_dispatches() {
+    let dir = temp_dir("dyn-wrapped-dst-field");
+    let src = fixture(&dir, "main.rs", WRAPPED_DST_FIELD_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const DST_TAIL_PTR_IDENTITY_SRC: &str = r#"
+struct Foo<T: ?Sized> {
+    a: u16,
+    b: T
+}
+trait Bar {
+    fn get(&self) -> usize;
+}
+impl Bar for usize {
+    fn get(&self) -> usize { *self }
+}
+fn main() {
+    let f: Foo<usize> = Foo { a: 0, b: 11 };
+    let ptr1: *const u8 = &f.b as *const _ as *const u8;
+    let f: &Foo<dyn Bar> = &f;
+    // The borrow of the DST tail recovers its dyn identity
+    // (and still dispatches through it) ...
+    assert_eq!(f.b.get(), 11);
+    // ... but as a data pointer it denotes the same field
+    // address as the sized borrow of the same field: the
+    // recovered dyn identity must not split the place-based
+    // pointer identity a field-offset comparison relies on
+    // (tests/ui/dst/dst-field-align.rs).
+    let ptr2: *const u8 = &f.b as *const _ as *const u8;
+    assert_eq!(ptr1, ptr2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_borrow_of_dst_tail_keeps_place_pointer_identity() {
+    let dir = temp_dir("dyn-dst-tail-ptr-identity");
+    let src = fixture(&dir, "main.rs", DST_TAIL_PTR_IDENTITY_SRC);
     assert_ok(&run_driver(&src));
 }

@@ -2370,6 +2370,86 @@ impl<'a> Interpreter<'a> {
         self.fat_deref_len(frames, body, &prefix)
     }
 
+    /// The trait-object fat pointer a place's last dereference
+    /// crosses, when it crosses one: the value of the pointer
+    /// the step dereferences, when that value is a `dyn` fat
+    /// pointer. A DST struct's unsized tail shares the
+    /// enclosing fat pointer's vtable, so a borrow of a place
+    /// reached through the dereference (`&(*x).ptr` for the
+    /// tail field of a `Fat<dyn Trait>`, say) denotes the
+    /// trait object the crossed pointer names.
+    pub(crate) fn crossed_dyn_ref(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+    ) -> Option<Value> {
+        let pos = place
+            .projection
+            .iter()
+            .rposition(|e| matches!(e, ProjectionElem::Deref))?;
+        let prefix = Place {
+            local: place.local,
+            projection: place.projection[..pos].to_vec(),
+        };
+        match self.read_place(frames, body, &prefix) {
+            Ok(v @ Value::DynRef { .. }) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The `dyn` identity a borrow of `place` takes when the
+    /// borrow's own type is a trait object (its bounds are
+    /// `dest_traits`) but the place is not itself a fat
+    /// pointer, so the thin borrow the place resolution forms
+    /// carries no vtable and a method call through it never
+    /// engages virtual dispatch: the identity a fat pointer
+    /// attached to the place carries — the value stored at
+    /// the place, when that value is a fat pointer the borrow
+    /// reborrows, or the fat pointer the place's last
+    /// dereference crosses, when the place is the unsized
+    /// tail of the pointee it denotes. `None` when neither
+    /// names the borrow's principal trait: the borrow then
+    /// keeps its thin form.
+    pub(crate) fn dyn_borrow_source(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+        target: &Resolved,
+        dest_traits: &[String],
+    ) -> Option<DynBorrowSource> {
+        let principal = dest_traits.first()?;
+        let names_principal = |traits: &[String]| traits.iter().any(|t| t == principal);
+        if let Ok(v @ Value::DynRef { .. }) = self.read_resolved(frames, target) {
+            let Value::DynRef { traits, .. } = &v else {
+                unreachable!()
+            };
+            if names_principal(traits) {
+                return Some(DynBorrowSource::Stored(v));
+            }
+        }
+        if let Some(crossed) = self.crossed_dyn_ref(frames, body, place) {
+            let Value::DynRef {
+                concrete,
+                traits,
+                drop_glue,
+                ..
+            } = crossed
+            else {
+                unreachable!()
+            };
+            if names_principal(&traits) {
+                return Some(DynBorrowSource::Crossed {
+                    concrete,
+                    traits: dest_traits.to_vec(),
+                    drop_glue,
+                });
+            }
+        }
+        None
+    }
+
     /// Whether a type is dynamically sized in the model's
     /// terms: a slice, a string, or an ADT whose last field is
     /// (recursively) dynamically sized — the shape of the
