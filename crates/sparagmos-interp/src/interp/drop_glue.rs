@@ -1091,10 +1091,13 @@ impl<'a> Interpreter<'a> {
                                         session: active,
                                         sessions: suspended,
                                     });
+                                    let stack_bytes =
+                                        self.charge_stack(frames, self.frame_stack_bytes(callee))?;
                                     frames.push(Frame {
                                         id: frame_id,
                                         func: drop_fn,
                                         locals,
+                                        stack_bytes,
                                         block: 0,
                                         stmt: 0,
                                         return_dest: None,
@@ -1310,10 +1313,13 @@ impl<'a> Interpreter<'a> {
                             session: active,
                             sessions: suspended,
                         });
+                        let stack_bytes =
+                            self.charge_stack(frames, self.frame_stack_bytes(callee))?;
                         frames.push(Frame {
                             id: frame_id,
                             func: drop_name,
                             locals,
+                            stack_bytes,
                             block: 0,
                             stmt: 0,
                             return_dest: None,
@@ -1718,10 +1724,13 @@ impl<'a> Interpreter<'a> {
                             session: active,
                             sessions: suspended,
                         });
+                        let stack_bytes =
+                            self.charge_stack(frames, self.frame_stack_bytes(callee))?;
                         frames.push(Frame {
                             id: frame_id,
                             func,
                             locals,
+                            stack_bytes,
                             block: 0,
                             stmt: 0,
                             return_dest: None,

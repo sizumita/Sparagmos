@@ -945,6 +945,7 @@ impl<'a> Interpreter<'a> {
             }
             locals[idx] = stamp;
         }
+        let stack_bytes = self.charge_stack(frames, self.frame_stack_bytes(callee))?;
         let frame_id = self.fresh_frame_id();
         let frame_func = self.serving_name(func);
         self.register_frame_base(&frames, frame_id, frame_func);
@@ -952,6 +953,7 @@ impl<'a> Interpreter<'a> {
             id: frame_id,
             func: frame_func.to_string(),
             locals,
+            stack_bytes,
             block: 0,
             stmt: 0,
             return_dest: Some(destination.clone()),
@@ -1020,6 +1022,7 @@ impl<'a> Interpreter<'a> {
                 locals[idx] = stamp;
             }
         }
+        let stack_bytes = self.charge_stack(frames, self.frame_stack_bytes(body))?;
         let incoming_asm = self.pending_asm_incoming.take();
         let id = self.fresh_frame_id();
         let frame_func = self.serving_name(func);
@@ -1028,6 +1031,7 @@ impl<'a> Interpreter<'a> {
             id,
             func: frame_func.to_string(),
             locals,
+            stack_bytes,
             block: 0,
             stmt: 0,
             return_dest: None,

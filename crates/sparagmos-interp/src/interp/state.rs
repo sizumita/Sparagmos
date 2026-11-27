@@ -21,6 +21,10 @@ pub(crate) struct ThreadSlot {
     /// back by `std::thread::Thread::name`); `None` for an
     /// unnamed thread.
     pub name: Option<String>,
+    /// The stack budget the thread's `std::thread::Builder` set
+    /// with `stack_size`, in bytes; `None` keeps the default
+    /// (see [`crate::InterpConfig::thread_stack_size`]).
+    pub stack_limit: Option<u64>,
     pub callable: Option<Value>,
     /// The frames of a run suspended at a quantum boundary, or
     /// blocked on a channel operation no other thread could

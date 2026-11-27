@@ -2402,6 +2402,17 @@ pub struct Body {
     /// interpreter's sequence-position judgment (see
     /// `array_position`). Empty for hand-built bodies.
     pub local_elem_sizes: Vec<Option<u64>>,
+    /// The native size of each local's declared type, indexed
+    /// by local (conversion-computed; see `mir_convert`'s
+    /// per-body tables). The IR type of an ADT local drops its
+    /// generic arguments, so a bare ADT name can denote several
+    /// recorded instances of different sizes and the size cannot
+    /// always be recovered from the declared type alone; this
+    /// table carries the size conversion computed while the
+    /// arguments were still at hand. `None` where conversion
+    /// could not determine the type's layout either. Empty for
+    /// hand-built bodies.
+    pub local_sizes: Vec<Option<u64>>,
     /// Whether each local's declared type is `char`, indexed
     /// by local (conversion-computed; see `mir_convert`). The
     /// IR type renders `char` as `Uint(U32)`, so the declared
@@ -2481,6 +2492,7 @@ impl Body {
             local_tys,
             return_discriminants: None,
             local_elem_sizes: Vec::new(),
+            local_sizes: Vec::new(),
             char_locals: Vec::new(),
             field_elem_sizes: Vec::new(),
             blocks,

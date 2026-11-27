@@ -30,6 +30,7 @@ mod pointers;
 mod process;
 mod run_basics;
 mod rustdoc_path;
+mod stack_overflow;
 mod string_mutators;
 mod strings;
 mod summary_mode;

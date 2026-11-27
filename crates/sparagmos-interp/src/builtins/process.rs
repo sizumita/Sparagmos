@@ -881,6 +881,30 @@ pub(super) fn join_handle_id(value: &Value) -> Option<u64> {
 /// first field, an `Option<String>` in the real field shape), as
 /// host text. `None` for an unnamed builder or a value of an
 /// unexpected shape.
+/// The stack size a `std::thread::Builder` value carries, in
+/// bytes: the builder's second field (the `stack_size` setting
+/// `Builtin::ThreadBuilderStackSize` recorded), when it is set.
+/// Read at `Builder::spawn` time, where the setting becomes the
+/// spawned thread's stack budget.
+pub(super) fn builder_thread_stack_size(builder: &Value) -> Option<u64> {
+    let Value::Enum { variant: 0, fields } = builder else {
+        return None;
+    };
+    let size_field = fields.get(1)?;
+    let Value::Enum {
+        variant: 1,
+        fields: size_fields,
+    } = size_field
+    else {
+        return None;
+    };
+    match size_fields.first()? {
+        Value::Int(v) if *v >= 0 => Some(*v as u64),
+        Value::Uint(v) => Some(*v as u64),
+        _ => None,
+    }
+}
+
 pub(super) fn builder_thread_name(builder: &Value) -> Option<String> {
     let Value::Enum { variant: 0, fields } = builder else {
         return None;
