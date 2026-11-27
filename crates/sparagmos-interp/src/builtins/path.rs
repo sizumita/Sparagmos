@@ -601,15 +601,21 @@ pub(super) fn read_dir_value(items: Vec<Value>) -> Value {
 /// around the pair of the entry's full path (as a `PathBuf`)
 /// and its file name (as an `OsString`) — the two facts the
 /// entry's modelled methods read.
-pub(super) fn dir_entry_value(entry: &std::fs::DirEntry) -> Value {
-    use std::os::unix::ffi::OsStrExt as _;
-    Value::Enum {
+pub(super) fn dir_entry_value(entry: &std::fs::DirEntry) -> InterpResult<Value> {
+    let file_name = entry.file_name();
+    let name_bytes =
+        crate::platform::os_str_bytes(&file_name).ok_or_else(|| {
+            unsupported(
+                "DirEntry::file_name: the host file name has no byte form on this platform",
+            )
+        })?;
+    Ok(Value::Enum {
         variant: 0,
         fields: vec![Value::Tuple(vec![
-            pathbuf_value(&host_path_bytes(&entry.path())),
-            os_string_value(entry.file_name().as_bytes()),
+            pathbuf_value(&host_path_bytes(&entry.path())?),
+            os_string_value(&name_bytes),
         ])],
-    }
+    })
 }
 
 /// The (full path, file name) values of a modelled `DirEntry`.
@@ -630,15 +636,25 @@ pub(super) fn dir_entry_parts(value: &Value) -> Option<(Value, Value)> {
 }
 
 /// A host path from raw path bytes (guest paths are byte
-/// strings, not necessarily UTF-8).
-pub(super) fn host_path(bytes: &[u8]) -> std::path::PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::OsStr::from_bytes(bytes).to_os_string().into()
+/// strings, not necessarily UTF-8). On a host whose
+/// strings are not byte strings, bytes that are not valid
+/// UTF-8 denote no path the host can express: a named
+/// unsupported error, never a substituted path.
+pub(super) fn host_path(bytes: &[u8]) -> InterpResult<std::path::PathBuf> {
+    crate::platform::path_from_bytes(bytes).ok_or_else(|| {
+        unsupported(
+            "host path: the path bytes have no host string form on this platform",
+        )
+    })
 }
 
-pub(super) fn host_path_bytes(path: &std::path::Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().to_vec()
+/// The bytes of a host path: on a host whose strings are
+/// not byte strings, a path that is not valid UTF-8 has
+/// no byte form (see [`host_path`]).
+pub(super) fn host_path_bytes(path: &std::path::Path) -> InterpResult<Vec<u8>> {
+    crate::platform::path_bytes(path).ok_or_else(|| {
+        unsupported("host path: the host path has no byte form on this platform")
+    })
 }
 
 /// One `Iterator::next` / `DoubleEndedIterator::next_back`
@@ -684,8 +700,13 @@ pub(super) fn components_step_state(
             ))
         }
     };
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes));
+    let path = std::path::Path::new(
+        crate::platform::os_str_from_bytes(&bytes).ok_or_else(|| {
+            unsupported(
+                "Components: the path bytes have no host string form on this platform",
+            )
+        })?,
+    );
     let mut iter = path.components();
     for _ in 0..front {
         let _ = iter.next();
@@ -696,15 +717,17 @@ pub(super) fn components_step_state(
     let item = if from_back { iter.next_back() } else { iter.next() };
     match item {
         Some(component) => {
+            let Some(value) = component_value(component) else {
+                return Err(unsupported(
+                    "Components: a host path component has no byte form on this platform",
+                ));
+            };
             let (front, back) = if from_back {
                 (front, back + 1)
             } else {
                 (front + 1, back)
             };
-            Ok((
-                components_state(&bytes, front, back),
-                Some(component_value(component)),
-            ))
+            Ok((components_state(&bytes, front, back), Some(value)))
         }
         None => Ok((state.clone(), None)),
     }
@@ -733,29 +756,30 @@ pub(super) fn components_state(bytes: &[u8], front: u128, back: u128) -> Value {
 /// the component's byte string (the model's `&OsStr`, the
 /// same form `Builtin::PathPart` returns for `&Path` /
 /// `&OsStr` results).
-fn component_value(component: std::path::Component) -> Value {
-    use std::os::unix::ffi::OsStrExt;
+fn component_value(component: std::path::Component) -> Option<Value> {
     match component {
-        std::path::Component::Prefix(prefix) => Value::Enum {
+        std::path::Component::Prefix(prefix) => Some(Value::Enum {
             variant: 0,
-            fields: vec![prefix_component_value(prefix)],
-        },
-        std::path::Component::RootDir => Value::Enum {
+            fields: vec![prefix_component_value(prefix)?],
+        }),
+        std::path::Component::RootDir => Some(Value::Enum {
             variant: 1,
             fields: Vec::new(),
-        },
-        std::path::Component::CurDir => Value::Enum {
+        }),
+        std::path::Component::CurDir => Some(Value::Enum {
             variant: 2,
             fields: Vec::new(),
-        },
-        std::path::Component::ParentDir => Value::Enum {
+        }),
+        std::path::Component::ParentDir => Some(Value::Enum {
             variant: 3,
             fields: Vec::new(),
-        },
-        std::path::Component::Normal(part) => Value::Enum {
+        }),
+        std::path::Component::Normal(part) => Some(Value::Enum {
             variant: 4,
-            fields: vec![Value::Bytes(part.as_bytes().to_vec())],
-        },
+            fields: vec![Value::Bytes(
+                crate::platform::os_str_bytes(part)?.into_owned(),
+            )],
+        }),
     }
 }
 
@@ -764,17 +788,18 @@ fn component_value(component: std::path::Component) -> Value {
 /// (`Verbatim`, `VerbatimUNC`, `VerbatimDisk`, `DeviceNS`,
 /// `UNC`, `Disk`) and the raw prefix string. Prefixes do
 /// not occur on Unix; the shape is built for completeness.
-fn prefix_component_value(prefix: std::path::PrefixComponent) -> Value {
-    use std::os::unix::ffi::OsStrExt;
-    let os = |s: &std::ffi::OsStr| Value::Bytes(s.as_bytes().to_vec());
+fn prefix_component_value(prefix: std::path::PrefixComponent) -> Option<Value> {
+    let os = |s: &std::ffi::OsStr| {
+        crate::platform::os_str_bytes(s).map(|b| Value::Bytes(b.into_owned()))
+    };
     let kind = match prefix.kind() {
         std::path::Prefix::Verbatim(s) => Value::Enum {
             variant: 0,
-            fields: vec![os(s)],
+            fields: vec![os(s)?],
         },
         std::path::Prefix::VerbatimUNC(a, b) => Value::Enum {
             variant: 1,
-            fields: vec![os(a), os(b)],
+            fields: vec![os(a)?, os(b)?],
         },
         std::path::Prefix::VerbatimDisk(d) => Value::Enum {
             variant: 2,
@@ -782,21 +807,21 @@ fn prefix_component_value(prefix: std::path::PrefixComponent) -> Value {
         },
         std::path::Prefix::DeviceNS(s) => Value::Enum {
             variant: 3,
-            fields: vec![os(s)],
+            fields: vec![os(s)?],
         },
         std::path::Prefix::UNC(a, b) => Value::Enum {
             variant: 4,
-            fields: vec![os(a), os(b)],
+            fields: vec![os(a)?, os(b)?],
         },
         std::path::Prefix::Disk(d) => Value::Enum {
             variant: 5,
             fields: vec![Value::Uint(d as u128)],
         },
     };
-    Value::Enum {
+    Some(Value::Enum {
         variant: 0,
-        fields: vec![kind, os(prefix.as_os_str())],
-    }
+        fields: vec![kind, os(prefix.as_os_str())?],
+    })
 }
 
 /// A `PathBuf` value in std's shape: `PathBuf { inner:

@@ -655,10 +655,19 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let id = self.file_id_of(frames, &vals[0])?;
                 let md = self.with_file(id, |f| f.metadata());
-                self.file_result(md, |md| Value::Enum {
-                    variant: 0,
-                    fields: vec![metadata_value(&md)],
-                })
+                match md {
+                    Some(Ok(md)) => Ok(io_result_ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![metadata_value(&md)?],
+                    })),
+                    Some(Err(error)) => {
+                        Ok(io_result_err(host_io_error(&error)))
+                    }
+                    None => Err(unsupported(
+                        "file operation on a handle that is not open"
+                            .to_string(),
+                    )),
+                }
             }
             "std::fs::File::try_clone" => {
                 arity(1)?;

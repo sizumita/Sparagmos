@@ -3063,8 +3063,11 @@ impl<'a> Interpreter<'a> {
                 let Some(bytes) = self.string_content_bytes(frames, value) else {
                     return Ok(None);
                 };
-                use std::os::unix::ffi::OsStrExt as _;
-                Ok(Some(format!("{:?}", std::ffi::OsStr::from_bytes(&bytes))))
+                let Some(os) = crate::platform::os_str_from_bytes(&bytes)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(format!("{:?}", os)))
             }
             "std::path::Display" | "std::ffi::os_str::Display" => {
                 // The `Display` helpers `Path::display` and
@@ -3090,8 +3093,12 @@ impl<'a> Interpreter<'a> {
                         options,
                     ))),
                     FmtTrait::Debug => {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        Ok(Some(format!("{:?}", std::ffi::OsStr::from_bytes(&bytes))))
+                        let Some(os) =
+                            crate::platform::os_str_from_bytes(&bytes)
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(Some(format!("{:?}", os)))
                     }
                     _ => Ok(None),
                 }

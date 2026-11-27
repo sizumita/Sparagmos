@@ -58,6 +58,7 @@ pub mod f128;
 pub mod interp;
 pub mod ir;
 pub mod mir_convert;
+mod platform;
 pub mod value;
 
 pub use error::{InterpError, InterpResult};

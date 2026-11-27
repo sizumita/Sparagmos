@@ -876,16 +876,10 @@ impl<'a> Interpreter<'a> {
     /// as a native child's stdin is the parent's.
     pub(crate) fn stdin_file_id(&self) -> u64 {
         if !self.files.borrow().contains_key(&STDIN_FILE_ID) {
-            use std::os::fd::AsFd as _;
-            if let Ok(owned) =
-                std::io::stdin().as_fd().try_clone_to_owned()
-            {
-                self.files.borrow_mut().insert(
-                    STDIN_FILE_ID,
-                    std::cell::RefCell::new(std::fs::File::from(
-                        owned,
-                    )),
-                );
+            if let Some(file) = crate::platform::stdin_dup_file() {
+                self.files
+                    .borrow_mut()
+                    .insert(STDIN_FILE_ID, std::cell::RefCell::new(file));
             }
         }
         STDIN_FILE_ID

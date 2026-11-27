@@ -578,13 +578,30 @@ const ERRNO_NOT_A_DIRECTORY: i32 = 20;
 /// exist, not be a directory, and carry an execute bit. The
 /// error is the `errno` the native spawn reports for it.
 fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
-    use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(candidate) {
         Ok(m) if m.is_dir() => Err(ERRNO_PERMISSION_DENIED),
-        Ok(m) if m.permissions().mode() & 0o111 == 0 => Err(ERRNO_PERMISSION_DENIED),
+        Ok(m) if !host_executable(&m) => Err(ERRNO_PERMISSION_DENIED),
         Ok(_) => Ok(()),
         Err(_) => Err(ERRNO_NOT_FOUND),
     }
+}
+
+/// Whether the host metadata carries an execute
+/// permission: the Unix mode's execute bits. Windows has
+/// no execute bit — a non-directory file is executable as
+/// far as this gate can honestly tell (the gate only
+/// vetoes spawns that would fail natively; a program that
+/// would start is reported as a named unsupported error
+/// by the caller).
+#[cfg(unix)]
+fn host_executable(md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    md.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn host_executable(_md: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Resolve a command's program the way `execvp` does at spawn:
@@ -598,15 +615,25 @@ fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
 /// the search, not to the working directory; `Err` is the
 /// `errno` the failed spawn reports.
 fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::PathBuf, i32> {
-    use std::os::unix::ffi::OsStrExt;
-    let program = std::ffi::OsStr::from_bytes(&state.program);
+    // A program name with no host string form on this
+    // platform names no file the host could execute: the
+    // resolution fails as not-found.
+    let Some(program) = crate::platform::os_str_from_bytes(&state.program)
+    else {
+        return Err(ERRNO_NOT_FOUND);
+    };
     if state.program.contains(&b'/') {
         let candidate = if state.program.starts_with(b"/") {
             std::path::PathBuf::from(program)
         } else {
             match &state.cwd {
                 Some(cwd) => {
-                    std::path::Path::new(std::ffi::OsStr::from_bytes(cwd)).join(program)
+                    let Some(cwd_os) =
+                        crate::platform::os_str_from_bytes(cwd)
+                    else {
+                        return Err(ERRNO_NOT_FOUND);
+                    };
+                    std::path::Path::new(cwd_os).join(program)
                 }
                 None => std::path::PathBuf::from(program),
             }
@@ -615,8 +642,10 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::Pat
     }
     // The effective PATH: the inherited environment with the
     // command's entries applied in order.
-    let mut path_var: Option<Vec<u8>> =
-        std::env::var_os("PATH").map(|v| v.as_bytes().to_vec());
+    let mut path_var: Option<Vec<u8>> = std::env::var_os("PATH")
+        .and_then(|v| {
+            crate::platform::os_str_bytes(&v).map(|b| b.into_owned())
+        });
     if state.env_clear {
         path_var = None;
     }
@@ -627,7 +656,11 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::Pat
     }
     let search: Vec<u8> = path_var.unwrap_or_else(|| b"/bin:/usr/bin".to_vec());
     let mut denied = false;
-    for dir in std::env::split_paths(std::ffi::OsStr::from_bytes(&search)) {
+    let Some(search_os) = crate::platform::os_str_from_bytes(&search)
+    else {
+        return Err(ERRNO_NOT_FOUND);
+    };
+    for dir in std::env::split_paths(search_os) {
         let candidate = dir.join(program);
         match check_executable(&candidate) {
             Ok(()) => return Ok(candidate),
@@ -671,12 +704,15 @@ pub(super) fn spawn_gate_error(
 }
 
 fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
-    use std::os::unix::ffi::OsStrExt;
     if state.saw_nul {
         return Some(io_simple_error_value(ERROR_KIND_INVALID_INPUT));
     }
     if let Some(cwd) = &state.cwd {
-        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(cwd));
+        let Some(cwd_os) = crate::platform::os_str_from_bytes(cwd)
+        else {
+            return Some(io_os_error_value(ERRNO_NOT_FOUND));
+        };
+        let dir = std::path::Path::new(cwd_os);
         match std::fs::metadata(dir) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => return Some(io_os_error_value(ERRNO_NOT_A_DIRECTORY)),
@@ -881,10 +917,10 @@ pub(super) fn tool_outcome(
     // `ToolRunRequest::resolved_program`). Both callers run
     // this only after the spawn gate has accepted the
     // command, so the resolution is the one that succeeded.
-    use std::os::unix::ffi::OsStrExt as _;
-    let resolved_program = resolve_program(state)
-        .ok()
-        .map(|path| path.as_os_str().as_bytes().to_vec());
+    let resolved_program = resolve_program(state).ok().and_then(|path| {
+        crate::platform::os_str_bytes(path.as_os_str())
+            .map(|b| b.into_owned())
+    });
     let request = crate::interp::ToolRunRequest {
         program: state.program.clone(),
         args: state.args.clone(),
@@ -949,7 +985,6 @@ fn process_spawn_request(
             None => default,
         }
     };
-    use std::os::unix::ffi::OsStrExt as _;
     crate::interp::ProcessSpawnRequest {
         program: state.program.clone(),
         args: state.args.clone(),
@@ -957,9 +992,10 @@ fn process_spawn_request(
         envs: state.envs.clone(),
         env_clear: state.env_clear,
         cwd: state.cwd.clone(),
-        resolved_program: resolve_program(state)
-            .ok()
-            .map(|path| path.as_os_str().as_bytes().to_vec()),
+        resolved_program: resolve_program(state).ok().and_then(|path| {
+            crate::platform::os_str_bytes(path.as_os_str())
+                .map(|b| b.into_owned())
+        }),
         stdin: wire(
             state.stdin_stdio,
             if output_captured {

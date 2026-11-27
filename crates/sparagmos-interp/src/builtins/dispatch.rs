@@ -707,15 +707,25 @@ impl<'a> Interpreter<'a> {
                 // innermost value is the `vec::IntoIter` in this
                 // model's iteration-state shape ([element
                 // snapshot, next index]).
-                use std::os::unix::ffi::OsStrExt as _;
-                let items: Vec<Value> = std::env::vars_os()
-                    .map(|(k, v)| {
-                        Value::Tuple(vec![
-                            os_string_value(k.as_bytes()),
-                            os_string_value(v.as_bytes()),
-                        ])
-                    })
-                    .collect();
+                let mut items: Vec<Value> = Vec::new();
+                for (k, v) in std::env::vars_os() {
+                    let key_bytes =
+                        crate::platform::os_str_bytes(&k).ok_or_else(|| {
+                            unsupported(
+                                "env::vars_os: a host variable name has no byte form on this platform",
+                            )
+                        })?;
+                    let value_bytes =
+                        crate::platform::os_str_bytes(&v).ok_or_else(|| {
+                            unsupported(
+                                "env::vars_os: a host variable value has no byte form on this platform",
+                            )
+                        })?;
+                    items.push(Value::Tuple(vec![
+                        os_string_value(&key_bytes),
+                        os_string_value(&value_bytes),
+                    ]));
+                }
                 let common_env = Value::Enum {
                     variant: 0,
                     fields: vec![owned_iter_state(items)],
@@ -2666,7 +2676,7 @@ impl<'a> Interpreter<'a> {
                 let path = std::env::current_exe().map_err(|e| {
                     unsupported(format!("current_exe is not available in this run: {e}"))
                 })?;
-                Ok(ok_result(pathbuf_value(&host_path_bytes(&path))))
+                Ok(ok_result(pathbuf_value(&host_path_bytes(&path)?)))
             }
             Builtin::ProcessId => {
                 arity(0)?;
@@ -3219,7 +3229,9 @@ impl<'a> Interpreter<'a> {
             Builtin::EnvCurrentExe => {
                 arity(0)?;
                 Ok(match std::env::current_exe() {
-                    Ok(path) => io_result_ok(pathbuf_value(&host_path_bytes(&path))),
+                    Ok(path) => {
+                        io_result_ok(pathbuf_value(&host_path_bytes(&path)?))
+                    }
                     Err(e) => io_result_err(host_io_error(&e)),
                 })
             }
@@ -3258,12 +3270,33 @@ impl<'a> Interpreter<'a> {
                     .truncate(truncate)
                     .create(create)
                     .create_new(create_new);
+                #[cfg(unix)]
                 {
                     use std::os::unix::fs::OpenOptionsExt;
                     host_options.custom_flags(custom_flags);
                     host_options.mode(mode);
                 }
-                match host_options.open(host_path(&bytes)) {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    host_options.custom_flags(custom_flags as u32);
+                    // std's default creation mode asks for
+                    // nothing Windows cannot express; any
+                    // other Unix mode has no equivalent.
+                    if mode != 0o666 {
+                        return Err(unsupported(format!(
+                            "OpenOptions mode {mode:#o} has no equivalent on this host platform"
+                        )));
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = (custom_flags, mode);
+                    return Err(unsupported(
+                        "OpenOptions custom flags and mode are not modelled on this host platform",
+                    ));
+                }
+                match host_options.open(host_path(&bytes)?) {
                     Ok(file) => {
                         let id = self.register_file(file);
                         Ok(io_result_ok(file_value(id)))
@@ -3295,11 +3328,11 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => false,
                 };
+                let host_dir = host_path(&bytes)?;
                 Ok(io_result_from_host(if recursive {
-                    std::fs::create_dir_all(host_path(&bytes))
-                        .map(|()| Value::Unit)
+                    std::fs::create_dir_all(&host_dir).map(|()| Value::Unit)
                 } else {
-                    std::fs::create_dir(host_path(&bytes)).map(|()| Value::Unit)
+                    std::fs::create_dir(&host_dir).map(|()| Value::Unit)
                 }))
             }
             Builtin::EnvJoinPaths => {
@@ -3381,11 +3414,11 @@ impl<'a> Interpreter<'a> {
             Builtin::EnvVarInner => {
                 arity(1)?;
                 let key = self.os_str_bytes(frames, &vals[0])?;
-                use std::os::unix::ffi::OsStrExt as _;
                 let value = if key.contains(&0) {
                     None
                 } else {
-                    std::env::var_os(std::ffi::OsStr::from_bytes(&key))
+                    crate::platform::os_str_from_bytes(&key)
+                        .and_then(|name| std::env::var_os(name))
                 };
                 Ok(match value {
                     None => err_result(Value::Enum {
@@ -3393,12 +3426,17 @@ impl<'a> Interpreter<'a> {
                         fields: Vec::new(),
                     }),
                     Some(v) => {
-                        let bytes = v.as_bytes();
-                        match std::str::from_utf8(bytes) {
+                        let bytes = crate::platform::os_str_bytes(&v)
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "env::var: the host value has no byte form on this platform",
+                                )
+                            })?;
+                        match std::str::from_utf8(&bytes) {
                             Ok(s) => ok_result(Value::Str(s.to_string())),
                             Err(_) => err_result(Value::Enum {
                                 variant: 1,
-                                fields: vec![os_string_value(bytes)],
+                                fields: vec![os_string_value(&bytes)],
                             }),
                         }
                     }
@@ -3410,10 +3448,18 @@ impl<'a> Interpreter<'a> {
                 if key.contains(&0) {
                     return Ok(none_value());
                 }
-                use std::os::unix::ffi::OsStrExt as _;
-                let value = std::env::var_os(std::ffi::OsStr::from_bytes(&key));
+                let value = crate::platform::os_str_from_bytes(&key)
+                    .and_then(|name| std::env::var_os(name));
                 Ok(match value {
-                    Some(v) => some_value(os_string_value(v.as_bytes())),
+                    Some(v) => {
+                        let bytes = crate::platform::os_str_bytes(&v)
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "getenv: the host value has no byte form on this platform",
+                                )
+                            })?;
+                        some_value(os_string_value(&bytes))
+                    }
                     None => none_value(),
                 })
             }
@@ -3428,11 +3474,15 @@ impl<'a> Interpreter<'a> {
                 {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
-                use std::os::unix::ffi::OsStrExt as _;
-                std::env::set_var(
-                    std::ffi::OsStr::from_bytes(&key),
-                    std::ffi::OsStr::from_bytes(&value),
-                );
+                let (Some(key_os), Some(value_os)) = (
+                    crate::platform::os_str_from_bytes(&key),
+                    crate::platform::os_str_from_bytes(&value),
+                ) else {
+                    return Err(unsupported(
+                        "set_var: the key or value has no host string form on this platform",
+                    ));
+                };
+                std::env::set_var(key_os, value_os);
                 Ok(io_result_ok(Value::Unit))
             }
             Builtin::EnvUnsetenv => {
@@ -3441,26 +3491,34 @@ impl<'a> Interpreter<'a> {
                 if key.is_empty() || key.contains(&b'=') || key.contains(&0) {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
-                use std::os::unix::ffi::OsStrExt as _;
-                std::env::remove_var(std::ffi::OsStr::from_bytes(&key));
+                let Some(key_os) =
+                    crate::platform::os_str_from_bytes(&key)
+                else {
+                    return Err(unsupported(
+                        "remove_var: the key has no host string form on this platform",
+                    ));
+                };
+                std::env::remove_var(key_os);
                 Ok(io_result_ok(Value::Unit))
             }
             Builtin::EnvCurrentDir => {
                 arity(0)?;
-                Ok(io_result_from_host(
-                    std::env::current_dir()
-                        .map(|dir| pathbuf_value(&host_path_bytes(&dir))),
-                ))
+                Ok(match std::env::current_dir() {
+                    Ok(dir) => {
+                        io_result_ok(pathbuf_value(&host_path_bytes(&dir)?))
+                    }
+                    Err(e) => io_result_err(host_io_error(&e)),
+                })
             }
             Builtin::EnvTempDir => {
                 arity(0)?;
-                Ok(pathbuf_value(&host_path_bytes(&std::env::temp_dir())))
+                Ok(pathbuf_value(&host_path_bytes(&std::env::temp_dir())?))
             }
             Builtin::EnvHomeDir => {
                 arity(0)?;
                 Ok(match std::env::home_dir() {
                     Some(dir) => {
-                        some_value(pathbuf_value(&host_path_bytes(&dir)))
+                        some_value(pathbuf_value(&host_path_bytes(&dir)?))
                     }
                     None => none_value(),
                 })
@@ -3472,7 +3530,7 @@ impl<'a> Interpreter<'a> {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
                 Ok(io_result_from_host(
-                    std::env::set_current_dir(host_path(&bytes))
+                    std::env::set_current_dir(host_path(&bytes)?)
                         .map(|()| Value::Unit),
                 ))
             }
@@ -3548,7 +3606,7 @@ impl<'a> Interpreter<'a> {
                 if bytes.contains(&0) {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
-                Ok(match std::fs::read(host_path(&bytes)) {
+                Ok(match std::fs::read(host_path(&bytes)?) {
                     Ok(data) => match String::from_utf8(data) {
                         Ok(text) => io_result_ok(Value::Str(text)),
                         Err(_) => io_result_err(io_simple_error_value(std::io::ErrorKind::InvalidData as u32)),
@@ -3563,7 +3621,8 @@ impl<'a> Interpreter<'a> {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
                 Ok(io_result_from_host(
-                    std::fs::read(host_path(&bytes)).map(|data| byte_vec_value(&data)),
+                    std::fs::read(host_path(&bytes)?)
+                        .map(|data| byte_vec_value(&data)),
                 ))
             }
             Builtin::FsWriteInner => {
@@ -3574,7 +3633,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let contents = self.arg_bytes(frames, &vals[1])?;
                 Ok(io_result_from_host(
-                    std::fs::write(host_path(&bytes), &contents)
+                    std::fs::write(host_path(&bytes)?, &contents)
                         .map(|()| Value::Unit),
                 ))
             }
@@ -3593,7 +3652,7 @@ impl<'a> Interpreter<'a> {
                 let bytes = self.path_bytes(frames, &vals[0])?;
                 let is_file = matches!(kind, Builtin::PathIsFile);
                 Ok(Value::Bool(
-                    match std::fs::metadata(host_path(&bytes)) {
+                    match std::fs::metadata(host_path(&bytes)?) {
                         Ok(md) => {
                             if is_file {
                                 md.is_file()
@@ -3825,16 +3884,13 @@ impl<'a> Interpreter<'a> {
                 if bytes.contains(&0) {
                     return Ok(io_result_err(io_simple_error_value(20)));
                 }
-                Ok(io_result_from_host(
-                    std::fs::metadata(host_path(&bytes)).map(|md| {
-                        // The public `Metadata` wraps the sys
-                        // value `metadata_value` builds.
-                        Value::Enum {
-                            variant: 0,
-                            fields: vec![metadata_value(&md)],
-                        }
+                Ok(match std::fs::metadata(host_path(&bytes)?) {
+                    Ok(md) => io_result_ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![metadata_value(&md)?],
                     }),
-                ))
+                    Err(e) => io_result_err(host_io_error(&e)),
+                })
             }
             Builtin::PathStartsWith => {
                 arity(2)?;
@@ -5059,25 +5115,34 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let (bytes, was_str) = self.path_bytes_of(frames, &vals[0])?;
                 let part = {
-                    use std::os::unix::ffi::OsStrExt;
                     let path = std::path::Path::new(
-                        std::ffi::OsStr::from_bytes(&bytes),
+                        crate::platform::os_str_from_bytes(&bytes)
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "Path part: the path bytes have no host string form on this platform",
+                                )
+                            })?,
                     );
-                    let part: Option<&[u8]> = match part {
+                    let part_os: Option<&std::ffi::OsStr> = match part {
                         PathPart::Parent => {
-                            path.parent().map(|p| p.as_os_str().as_bytes())
+                            path.parent().map(|p| p.as_os_str())
                         }
-                        PathPart::FileName => {
-                            path.file_name().map(|s| s.as_bytes())
-                        }
-                        PathPart::FileStem => {
-                            path.file_stem().map(|s| s.as_bytes())
-                        }
-                        PathPart::Extension => {
-                            path.extension().map(|s| s.as_bytes())
-                        }
+                        PathPart::FileName => path.file_name(),
+                        PathPart::FileStem => path.file_stem(),
+                        PathPart::Extension => path.extension(),
                     };
-                    part.map(<[u8]>::to_vec)
+                    match part_os {
+                        Some(os) => Some(
+                            crate::platform::os_str_bytes(os)
+                                .ok_or_else(|| {
+                                    unsupported(
+                                        "Path part: the host component has no byte form on this platform",
+                                    )
+                                })?
+                                .into_owned(),
+                        ),
+                        None => None,
+                    }
                 };
                 Ok(match part {
                     Some(bytes) => some_value(if was_str {
@@ -5115,9 +5180,9 @@ impl<'a> Interpreter<'a> {
                             slot.kind_name(),
                         )
                     })?;
-                    let mut buf = host_path(&current);
-                    buf.push(host_path(&addition));
-                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    let mut buf = host_path(&current)?;
+                    buf.push(host_path(&addition)?);
+                    *slot = pathbuf_value(&host_path_bytes(&buf)?);
                     Ok(Value::Unit)
                 })
             }
@@ -5132,9 +5197,9 @@ impl<'a> Interpreter<'a> {
                             slot.kind_name(),
                         )
                     })?;
-                    let mut buf = host_path(&current);
+                    let mut buf = host_path(&current)?;
                     let popped = buf.pop();
-                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    *slot = pathbuf_value(&host_path_bytes(&buf)?);
                     Ok(Value::Bool(popped))
                 })
             }
@@ -5150,11 +5215,16 @@ impl<'a> Interpreter<'a> {
                             slot.kind_name(),
                         )
                     })?;
-                    use std::os::unix::ffi::OsStrExt;
-                    let mut buf = host_path(&current);
-                    let set =
-                        buf.set_extension(std::ffi::OsStr::from_bytes(&extension));
-                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    let mut buf = host_path(&current)?;
+                    let extension_os =
+                        crate::platform::os_str_from_bytes(&extension)
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "PathBuf::set_extension: the extension has no host string form on this platform",
+                                )
+                            })?;
+                    let set = buf.set_extension(extension_os);
+                    *slot = pathbuf_value(&host_path_bytes(&buf)?);
                     Ok(Value::Bool(set))
                 })
             }
@@ -5162,10 +5232,15 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
                 let (extension, _) = self.path_bytes_of(frames, &vals[1])?;
-                use std::os::unix::ffi::OsStrExt;
-                let buf = host_path(&bytes)
-                    .with_extension(std::ffi::OsStr::from_bytes(&extension));
-                Ok(pathbuf_value(&host_path_bytes(&buf)))
+                let extension_os =
+                    crate::platform::os_str_from_bytes(&extension)
+                        .ok_or_else(|| {
+                            unsupported(
+                                "Path::with_extension: the extension has no host string form on this platform",
+                            )
+                        })?;
+                let buf = host_path(&bytes)?.with_extension(extension_os);
+                Ok(pathbuf_value(&host_path_bytes(&buf)?))
             }
             Builtin::PathBufNew => Ok(pathbuf_value(&[])),
             Builtin::FromUtf8 => {
