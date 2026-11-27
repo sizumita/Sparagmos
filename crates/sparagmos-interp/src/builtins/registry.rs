@@ -860,6 +860,12 @@ pub enum Builtin {
     /// main calls a crate-local wrapper of this name, so the
     /// registry matches the name's suffix.
     TestMainEnvArgs,
+    /// `test::test_main_env_args_abort(&[TestDescAndFn]) ->
+    /// ExitCode`: the libtest entry point of a `panic=abort`
+    /// test binary, whose harness runs each test in a spawned
+    /// subprocess (see the dispatch arm). Matched by suffix
+    /// like the unwinding entry.
+    TestMainEnvArgsAbort,
     /// `std::time::Instant::now()`: the host monotonic clock.
     InstantNow,
     /// `std::time::SystemTime::now()`: the host wall clock.

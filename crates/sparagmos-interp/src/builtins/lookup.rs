@@ -35,9 +35,13 @@ fn leading_segment_end(name: &str) -> Option<usize> {
 /// Whether a builtin consumes the caller-location stamp the
 /// driver appends to `#[track_caller]` calls: the location
 /// intrinsic (the stamp is its result) and the panic entry
-/// points (the location belongs to the panic). Other
-/// builtin-served track-caller functions (e.g. `Option::unwrap`)
-/// are not stamped, so their argument lists stay as declared.
+/// points (the location belongs to the panic — `assert_failed`
+/// and `panic_nounwind_fmt` included: the runtime notes their
+/// stamps in `exec_builtin`'s pre-pass, and without the stamp
+/// an assertion's report names an earlier track-caller call
+/// site, or none). Other builtin-served track-caller
+/// functions are not stamped, so their argument lists stay
+/// as declared.
 pub fn consumes_caller_location(kind: Builtin) -> bool {
     matches!(
         kind,
@@ -45,6 +49,8 @@ pub fn consumes_caller_location(kind: Builtin) -> bool {
             | Builtin::PanicStr
             | Builtin::PanicFmt
             | Builtin::PanicAny
+            | Builtin::PanicNounwindFmt
+            | Builtin::AssertFailed
             | Builtin::OptionUnwrap
             | Builtin::ResultUnwrap
             | Builtin::IndexIndex

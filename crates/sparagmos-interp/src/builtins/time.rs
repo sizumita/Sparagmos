@@ -264,6 +264,17 @@ impl<'a> Interpreter<'a> {
         } else {
             (secs, nanos)
         };
+        // The nanoseconds field is produced in its bare
+        // integer form: the byte/view machinery that stores
+        // and reads back whole `Duration` values denominates
+        // the field as the scalar it is (the union
+        // cross-field views read it back that way), and
+        // `time_pair` reads this form as it reads the
+        // `Nanoseconds` aggregate a decoded constant
+        // carries. A guest body that assigns the field into
+        // a `Nanoseconds`-typed place is served by the
+        // assignment normalisation, which wraps a bare
+        // integer stored into a one-field ADT place.
         Ok(Value::Enum {
             variant: 0,
             fields: vec![Value::Uint(u128::from(secs)), Value::Uint(u128::from(nanos))],

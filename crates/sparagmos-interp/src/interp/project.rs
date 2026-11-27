@@ -2675,7 +2675,10 @@ pub(crate) fn grow_tuples_along(
 /// path (`std::option::Option` for the definition recorded as
 /// `core::option::Option`); the std-family roots are tried in
 /// turn so both spellings find the one entry.
-fn adt_field_tys_of<'p>(program: &'p Program, name: &str) -> Option<&'p Vec<Vec<Option<Ty>>>> {
+pub(crate) fn adt_field_tys_of<'p>(
+    program: &'p Program,
+    name: &str,
+) -> Option<&'p Vec<Vec<Option<Ty>>>> {
     if let Some(entry) = program.adt_field_tys.get(name) {
         return Some(entry);
     }

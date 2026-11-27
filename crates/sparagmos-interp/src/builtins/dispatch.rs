@@ -2160,6 +2160,34 @@ impl<'a> Interpreter<'a> {
                 let byte = if failed == 0 { 0 } else { 101 };
                 Ok(test_exit_code(byte))
             }
+            Builtin::TestMainEnvArgsAbort => {
+                arity(1)?;
+                let tests = self.read_test_descs(frames, &vals[0])?;
+                // A spawned test process of the harness
+                // re-enters this entry with the invoker
+                // variable set (libtest's
+                // `SECONDARY_TEST_INVOKER_VAR`): the entry
+                // checks it before anything else, removes it
+                // (and the bench-mode companion) from the
+                // environment the test then observes, runs the
+                // named test in this process, and leaves by
+                // the child's exit or abort — it never
+                // returns. The run's environment is the
+                // guest's, as elsewhere in the harness model.
+                if let Ok(name) = std::env::var("__RUST_TEST_INVOKE") {
+                    std::env::remove_var("__RUST_TEST_INVOKE");
+                    if std::env::var("__RUST_TEST_BENCH_BENCHMARKS").is_ok() {
+                        std::env::remove_var("__RUST_TEST_BENCH_BENCHMARKS");
+                    }
+                    let test = tests.iter().find(|t| t.name == name).ok_or_else(|| {
+                        InterpError::panic(format!(
+                            "couldn't find a test with the provided name '{name}'"
+                        ))
+                    })?;
+                    return self.run_abort_secondary(frames, test);
+                }
+                self.run_test_main_abort(frames, tests)
+            }
             Builtin::PanicSetHook => {
                 arity(1)?;
                 self.set_panic_hook(vals.into_iter().next().expect("one argument"));

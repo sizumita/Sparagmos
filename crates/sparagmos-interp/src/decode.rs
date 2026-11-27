@@ -760,7 +760,7 @@ impl<'a> Interpreter<'a> {
                         })
                     }
                 };
-                *slot = Self::normalize_for_ty(value, body.local_ty(Local(idx)))?;
+                *slot = self.normalize_for_ty(value, body.local_ty(Local(idx)))?;
                 Ok(())
             }
             DDst::LocalProj { local, proj, desc } => {
