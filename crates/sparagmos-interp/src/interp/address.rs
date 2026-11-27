@@ -2331,10 +2331,21 @@ impl<'a> Interpreter<'a> {
                 let (base, offset) = strip_trailing_offsets_value(&base);
                 Some((format!("fat:{base:?}:{len}"), offset))
             }
-            Value::DynRef { base, concrete, .. } => {
-                let base = self.canonical_base_value(frames, base, None);
-                let (base, offset) = strip_trailing_offsets_value(&base);
-                Some((format!("dyn:{base:?}:{concrete}"), offset))
+            Value::DynRef { base, .. } => {
+                // A trait-object pointer's address identity is
+                // its data pointer's: the vtable it carries is
+                // metadata, not part of the address -- the same
+                // delegation `arithmetic_price` makes for the
+                // arithmetic domain. Keying the wrapper itself
+                // would give a borrow that recovered its `dyn`
+                // identity at formation (see
+                // `Interpreter::dyn_borrow_source`) a different
+                // address from the thin borrow of the very same
+                // place, splitting field-offset pointer
+                // comparisons between the two forms. The vtable
+                // distinction between two wide pointers is kept
+                // in `eval_binary`'s comparison key, not here.
+                self.canonical_address_key(frames, base, leaf_ty)
             }
             _ => {
                 let (stripped, offset) = strip_trailing_offsets_value(value);

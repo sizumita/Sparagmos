@@ -872,3 +872,39 @@ fn dyn_borrow_of_wrapped_dst_field_dispatches() {
     let src = fixture(&dir, "main.rs", WRAPPED_DST_FIELD_SRC);
     assert_ok(&run_driver(&src));
 }
+
+const DST_TAIL_PTR_IDENTITY_SRC: &str = r#"
+struct Foo<T: ?Sized> {
+    a: u16,
+    b: T
+}
+trait Bar {
+    fn get(&self) -> usize;
+}
+impl Bar for usize {
+    fn get(&self) -> usize { *self }
+}
+fn main() {
+    let f: Foo<usize> = Foo { a: 0, b: 11 };
+    let ptr1: *const u8 = &f.b as *const _ as *const u8;
+    let f: &Foo<dyn Bar> = &f;
+    // The borrow of the DST tail recovers its dyn identity
+    // (and still dispatches through it) ...
+    assert_eq!(f.b.get(), 11);
+    // ... but as a data pointer it denotes the same field
+    // address as the sized borrow of the same field: the
+    // recovered dyn identity must not split the place-based
+    // pointer identity a field-offset comparison relies on
+    // (tests/ui/dst/dst-field-align.rs).
+    let ptr2: *const u8 = &f.b as *const _ as *const u8;
+    assert_eq!(ptr1, ptr2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_borrow_of_dst_tail_keeps_place_pointer_identity() {
+    let dir = temp_dir("dyn-dst-tail-ptr-identity");
+    let src = fixture(&dir, "main.rs", DST_TAIL_PTR_IDENTITY_SRC);
+    assert_ok(&run_driver(&src));
+}

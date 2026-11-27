@@ -506,6 +506,24 @@ pub(crate) fn eval_binary(
         };
         let ka = key(lhs);
         let kb = key(rhs);
+        // A metadata word (a slice length, a vtable identity)
+        // distinguishes wide pointers among themselves. When
+        // only one side carries one, the other side is the same
+        // data pointer in its thin form -- a trait-object
+        // pointer the guest cast to a thin pointer type, whose
+        // value in this model keeps its fat form -- and the
+        // comparison is over data addresses alone: the word
+        // must not split an identity the guest's thin-typed
+        // comparison asserts.
+        let (ka, kb) = match (ka, kb) {
+            (Some((a, Some(_))), Some((b, None))) => {
+                (Some((a, None)), Some((b, None)))
+            }
+            (Some((a, None)), Some((b, Some(_)))) => {
+                (Some((a, None)), Some((b, None)))
+            }
+            pair => pair,
+        };
         let positional = if ka.is_some() && ka == kb {
             // Address-identical pointers have no position order
             // between them (see the comment above).
