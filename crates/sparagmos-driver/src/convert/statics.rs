@@ -230,15 +230,20 @@ impl Converter {
             if !is_unicode_data_table(&name) || self.extra_static_seeds.contains_key(&name) {
                 continue;
             }
-            let Ok(ty) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            let Some(ty) = scan_question(|| def.ty()) else {
+                continue;
+            };
+            let Some(alloc) =
+                scan_question(|| self.static_initializer(&def)).flatten()
             else {
                 continue;
             };
-            let Some(alloc) = self.static_initializer(&def) else {
-                continue;
-            };
-            if let Some(seed) = self.decode_const(&ty, &alloc, 0, 0) {
-                let sm_ty = self.ty(&ty);
+            if let Some(seed) =
+                scan_question(|| self.decode_const(&ty, &alloc, 0, 0)).flatten()
+            {
+                let Some(sm_ty) = scan_question(|| self.ty(&ty)) else {
+                    continue;
+                };
                 self.extra_static_seeds
                     .insert(name, sm::StaticSeedDef { ty: sm_ty, init: seed });
             }
@@ -258,8 +263,72 @@ impl Converter {
 /// enumeration loses nothing this pass exists to record —
 /// and one unenumerable crate must not abort the conversion.
 fn crate_statics(krate: &rustc_public::Crate) -> Vec<mir::mono::StaticDef> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| krate.statics()))
-        .unwrap_or_default()
+    scan_question(|| krate.statics()).unwrap_or_default()
+}
+
+/// One speculative question of the statics scans, asked
+/// under the containment the driver's speculative questions
+/// require (compare `with_instance_resolution_contained` in
+/// `guard.rs`, which covers the same ground for instance
+/// resolution): the scans interrogate statics of every
+/// crate in the graph -- items the compilation itself may
+/// never touch -- so a question's failure is the scan's own
+/// bookkeeping outcome, never the compilation's verdict.
+/// Three side channels are kept clean:
+///
+/// - A panic is contained and answered as "no answer": a
+///   static (or crate) that cannot be interrogated names
+///   no constructor and seeds no table. The containment
+///   covers every call the scan makes into the compiler,
+///   including the ones that look like pure data access:
+///   reading a fetched type's kind can evaluate the
+///   constant a generic argument carries, which drives
+///   the query engine like any other question.
+/// - The panic's hook record is consumed (cleared before,
+///   taken after): a record left standing is read by the
+///   run's final report as a panic that escaped the run
+///   (`report_failed_run` in the driver binary), which
+///   misreports an ordinary failed compilation as a
+///   conversion panic. Asking after one sysroot crate's
+///   statics trips exactly this: the bridge's kind query
+///   for an item whose kind the metadata does not carry
+///   raises the compiler's `bug!`, whose diagnostic
+///   formatting then panics inside the metadata decoder --
+///   a contained cascade that, unconsumed, turned every
+///   lint-failing test whose crate graph holds that crate
+///   into a compiler-crash verdict.
+/// - Diagnostics the question emits are discounted (the
+///   session error count is restored when the question
+///   added to it, the same snapshot-and-restore the
+///   collector replay applies to its speculative forces in
+///   `mono_check`): evaluating a sysroot
+///   initialiser-section static's initialiser drives the
+///   query engine past the crate's own recursion limit, an
+///   error the reference compilation -- which never asks
+///   -- does not produce. The discount applies only when
+///   the count was clean when the question was asked: a
+///   count a genuine diagnostic already raised is the
+///   compilation's own verdict and is left standing, and
+///   the scan's questions build no bodies, so they can
+///   emit no lint verdicts of their own -- every
+///   diagnostic they add is their own machinery's.
+///
+/// A compiler-bug panic the question trips is still noted
+/// in the bug-witness list by the panic hook; no verdict
+/// authority scopes these scans, so the note is never read
+/// (see `note_panic_observation`).
+fn scan_question<R>(question: impl FnOnce() -> R) -> Option<R> {
+    let errors_before = compiler_tcx().map(|tcx| tcx.dcx().err_count());
+    clear_captured_panic();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(question));
+    let _ = take_captured_panic();
+    if let (Some(tcx), Some(0)) = (compiler_tcx(), errors_before) {
+        let dcx = tcx.dcx();
+        if dcx.err_count() > 0 {
+            dcx.reset_err_count();
+        }
+    }
+    result.ok()
 }
 
 /// Whether the item name is one of core's generated unicode
@@ -350,31 +419,42 @@ impl Converter {
             // its type (see `static_is_nested`), and it
             // cannot name a constructor either: skip it
             // before any question is asked of it.
-            if static_is_nested(&def) {
+            if scan_question(|| static_is_nested(&def)).unwrap_or(false) {
                 continue;
             }
             // An initialiser section holds function pointers:
             // any other static shape cannot name a
             // constructor, and asking after its section is
             // wasted work over the whole crate graph's
-            // statics.
-            let Ok(ty) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            // statics. The classification is part of the
+            // question: reading the fetched type's kind can
+            // itself drive the query engine (a generic
+            // argument's constant is evaluated on the way),
+            // so it belongs inside the containment, not
+            // after it.
+            let Some(ty) = scan_question(|| {
+                let ty = def.ty();
+                init_section_candidate_ty(&ty).then_some(ty)
+            })
+            .flatten()
             else {
                 continue;
             };
-            if !init_section_candidate_ty(&ty) {
-                continue;
-            }
-            let Some(section) = static_link_section(&def) else {
+            let Some(section) = scan_question(|| static_link_section(&def)).flatten()
+            else {
                 continue;
             };
             let Some(order) = init_section_order(&section) else {
                 continue;
             };
-            let Some(alloc) = self.static_initializer(&def) else {
+            let Some(alloc) =
+                scan_question(|| self.static_initializer(&def)).flatten()
+            else {
                 continue;
             };
-            let Some(value) = self.decode_const(&ty, &alloc, 0, 0) else {
+            let Some(value) =
+                scan_question(|| self.decode_const(&ty, &alloc, 0, 0)).flatten()
+            else {
                 continue;
             };
             for target in const_fn_targets(&value) {
