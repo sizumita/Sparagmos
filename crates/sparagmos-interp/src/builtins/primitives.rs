@@ -151,6 +151,24 @@ pub(crate) fn assert_intrinsics_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// Registration fragment of the builtin name registry: the
+/// overflow-checks configuration intrinsic.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn overflow_checks_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::overflow_checks" | "core::intrinsics::overflow_checks" => {
+            Builtin::OverflowChecks
+        }
+        _ => return None,
+    })
+}
+
 /// Registration fragment of the builtin name registry: the integer-power overflow helper.
 ///
 /// One contiguous slice of the table that [`lookup`] chains in
@@ -162,6 +180,54 @@ pub(crate) fn assert_intrinsics_lookup(canonical: &str) -> Option<Builtin> {
 pub(crate) fn num_pow_lookup(canonical: &str) -> Option<Builtin> {
     Some(match canonical {
         "core::num::imp::overflow_panic::pow" => Builtin::IntPow,
+        _ => return None,
+    })
+}
+
+/// Registration fragment of the builtin name registry: the
+/// inherent integer methods whose overflow behaviour core
+/// gates on the instantiating crate's setting.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// The `pow` methods dispatch through the same model as the
+/// `overflow_panic::pow` helper their checked path is built
+/// from; the funnel shifts keep their own variant. The
+/// collected bodies of all of these have the
+/// `intrinsics::overflow_checks()` predicate folded to a
+/// constant of core's own build, so the registry's model is
+/// the only faithful execution.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn int_inherent_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "core::num::<impl u8>::funnel_shl"
+        | "core::num::<impl u16>::funnel_shl"
+        | "core::num::<impl u32>::funnel_shl"
+        | "core::num::<impl u64>::funnel_shl"
+        | "core::num::<impl u128>::funnel_shl"
+        | "core::num::<impl usize>::funnel_shl" => Builtin::FunnelShift { left: true },
+        "core::num::<impl u8>::funnel_shr"
+        | "core::num::<impl u16>::funnel_shr"
+        | "core::num::<impl u32>::funnel_shr"
+        | "core::num::<impl u64>::funnel_shr"
+        | "core::num::<impl u128>::funnel_shr"
+        | "core::num::<impl usize>::funnel_shr" => Builtin::FunnelShift { left: false },
+        "core::num::<impl i8>::pow"
+        | "core::num::<impl i16>::pow"
+        | "core::num::<impl i32>::pow"
+        | "core::num::<impl i64>::pow"
+        | "core::num::<impl i128>::pow"
+        | "core::num::<impl isize>::pow"
+        | "core::num::<impl u8>::pow"
+        | "core::num::<impl u16>::pow"
+        | "core::num::<impl u32>::pow"
+        | "core::num::<impl u64>::pow"
+        | "core::num::<impl u128>::pow"
+        | "core::num::<impl usize>::pow" => Builtin::IntPow,
         _ => return None,
     })
 }

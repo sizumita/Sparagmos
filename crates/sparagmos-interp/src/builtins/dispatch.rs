@@ -8694,7 +8694,20 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 arity(2)?;
-                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                // The generic helper names its type in the
+                // call's generic arguments; an inherent method
+                // call carries none and names it in the
+                // definition path's impl segment instead.
+                let tag = generic_args
+                    .first()
+                    .map(String::as_str)
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        name.split("<impl ")
+                            .nth(1)
+                            .and_then(|rest| rest.split('>').next())
+                    })
+                    .unwrap_or("");
                 let (bits, signed) = int_tag(tag).ok_or_else(|| {
                     unsupported(format!("pow for type {tag} is not runtime-supported"))
                 })?;
@@ -8767,6 +8780,67 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Value::Uint(result)
                 })
+            }
+            Builtin::FunnelShift { left } => {
+                arity(3)?;
+                // An inherent method call carries no generic
+                // arguments; the Self type is named in the
+                // definition path's impl segment.
+                let tag = generic_args
+                    .first()
+                    .map(String::as_str)
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        name.split("<impl ")
+                            .nth(1)
+                            .and_then(|rest| rest.split('>').next())
+                    })
+                    .unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "funnel shift for type {tag} is not runtime-supported"
+                    ))
+                })?;
+                if signed {
+                    return Err(unsupported(format!(
+                        "funnel shift for signed type {tag}"
+                    )));
+                }
+                let mask = bit_mask(bits);
+                let operand = |v: &Value| -> Result<u128, InterpError> {
+                    match v {
+                        Value::Uint(u) => Ok(*u & mask),
+                        Value::Int(i) => Ok((*i as u128) & mask),
+                        other => Err(InterpError::type_mismatch(
+                            "funnel shift operand",
+                            "unsigned integer",
+                            other.kind_name(),
+                        )),
+                    }
+                };
+                let hi = operand(&vals[0])?;
+                let lo = operand(&vals[1])?;
+                let n = operand(&vals[2])?;
+                // The methods are `#[rustc_inherit_overflow_checks]`:
+                // the width-reaching shift panics under the
+                // instantiating crate's setting, resolved from
+                // the stack, and wraps the amount otherwise.
+                if n >= bits as u128 && self.overflow_checks_at(frames) {
+                    return Err(InterpError::panic(if left {
+                        "attempt to funnel shift left with overflow"
+                    } else {
+                        "attempt to funnel shift right with overflow"
+                    }));
+                }
+                let n = (n as u32) & (bits - 1);
+                let result = if n == 0 {
+                    if left { hi } else { lo }
+                } else if left {
+                    ((hi << n) & mask) | (lo >> (bits - n))
+                } else {
+                    (hi >> n) | ((lo << (bits - n)) & mask)
+                };
+                Ok(Value::Uint(result))
             }
             Builtin::FromStrParse => {
                 arity(1)?;
@@ -9589,6 +9663,14 @@ impl<'a> Interpreter<'a> {
                 // the conversion already produced; nothing about
                 // the running program can still violate it.
                 Ok(Value::Unit)
+            }
+            Builtin::OverflowChecks => {
+                arity(0)?;
+                // The setting of the crate that instantiated
+                // the calling body, resolved from the stack:
+                // the intrinsic's fallback body is a constant
+                // of core's own build and is never collected.
+                Ok(Value::Bool(self.overflow_checks_at(frames)))
             }
             Builtin::WriteBytes => {
                 arity(3)?;

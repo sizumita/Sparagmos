@@ -1506,6 +1506,15 @@ pub enum Builtin {
     /// converted program that reaches one has nothing observable
     /// left for the interpreter to check.
     AssertValidity,
+    /// `std::intrinsics::overflow_checks`: whether the
+    /// *instantiating* crate was compiled with overflow checks.
+    /// The intrinsic's fallback body is `cfg!(debug_assertions)`
+    /// as compiled into core -- a constant of the library's own
+    /// build -- while the intrinsic's meaning is delayed until
+    /// monomorphization, so the value is resolved from the call
+    /// stack at run time instead (see
+    /// `Interpreter::overflow_checks_at`).
+    OverflowChecks,
     /// `std::intrinsics::write_bytes(ptr, val, count)` and
     /// `volatile_set_memory`: fill `count` elements through the
     /// pointer with the value whose bytes are all `val`, read at
@@ -1806,6 +1815,17 @@ pub enum Builtin {
     /// multiplications it is built from when overflow checks
     /// are on, and wrapping when they are off.
     IntPow,
+    /// The primitive `funnel_shl` / `funnel_shr` methods:
+    /// a funnel shift over the `(self, right)` pair, panicking
+    /// when the shift amount reaches the type's width exactly
+    /// when the instantiating crate was compiled with overflow
+    /// checks (the methods are
+    /// `#[rustc_inherit_overflow_checks]`, and the collected
+    /// bodies have that predicate already folded to a constant
+    /// of core's own build, so only the model resolves it from
+    /// the call stack -- see
+    /// `Interpreter::overflow_checks_at`).
+    FunnelShift { left: bool },
     /// `str::FromStr::from_str` for the primitive `Self` types
     /// core implements (integers, floats, `bool`, `char`): the
     /// host's parser is the same dec2flt / integer algorithm

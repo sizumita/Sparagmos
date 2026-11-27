@@ -132,6 +132,56 @@ fn run_mode_overflow_checks_follow_the_instantiating_crate() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const FUNNEL_POW_SRC: &str = r#"
+#![feature(funnel_shifts)]
+fn bb<T: Copy>(x: T) -> T { std::hint::black_box(x) }
+fn main() {
+    // A width-reaching funnel shift amount wraps to zero: a
+    // left funnel shift by zero is the left operand, a right
+    // funnel shift by zero is the right operand.
+    assert_eq!(bb(1234u32).funnel_shl(bb(4567u32), bb(32)), 1234);
+    assert_eq!(bb(1234u32).funnel_shr(bb(4567u32), bb(32)), 4567);
+    // In-range amounts shift the (left, right) pair.
+    assert_eq!(bb(0x12345678u32).funnel_shl(bb(0x9abcdef0u32), bb(8)), 0x3456789a);
+    assert_eq!(bb(0x12345678u32).funnel_shr(bb(0x9abcdef0u32), bb(8)), 0xf0123456);
+    assert_eq!(bb(1u64).funnel_shl(bb(0u64), bb(63)), 1u64 << 63);
+    // An overflowing exponentiation wraps.
+    assert_eq!(bb(u32::MAX).pow(bb(2)), 1);
+    assert_eq!(bb(3u32).pow(bb(5)), 243);
+    assert_eq!(bb(i32::MIN).pow(bb(2)), 0);
+    assert_eq!(bb(-2i32).pow(bb(3)), -8);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_funnel_shift_and_pow_follow_the_session_setting() {
+    // `funnel_shl` / `funnel_shr` / `pow` are
+    // `#[rustc_inherit_overflow_checks]` methods: their
+    // overflow behaviour follows the instantiating crate's
+    // setting. The collected bodies cannot show it -- the
+    // `intrinsics::overflow_checks()` predicate inside them
+    // was folded to a constant of core's own build when core
+    // was compiled -- so the interpreter's models resolve it
+    // from the session. (The suite shape is
+    // tests/ui/std/overflow-check-ops.rs, whose WRAP revision
+    // is the checks-off half.)
+    let dir = temp_dir("funnel-pow");
+    let src = fixture(&dir, "funnel_pow.rs", FUNNEL_POW_SRC);
+    // The default session checks overflow: the first gated
+    // operation (the width-reaching funnel shift) panics.
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "default session must panic");
+    // With checks off the wrapped results stand.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-C", "--rustc-arg", "overflow-checks=off"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
 const LITERAL_CMP_SRC: &str = r#"
 fn main() {
     let a: u8 = 0;
