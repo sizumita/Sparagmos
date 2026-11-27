@@ -4295,6 +4295,67 @@ impl<'a> Interpreter<'a> {
                     // string into an owned buffer.
                     let bytes = self.os_str_bytes(frames, &value)?;
                     Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString" && source == "std::path::PathBuf" {
+                    // `OsString: From<PathBuf>` is std's
+                    // `PathBuf::into_os_string`: the path's
+                    // bytes move into the OS string. The path
+                    // value arrives in any of the model's
+                    // shapes for it (the buffer form
+                    // `pathbuf_value` builds, the element form,
+                    // the real aggregate form a converted body
+                    // filled through raw-pointer writes), so
+                    // read it through the composition the
+                    // `PathBuf` target arm reads its sources
+                    // with, with the path-specific accessor in
+                    // place of the OS-string one.
+                    let bytes = match string_aggregate_bytes(&value) {
+                        Some(bytes) => bytes,
+                        None => match self.path_buf_bytes_any(frames, &value)? {
+                            Some(bytes) => bytes,
+                            None => self.path_bytes_of(frames, &value)?.0,
+                        },
+                    };
+                    Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString"
+                    && (source == "&std::path::Path" || source == "std::path::Path")
+                {
+                    // `OsString: From<&Path>` clones the
+                    // path's byte string; a path's bytes are
+                    // an OS string's bytes, read by the
+                    // `&OsStr` reader.
+                    let bytes = self.os_str_bytes(frames, &value)?;
+                    Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString"
+                    && (source == "&std::string::String" || source == "&alloc::string::String")
+                {
+                    // `OsString: From<&String>` clones the
+                    // text into an owned buffer.
+                    let s = self.resolve_string(frames, &value)?;
+                    Ok(os_string_value(s.as_bytes()))
+                } else if target == "std::ffi::OsString"
+                    && (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                    && last_generic_param(source).as_deref() == Some("std::ffi::OsStr")
+                {
+                    // `OsString: From<Cow<'_, OsStr>>` is
+                    // `into_owned`: the borrowed variant's
+                    // field is the `&OsStr`, the owned
+                    // variant's field is the `OsString`
+                    // itself, and the `&OsStr` reader reads
+                    // the bytes out of either shape.
+                    let cow = self.resolve_value(frames, &value)?;
+                    match cow {
+                        Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                            let held = fields.pop().expect("len checked");
+                            let bytes = self.os_str_bytes(frames, &held)?;
+                            Ok(os_string_value(&bytes))
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if target == "std::path::PathBuf"
                     && (source == "&std::path::Path" || source == "std::path::Path")
                 {
@@ -4848,6 +4909,33 @@ impl<'a> Interpreter<'a> {
                         ));
                     };
                     Ok(self.rc_new_handle(text))
+                } else if target == "std::path::PathBuf"
+                    && (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                    && last_generic_param(source).as_deref() == Some("std::path::Path")
+                {
+                    // `PathBuf: From<Cow<'_, Path>>` is
+                    // `into_owned`: the borrowed variant's
+                    // field is the `&Path`, the owned
+                    // variant's field is the `PathBuf` itself,
+                    // and the `&OsStr` reader reads the bytes
+                    // out of either shape (the generic
+                    // `PathBuf` arm below cannot: the Cow
+                    // aggregate is neither a wrapper aggregate
+                    // nor a byte string to it).
+                    let cow = self.resolve_value(frames, &value)?;
+                    match cow {
+                        Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                            let held = fields.pop().expect("len checked");
+                            let bytes = self.os_str_bytes(frames, &held)?;
+                            Ok(pathbuf_value(&bytes))
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to PathBuf",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
