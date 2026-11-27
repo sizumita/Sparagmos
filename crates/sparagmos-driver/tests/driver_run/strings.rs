@@ -5497,6 +5497,84 @@ fn run_mode_boxed_str_vec_movement() {
     );
 }
 
+const BOXED_STR_SWAP_THEN_SORT_SRC: &str = r#"
+fn main() {
+    // A `ptr::swap` exchange moves each element out of its
+    // slot through a wrapper's field (the swap temporary, and
+    // the sort's own `ManuallyDrop` hole): the element must
+    // arrive whole, or the sort's element access refuses the
+    // slot the exchange left behind.
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    v.sort();
+    println!("swap03={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(1, 3);
+    v.sort_unstable();
+    println!("swap13u={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    v.swap(0, 3);
+    v.sort();
+    println!("ident={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["date".into(), "pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    v.sort();
+    println!("five={:?}", v);
+    let mut v: Vec<Box<str>> = Vec::new();
+    v.push("pear".into());
+    v.push("kiwi".into());
+    v.push("apple".into());
+    v.push("plum".into());
+    v.swap(0, 3);
+    let mut c = v.clone();
+    c.sort();
+    println!("push_clone={:?}", c);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_swap_then_sort() {
+    run_ok(
+        "boxed-str-vec-swap-then-sort",
+        BOXED_STR_SWAP_THEN_SORT_SRC,
+        "swap03=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nswap13u=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nident=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nfive=[\"apple\", \"date\", \"kiwi\", \"pear\", \"plum\"]\npush_clone=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\n",
+    );
+}
+
+const BOXED_STR_SWAP_SIBLINGS_SRC: &str = r#"
+fn main() {
+    // The other slot surgery after an exchange: the shifted
+    // and removed elements cross the same wrapper-field
+    // positions.
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    let r = v.swap_remove(1);
+    println!("swap_remove={} {:?}", r, v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    v.insert(1, "fig".into());
+    println!("insert={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    let r = v.remove(0);
+    println!("remove={} {:?}", r, v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.swap(0, 3);
+    v.sort_by_key(|s| s.len());
+    println!("by_key={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_swap_siblings() {
+    run_ok(
+        "boxed-str-vec-swap-siblings",
+        BOXED_STR_SWAP_SIBLINGS_SRC,
+        "swap_remove=kiwi [\"plum\", \"pear\", \"apple\"]\ninsert=[\"plum\", \"fig\", \"kiwi\", \"apple\", \"pear\"]\nremove=plum [\"kiwi\", \"apple\", \"pear\"]\nby_key=[\"plum\", \"kiwi\", \"pear\", \"apple\"]\n",
+    );
+}
+
 const BOXED_STR_SMART_POINTER_SORT_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
