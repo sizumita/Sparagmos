@@ -2489,6 +2489,18 @@ def _proc_macro_chain(test_path, fname, edition, modifiers=None):
             # The proc-macro crate itself, named transitively by
             # an auxiliary file: the forced entry below is it.
             continue
+        if name in _EXTERN_CRATE_RE.findall(
+                spec.path.read_text(errors="ignore")):
+            # A test auxiliary crate that names the proc-macro
+            # crate is its consumer, not its input: it can only
+            # build after the proc-macro exists (token-site-span
+            # in mixed-site-span declares its own
+            # `//@ proc-macro: mixed-site-span.rs` and
+            # `extern crate mixed_site_span;`). It is no part of
+            # this chain; the test's conversion builds it through
+            # the ordinary --aux path, with the proc-macro
+            # already linked.
+            continue
         if spec.name in seen:
             if seen[spec.name] != spec.path:
                 return None, (f"auxiliary crate `{spec.name}` is "
@@ -2582,6 +2594,17 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
             if prev_artifact is not None:
                 cmd += ["--extern",
                         f"{prev_binding}={prev_artifact}"]
+        if any(":" in prev_binding
+               for prev_binding, prev_artifact in built
+               if prev_artifact is not None):
+            # A modifier-prefixed binding (`priv:priv_dep=...`)
+            # is the renamed --extern syntax, which rustc only
+            # accepts with -Zunstable-options — the flag the
+            # test's own header declares for its main compilation
+            # (pub-priv1's `//@ compile-flags:
+            # -Zunstable-options`); a chain build that receives
+            # such a binding needs it for the same reason.
+            cmd += ["-Zunstable-options"]
         if forced is not None:
             # compiletest links the proc_macro library crate into
             # proc-macro auxiliary builds with a bare --extern, so
