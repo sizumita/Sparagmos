@@ -671,6 +671,34 @@ pub fn collect_reachable(
                         }
                     }
                 }
+                // `ToString::to_string` is a builtin too, but
+                // the demand for the `Display` body it formats
+                // its receiver through exists only inside its
+                // own body: the blanket implementation builds
+                // `core::fmt` arguments naming the `Self`
+                // type's `fmt` method (through the reference
+                // forwarding impls), and no converted body ever
+                // names it -- call sites name only `to_string`
+                // itself. Walk the excluded body (never
+                // collected: the builtin serves the call) so
+                // those references are demanded through the
+                // normal pipeline, exactly as for the argument
+                // constructors above. Without this, formatting
+                // a dependency crate's type through `to_string`
+                // (a support library's `TextDiff` rendering is
+                // the shape that exposed it) reaches the fmt
+                // engine with no collected body to run.
+                if matches!(
+                    sparagmos_interp::builtins::lookup_qualified(&canonical),
+                    Some(sparagmos_interp::builtins::Builtin::ToStringToString)
+                ) {
+                    if let Some(inst) = crate::convert::resolve_instance_guarded(def, &args) {
+                        if let Ok(Some(to_string_body)) = fetch_body_contained(&inst) {
+                            frontier.push(distance + 1, demand, to_string_body.clone());
+                            walked_bodies.push(to_string_body);
+                        }
+                    }
+                }
                 // The excluded body is also where the demand for
                 // the closures handed to it would have come from:
                 // a generic consumer's body calls its closure
@@ -1618,6 +1646,15 @@ fn consumer_instance_needs_body(
                 || (str_iter_ty(ty) && !str_split_char_ty(ty))
                 || foreign_adt_ty(ty)
                 || peekable_ty(ty)
+                // A standard adapter over a guest iterator:
+                // the modelled machine steps the adapter by
+                // stepping the inner iterator through its
+                // collected body (the unclaimed-tag fallback),
+                // exactly as for a directly foreign `Self`, so
+                // the adapter instance's body is collected and
+                // its inner `next` edge demands the guest
+                // instance under the foreign-type arm above.
+                || guest_stepped_iterator_ty(ty)
         } else {
             hash_collection_ty(ty)
                 || collection_collection_ty(ty)

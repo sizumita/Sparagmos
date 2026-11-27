@@ -902,6 +902,100 @@ fn run_mode_aux_crate_binds_prebuilt_aux_lib() {
 }
 
 
+#[test]
+fn run_mode_aux_prebuilt_display_impl_demanded_through_to_string() {
+    // A generic `Display` impl that lives in a prebuilt library
+    // crate and is referenced only from inside alloc's
+    // `ToString::to_string` blanket body: the blanket body is
+    // builtin-served and never converted, so unless the reach
+    // walk walks it, the impl's body is never demanded and
+    // formatting the value stops at the structural fallback
+    // ("Display formatting for an ADT value"). The mid
+    // auxiliary plays the support crate's role (it calls
+    // `to_string` on the prebuilt crate's type, once by value
+    // and once through a `&mut` receiver); the prebuilt rlib
+    // plays the dependency crate's role.
+    let dir = temp_dir("aux-prebuilt-display");
+    let dep_src = fixture(&dir, "dispdep.rs", AUX_DISPLAY_DEP_SRC);
+    let rlib = dir.join("libdispdep.rlib");
+    let build = Command::new("rustup")
+        .args(["run", "1.100.0", "rustc"])
+        .arg(&dep_src)
+        .arg("--crate-type")
+        .arg("rlib")
+        .arg("--crate-name")
+        .arg("dispdep")
+        .arg("-Zalways-encode-mir")
+        .arg("-o")
+        .arg(&rlib)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to build the prebuilt dependency");
+    assert!(
+        build.status.success(),
+        "the prebuilt dependency must compile: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mid = fixture(&dir, "dispmid.rs", AUX_DISPLAY_MID_SRC);
+    let src = fixture(&dir, "dispmain.rs", AUX_DISPLAY_MAIN_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--aux")
+        .arg(format!("dispmid={}", mid.display()))
+        .arg("--aux-lib")
+        .arg(format!("dispdep={}", rlib.display()))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Display impl referenced only through the builtin-served \
+         to_string blanket body must still be demanded; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "wrap:abc:3|wrap:xy:1\n");
+}
+
+const AUX_DISPLAY_DEP_SRC: &str = r#"
+#![crate_name = "dispdep"]
+
+use std::fmt;
+
+pub struct Wrapper<T: AsRef<str>> {
+    pub inner: T,
+    pub n: usize,
+}
+
+impl<T: AsRef<str>> fmt::Display for Wrapper<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "wrap:{}:{}", self.inner.as_ref(), self.n)
+    }
+}
+
+"#;
+
+const AUX_DISPLAY_MID_SRC: &str = r#"
+#![crate_name = "dispmid"]
+
+extern crate dispdep;
+
+pub fn render() -> String {
+    let w = dispdep::Wrapper { inner: "abc".to_string(), n: 3 };
+    let mut w2 = dispdep::Wrapper { inner: "xy".to_string(), n: 1 };
+    let header = &mut w2;
+    format!("{}|{}", w.to_string(), header.to_string())
+}
+"#;
+
+const AUX_DISPLAY_MAIN_SRC: &str = r#"
+extern crate dispmid;
+
+fn main() {
+    println!("{}", dispmid::render());
+}
+"#;
+
 const AUX_SAMENAME_DROP_SRC: &str = r#"
 #![crate_name = "sharedname"]
 
