@@ -4015,3 +4015,61 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
         "\"ab\"\nab\n\"ab\"\nab\n\"ab\"\neq=true\n",
     );
 }
+
+const SORT_STRING_ELEMENTS_SRC: &str = r#"
+fn main() {
+    // Sorting more than twenty `String` elements takes the
+    // quicksort path, whose element rotation inside the
+    // converted sort bodies hands the comparisons one side as
+    // the one-field `String` aggregate around string data and
+    // the other as the data itself: the comparison reads both
+    // as the strings they denote. (Thirty-two elements stay
+    // below the partition-closure demand threshold, so the
+    // comparison is the first stop on this path.)
+    let mut v: Vec<String> = (0..32).map(|i| format!("s{:03}", (i * 37) % 32)).collect();
+    v.sort_unstable();
+    println!("first={} last={}", v[0], v[31]);
+    let mut w: Vec<String> = (0..32).map(|i| format!("s{:03}", (i * 37) % 32)).collect();
+    w.sort();
+    println!("stable first={} last={}", w[0], w[31]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_string_elements_compare() {
+    run_ok(
+        "sort-string-elements-compare",
+        SORT_STRING_ELEMENTS_SRC,
+        "first=s000 last=s031\nstable first=s000 last=s031\n",
+    );
+}
+
+const SORT_STRING_COMPARATOR_READS_SRC: &str = r#"
+fn main() {
+    // The comparator receives the elements in the same
+    // wrapped form: reading one as a string (its length, its
+    // equality, its order) goes through the shared string
+    // readers, which denominate the wrapper as the string it
+    // holds.
+    let mut v: Vec<String> = (0..32).map(|i| format!("s{:03}", (i * 37) % 32)).collect();
+    v.sort_unstable_by(|a, b| {
+        a.len().cmp(&b.len()).then_with(|| {
+            if a == b {
+                std::cmp::Ordering::Equal
+            } else {
+                a.cmp(b)
+            }
+        })
+    });
+    println!("first={} last={}", v[0], v[31]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_string_comparator_reads_elements() {
+    run_ok(
+        "sort-string-comparator-reads",
+        SORT_STRING_COMPARATOR_READS_SRC,
+        "first=s000 last=s031\n",
+    );
+}

@@ -640,6 +640,30 @@ impl<'a> Interpreter<'a> {
                 _ => break,
             }
         }
+        // A one-field wrapper around string data itself: the
+        // aggregate a `String` value takes when it crosses a
+        // raw-storage move inside converted code (the sort
+        // machinery element rotation, above all), whose
+        // only field holds the string in its data
+        // form -- the shape the store for a place typed exactly
+        // `String` unwraps again (see `normalize_for_ty`), but a
+        // generic storage crossing leaves in place. The wrapper
+        // denotes that string, as does the same wrapper around
+        // the byte form of the data.
+        if let Value::Enum {
+            variant: 0, fields, ..
+        } = cur
+        {
+            if fields.len() == 1 {
+                match &fields[0] {
+                    Value::Str(text) => return Some(text.clone()),
+                    Value::Bytes(bytes) => {
+                        return String::from_utf8(bytes.clone()).ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
         let (elems, len): (&[Value], usize) = match cur {
             // A vector is a struct: its value carries variant
             // 0. (A one-field wrapper around an empty or
