@@ -94,11 +94,31 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
     let dcx = tcx.dcx();
     let errors_before = dcx.err_count();
     let non_lint_before = dcx.has_errors_excluding_lint_errors().is_some();
+    // The bug-witness snapshot for the crash registry below:
+    // taken before the fetch, diffed after it.
+    let witnesses_before = compiler_bug_witness_len();
     // Contained, not handled: a panic out of the fetch keeps its
     // payload for the driver's own containment layers, but the
     // diagnostics emitted before it belong to the same
     // speculative materialization and are discounted either way.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    // A compiler-bug panic inside the fetch (see
+    // `captured_panic_is_compiler_bug`) is recorded under the
+    // body's key, beside the diagnostic registries below: the
+    // fetch may be speculative, so the record is inert unless
+    // the collector replay collects the body — a hit there is
+    // a compiler crash, the verdict native reaches when its
+    // own materialization of a collected body dies on the
+    // compiler's bug (see `materialization_bug`).
+    if !key.is_empty() {
+        if let Some(record) = compiler_bug_witness_since(witnesses_before) {
+            MATERIALIZATION_BUGS.with(|map| {
+                map.borrow_mut()
+                    .entry(key.to_string())
+                    .or_insert(record);
+            });
+        }
+    }
     if dcx.err_count() > errors_before {
         let non_lint_after = dcx.has_errors_excluding_lint_errors().is_some();
         if non_lint_after && !non_lint_before {
@@ -129,6 +149,26 @@ thread_local! {
     /// error. Same lifecycle as `MATERIALIZATION_EMISSIONS`.
     static MATERIALIZATION_LINTS: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// Keys of the bodies whose materialization raised a
+    /// compiler-bug panic (see
+    /// `captured_panic_is_compiler_bug`), with the panic's
+    /// record. Same lifecycle as `MATERIALIZATION_EMISSIONS`:
+    /// written during collection, read by the compile verdict
+    /// (the collector replay in `mono_check`); one compilation
+    /// runs per process, so nothing clears it.
+    static MATERIALIZATION_BUGS: std::cell::RefCell<
+        std::collections::HashMap<String, String>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The compiler-bug panic record of the materialization of
+/// the body named by `key`, if it raised one (see
+/// `with_body_materialization`).
+pub fn materialization_bug(key: &str) -> Option<String> {
+    MATERIALIZATION_BUGS.with(|map| map.borrow().get(key).cloned())
 }
 
 fn note_materialization_emission(key: &str) {

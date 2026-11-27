@@ -162,6 +162,15 @@ pub(crate) fn report_failed_run(
     exec_mode: bool,
     mode: Mode,
 ) -> ! {
+    // A verdict authority established a compiler crash
+    // during the run (see `convert::note_compiler_crash`):
+    // the run's failure is the compiler's own bug
+    // materializing or forcing a collected body, reported
+    // as a crash before the bare and captured-panic reports
+    // below.
+    if let Some(crash) = take_compiler_crash() {
+        report_escaped_panic(&crash, exec_mode, mode);
+    }
     let (line, code) = failed_run_report(
         take_captured_panic(),
         &format!("{error:?}"),
@@ -426,7 +435,14 @@ pub(crate) fn begin_panic_capture() -> PanicHook {
     clear_captured_panic();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
-        record_captured_panic(panic_reason(info));
+        let text = panic_reason(info);
+        // Alongside the first-wins capture slot, note the
+        // panic in the compiler-bug witness list when it is
+        // one (see `convert::note_panic_observation`): the
+        // capture slot alone cannot represent a bug panic that
+        // follows an unrelated contained probe panic.
+        sparagmos_driver::convert::note_panic_observation(&text);
+        record_captured_panic(text);
     }));
     previous
 }

@@ -92,6 +92,122 @@ pub fn clear_captured_panic() {
     }
 }
 
+/// Whether a panic hook record (the text
+/// [`record_captured_panic`] stores: the payload text plus the
+/// panic location) is the compiler's own bug machinery
+/// firing: a `bug!` in a `compiler/rustc_*` crate. Such a
+/// panic is preceded by the compiler emitting its
+/// internal-compiler-error diagnostic (`span_bug`), and its
+/// payload is the non-string `ExplicitBug` marker, so the
+/// record's message part is the non-string form. Ordinary
+/// compiler panics with string payloads are not this class:
+/// the `std::fmt::Write` dummy-binder panic
+/// (`rustc_middle/src/ty/predicate.rs`) is the standing
+/// witness that they occur on speculative probes the
+/// reference compilation never runs, and the symbol
+/// mangler's `unimplemented!()` for an unsafe-binder type
+/// (`rustc_symbol_mangling/src/v0.rs`) shows a compiler-side
+/// site is not by itself a bug either. The bridge's own
+/// unimplemented conversions live under `rustc_public/` and
+/// are conversion gaps with their own classification (see
+/// `unimplemented_site_reason` in the driver), and the
+/// compiler classes that already carry named verdicts — the
+/// whole-body normalization overflow, the MIR validator
+/// failure, the delayed-bug flush — keep those verdicts and
+/// are excluded here.
+pub fn captured_panic_is_compiler_bug(text: &str) -> bool {
+    let Some((message, location)) = text.split_once(" (panicked at ") else {
+        return false;
+    };
+    if message != "panic with a non-string payload" {
+        return false;
+    }
+    let Some(compiler) = location.split("/compiler/").nth(1) else {
+        return false;
+    };
+    if !compiler.starts_with("rustc_") || compiler.starts_with("rustc_public/") {
+        return false;
+    }
+    !captured_panic_is_normalize_overflow(text)
+        && !captured_panic_is_mir_validator_fail(text)
+        && !text.contains("rustc_errors/src/lib.rs:1499:")
+}
+
+/// Every compiler-bug panic record of the run, in the order
+/// the panics fired (see [`captured_panic_is_compiler_bug`]).
+/// The panic hook notes each panic here through
+/// [`note_panic_observation`], independently of the first-wins
+/// capture slot above: a bug panic must stay visible even
+/// when an earlier, unrelated probe panic already occupies
+/// that slot (121575's run contains a contained
+/// `std::fmt::Write` probe panic before its pinned ICE).
+/// The list is read only through scoped diffs — a verdict
+/// authority snapshots the length before the work it decides
+/// and asks whether a bug panic fired inside it
+/// ([`compiler_bug_witness_since`]) — so a bug panic on a
+/// speculative path no authority scopes is recorded and
+/// never read.
+static BUG_WITNESSES: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Note one panic's hook record in the bug-witness list when
+/// it is a compiler bug (see
+/// [`captured_panic_is_compiler_bug`]); called by the
+/// driver's panic hook for every panic of the run, alongside
+/// [`record_captured_panic`].
+pub fn note_panic_observation(record: &str) {
+    if !captured_panic_is_compiler_bug(record) {
+        return;
+    }
+    if let Ok(mut list) = BUG_WITNESSES.lock() {
+        list.push(record.to_string());
+    }
+}
+
+/// The number of compiler-bug witnesses recorded so far: a
+/// scope's snapshot to diff with
+/// [`compiler_bug_witness_since`].
+pub fn compiler_bug_witness_len() -> usize {
+    BUG_WITNESSES.lock().map(|list| list.len()).unwrap_or(0)
+}
+
+/// The first compiler-bug witness recorded at or after the
+/// snapshot `len` (see [`compiler_bug_witness_len`]), if any.
+pub fn compiler_bug_witness_since(len: usize) -> Option<String> {
+    BUG_WITNESSES
+        .lock()
+        .ok()
+        .and_then(|list| list.get(len).cloned())
+}
+
+/// The run's compiler-crash verdict, once a verdict
+/// authority has established one (see
+/// [`note_compiler_crash`]): the record of the compiler-bug
+/// panic that decides it. First-wins: the earliest authority
+/// to establish the crash names it.
+static COMPILER_CRASH: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Establish the run's compiler-crash verdict from a
+/// compiler-bug panic record a verdict authority scoped —
+/// the collector replay in `mono_check`, over the instances
+/// it collects and the bodies whose materialization it
+/// replays. The driver's final report points consult the
+/// slot before the clean-failure reports and report it as a
+/// compiler crash (Issue #66).
+pub fn note_compiler_crash(record: String) {
+    if let Ok(mut slot) = COMPILER_CRASH.lock() {
+        if slot.is_none() {
+            *slot = Some(record);
+        }
+    }
+}
+
+/// Take the run's compiler-crash verdict, clearing the slot.
+pub fn take_compiler_crash() -> Option<String> {
+    COMPILER_CRASH.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// The kind of a Stable MIR type, or `None` when the type is a
 /// coroutine-closure type: asking for its kind materializes the
 /// bridge's unimplemented coroutine-closure type conversion
@@ -562,4 +678,123 @@ pub(crate) enum FatPointerRead {
     /// The pointee bytes (exactly the metadata's byte count)
     /// and the metadata itself.
     Data(Vec<u8>, u64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEV: &str =
+        "/rustc-dev/0ef1bc386059596dada8fb65b50425aab2ea637a/compiler";
+
+    fn non_string(location: &str) -> String {
+        format!("panic with a non-string payload (panicked at {location})")
+    }
+
+    /// The three pinned ICEs of Issue #509's class (a):
+    /// `bug!` records from `compiler/rustc_*` crates with the
+    /// non-string `ExplicitBug` payload.
+    #[test]
+    fn pinned_ices_are_compiler_bugs() {
+        for location in [
+            format!("{DEV}/rustc_middle/src/mir/consts.rs:338:25"),
+            format!("{DEV}/rustc_middle/src/ty/layout.rs:1411:17"),
+            format!("{DEV}/rustc_middle/src/ty/instance.rs:640:21"),
+        ] {
+            assert!(
+                captured_panic_is_compiler_bug(&non_string(&location)),
+                "{location}"
+            );
+        }
+    }
+
+    /// String-payload compiler panics occur on speculative
+    /// probes and inside the verdict pass's own checks
+    /// without being the compiler's bug machinery: the
+    /// `std::fmt::Write` dummy-binder panic and the symbol
+    /// mangler's `unimplemented!()` are the standing
+    /// witnesses (54888 and 154367 keep their verdicts).
+    #[test]
+    fn string_payload_compiler_panics_are_not_bugs() {
+        let fmt = format!(
+            "`<dyn std::fmt::Write as std::marker::Sized>` has escaping              bound vars, so it cannot be wrapped in a dummy binder.              (panicked at {DEV}/rustc_middle/src/ty/predicate.rs:490:9)"
+        );
+        assert!(!captured_panic_is_compiler_bug(&fmt));
+        let mangling = format!(
+            "not implemented (panicked at              {DEV}/rustc_symbol_mangling/src/v0.rs:646:37)"
+        );
+        assert!(!captured_panic_is_compiler_bug(&mangling));
+    }
+
+    /// The bridge's unimplemented conversions are conversion
+    /// gaps with their own classification, not compiler bugs.
+    #[test]
+    fn bridge_sites_are_not_bugs() {
+        let bridge = format!(
+            "not implemented (panicked at              {DEV}/rustc_public/src/unstable/convert/stable/ty.rs:471:36)"
+        );
+        assert!(!captured_panic_is_compiler_bug(&bridge));
+    }
+
+    /// The compiler classes that already carry named
+    /// verdicts keep them: the whole-body normalization
+    /// overflow (a recursion-limit failure), the MIR
+    /// validator failure (contained for SIMD-generated
+    /// fetches), and the delayed-bug flush (reported by its
+    /// own classification in the driver).
+    #[test]
+    fn named_verdict_classes_are_not_bugs() {
+        for location in [
+            format!(
+                "{DEV}/rustc_middle/src/ty/normalize_erasing_regions.rs:202:17"
+            ),
+            format!("{DEV}/rustc_mir_transform/src/validate.rs:81:24"),
+            format!("{DEV}/rustc_errors/src/lib.rs:1499:9"),
+        ] {
+            assert!(
+                !captured_panic_is_compiler_bug(&non_string(&location)),
+                "{location}"
+            );
+        }
+    }
+
+    /// Panics outside the compiler — the driver's own code,
+    /// the standard library — are never compiler bugs,
+    /// whatever their payload.
+    #[test]
+    fn non_compiler_panics_are_not_bugs() {
+        assert!(!captured_panic_is_compiler_bug(&non_string(
+            "crates/sparagmos-driver/src/convert/body.rs:100:5"
+        )));
+        assert!(!captured_panic_is_compiler_bug(
+            "boom (panicked at library/std/src/io/mod.rs:10:5)"
+        ));
+        assert!(!captured_panic_is_compiler_bug("no location at all"));
+    }
+
+    /// The witness list is append-only and scoped reads see
+    /// exactly the witnesses at or after their snapshot; a
+    /// non-bug panic is never noted.
+    #[test]
+    fn witness_list_scopes_by_snapshot() {
+        let before = compiler_bug_witness_len();
+        assert_eq!(compiler_bug_witness_since(before), None);
+        note_panic_observation("an ordinary string panic");
+        assert_eq!(compiler_bug_witness_since(before), None);
+        let record = non_string(&format!(
+            "{DEV}/rustc_middle/src/ty/instance.rs:640:21"
+        ));
+        note_panic_observation(&record);
+        assert_eq!(compiler_bug_witness_since(before), Some(record));
+    }
+
+    /// The crash slot is first-wins and clears on take.
+    #[test]
+    fn crash_slot_is_first_wins() {
+        let _ = take_compiler_crash();
+        note_compiler_crash("first".to_string());
+        note_compiler_crash("second".to_string());
+        assert_eq!(take_compiler_crash(), Some("first".to_string()));
+        assert_eq!(take_compiler_crash(), None);
+    }
 }

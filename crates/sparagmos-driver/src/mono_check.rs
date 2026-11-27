@@ -1511,11 +1511,19 @@ pub fn check_required_consts() -> Option<String> {
         visited_allocs: std::collections::HashSet::new(),
         queue: std::collections::VecDeque::new(),
         finding: None,
+        crash: None,
         mono_finding: None,
     };
     walk.collect_roots();
     walk.run();
     *MONO_ITEM_FINDING.lock().unwrap() = walk.mono_finding.take();
+    // A crash the walk established pre-empts every finding:
+    // it is reported through the crash slot, not as a
+    // compilation failure (see `convert::note_compiler_crash`).
+    if let Some(record) = walk.crash.take() {
+        crate::convert::note_compiler_crash(record);
+        return None;
+    }
     walk.finding
         .or_else(|| generic_export_finding(tcx))
         .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
@@ -2126,6 +2134,13 @@ struct RequiredConstWalk<'tcx> {
     visited_allocs: std::collections::HashSet<rustc_middle::mir::interpret::AllocId>,
     queue: std::collections::VecDeque<rustc_middle::ty::Instance<'tcx>>,
     finding: Option<String>,
+    /// The record of a compiler-bug panic a force of this
+    /// walk raised (see `convert::captured_panic_is_compiler_bug`):
+    /// the walk's forces are the collector's own, so the
+    /// compiler dying inside one is a crash verdict, kept
+    /// apart from the findings and reported as one by
+    /// `check_required_consts`.
+    crash: Option<String>,
     /// The first `check_mono_item` rejection the walk's forces
     /// produced, kept apart from `finding`: it is reported
     /// after `check_bodies`, whose findings name some of the
@@ -2136,9 +2151,12 @@ struct RequiredConstWalk<'tcx> {
 impl<'tcx> RequiredConstWalk<'tcx> {
     fn run(&mut self) {
         while let Some(instance) = self.queue.pop_front() {
-            if self.finding.is_some() {
+            if self.finding.is_some() || self.crash.is_some() {
                 return;
             }
+            // The bug-witness snapshot for this instance's
+            // processing, diffed below.
+            let witnesses_before = crate::convert::compiler_bug_witness_len();
             // Instance-body access and constant evaluation go
             // through the compiler's internals and can panic on
             // exotic instances (foreign bodies with no MIR here,
@@ -2147,6 +2165,27 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.process(instance);
             }));
+            // A compiler-bug panic inside the processing is
+            // not an exotic instance: every force the walk
+            // makes is one the compiler's own collector makes
+            // for an instance it collects (the per-instance
+            // `check_mono_item` force, the required-constant
+            // evaluations, the vtable allocations of mentioned
+            // unsize casts), so the compiler dying inside one
+            // is the compiler crashing on a collected
+            // instance — a crash verdict, and the walk ends.
+            // The diff is scoped to this instance's processing,
+            // so bug panics contained on speculative paths the
+            // walk does not decide (and the findings computed
+            // after the walk) never reach it.
+            if self.crash.is_none() {
+                if let Some(record) =
+                    crate::convert::compiler_bug_witness_since(witnesses_before)
+                {
+                    self.crash = Some(record);
+                    return;
+                }
+            }
         }
     }
 
@@ -2459,6 +2498,19 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         // a generic definition's body is materialized once,
         // under the definition's key, and its diagnostics are
         // properties of every instance of it.
+        //
+        // A compiler-bug panic recorded for the body's
+        // materialization (see `convert::materialization_bug`)
+        // is the stronger verdict of the same shape: the
+        // compiler crashed materializing a body the collector
+        // collects, which native reports as a crash, not as a
+        // diagnostics finding.
+        if let Some(record) = crate::convert::materialization_bug(&key)
+            .or_else(|| crate::convert::materialization_bug(&def_key))
+        {
+            self.crash = Some(record);
+            return;
+        }
         {
             if crate::convert::materialization_emitted(&key)
                 || crate::convert::materialization_emitted(&def_key)
