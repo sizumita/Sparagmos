@@ -47,24 +47,28 @@ impl<'a> Interpreter<'a> {
         } else {
             None
         };
-        let first = host_path(&first);
+        let first = host_path(&first)?;
         Ok(match op {
-            FsSysOp::Metadata => {
-                io_result_from_host(std::fs::metadata(&first).map(|md| metadata_value(&md)))
+            FsSysOp::Metadata => match std::fs::metadata(&first) {
+                Ok(md) => io_result_ok(metadata_value(&md)?),
+                Err(e) => io_result_err(host_io_error(&e)),
+            },
+            FsSysOp::SymlinkMetadata => {
+                match std::fs::symlink_metadata(&first) {
+                    Ok(md) => io_result_ok(metadata_value(&md)?),
+                    Err(e) => io_result_err(host_io_error(&e)),
+                }
             }
-            FsSysOp::SymlinkMetadata => io_result_from_host(
-                std::fs::symlink_metadata(&first).map(|md| metadata_value(&md)),
-            ),
-            FsSysOp::Canonicalize => io_result_from_host(
-                std::fs::canonicalize(&first)
-                    .map(|p| pathbuf_value(&host_path_bytes(&p))),
-            ),
+            FsSysOp::Canonicalize => match std::fs::canonicalize(&first) {
+                Ok(p) => io_result_ok(pathbuf_value(&host_path_bytes(&p)?)),
+                Err(e) => io_result_err(host_io_error(&e)),
+            },
             FsSysOp::Copy => {
-                let to = host_path(second.as_ref().expect("two-path operation"));
+                let to = host_path(second.as_ref().expect("two-path operation"))?;
                 io_result_from_host(std::fs::copy(&first, &to).map(|n| Value::Uint(n as u128)))
             }
             FsSysOp::HardLink => {
-                let to = host_path(second.as_ref().expect("two-path operation"));
+                let to = host_path(second.as_ref().expect("two-path operation"))?;
                 io_result_from_host(std::fs::hard_link(&first, &to).map(|()| Value::Unit))
             }
             FsSysOp::ReadDir => {
@@ -80,7 +84,7 @@ impl<'a> Interpreter<'a> {
                         let mut items = Vec::new();
                         for entry in entries {
                             items.push(match entry {
-                                Ok(ent) => io_result_ok(dir_entry_value(&ent)),
+                                Ok(ent) => io_result_ok(dir_entry_value(&ent)?),
                                 Err(e) => io_result_err(host_io_error(&e)),
                             });
                         }
@@ -89,9 +93,10 @@ impl<'a> Interpreter<'a> {
                     Err(e) => io_result_err(host_io_error(&e)),
                 }
             }
-            FsSysOp::ReadLink => io_result_from_host(
-                std::fs::read_link(&first).map(|p| pathbuf_value(&host_path_bytes(&p))),
-            ),
+            FsSysOp::ReadLink => match std::fs::read_link(&first) {
+                Ok(p) => io_result_ok(pathbuf_value(&host_path_bytes(&p)?)),
+                Err(e) => io_result_err(host_io_error(&e)),
+            },
             FsSysOp::RemoveDir => {
                 io_result_from_host(std::fs::remove_dir(&first).map(|()| Value::Unit))
             }
@@ -102,7 +107,7 @@ impl<'a> Interpreter<'a> {
                 io_result_from_host(std::fs::remove_file(&first).map(|()| Value::Unit))
             }
             FsSysOp::Rename => {
-                let to = host_path(second.as_ref().expect("two-path operation"));
+                let to = host_path(second.as_ref().expect("two-path operation"))?;
                 io_result_from_host(std::fs::rename(&first, &to).map(|()| Value::Unit))
             }
             FsSysOp::SetPermissions => {
@@ -119,18 +124,21 @@ impl<'a> Interpreter<'a> {
                 let mode = permissions_mode(&perms).ok_or_else(|| {
                     unsupported("set_permissions: unrecognised Permissions shape".to_string())
                 })?;
+                let host_perms =
+                    crate::platform::permissions_from_mode(mode).ok_or_else(|| {
+                        unsupported(
+                            "set_permissions: Unix mode permissions have no equivalent on this host platform",
+                        )
+                    })?;
                 io_result_from_host(
-                    std::fs::set_permissions(
-                        &first,
-                        std::os::unix::fs::PermissionsExt::from_mode(mode),
-                    )
-                    .map(|()| Value::Unit),
+                    std::fs::set_permissions(&first, host_perms)
+                        .map(|()| Value::Unit),
                 )
             }
             FsSysOp::Symlink => {
-                let to = host_path(second.as_ref().expect("two-path operation"));
+                let to = host_path(second.as_ref().expect("two-path operation"))?;
                 io_result_from_host(
-                    std::os::unix::fs::symlink(&first, &to).map(|()| Value::Unit),
+                    crate::platform::symlink(&first, &to).map(|()| Value::Unit),
                 )
             }
         })
@@ -304,7 +312,8 @@ pub(super) fn replace_slice_bytes(
 /// file's birth time and the full statx mask when the host
 /// reports a birth time, `None` otherwise (the same fallback
 /// std takes when the birth time is unavailable).
-pub(super) fn metadata_value(md: &std::fs::Metadata) -> Value {
+#[cfg(unix)]
+pub(super) fn metadata_value(md: &std::fs::Metadata) -> InterpResult<Value> {
     use std::os::unix::fs::MetadataExt;
     let stat = Value::Enum {
         variant: 0,
@@ -354,10 +363,23 @@ pub(super) fn metadata_value(md: &std::fs::Metadata) -> Value {
             fields: vec![],
         },
     };
-    Value::Enum {
+    Ok(Value::Enum {
         variant: 0,
         fields: vec![stat, statx_extra],
-    }
+    })
+}
+
+/// A `std::fs::Metadata` value on a non-Unix host: the
+/// modelled shape is the host Unix `stat` struct, which
+/// has no equivalent on this platform, so the operation
+/// is named unsupported rather than filled with invented
+/// field values.
+#[cfg(not(unix))]
+pub(super) fn metadata_value(md: &std::fs::Metadata) -> InterpResult<Value> {
+    let _ = md;
+    Err(unsupported(
+        "fs metadata: the modelled stat shape is the host Unix one; this host platform has no equivalent",
+    ))
 }
 
 /// The mode of a `std::fs::Permissions` value: `{ inner:

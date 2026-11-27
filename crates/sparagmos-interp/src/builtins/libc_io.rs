@@ -294,15 +294,9 @@ impl<'a> Interpreter<'a> {
                     // kernel's own answer (`EPIPE` on
                     // Linux) comes from a duplicate of the
                     // host descriptor.
-                    use std::os::fd::AsFd as _;
-                    let result = socket
-                        .as_fd()
-                        .try_clone_to_owned()
-                        .and_then(|owned| {
-                            let mut file = std::fs::File::from(owned);
-                            file.write(bytes)
-                        });
-                    Step::Done(result)
+                    Step::Done(crate::platform::listener_socket_write(
+                        socket, bytes,
+                    ))
                 }
             });
             match step {
@@ -432,15 +426,9 @@ impl<'a> Interpreter<'a> {
                     // own answer (`ENOTCONN` on Linux) comes
                     // from a duplicate of the host
                     // descriptor.
-                    use std::os::fd::AsFd as _;
-                    let result = socket
-                        .as_fd()
-                        .try_clone_to_owned()
-                        .and_then(|owned| {
-                            let mut file = std::fs::File::from(owned);
-                            file.read(buf)
-                        });
-                    Step::Done(result)
+                    Step::Done(crate::platform::listener_socket_read(
+                        socket, buf,
+                    ))
                 }
             });
             match step {

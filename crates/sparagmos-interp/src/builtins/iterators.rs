@@ -2951,12 +2951,23 @@ impl<'a> Interpreter<'a> {
         };
         let bytes = self.path_bytes_of(frames, &payload)?.0;
         let next = {
-            use std::os::unix::ffi::OsStrExt;
-            let path =
-                std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes));
+            let path = std::path::Path::new(
+                crate::platform::os_str_from_bytes(&bytes).ok_or_else(|| {
+                    unsupported(
+                        "Ancestors: the path bytes have no host string form on this platform",
+                    )
+                })?,
+            );
             match path.parent() {
                 Some(parent) => {
-                    some_value(sub_path_value(parent.as_os_str().as_bytes()))
+                    let parent_bytes =
+                        crate::platform::os_str_bytes(parent.as_os_str())
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "Ancestors: the host parent path has no byte form on this platform",
+                                )
+                            })?;
+                    some_value(sub_path_value(&parent_bytes))
                 }
                 None => none_value(),
             }
