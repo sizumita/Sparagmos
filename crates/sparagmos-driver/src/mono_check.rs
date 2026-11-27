@@ -1718,6 +1718,25 @@ fn generic_export_finding<'tcx>(
         ) {
             continue;
         }
+        // An associated item declared in a trait is not an
+        // export candidate at all: the attribute is inert on
+        // trait items (rustc warns it "cannot be used on"
+        // them), and the compiler's own check — the
+        // `InvalidNoMangleItems` late lint — visits free
+        // functions and constants only, never trait items.
+        // A generic trait method carrying the attribute is
+        // therefore accepted, as in
+        // tests/ui/feature-gates/issue-43106-gating-of-builtin-attrs.rs,
+        // where `#[no_mangle]` sits on the methods of a trait.
+        if matches!(
+            tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::AssocFn
+        ) && matches!(
+            tcx.associated_item(def_id).container,
+            rustc_middle::ty::AssocContainer::Trait
+        ) {
+            continue;
+        }
         let attrs = tcx.codegen_fn_attrs(def_id);
         let exported = attrs.symbol_name.is_some()
             || attrs.flags.contains(
