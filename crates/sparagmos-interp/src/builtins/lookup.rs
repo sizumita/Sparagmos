@@ -55,26 +55,48 @@ pub fn consumes_caller_location(kind: Builtin) -> bool {
 /// Whether a body-less call that names this builtin only by its
 /// plain trait path may be served by the builtin at run time.
 /// Such a call reaches the interpreter as a name with no body
-/// under it (a function value like `.map(Clone::clone)`, or a
-/// call inside a body the converter kept in generic form): the
-/// driver collects no body for a builtin-owned definition, and
-/// conversion had no impl instance to resolve the name to, so
-/// the direct-call conversion to `CallBuiltin` never saw it.
-/// Only the value-semantics models qualify — they compute from
-/// the argument values alone and need nothing conversion bakes
-/// into a `CallBuiltin` (no drop glue, no caller-location stamp,
-/// no generic tags: `Clone::clone`'s tag-keyed handle cases do
-/// not arise for the plain-data values these calls carry, and
-/// enum comparisons order structurally, as they do for a
-/// `CallBuiltin` whose discriminant table conversion could not
-/// bake either). Anything else keeps the missing-body error.
+/// under it (a function value like `.map(Clone::clone)`, a call
+/// inside a body the converter kept in generic form, or a
+/// builtin-owned definition reified to a function pointer and
+/// invoked through the value): the driver collects no body for
+/// a builtin-owned definition, and conversion had no impl
+/// instance to resolve the name to, so the direct-call
+/// conversion to `CallBuiltin` never saw it.
+/// Only models that need nothing conversion bakes into a
+/// `CallBuiltin` qualify — no drop glue, no caller-location
+/// stamp (the fallback completion drops a trailing stamp for
+/// the kinds that do not consume one, as the conversion does),
+/// no generic tags. Two families meet that bar:
+///
+/// * The value-semantics models: they compute from the argument
+///   values alone (`Clone::clone`'s tag-keyed handle cases do
+///   not arise for the plain-data values these calls carry, and
+///   enum comparisons order structurally, as they do for a
+///   `CallBuiltin` whose discriminant table conversion could
+///   not bake either).
+/// * The host-state models: the process-environment, clock,
+///   current-thread and standard-stream surfaces. Their
+///   execution reads the argument values plus the live state
+///   the interpreter itself hosts — the host process
+///   environment and id, the guest's argv, the monotonic and
+///   wall clocks, the current thread, the descriptor routing —
+///   which is exactly the state their `CallBuiltin` execution
+///   reads, so the result is the same whichever path serves
+///   the call. The thread park family is deliberately not in
+///   this family: it can suspend the calling thread, and the
+///   name fallback's completion is a synchronous builtin
+///   completion without the direct call arms' suspension
+///   bookkeeping.
+///
+/// Anything else keeps the missing-body error.
 ///
 /// The driver uses the same predicate from the other side: a
 /// builtin-owned definition demanded *as a value* whose kind is
-/// not servable here gets its real body collected instead (see
-/// `value_demand_needs_body` in the driver's reach walk), so a
-/// call through the value runs the body the compiler would have
-/// run — drop glue and all — under the plain definition name.
+/// not servable here gets its real body collected instead when
+/// it has one (see `value_demand_needs_body` in the driver's
+/// reach walk), so a call through the value runs the body the
+/// compiler would have run — drop glue and all — under the
+/// plain definition name.
 pub fn runtime_name_fallback(kind: Builtin) -> bool {
     matches!(
         kind,
@@ -102,6 +124,39 @@ pub fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::IoDecodeErrorKind
             | Builtin::IoFormatOsError
             | Builtin::IoIsInterrupted
+            // The host-state models (see the doc comment): the
+            // process-environment surface, in registry order.
+            | Builtin::EnvArgs
+            | Builtin::EnvArgsOs
+            | Builtin::EnvVars
+            | Builtin::EnvVarsOs
+            | Builtin::EnvCurrentExe
+            | Builtin::EnvVarInner
+            | Builtin::EnvSplitPaths
+            | Builtin::EnvJoinPaths
+            | Builtin::EnvGetenv
+            | Builtin::EnvSetenv
+            | Builtin::EnvUnsetenv
+            | Builtin::EnvCurrentDir
+            | Builtin::EnvTempDir
+            | Builtin::EnvHomeDir
+            | Builtin::SysChdir
+            // The host process and clock queries.
+            | Builtin::CurrentExe
+            | Builtin::ProcessId
+            | Builtin::InstantNow
+            | Builtin::SystemTimeNow
+            // The current-thread queries and scheduler drains
+            // (the park family can suspend and stays out).
+            | Builtin::ThreadCurrent
+            | Builtin::ThreadIdOf
+            | Builtin::ThreadName
+            | Builtin::ThreadSleep
+            | Builtin::ThreadYield
+            // The standard-stream constructors: handle values
+            // built from the run's descriptor routing alone.
+            | Builtin::Stdout
+            | Builtin::Stdin
     )
 }
 
