@@ -162,8 +162,11 @@ pub struct ProcessSpawnRequest {
 
 /// The outcome of one finished child process: its exit code
 /// (negative when the child ended on a signal) and the bytes
-/// its stdout and stderr produced. The host always captures
-/// both streams; the interpreter routes them by the command's
+/// its stdout and stderr produced. The host captures both
+/// streams, except one the invocation wired to a file: that
+/// stream's bytes move through the guest's file while the
+/// child runs and its captured half is empty. The
+/// interpreter routes the captured bytes by the command's
 /// stdio configuration (collected into the guest's `Output`,
 /// relayed into the guest's own streams, or discarded).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +197,14 @@ pub enum ProcessHostError {
 /// `ChildStderr` handles are ordinary file handles: reads and
 /// writes go through the file model, and dropping a handle
 /// closes its end of the pipe, as a native handle drop does.
-/// A stream the wiring did not pipe (an inherited or nulled
-/// stdin) hands back no file.
+/// A stream the wiring did not pipe hands back no file:
+/// an inherited or nulled stdin, and a stream wired to a
+/// file, whose bytes move through the guest's file directly
+/// from the spawn (for a self-child's stderr, through a
+/// host relay fed by the child's guest-stderr channel), so
+/// a guest reading the other end of a pipe it wired
+/// observes the bytes, and end-of-file, while the child
+/// runs rather than when its end is observed.
 pub struct ProcessSpawned {
     pub host_id: u64,
     pub pid: u32,
