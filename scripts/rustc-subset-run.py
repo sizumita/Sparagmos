@@ -83,7 +83,13 @@ A test is *attempted* only when both sides can be run faithfully:
   guest's stdout compared as for run-pass; the driver reports
   a guest crash -- a panic that may not unwind -- with exit
   code 134 and a `guest crashed` marker, keeping it distinct
-  from an unwinding guest panic (101); `//@ run-flags:` are
+  from an unwinding guest panic (101), and the verdict
+  requires that evidence: a crash-class exit code alone
+  never passes, because a guest can produce one without
+  crashing (`std::process::exit(134)`), so an exit 134
+  without the marker -- and any other crash-class code,
+  which the driver never produces for a guest crash -- is
+  judged as a crash that was not evidenced, not as a pass; `//@ run-flags:` are
   forwarded to both runs -- as the native run's argv and as the
   driver's `--guest-arg` options -- and `//@ exec-env:` pairs
   are applied to both runs' environments, the way compiletest
@@ -1631,6 +1637,33 @@ def missing_run_patterns(view, result):
     return missing
 
 
+GUEST_CRASH_EXIT_CODE = 134
+GUEST_CRASH_MARKER = "sparagmos-driver run: guest crashed"
+
+
+def guest_crash_evidenced(result):
+    """Whether a Sparagmos run result carries the driver's
+    guest-crash evidence: exit code 134 together with the
+    `guest crashed` marker the driver prints on its own stderr
+    for a guest abort (see execute.rs in sparagmos-driver).
+    The marker is looked for on the driver's own stderr
+    (`driver_stderr`, preserved by sparagmos_side before the
+    guest's captured stderr replaces the result's `stderr`)
+    and on the result's stderr itself (the JIT run shares one
+    channel). A crash-class exit code without this evidence
+    is not a guest crash: a guest can exit with any code it
+    chooses (`std::process::exit(134)` is a normal, if
+    unusual, termination), and the driver produces 134 only
+    on the abort path, so every other crash-class code is
+    likewise unevidenced."""
+    if result.get("exit_code") != GUEST_CRASH_EXIT_CODE:
+        return False
+    for key in ("driver_stderr", "stderr"):
+        if GUEST_CRASH_MARKER in (result.get(key) or ""):
+            return True
+    return False
+
+
 def run_result_class(exit_code):
     """compiletest's classification of a finished program run
     (runtest/ui.rs's RunResult): exit 0 is "pass", an exit code
@@ -1679,6 +1712,8 @@ def failure_bucket(detail):
         return "stderr mismatch"
     if detail.startswith("guest did not crash"):
         return "guest did not crash"
+    if detail.startswith("guest crash not evidenced"):
+        return "guest crash not evidenced"
     return "exit-code mismatch"
 
 
@@ -1708,11 +1743,21 @@ def judge(mode, header, native, sparagmos, path=None, base_dir=None):
         # as a crash (run_result_class); the native side has
         # already been checked to crash, so the Sparagmos run
         # passes when it crashes too and the guest's stdout up
-        # to the crash agrees with the native run's.
+        # to the crash agrees with the native run's. The crash
+        # must be the guest's, evidenced the way the driver
+        # reports one (guest_crash_evidenced): the class alone
+        # is not sufficient, because a crash-class exit code
+        # can also be a plain guest exit with a large code,
+        # which is not a crash at all.
         if run_result_class(sparagmos["exit_code"]) != "crash":
             return ("fail",
                     f"guest did not crash: exit "
                     f"{sparagmos['exit_code']}")
+        if not guest_crash_evidenced(sparagmos):
+            return ("fail",
+                    f"guest crash not evidenced: exit "
+                    f"{sparagmos['exit_code']} without the "
+                    f"driver's guest-crash marker")
         if sparagmos["stdout"] != native["stdout"]:
             return ("fail", "stdout mismatch")
         return ("pass", "")
@@ -3330,6 +3375,10 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
             f"driver killed by signal {-res['exit_code']}: " \
             f"{res['stderr'].strip()[:300]}"
     if guest_stderr_path is not None:
+        # The driver's own stderr is preserved alongside: the
+        # guest-crash marker lives there, and the run-crash
+        # verdict reads it as the crash's evidence.
+        res["driver_stderr"] = res["stderr"]
         try:
             res["stderr"] = guest_stderr_path.read_text(
                 errors="replace")

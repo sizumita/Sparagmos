@@ -346,6 +346,14 @@ denominator. Runs on every push to `main` and on manual dispatch.
   second panic while a panic is in flight) -- with exit code
   134 and a `guest crashed` marker line, while an unwinding
   guest panic keeps exit 101 and a completed run keeps 0.
+  The verdict requires that evidence (exit 134 with the
+  marker on the driver's own stderr, which the runner
+  preserves next to the guest's captured stderr): a
+  crash-class exit code alone never passes, since a guest
+  can produce one without crashing (a plain
+  `std::process::exit(134)`), and the driver produces 134
+  only on the abort path, so any other crash-class code is
+  likewise judged as a crash that was not evidenced.
   A guest failure the interpreter cannot exhibit as a crash
   (a hook panic the interpreter unwinds where native code
   aborts, a conversion gap) fails under its own bucket; the

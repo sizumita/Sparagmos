@@ -719,7 +719,50 @@ class JudgeTests(unittest.TestCase):
     def test_run_crash_both_sides_crash_passes(self):
         h = header("//@ run-crash\n")
         native = {"exit_code": -6, "stdout": ""}
-        got = {"exit_code": 134, "stdout": ""}
+        got = {"exit_code": 134, "stdout": "",
+               "driver_stderr":
+                   "sparagmos-driver run: guest crashed: abort\n"}
+        self.assertEqual(run.judge("run-crash", h, native, got),
+                         ("pass", ""))
+
+    def test_run_crash_plain_exit_134_fails(self):
+        # A guest that terminates normally with exit code 134
+        # (std::process::exit(134)) has not crashed: the code
+        # is crash-class, but the driver's guest-crash marker
+        # is absent, so the record must not pass.
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -6, "stdout": ""}
+        got = {"exit_code": 134, "stdout": "", "stderr": "",
+               "driver_stderr": ""}
+        status, detail = run.judge("run-crash", h, native, got)
+        self.assertEqual(status, "fail")
+        self.assertIn("not evidenced", detail)
+        self.assertEqual(run.failure_bucket(detail),
+                         "guest crash not evidenced")
+
+    def test_run_crash_other_crash_class_codes_fail(self):
+        # The driver produces 134 only for a guest crash, so
+        # any other crash-class code (a plain exit above 127,
+        # or a signal death that reached the judge) is not
+        # evidenced as a guest crash either.
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -6, "stdout": ""}
+        for code in (200, -11):
+            got = {"exit_code": code, "stdout": "",
+                   "driver_stderr":
+                       "sparagmos-driver run: guest crashed: abort\n"}
+            status, detail = run.judge("run-crash", h, native, got)
+            self.assertEqual(status, "fail")
+            self.assertIn("not evidenced", detail)
+
+    def test_run_crash_marker_on_shared_stderr_passes(self):
+        # The JIT run shares one stderr channel: the marker
+        # there is the same evidence.
+        h = header("//@ run-crash\n")
+        native = {"exit_code": -11, "stdout": ""}
+        got = {"exit_code": 134, "stdout": "",
+               "stderr":
+                   "sparagmos-driver run: guest crashed: abort\n"}
         self.assertEqual(run.judge("run-crash", h, native, got),
                          ("pass", ""))
 
@@ -746,7 +789,9 @@ class JudgeTests(unittest.TestCase):
     def test_run_crash_stdout_mismatch_fails(self):
         h = header("//@ run-crash\n")
         native = {"exit_code": -6, "stdout": "before\n"}
-        got = {"exit_code": 134, "stdout": ""}
+        got = {"exit_code": 134, "stdout": "",
+               "driver_stderr":
+                   "sparagmos-driver run: guest crashed: abort\n"}
         status, detail = run.judge("run-crash", h, native, got)
         self.assertEqual(status, "fail")
         self.assertEqual(detail, "stdout mismatch")
@@ -4551,7 +4596,9 @@ class ProcessStage2RunModeTests(unittest.TestCase):
         res = self.run_with_sides(
             rec,
             ({"exit_code": -6, "stdout": "", "stderr": ""}, None),
-            ({"exit_code": 134, "stdout": "", "stderr": ""},
+            ({"exit_code": 134, "stdout": "", "stderr": "",
+              "driver_stderr":
+                  "sparagmos-driver run: guest crashed: abort\n"},
              "result", ""),
             conv())
         self.assertEqual(res["status"], "pass")
