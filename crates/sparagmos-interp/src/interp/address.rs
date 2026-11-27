@@ -3894,6 +3894,94 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether the declared type at the end of
+    /// `projection` is a union, walked from the target's
+    /// birth type through the projection's field steps (a
+    /// field whose recorded type is absent — its type
+    /// mentions a generic parameter at its head — steps by
+    /// its field tag, which names the field's instance
+    /// type). A position the walk cannot denominate (an
+    /// allocation base, an index into a non-array type, a
+    /// step of another kind) is not judged a union: the
+    /// caller's absorption keeps its existing behaviour
+    /// there.
+    fn projection_end_is_union(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        static_name: Option<&str>,
+        projection: &[RefProj],
+    ) -> bool {
+        let mut cur: Ty = if let Some(name) = static_name {
+            match self.program().static_tys.get(name) {
+                Some(ty) => ty.clone(),
+                None => return false,
+            }
+        } else if let Some((frame_id, local)) = place {
+            let frame = match self.frame_pos(frames, frame_id) {
+                Ok(pos) => &frames[pos],
+                Err(_) => return false,
+            };
+            let body = match self.program().functions.get(&frame.func) {
+                Some(body) => body,
+                None => return false,
+            };
+            match body.local_tys.get(local) {
+                Some(ty) => ty.clone(),
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        let mut variant = 0usize;
+        for step in projection {
+            match step {
+                RefProj::Field(i) => {
+                    let Ty::Adt(name) = &cur else {
+                        return false;
+                    };
+                    cur = match self.instance_field_ty(name, &cur, variant, *i)
+                    {
+                        Some(ty) => ty,
+                        None => match self.adt_field_tag(name, variant, *i) {
+                            Some(tag) => Ty::Adt(tag.trim().to_string()),
+                            None => return false,
+                        },
+                    };
+                    variant = 0;
+                }
+                RefProj::UnionField { idx, .. } => {
+                    let Ty::Adt(name) = &cur else {
+                        return false;
+                    };
+                    cur = match self.instance_field_ty(name, &cur, 0, *idx) {
+                        Some(ty) => ty,
+                        None => match self.adt_field_tag(name, 0, *idx) {
+                            Some(tag) => Ty::Adt(tag.trim().to_string()),
+                            None => return false,
+                        },
+                    };
+                    variant = 0;
+                }
+                RefProj::Index(_) => {
+                    cur = match &cur {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => {
+                            (**elem).clone()
+                        }
+                        _ => return false,
+                    };
+                    variant = 0;
+                }
+                RefProj::Downcast(v) => variant = *v as usize,
+                _ => return false,
+            }
+        }
+        match &cur {
+            Ty::Adt(name) => self.adt_is_union(name),
+            _ => false,
+        }
+    }
+
     /// Advance a place/static target's projection by an offset:
     /// `disp` is the byte displacement (`None` when the offset's
     /// element size is unknown) and `count` the offset in
@@ -4018,6 +4106,12 @@ impl<'a> Interpreter<'a> {
             && !self.byte_view_covers(frames, place, static_name, &projection, base)
         {
             if let Some(base) = base {
+                let end_is_union = self.projection_end_is_union(
+                    frames,
+                    place,
+                    static_name,
+                    &projection,
+                );
                 if let Some(absorbed) = self.absorb_displacement(
                     base,
                     &projection,
@@ -4025,6 +4119,7 @@ impl<'a> Interpreter<'a> {
                     elem_size,
                     count,
                     storage_grows,
+                    end_is_union,
                 ) {
                     return Ok(absorbed);
                 }
@@ -4278,7 +4373,14 @@ impl<'a> Interpreter<'a> {
     /// its storage (see `Value::SparseVec`), spare-capacity
     /// slots included; a byte string or string is a container
     /// only for a byte-sized offset. Any other shape denotes
-    /// no container an offset can range over.
+    /// no container an offset can range over. One position
+    /// is excepted in `absorb_displacement`'s final judgment:
+    /// a position whose declared type is a union — there the
+    /// ADT value's fields are the union's declared fields,
+    /// each as wide as its own type, not elements of the
+    /// offset's size (a one-byte displacement into a
+    /// `MaybeUninit<u32>` value landed as field index 1,
+    /// outside the payload the byte addresses).
     fn offset_container_count(container: &Value, size: i128) -> Option<i128> {
         match container {
             Value::Tuple(items) => i128::try_from(items.len()).ok(),
@@ -4310,6 +4412,7 @@ impl<'a> Interpreter<'a> {
         elem_size: Option<u64>,
         off_count: i128,
         storage_grows: bool,
+        end_is_union: bool,
     ) -> Option<Vec<RefProj>> {
         let size = i128::from(elem_size?);
         // Navigate to the container the position sits in. A
@@ -4497,6 +4600,26 @@ impl<'a> Interpreter<'a> {
         // above does not advance `cur` past the container it
         // selects, and every other path leaves the position's
         // container in `cur` as well.
+        // A position whose declared type is a union does
+        // not absorb into the union value's fields (see
+        // `offset_container_count`): the displacement is
+        // denominated in the offset's element size, the
+        // fields in their own types' widths. The one
+        // exception is the single-field wrapper over an
+        // element aggregate, which the unwrapping below
+        // re-denominates over the aggregate itself.
+        if end_is_union {
+            if let Value::Enum { fields, .. } = cur {
+                let unwraps = fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        Value::Tuple(_) | Value::Bytes(_)
+                    );
+                if !unwraps {
+                    return None;
+                }
+            }
+        }
         let mut container: &Value = cur;
         loop {
             match container {

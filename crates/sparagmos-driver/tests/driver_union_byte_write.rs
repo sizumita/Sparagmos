@@ -363,3 +363,228 @@ fn main() {
 "#,
     );
 }
+
+// A byte write displaced into a const-seeded static
+// `MaybeUninit<T>` (Issue #513): the write resolves
+// through the union pointer cast to a byte position of
+// the union's storage, and the payload read through
+// `assume_init_ref` must see it. The displacement used
+// to absorb into the union value's field vector as an
+// element index (the fields of an ADT are not elements
+// of the byte's size), landing one past the held field
+// where the write was silently dropped; and a write
+// that did land converted the union to its byte form,
+// which the payload descent's plain field steps then
+// refused to read.
+#[test]
+fn run_mode_maybeuninit_static_byte_write_displaced_payload_read() {
+    run_ok(
+        "maybeuninit-static-displaced",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "ab00\n",
+    );
+}
+
+// The same write against a nonzero seed: the bytes the
+// write does not touch survive it.
+#[test]
+fn run_mode_maybeuninit_static_byte_write_preserves_seed_bytes() {
+    run_ok(
+        "maybeuninit-static-seed",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0x11223344u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "1122ab44\n",
+    );
+}
+
+// A byte write at the base of the union's storage with
+// no displacement is a byte of the storage, not a
+// replacement for the union value: the seed's other
+// bytes survive.
+#[test]
+fn run_mode_maybeuninit_static_byte_write_at_base_preserves_seed() {
+    run_ok(
+        "maybeuninit-static-base",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0x11223344u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp = 0xAB;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "112233ab\n",
+    );
+}
+
+// A displaced write followed by a base write compose in
+// the storage: each byte lands at its own position.
+#[test]
+fn run_mode_maybeuninit_static_byte_writes_compose() {
+    run_ok(
+        "maybeuninit-static-compose",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        *bp.add(0) = 0x11;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "ab11\n",
+    );
+}
+
+// The last byte of the payload's storage.
+#[test]
+fn run_mode_maybeuninit_static_byte_write_last_byte() {
+    run_ok(
+        "maybeuninit-static-last",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(3) = 0xAB;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "ab000000\n",
+    );
+}
+
+// A wide payload: a byte displaced into a u64
+// `MaybeUninit`.
+#[test]
+fn run_mode_maybeuninit_static_byte_write_u64_payload() {
+    run_ok(
+        "maybeuninit-static-u64",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0u64)));
+struct Cell0(UnsafeCell<MaybeUninit<u64>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(5) = 0xAB;
+        println!("{:x}", (*p).assume_init_ref());
+    }
+}
+"#,
+        "ab0000000000\n",
+    );
+}
+
+// The local shape: a byte write through a byte pointer
+// cast from a local `MaybeUninit` pointer, read back
+// through `assume_init_ref`.
+#[test]
+fn run_mode_maybeuninit_local_byte_write_payload_read() {
+    run_ok(
+        "maybeuninit-local",
+        r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    unsafe {
+        let mut m = MaybeUninit::<u32>::new(0);
+        let p = &mut m as *mut MaybeUninit<u32>;
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        println!("{:x}", *m.assume_init_ref());
+    }
+}
+"#,
+        "ab00\n",
+    );
+}
+
+// Byte reads back through the same byte pointer see the
+// written byte and the seed's untouched byte.
+#[test]
+fn run_mode_maybeuninit_static_byte_readback_through_pointer() {
+    run_ok(
+        "maybeuninit-static-byteread",
+        r#"
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+
+static CELL: Cell0 = Cell0(UnsafeCell::new(MaybeUninit::new(0u32)));
+struct Cell0(UnsafeCell<MaybeUninit<u32>>);
+unsafe impl Sync for Cell0 {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        println!("{:x} {:x}", *bp.add(1), *bp.add(0));
+    }
+}
+"#,
+        "ab 0\n",
+    );
+}

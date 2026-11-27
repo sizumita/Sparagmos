@@ -3280,6 +3280,16 @@ impl<'a> Interpreter<'a> {
         if let Some(spliced) = self.bytes_storage_splice(target, &value, root_ty) {
             return spliced;
         }
+        // A single-byte store at a union position with no
+        // displacement (a byte pointer cast from the union's
+        // own pointer) splices into the union's storage
+        // image rather than replacing the union value (see
+        // `union_byte_base_write`).
+        if let Some(spliced) =
+            self.union_byte_base_write(frames, target, &value)
+        {
+            return spliced;
+        }
         let grow = matches!(target, Resolved::Alloc { .. });
         let mut pending = Some(value);
         let crossed = self.union_crossing_write(
