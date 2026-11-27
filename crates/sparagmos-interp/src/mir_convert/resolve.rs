@@ -85,25 +85,29 @@ pub(super) fn body_is_closure_body(body: &mir::Body) -> bool {
 /// receiver value. A concrete ADT `Self` instead names a
 /// hand-written `Fn` impl, whose collected shim body the
 /// direct resolution should keep.
-/// The coroutine-closure aggregate that creates local `local`'s
+/// The coroutine-closure aggregate that creates `place`'s
 /// value in `body`, if the body creates it: the closure's
 /// definition and the types of its captures (the upvars tuple of
 /// the aggregate's generic arguments). A coroutine-closure type
 /// is recorded by the driver as the unit placeholder (its kind
 /// is unaskable through Stable MIR), so the aggregate that
 /// creates the value is the one place a body's conversion can
-/// learn what the value is.
+/// learn what the value is. The place is the bare local in a
+/// plain frame; in a coroutine body the transform assigns the
+/// value to a state-field projection of the coroutine place,
+/// and a later drop of that same projection must plan from the
+/// same aggregate, so the match is on the whole place.
 pub(super) fn coroutine_closure_creation(
     body: &mir::Body,
-    local: usize,
+    place: &mir::Place,
 ) -> Option<(mir::DefId, Vec<mir::Ty>)> {
     for bb in &body.basic_blocks {
         for stmt in &bb.statements {
             let mir::StatementKind::Assign(pair) = &stmt.kind else {
                 continue;
             };
-            let (place, rv) = &**pair;
-            if place.local.index() != local || !place.projection.is_empty() {
+            let (dest, rv) = &**pair;
+            if dest != place {
                 continue;
             }
             let mir::Rvalue::Aggregate(kind, _) = rv else {
@@ -124,6 +128,37 @@ pub(super) fn coroutine_closure_creation(
         }
     }
     None
+}
+
+/// The source place of `place`'s sole assignment in `body` when
+/// that assignment is a plain use (a move or a copy of another
+/// place): the shape of the temporary a call argument is staged
+/// through (`_tmp = move _x` ahead of the call). `None` when the
+/// place is assigned any other way, or more than once - a reused
+/// place's value cannot be traced to one origin.
+pub(super) fn sole_use_source(body: &mir::Body, place: &mir::Place) -> Option<mir::Place> {
+    let mut source = None;
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            let mir::StatementKind::Assign(pair) = &stmt.kind else {
+                continue;
+            };
+            let (dest, rv) = &**pair;
+            if dest != place {
+                continue;
+            }
+            if source.is_some() {
+                return None;
+            }
+            match rv {
+                mir::Rvalue::Use(mir::Operand::Copy(src) | mir::Operand::Move(src)) => {
+                    source = Some(src.clone());
+                }
+                _ => return None,
+            }
+        }
+    }
+    source
 }
 
 /// The per-capture plan of an async closure, from its creation
