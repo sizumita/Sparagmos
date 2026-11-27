@@ -393,3 +393,29 @@ fn main() {{
     );
     assert_run("nested", &src, "nested: 10\n");
 }
+
+#[test]
+fn async_closure_immediately_called_through_promoted_ref() {
+    // An async closure that is called in the same expression
+    // that creates it is not built by an aggregate in the
+    // caller: MIR passes it as a promoted by-reference
+    // constant (`const _promoted: &{async closure}`), whose
+    // pointee type's kind cannot be asked through Stable MIR.
+    // The constant must still decode to the closure value so
+    // the call converts and runs (Issue #396).
+    let src = format!(
+        r#"{POLL_PRELUDE}
+fn make(x: u8) -> impl Future<Output = u8> {{
+    (async move |x: u8| -> u8 {{ x + 1 }})(x)
+}}
+
+fn main() {{
+    match poll_once(make(41)) {{
+        Poll::Ready(v) => println!("ready: {{}}", v),
+        Poll::Pending => println!("pending"),
+    }}
+}}
+"#
+    );
+    assert_run("promoted-ref", &src, "ready: 42\n");
+}
