@@ -38,6 +38,17 @@
 //!   their pointees -- resolving also recurses without
 //!   bound on a self-referential pointee (a stored pointer
 //!   denoting the very aggregate that holds it).
+//! * The same comparisons where the subject reaches the
+//!   comparison without a direct call's type tags: a
+//!   `Vec<*const T>` sort hands `PartialOrd::lt` to the
+//!   sort's generic core as a function item, and a method
+//!   call on pointers read back from a collection denotes
+//!   elements of an aggregate held as a value, whose scalar
+//!   leaves carry no width to price the element's position
+//!   from. The sort must run core's own comparison bodies
+//!   (collected under the value demand), and the builtin's
+//!   address pricing must take its element width from the
+//!   comparison's own pointee tag.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -389,5 +400,111 @@ fn main() {
 }
 "#,
         "ptr-trait-ord ok",
+    );
+}
+
+#[test]
+fn vec_raw_pointer_sort_orders_by_address() {
+    assert_runs(
+        "vec-ptr-sort",
+        r#"
+fn main() {
+    // Array elements sit at ascending addresses; the
+    // values descend with the index, so address order,
+    // pointee order and input order all print differently.
+    let vals: [i32; 6] = [50, 40, 30, 20, 10, 0];
+    let mut ptrs: Vec<*const i32> =
+        vals.iter().map(|v| v as *const i32).collect();
+    ptrs.reverse();
+    ptrs.sort();
+    let sorted: Vec<i32> = ptrs.iter().map(|p| unsafe { **p }).collect();
+    assert_eq!(sorted, vec![50, 40, 30, 20, 10, 0]);
+    // Scrambled input over the same elements: address
+    // order is the index order (0, 2, 3, 5).
+    let base: Vec<*const i32> =
+        vals.iter().map(|v| v as *const i32).collect();
+    let mut scrambled: Vec<*const i32> =
+        vec![base[2], base[5], base[0], base[3]];
+    scrambled.sort();
+    let out: Vec<i32> =
+        scrambled.iter().map(|p| unsafe { **p }).collect();
+    assert_eq!(out, vec![50, 30, 20, 0]);
+    let mut mvals: [i32; 4] = [50, 40, 30, 20];
+    let mut mptrs: Vec<*mut i32> =
+        mvals.iter_mut().map(|v| v as *mut i32).collect();
+    mptrs.reverse();
+    mptrs.sort_unstable();
+    let mout: Vec<i32> =
+        mptrs.iter().map(|p| unsafe { **p }).collect();
+    assert_eq!(mout, vec![50, 40, 30, 20]);
+    println!("vec-ptr-sort ok");
+}
+"#,
+        "vec-ptr-sort ok",
+    );
+}
+
+#[test]
+fn vec_raw_pointer_method_cmp_orders_by_address() {
+    assert_runs(
+        "vec-ptr-cmp",
+        r#"
+use std::cmp::Ordering;
+fn main() {
+    let vals: [i32; 3] = [30, 20, 10];
+    // Pointers read back from the vector denote elements of
+    // an aggregate held as a value; the method-call
+    // comparisons must still order by address (element
+    // index), the exact reverse of the pointee order.
+    let p: Vec<*const i32> =
+        vals.iter().map(|v| v as *const i32).collect();
+    assert_eq!(p[0].cmp(&p[2]), Ordering::Less);
+    assert_eq!(p[2].cmp(&p[0]), Ordering::Greater);
+    assert_eq!(p[0].cmp(&p[1]), Ordering::Less);
+    assert_eq!(p[1].cmp(&p[0]), Ordering::Greater);
+    assert_eq!(p[1].cmp(&p[2]), Ordering::Less);
+    assert_eq!(p[2].cmp(&p[1]), Ordering::Greater);
+    assert_eq!(p[1].partial_cmp(&p[2]), Some(Ordering::Less));
+    assert!(p[0] != p[2]);
+    assert!(p[1] == p[1]);
+    println!("vec-ptr-cmp ok");
+}
+"#,
+        "vec-ptr-cmp ok",
+    );
+}
+
+#[test]
+fn raw_pointer_cmp_through_generic_and_ref_subjects() {
+    assert_runs(
+        "ptr-generic-ref-cmp",
+        r#"
+use std::cmp::Ordering;
+fn glt<T: Ord>(a: &T, b: &T) -> bool { a < b }
+fn gcmp<T: Ord>(a: &T, b: &T) -> Ordering { a.cmp(b) }
+fn main() {
+    let vals: [i32; 3] = [30, 20, 10];
+    let ptrs: Vec<*const i32> =
+        vals.iter().map(|v| v as *const i32).collect();
+    // Declared in address order: storage-slot order and
+    // pointee order both disagree with address order for
+    // the (&a) < (&b) form in one of the two arrangements
+    // below, so only address pricing satisfies both.
+    let b = ptrs[0];
+    let a = ptrs[2];
+    assert!(!((&a) < (&b)));
+    assert!((&b) < (&a));
+    assert!(!glt(&a, &b));
+    assert!(glt(&b, &a));
+    assert_eq!(gcmp(&a, &b), Ordering::Greater);
+    let c = ptrs[2];
+    let d = ptrs[0];
+    assert!(!((&c) < (&d)));
+    assert!(!glt(&c, &d));
+    assert_eq!(gcmp(&c, &d), Ordering::Greater);
+    println!("ptr-generic-ref-cmp ok");
+}
+"#,
+        "ptr-generic-ref-cmp ok",
     );
 }

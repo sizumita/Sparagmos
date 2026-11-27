@@ -476,10 +476,11 @@ impl<'a> Converter<'a> {
     /// time's name dispatch).
     /// Whether this call names one of the builtin-owned
     /// definitions the driver's reach walk collects a body for
-    /// only under a *value* demand (`mem::drop`, `Deref::deref`;
-    /// the kind list mirrors `value_demand_needs_body` in the
-    /// driver's reach walk -- keep the two in sync), in a shape
-    /// the collected body must not bind (see
+    /// only under a *value* demand (`mem::drop`, `Deref::deref`,
+    /// and the comparison methods for a thin raw-pointer
+    /// `Self`; the kind list mirrors `value_demand_needs_body`
+    /// in the driver's reach walk -- keep the two in sync), in
+    /// a shape the collected body must not bind (see
     /// `resolve_body_callee`). Checked exactly as the
     /// external/builtin conversion checks the callee, so a call
     /// is only ever diverted to a builtin that conversion would
@@ -497,6 +498,30 @@ impl<'a> Converter<'a> {
             // for every `T`; a direct call is never bound to a
             // collected body on the un-demanded path either.
             Some(crate::builtins::Builtin::MemDrop) => true,
+            // The comparison methods are collected under a
+            // value demand only for a thin raw-pointer `Self`:
+            // a call through the value carries no type tags
+            // for the runtime fallback to judge the subject
+            // from, while core's bodies compare the pointer
+            // values themselves. A direct call names its
+            // subject in its own tags -- exactly what the
+            // builtin's raw-pointer arms judge from -- so the
+            // builtin keeps every direct call and the collected
+            // body serves only the value call.
+            Some(
+                crate::builtins::Builtin::PartialEqEq
+                | crate::builtins::Builtin::PartialEqNe
+                | crate::builtins::Builtin::PartialCmp
+                | crate::builtins::Builtin::OrdCmp
+                | crate::builtins::Builtin::PartialOrdRel(_),
+            ) => {
+                let Some(self_name) =
+                    self.comparison_call_self(&name, &raw_generic_args)
+                else {
+                    return false;
+                };
+                crate::builtins::comparison_subject_is_raw_pointer(&[self_name])
+            }
             // A `deref` body is a concrete impl's projection
             // over its `Self` layout. For a `Self` the value
             // model owns -- a foreign type (see
@@ -579,6 +604,54 @@ impl<'a> Converter<'a> {
         let trait_path = trait_part.strip_suffix(">::deref")?;
         if trait_path == "core::ops::Deref" || trait_path == "std::ops::Deref"
         {
+            return Some(self_part.to_string());
+        }
+        None
+    }
+
+    /// The `Self` type a comparison call (`PartialEq` /
+    /// `PartialOrd` / `Ord`) is monomorphized at, in rendered
+    /// form, mirroring the three callee name shapes
+    /// `deref_call_self` handles: the trait item (whose `Self`
+    /// is the call's first generic argument), the resolved
+    /// impl instance (`<Self as Trait>::method`), and the
+    /// module-qualified impl instance (`core::...::<impl
+    /// Trait for Type>::method`).
+    fn comparison_call_self(
+        &self,
+        name: &str,
+        raw_generic_args: &[mir::Ty],
+    ) -> Option<String> {
+        const TRAITS: [&str; 6] = [
+            "core::cmp::PartialEq",
+            "std::cmp::PartialEq",
+            "core::cmp::PartialOrd",
+            "std::cmp::PartialOrd",
+            "core::cmp::Ord",
+            "std::cmp::Ord",
+        ];
+        let method = name.rsplit("::").next()?;
+        // The name without its trailing `::method`: the trait
+        // path (trait item), `<Self as Trait>` (impl
+        // instance), or `core::...::<impl Trait for Self>`
+        // (module-qualified impl instance).
+        let stem = name.strip_suffix(method)?.strip_suffix("::")?;
+        if TRAITS.contains(&stem) {
+            return raw_generic_args
+                .first()
+                .map(|t| self.concrete_ty_name(t));
+        }
+        if let Some((_, inner)) = stem.rsplit_once("::<impl ") {
+            let inner = inner.strip_suffix('>')?;
+            let (trait_path, self_part) = inner.rsplit_once(" for ")?;
+            if TRAITS.contains(&trait_path) {
+                return Some(self_part.to_string());
+            }
+            return None;
+        }
+        let rest = stem.strip_prefix('<')?.strip_suffix('>')?;
+        let (self_part, trait_part) = rest.rsplit_once(" as ")?;
+        if TRAITS.contains(&trait_part) {
             return Some(self_part.to_string());
         }
         None

@@ -61,7 +61,7 @@ fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
 /// (`Option<*const T>`) is a field comparison, which the
 /// structural recursion in `values_equal` judges, not this
 /// dispatch.
-fn comparison_subject_is_raw_pointer(generic_args: &[String]) -> bool {
+pub(crate) fn comparison_subject_is_raw_pointer(generic_args: &[String]) -> bool {
     let Some(tag) = generic_args.first() else {
         return false;
     };
@@ -78,6 +78,50 @@ fn comparison_subject_is_raw_pointer(generic_args: &[String]) -> bool {
     !(pointee.starts_with("dyn ")
         || pointee == "str"
         || (pointee.starts_with('[') && !pointee.contains(';')))
+}
+
+/// The pointee type of a raw-pointer comparison subject (see
+/// `comparison_subject_is_raw_pointer`), parsed from the same
+/// tag: the element type a step into storage the pointer
+/// denotes advances by. Pricing an operand that denotes an
+/// element of an aggregate held as a value -- a collection
+/// iterator's elements, above all -- needs it: the
+/// aggregate's scalar leaves carry no width of their own, so
+/// without the subject's own pointee type the offset walk
+/// cannot price the element's position, the address comes
+/// back underivable, and the comparison falls back to
+/// comparing pointees. `None` when the subject is not a thin
+/// raw pointer or the pointee tag does not parse.
+fn raw_pointer_subject_pointee(generic_args: &[String]) -> Option<Ty> {
+    if !comparison_subject_is_raw_pointer(generic_args) {
+        return None;
+    }
+    let tag = generic_args.first()?;
+    let tag = tag
+        .strip_prefix("&mut ")
+        .or_else(|| tag.strip_prefix('&'))
+        .unwrap_or(tag);
+    let pointee = tag
+        .strip_prefix("*const ")
+        .or_else(|| tag.strip_prefix("*mut "))?;
+    ty_from_tag(pointee.trim())
+}
+
+/// How many reference layers one operand of a raw-pointer
+/// comparison sits behind: the call passes a reference to
+/// the compared value, and when the subject is itself a
+/// reference to a raw pointer (`&*const T` -- the shape a
+/// comparison of two `&T` values in generic code takes, and
+/// of `(&a) < (&b)` directly), the compared value is a
+/// reference whose denoted value is the pointer, one layer
+/// deeper. Pricing the outer reference instead would price
+/// the slot that holds it, ordering the comparison by
+/// storage position rather than by the pointers denoted.
+fn raw_pointer_operand_layers(generic_args: &[String]) -> usize {
+    match generic_args.first() {
+        Some(tag) if tag.starts_with('&') => 2,
+        _ => 1,
+    }
 }
 
 impl<'a> Interpreter<'a> {
@@ -167,24 +211,32 @@ impl<'a> Interpreter<'a> {
 
     /// The address one operand of a raw-pointer comparison
     /// denotes: the call passes a reference to the compared
-    /// value, so one dereference layer reaches the pointer
+    /// value, so dereferencing the operand's layers (see
+    /// `raw_pointer_operand_layers`) reaches the pointer
     /// value itself, and `pointer_address` prices it in the
-    /// same model every other pointer identity uses. `None`
-    /// when the layer cannot be read or no address can be
+    /// same model every other pointer identity uses, with the
+    /// subject's pointee type as the projection walk's leaf
+    /// evidence (see `raw_pointer_subject_pointee`). `None`
+    /// when a layer cannot be read or no address can be
     /// derived, leaving the ordinary comparison in charge.
     fn raw_pointer_operand_address(
         &self,
         frames: &[Frame],
         value: &Value,
+        leaf_ty: Option<&Ty>,
+        layers: usize,
     ) -> Option<u128> {
-        let compared = match value {
-            Value::Ref(_) | Value::FatRef { .. } => {
-                let target = self.deref_value(frames, value).ok()?;
-                self.read_resolved(frames, &target).ok()?
-            }
-            _ => value.clone(),
-        };
-        self.pointer_address(frames, &compared, None)
+        let mut compared = value.clone();
+        for _ in 0..layers {
+            compared = match &compared {
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    let target = self.deref_value(frames, &compared).ok()?;
+                    self.read_resolved(frames, &target).ok()?
+                }
+                _ => break,
+            };
+        }
+        self.pointer_address(frames, &compared, leaf_ty)
     }
 
     /// Raw-pointer equality under the type's own `PartialEq`
@@ -206,8 +258,12 @@ impl<'a> Interpreter<'a> {
         if !comparison_subject_is_raw_pointer(generic_args) {
             return None;
         }
-        let x = self.raw_pointer_operand_address(frames, a)?;
-        let y = self.raw_pointer_operand_address(frames, b)?;
+        let pointee = raw_pointer_subject_pointee(generic_args);
+        let layers = raw_pointer_operand_layers(generic_args);
+        let x = self
+            .raw_pointer_operand_address(frames, a, pointee.as_ref(), layers)?;
+        let y = self
+            .raw_pointer_operand_address(frames, b, pointee.as_ref(), layers)?;
         Some(x == y)
     }
 
@@ -224,8 +280,12 @@ impl<'a> Interpreter<'a> {
         if !comparison_subject_is_raw_pointer(generic_args) {
             return None;
         }
-        let x = self.raw_pointer_operand_address(frames, a)?;
-        let y = self.raw_pointer_operand_address(frames, b)?;
+        let pointee = raw_pointer_subject_pointee(generic_args);
+        let layers = raw_pointer_operand_layers(generic_args);
+        let x = self
+            .raw_pointer_operand_address(frames, a, pointee.as_ref(), layers)?;
+        let y = self
+            .raw_pointer_operand_address(frames, b, pointee.as_ref(), layers)?;
         Some(Some(x.cmp(&y)))
     }
 

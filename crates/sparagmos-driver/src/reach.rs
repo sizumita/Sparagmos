@@ -632,7 +632,7 @@ pub fn collect_reachable(
             if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
                 && !consumer_instance_needs_body(&def, &canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
-                && !value_demand_needs_body(&canonical, demand)
+                && !value_demand_needs_body(&canonical, &args, demand)
             {
                 if builtin_seen.insert(def_id) {
                     records.push(Record {
@@ -1430,21 +1430,72 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// the model does not reproduce, and binding direct calls to
 /// it breaks every modelled deref in the program (the
 /// dyn-dispatch, lock-guard and SmallVec corpus tests pin
-/// this). Extend the kind list only with a value-call
+/// this).
+///
+/// The comparison kinds (`PartialEq` / `PartialOrd` / `Ord`)
+/// join the list for one `Self` shape: a thin raw pointer.
+/// The builtin models judge a comparison from the call's type
+/// tags, and a call through a value carries none -- the
+/// runtime name fallback has no instance attached -- so a
+/// `Vec<*const T>` sort, whose ordering reaches
+/// `PartialOrd::lt` only as a function item handed to the
+/// sort's generic core, silently compares pointees instead of
+/// addresses. Core's own bodies for a raw pointer compare the
+/// pointer values themselves (a primitive comparison the
+/// interpreter prices from the body's operands), so
+/// collecting the body is the faithful execution; the
+/// pre-emption keeps direct calls on the builtin, whose tags
+/// name the subject exactly. A fat pointee (slice, `str`,
+/// `dyn`) stays excluded, mirroring the builtin's own gate:
+/// its native comparison also weighs the metadata.
+///
+/// Extend the kind list only with a value-call
 /// regression test per kind, and extend the conversion
 /// pre-emption's list with it.
-fn value_demand_needs_body(canonical: &str, demand: Demand) -> bool {
+fn value_demand_needs_body(canonical: &str, args: &GenericArgs, demand: Demand) -> bool {
     if demand != Demand::Value {
         return false;
     }
     match sparagmos_interp::builtins::lookup_qualified(canonical) {
-        Some(kind) => matches!(
-            kind,
-            sparagmos_interp::builtins::Builtin::MemDrop
-                | sparagmos_interp::builtins::Builtin::Deref
-        ),
+        Some(kind) => {
+            matches!(
+                kind,
+                sparagmos_interp::builtins::Builtin::MemDrop
+                    | sparagmos_interp::builtins::Builtin::Deref
+            ) || (matches!(
+                kind,
+                sparagmos_interp::builtins::Builtin::PartialEqEq
+                    | sparagmos_interp::builtins::Builtin::PartialEqNe
+                    | sparagmos_interp::builtins::Builtin::PartialCmp
+                    | sparagmos_interp::builtins::Builtin::OrdCmp
+                    | sparagmos_interp::builtins::Builtin::PartialOrdRel(_)
+            ) && thin_raw_pointer_self(args))
+        }
         None => false,
     }
+}
+
+/// Whether a demand's `Self` type (its first generic
+/// argument) is a thin raw pointer: a `*const T` / `*mut T`
+/// whose pointee is sized, so the pointer is a bare address.
+/// A slice, `str` or `dyn` pointee makes it a fat
+/// (address, metadata) pair, which the raw-pointer
+/// comparison bodies do not model.
+fn thin_raw_pointer_self(args: &GenericArgs) -> bool {
+    let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+        return false;
+    };
+    let Some(TyKind::RigidTy(RigidTy::RawPtr(pointee, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    !matches!(
+        guarded_ty_kind(&pointee),
+        Some(
+            TyKind::RigidTy(RigidTy::Slice(_))
+                | TyKind::RigidTy(RigidTy::Str)
+                | TyKind::RigidTy(RigidTy::Dynamic(..))
+        )
+    )
 }
 
 /// Whether a call target naming one of the iterator-consumer
