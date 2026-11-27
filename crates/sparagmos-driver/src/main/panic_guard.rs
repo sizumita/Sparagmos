@@ -10,13 +10,34 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'sta
 /// compiler also panics with non-string marker payloads; those are
 /// reported as such, with the location still identifying where the
 /// conversion gave up.
+/// The readable message for a panic whose payload is not a
+/// string, named from the panic site (file and line) where
+/// the class is known. The MIR validator's `fail` site
+/// (`rustc_mir_transform/src/validate.rs:81` in the pinned
+/// toolchain) panics with the non-string `ExplicitBug` marker
+/// for every validation failure, and reporting that site as a
+/// bare non-string payload leaves the failure bucket opaque
+/// (Issue #395). Any other site keeps the plain non-string
+/// form; the location `panic_reason` appends still identifies
+/// it.
+fn non_string_payload_for(file: &str, line: u32) -> String {
+    if file.ends_with("rustc_mir_transform/src/validate.rs") && line == 81 {
+        "MIR validation failure (panic with a non-string payload)".to_string()
+    } else {
+        "panic with a non-string payload".to_string()
+    }
+}
+
 fn panic_reason(info: &std::panic::PanicHookInfo<'_>) -> String {
     let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
         s.clone()
     } else {
-        "panic with a non-string payload".to_string()
+        match info.location() {
+            Some(loc) => non_string_payload_for(loc.file(), loc.line()),
+            None => "panic with a non-string payload".to_string(),
+        }
     };
     match info.location() {
         Some(loc) => format!(
@@ -595,6 +616,34 @@ mod tests {
             failed_run_report(None, "Failed", false, Mode::Convert);
         assert_eq!(line, "sparagmos-driver: compilation failed: Failed");
         assert_eq!(code, 1);
+    }
+
+    /// A non-string payload at the MIR validator's fail site
+    /// is named as a validation failure (Issue #395); any
+    /// other site keeps the plain non-string form.
+    #[test]
+    fn non_string_payload_at_validator_site_is_named() {
+        assert_eq!(
+            non_string_payload_for(
+                "/rustc-dev/0ef1bc386/compiler/rustc_mir_transform/src/validate.rs",
+                81,
+            ),
+            "MIR validation failure (panic with a non-string payload)"
+        );
+        assert_eq!(
+            non_string_payload_for(
+                "/rustc-dev/0ef1bc386/compiler/rustc_middle/src/ty/layout.rs",
+                1411,
+            ),
+            "panic with a non-string payload"
+        );
+        assert_eq!(
+            non_string_payload_for(
+                "/rustc-dev/0ef1bc386/compiler/rustc_mir_transform/src/validate.rs",
+                82,
+            ),
+            "panic with a non-string payload"
+        );
     }
 
     /// The panic classification itself is unchanged by the
