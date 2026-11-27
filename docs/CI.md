@@ -98,7 +98,10 @@ denominator. Runs on every push to `main` and on manual dispatch.
   itself and cargo orchestration — workspace resolution,
   build-script and proc-macro processes, and the real compiler
   artifacts cargo consumes — is not modelled by the harness),
-  and the stage-4 rustdoc harness, which attempts the
+  except the records named in the runner's
+  `STAGE3_CARGO_SHIM_RECORDS`, which are attempted under the
+  convert-and-delegate shim described below, and the stage-4
+  rustdoc harness, which attempts the
   `rustdoc-check` records (see "Stage 4" below). A second
   matrix repeats the pass with `--jit` for metric 4; the JIT
   pass attempts neither procedure nor rustdoc records (the
@@ -114,6 +117,27 @@ denominator. Runs on every push to `main` and on manual dispatch.
   arguments, environment and working directory. Stage-3 runs
   configure tool interception instead and install no process
   host, and the JIT pass (`run-jit`) installs none either.
+  The one stage-3 exception is the cargo-shim records (issue
+  #359): their guest runs configure tool interception and the
+  process host together — the interception is consulted
+  first (the named compiler through the tool runner, the
+  artifacts the run produced through the fallback), and a
+  program neither claims, the recipe's cargo, is the host's
+  to serve as a real process. That cargo runs with the
+  driver as its `RUSTC_WRAPPER` (the driver's `rustc-shim`
+  mode): for every compilation unit cargo performs, the
+  wrapper converts the unit with the driver and appends its
+  verdict to a side-channel file, then delegates to the real
+  rustc, which produces the real artifacts the recipe's own
+  assertions inspect. A cargo-shim record passes only when
+  the native run passed, the guest run exits 0 (so the real
+  cargo build the recipe drove succeeded on its own terms),
+  and every unit in the side channel converted with nothing
+  skipped; a unit that fails conversion fails the record
+  even though the delegated build succeeded. The build-std
+  members of this class additionally need the toolchain's
+  rust-src component on the judging host, which the measure
+  jobs install with the toolchain.
 - Guest runs are bounded by the interpreter's step budget
   (`InterpConfig`'s default `max_steps`, 1e9 statements +
   terminators), which has no counterpart in compiletest --

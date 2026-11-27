@@ -2303,14 +2303,8 @@ impl<'a> Interpreter<'a> {
                         // answers `spawn` itself.
                         if name == "std::process::Command::status" {
                             check_stdio_modelled(&state)?;
-                            let outcome = match tool_outcome(
-                                self.tool_interception(),
-                                &state,
-                                false,
-                            )? {
-                                Some(outcome) => Some(Ok(outcome)),
-                                None => self.host_outcome(&state, false)?,
-                            };
+                            let outcome =
+                                self.tool_or_host_outcome(&state, false)?;
                             match outcome {
                                 Some(Ok(outcome)) => {
                                     // `status` inherits the
@@ -2465,14 +2459,8 @@ impl<'a> Interpreter<'a> {
                     Some(error) => Ok(err_result(error)),
                     None => {
                         check_stdio_modelled(&state)?;
-                        let outcome = match tool_outcome(
-                            self.tool_interception(),
-                            &state,
-                            true,
-                        )? {
-                            Some(outcome) => Some(Ok(outcome)),
-                            None => self.host_outcome(&state, true)?,
-                        };
+                        let outcome =
+                            self.tool_or_host_outcome(&state, true)?;
                         match outcome {
                             Some(Ok(outcome)) => {
                                 // `output` collects the streams

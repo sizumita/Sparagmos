@@ -1222,6 +1222,126 @@ pub(crate) fn tool_run(
     })
 }
 
+/// The environment variable naming the cargo shim's verdict
+/// channel: the stage-3 runner sets it to a file path, and
+/// every shim invocation appends one line per compilation
+/// unit it converts (see `rustc_shim`).
+pub(crate) const CARGO_SHIM_VERDICTS_ENV: &str =
+    "SPARAGMOS_CARGO_SHIM_VERDICTS";
+
+/// Act as a cargo `RUSTC_WRAPPER`: cargo invokes the wrapper
+/// as `<wrapper> <rustc> <args...>` for every compilation
+/// unit of a build. Each unit is first converted with this
+/// driver's own machinery -- the same conversion `tool_run`
+/// performs for an intercepted invocation, over a fresh
+/// registry: a shim build's artifacts are the real files the
+/// delegation below produces, never registry placeholders a
+/// later invocation must resolve -- and the unit's verdict
+/// is appended to the side channel the runner named in
+/// `SPARAGMOS_CARGO_SHIM_VERDICTS`. The invocation is then
+/// delegated to the real rustc with the same arguments, and
+/// the wrapper exits with the real compiler's exit code.
+/// The two verdicts are kept apart on purpose: the
+/// conversion verdict rides the side channel, the build's
+/// own verdict is cargo's exit status as the recipe observes
+/// it -- the stage-3 cargo proposition reads both (issue
+/// #359). Informational invocations (`--print`, `--version`
+/// and their kin: cargo's probes, not compilation units)
+/// are delegated without a conversion and record no verdict.
+pub(crate) fn rustc_shim(args: &[String]) -> i32 {
+    let Some((rustc, rest)) = args.split_first() else {
+        eprintln!("sparagmos-driver rustc-shim: no rustc program named");
+        return 1;
+    };
+    let informational = rest.iter().any(|a| {
+        a == "--print"
+            || a.starts_with("--print=")
+            || a == "--version"
+            || a == "-V"
+            || a == "-vV"
+            || a == "--explain"
+    });
+    if !informational {
+        record_shim_verdict(rustc, rest);
+    }
+    // Delegate: the real compiler produces the real
+    // artifacts, over this process's own streams.
+    match std::process::Command::new(rustc).args(rest).status() {
+        Ok(status) => status.code().unwrap_or(101),
+        Err(e) => {
+            eprintln!(
+                "sparagmos-driver rustc-shim: cannot start {rustc}: {e}"
+            );
+            1
+        }
+    }
+}
+
+/// Convert one shim unit and append its verdict line to the
+/// side channel: `<verdict>\t<crate name>\t<input>`, where
+/// the verdict is `converted` (the unit converted with
+/// nothing skipped), `failed` (the conversion ran and did
+/// not succeed), or `unsupported` (the machinery could not
+/// carry the invocation out). The crate name and input are
+/// diagnostic; the runner's judging reads the verdict word.
+/// An invocation naming no input file is a probe the
+/// informational scan did not recognise, not a compilation
+/// unit: it records nothing.
+fn record_shim_verdict(rustc: &str, rest: &[String]) {
+    let mut crate_name = String::new();
+    let mut input = String::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--crate-name" {
+            if let Some(v) = rest.get(i + 1) {
+                crate_name = v.clone();
+                i += 1;
+            }
+        } else if let Some(v) = arg.strip_prefix("--crate-name=") {
+            crate_name = v.to_string();
+        } else if input.is_empty()
+            && arg.ends_with(".rs")
+            && !arg.contains('=')
+        {
+            input = arg.clone();
+        }
+        i += 1;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let request = sparagmos_interp::ToolRunRequest {
+        program: rustc.as_bytes().to_vec(),
+        args: rest.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        argv0: None,
+        envs: Vec::new(),
+        env_clear: false,
+        cwd: Some(cwd.as_os_str().as_encoded_bytes().to_vec()),
+        resolved_program: None,
+        output_captured: false,
+    };
+    let registry = ToolRegistry::default();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let verdict = match tool_run(&request, &registry, &exe) {
+        Ok(outcome) if outcome.exit_code == 0 => "converted",
+        Ok(_) => "failed",
+        Err(reason) if reason.contains("names no input file") => return,
+        Err(_) => "unsupported",
+    };
+    let Some(path) = std::env::var_os(CARGO_SHIM_VERDICTS_ENV) else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(
+            format!("{verdict}\t{crate_name}\t{input}\n").as_bytes(),
+        );
+    }
+}
+
 /// Answer one invocation of a program the guest itself
 /// produced earlier in this run (a run-make recipe running a
 /// binary it just built): the artifact registry knows the
