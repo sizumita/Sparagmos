@@ -4710,6 +4710,29 @@ impl<'a> Interpreter<'a> {
                 let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
                 return self.format_debug_seq_items(frames, &items, options, indent, open, close, &tys);
             }
+            // A sequence container's own aggregate form: the
+            // fat pointer a `Deref` produces (a `Vec`'s, an owned
+            // `Cow`'s) denotes the container itself, so resolving
+            // it yields the container value rather than an
+            // element snapshot. The slice's elements are the
+            // container's, read by the same element readers the
+            // slice machinery uses: a real aggregate form's
+            // elements sit behind its buffer pointer (see
+            // `real_vec_elements`); the plain and sparse forms
+            // are the element reader's own shapes.
+            Value::Enum { .. } | Value::SparseVec { .. } => {
+                if let Some(items) = self.real_vec_elements(frames, value, elem_ty) {
+                    let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
+                    return self.format_debug_seq_items(
+                        frames, &items, options, indent, open, close, &tys,
+                    );
+                }
+                let (items, _) = self.slice_elements(frames, value)?;
+                let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
+                return self.format_debug_seq_items(
+                    frames, &items, options, indent, open, close, &tys,
+                );
+            }
             other => {
                 return Err(InterpError::type_mismatch(
                     "Debug sequence formatting",

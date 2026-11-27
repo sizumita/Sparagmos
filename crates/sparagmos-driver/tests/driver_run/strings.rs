@@ -533,6 +533,71 @@ fn run_mode_debug_format_mut_vec_slice() {
     );
 }
 
+const DEBUG_FORMAT_DEREF_SLICE_SRC: &str = r#"
+use std::borrow::Cow;
+
+#[derive(Debug)]
+struct Wrapper<'a> { s: &'a [u8], n: i32 }
+
+fn main() {
+    let v = vec![1u8, 2, 3];
+    let s: &[u8] = &v;
+    println!("vec: {:?}", s);
+    println!("vec-alt: {:#?}", s);
+    println!("deref-expr: {:?}", &*v);
+    let mut mv = vec![4u8, 5];
+    let ms: &mut [u8] = &mut mv;
+    println!("mut: {:?}", ms);
+    let owned: Cow<'_, [u8]> = Cow::Owned(vec![10u8, 11, 12]);
+    println!("cow-owned: {:?}", &*owned);
+    let borrowed: Cow<'_, [u8]> = Cow::Borrowed(&[7u8, 8, 9]);
+    println!("cow-borrowed: {:?}", &*borrowed);
+    let vi = vec![-1i8, 2, -3];
+    println!("i8: {:?}", &*vi);
+    let v16 = vec![1000u16, 2000, 3000];
+    println!("u16: {:?}", &*v16);
+    let mut sparse = Vec::with_capacity(4);
+    sparse.push(4u8);
+    sparse.push(5);
+    sparse.push(6);
+    println!("sparse: {:?}", &*sparse);
+    let w = Wrapper { s: &v, n: 7 };
+    println!("nested: {:?}", w);
+    let cow_strs: Cow<'_, [&str]> = Cow::Owned(vec!["a\n", "b\n"]);
+    println!("cow-strs: {:?}", &*cow_strs);
+    println!("debug deref slice ok");
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_dereferenced_slice() {
+    // A slice produced by a `Deref` (a `Vec`'s, an owned
+    // `Cow`'s) is a fat pointer denoting the container itself,
+    // so resolving it hands the sequence formatter the
+    // container's aggregate value, which it used to refuse
+    // ("expected tuple or byte value, found ADT value"). The
+    // sequence formatter now reads such a value's elements
+    // through the slice element readers, as it does for a fat
+    // pointer value.
+    let dir = temp_dir("debug-format-deref-slice");
+    let src = fixture(
+        &dir,
+        "debug_format_deref_slice.rs",
+        DEBUG_FORMAT_DEREF_SLICE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Debug of a dereferenced slice must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "vec: [1, 2, 3]\nvec-alt: [\n    1,\n    2,\n    3,\n]\nderef-expr: [1, 2, 3]\nmut: [4, 5]\ncow-owned: [10, 11, 12]\ncow-borrowed: [7, 8, 9]\ni8: [-1, 2, -3]\nu16: [1000, 2000, 3000]\nsparse: [4, 5, 6]\nnested: Wrapper { s: [1, 2, 3], n: 7 }\ncow-strs: [\"a\\n\", \"b\\n\"]\ndebug deref slice ok\n"
+    );
+}
+
 const REFCELL_GUARD_DISPLAY_SRC: &str = r#"
 use std::cell::RefCell;
 
