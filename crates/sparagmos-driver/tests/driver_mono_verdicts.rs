@@ -1222,3 +1222,47 @@ fn prefer_dynamic_without_lto_converts() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
+
+#[test]
+fn abandoned_force_ice_diagnostic_discounted() {
+    // The required-const walk forces `check_mono_item` on
+    // instances the collector itself would never collect; on
+    // an instance whose types do not normalize in the
+    // monomorphized environment (here the projections of an
+    // impl whose `Self` carries the unprovable assumed bound
+    // `&'a [u8]: Archive`), the force panics inside the query
+    // after emitting its ICE diagnostic into the session.
+    // The abandoned force's diagnostic must not fail the
+    // compilation: rustc accepts the crate (this is the shape
+    // of tests/ui/mir/issue-107691.rs, and of
+    // tests/ui/traits/next-solver/generalize/
+    // hr-alias-universe-lowering-ambiguity.rs, whose forced
+    // type is a closure over a projection).
+    let case = Case::new("abandoned-force-ice");
+    let src = case.write(
+        "case.rs",
+        "#![crate_type = \"lib\"]\n\
+         pub trait Archive {\n\
+             type Archived;\n\
+             type Resolver;\n\
+             fn resolve(resolver: Self::Resolver, out: *mut Self::Archived);\n\
+         }\n\
+         pub type Archived<T> = <T as Archive>::Archived;\n\
+         pub type Resolver<T> = <T as Archive>::Resolver;\n\
+         pub struct Record<'a> { _payload: &'a [u8] }\n\
+         pub struct ArchivedRecord<'a> where &'a [u8]: Archive {\n\
+             _payload: Archived<&'a [u8]>,\n\
+         }\n\
+         pub struct RecordResolver<'a> where &'a [u8]: Archive {\n\
+             _payload: Resolver<&'a [u8]>,\n\
+         }\n\
+         impl<'a> Archive for Record<'a> where &'a [u8]: Archive {\n\
+             type Archived = ArchivedRecord<'a>;\n\
+             type Resolver = RecordResolver<'a>;\n\
+             fn resolve(_resolver: Self::Resolver, _out: *mut Self::Archived) {}\n\
+         }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
