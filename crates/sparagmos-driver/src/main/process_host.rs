@@ -432,6 +432,13 @@ impl DriverProcessHost {
         } else {
             std::process::Command::new(os(&request.program))
         };
+        // The uid/gid the guest set through `CommandExt`
+        // apply only where the host's process model has
+        // them; elsewhere there is no credential to hand
+        // the child, so the request fields stand unapplied
+        // (the requests originate from the Unix guest
+        // model, which no non-Unix host serves).
+        #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
             if let Some(uid) = request.uid {
@@ -440,6 +447,10 @@ impl DriverProcessHost {
             if let Some(gid) = request.gid {
                 cmd.gid(gid);
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (request.uid, request.gid);
         }
         let mut stderr_file = None;
         if self_run {
@@ -535,18 +546,27 @@ impl DriverProcessHost {
         // exec — the call std's implementation makes —
         // and its failure (too many groups, no privilege)
         // fails the spawn with the host error, as the
-        // native spawn fails.
-        if let Some(groups) = &request.groups {
-            use std::os::unix::process::CommandExt as _;
-            let groups = groups.clone();
-            unsafe {
-                cmd.pre_exec(move || {
-                    if host_setgroups(groups.len(), groups.as_ptr()) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+        // native spawn fails. Hosts without the Unix
+        // process model have no supplementary groups to
+        // install, so the request stands unapplied there.
+        #[cfg(unix)]
+        {
+            if let Some(groups) = &request.groups {
+                use std::os::unix::process::CommandExt as _;
+                let groups = groups.clone();
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if host_setgroups(groups.len(), groups.as_ptr()) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &request.groups;
         }
         // The child starts with the `SIGPIPE`
         // disposition the guest's spawn semantics name
