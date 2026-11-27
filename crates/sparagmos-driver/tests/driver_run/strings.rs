@@ -4091,6 +4091,46 @@ fn main() {
 }
 "#;
 
+const OS_STRING_REAL_AGGREGATE_ORD_SRC: &str = r#"
+use std::cmp::Ordering;
+use std::ffi::OsString;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(32);
+    o.push(s);
+    o
+}
+
+fn ord_name(o: Ordering) -> &'static str {
+    match o {
+        Ordering::Less => "Less",
+        Ordering::Equal => "Equal",
+        Ordering::Greater => "Greater",
+    }
+}
+
+fn main() {
+    // Ordering reads the same buffer bytes equality does:
+    // the real aggregate form (built by `with_capacity`
+    // plus `push`) orders against the element form and
+    // against a clone by content, in both operand orders.
+    let a_agg = agg("abc");
+    let b_agg = agg("abd");
+    let a_from = OsString::from("abc");
+    let b_from = OsString::from("abd");
+    let a_clone = a_agg.clone();
+    println!("lt agg<from: {}", a_agg < b_from);
+    println!("lt from<agg: {}", a_from < b_agg);
+    println!("lt agg<agg: {}", a_agg < b_agg);
+    println!("gt agg>from: {}", b_agg > a_from);
+    println!("cmp agg/from: {}", ord_name(a_agg.cmp(&a_from)));
+    println!("cmp agg/agg: {}", ord_name(a_agg.cmp(&b_agg)));
+    println!("cmp from/agg: {}", ord_name(b_from.cmp(&a_agg)));
+    println!("le agg<=clone: {}", a_agg <= a_clone);
+    println!("ge from>=agg: {}", b_from >= b_agg);
+}
+"#;
+
 #[test]
 fn run_mode_sort_string_elements_compare() {
     run_ok(
@@ -4127,5 +4167,14 @@ fn run_mode_sort_string_comparator_reads_elements() {
         "sort-string-comparator-reads",
         SORT_STRING_COMPARATOR_READS_SRC,
         "first=s000 last=s031\n",
+    );
+}
+
+#[test]
+fn run_mode_os_string_real_aggregate_ordering() {
+    run_ok(
+        "os-string-real-aggregate-ordering",
+        OS_STRING_REAL_AGGREGATE_ORD_SRC,
+        "lt agg<from: true\nlt from<agg: true\nlt agg<agg: true\ngt agg>from: true\ncmp agg/from: Equal\ncmp agg/agg: Less\ncmp from/agg: Greater\nle agg<=clone: true\nge from>=agg: true\n",
     );
 }

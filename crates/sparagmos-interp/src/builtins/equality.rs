@@ -1045,6 +1045,20 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 return Ok(Some(if flip { ord.reverse() } else { ord }));
             }
         }
+        // An `OsString` denotes the bytes its buffer holds,
+        // in whichever of the model's shapes it is stored
+        // (see `values_equal`): when both sides yield their
+        // OS-string bytes they order as those bytes, which
+        // is the byte-wise lexicographic order `OsStr`'s
+        // `Ord` performs. A side that yields no bytes
+        // decides nothing, and the pair keeps the structural
+        // comparison below.
+        if let (Some(x), Some(y)) = (
+            self.os_string_bytes_any(frames, a.as_ref())?,
+            self.os_string_bytes_any(frames, b.as_ref())?,
+        ) {
+            return Ok(Some(x.cmp(&y)));
+        }
         // A scalar in its byte form orders as the integer it
         // denotes, against the same scalar in its integer form
         // (see `values_equal` for the two byte shapes and why
