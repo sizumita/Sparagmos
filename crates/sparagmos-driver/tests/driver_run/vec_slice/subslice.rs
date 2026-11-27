@@ -208,3 +208,36 @@ fn run_mode_array_subslice_binding_moves_window_out() {
         "the moved window's elements drop with the binding, the rest with the array"
     );
 }
+const CLOSURE_ARRAY_PATTERN_REST_SRC: &str = r#"
+fn arr_by_ref(x: [String; 3]) {
+    let r = &x;
+    let f = || {
+        let [ref y, ref z @ ..] = x;
+        println!("{} {:?}", y, z);
+    };
+    f();
+    f();
+    drop(r);
+    drop(x);
+}
+
+fn main() {
+    arr_by_ref([String::from("a"), String::from("b"), String::from("c")]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_closure_array_pattern_rest_binds_the_window() {
+    // A slice pattern with a `@ ..` rest binding inside a
+    // closure reads the pattern place through a deref plus
+    // subslice projection: the read value is the projector's
+    // two-element window, whatever length the place's own
+    // declared type carries (the rustc suite's
+    // `borrowck/borrowck-closures-slice-patterns-ok` shape).
+    run_ok(
+        "closure-array-pattern-rest",
+        CLOSURE_ARRAY_PATTERN_REST_SRC,
+        "a [\"b\", \"c\"]\na [\"b\", \"c\"]\nok\n",
+    );
+}

@@ -2972,10 +2972,19 @@ fn truncate_to_declared_array(
     let Some(Ty::Array(_, n)) = place_ty else {
         return value;
     };
+    // A projection that already applies a subslice window
+    // holds its window from the projector: the declared
+    // length of such a place can be the pattern tail's
+    // degenerate length rather than the window's, and the
+    // read value must stand as projected.
     if !place
         .projection
         .iter()
         .any(|step| matches!(step, ProjectionElem::Deref))
+        || place
+            .projection
+            .iter()
+            .any(|step| matches!(step, ProjectionElem::Subslice { .. }))
     {
         return value;
     }

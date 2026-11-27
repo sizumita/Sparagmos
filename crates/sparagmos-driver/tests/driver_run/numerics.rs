@@ -448,6 +448,34 @@ fn run_mode_punned_scalar_view_other_kinds_and_storages() {
     );
 }
 
+const PUNNED_SCALAR_VIEW_INTO_ITER_SRC: &str = r#"
+fn main() {
+    let y: u32 = 0x3F80_0000;
+    let view = unsafe { std::slice::from_raw_parts(&y as *const u32 as *const f32, 1) };
+    for v in view {
+        println!("v={:?}", v);
+    }
+    let mut total = 0.0f32;
+    for v in view.into_iter() {
+        total += *v;
+    }
+    println!("t={}", total);
+}
+"#;
+
+#[test]
+fn run_mode_punned_scalar_view_into_iter_yields_the_element_kind() {
+    // The `IntoIterator` path over a punned scalar view
+    // (the `for v in view` shape) yields the element under
+    // its own kind, like the `iter()` path does. Native
+    // rustc 1.100.0's output.
+    run_ok(
+        "punned-scalar-view-into-iter",
+        PUNNED_SCALAR_VIEW_INTO_ITER_SRC,
+        "v=1.0\nt=1\n",
+    );
+}
+
 const CHAR_REFERENCE_FMT_SRC: &str = r#"
 fn main() {
     let c: char = 'A';
