@@ -163,6 +163,13 @@ pub fn runtime_name_fallback(kind: Builtin) -> bool {
             // built from the run's descriptor routing alone.
             | Builtin::Stdout
             | Builtin::Stdin
+            // The default allocation-error hook: only ever
+            // invoked indirectly, through the function pointer
+            // `take_alloc_error_hook` hands out when no custom
+            // hook is installed (its body is std-internal and
+            // never collected), so the name fallback is the
+            // only dispatch that reaches it.
+            | Builtin::AllocErrorDefaultHook
     )
 }
 

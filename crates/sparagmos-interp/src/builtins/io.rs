@@ -6,7 +6,7 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     Frame, Interpreter,
 };
-use crate::value::Value;
+use crate::value::{RefProj, RefTarget, Value};
 
 use super::*;
 
@@ -745,6 +745,9 @@ impl<'a> Interpreter<'a> {
 pub(crate) fn io_lookup(canonical: &str) -> Option<Builtin> {
     Some(match canonical {
         "std::io::_print" => Builtin::Print,
+        "std::io::BufWriter::<W>::flush_buf::BufGuard::remaining" => {
+            Builtin::BufGuardRemaining
+        }
         "std::io::_eprint" => Builtin::Eprint,
         _ => return None,
     })
@@ -767,4 +770,96 @@ pub(crate) fn io_stream_lookup(canonical: &str) -> Option<Builtin> {
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
         _ => return None,
     })
+}
+
+impl<'a> Interpreter<'a> {
+    /// `BufGuard::remaining` (the guard `BufWriter::flush_buf`
+    /// lends its buffer to): the unwritten part of the buffer,
+    /// `&buffer[written..]`. The returned fat reference
+    /// denotes the buffer allocation's element window from
+    /// `written` on — the sub-slice projection over the
+    /// allocation the vector's buffer pointer names, with
+    /// the remaining length.
+    pub(super) fn buf_guard_remaining(
+        &self,
+        frames: &mut Vec<Frame>,
+        guard: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        let value = self.resolve_value(frames, guard)?;
+        let fields = match &value {
+            Value::Enum { fields, .. } | Value::Tuple(fields) => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a BufGuard value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if fields.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a BufGuard value (buffer, written)",
+                value.kind_name(),
+            ));
+        }
+        let written = match &fields[1] {
+            Value::Uint(n) => *n,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a BufGuard written count",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let vec_value = self.resolve_value(frames, &fields[0])?;
+        let total = crate::interp::vec_value_len(&vec_value).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a BufGuard buffer vector",
+                vec_value.kind_name(),
+            )
+        })?;
+        let remaining = total.checked_sub(written).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a BufGuard whose written count fits its buffer",
+                value.kind_name(),
+            )
+        })?;
+        // The buffer allocation: the innermost field-0 chain
+        // of the vector aggregate ends at the buffer pointer,
+        // a reference to the allocation holding the elements.
+        let mut cur = &vec_value;
+        let alloc_id = loop {
+            match cur {
+                Value::Ref(RefTarget::Alloc { id, .. }) => break *id,
+                Value::Enum { fields, .. } | Value::Tuple(fields)
+                    if !fields.is_empty() =>
+                {
+                    cur = &fields[0];
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a BufGuard buffer allocation pointer",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        };
+        Ok(Value::FatRef {
+            base: Box::new(Value::Ref(RefTarget::Alloc {
+                id: alloc_id,
+                projection: vec![RefProj::Subslice {
+                    offset: written as usize,
+                    len: remaining as usize,
+                }],
+            })),
+            len: remaining,
+        })
+    }
+
 }

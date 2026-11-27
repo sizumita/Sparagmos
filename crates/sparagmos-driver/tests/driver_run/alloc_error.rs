@@ -1,4 +1,4 @@
-use super::{fixture, run_driver, run_driver_extra, temp_dir};
+use super::{fixture, run_driver, run_driver_extra, run_ok, temp_dir};
 
 // ----- allocation-error handling (`handle_alloc_error` / `handle_error`) --
 //
@@ -151,5 +151,97 @@ fn run_mode_no_std_default_alloc_error_reaches_panic_handler() {
         stderr.contains("handler got: memory allocation of 4096 bytes failed"),
         "with no alloc error handler, the failure reaches the panic \
          handler as a PanicInfo carrying the allocation message: {stderr}"
+    );
+}
+
+
+// ----- allocation-error hook (`set_alloc_error_hook`) -----
+//
+// `std::alloc::set_alloc_error_hook` / `take_alloc_error_hook`
+// have no Stable MIR body; the interpreter keeps the hook in
+// its state and `run_alloc_error` invokes it with a
+// fabricated `Layout` value in place of the default hook.
+
+const HOOK_FIRES_SRC: &str = r#"
+#![feature(alloc_error_hook)]
+use std::panic::catch_unwind;
+fn main() {
+    std::alloc::set_alloc_error_hook(|layout| {
+        println!("hook saw size {}", layout.size());
+        panic!("hook panics");
+    });
+    let caught = catch_unwind(|| {
+        let layout = std::alloc::Layout::from_size_align(4096, 8).unwrap();
+        std::alloc::handle_alloc_error(layout);
+    });
+    println!("caught: {}", caught.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_alloc_error_hook_fires_with_the_layout_and_panics() {
+    let dir = temp_dir("alloc-hook-fires");
+    let src = fixture(&dir, "case.rs", HOOK_FIRES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hook saw size 4096\ncaught: true\n",
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("hook panics"),
+        "the hook's panic is the one caught: {stderr}"
+    );
+}
+
+const HOOK_TAKE_SRC: &str = r#"
+#![feature(alloc_error_hook)]
+use std::alloc::Layout;
+fn my_hook(layout: Layout) { println!("custom hook {}", layout.size()); }
+fn main() {
+    std::alloc::set_alloc_error_hook(my_hook);
+    let taken = std::alloc::take_alloc_error_hook();
+    taken(Layout::new::<[u8; 7]>());
+    println!("after taken call");
+    let mine: fn(Layout) = my_hook;
+    let def = std::alloc::take_alloc_error_hook();
+    println!("default differs: {}", !std::ptr::fn_addr_eq(def, mine));
+}
+"#;
+
+#[test]
+fn run_mode_alloc_error_hook_take_returns_installed_then_default() {
+    run_ok(
+        "alloc-hook-take",
+        HOOK_TAKE_SRC,
+        "custom hook 7\nafter taken call\ndefault differs: true\n",
+    );
+}
+
+const HOOK_DEFAULT_CALL_SRC: &str = r#"
+#![feature(alloc_error_hook)]
+fn main() {
+    let def = std::alloc::take_alloc_error_hook();
+    def(std::alloc::Layout::new::<[u8; 42]>());
+    println!("never");
+}
+"#;
+
+#[test]
+fn run_mode_alloc_error_hook_default_hook_reports_and_aborts() {
+    let dir = temp_dir("alloc-hook-default");
+    let src = fixture(&dir, "case.rs", HOOK_DEFAULT_CALL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "calling the default hook aborts the guest; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("memory allocation of 42 bytes failed"),
+        "the default hook reports the failed size: {stderr}"
     );
 }

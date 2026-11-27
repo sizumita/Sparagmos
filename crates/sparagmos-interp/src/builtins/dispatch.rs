@@ -3022,6 +3022,14 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 Ok(Value::Unit)
             }
+            Builtin::OnceCall => {
+                arity(3)?;
+                self.sys_once_call(frames, &vals, name)
+            }
+            Builtin::BufGuardRemaining => {
+                arity(1)?;
+                self.buf_guard_remaining(frames, &vals[0], name)
+            }
             Builtin::BacktraceCapture => {
                 arity(0)?;
                 Ok(backtrace_value(frames, false))
@@ -4233,6 +4241,13 @@ impl<'a> Interpreter<'a> {
                     self.path_bytes(frames, &vals[0])?
                 };
                 Ok(cow_str_value(&bytes))
+            }
+            Builtin::OsStrToAsciiLowercase => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                let lowered: Vec<u8> =
+                    bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+                Ok(os_string_value(&lowered))
             }
             Builtin::DirEntryPath | Builtin::DirEntryFileName => {
                 arity(1)?;
@@ -5847,6 +5862,49 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Bool(set))
                 })
             }
+            Builtin::PathBufSetFileName => {
+                arity(2)?;
+                let (file_name, _) = self.path_bytes_of(frames, &vals[1])?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| {
+                    let current = string_aggregate_bytes(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "PathBuf::set_file_name",
+                            "path buffer holding byte data",
+                            slot.kind_name(),
+                        )
+                    })?;
+                    let mut buf = host_path(&current)?;
+                    // std's own definition: pop the current
+                    // file name when there is one, then push
+                    // the new one.
+                    if buf.file_name().is_some() {
+                        let popped = buf.pop();
+                        debug_assert!(popped);
+                    }
+                    let name_os =
+                        crate::platform::os_str_from_bytes(&file_name)
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "PathBuf::set_file_name: the file name has no host string form on this platform",
+                                )
+                            })?;
+                    buf.push(name_os);
+                    *slot = pathbuf_value(&host_path_bytes(&buf)?);
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::SysPathAbsolute => {
+                arity(1)?;
+                let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
+                let path = host_path(&bytes)?;
+                match std::path::absolute(&path) {
+                    Ok(abs) => {
+                        Ok(io_result_ok(pathbuf_value(&host_path_bytes(&abs)?)))
+                    }
+                    Err(error) => Ok(io_result_err(host_io_error(&error))),
+                }
+            }
             Builtin::PathWithExtension => {
                 arity(2)?;
                 let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
@@ -6524,6 +6582,24 @@ impl<'a> Interpreter<'a> {
             Builtin::RawVecHandleError => {
                 arity(1)?;
                 self.exec_raw_vec_handle_error(frames, &vals[0])
+            }
+            Builtin::AllocErrorHookSet => {
+                arity(1)?;
+                self.set_alloc_error_hook(vals[0].clone());
+                Ok(Value::Unit)
+            }
+            Builtin::AllocErrorHookTake => {
+                arity(0)?;
+                Ok(match self.take_alloc_error_hook() {
+                    Some(hook) => hook,
+                    None => Value::FnPtr(
+                        "std::alloc::default_alloc_error_hook".to_string(),
+                    ),
+                })
+            }
+            Builtin::AllocErrorDefaultHook => {
+                arity(1)?;
+                self.exec_default_alloc_error_hook(frames, &vals[0])
             }
             Builtin::PanicNounwindFmt => {
                 // `panic_nounwind_fmt(args, force_no_backtrace)`:

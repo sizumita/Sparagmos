@@ -1987,3 +1987,116 @@ fn run_mode_manually_drop_vec_into_iter_option_elements() {
         "sum 4\n",
     );
 }
+
+
+// ----- sys `Once::call` model -----
+//
+// `std::sys::sync::once::futex::Once::call` has no MIR body;
+// the interpreter runs its state machine over the model's
+// word, invoking the guest closure on the cooperative
+// scheduler. The public wrappers' converted bodies call it
+// directly.
+
+const ONCE_CALL_ONCE_SRC: &str = r#"
+use std::sync::Once;
+static ONCE: Once = Once::new();
+static mut VAL: u32 = 0;
+fn main() {
+    ONCE.call_once(|| unsafe { VAL = 42; });
+    ONCE.call_once(|| unsafe { VAL = 1; });
+    println!("{}", unsafe { VAL });
+}
+"#;
+
+#[test]
+fn run_mode_once_call_once_runs_the_closure_once() {
+    run_ok("once-call-once", ONCE_CALL_ONCE_SRC, "42\n");
+}
+
+const ONCE_LOCK_SRC: &str = r#"
+use std::sync::OnceLock;
+static LOCK: OnceLock<u32> = OnceLock::new();
+fn main() {
+    println!("{}", LOCK.get_or_init(|| 42));
+    println!("{}", LOCK.get_or_init(|| 1));
+}
+"#;
+
+#[test]
+fn run_mode_once_lock_get_or_init() {
+    run_ok("once-lock", ONCE_LOCK_SRC, "42\n42\n");
+}
+
+const ONCE_POISON_SRC: &str = r#"
+use std::sync::Once;
+use std::panic::catch_unwind;
+static ONCE: Once = Once::new();
+fn main() {
+    let r = catch_unwind(|| { ONCE.call_once(|| panic!("boom")); });
+    println!("caught: {}", r.is_err());
+    let r2 = catch_unwind(|| { ONCE.call_once(|| {}); });
+    println!("second (poisoned) panics: {}", r2.is_err());
+    println!("is_completed: {}", ONCE.is_completed());
+}
+"#;
+
+#[test]
+fn run_mode_once_poisoning_panics_the_next_caller() {
+    let dir = temp_dir("once-poison");
+    let src = fixture(&dir, "case.rs", ONCE_POISON_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught: true\nsecond (poisoned) panics: true\nis_completed: false\n",
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Once instance has previously been poisoned"),
+        "the poisoned call reports std's message: {stderr}"
+    );
+}
+
+const ONCE_FORCE_SRC: &str = r#"
+use std::sync::Once;
+static ONCE: Once = Once::new();
+fn main() {
+    let r = std::panic::catch_unwind(|| { ONCE.call_once(|| panic!("boom")); });
+    println!("caught: {}", r.is_err());
+    ONCE.call_once_force(|state| {
+        println!("force ran, poisoned: {}", state.is_poisoned());
+    });
+    println!("is_completed: {}", ONCE.is_completed());
+    ONCE.call_once(|| println!("must not print"));
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_once_call_once_force_observes_the_poison() {
+    run_ok(
+        "once-force",
+        ONCE_FORCE_SRC,
+        "caught: true\nforce ran, poisoned: true\nis_completed: true\ndone\n",
+    );
+}
+
+const ONCE_RACE_SRC: &str = r#"
+use std::sync::Once;
+static ONCE: Once = Once::new();
+static mut COUNT: u32 = 0;
+fn main() {
+    let h = std::thread::spawn(|| {
+        ONCE.call_once(|| { std::thread::yield_now(); unsafe { COUNT += 1; } });
+    });
+    ONCE.call_once(|| unsafe { COUNT += 10; });
+    h.join().unwrap();
+    println!("count {}", unsafe { COUNT });
+}
+"#;
+
+#[test]
+fn run_mode_once_two_threads_run_one_initializer() {
+    run_ok("once-race", ONCE_RACE_SRC, "count 10\n");
+}

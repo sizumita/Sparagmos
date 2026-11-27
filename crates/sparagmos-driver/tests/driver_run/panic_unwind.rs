@@ -3932,3 +3932,55 @@ fn run_mode_assert_failed_reports_the_assertion_site() {
         .as_str()
     );
 }
+
+
+// ----- `assert_failed_inner` -----
+//
+// `core::panicking::assert_failed_inner` (the non-generic
+// leaf `assert_failed` forwards to and `assert_matches_failed`
+// calls with the operands erased to `&dyn Debug`) has no MIR
+// body; the interpreter's `AssertFailed` dispatch serves it,
+// formatting the operands through their vtables.
+
+const ASSERT_MATCHES_FAIL_SRC: &str = r#"
+use std::assert_matches;
+fn main() {
+    let v: Result<u32, String> = Ok(5);
+    assert_matches!(v, Ok(6));
+}
+"#;
+
+#[test]
+fn run_mode_assert_matches_failure_panics_with_the_native_message() {
+    let dir = temp_dir("assert-matches-fail");
+    let src = fixture(&dir, "case.rs", ASSERT_MATCHES_FAIL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a failed assert_matches! is a guest panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("assertion `left matches right` failed"),
+        "the panic message is std's: {stderr}"
+    );
+    assert!(
+        stderr.contains("left: Ok(5)"),
+        "the left operand formats through its Debug vtable: {stderr}"
+    );
+}
+
+const ASSERT_MATCHES_OK_SRC: &str = r#"
+use std::assert_matches;
+fn main() {
+    let v: Result<u32, String> = Ok(5);
+    assert_matches!(v, Ok(5));
+    println!("matches ok");
+}
+"#;
+
+#[test]
+fn run_mode_assert_matches_passing_runs() {
+    run_ok("assert-matches-ok", ASSERT_MATCHES_OK_SRC, "matches ok\n");
+}

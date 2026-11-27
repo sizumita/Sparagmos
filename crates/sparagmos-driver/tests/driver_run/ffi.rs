@@ -1598,3 +1598,31 @@ fn run_mode_thread_local_extern_static_defined_in_aux_resolves() {
     );
     assert_eq!(stdout, "foo=3\nfoo2=9\n", "stderr={stderr}");
 }
+
+
+// ----- `OsStr::to_ascii_lowercase` -----
+//
+// The method has no MIR body; the interpreter answers it
+// with the byte-wise ASCII case folding std defines, over
+// the receiver's platform bytes.
+
+const OS_STR_TO_ASCII_LOWERCASE_SRC: &str = r#"
+use std::ffi::OsStr;
+fn main() {
+    let s = OsStr::new("AbC dEf XYZ");
+    println!("{:?}", s.to_ascii_lowercase());
+    let owned = std::ffi::OsString::from("MiXeD");
+    println!("{:?}", owned.as_os_str().to_ascii_lowercase());
+    let lower = OsStr::new("already lower 123");
+    println!("{:?}", lower.to_ascii_lowercase());
+}
+"#;
+
+#[test]
+fn run_mode_os_str_to_ascii_lowercase() {
+    run_ok(
+        "os-str-to-ascii-lowercase",
+        OS_STR_TO_ASCII_LOWERCASE_SRC,
+        "\"abc def xyz\"\n\"mixed\"\n\"already lower 123\"\n",
+    );
+}

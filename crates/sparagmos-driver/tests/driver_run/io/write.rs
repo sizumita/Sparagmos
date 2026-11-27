@@ -310,3 +310,56 @@ fn run_mode_nostd_stdout_write() {
         "nostd out\nnostd stdout done\n",
     );
 }
+
+
+// ----- `BufGuard::remaining` -----
+//
+// `BufWriter::flush_buf`'s guard method has no MIR body; the
+// interpreter serves it (the unwritten tail of the buffer),
+// so the flush loop below drives the inner writer with the
+// correct sub-slices — visible in the chunked output. The
+// run then stops at the guard's own `Drop` terminator: the
+// conversion drop-glue planner has no plan for the
+// function-local `BufGuard` type (a separate gap, in the
+// planner, not in this method's model).
+
+const BUF_GUARD_REMAINING_SRC: &str = r#"
+use std::io::{BufWriter, Write};
+struct ShortPrint;
+impl Write for ShortPrint {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(3);
+        print!("[{}]", String::from_utf8_lossy(&buf[..n]));
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+fn main() {
+    let mut w = BufWriter::new(ShortPrint);
+    w.write_all(b"hello world").unwrap();
+    w.flush().unwrap();
+    println!("flushed");
+}
+"#;
+
+#[test]
+fn run_mode_buf_guard_remaining_feeds_the_flush_loop() {
+    let dir = temp_dir("buf-guard-remaining");
+    let src = fixture(&dir, "case.rs", BUF_GUARD_REMAINING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[hel][lo ][wor][ld]",
+        "each flush iteration writes the guard's remaining slice; stderr={stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the run stops at the BufGuard drop glue; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported terminator: Drop"),
+        "the stop is the guard's drop, past the flush loop: {stderr}"
+    );
+}

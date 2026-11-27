@@ -165,6 +165,12 @@ pub enum Builtin {
     /// `StringFromUtf8Lossy` performs, over bytes read from the
     /// receiver instead of a byte slice).
     ToStringLossy,
+    /// `std::ffi::OsStr::to_ascii_lowercase(&self) ->
+    /// OsString`: no MIR body is available for it; the
+    /// conversion is byte-wise ASCII case folding of the
+    /// receiver's bytes (std's own definition, over the
+    /// platform byte string), answered directly.
+    OsStrToAsciiLowercase,
     /// `std::fs::DirEntry::path(&entry) -> PathBuf`: the full
     /// path the modelled entry was snapshotted with.
     DirEntryPath,
@@ -715,6 +721,15 @@ pub enum Builtin {
     /// the waiting readers (see
     /// `Interpreter::sys_rwlock_wake_writer_or_readers`).
     SysRwLockWakeWriterOrReaders,
+    /// `std::sys::sync::once::futex::Once::call(&self,
+    /// ignore_poisoning: bool, f: &mut dyn FnMut(&OnceState))`:
+    /// the futex-backed sys `Once` state machine. The fast
+    /// paths are plain atomic operations the converted bodies
+    /// serve, but this entry point itself has no MIR body;
+    /// the builtin runs the state machine over the model's
+    /// word, invoking the guest closure on the cooperative
+    /// scheduler (see `Interpreter::sys_once_call`).
+    OnceCall,
     /// `std::sys::sync::futex::unix::futex_wait`: the futex
     /// wait the sys locks, `Once`, the condvar and the thread
     /// parker sleep on: wait until the word differs from the
@@ -1047,6 +1062,12 @@ pub enum Builtin {
     /// `std::sys::io::error::unix::is_interrupted(errno)`:
     /// the error is `EINTR`.
     IoIsInterrupted,
+    /// `std::io::BufWriter::<W>::flush_buf`'s
+    /// `BufGuard::remaining(&self) -> usize`: the number of
+    /// buffered bytes the in-progress flush has not yet
+    /// written (`buffer.len() - written` over the guard's
+    /// two fields). No MIR body is available for it.
+    BufGuardRemaining,
     /// `std::net::ToSocketAddrs::to_socket_addrs`: name
     /// resolution into the modelled address iterator (see
     /// [`net_trait_method`]).
@@ -1707,6 +1728,22 @@ pub enum Builtin {
     /// `std::path::PathBuf` over the model's byte string, as
     /// for `_push`.
     PathBufSetExtension,
+    /// `std::path::PathBuf::_set_file_name(&mut self,
+    /// file_name: &OsStr)`: the mutation
+    /// `PathBuf::set_file_name` forwards to; no MIR body is
+    /// available for it. Answered with the host's
+    /// `std::path::PathBuf` over the model's byte string, as
+    /// for `_set_extension` (pop the current file name when
+    /// there is one, then push the new one — std's own
+    /// definition).
+    PathBufSetFileName,
+    /// `std::sys::path::unix::absolute(path: &Path) ->
+    /// io::Result<PathBuf>`: the leaf `std::path::absolute`
+    /// forwards to; no MIR body is available for it. Answered
+    /// with the host's `std::path::absolute`, whose current
+    /// directory is the model's own (the interpreter's
+    /// working directory is the host process's).
+    SysPathAbsolute,
     /// `std::path::Path::_with_extension(&self, extension:
     /// &OsStr) -> PathBuf`: the leaf `Path::with_extension`
     /// forwards to; no MIR body is available for it.
@@ -1818,6 +1855,25 @@ pub enum Builtin {
     /// program defines one) otherwise. See
     /// `builtins::alloc_error`.
     HandleAllocError,
+    /// `std::alloc::set_alloc_error_hook(hook: fn(Layout))`:
+    /// installs the guest's allocation-error hook in the
+    /// interpreter's state; `run_alloc_error` invokes it
+    /// (with a fabricated `Layout` value) in place of the
+    /// default hook. No MIR body is available for it. See
+    /// `builtins::alloc_error`.
+    AllocErrorHookSet,
+    /// `std::alloc::take_alloc_error_hook() -> fn(Layout)`:
+    /// removes and returns the installed hook; with none
+    /// installed it returns the default hook (the
+    /// `AllocErrorDefaultHook` name below), as std does.
+    AllocErrorHookTake,
+    /// `std::alloc::default_alloc_error_hook(layout:
+    /// Layout)`: std's own default hook, named so
+    /// `take_alloc_error_hook` can hand it back as a value;
+    /// calling it prints the default report and aborts,
+    /// exactly the endpoint `run_alloc_error` models for a
+    /// program with no custom hook.
+    AllocErrorDefaultHook,
     /// `alloc::raw_vec::handle_error(TryReserveError) -> !`:
     /// RawVec's reserve-failure endpoint, likewise body-less
     /// in Stable MIR. `CapacityOverflow` is the

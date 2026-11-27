@@ -7,7 +7,7 @@ use crate::interp::{
     channel_handle_id,
     Frame, Interpreter, Resolved,
 };
-use crate::value::{RefProj, Value};
+use crate::value::{RefProj, RefTarget, Value};
 
 use super::*;
 
@@ -472,6 +472,176 @@ impl<'a> Interpreter<'a> {
                     name,
                     "the futex word is unchanged and no pending thread can change it",
                 ));
+            }
+        }
+    }
+
+    /// `std::sys::sync::once::futex::Once::call`: the sys
+    /// `Once` state machine over its one atomic word
+    /// (`COMPLETE` 0, `RUNNING` 1, `POISONED` 2,
+    /// `INCOMPLETE` 3, plus the `QUEUED` bit 4), run on the
+    /// cooperative scheduler. The call that wins the
+    /// incomplete/poisoned state runs the guest closure with
+    /// a fabricated public `OnceState` — kept in an
+    /// allocation cell, so the closure's `poison()` write
+    /// through the shared reference lands where this builtin
+    /// reads `set_state_to` back afterwards, exactly as std
+    /// does — a call that finds the word `RUNNING` marks
+    /// itself queued and sleeps on the word through the
+    /// futex-wait model, and a panicking closure poisons the
+    /// word before its panic propagates (the completion
+    /// guard's drop in std).
+    pub(super) fn sys_once_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        vals: &[Value],
+        name: &str,
+    ) -> InterpResult<Value> {
+        const COMPLETE: u32 = 0;
+        const RUNNING: u32 = 1;
+        const POISONED: u32 = 2;
+        const INCOMPLETE: u32 = 3;
+        const QUEUED: u32 = 4;
+        const STATE_MASK: u32 = 0b11;
+
+        let target = self.deref_value(frames, &vals[0])?;
+        let ignore_poisoning = matches!(
+            self.resolve_value(frames, &vals[1])?,
+            Value::Bool(true)
+        );
+        // The closure argument as the dyn value the caller
+        // formed: follow one reference layer when the fat
+        // pointer itself is stored behind one.
+        let f_value = match &vals[2] {
+            v @ Value::DynRef { .. } => v.clone(),
+            Value::Ref(_) => {
+                let stored = self.deref_value(frames, &vals[2])?;
+                self.read_resolved(frames, &stored)?
+            }
+            other => other.clone(),
+        };
+        let (callable, _env) = self.dyn_callable(frames, &f_value)?;
+
+        let read_word = |this: &Self, frames: &[Frame]| -> InterpResult<u32> {
+            let value = this.read_resolved(frames, &target)?;
+            sys_lock_word(&value).ok_or_else(|| {
+                InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a sys Once value",
+                    value.kind_name(),
+                )
+            })
+        };
+        let write_word =
+            |this: &Self, frames: &mut Vec<Frame>, word: u32| -> InterpResult<()> {
+                this.modify_resolved(frames, &target, |slot| {
+                    let kind = slot.kind_name();
+                    let cell = sys_lock_word_mut(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "a sys Once value",
+                            kind,
+                        )
+                    })?;
+                    *cell = u128::from(word);
+                    Ok(())
+                })
+            };
+
+        loop {
+            let word = read_word(self, frames)?;
+            let state = word & STATE_MASK;
+            let queued = word & QUEUED != 0;
+            match state {
+                COMPLETE => return Ok(Value::Unit),
+                POISONED if !ignore_poisoning => {
+                    return Err(InterpError::panic_str_payload(
+                        "Once instance has previously been poisoned",
+                    ));
+                }
+                INCOMPLETE | POISONED => {
+                    // Register this call as the runner. In the
+                    // cooperative model the word cannot change
+                    // between the read above and this write
+                    // (no scheduling point intervenes), so the
+                    // plain store is std's compare-exchange.
+                    write_word(self, frames, RUNNING | (word & QUEUED))?;
+                    // The public `OnceState` the closure
+                    // observes: the public struct wraps the
+                    // sys state (`poisoned`, and the
+                    // `set_state_to` cell — a `Cell` over an
+                    // `UnsafeCell` over the state word),
+                    // initially set to complete on return.
+                    let f_state = Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Bool(state == POISONED),
+                                Value::Enum {
+                                    variant: 0,
+                                    fields: vec![Value::Enum {
+                                        variant: 0,
+                                        fields: vec![Value::Uint(u128::from(
+                                            COMPLETE,
+                                        ))],
+                                    }],
+                                },
+                            ],
+                        }],
+                    };
+                    let state_id = self.alloc_insert(f_state);
+                    let state_ref = Value::Ref(RefTarget::Alloc {
+                        id: state_id,
+                        projection: Vec::new(),
+                    });
+                    let result = self.call_callable_to_completion(
+                        frames,
+                        &callable,
+                        vec![state_ref.clone()],
+                    );
+                    match result {
+                        Ok(_) => {
+                            let stored_target =
+                                self.deref_value(frames, &state_ref)?;
+                            let stored =
+                                self.read_resolved(frames, &stored_target)?;
+                            let set_to = match &stored {
+                                Value::Enum { fields, .. }
+                                | Value::Tuple(fields) => fields.first(),
+                                _ => None,
+                            }
+                            .and_then(|inner| match inner {
+                                Value::Enum { fields, .. }
+                                | Value::Tuple(fields) => fields.get(1),
+                                _ => None,
+                            })
+                            .and_then(sys_lock_word)
+                            .unwrap_or(COMPLETE);
+                            write_word(self, frames, set_to)?;
+                            return Ok(Value::Unit);
+                        }
+                        Err(error) => {
+                            // The completion guard's drop:
+                            // poison the word, then let the
+                            // panic propagate.
+                            write_word(self, frames, POISONED)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                _ => {
+                    // RUNNING: mark this call queued, then
+                    // sleep on the word until it changes (the
+                    // futex-wait model serves the wait and the
+                    // deadlock verdict).
+                    let mut expected = word;
+                    if !queued {
+                        expected = word | QUEUED;
+                        write_word(self, frames, expected)?;
+                    }
+                    self.futex_wait(frames, &vals[0], expected, false, name)?;
+                }
             }
         }
     }
@@ -1044,6 +1214,11 @@ pub(crate) fn sync_lookup(canonical: &str) -> Option<Builtin> {
         // The futex primitives themselves: bodies that ARE
         // converted (the rwlock's `downgrade`, `Once`, the
         // condvar, the thread parker) call them directly.
+        // The futex-backed sys `Once` entry point: the
+        // state machine itself has no MIR body (its fast
+        // paths live in the public wrappers' converted
+        // bodies, which call it directly).
+        "std::sys::sync::once::futex::Once::call" => Builtin::OnceCall,
         "std::sys::sync::futex::unix::futex_wait" => Builtin::FutexWait,
         "std::sys::sync::futex::unix::futex_wake" => Builtin::FutexWake,
         "std::sys::sync::futex::unix::futex_wake_all" => Builtin::FutexWakeAll,

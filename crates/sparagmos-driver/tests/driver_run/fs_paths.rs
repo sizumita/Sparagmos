@@ -1422,3 +1422,56 @@ fn run_mode_cow_from_reference_sources() {
         "a=literal text borrowed=true\nb_len=6 borrowed=true\nc_len=3 borrowed=true\nd=ref string borrowed=true\ne_len=6 borrowed=true\nf_debug=\"/ref/path\" borrowed=true\ng_len=2 borrowed=true\nh_len=7 owned=true\ni=into str owned=true\n"
     );
 }
+
+
+// ----- `PathBuf::_set_file_name` / `sys::path::unix::absolute` -----
+//
+// Both leaves have no MIR body; the interpreter answers them
+// with the host `std::path` machinery over the model's byte
+// string (the model's working directory is the host
+// process's, as for `current_dir`).
+
+const SET_FILE_NAME_SRC: &str = r#"
+use std::path::PathBuf;
+fn main() {
+    let mut p = PathBuf::from("/a/b/c.txt");
+    p.set_file_name("new.rs");
+    println!("{}", p.display());
+    let mut root = PathBuf::from("/");
+    root.set_file_name("x");
+    println!("{}", root.display());
+    let mut trailing = PathBuf::from("/a/b/");
+    trailing.set_file_name("y.rs");
+    println!("{}", trailing.display());
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_set_file_name() {
+    run_ok(
+        "pathbuf-set-file-name",
+        SET_FILE_NAME_SRC,
+        "/a/b/new.rs\n/x\n/a/y.rs\n",
+    );
+}
+
+const ABSOLUTE_SRC: &str = r#"
+fn main() {
+    let abs = std::path::absolute("rel/path").unwrap();
+    let expect = std::env::current_dir().unwrap().join("rel/path");
+    println!("equal: {}", abs == expect);
+    let already = std::path::absolute("/already/abs").unwrap();
+    println!("already: {}", already.display());
+    let dotted = std::path::absolute("./dot/rel").unwrap();
+    println!("dotted equal: {}", dotted == std::env::current_dir().unwrap().join("dot/rel"));
+}
+"#;
+
+#[test]
+fn run_mode_path_absolute() {
+    run_ok(
+        "path-absolute",
+        ABSOLUTE_SRC,
+        "equal: true\nalready: /already/abs\ndotted equal: true\n",
+    );
+}
