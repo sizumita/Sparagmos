@@ -936,6 +936,38 @@ thread '{name}' ({tid}) panicked:
 ");
     }
 
+    /// A failed validity assertion (a validity intrinsic or
+    /// `mem::zeroed` whose type the compiler's own validity
+    /// check rejected, see `TerminatorKind::CallBuiltin::
+    /// validity_panic`): code generation answers the call with
+    /// `panic_nounwind` carrying the check's message, so the
+    /// run prints that panic's report -- located at the
+    /// `panic_nounwind_fmt` call inside `panic_nounwind`
+    /// (core/src/panicking.rs:225:5 in the pinned 1.100.0
+    /// build, the position every such report carries) -- and
+    /// the non-unwinding line, then aborts. The returned error
+    /// is the abort the caller propagates.
+    pub(crate) fn validity_assertion_abort(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        message: &str,
+    ) -> InterpError {
+        self.fire_nounwind_abort_panic(
+            frames,
+            (
+                "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core/src/panicking.rs"
+                    .to_string(),
+                225,
+                5,
+            ),
+            message,
+            false,
+        );
+        InterpError::Abort {
+            message: format!("validity assertion failed: {message}"),
+        }
+    }
+
     /// Call the guest's custom panic hook with a modelled
     /// `PanicHookInfo` (payload as a `dyn Any` reference, the
     /// location stamp, `can_unwind`). A panic raised by the

@@ -267,6 +267,7 @@ impl<'a> Interpreter<'a> {
             None,
             None,
             None,
+            None,
         )?;
         match target {
             Some(bb) => {
@@ -1206,6 +1207,7 @@ impl<'a> Interpreter<'a> {
                     &generic_args,
                     None,
                     arg_values,
+                    None,
                     None,
                     None,
                     None,

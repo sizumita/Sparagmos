@@ -658,16 +658,20 @@ impl Converter {
             sm::Place,
             Vec<String>,
         )> = Vec::new();
+        let mut validity_panics: Vec<(u32, String)> = Vec::new();
         let mut blocks: Vec<sm::BasicBlockData> = body
             .blocks
             .iter()
             .enumerate()
             .map(|(index, b)| {
-                let (block, lines, ids, methods) =
+                let (block, lines, ids, methods, validity_panic) =
                     self.basic_block(body, index as u32, b);
                 source_lines.push(lines);
                 unsize_type_ids.extend(ids);
                 unsize_vtable_methods.extend(methods);
+                if let Some(entry) = validity_panic {
+                    validity_panics.push(entry);
+                }
                 block
             })
             .collect();
@@ -720,6 +724,7 @@ impl Converter {
             b.source_lines = source_lines;
             b.unsize_type_ids = unsize_type_ids;
             b.unsize_vtable_methods = unsize_vtable_methods;
+            b.validity_panics = validity_panics;
             Ok(b)
         } else {
             Err(std::mem::take(&mut self.errors))
@@ -1009,6 +1014,7 @@ impl Converter {
         sm::BlockSourceLines,
         Vec<(u32, sm::Place, (u64, u64))>,
         Vec<(u32, sm::Place, Vec<String>)>,
+        Option<(u32, String)>,
     ) {
         let statements: Vec<sm::Statement> = bb
             .statements
@@ -1055,7 +1061,10 @@ impl Converter {
         // cleanup region is recovered structurally in
         // `convert_body` (see `mark_cleanup_region`).
         data.is_cleanup = false;
-        (data, lines, unsize_type_ids, unsize_vtable_methods)
+        let validity_panic = self
+            .validity_panic_message(&bb.terminator)
+            .map(|message| (bb_index, message));
+        (data, lines, unsize_type_ids, unsize_vtable_methods, validity_panic)
     }
 
     /// The compiler-resolved method instance names of the
@@ -1221,6 +1230,85 @@ impl Converter {
         } else {
             Some(names)
         }
+    }
+
+    /// The `panic_nounwind` message of one block's validity
+    /// assertion, when the block's terminator is a call the
+    /// compiler itself answers with a validity check and the
+    /// check fails: a call to `core::intrinsics::assert_inhabited`,
+    /// `assert_zero_valid` or `assert_mem_uninitialized_valid`,
+    /// or to `core::mem::zeroed` (whose own assertion the
+    /// interpreter's preemption of the call would otherwise
+    /// skip). The verdict is the pinned compiler's own:
+    /// `check_validity_requirement` is the very query code
+    /// generation consults for these calls, run here on the
+    /// call's monomorphic type argument under a fully
+    /// monomorphized typing environment, and the message is
+    /// the one code generation formats for the failure (the
+    /// uninhabited wording whenever the layout is uninhabited,
+    /// else the zero/uninitialized wording of the requirement),
+    /// with the type rendered the way code generation renders
+    /// it (no visible or trimmed paths). A call the query
+    /// cannot judge -- a layout error, a still-generic type --
+    /// records nothing: the assertion stays the no-op it is
+    /// for every type the compiler accepts.
+    fn validity_panic_message(&mut self, term: &mir::Terminator) -> Option<String> {
+        use rustc_middle::ty::layout::ValidityRequirement;
+        let mir::TerminatorKind::Call { func, .. } = &term.kind else {
+            return None;
+        };
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() else {
+            return None;
+        };
+        let name = def.def_id().name();
+        let requirement = if name.ends_with("intrinsics::assert_inhabited") {
+            ValidityRequirement::Inhabited
+        } else if name.ends_with("intrinsics::assert_zero_valid") {
+            ValidityRequirement::Zero
+        } else if name.ends_with("intrinsics::assert_mem_uninitialized_valid") {
+            ValidityRequirement::UninitMitigated0x01Fill
+        } else if name == "core::mem::zeroed" || name == "std::mem::zeroed" {
+            ValidityRequirement::Zero
+        } else {
+            return None;
+        };
+        let ty = args.0.iter().find_map(|arg| match arg {
+            GenericArgKind::Type(ty) => Some(ty),
+            _ => None,
+        })?;
+        let tcx = compiler_tcx()?;
+        let ity = rustc_public::rustc_internal::internal(tcx, ty);
+        let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+        let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tcx.check_validity_requirement((requirement, typing_env.as_query_input(ity)))
+        }));
+        let Ok(Ok(valid)) = verdict else {
+            return None;
+        };
+        if valid {
+            return None;
+        }
+        let uninhabited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tcx.layout_of(typing_env.as_query_input(ity))
+                .map(|layout| layout.is_uninhabited())
+                .unwrap_or(false)
+        }))
+        .unwrap_or(false);
+        let rendered = rustc_middle::ty::print::with_no_visible_paths!({
+            rustc_middle::ty::print::with_no_trimmed_paths!({
+                format!("{ity}")
+            })
+        });
+        Some(if uninhabited {
+            format!("attempted to instantiate uninhabited type `{rendered}`")
+        } else if requirement == ValidityRequirement::Zero {
+            format!("attempted to zero-initialize type `{rendered}`, which is invalid")
+        } else {
+            format!("attempted to leave type `{rendered}` uninitialized, which is invalid")
+        })
     }
 
     /// The `TypeId` segments of the concrete type of an unsizing

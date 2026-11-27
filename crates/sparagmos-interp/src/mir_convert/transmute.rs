@@ -2664,6 +2664,12 @@ let inner = match (&src, target) {
                 Some(Value::Tuple(fields))
             }
             mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n == 0 {
+                    // An empty array's pattern denotes the
+                    // empty aggregate whatever the element
+                    // type (even an uninhabited one).
+                    return Some(Value::Tuple(Vec::new()));
+                }
                 if *n > 4096 {
                     return None;
                 }
@@ -2755,6 +2761,249 @@ let inner = match (&src, target) {
                         Some(Value::Enum {
                             variant,
                             fields: zeroed_fields(variant)?,
+                        })
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a variant of the ADT instance is provably
+    /// uninhabited: one of its fields has a provably
+    /// uninhabited type (see [`Self::ty_provably_uninhabited`]).
+    fn variant_provably_uninhabited(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        variant: u32,
+        depth: u32,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(ftys) = self.instantiated_field_tys(def, args, variant) else {
+            return false;
+        };
+        ftys.iter()
+            .any(|fty| self.ty_provably_uninhabited(fty, depth + 1))
+    }
+
+    /// Whether a type is provably uninhabited from the
+    /// recorded shapes alone: the never type, an enum with
+    /// no variants, and the composites over one (a tuple
+    /// with an uninhabited component, a non-empty array of
+    /// an uninhabited element). Anything else is not
+    /// provable here and answers `false`.
+    fn ty_provably_uninhabited(&self, ty: &mir::Ty, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match ty {
+            mir::Ty::Never => true,
+            mir::Ty::Tuple(ts) => ts
+                .iter()
+                .any(|t| self.ty_provably_uninhabited(t, depth + 1)),
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                *n > 0 && self.ty_provably_uninhabited(elem, depth + 1)
+            }
+            mir::Ty::Adt(def, _) => match self.adt_shapes.get(def) {
+                Some(shape) => {
+                    shape.kind == mir::AdtShapeKind::Enum
+                        && shape.variants.is_empty()
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The value of type `ty` whose every byte is `byte`, for
+    /// a `write_bytes` fill with a constant byte (the 0x01 fill
+    /// `mem::uninitialized` performs): the shapes
+    /// [`Self::zeroed_model_value`] builds, with the byte's
+    /// repeated pattern in place of zero -- a thin pointer is
+    /// the address-only pointer the pattern denotes, a fat
+    /// slice/string pointer carries the pattern as both
+    /// address and length, an enum's niche window or lone
+    /// variant selects the variant the pattern denotes.
+    /// Shapes whose filled form the model cannot denote
+    /// (unions, `dyn` pointers, multi-variant direct-tag
+    /// enums, a pattern that is not a `bool`/`char` value)
+    /// answer `None`, and the builtin keeps its tag-based
+    /// fallbacks for those.
+    pub(super) fn byte_filled_model_value(
+        &self,
+        ty: &mir::Ty,
+        byte: u8,
+        depth: u32,
+    ) -> Option<Value> {
+        use crate::value::RefTarget;
+        if byte == 0 {
+            return self.zeroed_model_value(ty, depth);
+        }
+        if depth > 8 {
+            return None;
+        }
+        fn pattern(byte: u8, bits: u32) -> u128 {
+            let mut p: u128 = 0;
+            let mut b = 0;
+            while b < bits {
+                p = (p << 8) | u128::from(byte);
+                b += 8;
+            }
+            p
+        }
+        match ty {
+            mir::Ty::Bool => match byte {
+                1 => Some(Value::Bool(true)),
+                _ => None,
+            },
+            mir::Ty::Char => {
+                let cp = u32::from(byte) * 0x0101_0101;
+                char::from_u32(cp).map(|_| Value::Uint(u128::from(cp)))
+            }
+            mir::Ty::Int(it) => {
+                let bits = it.bits();
+                let p = pattern(byte, bits);
+                let v = if bits >= 128 {
+                    p as i128
+                } else if p & (1u128 << (bits - 1)) != 0 {
+                    (p as i128) - (1i128 << bits)
+                } else {
+                    p as i128
+                };
+                Some(Value::Int(v))
+            }
+            mir::Ty::Uint(ut) => Some(Value::Uint(pattern(byte, ut.bits()))),
+            mir::Ty::Float(ft) => Some(match ft.bits() {
+                16 => Value::Float(crate::mir_convert::f16_to_f64(pattern(byte, 16) as u16)),
+                32 => Value::Float(f64::from(f32::from_bits(pattern(byte, 32) as u32))),
+                64 => Value::Float(f64::from_bits(pattern(byte, 64) as u64)),
+                _ => Value::Float128(pattern(byte, 128)),
+            }),
+            mir::Ty::Tuple(ts) => {
+                if ts.is_empty() {
+                    return Some(Value::Unit);
+                }
+                let mut fields = Vec::with_capacity(ts.len());
+                for t in ts {
+                    fields.push(self.byte_filled_model_value(t, byte, depth + 1)?);
+                }
+                Some(Value::Tuple(fields))
+            }
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n == 0 {
+                    return Some(Value::Tuple(Vec::new()));
+                }
+                if *n > 4096 {
+                    return None;
+                }
+                let elem = self.byte_filled_model_value(elem, byte, depth + 1)?;
+                Some(Value::Tuple(vec![elem; *n as usize]))
+            }
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                let addr = pattern(byte, 64);
+                match &**inner {
+                    mir::Ty::Slice(_) | mir::Ty::Str => Some(Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::Address(addr as u64))),
+                        len: addr,
+                    }),
+                    mir::Ty::Dynamic(..) => None,
+                    _ => Some(Value::Ref(RefTarget::Address(addr as u64))),
+                }
+            }
+            // A filled function pointer denotes no function;
+            // the address-only pointer is the model's form for
+            // a pointer known only by its address.
+            mir::Ty::FnPtr(_) => Some(Value::Ref(RefTarget::Address(pattern(byte, 64) as u64))),
+            mir::Ty::Adt(def, args) => {
+                // `MaybeUninit<T>` holds its payload at field 0
+                // in this model, as for the zeroed form.
+                if matches!(
+                    self.def_display_name(def).as_str(),
+                    "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+                ) {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    let payload = self.byte_filled_model_value(&args[0], byte, depth + 1)?;
+                    return Some(Value::Enum {
+                        variant: 0,
+                        fields: vec![payload],
+                    });
+                }
+                let shape = self.adt_shapes.get(def)?;
+                let filled_fields = |variant: u32| -> Option<Vec<Value>> {
+                    let ftys = self.instantiated_field_tys(def, args, variant)?;
+                    let mut fields = Vec::with_capacity(ftys.len());
+                    for fty in &ftys {
+                        fields.push(self.byte_filled_model_value(fty, byte, depth + 1)?);
+                    }
+                    Some(fields)
+                };
+                match shape.kind {
+                    mir::AdtShapeKind::Union => None,
+                    mir::AdtShapeKind::Struct => Some(Value::Enum {
+                        variant: 0,
+                        fields: filled_fields(0)?,
+                    }),
+                    mir::AdtShapeKind::Enum => {
+                        // A niche-encoded instance: the window
+                        // the pattern reads in the niche scalar
+                        // selects the variant, as the zero
+                        // window does for the zeroed form.
+                        let tag = crate::builtins::ty_tag(
+                            &mir::Ty::Adt(*def, args.to_vec()),
+                            self.names,
+                        );
+                        if let Some(niche) = self.adt_niches.get(&tag) {
+                            let mask = if niche.tag_bits >= 128 {
+                                u128::MAX
+                            } else {
+                                (1u128 << niche.tag_bits) - 1
+                            };
+                            let window = pattern(byte, niche.tag_bits.min(128)) & mask;
+                            let offset =
+                                window.wrapping_sub(niche.niche_start) & mask;
+                            let span = u128::from(
+                                niche.niche_variants.1 - niche.niche_variants.0,
+                            );
+                            if offset <= span {
+                                return Some(Value::Enum {
+                                    variant: niche.niche_variants.0
+                                        + offset as u32,
+                                    fields: Vec::new(),
+                                });
+                            }
+                            return Some(Value::Enum {
+                                variant: niche.untagged_variant,
+                                fields: filled_fields(niche.untagged_variant)?,
+                            });
+                        }
+                        let table = self.discriminants.get(def)?;
+                        // A lone live variant is the only
+                        // value the pattern can denote (a
+                        // layout with one inhabited variant
+                        // stores no discriminant the pattern
+                        // could miss); a multi-variant direct
+                        // tag would need the tag scalar's own
+                        // width to compare the pattern against
+                        // the discriminants, which this table
+                        // does not record.
+                        let live: Vec<u32> = (0..table.len() as u32)
+                            .filter(|v| {
+                                !self.variant_provably_uninhabited(
+                                    def, args, *v, 0,
+                                )
+                            })
+                            .collect();
+                        if live.len() != 1 {
+                            return None;
+                        }
+                        Some(Value::Enum {
+                            variant: live[0],
+                            fields: filled_fields(live[0])?,
                         })
                     }
                 }

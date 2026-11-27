@@ -543,6 +543,12 @@ impl<'a> Interpreter<'a> {
             | (Some(Ty::FnPtr), Value::Closure { .. })
             | (Some(Ty::FnDef(_)), Value::FnPtr(_))
             | (Some(Ty::Closure(..)), Value::Closure { .. }) => Ok(value),
+            // A function pointer known only by its address (a
+            // byte fill's pattern, an integer cast's result):
+            // the address is the value the place denotes, and
+            // a call through it stays an error at the call
+            // site, which cannot name a function for it.
+            (Some(Ty::FnPtr), Value::Ref(_)) => Ok(value),
             // A coroutine-closure (async closure) place whose
             // type the driver recorded as the unit placeholder
             // (the type's kind is unaskable through Stable MIR;

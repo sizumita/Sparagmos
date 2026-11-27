@@ -1528,6 +1528,7 @@ impl<'a> Interpreter<'a> {
                     result_unsize,
                     unique_elem,
                     zeroed_value,
+                    validity_panic,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -1653,6 +1654,7 @@ impl<'a> Interpreter<'a> {
                             elem_glue.as_ref(),
                             receiver_glue.as_ref(),
                             zeroed_value.as_ref(),
+                            validity_panic.as_deref(),
                         );
                         if matches!(builtin_outcome, Err(InterpError::Suspended)) {
                             Self::restore_moved_args(frames, caller_id, moved_args);

@@ -40,6 +40,7 @@ mod summary_mode;
 mod sync;
 mod tool_interception;
 mod transmute;
+mod validity_assert;
 mod vec_slice;
 
 /// Fixture directories this test process created under the

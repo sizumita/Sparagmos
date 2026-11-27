@@ -639,6 +639,7 @@ fn run_steps(local_tys: Vec<Ty>, steps: Vec<Step>) -> String {
                         unique_elem: None,
                         zeroed_value: None,
                         generic_type_ids: None,
+                        validity_panic: None,
                     },
                 ));
             }

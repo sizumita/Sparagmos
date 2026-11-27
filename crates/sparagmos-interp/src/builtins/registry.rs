@@ -1566,10 +1566,12 @@ pub enum Builtin {
     /// about the generic type — that it is inhabited, that its
     /// all-zero bit pattern is a valid value, that it may be left
     /// uninitialized. Code generation keeps each as a no-op for
-    /// exactly the types that satisfy the property, and a
-    /// violation is undefined behaviour in the guest, so a
-    /// converted program that reaches one has nothing observable
-    /// left for the interpreter to check.
+    /// exactly the types that satisfy the property and answers
+    /// the rest with a `panic_nounwind` carrying the check's
+    /// message; conversion bakes that verdict per call site
+    /// (see `TerminatorKind::CallBuiltin::validity_panic`), and
+    /// the builtin raises it, or serves the no-op when no
+    /// verdict was baked.
     AssertValidity,
     /// `std::intrinsics::overflow_checks`: whether the
     /// *instantiating* crate was compiled with overflow checks.

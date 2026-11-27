@@ -1288,7 +1288,13 @@ impl<'a> Converter<'a> {
         }
         let terminator = match &bb.terminator {
             Some(term) => {
-                self.convert_terminator(body, &term.kind, fn_abi, !bb.statements.is_empty())?
+                self.convert_terminator(
+                    body,
+                    bb_index,
+                    &term.kind,
+                    fn_abi,
+                    !bb.statements.is_empty(),
+                )?
             }
             None => ir::TerminatorKind::Unsupported("missing terminator".to_string()),
         };
