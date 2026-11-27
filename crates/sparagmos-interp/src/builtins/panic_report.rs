@@ -33,9 +33,10 @@ pub(super) fn json_escape(text: &str) -> String {
 }
 
 /// A panic report as it appears in a passing should-panic
-/// test's captured output: the `thread '...' panicked at ...`
-/// head and the message, without the backtrace note the
-/// failure account adds.
+/// test's captured output: the full report when this panic is
+/// the process's first (the backtrace note is spent on the
+/// first panic wherever it is accounted, a passing
+/// should-panic test's included), the head alone afterwards.
 /// The full panic report of a failing test's captured output:
 /// the report head plus the backtrace note line, as libtest
 /// prints it ahead of a failure's own account (for example the
@@ -50,6 +51,20 @@ pub(super) fn panic_report_full(
         "{}note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
         panic_report_head(test, thread_id, location, message)
     )
+}
+
+pub(super) fn panic_report_pass(
+    test: &TestDesc,
+    thread_id: u64,
+    location: Option<(String, u64, u64)>,
+    message: &str,
+    note_pending: bool,
+) -> String {
+    if note_pending {
+        panic_report_full(test, thread_id, location, message)
+    } else {
+        panic_report_head(test, thread_id, location, message)
+    }
 }
 
 pub(super) fn panic_report_head(
