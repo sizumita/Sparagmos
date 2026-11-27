@@ -2832,6 +2832,19 @@ let inner = match (&src, target) {
     /// enums, a pattern that is not a `bool`/`char` value)
     /// answer `None`, and the builtin keeps its tag-based
     /// fallbacks for those.
+    ///
+    /// A `MaybeUninit<T>` fill is the payload's filled value,
+    /// not the union-wrapped form a whole-value construction
+    /// of the `MaybeUninit` itself denotes (see
+    /// [`Self::zeroed_model_value`]): a byte fill over a
+    /// `MaybeUninit` region writes `T`'s bytes, the region's
+    /// slots denote the payload's own storage and its readers
+    /// read them as `T` (a raw table's control bytes are
+    /// allocated as `MaybeUninit<Tag>` and read as `Tag`) --
+    /// the same denomination the builtin's tag-based
+    /// fallback (`wrapped_byte_fill`) gives such a fill. The
+    /// builtin's fill path re-wraps the payload when the
+    /// target place itself holds the wrapper.
     pub(super) fn byte_filled_model_value(
         &self,
         ty: &mir::Ty,
@@ -2839,11 +2852,27 @@ let inner = match (&src, target) {
         depth: u32,
     ) -> Option<Value> {
         use crate::value::RefTarget;
-        if byte == 0 {
-            return self.zeroed_model_value(ty, depth);
-        }
         if depth > 8 {
             return None;
+        }
+        // A `MaybeUninit<T>` fill denotes the payload's
+        // filled value (see the doc comment above), for the
+        // zero byte as much as for any other: the zeroed
+        // form's wrapper belongs to whole-value construction,
+        // not to a region fill.
+        if let mir::Ty::Adt(def, args) = ty {
+            if matches!(
+                self.def_display_name(def).as_str(),
+                "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+            ) {
+                if args.len() != 1 {
+                    return None;
+                }
+                return self.byte_filled_model_value(&args[0], byte, depth + 1);
+            }
+        }
+        if byte == 0 {
+            return self.zeroed_model_value(ty, depth);
         }
         fn pattern(byte: u8, bits: u32) -> u128 {
             let mut p: u128 = 0;
@@ -2918,21 +2947,8 @@ let inner = match (&src, target) {
             // a pointer known only by its address.
             mir::Ty::FnPtr(_) => Some(Value::Ref(RefTarget::Address(pattern(byte, 64) as u64))),
             mir::Ty::Adt(def, args) => {
-                // `MaybeUninit<T>` holds its payload at field 0
-                // in this model, as for the zeroed form.
-                if matches!(
-                    self.def_display_name(def).as_str(),
-                    "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
-                ) {
-                    if args.len() != 1 {
-                        return None;
-                    }
-                    let payload = self.byte_filled_model_value(&args[0], byte, depth + 1)?;
-                    return Some(Value::Enum {
-                        variant: 0,
-                        fields: vec![payload],
-                    });
-                }
+                // A `MaybeUninit` type never reaches here: it
+                // is intercepted at the top of this function.
                 let shape = self.adt_shapes.get(def)?;
                 let filled_fields = |variant: u32| -> Option<Vec<Value>> {
                     let ftys = self.instantiated_field_tys(def, args, variant)?;
