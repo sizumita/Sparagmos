@@ -1993,6 +1993,21 @@ impl<'a> Interpreter<'a> {
                     other.kind_name(),
                 )),
             },
+            // A bare string or byte value is the data itself in
+            // this model (see `deref_value`: a `&str` materialised
+            // as bare string data dereferences to the data), so a
+            // pointer formed from it -- a `Location` file string
+            // reaching `CStr::as_ptr` through
+            // `Location::file_as_c_str`, whose file field the
+            // caller-location stamp denominates as the string
+            // itself -- denotes its first element exactly as the
+            // fat-pointer-over-string arm above denotes it: a
+            // value target at index 0, which the offset machinery
+            // advances through the bytes.
+            Value::Str(_) | Value::Bytes(_) => Ok(Value::Ref(RefTarget::Value(
+                Box::new(value),
+                vec![RefProj::Index(0)],
+            ))),
             other => Err(InterpError::type_mismatch(
                 "first-element pointer cast",
                 "pointer to an array, slice or string",
