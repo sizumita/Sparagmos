@@ -502,6 +502,14 @@ impl<'a> Converter<'a> {
             .operand_place_ty(body, operand)
             .or_else(|| match constant_recorded_ty(operand) {
                 Some(t @ mir::Ty::Adt(..)) => Some(t),
+                // An array constant likewise: its element
+                // kind and length are not recoverable from
+                // the converted value alone (a tuple constant
+                // does not say whether its elements are the
+                // leaves of the array or a regrouping of
+                // them), and the stream arms below key on
+                // the recorded array type.
+                Some(t @ mir::Ty::Array(..)) => Some(t),
                 _ => None,
             });
         // A byte-string constant in pointer position carries no
@@ -1648,14 +1656,36 @@ let inner = match (&src, target) {
                             None => unsupported(),
                         }
                     }
-                    _ => match (self.zst_value(src.as_ref().unwrap(), 0), self.zst_value(target, 0)) {
-                        (Some(_), Some(tv)) => match value_to_constant(&tv) {
-                            Some(c) => {
-                                ir::Rvalue::Use(ir::Operand::Constant(c))
+                    _ => match self.stream_regroup_rvalue(
+                        &mir::Ty::Adt(def.clone(), args.clone()),
+                        target,
+                        v,
+                    ) {
+                        // A one-payload wrapper over an array
+                        // transmuted to another such wrapper
+                        // (Mu64([u64; 4]) -> Mf64([f64; 4])):
+                        // the bit-stream reinterpretation over
+                        // the two payload streams, at any total
+                        // width -- the whole-shape budget caps
+                        // the generic path at 128 bits and the
+                        // array arms below require an array on
+                        // at least one side, so a wrapper pair
+                        // has no other conversion.
+                        Some(rv) => rv,
+                        None => match (
+                            self.zst_value(src.as_ref().unwrap(), 0),
+                            self.zst_value(target, 0),
+                        ) {
+                            (Some(_), Some(tv)) => {
+                                match value_to_constant(&tv) {
+                                    Some(c) => ir::Rvalue::Use(
+                                        ir::Operand::Constant(c),
+                                    ),
+                                    None => unsupported(),
+                                }
                             }
-                            None => unsupported(),
+                            _ => unsupported(),
                         },
-                        _ => unsupported(),
                     },
                 }
             }
