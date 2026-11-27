@@ -758,6 +758,30 @@ pub enum Builtin {
     ThreadSleep,
     /// `std::thread::yield_now()`: a cooperative scheduling point.
     ThreadYield,
+    /// `std::thread::park()`: block the executing thread until
+    /// its park token is set by an `unpark` (see
+    /// [`Builtin::ThreadUnpark`]), consuming the token. The
+    /// function has no MIR body in the pinned std (the dump
+    /// records it as "no MIR body available"), so the wait is
+    /// modelled on the interpreter's per-thread token set.
+    ThreadPark,
+    /// `std::thread::park_timeout(dur)`: `park` with an upper
+    /// bound on the wait. The cooperative model has no clock
+    /// for the bound: the wait ends when the token is set, or
+    /// when no pending thread can still set it (the point past
+    /// which only the passage of time could, which the value
+    /// model does not observe — the same convention as
+    /// [`Builtin::ThreadSleep`]). A zero duration only polls
+    /// the token.
+    ThreadParkTimeout,
+    /// `std::thread::Thread::unpark(&thread)`: set the target
+    /// thread's park token. A converted body exists for this
+    /// method, but it walks the real `Thread` struct's Parker
+    /// word, which the model's id-handle thread values do not
+    /// carry (the body fails over them), so the token lives in
+    /// the interpreter's per-thread set instead, where
+    /// [`Builtin::ThreadPark`] observes it.
+    ThreadUnpark,
     /// `core::core_arch::x86::sse2::pause` (what
     /// `std::hint::spin_loop` lowers to): a spin-wait hint with
     /// no architectural effect, so the model is a no-op (in
