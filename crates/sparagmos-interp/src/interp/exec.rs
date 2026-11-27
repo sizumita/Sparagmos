@@ -1109,21 +1109,41 @@ impl<'a> Interpreter<'a> {
                                         // verbatim. A deref capture
                                         // is NOT expanded here, as
                                         // it is in the `async_call`
-                                        // arm below: a future
-                                        // created by `async_call_once`
-                                        // is typically nested inside
-                                        // another coroutine's storage
-                                        // (the `call_once` shim's),
-                                        // and a reference rooted at
-                                        // the enclosing frame's
-                                        // coroutine-self place gains
-                                        // a spurious field step when
-                                        // it is read back through
-                                        // that storage, so the
-                                        // derived per-field
-                                        // references land one field
-                                        // off. The expansion waits
-                                        // on that read-back rebase.
+                                        // arm below, and that is the
+                                        // shape this future's poll
+                                        // body consumes: `async_call_once`
+                                        // consumes the closure, so
+                                        // the future's upvars are the
+                                        // closure's captures
+                                        // themselves, and the poll
+                                        // body reads the environment
+                                        // reference itself and
+                                        // projects the pointee's
+                                        // fields through it (a
+                                        // reborrow of field 1 of the
+                                        // pointee is composed onto
+                                        // the stored reference's
+                                        // target at read-back). The
+                                        // fan-out plan describes the
+                                        // borrowed-call futures
+                                        // (`async_call` /
+                                        // `async_call_mut`), which
+                                        // cannot hold the closure and
+                                        // so hold one reborrow per
+                                        // captured field instead.
+                                        // Expanding here would put a
+                                        // per-field reference where
+                                        // the poll body expects the
+                                        // environment reference, and
+                                        // its projections would land
+                                        // one field off (measured on
+                                        // the `async move` block of
+                                        // tests/ui/async-await/async-closures/precise-captures.rs:
+                                        // the field write's target
+                                        // gains a spurious `Field(0)`
+                                        // after the environment
+                                        // prefix, [F0, F0, F0, F1, F0]
+                                        // in place of [F0, F0, F1, F0]).
                                         fields.extend(env);
                                     }
                                     // A zero-sized async closure

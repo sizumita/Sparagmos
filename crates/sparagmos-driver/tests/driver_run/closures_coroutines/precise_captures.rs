@@ -184,3 +184,79 @@ fn run_mode_pinned_coroutine_saved_field_read_back_after_resume() {
         "the saved local survives the suspension and is read back"
     );
 }
+
+const PRECISE_CAPTURE_ONCE_MOVE_SRC: &str = r#"
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    let mut fut = pin!(fut);
+    let ctx = &mut Context::from_waker(Waker::noop());
+    loop {
+        match unsafe { fut.as_mut().poll(ctx) } {
+            Poll::Pending => {}
+            Poll::Ready(t) => break t,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Drop(&'static str);
+impl std::ops::Drop for Drop {
+    fn drop(&mut self) { println!("{}", self.0); }
+}
+struct S { a: i32, b: Drop, c: Drop }
+
+async fn call_once(f: impl AsyncFnOnce()) { f().await }
+
+async fn async_main() {
+    let s = &mut S { a: 1, b: Drop("fix me up"), c: Drop("untouched") };
+    let mut c = async move || {
+        s.a = 2;
+        let w = &mut s.b;
+        w.0 = "fixed";
+    };
+    let fut = call_once(c);
+    println!("after call");
+    fut.await;
+    println!("after await");
+}
+
+fn main() { block_on(async_main()); }
+"#;
+
+#[test]
+fn run_mode_async_closure_precise_capture_once_move() {
+    // The same deref capture as above, but the closure is an
+    // `async move` closure consumed by an `AsyncFnOnce` call
+    // through a generic shim: the future the call creates
+    // holds the environment verbatim (the single `&mut S`),
+    // because the once future's poll body reads the
+    // environment reference itself and projects the pointee's
+    // fields through it. Expanding the environment into
+    // per-field references at creation - the shape the
+    // borrowed `AsyncFn` calls create - puts a per-field
+    // reference where the poll body expects the environment
+    // reference, and its field projections land one field off
+    // (the write to `s.b` composes onto the `s.a` reference's
+    // target and the run stops with a field-write type
+    // mismatch). The reference the body's writes go through is
+    // rooted at the enclosing coroutine's self place (the
+    // struct lives in `async_main`'s saved storage, reached
+    // through the `Pin` in the outer frame).
+    let dir = temp_dir("async-precise-capture-once-move");
+    let src = fixture(&dir, "precise_capture_once_move.rs", PRECISE_CAPTURE_ONCE_MOVE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "precise capture through a once call must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after call\nafter await\nfixed\nuntouched\n",
+        "both captured fields are written through the environment reference"
+    );
+}
