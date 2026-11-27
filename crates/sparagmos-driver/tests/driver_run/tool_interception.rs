@@ -1940,3 +1940,102 @@ fn run_mode_tool_interception_artifact_naming_and_binding() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "artifact naming guest ok\n", "stderr={stderr}");
 }
+
+const DEP_INFO_GUEST_SRC: &str = r#"
+use std::process::Command;
+
+fn main() {
+    // The harness passes the tool program's path as the first
+    // guest argument; every compile request below is answered
+    // by the driver's tool interception.
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // A type error lies past the dep-info phase boundary: the
+    // real compiler answers a dep-info-only invocation on
+    // this source with success and a `.d` file, and the type
+    // error is never even computed, so it cannot appear on
+    // stderr either.
+    std::fs::write("erroneous.rs", "fn main() {\n    let a: u8 = \"a\";\n}\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=dep-info")
+        .arg("erroneous.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dep-info-only on a type-error source failed");
+    assert!(std::path::Path::new("erroneous.d").exists(), "dep-info file missing");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!stderr.contains("E0308"), "type error leaked into dep-info stderr: {stderr}");
+
+    // A borrow error is past the boundary too.
+    std::fs::write("borrowerr.rs", "fn main() {\n    let v = vec![1, 2, 3];\n    let r = &v;\n    let w = v;\n    let _ = (r, w);\n}\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=dep-info")
+        .arg("borrowerr.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dep-info-only on a borrow-error source failed");
+
+    // A parse error is at the boundary: it still fails, with
+    // the diagnostics on stderr.
+    std::fs::write("parsebad.rs", "fn main() {\n    let a: u8 = ;\n}\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=dep-info")
+        .arg("parsebad.rs")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "dep-info-only on a parse-error source succeeded");
+    assert!(!out.stderr.is_empty(), "parse diagnostics missing");
+
+    // An unresolved import is settled by resolution, before
+    // the boundary: it still fails.
+    std::fs::write("resolvebad.rs", "use totally_nonexistent_crate::Thing;\nfn main() {}\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=dep-info")
+        .arg("resolvebad.rs")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "dep-info-only on an unresolved-import source succeeded");
+
+    // Any further emit kind restores the full judgement: the
+    // same type-error source fails with dep-info,link and
+    // with metadata alone.
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=dep-info,link")
+        .arg("erroneous.rs")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "dep-info,link on a type-error source succeeded");
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--emit=metadata")
+        .arg("erroneous.rs")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "metadata on a type-error source succeeded");
+
+    println!("dep-info guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_dep_info_verdict() {
+    let dir = temp_dir("tool-dep-info");
+    let src = fixture(&dir, "dep_info_guest.rs", DEP_INFO_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "dep-info guest ok\n", "stderr={stderr}");
+}

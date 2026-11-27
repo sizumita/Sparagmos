@@ -861,6 +861,54 @@ fn crate_root_has_main(root: &std::path::Path, root_text: &str) -> bool {
     false
 }
 
+/// Write one `dep-info` emit's file: the Makefile-shaped
+/// dependency text naming the invocation's primary output
+/// (or the crate name, when the invocation recorded none)
+/// and the sources it read -- the input and the aux sources
+/// it bound. Shared by the success path's emit loop and the
+/// dep-info verdict fallback in `tool_run`, the two places an
+/// invocation is judged to have produced dep-info.
+fn write_dep_info_emit(
+    path: &Option<String>,
+    cwd: &std::path::Path,
+    out_base: &std::path::Path,
+    crate_name: &str,
+    input_abs: &std::path::Path,
+    aux: &[String],
+    primary: Option<&std::path::Path>,
+) {
+    let p = match path {
+        Some(p) => absolutize(cwd, p),
+        None => out_base.join(format!("{crate_name}.d")),
+    };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut deps = vec![input_abs.to_path_buf()];
+    for spec in aux {
+        if let Some((_, src)) = spec.split_once('=') {
+            let src = src.split(';').next().unwrap_or(src);
+            deps.push(std::path::PathBuf::from(src));
+        }
+    }
+    let target = primary
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| crate_name.to_string());
+    let mut text = format!(
+        "{}: {}",
+        target,
+        deps.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for d in &deps {
+        text += &format!("\n{}:", d.display());
+    }
+    text.push('\n');
+    let _ = std::fs::write(&p, text);
+}
+
 /// Answer one intercepted tool invocation (a run-make recipe's
 /// compiler call) with the driver's own conversion machinery:
 /// the invocation is re-run as this binary in convert mode over
@@ -873,10 +921,21 @@ fn crate_root_has_main(root: &std::path::Path, root_text: &str) -> bool {
 /// and MIR output) so later invocations can name them through
 /// `--extern`, which then binds the original source through
 /// `--aux`.
+///
+/// One invocation class is not judged by conversion: when the
+/// emit set is dep-info alone, the real compiler answers at
+/// its dep-info phase boundary -- success iff the crate
+/// parses, expands and resolves, however its type checking
+/// would fare -- so a failed conversion verdict for such an
+/// invocation is re-taken at that boundary (see the verdict
+/// fallback below). Callers asking for the conversion verdict
+/// itself (the cargo shim's verdict channel) pass
+/// `allow_dep_info_verdict = false` and never take it.
 pub(crate) fn tool_run(
     request: &sparagmos_interp::ToolRunRequest,
     registry: &ToolRegistry,
     exe: &std::path::Path,
+    allow_dep_info_verdict: bool,
 ) -> Result<sparagmos_interp::ToolRunOutcome, String> {
     let cwd: std::path::PathBuf = match &request.cwd {
         Some(dir) => std::path::PathBuf::from(os_string_from_bytes(dir)),
@@ -1214,6 +1273,13 @@ pub(crate) fn tool_run(
         tail.push("--dump".to_string());
         tail.push(dump.display().to_string());
     }
+    // Whether the invocation's emit set is dep-info alone:
+    // such an invocation is judged at the real compiler's
+    // dep-info phase boundary, not by conversion (see the
+    // verdict fallback at the failure return below).
+    let dep_info_only = !emits.is_empty()
+        && emits.iter().all(|(kind, _)| kind == "dep-info");
+
     let (code, stdout, stderr) =
         run_convert_subprocess(exe, &tail, &cwd, request.env_clear, &request.envs)?;
 
@@ -1235,6 +1301,49 @@ pub(crate) fn tool_run(
     });
     let child_stderr = child_stream(&stderr);
     if code != 0 || skipped != Some(0) {
+        // The dep-info verdict fallback (see the doc comment
+        // above): conversion subsumes resolution -- a crate
+        // that fails parsing, expansion or resolution cannot
+        // convert -- so when the crate resolves cleanly, the
+        // conversion failure lies in a phase dep-info skips
+        // and the invocation succeeds the way the real
+        // compiler's does. The dep-info file is its only
+        // artifact (the real compiler produces no primary
+        // output for it, and none is recorded), and the
+        // verdict run's stderr -- the diagnostics through
+        // resolution -- is what the guest sees.
+        if allow_dep_info_verdict && dep_info_only {
+            let mut verdict_tail = tail.clone();
+            verdict_tail.push("--dep-info-verdict".to_string());
+            if let Ok((verdict_code, _, verdict_stderr)) = run_convert_subprocess(
+                exe,
+                &verdict_tail,
+                &cwd,
+                request.env_clear,
+                &request.envs,
+            ) {
+                if verdict_code == 0 {
+                    for (kind, path) in &emits {
+                        if kind == "dep-info" {
+                            write_dep_info_emit(
+                                path,
+                                &cwd,
+                                &out_base,
+                                &crate_name,
+                                &input_abs,
+                                &aux,
+                                None,
+                            );
+                        }
+                    }
+                    return Ok(sparagmos_interp::ToolRunOutcome {
+                        exit_code: 0,
+                        stdout: Vec::new(),
+                        stderr: child_stream(&verdict_stderr),
+                    });
+                }
+            }
+        }
         return Ok(sparagmos_interp::ToolRunOutcome {
             exit_code: if code == 101 { 101 } else { 1 },
             stdout: Vec::new(),
@@ -1364,37 +1473,15 @@ pub(crate) fn tool_run(
                 record(p, Some(types[0].clone()), registry, &mut primary);
             }
             "dep-info" => {
-                let p = match path {
-                    Some(p) => absolutize(&cwd, p),
-                    None => out_base.join(format!("{crate_name}.d")),
-                };
-                if let Some(parent) = p.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let mut deps = vec![input_abs.clone()];
-                for spec in &aux {
-                    if let Some((_, src)) = spec.split_once('=') {
-                        let src = src.split(';').next().unwrap_or(src);
-                        deps.push(std::path::PathBuf::from(src));
-                    }
-                }
-                let target = primary
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| crate_name.clone());
-                let mut text = format!(
-                    "{}: {}",
-                    target,
-                    deps.iter()
-                        .map(|d| d.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                write_dep_info_emit(
+                    path,
+                    &cwd,
+                    &out_base,
+                    &crate_name,
+                    &input_abs,
+                    &aux,
+                    primary.as_deref(),
                 );
-                for d in &deps {
-                    text += &format!("\n{}:", d.display());
-                }
-                text.push('\n');
-                let _ = std::fs::write(&p, text);
             }
             "llvm-ir" => {
                 let p = match path {
@@ -1526,7 +1613,7 @@ fn record_shim_verdict(rustc: &str, rest: &[String]) {
     };
     let registry = ToolRegistry::default();
     let exe = std::env::current_exe().unwrap_or_default();
-    let verdict = match tool_run(&request, &registry, &exe) {
+    let verdict = match tool_run(&request, &registry, &exe, false) {
         Ok(outcome) if outcome.exit_code == 0 => "converted",
         Ok(_) => "failed",
         Err(reason) if reason.contains("names no input file") => return,
