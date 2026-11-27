@@ -451,6 +451,46 @@ impl<'a> Interpreter<'a> {
                 return Some(Ok((candidate, receiver)));
             }
         }
+        // The pointer's bounds name the trait *instance* the
+        // pointer was formed for, generic arguments included
+        // (`Bar<i32>`), while the call names the trait
+        // definition alone. When the concrete type implements
+        // the trait under several instantiations -- `Bar<i32>`
+        // and `Bar<bool>` for one `S2`, reached through
+        // different supertrait upcasts of one `dyn Foo` -- the
+        // scan below cannot choose between the instances, but
+        // the bound can: it is the vtable's identity. Try the
+        // candidates the bounds spell (under the same
+        // elided-`Self` spellings as above) before the scan;
+        // several distinct hits are genuinely ambiguous and
+        // fall through to it.
+        let mut trait_paths = vec![trait_path.to_string()];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            trait_paths.push(format!("core::{rest}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            trait_paths.push(format!("std::{rest}"));
+        }
+        let mut instanced: Vec<String> = Vec::new();
+        for entry in traits {
+            let entry_path = entry.split('<').next().unwrap_or(entry.as_str());
+            if !trait_paths.iter().any(|p| p == entry_path) {
+                continue;
+            }
+            let mut self_spellings = vec![concrete.clone()];
+            self_spellings.extend(elided_self_spellings(concrete));
+            for self_spelling in self_spellings {
+                let candidate = format!("<{self_spelling} as {entry}>::{method}");
+                if (self.program.get(&candidate).is_some()
+                    || self.program.unconverted_reason(&candidate).is_some())
+                    && !instanced.contains(&candidate)
+                {
+                    instanced.push(candidate);
+                }
+            }
+        }
+        if instanced.len() == 1 {
+            return Some(Ok((instanced.pop().unwrap(), receiver)));
+        }
         // The impl key may carry the trait's generic arguments
         // (`<S as std::ops::FnMut<(i32,)>>::call_mut`) or spell the
         // trait through the other of `std::` / `core::`: scan the

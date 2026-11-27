@@ -44,6 +44,14 @@
 //!   segment (`main::{closure#0}`) in the fat pointer's
 //!   concrete tag; the impl scan must equate the two
 //!   spellings (tests/ui/regions/issue-6157.rs).
+//! * A concrete type may implement one trait under several
+//!   generic instantiations (`Bar<i32>` and `Bar<bool>` for
+//!   one `S2`); neither the call's name nor the impl scan
+//!   can choose between the instances, but the fat pointer's
+//!   own bound names the instance the pointer was formed
+//!   for, so the lookup tries the bound's spelling as a
+//!   candidate key before scanning (tests/ui/traits/
+//!   trait-upcasting/correct-supertrait-substitution.rs).
 //! * A `Self` carrying a function pointer with a concrete
 //!   region (`Foo<fn(&'static u8)>`) renders in the fat
 //!   pointer's concrete tag with the region dropped
@@ -570,4 +578,49 @@ fn region_erasure_two_binderless_candidates_decline() {
         Some(2),
         "ambiguous erasure candidates must stay unresolved; stderr={stderr}"
     );
+}
+
+const MULTI_INSTANCE_SUPERTRAIT_SRC: &str = r#"
+trait Foo<T: Default + ToString>: Bar<i32> + Bar<T> {}
+trait Bar<T: Default + ToString> {
+    fn bar(&self) -> String {
+        T::default().to_string()
+    }
+}
+
+struct S1;
+impl Bar<i32> for S1 {}
+impl Foo<i32> for S1 {}
+
+struct S2;
+impl Bar<i32> for S2 {}
+impl Bar<bool> for S2 {}
+impl Foo<bool> for S2 {}
+
+fn test1(x: &dyn Foo<i32>) {
+    let s = x as &dyn Bar<i32>;
+    assert_eq!("0", &s.bar().to_string());
+}
+
+fn test2(x: &dyn Foo<bool>) {
+    let p = x as &dyn Bar<i32>;
+    assert_eq!("0", &p.bar().to_string());
+    let q = x as &dyn Bar<bool>;
+    assert_eq!("false", &q.bar().to_string());
+}
+
+fn main() {
+    let s1 = S1;
+    test1(&s1);
+    let s2 = S2;
+    test2(&s2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_call_picks_the_bound_instance_among_supertrait_upcasts() {
+    let dir = temp_dir("dyn-bound-instance");
+    let src = fixture(&dir, "main.rs", MULTI_INSTANCE_SUPERTRAIT_SRC);
+    assert_ok(&run_driver(&src));
 }
