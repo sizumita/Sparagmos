@@ -537,6 +537,7 @@ impl Conv {
             required_consts: Vec::new(),
             unsize_type_ids: Vec::new(),
             unsize_vtable_methods: Vec::new(),
+            validity_panics: Vec::new(),
         })
     }
 

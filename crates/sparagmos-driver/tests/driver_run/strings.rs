@@ -4072,6 +4072,65 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
     );
 }
 
+const OS_STRING_INTO_BOXED_OS_STR_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+fn check(tag: &str, os: OsString) {
+    // `into_boxed_os_str` hands the bytes to a fresh box;
+    // every `OsStr` consumer reads the same bytes back,
+    // whichever form the `OsString` was built in.
+    let b = os.into_boxed_os_str();
+    println!("{} len={} empty={} bytes={:?} lossy={} eq={} dbg={:?}",
+        tag, b.len(), b.is_empty(), b.as_bytes(), b.to_string_lossy(),
+        &*b == OsStr::new("hello"), b);
+}
+
+fn main() {
+    check("from", OsString::from("hello"));
+    let mut os = OsString::with_capacity(16);
+    os.push("hel");
+    os.push("lo");
+    check("push", os);
+    check("vec", OsString::from_vec(b"hello".to_vec()));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_into_boxed_os_str() {
+    run_ok(
+        "os-string-into-boxed-os-str",
+        OS_STRING_INTO_BOXED_OS_STR_SRC,
+        "from len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\npush len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\nvec len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\n",
+    );
+}
+
+const OS_STRING_INTO_BOXED_OS_STR_EDGE_SRC: &str = r#"
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+fn main() {
+    // The empty string boxes to an empty `OsStr`, non-UTF-8
+    // bytes survive the round trip unaltered, and the box
+    // converts back into the `OsString` it came from.
+    let empty = OsString::new().into_boxed_os_str();
+    println!("empty len={} empty={}", empty.len(), empty.is_empty());
+    let raw = OsString::from_vec(vec![0xff, b'a', 0x80]).into_boxed_os_str();
+    println!("nonutf8 bytes={:?}", raw.as_bytes());
+    let back: OsString = OsString::from(OsString::from("hello").into_boxed_os_str());
+    println!("back={:?}", back);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_into_boxed_os_str_edges() {
+    run_ok(
+        "os-string-into-boxed-os-str-edges",
+        OS_STRING_INTO_BOXED_OS_STR_EDGE_SRC,
+        "empty len=0 empty=true\nnonutf8 bytes=[255, 97, 128]\nback=\"hello\"\n",
+    );
+}
+
 const SORT_STRING_ELEMENTS_SRC: &str = r#"
 fn main() {
     // Sorting more than twenty `String` elements takes the
@@ -4176,5 +4235,283 @@ fn run_mode_os_string_real_aggregate_ordering() {
         "os-string-real-aggregate-ordering",
         OS_STRING_REAL_AGGREGATE_ORD_SRC,
         "lt agg<from: true\nlt from<agg: true\nlt agg<agg: true\ngt agg>from: true\ncmp agg/from: Equal\ncmp agg/agg: Less\ncmp from/agg: Greater\nle agg<=clone: true\nge from>=agg: true\n",
+    );
+}
+
+const OS_STRING_COPY_SHIFT_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // A raw-pointer copy of the real-aggregate form (built by
+    // `with_capacity` plus `push`) over a sibling slot of the
+    // same buffer: the copied element keeps the element's own
+    // form, so equality, length and comparison still read it.
+    let mut a = OsString::with_capacity(32);
+    a.push("hello-world");
+    let b = OsString::from("hello-world");
+    let mut v: Vec<OsString> = vec![a, b];
+    unsafe {
+        let base = v.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(base, base.add(1), 1);
+    }
+    let expect = OsString::from("hello-world");
+    println!("eq1: {}", v[1] == expect);
+    println!("len1: {}", v[1].len());
+    println!("cmp1: {:?}", v[1].cmp(&expect));
+    println!("eq0: {}", v[0] == expect);
+    println!("lossy1: {}", v[1].to_string_lossy());
+    std::mem::forget(v);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_copy_nonoverlapping_shift() {
+    run_ok(
+        "os-string-copy-nonoverlapping-shift",
+        OS_STRING_COPY_SHIFT_SRC,
+        "eq1: true\nlen1: 11\ncmp1: Equal\neq0: true\nlossy1: hello-world\n",
+    );
+}
+
+const OS_STRING_COPY_SPARE_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // The same copy into a spare-capacity slot (never written
+    // before): the element lands whole there too.
+    let mut a = OsString::with_capacity(32);
+    a.push("hello-world");
+    let mut v: Vec<OsString> = Vec::with_capacity(4);
+    v.push(OsString::from("zzz"));
+    unsafe {
+        let dst = v.as_mut_ptr().add(1);
+        std::ptr::copy_nonoverlapping(&a, dst, 1);
+        v.set_len(2);
+    }
+    let expect = OsString::from("hello-world");
+    println!("eq1: {}", v[1] == expect);
+    println!("len1: {}", v[1].len());
+    println!("cmp1: {:?}", v[1].cmp(&expect));
+    println!("lossy1: {}", v[1].to_string_lossy());
+    std::mem::forget(a);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_copy_into_spare_capacity() {
+    run_ok(
+        "os-string-copy-into-spare-capacity",
+        OS_STRING_COPY_SPARE_SRC,
+        "eq1: true\nlen1: 11\ncmp1: Equal\nlossy1: hello-world\n",
+    );
+}
+
+const OS_STRING_COPY_MULTI_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(32);
+    o.push(s);
+    o
+}
+
+fn main() {
+    // A multi-element copy shifts both elements with their
+    // forms intact.
+    let mut v: Vec<OsString> = vec![agg("aaa"), OsString::from("bbb"), agg("ccc")];
+    unsafe {
+        let base = v.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(base, base.add(1), 2);
+    }
+    let ea = OsString::from("aaa");
+    let eb = OsString::from("bbb");
+    println!("eq1: {}", v[1] == ea);
+    println!("len1: {}", v[1].len());
+    println!("eq2: {}", v[2] == eb);
+    println!("len2: {}", v[2].len());
+    std::mem::forget(v);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_copy_multi_element() {
+    run_ok(
+        "os-string-copy-multi-element",
+        OS_STRING_COPY_MULTI_SRC,
+        "eq1: true\nlen1: 3\neq2: true\nlen2: 3\n",
+    );
+}
+
+const OS_STRING_PTR_COPY_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(32);
+    o.push(s);
+    o
+}
+
+fn main() {
+    // The overlapping copy (the sort shift's form) keeps the
+    // shifted element's form too.
+    let mut v: Vec<OsString> = vec![agg("hello-world"), OsString::from("hello-world")];
+    unsafe {
+        let base = v.as_mut_ptr();
+        std::ptr::copy(base, base.add(1), 1);
+    }
+    let expect = OsString::from("hello-world");
+    println!("eq1: {}", v[1] == expect);
+    println!("len1: {}", v[1].len());
+    println!("lossy1: {}", v[1].to_string_lossy());
+    std::mem::forget(v);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_ptr_copy_shift() {
+    run_ok(
+        "os-string-ptr-copy-shift",
+        OS_STRING_PTR_COPY_SRC,
+        "eq1: true\nlen1: 11\nlossy1: hello-world\n",
+    );
+}
+
+const OS_STRING_SORT_MIXED_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(32);
+    o.push(s);
+    o
+}
+
+fn main() {
+    // Sorting a vector that mixes the real-aggregate form
+    // with the from-literal form: the shifts inside the sort
+    // move whole elements, so every comparison after a shift
+    // still reads an intact element.
+    let mut v: Vec<OsString> = vec![agg("bbb"), OsString::from("ddd"), agg("aaa"), OsString::from("ccc")];
+    v.sort();
+    for s in &v {
+        print!("{} ", s.to_string_lossy());
+    }
+    println!();
+    let expect: Vec<OsString> = vec![OsString::from("aaa"), OsString::from("bbb"), OsString::from("ccc"), OsString::from("ddd")];
+    println!("sorted_eq: {}", v == expect);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_vec_sort_mixed_forms() {
+    run_ok(
+        "os-string-vec-sort-mixed-forms",
+        OS_STRING_SORT_MIXED_SRC,
+        "aaa bbb ccc ddd \nsorted_eq: true\n",
+    );
+}
+
+const OS_STRING_COPY_WRAPPER_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(32);
+    o.push(s);
+    o
+}
+
+#[repr(transparent)]
+struct W(OsString);
+
+fn main() {
+    // The genuine wrapper source: the pointer names a
+    // transparent wrapper place, and the element is its only
+    // field -- the copy moves the field, with the element's
+    // own layers intact below the wrapper's.
+    let w = W(agg("hello-world"));
+    let mut v: Vec<OsString> = vec![OsString::from("zzz")];
+    unsafe {
+        let src = &w as *const W as *const OsString;
+        let dst = v.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(src, dst, 1);
+    }
+    let expect = OsString::from("hello-world");
+    println!("eq0: {}", v[0] == expect);
+    println!("len0: {}", v[0].len());
+    println!("lossy0: {}", v[0].to_string_lossy());
+    std::mem::forget(v);
+    std::mem::forget(w);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_copy_from_wrapper_place() {
+    run_ok(
+        "os-string-copy-from-wrapper-place",
+        OS_STRING_COPY_WRAPPER_SRC,
+        "eq0: true\nlen0: 11\nlossy0: hello-world\n",
+    );
+}
+
+const STRING_DRAIN_NEXT_BACK_STORAGE_SRC: &str = r#"
+fn main() {
+    let mut j = ["a", "b", "c"].join("/");
+    let mut dj = j.drain(0..1);
+    println!("{:?}", dj.next_back());
+    println!("{:?}", dj.next_back());
+    std::mem::forget(dj);
+    println!("[{}]", j);
+    let mut c = ["a/", "b/", "c"].concat();
+    let mut dc = c.drain(0..1);
+    println!("{:?}", dc.next_back());
+    println!("{:?}", dc.next_back());
+    std::mem::forget(dc);
+    println!("[{}]", c);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_storage_backed() {
+    // A drain over a join/concat-built string holds a `Chars`
+    // state whose byte pointers denote the string's own
+    // storage. The back step is served by the modelled state
+    // machine (as the front step is), which snapshots the
+    // remaining bytes through the pointers before stepping;
+    // the collected `Drain::next_back` body forwarded the
+    // stored storage-backed state to the `Chars` back step
+    // directly, and its snapshot reader only reads value
+    // snapshots. The drained range is the first byte, the one
+    // element whose stored form is plain, so the step is
+    // judged on the pointer form alone. The drain values are
+    // forgotten: the drop-side removal over a join/concat
+    // string is a separate consumer.
+    run_ok(
+        "string-drain-next-back-storage-backed",
+        STRING_DRAIN_NEXT_BACK_STORAGE_SRC,
+        "Some('a')\nNone\n[a/b/c]\nSome('a')\nNone\n[a/b/c]\n",
+    );
+}
+
+const STRING_DRAIN_NEXT_BACK_VALUE_SRC: &str = r#"
+fn main() {
+    let mut m = String::new();
+    m.push_str("a/b/c");
+    {
+        let mut d = m.drain(1..4);
+        println!("{:?}", d.next_back());
+    }
+    println!("[{}]", m);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_value_snapshot() {
+    // The same back step over a push-built string, whose
+    // drain state already denotes a value snapshot: the
+    // modelled route serves it identically, and the drain's
+    // drop still removes the stepped range.
+    run_ok(
+        "string-drain-next-back-value-snapshot",
+        STRING_DRAIN_NEXT_BACK_VALUE_SRC,
+        "Some('/')\n[ac]\n",
     );
 }

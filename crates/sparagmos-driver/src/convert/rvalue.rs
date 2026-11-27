@@ -176,7 +176,39 @@ impl Converter {
         if k.ty.is_none() {
             k.ty = self.constant_adt_ty(c, &k);
         }
+        if k.ty.is_none() {
+            k.ty = self.constant_array_ty(c, &k);
+        }
         k
+    }
+
+    /// The constant's own type when the constant is an
+    /// array value: a `transmute` of such a constant (a
+    /// folded `const` array regrouped into another array
+    /// shape) is decided from the source type, which the
+    /// decoded tuple value alone does not name -- neither
+    /// the element kind nor whether the tuple's elements
+    /// are the array's leaves or a regrouping of narrower
+    /// leaves. Recorded only for array-typed constants
+    /// whose literal decoded to a tuple of elements; every
+    /// other constant keeps the narrower rules above.
+    fn constant_array_ty(
+        &mut self,
+        c: &mir::ConstOperand,
+        k: &sm::Constant,
+    ) -> Option<sm::Ty> {
+        if !matches!(
+            k.literal,
+            sm::ConstKind::Value(sm::ConstValue::Tuple(_))
+        ) {
+            return None;
+        }
+        match guarded_ty_kind(&c.const_.ty())? {
+            TyKind::RigidTy(RigidTy::Array(..)) => {
+                Some(self.ty(&c.const_.ty()))
+            }
+            _ => None,
+        }
     }
 
     /// The constant's own type when the constant is a decoded

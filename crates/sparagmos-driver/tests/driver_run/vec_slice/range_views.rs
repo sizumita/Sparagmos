@@ -237,3 +237,30 @@ fn run_mode_slice_metadata_through_places() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "meta ok\n");
 }
+
+const RANGE_VIEW_SPARSE_MUT_SRC: &str = r#"
+use std::cell::Cell;
+
+fn main() {
+    let mut v: Vec<Cell<i32>> = Vec::new();
+    for i in 0..6 { v.push(Cell::new(i * 10)); }
+    let view = &mut v[1..4];
+    view[0].set(111);
+    view[2] = Cell::new(333);
+    println!("src: {} {} {}", v[1].get(), v[2].get(), v[3].get());
+}
+"#;
+
+#[test]
+fn run_mode_range_view_over_sparse_vec_mut_aliases_source() {
+    let dir = temp_dir("range-view-sparse-mut");
+    let src = fixture(&dir, "range_view_sparse_mut.rs", RANGE_VIEW_SPARSE_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a mutable range view over sparse-backed storage must alias the source; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "src: 111 20 333\n");
+}

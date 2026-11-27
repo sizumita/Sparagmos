@@ -5793,6 +5793,42 @@ def compile_expectation(suite, header):
     return "success"
 
 
+def compile_flags_emit_beyond_check(view):
+    """Whether the view's own compile-flags add an `--emit`
+    kind beyond the analysis-level ones (metadata, dep-info).
+
+    compiletest appends `--emit metadata` to a check
+    compilation, but a test's own `--emit` flags accumulate
+    with it, and the added kinds make the reference
+    compilation run phases a metadata-only compilation never
+    reaches: `--emit=mir` evaluates the constants whose
+    errors the check compilation is supposed to stay silent
+    on (tests/ui/limits/vtable-try-as-dyn.rs reports its
+    E0080 under `--emit=mir` and stays silent under
+    `--emit=metadata`, measured against the pinned rustc).
+    Such a view is not decided by a check compilation, so
+    the driver's codegen-level verdicts stay live for it.
+    """
+    tokens = compile_flags(view)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        value = None
+        if tok == "--emit":
+            if i + 1 < len(tokens):
+                value = tokens[i + 1]
+                i += 1
+        elif tok.startswith("--emit="):
+            value = tok[len("--emit="):]
+        if value is not None:
+            for kind in value.split(","):
+                kind = kind.split("=", 1)[0].strip()
+                if kind and kind not in ("metadata", "dep-info"):
+                    return True
+        i += 1
+    return False
+
+
 def compiletest_check_mode(suite, view):
     """Whether compiletest compiles this view with a check
     compilation (`--emit=metadata`), so the reference
@@ -5806,6 +5842,12 @@ def compiletest_check_mode(suite, view):
     builds. Incremental revisions: `cpass` is a check
     compilation, the b*/r* kinds are builds. Every other suite
     is compiled in build mode (or not by rustc at all).
+
+    A view whose own compile-flags add an `--emit` kind
+    beyond the analysis-level ones is not a check
+    compilation either: the added emit makes the reference
+    compilation evaluate what a metadata-only compilation
+    never reaches (see `compile_flags_emit_beyond_check`).
     """
     if suite in ("ui", "ui-fulldeps"):
         if run_mode(view) is not None:
@@ -5814,10 +5856,11 @@ def compiletest_check_mode(suite, view):
             return False
         if view.has("build-pass") or view.has("build-fail"):
             return False
-        return True
+        return not compile_flags_emit_beyond_check(view)
     if suite == "incremental":
         revision = getattr(view, "revision", None)
-        return bool(revision) and revision.startswith("cpass")
+        return bool(revision) and revision.startswith("cpass") \
+            and not compile_flags_emit_beyond_check(view)
     return False
 
 

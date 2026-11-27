@@ -227,3 +227,90 @@ fn run_mode_maybeuninit_slice_copy_wider_elements() {
         "first 0\nsecond 1000\nv0 0\n",
     );
 }
+
+const VISITABLE_SLICE_DEREF_SRC: &str = r##"
+#![feature(rustc_private)]
+
+extern crate rustc_type_ir;
+extern crate rustc_type_ir_macros;
+
+use rustc_type_ir::GenericTypeVisitable;
+use rustc_type_ir_macros::GenericTypeVisitable;
+
+// Necessary to pull in object code as the rest of the rustc crates are shipped only as rmeta
+// files.
+#[expect(unused_extern_crates)]
+extern crate rustc_driver;
+
+#[derive(GenericTypeVisitable)]
+enum Enum {
+    A,
+    B(Incrementer),
+    C { one: Incrementer, two: Vec<Incrementer> },
+}
+
+#[derive(GenericTypeVisitable)]
+struct PartiallyRecursiveField<T> {
+    #[generic_type_visitable(bounds(T: GenericTypeVisitable<__V>))]
+    partially_rec: (Vec<Self>, T),
+    other: Incrementer,
+}
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static COUNT: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone)]
+struct Incrementer;
+
+unsafe impl<V> GenericTypeVisitable<V> for Incrementer {
+    fn generic_visit_with(&self, _visitor: &mut V) {
+        COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn main() {
+    use Incrementer as Inc; // for brevity
+
+    #[track_caller]
+    fn check<T: GenericTypeVisitable<()>>(item: T, count: u8) {
+        let mut v = ();
+        item.generic_visit_with(&mut v);
+        assert_eq!(COUNT.swap(0, Ordering::Relaxed), count);
+    }
+
+    macro_rules! prec {
+        ([$($i:expr),* $(,)?], $o:expr) => {
+            PartiallyRecursiveField { partially_rec: (vec![$($i),*], $o), other: Inc }
+        }
+    }
+    let a = || Enum::A;
+    check(prec!([], a()), 1 + 0);
+    check(prec!([prec!([], a())], a()), 1 + (1 + 0) + 0);
+    println!("visitable ok");
+}
+"##;
+
+#[test]
+fn run_mode_visitable_slice_deref_element_not_wrapper() {
+    // The reduced shape of tests/ui-fulldeps/derive-generic-type-visitable.rs:
+    // the derived visitor iterates the (Vec<Self>, T) field through the
+    // slice iterator machinery, whose construction reborrows the fat
+    // pointer (`&*fat`). That dereference resolves to the base of the
+    // fat pointer, a position denominated at the first element, and
+    // the value stored there is the element itself -- here a struct
+    // in enum form whose first field is the inner (Vec, Enum) tuple,
+    // a tuple of values that fit the element type. The MaybeUninit
+    // entry judgment in place resolution mistook that element for a
+    // wrapper around the whole slice and descended into its first
+    // field, shifting every later step one level too deep (the read
+    // of the inner enum field then reported an uninitialised place).
+    // A slice payload is the whole sequence, so the entry must be
+    // refused at an element position.
+    let dir = temp_dir("visitable-slice-deref");
+    let src = fixture(&dir, "visitable.rs", VISITABLE_SLICE_DEREF_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "visitable ok\n");
+}

@@ -4,8 +4,9 @@
 
 use crate::error::InterpResult;
 use crate::interp::{
-    Interpreter, Resolved,
+    Frame, Interpreter, Resolved,
 };
+use crate::ir::Ty;
 use crate::value::{RefProj, Value};
 
 use super::*;
@@ -126,6 +127,7 @@ fn value_fingerprint(value: &Value) -> u64 {
 
     pub(super) fn pointer_distance(
         &self,
+        frames: &[Frame],
         x: &Resolved,
         y: &Resolved,
         generic_args: &[String],
@@ -204,8 +206,40 @@ fn value_fingerprint(value: &Value) -> u64 {
                         .map(|p| format!("{p:?}"))
                         .collect::<Vec<_>>()
                         .join("/");
+                    // An index step is denominated in the
+                    // sequence's own slots, whose size conversion
+                    // recorded for the place (a byte-denominated
+                    // buffer's slots are bytes); the distance is
+                    // denominated in the intrinsic's elements, so
+                    // a position over a sequence whose slots are
+                    // narrower than the elements scales by the
+                    // slot size. A position that does not land on
+                    // an element boundary under that scaling
+                    // denotes no element position at all. The
+                    // field-step fallback reading (no index step
+                    // in the projection) keeps the field number's
+                    // own denomination, as before.
+                    let position = if matches!(projection[at], RefProj::Index(_)) {
+                        match (
+                            self.distance_slot_size(frames, target, &projection[..at]),
+                            elem_size,
+                        ) {
+                            (Some(slot), Some(es))
+                                if slot > 0 && es > 0 && u128::from(slot) != es =>
+                            {
+                                let num = (i as i128).checked_mul(i128::from(slot))?;
+                                if num % (es as i128) != 0 {
+                                    return None;
+                                }
+                                num / (es as i128)
+                            }
+                            _ => i as i128,
+                        }
+                    } else {
+                        i as i128
+                    };
                     let mut candidates =
-                        vec![(format!("{base}|{key}"), i as i128)];
+                        vec![(format!("{base}|{key}"), position)];
                     // When the element step is the projection's
                     // trailing field step (the fallback
                     // `element_position_step` applies when the
@@ -253,7 +287,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                             .join("/");
                         candidates.push((
                             format!("{base}|{prefix_key}"),
-                            i as i128,
+                            position,
                         ));
                     }
                     Some(candidates)
@@ -269,6 +303,55 @@ fn value_fingerprint(value: &Value) -> u64 {
             }),
             _ => None,
         })
+    }
+
+    /// The slot size, in bytes, of the sequence a place or
+    /// static target's element-step prefix denotes, from the
+    /// records conversion left for it (the same records
+    /// `array_position` prices pointer offsets by): a field
+    /// path's recorded element size, an array local's element
+    /// size, or a sequence ADT local's recorded element size.
+    /// `None` when no record denominates the sequence — the
+    /// distance then keeps the index step's own denomination.
+    fn distance_slot_size(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        prefix: &[RefProj],
+    ) -> Option<u64> {
+        match target {
+            Resolved::Place { frame_pos, local, .. } => {
+                let frame = frames.get(*frame_pos)?;
+                let body = self.program().functions.get(&frame.func)?;
+                let mut path = Vec::new();
+                for step in prefix {
+                    match step {
+                        RefProj::Field(f) => path.push(*f),
+                        RefProj::UnionField { idx, .. } => path.push(*idx),
+                        _ => return None,
+                    }
+                }
+                if !path.is_empty() {
+                    return body
+                        .field_elem_sizes
+                        .get(*local)
+                        .and_then(|sizes| sizes.get(&path))
+                        .copied();
+                }
+                match body.local_tys.get(*local)? {
+                    Ty::Array(elem, _) => self.ty_size(elem),
+                    Ty::Adt(_) => body.local_elem_sizes.get(*local).copied().flatten(),
+                    _ => None,
+                }
+            }
+            Resolved::Static { name, .. } if prefix.is_empty() => {
+                match self.program().static_tys.get(name)? {
+                    Ty::Array(elem, _) => self.ty_size(elem),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 }
 

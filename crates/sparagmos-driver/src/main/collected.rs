@@ -86,6 +86,9 @@ pub(crate) struct Collected {
     /// Declared types of the converted program's statics, for
     /// the interpreter (see `Converter::static_tys_mir`).
     pub(crate) static_tys: sparagmos_mir::StaticTys,
+    /// Declared alignments of the converted program's statics,
+    /// for the interpreter (see `Converter::static_aligns`).
+    pub(crate) static_aligns: sparagmos_mir::StaticAligns,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, for the interpreter
     /// (see `Converter::adt_instance_shapes`).

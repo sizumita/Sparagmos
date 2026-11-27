@@ -92,6 +92,20 @@ pub fn clear_captured_panic() {
     }
 }
 
+/// Whether a panic record's message part is a non-string
+/// payload: either the plain form, or one of the named forms
+/// the panic hook gives a known site
+/// (`main::panic_guard::non_string_payload_for` renders a
+/// named non-string payload as
+/// `"<name> (panic with a non-string payload)"`). The
+/// classifiers below key on the payload kind through this
+/// predicate, never on one exact rendering, so naming a new
+/// site in the hook cannot silently unclassify its panics.
+fn message_is_non_string_payload(message: &str) -> bool {
+    message == "panic with a non-string payload"
+        || message.ends_with("(panic with a non-string payload)")
+}
+
 /// Whether a panic hook record (the text
 /// [`record_captured_panic`] stores: the payload text plus the
 /// panic location) is the compiler's own bug machinery
@@ -119,7 +133,7 @@ pub fn captured_panic_is_compiler_bug(text: &str) -> bool {
     let Some((message, location)) = text.split_once(" (panicked at ") else {
         return false;
     };
-    if message != "panic with a non-string payload" {
+    if !message_is_non_string_payload(message) {
         return false;
     }
     let Some(compiler) = location.split("/compiler/").nth(1) else {
@@ -131,6 +145,58 @@ pub fn captured_panic_is_compiler_bug(text: &str) -> bool {
     !captured_panic_is_normalize_overflow(text)
         && !captured_panic_is_mir_validator_fail(text)
         && !text.contains("rustc_errors/src/lib.rs:1499:")
+}
+
+/// Whether a panic hook record is the compiler's
+/// unimplemented normalization of a `ty::ConstKind::Expr`
+/// (`rustc_middle/src/mir/consts.rs:338`, a `bug!` with the
+/// non-string `ExplicitBug` payload): `Const::eval` has no
+/// evaluation for a generic const expression. The site is a
+/// compiler bug when the compiler's own const-eval forces it
+/// (the collector replay in `mono_check` keeps that crash
+/// verdict through the bug-witness list), but Stable MIR's
+/// body builder also calls `Const::eval` eagerly on every
+/// constant of a body it materializes -- including const
+/// expressions that appear only in types, which the native
+/// pipeline never evaluates as values -- so inside a body
+/// materialization the same panic is an artifact of the
+/// fetch, not of the program (Issue #510). The two readings
+/// are told apart by scope, not by site: this predicate only
+/// names the site, and `with_body_materialization` decides
+/// what a materialization-scope firing means.
+pub fn captured_panic_is_const_expr_normalize(text: &str) -> bool {
+    let Some((message, location)) = text.split_once(" (panicked at ") else {
+        return false;
+    };
+    message_is_non_string_payload(message)
+        && location.contains("rustc_middle/src/mir/consts.rs:338:")
+}
+
+/// Every const-expr-normalize panic record of the run (see
+/// [`captured_panic_is_const_expr_normalize`]), noted by the
+/// panic hook alongside the bug-witness list and read only
+/// through scoped diffs of the same shape
+/// ([`const_expr_normalize_witness_since`]).
+static CONST_EXPR_WITNESSES: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The number of const-expr-normalize witnesses recorded so
+/// far: a scope's snapshot to diff with
+/// [`const_expr_normalize_witness_since`].
+pub fn const_expr_normalize_witness_len() -> usize {
+    CONST_EXPR_WITNESSES
+        .lock()
+        .map(|list| list.len())
+        .unwrap_or(0)
+}
+
+/// The first const-expr-normalize witness recorded at or
+/// after the snapshot `len`, if any.
+pub fn const_expr_normalize_witness_since(len: usize) -> Option<String> {
+    CONST_EXPR_WITNESSES
+        .lock()
+        .ok()
+        .and_then(|list| list.get(len).cloned())
 }
 
 /// Every compiler-bug panic record of the run, in the order
@@ -156,6 +222,11 @@ static BUG_WITNESSES: std::sync::Mutex<Vec<String>> =
 /// driver's panic hook for every panic of the run, alongside
 /// [`record_captured_panic`].
 pub fn note_panic_observation(record: &str) {
+    if captured_panic_is_const_expr_normalize(record) {
+        if let Ok(mut list) = CONST_EXPR_WITNESSES.lock() {
+            list.push(record.to_string());
+        }
+    }
     if !captured_panic_is_compiler_bug(record) {
         return;
     }
@@ -786,6 +857,73 @@ mod tests {
         ));
         note_panic_observation(&record);
         assert_eq!(compiler_bug_witness_since(before), Some(record));
+    }
+
+    /// The const-expr-normalize site (Issue #510) is named
+    /// by its location and non-string payload alone: a
+    /// string-payload panic at the same site, and the
+    /// non-string panics of the other pinned sites, are not
+    /// this class.
+    #[test]
+    fn const_expr_normalize_site_is_named() {
+        let record = non_string(&format!(
+            "{DEV}/rustc_middle/src/mir/consts.rs:338:25"
+        ));
+        assert!(captured_panic_is_const_expr_normalize(&record));
+        // It stays a compiler bug for the scopes that force
+        // it themselves (the collector replay's crash
+        // verdict); only the materialization scope discounts
+        // its own firings.
+        assert!(captured_panic_is_compiler_bug(&record));
+        let string_at_site = format!(
+            "boom (panicked at {DEV}/rustc_middle/src/mir/consts.rs:338:25)"
+        );
+        assert!(!captured_panic_is_const_expr_normalize(&string_at_site));
+        let other_site = non_string(&format!(
+            "{DEV}/rustc_middle/src/ty/layout.rs:1411:17"
+        ));
+        assert!(!captured_panic_is_const_expr_normalize(&other_site));
+    }
+
+    /// The panic hook names the non-string payloads of known
+    /// sites (Issue #395's diagnosability work), so their
+    /// records carry `"<name> (panic with a non-string
+    /// payload)"` as the message part. The classifiers key on
+    /// the payload kind, not the exact rendering, so a named
+    /// record classifies exactly as the plain form did: the
+    /// const-expr site is still the const-expr class and
+    /// still a compiler bug, and the normalization overflow
+    /// keeps its named verdict (not a bug).
+    #[test]
+    fn named_non_string_payloads_keep_their_classification() {
+        let const_expr = format!("constant-expression normalization failure (panic with a non-string payload) (panicked at {DEV}/rustc_middle/src/mir/consts.rs:338:25)");
+        assert!(captured_panic_is_const_expr_normalize(&const_expr));
+        assert!(captured_panic_is_compiler_bug(&const_expr));
+        let overflow = format!("type normalization overflow (panic with a non-string payload) (panicked at {DEV}/rustc_middle/src/ty/normalize_erasing_regions.rs:202:17)");
+        assert!(!captured_panic_is_compiler_bug(&overflow));
+        assert!(captured_panic_is_normalize_overflow(&overflow));
+        let validator = format!("MIR validation failure (panic with a non-string payload) (panicked at {DEV}/rustc_mir_transform/src/validate.rs:81:24)");
+        assert!(!captured_panic_is_compiler_bug(&validator));
+        assert!(captured_panic_is_mir_validator_fail(&validator));
+    }
+
+    /// The const-expr witness list is append-only and scoped
+    /// reads see exactly the witnesses at or after their
+    /// snapshot; an unrelated panic is never noted.
+    #[test]
+    fn const_expr_witness_list_scopes_by_snapshot() {
+        let before = const_expr_normalize_witness_len();
+        assert_eq!(const_expr_normalize_witness_since(before), None);
+        note_panic_observation("an ordinary string panic");
+        assert_eq!(const_expr_normalize_witness_since(before), None);
+        let record = non_string(&format!(
+            "{DEV}/rustc_middle/src/mir/consts.rs:338:25"
+        ));
+        note_panic_observation(&record);
+        assert_eq!(
+            const_expr_normalize_witness_since(before),
+            Some(record)
+        );
     }
 
     /// The crash slot is first-wins and clears on take.

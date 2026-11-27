@@ -134,6 +134,23 @@ pub struct Body {
     /// spellings. Empty for hand-built bodies and for casts
     /// whose vtable the driver could not resolve.
     pub unsize_vtable_methods: Vec<(u32, Place, Vec<String>)>,
+    /// The validity-assertion failures the compiler's own
+    /// check settles for this body, keyed by block index: a
+    /// block whose terminator calls one of the validity
+    /// intrinsics (`core::intrinsics::assert_inhabited` /
+    /// `assert_zero_valid` / `assert_mem_uninitialized_valid`)
+    /// or `core::mem::zeroed` (whose body the interpreter
+    /// preempts, so its assertion never runs as a call) with a
+    /// type the pinned compiler's `check_validity_requirement`
+    /// query judges invalid for that initialization kind. The
+    /// entry carries the exact message the compiler's code
+    /// generation raises through `panic_nounwind` for the call.
+    /// Blocks the query could not judge (a layout error, a
+    /// still-generic type) and blocks whose type is valid have
+    /// no entry: their assertions are the no-ops code
+    /// generation makes of them. Filled by the driver; empty
+    /// for hand-built bodies.
+    pub validity_panics: Vec<(u32, String)>,
 }
 impl Body {
     pub fn new(
@@ -152,6 +169,7 @@ impl Body {
             coverage_owners: Vec::new(),
             unsize_type_ids: Vec::new(),
             unsize_vtable_methods: Vec::new(),
+            validity_panics: Vec::new(),
         }
     }
     pub fn return_ty(&self) -> Option<&Ty> {

@@ -48,6 +48,7 @@ impl<'a> Interpreter<'a> {
         elem_glue: Option<&crate::ir::DropGlue>,
         receiver_glue: Option<&crate::ir::DropGlue>,
         zeroed_value: Option<&Value>,
+        validity_panic: Option<&str>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -210,7 +211,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("five arguments");
             self.note_forwarded_panic_stamp(frames, stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, generic_type_ids, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue, zeroed_value)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, generic_type_ids, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue, zeroed_value, validity_panic)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -233,6 +234,7 @@ impl<'a> Interpreter<'a> {
         elem_glue: Option<&crate::ir::DropGlue>,
         receiver_glue: Option<&crate::ir::DropGlue>,
         zeroed_value: Option<&Value>,
+        validity_panic: Option<&str>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -4154,6 +4156,27 @@ impl<'a> Interpreter<'a> {
                             value.kind_name(),
                         )),
                     }
+                } else if target == "std::ffi::OsString"
+                    && (generic_first_arg(source, "std::boxed::Box<")
+                        == Some("std::ffi::OsStr")
+                        || generic_first_arg(source, "alloc::boxed::Box<")
+                            == Some("std::ffi::OsStr"))
+                {
+                    // `OsString: From<Box<OsStr>>`: the byte
+                    // string moves out of the box, releasing
+                    // its allocation; the `OsString` value is
+                    // the buffer form over those bytes.
+                    match self.unbox_take(&value) {
+                        Some(pointee) => {
+                            let bytes = self.os_str_bytes(frames, &pointee)?;
+                            Ok(os_string_value(&bytes))
+                        }
+                        _ => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "boxed OS string value",
+                            value.kind_name(),
+                        )),
+                    }
                 } else if target == "std::string::String"
                     && (source == "&str" || source == "&mut str")
                 {
@@ -5659,6 +5682,20 @@ impl<'a> Interpreter<'a> {
                 let s = self.resolve_string(frames, &vals[0])?;
                 let boxed = self.new_box(Value::Str(s));
                 self.record_box_ty(&boxed, Ty::Str);
+                Ok(boxed)
+            }
+            Builtin::OsStringIntoBoxedOsStr => {
+                arity(1)?;
+                let pointee = self.resolve_value(frames, &vals[0])?;
+                let bytes = self.os_string_bytes_any(frames, &pointee)?.ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "an OS string value",
+                        pointee.kind_name(),
+                    )
+                })?;
+                let boxed = self.new_box(Value::Bytes(bytes));
+                self.record_box_ty(&boxed, Ty::Slice(Box::new(Ty::Uint(crate::ir::UintTy::U8))));
                 Ok(boxed)
             }
             Builtin::NoAllocShimMarker => {
@@ -9372,7 +9409,7 @@ impl<'a> Interpreter<'a> {
                     _ => {
                         let x = self.deref_value(frames, &vals[0])?;
                         let y = self.deref_value(frames, &vals[1])?;
-                        self.pointer_distance(&x, &y, generic_args)?
+                        self.pointer_distance(frames, &x, &y, generic_args)?
                     }
                 };
                 match d {
@@ -9394,6 +9431,15 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::MemZeroed => {
                 arity(0)?;
+                // `mem::zeroed`'s own `assert_zero_valid` call
+                // never runs -- this builtin preempts the body --
+                // so a type the compiler's validity check rejects
+                // raises its `panic_nounwind` here, before any
+                // value is materialized (see
+                // `TerminatorKind::CallBuiltin::validity_panic`).
+                if let Some(message) = validity_panic {
+                    return Err(self.validity_assertion_abort(frames, message));
+                }
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 match zeroed_value_for_tag(tag) {
                     Some(value) => Ok(value),
@@ -10045,9 +10091,18 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::AssertValidity => {
                 arity(0)?;
-                // The asserted property is a fact about the type
-                // the conversion already produced; nothing about
-                // the running program can still violate it.
+                // The asserted property is a fact about the
+                // call's type the compiler itself settled (see
+                // `TerminatorKind::CallBuiltin::validity_panic`):
+                // for a type the compiler's validity check
+                // accepts, code generation makes the assertion a
+                // no-op; for one it rejects, code generation
+                // calls `panic_nounwind` with the baked message,
+                // whose report and abort the interpreter
+                // reproduces here.
+                if let Some(message) = validity_panic {
+                    return Err(self.validity_assertion_abort(frames, message));
+                }
                 Ok(Value::Unit)
             }
             Builtin::OverflowChecks => {
@@ -10074,20 +10129,15 @@ impl<'a> Interpreter<'a> {
                         ));
                     }
                 };
-                let fill = byte_fill_value(tag, byte)
+                // A baked value was built at conversion for
+                // exactly this call's constant fill byte (see
+                // `zeroed_value` in `ir`); it covers the shapes
+                // the tag-based constructions below cannot
+                // describe (enums, pointers, tuples).
+                let fill = zeroed_value
+                    .cloned()
+                    .or_else(|| byte_fill_value(tag, byte))
                     .or_else(|| self.wrapped_byte_fill(tag, byte, 0))
-                    .or_else(|| {
-                        // A zero fill over a type the byte
-                        // patterns above cannot describe (an
-                        // enum): conversion baked the value
-                        // the zero pattern denotes (see
-                        // `zeroed_value` in `ir`).
-                        if byte == 0 {
-                            zeroed_value.cloned()
-                        } else {
-                            None
-                        }
-                    })
                     .ok_or_else(|| {
                         unsupported(format!(
                             "write_bytes for {tag} is not runtime-supported"
@@ -10142,6 +10192,29 @@ impl<'a> Interpreter<'a> {
                 // is a buffer being filled, which the indexed path
                 // can create elements in.
                 let dst = self.read_resolved(frames, &target);
+                // A fill over a one-field aggregate's storage (a
+                // `MaybeUninit` union place: the pointer denotes
+                // the payload slot, which shares the place's own
+                // address): when the fill has the slot's shape
+                // rather than the aggregate's, it is the slot's
+                // new content, and writing it whole would strip
+                // the wrapper every later field read expects.
+                if let Ok(v @ Value::Enum { fields, .. }) = &dst {
+                    if fields.len() == 1
+                        && !same_value_shape(&fill, v)
+                        && same_value_shape(&fill, &fields[0])
+                    {
+                        let Value::Enum { variant, .. } = v else {
+                            unreachable!("guard checked the variant")
+                        };
+                        let wrapped = Value::Enum {
+                            variant: *variant,
+                            fields: vec![fill],
+                        };
+                        self.write_resolved(frames, &target, wrapped)?;
+                        return Ok(Value::Unit);
+                    }
+                }
                 // A one-element fill denotes the target whole when
                 // the target is not a sequence (a scalar or wrapper
                 // place: the fill is its new value), and also when
@@ -10156,8 +10229,21 @@ impl<'a> Interpreter<'a> {
                 let whole = n == 1
                     && match &dst {
                         Ok(v @ Value::Tuple(_)) => {
-                            value_leaf_count(v).is_some()
-                                && value_leaf_count(v) == tag_leaf_count(tag)
+                            // The leaf counts agree for the
+                            // ordinary shapes. They disagree
+                            // for the unit/empty-tuple duality
+                            // (the tag counts `()` as one leaf,
+                            // the stored empty tuple as none),
+                            // and the tag's count is
+                            // unmeasurable for an element type
+                            // with no scalar leaves (like
+                            // `[!; 0]`): in both cases the fill
+                            // denotes the target whole exactly
+                            // when it has the target's own
+                            // shape.
+                            (value_leaf_count(v).is_some()
+                                && value_leaf_count(v) == tag_leaf_count(tag))
+                                || same_value_shape(v, &fill)
                         }
                         Ok(Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)) => {
                             false

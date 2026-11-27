@@ -11,16 +11,15 @@ Sparagmos の目標は「Rust 1.100.0 を 99% のレベルで実行できるこ�
 |---|---|
 | 1. MIR バリアント網羅率 | 77.5% (実装済み 31 / 母数 40) |
 | 2(a). 自前コーパスのパス率 | 100% (47 / 47) |
-| 2(b). rustc テストスイート部分集合のパス率 | 88.563% (パス 22,085 / 母数 24,937 の全母数換算) |
+| 2(b). rustc テストスイート部分集合のパス率 | 88.575% (パス 22,088 / 母数 24,937 の全母数換算) |
 | 2(c). rustc 自体の実行 | 未着手 |
 | 参考. コーパスの JIT 経路パス率 | 100% (47 / 47) |
 | 3. std 機能網羅率 | 98.070% (1,677 / 1,710) |
-| 4. テストスイート全体の JIT パス率 | 69.744% (17,392 / 24,937) |
+| 4. テストスイート全体の JIT パス率 | 69.720% (17,386 / 24,937) |
 
-現在の実測値は、Official Measurement run 46002490516 (main ヘッド
-`30cbd2bd`) の結果です。指標2(b) は今回、母数 24,937 件のうち
-24,933 件を判定できました。残る 4 件は windows-gnu クラス分で
-未判定です (詳細は指標2(b) の節)。
+現在の実測値は、Official Measurement run 46015526965 (main ヘッド
+`2e06b0fb`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
+判定できました (詳細は指標2(b) の節)。
 
 ## 指標1: MIR バリアント網羅率
 
@@ -94,58 +93,61 @@ FFI を含むテスト、補助ファイルやビルドステップを要する�
 
 | 判定種別 | 件数 | 判定済み | 現在のパス |
 |---|---|---|---|
-| 実行 (exec) | 4,149 | 4,149 | 3,914 (94.336%) |
-| コンパイル時検証 (compile-check) | 18,332 | 18,331 | 17,946 (97.894%) |
-| 手順 (procedure / run-make) | 551 | 548 | 84 (15.245%) |
+| 実行 (exec) | 4,149 | 4,149 | 3,921 (94.505%) |
+| コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,940 (97.862%) |
+| 手順 (procedure / run-make) | 551 | 551 | 86 (15.608%) |
 | デバッガ実行 (exec-debugger) | 170 | 170 | 141 (82.941%) |
 | rustdoc 検証 | 1,735 | 1,735 | 0 |
-| 合計 | 24,937 | 24,933 | **22,085** |
+| 合計 | 24,937 | 24,937 | **22,088** |
 
-パス率は全母数換算で **88.563%** (22,085 / 24,937) です。パスして
-いないのは 2,852 件で、判定済みの失敗 2,848 件と未判定 4 件から
-なります (種別ごとの残りは、実行 235、コンパイル時検証 386、
-rustdoc 検証 1,735、手順 467、デバッガ実行 29)。
+パス率は全母数換算で **88.575%** (22,088 / 24,937) です。パスして
+いないのは 2,849 件で、全て判定済みの失敗です (種別ごとの残りは、
+実行 228、コンパイル時検証 392、rustdoc 検証 1,735、手順 465、
+デバッガ実行 29)。
 
-#### Windows 4 件の未判定について
+#### Windows クラスの判定について
 
-今回の計測では、Windows 両クラス (windows-msvc 72 件、windows-gnu
-9 件、計 81 件) のドライバは正常にビルドでき、81 件のうち 77 件を
-判定できました。残る windows-gnu の 4 件が未判定です。原因は
-ドライバではなく、計測前の検証ステップ (Verify the gnu-hosted
-toolchain is the default) の EPIPE 競合です。`rustc -vV | grep -q`
-の grep がマッチ直後にパイプを閉じるため rustc が broken pipe
-(os error 232) で panic し、該当シャードの計測ステップ自体が
-実行されませんでした。再実行で解消する種類の CI フレークです。
-未判定の 4 件は `tests/run-make/mingw-export-call-convention`、
+Windows 両クラス (windows-msvc 72 件、windows-gnu 9 件、計 81 件)
+は、ネイティブの Windows ランナー上でビルドしたドライバで判定して
+います。今回の計測では 81 件すべてを判定できました。そのうち
+windows-gnu の次の 4 件は失敗として判定されています:
+`tests/run-make/mingw-export-call-convention`、
 `tests/run-make/raw-dylib-custom-dlltool`、
-`tests/run-make/windows-gnu-corrupt-drective` (いずれも手順) と
+`tests/run-make/windows-gnu-corrupt-drective` (いずれも手順、
+stage-3 のサポートビルド失敗) と
 `tests/ui/linkage-attr/raw-dylib/windows/dlltool-failed.rs`
-(コンパイル時検証) です。これら 4 件はパスでも判定済みの失敗でも
-なく、上の表の「判定済み」列には含まれません。
+(コンパイル時検証、失敗すべきテストでの compiler crash) です。
 
 #### 前回確定値との差分
 
-前回の確定値 (run 45986310798) と両方で判定できた範囲の差分は
-gain 59 / loss 4 です。効果分離では、Windows 両クラスの新規判定
-77 件のうちパスは 3 件です。既に判定できていた範囲の gain 59 件は、
-手順の extern / 成果物バインディング家族である PR #845 が 32 件、
-前回失敗していたレコードの回復が 3 件 (PR #829 が 2 件、PR #824 の
-調停が 1 件)、その他の実装が 24 件で、新規 loss 4 件を引いた
-net は +55 件です。前回の loss のうち
-`tests/ui/codegen/init-large-type.rs` (exec) と
-`tests/ui/codegen/issue-28950.rs` (exec) は PR #829 で回復しました。
-`tests/ui/codegen/normalization-overflow/recursion-issue-118590.rs`
-(compile-check) の修正である PR #857 は、この run の開始後に
-マージされたため本 run には含まれず、次回で回復する見込みです。
-新規の loss 4 件は帰属が未証明でトリアージ中です:
+前回の確定値 (run 46011330082) と両方で判定できた範囲の差分は
+gain 1 / loss 0 です。唯一の gain は PR #832 の対象レコード
+`tests/ui/intrinsics/panic-uninitialized-zeroed.rs` (実行) で、
+`mem::zeroed` / `mem::uninitialized` / `assume_init` に対する
+zero/uninit validity 強制が公式計測でも確認されました。head 間隔の
+他の PR (#872、#874、#875、#877、#847、#876) は今回の公式値に
+flip を生みませんでした。以前の run で新規 loss となった 14 件は
+今回も全て同じ理由で失敗しています:
 `tests/ui/limits/vtable-try-as-dyn.rs` (コンパイル時検証、
-no-debuginfo リビジョンで compiler crash。指標4の唯一の loss でも
-あります)、
+no-debuginfo リビジョンで compiler crash)、
 `tests/ui/macros/rfc-2011-nicer-assert-messages/feature-gate-generic_assert.rs`
 (実行、終了コード不一致)、
-`tests/ui/panics/issue-47429-short-backtraces.rs` (実行、標準エラー
-不一致)、`tests/ui/panics/runtime-switch.rs` (実行、標準エラー
-不一致)。
+`tests/ui/panics/issue-47429-short-backtraces.rs`、
+`tests/ui/panics/runtime-switch.rs` (いずれも実行、標準エラー不一致)、
+`tests/run-make/prefer-rlib` (手順、レシピ失敗)、
+`tests/ui-fulldeps/internal-lints/` 配下の 4 件
+(`direct-use-of-rustc-type-ir.rs`、`import-of-type-ir-inherent.rs`、
+`import-of-type-ir-traits.rs`、
+`non_glob_import_of_type_ir_inherent.rs`、いずれもコンパイル時検証、
+失敗すべきテストでの compiler crash)、
+`tests/ui/lifetimes/issue-91763.rs`、
+`tests/ui/lint/redundant-semicolon/redundant-semi-proc-macro.rs`、
+`tests/ui/suggestions/issue-61963.rs` (いずれもコンパイル時検証、
+同種の compiler crash)、`tests/ui/threads-sendsync/mpsc_stress.rs`
+(実行、タイムアウト)、
+`tests/ui/traits/next-solver/overflow/recursion-limit-zero-issue-115351.rs`
+(コンパイル時検証、成功すべきテストで再帰上限超過) です。
+これら 14 件は帰属が未証明でトリアージ中です。
 
 #### パスの定義
 
@@ -216,8 +218,7 @@ by-value 反復 (IntoIter) も要素型ごとのレイアウトで実行でき�
 変換済みプログラムにその関数の本体が含まれるか、インタプリタの
 ビルトインとして解決できること。現在 **1,677 / 1,710 (98.070%)**。
 全プログラムで本体が揃うことを要求する厳密値では 1,661 / 1,710 (97.135%)
-です。母数が前回から 1 件減ったのは、`std::vec::IntoIter::<T, A>::as_slice`
-が出現集合から外れた構成変化によるもので、共通項目の flip は 0 件です。
+です。母数と項目集合は前回と同一で、共通項目の flip は 0 件です。
 
 ## 指標4: テストスイート全体の JIT パス率
 
@@ -237,11 +238,10 @@ procedure / exec-debugger / rustdoc のレコードは現在 JIT 経路では
 
 ### 現在値
 
-**17,392 / 24,937 (69.744%)**。内訳はコンパイル時検証
-15,964 / 18,332、実行 1,428 / 4,149 で、procedure / exec-debugger /
-rustdoc の nature は 0 件です。前回の確定値との差分は gain 7 /
-loss 1 で、loss の1件は `tests/ui/limits/vtable-try-as-dyn.rs`
-(コンパイル時検証) で、指標2(b) の新規 loss と同一レコードです。主な失敗要因は、JIT ロワリング未対応 (その他) と、
+**17,386 / 24,937 (69.720%)**。内訳はコンパイル時検証
+15,958 / 18,332、実行 1,428 / 4,149 で、procedure / exec-debugger /
+rustdoc の nature は 0 件です。前回の確定値との差分は gain 0 /
+loss 0 で、値と内訳は前回と同一です。主な失敗要因は、JIT ロワリング未対応 (その他) と、
 変換済み本体を持たない関数への呼び出しです。この値は、未対応の
 呼び出しを到達時点で失敗するトラップとして下げ、String をヒープ
 機構で処理する現在の jit-compile の意味論のもとで測ったものです。

@@ -479,6 +479,14 @@ pub enum Builtin {
     /// string model can serve; the box over the string value
     /// itself is the same observable value.
     StringIntoBoxedStr,
+    /// `OsString::into_boxed_os_str(OsString) -> Box<OsStr>`:
+    /// the OS string's bytes in a fresh box allocation, the
+    /// counterpart of `StringIntoBoxedStr`. The collected body
+    /// rebuilds the box from the buffer's raw parts, which the
+    /// OS-string model cannot serve; the box over the byte
+    /// value itself is the same observable value (in this
+    /// model an `OsStr` is its byte string).
+    OsStringIntoBoxedOsStr,
     /// `Vec::into_boxed_slice(Vec<T>) -> Box<[T]>`: the element
     /// aggregate in a fresh box allocation, for the same reason
     /// as `String::into_boxed_str`.
@@ -1572,10 +1580,12 @@ pub enum Builtin {
     /// about the generic type — that it is inhabited, that its
     /// all-zero bit pattern is a valid value, that it may be left
     /// uninitialized. Code generation keeps each as a no-op for
-    /// exactly the types that satisfy the property, and a
-    /// violation is undefined behaviour in the guest, so a
-    /// converted program that reaches one has nothing observable
-    /// left for the interpreter to check.
+    /// exactly the types that satisfy the property and answers
+    /// the rest with a `panic_nounwind` carrying the check's
+    /// message; conversion bakes that verdict per call site
+    /// (see `TerminatorKind::CallBuiltin::validity_panic`), and
+    /// the builtin raises it, or serves the no-op when no
+    /// verdict was baked.
     AssertValidity,
     /// `std::intrinsics::overflow_checks`: whether the
     /// *instantiating* crate was compiled with overflow checks.

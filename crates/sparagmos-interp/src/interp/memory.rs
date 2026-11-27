@@ -475,6 +475,129 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The declared type of the whole position `target`
+    /// denotes, when the copy machinery can name it: a whole
+    /// place's declared local type, a whole allocation's
+    /// recorded creation type, a whole static's recorded type.
+    /// A projected target denotes the position its projection
+    /// names (a sequence element, a field), whose value the
+    /// read has already denominated, and an element block's
+    /// slots are its elements by construction, so both are
+    /// `None` here: no denomination is owed for them.
+    fn copy_source_place_ty(&self, frames: &[Frame], target: &Resolved) -> Option<Ty> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } if projection.is_empty() => frames
+                .get(*frame_pos)
+                .and_then(|f| self.program.get(&f.func))
+                .and_then(|b| b.local_ty(Local(*local)))
+                .cloned(),
+            Resolved::Alloc { id, projection }
+                if projection.is_empty() && !self.is_elem_block(*id) =>
+            {
+                self.alloc_ty(*id)
+            }
+            Resolved::Static { name, projection } if projection.is_empty() => {
+                self.program.static_tys.get(name).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The first element a `src_single` copy moves, and
+    /// whether it was peeled out of a wrapper the source
+    /// pointer names. The pointer names the element itself
+    /// whenever the source target denotes the element (an
+    /// element position, or a whole place / allocation /
+    /// static OF the element type): the value found there IS
+    /// the element, in whatever form it stands -- its own
+    /// one-field layers are part of the element (an
+    /// `OsString`'s `Buf` layer, its buffer's `NonNull`), not
+    /// a wrapper around it, so the snapshot keeps the value
+    /// whole. (The shape-based unwrap cannot tell those layers
+    /// from a wrapper: it peeled an `OsString` element down to
+    /// its inner `Vec`, and neither the destination-side
+    /// rewrap -- which counts the destination's old occupant's
+    /// chain, a different form of the same type -- nor the
+    /// sequence write rebuilt them, so the copied element was
+    /// a hybrid no consumer recognises: equality against an
+    /// intact element answered false, and `Deref` / `cmp`
+    /// stopped on it.) Only a whole position of a DIFFERENT
+    /// type wraps the element (a transparent wrapper place a
+    /// cast pointer names): the element is its field-0 core,
+    /// reached by descending while the denoting type differs
+    /// from the element type, walking the declared field
+    /// types, so the descent stops at the element type and
+    /// never enters the element's own layers. A shape the
+    /// walk cannot denominate keeps the shape-based core
+    /// (`copy_unwrap`), as before.
+    fn copy_snapshot_first(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        value: &Value,
+        elem: &Ty,
+    ) -> (Value, bool) {
+        let Some(place_ty) = self.copy_source_place_ty(frames, target) else {
+            return (value.clone(), false);
+        };
+        if place_ty == *elem {
+            return (value.clone(), false);
+        }
+        let mut current_ty = place_ty;
+        let mut current = value;
+        while current_ty != *elem {
+            let Some(field_ty) = self.adt_field_ty(&current_ty, 0, 0) else {
+                return (self.copy_unwrap(value).clone(), true);
+            };
+            match current {
+                Value::Enum {
+                    variant: 0,
+                    fields,
+                } if fields.len() == 1 => {
+                    current = &fields[0];
+                    current_ty = field_ty;
+                }
+                _ => return (self.copy_unwrap(value).clone(), true),
+            }
+        }
+        (current.clone(), true)
+    }
+
+    /// The denomination a sequence element read out of storage
+    /// takes for a copy whose element type is `elem`: an element
+    /// stored in a `MaybeUninit` slot arrives in the union form
+    /// over its payload — the slot's own denomination — while
+    /// the copy moves the payload itself, denominated in the
+    /// element type. The judgement mirrors the single-element
+    /// path's (`copy_unwrap` over `value_fits_ty`): the wrapper
+    /// peels only when the wrapped value is not itself a value
+    /// of the element type but its core is, so a genuine
+    /// one-field aggregate element (which fits its ADT type as
+    /// it stands) is never peeled. A union over uninitialized
+    /// content denominates to the uninitialized marker: an
+    /// untouched slot's payload is uninitialized content, not a
+    /// value of the element type.
+    fn copy_denominate(&self, unit: Value, elem: Option<&Ty>) -> Value {
+        let Some(ty) = elem else {
+            return unit;
+        };
+        if value_fits_ty(&unit, ty) {
+            return unit;
+        }
+        let core = self.copy_unwrap(&unit);
+        if matches!(core, Value::Uninit) {
+            return Value::Uninit;
+        }
+        if value_fits_ty(core, ty) {
+            return core.clone();
+        }
+        unit
+    }
+
     /// `elem` is the copy's element type when the call site knows
     /// it (both call paths take it from the pointer operands'
     /// declared types); with `None` the copy reads the element
@@ -711,6 +834,13 @@ impl<'a> Interpreter<'a> {
                 // packs over).
                 let packed_elems = elem
                     .and_then(|e| self.packed_scalar_elems(&src_base, e, n));
+                // Whether the first element's snapshot was
+                // peeled out of a wrapper the source pointer
+                // names (see `copy_snapshot_first`): only a
+                // peeled element is ever rewrapped at the
+                // destination; an element the source denotes
+                // directly is stored as it stands.
+                let mut first_peeled = true;
                 let elems: Vec<Value> = if let Some(packed) = packed_elems {
                     packed
                 } else if src_single {
@@ -722,9 +852,18 @@ impl<'a> Interpreter<'a> {
                             elems.push(maybe_uninit_form(unit));
                         }
                     } else {
-                        elems.push(self.copy_unwrap(&src_base).clone());
+                        let (first, peeled) = match elem {
+                            Some(ty) => {
+                                self.copy_snapshot_first(frames, &src_target, &src_base, ty)
+                            }
+                            None => (self.copy_unwrap(&src_base).clone(), true),
+                        };
+                        first_peeled = peeled;
+                        elems.push(first);
                         for i in 1..n {
-                            elems.push(self.read_seq_at_with_elem(frames, &src_target, i, elem)?);
+                            let unit =
+                                self.read_seq_at_with_elem(frames, &src_target, i, elem)?;
+                            elems.push(self.copy_denominate(unit, elem));
                         }
                     }
                     elems
@@ -745,7 +884,7 @@ impl<'a> Interpreter<'a> {
                         let unit = if mu_elem {
                             maybe_uninit_form(unit)
                         } else {
-                            unit
+                            self.copy_denominate(unit, elem)
                         };
                         elems.push(unit);
                     }
@@ -826,7 +965,7 @@ impl<'a> Interpreter<'a> {
                     let cur_is_element = match &dst_place_ty {
                         Some(_) => dst_place_ty.as_ref() == elem || !src_single,
                         None => match elem {
-                            Some(_) => !src_single,
+                            Some(_) => !src_single || !first_peeled,
                             None => true,
                         },
                     };
@@ -2061,6 +2200,31 @@ impl<'a> Interpreter<'a> {
         self.read_resolved_ref_typed(frames, target, None)
     }
 
+    /// [`read_resolved`] for a caller that only inspects the
+    /// value -- its form, its length, the shape of a field --
+    /// and never consumes it: the borrowed read where it can
+    /// judge the position, so an aggregate the caller only
+    /// looks at is lent, not cloned; the owned read where the
+    /// borrowed one declines, so the value seen is the owned
+    /// read's in every case the borrowed read cannot judge.
+    /// The judgment reads of place resolution (the storage /
+    /// wrapper probes of the dereference walk), the fat-length
+    /// fallback of borrow formation, the raw-parts base
+    /// denomination, and the vector append form check read
+    /// through this: a probe that cloned the whole buffer on
+    /// every element access made every access cost the
+    /// buffer's length.
+    pub(crate) fn read_resolved_peek<'x>(
+        &self,
+        frames: &'x [Frame],
+        target: &Resolved,
+    ) -> InterpResult<Cow<'x, Value>> {
+        match self.read_resolved_ref(frames, target) {
+            Ok(value) => Ok(value),
+            Err(_) => self.read_resolved(frames, target).map(Cow::Owned),
+        }
+    }
+
     /// [`read_resolved_ref`] with the declared type of the
     /// place being read (see [`read_resolved_typed`]).
     pub(crate) fn read_resolved_ref_typed<'x>(
@@ -2744,48 +2908,72 @@ impl<'a> Interpreter<'a> {
         // path canonicalises it, so the steps walked are the
         // steps the store will navigate.
         let effective;
-        let (root, projection): (Resolved, &[RefProj]) = match target {
+        let projection: &[RefProj] = match target {
             Resolved::Alloc { id, projection } => {
                 effective = self.elem_block_projection(*id, projection);
-                (
-                    Resolved::Alloc {
-                        id: *id,
-                        projection: Vec::new(),
-                    },
-                    &effective,
-                )
+                &effective
             }
-            Resolved::Place {
-                frame_pos,
-                local,
-                projection,
-            } => (
-                Resolved::Place {
-                    frame_pos: *frame_pos,
-                    local: *local,
-                    projection: Vec::new(),
-                },
-                projection,
-            ),
-            Resolved::Static { name, projection } => (
-                Resolved::Static {
-                    name: name.clone(),
-                    projection: Vec::new(),
-                },
-                projection,
-            ),
+            Resolved::Place { projection, .. } => projection,
+            Resolved::Static { projection, .. } => projection,
             Resolved::Value(..) => return None,
         };
         if projection.is_empty() {
             return None;
         }
-        let root_value = self.read_resolved(frames, &root).ok()?;
+        // The root value the walk starts from, borrowed from
+        // its store rather than read owned: this probe runs on
+        // every projected write, and an owned read of the root
+        // clones the whole aggregate or allocation each time --
+        // a sequence of single-element writes into a large
+        // buffer (a hash table's bucket array, copied bucket by
+        // bucket) then pays the buffer's whole size per element
+        // written, which is the superlinear per-step cost the
+        // long-running hash-table programs met (issue #399).
+        // The borrowed walk sees exactly the value the owned
+        // read produced: a root holding the uninitialised
+        // marker is the one case the owned read does not hand
+        // back -- it fails, or substitutes a place local's
+        // zero-sized value -- so both are reproduced here.
+        let alloc_store;
+        let static_store;
+        let zst_root;
+        let root_value: &Value = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let stored = frame.locals.get(*local)?;
+                if *stored == Value::Uninit {
+                    zst_root = self.zst_local_value(frame, *local)?;
+                    &zst_root
+                } else {
+                    stored
+                }
+            }
+            Resolved::Static { name, .. } => {
+                static_store = self.statics.borrow();
+                let stored = static_store.get(name)?;
+                if *stored == Value::Uninit {
+                    return None;
+                }
+                stored
+            }
+            Resolved::Alloc { id, .. } => {
+                alloc_store = self.allocs.borrow();
+                let stored = alloc_store.get(id)?;
+                if *stored == Value::Uninit {
+                    return None;
+                }
+                stored
+            }
+            Resolved::Value(..) => unreachable!(),
+        };
         // The walk, staged exactly as `project_value_ref_t`
         // stages it: a step that materialises a value (a
         // sub-slice, a union field) stages it in `stage`, and
         // the walk continues into the staged value.
         let mut stage: Option<Value> = None;
-        let mut cur: &Value = &root_value;
+        let mut cur: &Value = root_value;
         for (i, step) in projection.iter().enumerate() {
             if matches!(step, RefProj::Index(_)) {
                 // The pointer this step crosses, when its input

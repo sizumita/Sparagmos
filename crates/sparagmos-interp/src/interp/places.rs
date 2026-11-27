@@ -1329,8 +1329,8 @@ impl<'a> Interpreter<'a> {
         };
         let mut rebased = resolved.clone();
         projection_of_mut(&mut rebased).pop();
-        let stored = self.read_resolved(frames, &rebased).ok()?;
-        let total = match &stored {
+        let stored = self.read_resolved_peek(frames, &rebased).ok()?;
+        let total = match &*stored {
             Value::Tuple(items) => items.len() as u64,
             Value::Bytes(bytes) => bytes.len() as u64,
             Value::SparseVec { len, .. } => {
@@ -1397,10 +1397,10 @@ impl<'a> Interpreter<'a> {
         {
             return rebased;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let stored_len = match &stored {
+        let stored_len = match &*stored {
             Value::Tuple(items) => items.len() as u64,
             Value::Bytes(bytes) => bytes.len() as u64,
             Value::SparseVec { len, .. } => {
@@ -1435,10 +1435,10 @@ impl<'a> Interpreter<'a> {
         if len == 1 {
             return resolved;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Tuple(items) = &stored else {
+        let Value::Tuple(items) = &*stored else {
             return resolved;
         };
         if items.len() == 1
@@ -1590,10 +1590,10 @@ impl<'a> Interpreter<'a> {
         if !scalar_pointee {
             return false;
         }
-        let Ok(value) = self.read_resolved(frames, resolved) else {
+        let Ok(value) = self.read_resolved_peek(frames, resolved) else {
             return false;
         };
-        matches!(value, Value::Tuple(_) | Value::Bytes(_))
+        matches!(&*value, Value::Tuple(_) | Value::Bytes(_))
     }
 
     fn peel_maybe_uninit_entry(
@@ -1608,6 +1608,26 @@ impl<'a> Interpreter<'a> {
         {
             return resolved;
         }
+        // Whether this position is an element of the sequence
+        // a slice pointee spans: a slice payload is the whole
+        // sequence, so a wrapper can only sit at the position
+        // of the sequence itself, while the base a fat
+        // dereference resolves to is denominated at its first
+        // element -- a position ending in an element step. The
+        // refusal this flag drives is scoped to the
+        // live-payload entry below; see there.
+        let at_slice_element = matches!(pointee, Ty::Slice(_)) && {
+            let projection = match &resolved {
+                Resolved::Place { projection, .. }
+                | Resolved::Static { projection, .. }
+                | Resolved::Alloc { projection, .. }
+                | Resolved::Value(_, projection) => projection,
+            };
+            matches!(
+                projection.last(),
+                Some(RefProj::Index(_)) | Some(RefProj::Subslice { .. })
+            )
+        };
         // The position's own declared type, where the model
         // records it, outranks the stored form: a place with no
         // projection is its home local itself, whose declared
@@ -1674,10 +1694,10 @@ impl<'a> Interpreter<'a> {
         if home_is_foreign_adt {
             return resolved;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Enum { variant, fields } = &stored else {
+        let Value::Enum { variant, fields } = &*stored else {
             return resolved;
         };
         // The payload sits in the wrapper's first field. A
@@ -1698,6 +1718,26 @@ impl<'a> Interpreter<'a> {
             return resolved;
         };
         if *field != Value::Uninit {
+            // At an element position of a slice the stored
+            // enum may be the element itself: an element held
+            // in enum form whose first field is a tuple of
+            // values that fit the element type is
+            // indistinguishable from the payload of the wrapper
+            // by the evidence below, but it is the own value of
+            // the position, never a wrapper around the
+            // sequence. A sized payload (an array) can itself
+            // be an element of an outer sequence, so this
+            // refusal is for the slice alone. The raw-form
+            // entry further below is not refused: its skeleton
+            // (a never-written first member, one live member in
+            // one-field form) is the shape a field-by-field
+            // write through a union's declared members leaves
+            // behind, and its payload must match the whole
+            // slice type, which an element's own member does
+            // not hold.
+            if at_slice_element {
+                return resolved;
+            }
             if !self.wrapper_payload_matches(field, *variant, pointee, fields.len()) {
                 return resolved;
             }
@@ -1754,10 +1794,10 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         resolved: Resolved,
     ) -> Resolved {
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Enum { fields, .. } = &stored else {
+        let Value::Enum { fields, .. } = &*stored else {
             return resolved;
         };
         let Some(field) = fields.first() else {
@@ -2029,6 +2069,17 @@ impl<'a> Interpreter<'a> {
             return matches!(value, Value::Tuple(_) | Value::Bytes(_) | Value::Str(_));
         }
         if tag.starts_with('&') || tag.starts_with('*') {
+            // A bare string value is the stored form of an
+            // `&str` field (the same representation
+            // `value_fits_ty` blesses for a reference-to-`str`
+            // position): the element is the string data,
+            // re-formed as a reference by the declared type on
+            // ordinary reads, so it is a plausible value of a
+            // reference-to-`str` field alongside the reference
+            // forms themselves.
+            if matches!(value, Value::Str(_)) && tag_pointee(tag) == Some("str") {
+                return true;
+            }
             return matches!(
                 value,
                 Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
@@ -2181,7 +2232,7 @@ impl<'a> Interpreter<'a> {
         // The base must currently hold a vector value: a
         // wrapper-typed reference over any other storage is an
         // ordinary aggregate reference.
-        let held = self.read_resolved(frames, &base)?;
+        let held = self.read_resolved_peek(frames, &base)?;
         if crate::builtins::vec_stored_len(&held).is_none() {
             return Ok(None);
         }
@@ -2222,18 +2273,23 @@ impl<'a> Interpreter<'a> {
     /// payload the type tracking could not name (see the
     /// `buf_suspect` state in `resolve_place_mode`).
     fn suspected_vec_position(&self, frames: &[Frame], pos: &Resolved) -> bool {
-        match self.read_resolved(frames, pos) {
-            Ok(Value::SparseVec { .. }) => true,
-            Ok(Value::Enum { fields, .. }) => Self::fields_form_element_list(&fields),
-            _ => false,
+        match self.read_resolved_peek(frames, pos) {
+            Ok(value) => match &*value {
+                Value::SparseVec { .. } => true,
+                Value::Enum { fields, .. } => Self::fields_form_element_list(fields),
+                _ => false,
+            },
+            Err(_) => false,
         }
     }
 
     fn vec_position_materialised(&self, frames: &[Frame], pos: &Resolved) -> bool {
-        matches!(
-            self.read_resolved(frames, pos),
-            Ok(Value::Enum { .. } | Value::SparseVec { .. })
-        )
+        match self.read_resolved_peek(frames, pos) {
+            Ok(value) => {
+                matches!(&*value, Value::Enum { .. } | Value::SparseVec { .. })
+            }
+            Err(_) => false,
+        }
     }
 
     /// Whether an aggregate's fields form an element list
@@ -2338,7 +2394,7 @@ impl<'a> Interpreter<'a> {
         // two-element slice (the array clone guard's partial drop)
         // for the slice's storage.
         if let Some((container, base)) = entered_element_container(cur) {
-            if let Ok(value) = self.read_resolved(frames, &container) {
+            if let Ok(value) = self.read_resolved_peek(frames, &container) {
                 if let Some(count) = value.len() {
                     if base as u128 + fat_len <= count {
                         return false;
@@ -2356,7 +2412,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        match self.read_resolved(frames, cur) {
+        match self.read_resolved_peek(frames, cur) {
             // The position denotes the slice's storage only when
             // the value there is the aggregate whose elements the
             // slice ranges over. A fat pointer or string value at
@@ -2366,12 +2422,12 @@ impl<'a> Interpreter<'a> {
             // `len()` reports the length it carries, not a
             // storage element count, and judging by it appended a
             // second index step that read into the element.
-            Ok(
-                value @ (Value::Tuple(_)
-                | Value::Enum { .. }
-                | Value::SparseVec { .. }),
-            ) => value.len() == Some(fat_len),
-            Ok(_) => false,
+            Ok(value) => {
+                matches!(
+                    &*value,
+                    Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
+                ) && value.len() == Some(fat_len)
+            }
             Err(_) => false,
         }
     }
@@ -2932,6 +2988,24 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
         }
     }
     None
+}
+
+/// The pointee a reference type tag denotes: the tag past
+/// the leading `&` / `*`, an optional `mut` / `const` of a
+/// raw pointer, and an optional lifetime (`&'static str`
+/// denotes `str`, as do `&str` and `*const str`).
+fn tag_pointee(tag: &str) -> Option<&str> {
+    let rest = tag.strip_prefix('&').or_else(|| tag.strip_prefix('*'))?;
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix("mut ")
+        .or_else(|| rest.strip_prefix("const "))
+        .unwrap_or(rest);
+    let rest = match rest.strip_prefix('\'') {
+        Some(lt) => lt.split_once(' ').map_or(lt, |(_, tail)| tail),
+        None => rest,
+    };
+    Some(rest.trim())
 }
 
 /// A resolved target descended through a one-field wrapper's

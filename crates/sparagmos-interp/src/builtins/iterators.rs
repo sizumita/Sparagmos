@@ -5459,7 +5459,7 @@ impl<'a> Interpreter<'a> {
         let front = self.deref_value(frames, front).ok()?;
         let end = self.deref_value(frames, end).ok()?;
         let args = [elem_tag.to_string()];
-        let distance = self.pointer_distance(&end, &front, &args).ok()??;
+        let distance = self.pointer_distance(frames, &end, &front, &args).ok()??;
         u64::try_from(distance).ok()
     }
 
@@ -7268,8 +7268,15 @@ pub fn iterator_consumer_modelled(self_ty: &str) -> bool {
 /// Whether the modelled `DoubleEndedIterator::next_back` step
 /// transitions this iterator type's state directly: the leaf
 /// shapes of `iterator_next_back_state` plus the `IterMut`
-/// state the back step serves in `next_back_on_state`. Adapter
-/// types are absent on purpose — their collected bodies
+/// state the back step serves in `next_back_on_state`. The
+/// string `Drain` state is served there too (through
+/// `string_drain_next_state`, which normalizes a storage-backed
+/// `Chars` state before stepping it); its collected body is
+/// not the primary execution, because the body forwards the
+/// drain's stored `Chars` state to the `Chars` back step
+/// without that normalization, and the step's snapshot reader
+/// cannot read storage-backed pointers. Adapter types are
+/// absent on purpose — their collected bodies
 /// compose the modelled steps and stay the primary execution
 /// (see `consumer_instance_needs_body` in the driver).
 pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
@@ -7316,6 +7323,8 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
+        || self_ty.starts_with("std::string::Drain")
+        || self_ty.starts_with("alloc::string::Drain")
     {
         return true;
     }
@@ -8753,6 +8762,25 @@ fn slice_iter_snapshot_bytes(state: &Value, self_ty: &str) -> InterpResult<Vec<u
     };
     let mut bytes = Vec::with_capacity(items.len());
     for item in &items {
+        // An element stored through the buffer's union view
+        // (the `MaybeUninit<u8>` spare-capacity region a
+        // `join` / `concat` fill writes through, whose stored
+        // elements a drain's converted construction snapshots
+        // verbatim) keeps the union's one-field form in the
+        // snapshot; the element is the byte it holds -- the
+        // same per-element peel the string readers apply
+        // (`string_from_element_form`,
+        // `string_from_real_aggregate`). The peel is one
+        // level, exactly as in those readers, and the peeled
+        // element faces the same byte judgement as a bare
+        // one, so every other shape keeps its rejection.
+        let item = match item {
+            Value::Enum {
+                variant: 0,
+                fields,
+            } if fields.len() == 1 => &fields[0],
+            other => other,
+        };
         match item {
             Value::Uint(v) => bytes.push(u8::try_from(*v).map_err(|_| {
                 InterpError::type_mismatch(

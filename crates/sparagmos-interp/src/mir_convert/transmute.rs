@@ -459,7 +459,11 @@ impl<'a> Converter<'a> {
     /// * scalar or thin pointer <-> union: the bit
     ///   reinterpretation between the leaf shape and the
     ///   storage shape of the union field whose own shape
-    ///   is the leaf's;
+    ///   is the leaf's; a union with no leaf-matching field
+    ///   shape takes the shape derived from its field types
+    ///   and its total size (`union_transmute_shape`), and a
+    ///   pointer constant (the form a raw pointer takes at
+    ///   higher opt levels) carries the thin-pointer shape;
     /// * a byte-string constant in pointer position (it
     ///   carries no place type) -> a thin pointer or a
     ///   transparent wrapper over one: const propagation
@@ -502,6 +506,14 @@ impl<'a> Converter<'a> {
             .operand_place_ty(body, operand)
             .or_else(|| match constant_recorded_ty(operand) {
                 Some(t @ mir::Ty::Adt(..)) => Some(t),
+                // An array constant likewise: its element
+                // kind and length are not recoverable from
+                // the converted value alone (a tuple constant
+                // does not say whether its elements are the
+                // leaves of the array or a regrouping of
+                // them), and the stream arms below key on
+                // the recorded array type.
+                Some(t @ mir::Ty::Array(..)) => Some(t),
                 _ => None,
             });
         // A byte-string constant in pointer position carries no
@@ -578,9 +590,13 @@ impl<'a> Converter<'a> {
         // result this does not reproduce (fieldless enums carry
         // no scalar shape, and the bare pointer pairs are claimed
         // by their own arms before this one is reached).
-        let shape_to = self.scalar_shape(target, 0);
+        let shape_to = self.scalar_shape(target, 0).or_else(|| {
+            self.union_transmute_shape_for_ty(target)
+        });
         let shape_from = match &src {
-            Some(s) => self.scalar_shape(s, 0),
+            Some(s) => self.scalar_shape(s, 0).or_else(|| {
+                self.union_transmute_shape_for_ty(s)
+            }),
             // A constant operand carries no place type; its
             // shape comes from the constant itself (see
             // `constant_scalar_shape`).
@@ -1648,14 +1664,36 @@ let inner = match (&src, target) {
                             None => unsupported(),
                         }
                     }
-                    _ => match (self.zst_value(src.as_ref().unwrap(), 0), self.zst_value(target, 0)) {
-                        (Some(_), Some(tv)) => match value_to_constant(&tv) {
-                            Some(c) => {
-                                ir::Rvalue::Use(ir::Operand::Constant(c))
+                    _ => match self.stream_regroup_rvalue(
+                        &mir::Ty::Adt(def.clone(), args.clone()),
+                        target,
+                        v,
+                    ) {
+                        // A one-payload wrapper over an array
+                        // transmuted to another such wrapper
+                        // (Mu64([u64; 4]) -> Mf64([f64; 4])):
+                        // the bit-stream reinterpretation over
+                        // the two payload streams, at any total
+                        // width -- the whole-shape budget caps
+                        // the generic path at 128 bits and the
+                        // array arms below require an array on
+                        // at least one side, so a wrapper pair
+                        // has no other conversion.
+                        Some(rv) => rv,
+                        None => match (
+                            self.zst_value(src.as_ref().unwrap(), 0),
+                            self.zst_value(target, 0),
+                        ) {
+                            (Some(_), Some(tv)) => {
+                                match value_to_constant(&tv) {
+                                    Some(c) => ir::Rvalue::Use(
+                                        ir::Operand::Constant(c),
+                                    ),
+                                    None => unsupported(),
+                                }
                             }
-                            None => unsupported(),
+                            _ => unsupported(),
                         },
-                        _ => unsupported(),
                     },
                 }
             }
@@ -2401,6 +2439,76 @@ let inner = match (&src, target) {
         Some((leaf, storage))
     }
 
+    /// The scalar shape of a union type for the transmute
+    /// path, derived from the union field types and the
+    /// ADT total size: the payload is the first field whose
+    /// own scalar shape spans the whole storage of the union
+    /// (its width is the total size the layout records), every
+    /// zero-sized field is a fill constant, and every other
+    /// field is left uninit -- the same one-live-field
+    /// convention [`Self::union_storage_shape`] uses. The
+    /// generic scalar-shape path cannot select this shape:
+    /// a union with several scalar-shaped fields is not a
+    /// one-payload struct, and the multi-field shape it would
+    /// try next reads the per-field layout offsets, which
+    /// unions have no entry for (their fields share one
+    /// offset). `None` when the union has no layout entry, its
+    /// total width is outside the reinterpretation budget, or
+    /// no field spans the whole storage.
+    fn union_transmute_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::ScalarShape> {
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let (size, _) = self.adt_layouts.get(&tag)?;
+        let total_bits = size.checked_mul(8)?;
+        if total_bits == 0 || total_bits > 128 {
+            return None;
+        }
+        let total_bits = total_bits as u32;
+        let mut payload: Option<(u32, ir::ScalarShape)> = None;
+        let mut fill = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            match self.scalar_shape(fty, 0) {
+                Some(fs) if fs.bits() == total_bits && payload.is_none() => {
+                    payload = Some((i as u32, fs));
+                }
+                Some(fs) if fs.bits() == 0 => {
+                    let zv = self.zst_value(fty, 0)?;
+                    fill.push((i as u32, value_to_constant(&zv)?));
+                }
+                _ => {}
+            }
+        }
+        let (index, inner) = payload?;
+        Some(ir::ScalarShape::AdtField {
+            index,
+            count: fields.len(),
+            fill,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// [`Self::union_transmute_shape`] for a type: the shape
+    /// when the type is a union ADT, `None` for any other type.
+    fn union_transmute_shape_for_ty(
+        &self,
+        ty: &mir::Ty,
+    ) -> Option<ir::ScalarShape> {
+        let mir::Ty::Adt(def, args) = ty else {
+            return None;
+        };
+        if !self.adt_is_union(def) {
+            return None;
+        }
+        self.union_transmute_shape(def, args)
+    }
+
     /// The storage shape of a union read through the
     /// field whose scalar shape is `want`: that field as
     /// the one-payload shape's payload, every zero-sized
@@ -2664,6 +2772,12 @@ let inner = match (&src, target) {
                 Some(Value::Tuple(fields))
             }
             mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n == 0 {
+                    // An empty array's pattern denotes the
+                    // empty aggregate whatever the element
+                    // type (even an uninhabited one).
+                    return Some(Value::Tuple(Vec::new()));
+                }
                 if *n > 4096 {
                     return None;
                 }
@@ -2755,6 +2869,265 @@ let inner = match (&src, target) {
                         Some(Value::Enum {
                             variant,
                             fields: zeroed_fields(variant)?,
+                        })
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a variant of the ADT instance is provably
+    /// uninhabited: one of its fields has a provably
+    /// uninhabited type (see [`Self::ty_provably_uninhabited`]).
+    fn variant_provably_uninhabited(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        variant: u32,
+        depth: u32,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(ftys) = self.instantiated_field_tys(def, args, variant) else {
+            return false;
+        };
+        ftys.iter()
+            .any(|fty| self.ty_provably_uninhabited(fty, depth + 1))
+    }
+
+    /// Whether a type is provably uninhabited from the
+    /// recorded shapes alone: the never type, an enum with
+    /// no variants, and the composites over one (a tuple
+    /// with an uninhabited component, a non-empty array of
+    /// an uninhabited element). Anything else is not
+    /// provable here and answers `false`.
+    fn ty_provably_uninhabited(&self, ty: &mir::Ty, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match ty {
+            mir::Ty::Never => true,
+            mir::Ty::Tuple(ts) => ts
+                .iter()
+                .any(|t| self.ty_provably_uninhabited(t, depth + 1)),
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                *n > 0 && self.ty_provably_uninhabited(elem, depth + 1)
+            }
+            mir::Ty::Adt(def, _) => match self.adt_shapes.get(def) {
+                Some(shape) => {
+                    shape.kind == mir::AdtShapeKind::Enum
+                        && shape.variants.is_empty()
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The value of type `ty` whose every byte is `byte`, for
+    /// a `write_bytes` fill with a constant byte (the 0x01 fill
+    /// `mem::uninitialized` performs): the shapes
+    /// [`Self::zeroed_model_value`] builds, with the byte's
+    /// repeated pattern in place of zero -- a thin pointer is
+    /// the address-only pointer the pattern denotes, a fat
+    /// slice/string pointer carries the pattern as both
+    /// address and length, an enum's niche window or lone
+    /// variant selects the variant the pattern denotes.
+    /// Shapes whose filled form the model cannot denote
+    /// (unions, `dyn` pointers, multi-variant direct-tag
+    /// enums, a pattern that is not a `bool`/`char` value)
+    /// answer `None`, and the builtin keeps its tag-based
+    /// fallbacks for those.
+    ///
+    /// A `MaybeUninit<T>` fill is the payload's filled value,
+    /// not the union-wrapped form a whole-value construction
+    /// of the `MaybeUninit` itself denotes (see
+    /// [`Self::zeroed_model_value`]): a byte fill over a
+    /// `MaybeUninit` region writes `T`'s bytes, the region's
+    /// slots denote the payload's own storage and its readers
+    /// read them as `T` (a raw table's control bytes are
+    /// allocated as `MaybeUninit<Tag>` and read as `Tag`) --
+    /// the same denomination the builtin's tag-based
+    /// fallback (`wrapped_byte_fill`) gives such a fill. The
+    /// builtin's fill path re-wraps the payload when the
+    /// target place itself holds the wrapper.
+    pub(super) fn byte_filled_model_value(
+        &self,
+        ty: &mir::Ty,
+        byte: u8,
+        depth: u32,
+    ) -> Option<Value> {
+        use crate::value::RefTarget;
+        if depth > 8 {
+            return None;
+        }
+        // A `MaybeUninit<T>` fill denotes the payload's
+        // filled value (see the doc comment above), for the
+        // zero byte as much as for any other: the zeroed
+        // form's wrapper belongs to whole-value construction,
+        // not to a region fill.
+        if let mir::Ty::Adt(def, args) = ty {
+            if matches!(
+                self.def_display_name(def).as_str(),
+                "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+            ) {
+                if args.len() != 1 {
+                    return None;
+                }
+                return self.byte_filled_model_value(&args[0], byte, depth + 1);
+            }
+        }
+        if byte == 0 {
+            return self.zeroed_model_value(ty, depth);
+        }
+        fn pattern(byte: u8, bits: u32) -> u128 {
+            let mut p: u128 = 0;
+            let mut b = 0;
+            while b < bits {
+                p = (p << 8) | u128::from(byte);
+                b += 8;
+            }
+            p
+        }
+        match ty {
+            mir::Ty::Bool => match byte {
+                1 => Some(Value::Bool(true)),
+                _ => None,
+            },
+            mir::Ty::Char => {
+                let cp = u32::from(byte) * 0x0101_0101;
+                char::from_u32(cp).map(|_| Value::Uint(u128::from(cp)))
+            }
+            mir::Ty::Int(it) => {
+                let bits = it.bits();
+                let p = pattern(byte, bits);
+                let v = if bits >= 128 {
+                    p as i128
+                } else if p & (1u128 << (bits - 1)) != 0 {
+                    (p as i128) - (1i128 << bits)
+                } else {
+                    p as i128
+                };
+                Some(Value::Int(v))
+            }
+            mir::Ty::Uint(ut) => Some(Value::Uint(pattern(byte, ut.bits()))),
+            mir::Ty::Float(ft) => Some(match ft.bits() {
+                16 => Value::Float(crate::mir_convert::f16_to_f64(pattern(byte, 16) as u16)),
+                32 => Value::Float(f64::from(f32::from_bits(pattern(byte, 32) as u32))),
+                64 => Value::Float(f64::from_bits(pattern(byte, 64) as u64)),
+                _ => Value::Float128(pattern(byte, 128)),
+            }),
+            mir::Ty::Tuple(ts) => {
+                if ts.is_empty() {
+                    return Some(Value::Unit);
+                }
+                let mut fields = Vec::with_capacity(ts.len());
+                for t in ts {
+                    fields.push(self.byte_filled_model_value(t, byte, depth + 1)?);
+                }
+                Some(Value::Tuple(fields))
+            }
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                if *n == 0 {
+                    return Some(Value::Tuple(Vec::new()));
+                }
+                if *n > 4096 {
+                    return None;
+                }
+                let elem = self.byte_filled_model_value(elem, byte, depth + 1)?;
+                Some(Value::Tuple(vec![elem; *n as usize]))
+            }
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                let addr = pattern(byte, 64);
+                match &**inner {
+                    mir::Ty::Slice(_) | mir::Ty::Str => Some(Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::Address(addr as u64))),
+                        len: addr,
+                    }),
+                    mir::Ty::Dynamic(..) => None,
+                    _ => Some(Value::Ref(RefTarget::Address(addr as u64))),
+                }
+            }
+            // A filled function pointer denotes no function;
+            // the address-only pointer is the model's form for
+            // a pointer known only by its address.
+            mir::Ty::FnPtr(_) => Some(Value::Ref(RefTarget::Address(pattern(byte, 64) as u64))),
+            mir::Ty::Adt(def, args) => {
+                // A `MaybeUninit` type never reaches here: it
+                // is intercepted at the top of this function.
+                let shape = self.adt_shapes.get(def)?;
+                let filled_fields = |variant: u32| -> Option<Vec<Value>> {
+                    let ftys = self.instantiated_field_tys(def, args, variant)?;
+                    let mut fields = Vec::with_capacity(ftys.len());
+                    for fty in &ftys {
+                        fields.push(self.byte_filled_model_value(fty, byte, depth + 1)?);
+                    }
+                    Some(fields)
+                };
+                match shape.kind {
+                    mir::AdtShapeKind::Union => None,
+                    mir::AdtShapeKind::Struct => Some(Value::Enum {
+                        variant: 0,
+                        fields: filled_fields(0)?,
+                    }),
+                    mir::AdtShapeKind::Enum => {
+                        // A niche-encoded instance: the window
+                        // the pattern reads in the niche scalar
+                        // selects the variant, as the zero
+                        // window does for the zeroed form.
+                        let tag = crate::builtins::ty_tag(
+                            &mir::Ty::Adt(*def, args.to_vec()),
+                            self.names,
+                        );
+                        if let Some(niche) = self.adt_niches.get(&tag) {
+                            let mask = if niche.tag_bits >= 128 {
+                                u128::MAX
+                            } else {
+                                (1u128 << niche.tag_bits) - 1
+                            };
+                            let window = pattern(byte, niche.tag_bits.min(128)) & mask;
+                            let offset =
+                                window.wrapping_sub(niche.niche_start) & mask;
+                            let span = u128::from(
+                                niche.niche_variants.1 - niche.niche_variants.0,
+                            );
+                            if offset <= span {
+                                return Some(Value::Enum {
+                                    variant: niche.niche_variants.0
+                                        + offset as u32,
+                                    fields: Vec::new(),
+                                });
+                            }
+                            return Some(Value::Enum {
+                                variant: niche.untagged_variant,
+                                fields: filled_fields(niche.untagged_variant)?,
+                            });
+                        }
+                        let table = self.discriminants.get(def)?;
+                        // A lone live variant is the only
+                        // value the pattern can denote (a
+                        // layout with one inhabited variant
+                        // stores no discriminant the pattern
+                        // could miss); a multi-variant direct
+                        // tag would need the tag scalar's own
+                        // width to compare the pattern against
+                        // the discriminants, which this table
+                        // does not record.
+                        let live: Vec<u32> = (0..table.len() as u32)
+                            .filter(|v| {
+                                !self.variant_provably_uninhabited(
+                                    def, args, *v, 0,
+                                )
+                            })
+                            .collect();
+                        if live.len() != 1 {
+                            return None;
+                        }
+                        Some(Value::Enum {
+                            variant: live[0],
+                            fields: filled_fields(live[0])?,
                         })
                     }
                 }
@@ -3538,6 +3911,17 @@ let inner = match (&src, target) {
                 (width == 128).then_some(S::Float { bits: 128 })
             }
             ir::Constant::Bool(_) => (width == 8).then_some(S::Bool),
+            // A pointer constant (a null pointer, or an
+            // integer-to-pointer constant): its value is an
+            // address only, so its shape is the thin-pointer
+            // leaf at the pointer width -- the shape a typed
+            // pointer operand would have given the crossing
+            // (a raw pointer transmuted into a union is the
+            // canonical case: at higher opt levels the pointer
+            // reaches the transmute as such a constant).
+            ir::Constant::NullPtr | ir::Constant::IntPtr(_) => {
+                (width == 64).then_some(S::Ptr)
+            }
             ir::Constant::Bytes(b) => {
                 (width == 8 * b.len() as u32).then(|| {
                     S::Array(

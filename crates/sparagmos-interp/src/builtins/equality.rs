@@ -679,6 +679,32 @@ impl<'a> Interpreter<'a> {
         ) {
             return Ok(x == y);
         }
+        // An `OsStr` value in its bare form -- the byte
+        // string itself, as a `Box<OsStr>`'s pointee and
+        // byte-view reads of OS-string storage hold it, or
+        // the text form when the bytes came from a string
+        // literal -- denotes the same bytes: against an
+        // OS-string shape, or against the other bare form,
+        // it compares as those bytes. Two bare byte strings
+        // never take this arm: a byte string there may be a
+        // scalar's storage, whose reading the scalar arm
+        // below decides by the partner's form.
+        for (side, other) in [(&*a, &*b), (&*b, &*a)] {
+            let bare = match side {
+                Value::Bytes(bytes) => Some(bytes.clone()),
+                Value::Str(text) => Some(text.clone().into_bytes()),
+                _ => None,
+            };
+            let Some(bare) = bare else { continue };
+            let other_bytes = match other {
+                Value::Bytes(_) => None,
+                Value::Str(text) => Some(text.clone().into_bytes()),
+                _ => self.os_string_bytes_any(frames, other)?,
+            };
+            if let Some(other_bytes) = other_bytes {
+                return Ok(bare == other_bytes);
+            }
+        }
         // A scalar in its byte form against the same scalar in
         // its integer form: the pointee of a CTFE-extracted
         // reference, above all, against the integer the same

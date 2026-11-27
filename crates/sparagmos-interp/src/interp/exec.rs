@@ -1109,21 +1109,41 @@ impl<'a> Interpreter<'a> {
                                         // verbatim. A deref capture
                                         // is NOT expanded here, as
                                         // it is in the `async_call`
-                                        // arm below: a future
-                                        // created by `async_call_once`
-                                        // is typically nested inside
-                                        // another coroutine's storage
-                                        // (the `call_once` shim's),
-                                        // and a reference rooted at
-                                        // the enclosing frame's
-                                        // coroutine-self place gains
-                                        // a spurious field step when
-                                        // it is read back through
-                                        // that storage, so the
-                                        // derived per-field
-                                        // references land one field
-                                        // off. The expansion waits
-                                        // on that read-back rebase.
+                                        // arm below, and that is the
+                                        // shape this future's poll
+                                        // body consumes: `async_call_once`
+                                        // consumes the closure, so
+                                        // the future's upvars are the
+                                        // closure's captures
+                                        // themselves, and the poll
+                                        // body reads the environment
+                                        // reference itself and
+                                        // projects the pointee's
+                                        // fields through it (a
+                                        // reborrow of field 1 of the
+                                        // pointee is composed onto
+                                        // the stored reference's
+                                        // target at read-back). The
+                                        // fan-out plan describes the
+                                        // borrowed-call futures
+                                        // (`async_call` /
+                                        // `async_call_mut`), which
+                                        // cannot hold the closure and
+                                        // so hold one reborrow per
+                                        // captured field instead.
+                                        // Expanding here would put a
+                                        // per-field reference where
+                                        // the poll body expects the
+                                        // environment reference, and
+                                        // its projections would land
+                                        // one field off (measured on
+                                        // the `async move` block of
+                                        // tests/ui/async-await/async-closures/precise-captures.rs:
+                                        // the field write's target
+                                        // gains a spurious `Field(0)`
+                                        // after the environment
+                                        // prefix, [F0, F0, F0, F1, F0]
+                                        // in place of [F0, F0, F1, F0]).
                                         fields.extend(env);
                                     }
                                     // A zero-sized async closure
@@ -1692,6 +1712,7 @@ impl<'a> Interpreter<'a> {
                     result_unsize,
                     unique_elem,
                     zeroed_value,
+                    validity_panic,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -1817,6 +1838,7 @@ impl<'a> Interpreter<'a> {
                             elem_glue.as_ref(),
                             receiver_glue.as_ref(),
                             zeroed_value.as_ref(),
+                            validity_panic.as_deref(),
                         );
                         if matches!(builtin_outcome, Err(InterpError::Suspended)) {
                             Self::restore_moved_args(frames, caller_id, moved_args);
@@ -2698,16 +2720,21 @@ impl<'a> Interpreter<'a> {
             },
             _ => return base,
         };
+        // The head sequence is only inspected -- its length,
+        // and the form and length of the element at the
+        // window's start -- so it is read in its borrowing
+        // form: a formation over a large buffer does not
+        // clone the whole sequence to judge it.
         let head_value = self
             .deref_value(frames, &head)
-            .and_then(|target| self.read_resolved(frames, &target))
+            .and_then(|target| self.read_resolved_peek(frames, &target))
             .ok();
         let head_len = head_value.as_ref().and_then(|value| value.len());
         let collides = head_value
             .as_ref()
             .and_then(|value| {
-                project_value(
-                    value.clone(),
+                project_value_ref(
+                    value,
                     &[RefProj::Index(start)],
                     "raw parts base",
                     "raw parts base",
@@ -2716,7 +2743,7 @@ impl<'a> Interpreter<'a> {
             })
             .is_some_and(|element| {
                 matches!(
-                    element,
+                    &*element,
                     Value::Tuple(_)
                         | Value::Bytes(_)
                         | Value::Str(_)
@@ -3691,7 +3718,7 @@ impl<'a> Interpreter<'a> {
                     {
                         self.fat_deref_len(frames, body, place)
                             .or_else(|| {
-                                self.read_resolved(frames, &target)
+                                self.read_resolved_peek(frames, &target)
                                     .ok()
                                     .and_then(|v| v.len())
                             })

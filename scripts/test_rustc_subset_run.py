@@ -5139,6 +5139,36 @@ class CompiletestCheckModeTests(unittest.TestCase):
         self.assertFalse(run.compiletest_check_mode(
             "crashes", self.view("fn main() {}\n")))
 
+    def test_emit_mir_flag_leaves_check_mode(self):
+        # The shape of tests/ui/limits/vtable-try-as-dyn.rs:
+        # the test's own --emit=mir accumulates with
+        # compiletest's --emit=metadata, and the reference
+        # compilation evaluates the constant whose error the
+        # test asserts -- a metadata-only compilation stays
+        # silent on it.
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ check-fail\n"
+                            "//@ compile-flags: --crate-type=lib --emit=mir\n"
+                            "fn main() {}\n")))
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ compile-flags: --emit mir\n"
+                            "fn main() {}\n")))
+
+    def test_analysis_level_emits_stay_check_mode(self):
+        self.assertTrue(run.compiletest_check_mode(
+            "ui", self.view("//@ check-fail\n"
+                            "//@ compile-flags: --emit=metadata\n"
+                            "fn main() {}\n")))
+        self.assertTrue(run.compiletest_check_mode(
+            "ui", self.view("//@ check-fail\n"
+                            "//@ compile-flags: --emit=dep-info\n"
+                            "fn main() {}\n")))
+        # An emit list naming an output path keeps its kind.
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ check-fail\n"
+                            "//@ compile-flags: --emit=mir=out.mir\n"
+                            "fn main() {}\n")))
+
 
 class SparagmosSideExitCodeTests(unittest.TestCase):
     """sparagmos_side's exit-code contract: the guest's own exit

@@ -2129,11 +2129,14 @@ pub enum TerminatorKind {
         /// zero pattern (the variant whose discriminant is
         /// zero, or the niche variant when zero lies in the
         /// recorded niche range) with zeroed fields, and an
-        /// aggregate is built field by field. The builtin's
+        /// aggregate is built field by field. A `write_bytes`
+        /// call with a constant fill byte carries the same
+        /// construction for that byte's pattern instead (the
+        /// 0x01 fill of `mem::uninitialized`). The builtin's
         /// tag-based construction covers scalars, tuples and
         /// arrays on its own; this value serves the types only
         /// the layout can describe. `None` for every other
-        /// builtin call, and when the zero pattern denotes no
+        /// builtin call, and when the pattern denotes no
         /// value conversion can build.
         zeroed_value: Option<Value>,
         /// The `TypeId` segments of the callee's generic type
@@ -2148,6 +2151,19 @@ pub enum TerminatorKind {
         /// them for this call (a hand-built body, or a callee
         /// that is not a function-item constant).
         generic_type_ids: Option<Vec<(u64, u64)>>,
+        /// The `panic_nounwind` message of this call's validity
+        /// assertion, baked by conversion from the driver's
+        /// per-block record (see `sparagmos_mir::Body::
+        /// validity_panics`) when this call is one of the
+        /// validity intrinsics or `std::mem::zeroed` and the
+        /// compiler's own validity check judges the call's type
+        /// invalid for the initialization kind: the builtin
+        /// raises the message as the nounwind panic code
+        /// generation emits for the call instead of serving it.
+        /// `None` for every other builtin call, and when the
+        /// check accepts the type (the assertion is then the
+        /// no-op code generation makes of it).
+        validity_panic: Option<String>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and
@@ -2741,6 +2757,13 @@ pub struct Program {
     /// the driver. Consulted when a pointer offset over a static
     /// must be denominated in the declared type's element size.
     pub static_tys: std::collections::HashMap<String, Ty>,
+    /// Declared alignments of the program's statics, in bytes,
+    /// keyed like [`Self::static_tys`]: the alignment a static's
+    /// own attributes demand, which can exceed its declared
+    /// type's alignment (see `mir::StaticAligns`). The address
+    /// pricing of a static's storage uses the greater of the
+    /// two alignments.
+    pub static_aligns: std::collections::HashMap<String, u64>,
     /// Declared types of the program's statics rendered as type
     /// tags (the rendering [`crate::builtins::ty_tag`] produces,
     /// the same form the debug variable table records for

@@ -506,3 +506,213 @@ fn run_mode_sort_unstable_by_guest_closure_past_smallsort() {
         "desc=true calls>0=true sum=693174496791170142 first=8957930565218848 last=23941204646919\n",
     );
 }
+
+const SORT_LARGE_BUFFER_ACCESS_SRC: &str = r#"
+fn checksum(v: &[i32]) -> i64 {
+    let mut s: i64 = 0;
+    for i in 0..v.len() {
+        s += v[i] as i64;
+    }
+    s
+}
+
+fn raw_checksum(v: &[i32]) -> i64 {
+    let mut s: i64 = 0;
+    unsafe {
+        let p = v.as_ptr();
+        for i in 0..v.len() {
+            s += *p.add(i) as i64;
+        }
+    }
+    s
+}
+
+fn sorted(v: &[i32]) -> bool {
+    v.windows(2).all(|w| w[0] <= w[1])
+}
+
+fn main() {
+    let mut e: Vec<i32> = Vec::new();
+    e.sort();
+    println!("empty {} {}", e.len(), sorted(&e));
+    let mut one = vec![42];
+    one.sort();
+    println!("one {} {} {}", one.len(), one[0], sorted(&one));
+
+    let mut r: Vec<i32> = (0..2000).rev().collect();
+    r.sort();
+    println!(
+        "rev {} {} {} {} {}",
+        sorted(&r),
+        checksum(&r),
+        raw_checksum(&r),
+        r[0],
+        r[1999]
+    );
+
+    let mut d: Vec<i32> = Vec::new();
+    for i in 0..2000usize {
+        d.push((i % 7) as i32);
+    }
+    d.sort();
+    println!(
+        "dup {} {} {} {} {} {}",
+        sorted(&d),
+        checksum(&d),
+        raw_checksum(&d),
+        d[285],
+        d[286],
+        d[1999]
+    );
+
+}
+"#;
+
+#[test]
+fn run_mode_sort_large_buffer_access_shapes() {
+    // Adversarial shapes at a size where every element
+    // access crosses the buffer's place machinery: an empty
+    // sort, a one-element sort, a reversed two-thousand, a
+    // duplicate-heavy two-thousand (seven distinct values).
+    // The readbacks judge the results through
+    // both access forms the sort itself uses -- the indexed
+    // (fat-pointer) read and the raw-pointer read -- so a
+    // denomination slip in either surfaces as a wrong sum or
+    // a wrong endpoint, not just a slow run.
+    run_ok(
+        "sort-large-buffer-access",
+        SORT_LARGE_BUFFER_ACCESS_SRC,
+        "empty 0 true\none 1 42 true\nrev true 1999000 1999000 0 1999\ndup true 5995 5995 0 1 6\n",
+    );
+}
+
+const SORT_COPY_BACK_ASSIGNMENT_READS_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = (0..100).rev().collect();
+    v.sort();
+    let a: i32 = v[1];
+    let b: i32 = v[2];
+    let c: i32 = v[50];
+    let d: i32 = v[98];
+    let mut acc: i64 = 0;
+    for i in 0..v.len() {
+        let x: i32 = v[i];
+        acc += x as i64;
+    }
+    println!("a={} b={} c={} d={} acc={}", a, b, c, d, acc);
+}
+"#;
+
+#[test]
+fn run_mode_sort_copy_back_assignment_reads() {
+    // A hundred-element stable sort: the merge copies the
+    // saved run back out of the `MaybeUninit` scratch through
+    // `ptr::copy_nonoverlapping`'s sequence path. That path
+    // used to move the scratch slots verbatim, so the buffer
+    // held the union form `MaybeUninit { payload }` in every
+    // interior slot while the endpoints (moved by the
+    // single-element paths) were denominated. A plain
+    // assignment read of an interior element then died with
+    // `expected Int(I32), found ADT value`, even though every
+    // payload was correct and derived reads (Debug, iteration)
+    // accepted the form. Sequence copies now denominate each
+    // element in the copy's element type, the way the
+    // single-element paths always did.
+    run_ok(
+        "sort-copy-back-assignment-reads",
+        SORT_COPY_BACK_ASSIGNMENT_READS_SRC,
+        "a=1 b=2 c=50 d=98 acc=4950\n",
+    );
+}
+
+const SORT_MERGE_STATE_DROP_COPY_BACK_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = (1..100).chain(std::iter::once(0)).collect();
+    v.sort();
+    let s: &[i32] = &v;
+    let a: i32 = s[1];
+    let b: i32 = s[50];
+    println!("a={a} b={b}");
+}
+"#;
+
+#[test]
+fn run_mode_sort_merge_state_drop_copies_only_the_saved_run() {
+    // A hundred elements whose single out-of-place value
+    // makes the final merge leave a one-element saved run in
+    // the scratch: `MergeState::drop` copies `start..end`
+    // back over the buffer. The scratch base is denominated
+    // in bytes (its storage field records a one-byte element
+    // size), so `end = buf.add(1)` carries a byte-denominated
+    // index step; the drop's length measurement
+    // (`end.offset_from_unsigned(start)`) read that step as
+    // one element per byte and copied four slots back,
+    // overwriting the sorted elements at positions 1..3 with
+    // the untouched slots' uninitialized union forms (the
+    // reads came back `a=50 b=98`). The distance now scales
+    // an index step by the sequence's recorded slot size, so
+    // the drop copies exactly the saved run.
+    run_ok(
+        "sort-merge-state-drop-copy-back",
+        SORT_MERGE_STATE_DROP_COPY_BACK_SRC,
+        "a=1 b=50\n",
+    );
+}
+
+const SORT_FIFTY_OUTPUT_VALUES_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    for i in 0..50 { v.push(((i * 37) % 50) as i32); }
+    v.sort();
+    let ok = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("{} {} {} {} {} {} ok={}", v[0], v[1], v[2], v[3], v[4], v[49], ok);
+}
+"#;
+
+#[test]
+fn run_mode_sort_fifty_output_values() {
+    // The fifty-element case of the same over-copy: the
+    // values themselves came out wrong (positions 1..3 held
+    // stale scratch contents, 2, 4, 6 instead of 1, 2, 3), not
+    // just the forms — the sortedness check over the output
+    // failed. With the drop's length measured in the
+    // intrinsic's elements, the output is exact.
+    run_ok(
+        "sort-fifty-output-values",
+        SORT_FIFTY_OUTPUT_VALUES_SRC,
+        "0 1 2 3 4 49 ok=true\n",
+    );
+}
+
+const COPY_INTO_MAYBEUNINIT_KEEPS_UNION_FORM_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let src: Vec<i32> = (0..100).collect();
+    let mut dst: Vec<MaybeUninit<i32>> = Vec::new();
+    dst.resize_with(100, MaybeUninit::uninit);
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<i32>(), 100);
+    }
+    let mut acc: i64 = 0;
+    for slot in &dst {
+        let x: i32 = unsafe { slot.assume_init() };
+        acc += x as i64;
+    }
+    println!("acc={}", acc);
+}
+"#;
+
+#[test]
+fn run_mode_copy_into_maybeuninit_keeps_union_form() {
+    // The mirror image of the copy-back denomination: a copy
+    // whose element type IS `MaybeUninit<T>` must keep the
+    // union form — the destination slots are union values, and
+    // `assume_init` reads the payload back out of them. The
+    // sequence path denominates by the copy's own element
+    // type only, so this copy is untouched by it.
+    run_ok(
+        "copy-into-maybeuninit",
+        COPY_INTO_MAYBEUNINIT_KEEPS_UNION_FORM_SRC,
+        "acc=4950\n",
+    );
+}

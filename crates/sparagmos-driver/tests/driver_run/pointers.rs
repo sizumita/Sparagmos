@@ -4357,3 +4357,78 @@ fn run_mode_copy_nonoverlapping_from_uninit_nested_array() {
         "grow ok: [10, 17, 24, 31]\nback ok: [10, 17, 24, 31]\n",
     );
 }
+
+const MAYBE_UNINIT_NODE_FIELD_ZERO_SRC: &str = r#"
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
+
+struct LL {
+    name: &'static str,
+    x: u32,
+}
+
+struct Node {
+    next: Option<NonNull<Node>>,
+    prev: Option<NonNull<Node>>,
+    element: LL,
+}
+
+fn main() {
+    unsafe {
+        let mut b2: Box<MaybeUninit<Node>> = Box::new_uninit();
+        b2.as_mut_ptr().write(Node {
+            next: None,
+            prev: None,
+            element: LL { name: "z", x: 9 },
+        });
+        let p2 = Box::into_raw(b2.assume_init());
+        let mut b1: Box<MaybeUninit<Node>> = Box::new_uninit();
+        b1.as_mut_ptr().write(Node {
+            next: Some(NonNull::new(p2).unwrap()),
+            prev: None,
+            element: LL { name: "a", x: 1 },
+        });
+        let p1 = Box::into_raw(b1.assume_init());
+        println!("next some {}", (*p1).next.is_some());
+        let n = (*p1).next.unwrap().as_ref();
+        println!("next elem {} {}", n.element.name, n.element.x);
+        (*p1).prev = (*p1).next;
+        (*p1).next = None;
+        println!(
+            "after writes {} {} {}",
+            (*p1).element.name,
+            (*p1).next.is_none(),
+            (*p1).prev.is_some()
+        );
+        let _ = Box::from_raw(p1);
+        let _ = Box::from_raw(p2);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_box_assume_init_field_zero_access() {
+    // Field 0 of a node stored through `Box<MaybeUninit<Node>>`
+    // and retargeted by `assume_init`: the payload was written
+    // through the union's own pointer (which enters the
+    // wrapper), so the storage holds the union form, and the
+    // retargeted pointer's field steps -- field 0 included --
+    // address the payload. The payload's element struct
+    // carries a `&str` field stored as a bare string value,
+    // which the wrapper-entry judgment must still accept as
+    // the payload's complete form.
+    let dir = temp_dir("maybe_uninit_field_zero");
+    let src = fixture(&dir, "maybe_uninit_field_zero.rs", MAYBE_UNINIT_NODE_FIELD_ZERO_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "field-0 read/write through an assume_init-retargeted pointer must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "next some true\nnext elem z 9\nafter writes a true true\nok\n"
+    );
+}

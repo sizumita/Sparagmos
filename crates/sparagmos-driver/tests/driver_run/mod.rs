@@ -35,12 +35,14 @@ mod process;
 mod run_basics;
 mod rustdoc_path;
 mod stack_overflow;
+mod static_align;
 mod string_mutators;
 mod strings;
 mod summary_mode;
 mod sync;
 mod tool_interception;
 mod transmute;
+mod validity_assert;
 mod vec_slice;
 
 /// Fixture directories this test process created under the

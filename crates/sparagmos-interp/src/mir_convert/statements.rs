@@ -1451,6 +1451,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1513,6 +1514,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1560,6 +1562,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1611,6 +1614,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1744,6 +1748,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -2131,24 +2136,38 @@ impl<'a> Converter<'a> {
             .or_else(|| raw_generic_args.first().cloned());
         // A coroutine-closure value's place type is the unit
         // placeholder, whose glue is trivial; the value's own glue
-        // is its captures' glue. When the argument is the bare
-        // local this body's coroutine-closure aggregate created,
+        // is its captures' glue. When the argument is the place
+        // this body's coroutine-closure aggregate created - the
+        // bare local in a plain frame, or the state-field
+        // projection a coroutine body assigns the value to -
         // plan the drop from the aggregate, exactly as a plain
         // closure type's glue is planned from its capture tuple -
         // the same recovery the `Drop` terminator conversion
-        // applies to a placeholder-typed place.
+        // applies to a placeholder-typed place. The argument is
+        // usually staged through a move temporary (`_tmp = move
+        // _x` ahead of the call), so trace the argument place
+        // back through sole plain-use assignments to the place
+        // the value was created at; a place assigned any other
+        // way, or more than once, stops the trace.
         let dropped_ty = match &dropped_ty {
             Some(t) if matches!(t, mir::Ty::Tuple(ts) if ts.is_empty()) => {
-                let local = match arg {
-                    mir::Operand::Copy(place) | mir::Operand::Move(place)
-                        if place.projection.is_empty() =>
-                    {
-                        Some(place.local.index())
-                    }
+                let place = match arg {
+                    mir::Operand::Copy(place) | mir::Operand::Move(place) => Some(place),
                     _ => None,
                 };
-                local
-                    .and_then(|l| coroutine_closure_creation(body, l))
+                place
+                    .and_then(|p| {
+                        // The step bound keeps a cyclic use chain
+                        // in dead code from spinning here.
+                        let mut origin = p.clone();
+                        for _ in 0..16 {
+                            if let Some(found) = coroutine_closure_creation(body, &origin) {
+                                return Some(found);
+                            }
+                            origin = sole_use_source(body, &origin)?;
+                        }
+                        None
+                    })
                     .map(|(def, upvars)| {
                         mir::Ty::Closure(def, vec![mir::Ty::Tuple(upvars)])
                     })
@@ -2396,6 +2415,7 @@ impl<'a> Converter<'a> {
     pub(super) fn convert_terminator(
         &self,
         body: &mir::Body,
+        bb_index: u32,
         kind: &mir::TerminatorKind,
         fn_abi: Option<&mir::Abi>,
         block_has_statements: bool,
@@ -3215,25 +3235,49 @@ impl<'a> Converter<'a> {
                                 .first()
                                 .and_then(|ty| self.zeroed_model_value(ty, 0))
                         } else if kind == crate::builtins::Builtin::WriteBytes
-                            && matches!(
-                                args.get(1).and_then(|arg| {
-                                    self.convert_operand(body, arg, None).ok()
-                                }),
-                                Some(ir::Operand::Constant(
-                                    ir::Constant::Uint(0)
-                                ))
-                            )
                         {
                             // A `write_bytes` whose fill byte is
-                            // the constant zero (`MaybeUninit::
-                            // zeroed` is its canonical use): the
-                            // filled region holds the zero
+                            // a constant (`MaybeUninit::zeroed`'s
+                            // zero fill and `mem::uninitialized`'s
+                            // 0x01 fill are the canonical uses):
+                            // the filled region holds that byte's
                             // pattern of the pointee type, whose
                             // denoted value is baked like
                             // `mem::zeroed`'s.
-                            raw_generic_args
-                                .first()
-                                .and_then(|ty| self.zeroed_model_value(ty, 0))
+                            match args.get(1).and_then(|arg| {
+                                self.convert_operand(body, arg, None).ok()
+                            }) {
+                                Some(ir::Operand::Constant(
+                                    ir::Constant::Uint(b),
+                                )) if b <= 0xff => raw_generic_args
+                                    .first()
+                                    .and_then(|ty| {
+                                        self.byte_filled_model_value(
+                                            ty,
+                                            b as u8,
+                                            0,
+                                        )
+                                    }),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        // The validity assertion of this call,
+                        // when the driver settled it against the
+                        // compiler's own check (see
+                        // `mir::Body::validity_panics`): only the
+                        // validity intrinsics and `mem::zeroed`
+                        // carry an entry, keyed by this block.
+                        let validity_panic = if matches!(
+                            kind,
+                            crate::builtins::Builtin::AssertValidity
+                                | crate::builtins::Builtin::MemZeroed
+                        ) {
+                            body.validity_panics
+                                .iter()
+                                .find(|(block, _)| *block == bb_index)
+                                .map(|(_, message)| message.clone())
                         } else {
                             None
                         };
@@ -3259,6 +3303,7 @@ impl<'a> Converter<'a> {
                                 unique_elem,
                                 zeroed_value,
                                 generic_type_ids,
+                                validity_panic,
                             }
                         }
                     } else if args.first().is_some_and(|a| {
@@ -3349,16 +3394,16 @@ impl<'a> Converter<'a> {
                     // A coroutine-closure value's place type is
                     // the unit placeholder, whose glue is trivial;
                     // the value's own glue is its captures' glue.
-                    // When the place is the bare local this body's
-                    // coroutine-closure aggregate created, plan it
-                    // from the aggregate, exactly as a plain
-                    // closure type's glue is planned from its
-                    // capture tuple.
-                    if place.projection.is_empty()
-                        && matches!(&t, mir::Ty::Tuple(ts) if ts.is_empty())
-                    {
+                    // When the place is the one this body's
+                    // coroutine-closure aggregate created - the
+                    // bare local in a plain frame, or the
+                    // state-field projection a coroutine body
+                    // assigns the value to - plan it from the
+                    // aggregate, exactly as a plain closure type's
+                    // glue is planned from its capture tuple.
+                    if matches!(&t, mir::Ty::Tuple(ts) if ts.is_empty()) {
                         if let Some((def, upvars)) =
-                            coroutine_closure_creation(body, place.local.index())
+                            coroutine_closure_creation(body, place)
                         {
                             let closure_ty =
                                 mir::Ty::Closure(def, vec![mir::Ty::Tuple(upvars)]);
