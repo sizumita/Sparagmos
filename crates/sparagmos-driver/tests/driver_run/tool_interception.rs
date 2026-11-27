@@ -1737,3 +1737,206 @@ fn run_mode_tool_interception_test_crate_binary() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "test crate guest ok\n", "stderr={stderr}");
 }
+
+const ARTIFACT_NAMING_GUEST_SRC: &str = r##"
+use std::process::Command;
+
+fn compile(rustc: &str, args: &[&str]) -> std::process::Output {
+    Command::new(rustc).args(args).output().unwrap()
+}
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // A crate name declared in the source and a glued
+    // `-Cextra-filename` suffix: the artifact file carries
+    // both (libdependency2.rlib, not a file named after the
+    // source), and a consumer naming that file resolves it.
+    std::fs::write(
+        "dep.rs",
+        "#![crate_name = \"dependency\"]\n#![crate_type = \"rlib\"]\npub fn f() -> u32 { 5 }\n",
+    )
+    .unwrap();
+    let out = compile(&rustc, &["--edition=2021", "dep.rs", "-Cextra-filename=2"]);
+    assert!(
+        out.status.success(),
+        "dep build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::path::Path::new("libdependency2.rlib").exists(),
+        "declared-name artifact missing"
+    );
+    std::fs::write(
+        "use_dep.rs",
+        "extern crate dependency; fn main() { assert_eq!(dependency::f(), 5); }\n",
+    )
+    .unwrap();
+    let out = compile(
+        &rustc,
+        &["--edition=2021", "use_dep.rs", "--extern", "dependency=libdependency2.rlib"],
+    );
+    assert!(
+        out.status.success(),
+        "declared-name consumer failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A crate type declared in the source: the artifact is
+    // the dylib file a real rustc writes for it.
+    std::fs::write(
+        "dy.rs",
+        "#![crate_type = \"dylib\"]\npub fn g() -> u32 { 6 }\n",
+    )
+    .unwrap();
+    let out = compile(&rustc, &["--edition=2021", "dy.rs"]);
+    assert!(
+        out.status.success(),
+        "dylib build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::path::Path::new("libdy.so").exists(),
+        "declared dylib artifact missing"
+    );
+
+    // A metadata-only build writes only the .rmeta (no rlib
+    // beside it), and the recorded artifact still binds a
+    // consumer -- under the build's own crate type, not an
+    // `rmeta` pseudo-type the session would reject.
+    std::fs::write("meta.rs", "pub fn h() -> u32 { 7 }\n").unwrap();
+    let out = compile(
+        &rustc,
+        &["--edition=2021", "meta.rs", "--crate-type", "lib", "--emit", "metadata"],
+    );
+    assert!(
+        out.status.success(),
+        "metadata build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::path::Path::new("libmeta.rmeta").exists(),
+        "rmeta artifact missing"
+    );
+    assert!(
+        !std::path::Path::new("libmeta.rlib").exists(),
+        "metadata build left an rlib"
+    );
+    std::fs::write(
+        "use_meta.rs",
+        "extern crate meta; fn main() { assert_eq!(meta::h(), 7); }\n",
+    )
+    .unwrap();
+    let out = compile(
+        &rustc,
+        &["--edition=2021", "use_meta.rs", "--extern", "meta=libmeta.rmeta"],
+    );
+    assert!(
+        out.status.success(),
+        "metadata consumer failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An explicit `--extern` is the binding for its name:
+    // a source file (or a missing path) named as the extern
+    // fails on its own, even though a library of that name
+    // was built earlier in the run.
+    std::fs::write("bar.rs", "pub fn b() -> u32 { 8 }\n").unwrap();
+    let out = compile(&rustc, &["--edition=2021", "bar.rs", "--crate-type", "rlib"]);
+    assert!(out.status.success(), "bar build failed");
+    std::fs::write(
+        "foo.rs",
+        "extern crate bar; fn main() { bar::b(); }\n",
+    )
+    .unwrap();
+    let out = compile(&rustc, &["--edition=2021", "foo.rs", "--extern", "bar=foo.rs"]);
+    assert!(!out.status.success(), "source-file extern unexpectedly bound");
+    let out = compile(&rustc, &["--edition=2021", "foo.rs", "--extern", "bar=no-exist"]);
+    assert!(!out.status.success(), "missing extern unexpectedly bound");
+
+    // A chain bound by `extern crate` scanning alone: the
+    // middle crate's build named no `--extern`, so the final
+    // conversion only finds the leaf if a binding carries
+    // the dependencies its own build recorded.
+    std::fs::write("leaf.rs", "pub fn l() -> u32 { 9 }\n").unwrap();
+    let out = compile(&rustc, &["--edition=2021", "leaf.rs", "--crate-type", "rlib"]);
+    assert!(out.status.success(), "leaf build failed");
+    std::fs::write(
+        "mid.rs",
+        "extern crate leaf; pub fn m() -> u32 { leaf::l() }\n",
+    )
+    .unwrap();
+    let out = compile(&rustc, &["--edition=2021", "mid.rs", "--crate-type", "rlib"]);
+    assert!(
+        out.status.success(),
+        "mid build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        "top.rs",
+        "extern crate mid; fn main() { assert_eq!(mid::m(), 9); }\n",
+    )
+    .unwrap();
+    let out = compile(&rustc, &["--edition=2021", "top.rs"]);
+    assert!(
+        out.status.success(),
+        "top build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A crate built with `-Zforce-unstable-if-unmarked`
+    // keeps that stability marking when a later invocation
+    // binds the artifact: the consumer meets the
+    // rustc_private gate the real artifact raises.
+    std::fs::write("unstable.rs", "pub fn u() {}\n").unwrap();
+    let out = compile(
+        &rustc,
+        &[
+            "--edition=2021",
+            "unstable.rs",
+            "-Zforce-unstable-if-unmarked",
+            "--crate-type",
+            "rlib",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "unstable build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write("gated.rs", "extern crate alloc; fn main() {}\n").unwrap();
+    let out = compile(
+        &rustc,
+        &["--edition=2021", "gated.rs", "--extern", "alloc=libunstable.rlib"],
+    );
+    assert!(
+        !out.status.success(),
+        "force-unstable consumer unexpectedly bound"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("rustc_private"),
+        "rustc_private diagnostic missing: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    println!("artifact naming guest ok");
+}
+"##;
+
+#[test]
+fn run_mode_tool_interception_artifact_naming_and_binding() {
+    let dir = temp_dir("tool-artifact-naming");
+    let src = fixture(&dir, "artifact_naming_guest.rs", ARTIFACT_NAMING_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "artifact naming guest ok\n", "stderr={stderr}");
+}

@@ -383,6 +383,27 @@ impl ToolRegistry {
         self.pinned_aux_specs(&artifact.aux_specs, &artifact.aux_pins)
     }
 
+    /// The recorded artifact a bound `--aux` spec denotes:
+    /// the artifact whose build the spec was taken from,
+    /// identified by its pinned source and by the spec the
+    /// artifact itself renders under the spec's binding name
+    /// (a rebuild of the same source renders the same spec;
+    /// the first match stands).
+    fn artifact_for_spec(
+        &self,
+        spec: &str,
+        pin: &(std::path::PathBuf, SourceTree),
+    ) -> Option<ToolArtifact> {
+        let name = spec.split('=').next().unwrap_or("");
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| a.source == pin.0)
+            .find(|(_, a)| aux_spec_for(name, a) == spec)
+            .map(|(_, a)| cloned_artifact(a))
+    }
+
     fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(slot) = entries.iter_mut().find(|(p, _)| *p == path) {
@@ -423,14 +444,18 @@ fn absolutize(cwd: &std::path::Path, path: &str) -> std::path::PathBuf {
 }
 
 /// The file name a real rustc gives the artifact of one crate
-/// type.
-fn artifact_filename(crate_name: &str, crate_type: &str) -> String {
+/// type: the crate name with the build's `-C extra-filename`
+/// suffix verbatim between it and the extension ("" when the
+/// invocation set none).
+fn artifact_filename(crate_name: &str, crate_type: &str, extra_filename: &str) -> String {
     match crate_type {
-        "bin" => crate_name.to_string(),
-        "dylib" | "cdylib" | "proc-macro" => format!("lib{crate_name}.so"),
-        "staticlib" => format!("lib{crate_name}.a"),
-        "rmeta" => format!("lib{crate_name}.rmeta"),
-        _ => format!("lib{crate_name}.rlib"),
+        "bin" => format!("{crate_name}{extra_filename}"),
+        "dylib" | "cdylib" | "proc-macro" => {
+            format!("lib{crate_name}{extra_filename}.so")
+        }
+        "staticlib" => format!("lib{crate_name}{extra_filename}.a"),
+        "rmeta" => format!("lib{crate_name}{extra_filename}.rmeta"),
+        _ => format!("lib{crate_name}{extra_filename}.rlib"),
     }
 }
 
@@ -443,7 +468,84 @@ fn aux_spec_for(name: &str, artifact: &ToolArtifact) -> String {
     if let Some(crate_type) = &artifact.crate_type {
         spec += &format!(";crate-type={crate_type}");
     }
+    if carried_force_unstable(&artifact.rustc_args) {
+        spec += ";force-unstable=yes";
+    }
     spec
+}
+
+/// Whether a forwarded rustc argument list carries
+/// `-Zforce-unstable-if-unmarked`, in either its glued
+/// one-token spelling or the split `-Z` + name pair.
+fn carried_force_unstable(args: &[String]) -> bool {
+    let mut prev_dash_z = false;
+    for arg in args {
+        if arg == "-Zforce-unstable-if-unmarked"
+            || (prev_dash_z && arg == "force-unstable-if-unmarked")
+        {
+            return true;
+        }
+        prev_dash_z = arg == "-Z";
+    }
+    false
+}
+
+/// Bind one registered artifact into a conversion's `aux`
+/// list under `name`, preceded by the bindings its own build
+/// recorded (see `ToolArtifact::aux_specs`): the artifact's
+/// auxiliary build inside the conversion declares those
+/// dependencies by name, and they must stand among the
+/// conversion's auxiliary crates, in dependency order, for
+/// the build to find them -- the chain a real compiler
+/// resolves through the artifacts' own metadata and the
+/// `-L` directory. The expansion is recursive (a
+/// dependency's own dependencies precede it) and each
+/// distinct spec is bound once.
+fn bind_artifact_with_deps(
+    registry: &ToolRegistry,
+    name: &str,
+    artifact: &ToolArtifact,
+    aux: &mut Vec<String>,
+    aux_pins: &mut Vec<(std::path::PathBuf, SourceTree)>,
+) {
+    fn push_spec(
+        registry: &ToolRegistry,
+        spec: &str,
+        pin: &(std::path::PathBuf, SourceTree),
+        owner: Option<&ToolArtifact>,
+        aux: &mut Vec<String>,
+        aux_pins: &mut Vec<(std::path::PathBuf, SourceTree)>,
+        depth: usize,
+    ) {
+        if depth > 32 || aux.iter().any(|s| s == spec) {
+            return;
+        }
+        if let Some(owner) = owner {
+            let deps: Vec<(String, (std::path::PathBuf, SourceTree))> = owner
+                .aux_specs
+                .iter()
+                .cloned()
+                .zip(owner.aux_pins.iter().cloned())
+                .collect();
+            for (dep_spec, dep_pin) in &deps {
+                let dep_owner = registry.artifact_for_spec(dep_spec, dep_pin);
+                push_spec(
+                    registry,
+                    dep_spec,
+                    dep_pin,
+                    dep_owner.as_ref(),
+                    aux,
+                    aux_pins,
+                    depth + 1,
+                );
+            }
+        }
+        aux.push(spec.to_string());
+        aux_pins.push(pin.clone());
+    }
+    let spec = aux_spec_for(name, artifact);
+    let pin = (artifact.source.clone(), artifact.source_tree.clone());
+    push_spec(registry, &spec, &pin, Some(artifact), aux, aux_pins, 0);
 }
 
 /// The subprocess's stderr with the driver's own report lines
@@ -819,6 +921,18 @@ pub(crate) fn tool_run(
     let mut out_dir: Option<String> = None;
     let mut informational = false;
     let mut positional_only = false;
+    let mut extra_filename: Option<String> = None;
+    // The crate names this invocation binds through an
+    // explicit `--extern`, whether the path resolved to a
+    // registered artifact or was forwarded: the `extern
+    // crate` scan below must not add a second binding for a
+    // name the invocation itself bound. Under rustc the
+    // explicit `--extern` IS the binding for its name; a
+    // scan-added binding for the same name would shadow a
+    // forwarded path the session must judge on its own (a
+    // nonexistent or non-crate file among them).
+    let mut explicit_extern_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].clone();
@@ -889,14 +1003,20 @@ pub(crate) fn tool_run(
                         Some((n, p)) => (n.to_string(), Some(p.to_string())),
                         None => (v.clone(), None),
                     };
+                    explicit_extern_names.insert(name.clone());
                     let bound = path.as_ref().and_then(|p| {
                         let abs = absolutize(&cwd, p);
                         registry.get(&abs).map(|art| (name.clone(), art))
                     });
                     match bound {
                         Some((name, art)) => {
-                            aux_pins.push((art.source.clone(), art.source_tree.clone()));
-                            aux.push(aux_spec_for(&name, &art));
+                            bind_artifact_with_deps(
+                                registry,
+                                &name,
+                                &art,
+                                &mut aux,
+                                &mut aux_pins,
+                            );
                         }
                         None => {
                             // A real file (a sysroot or prebuilt
@@ -919,13 +1039,36 @@ pub(crate) fn tool_run(
                 informational = true;
                 forward.push(arg.clone());
             }
-            "--cfg" | "--check-cfg" | "-C" | "-Z" | "-L" | "--target"
+            "-C" => {
+                forward.push(flag.to_string());
+                if let Some(v) = take_value(inline, &mut i) {
+                    // The output-name suffix is the one codegen
+                    // option the artifact recording below must
+                    // honour: it is part of the file name a
+                    // real rustc gives the artifact.
+                    if let Some(suffix) = v.strip_prefix("extra-filename=") {
+                        extra_filename = Some(suffix.to_string());
+                    }
+                    forward.push(v);
+                }
+            }
+            "--cfg" | "--check-cfg" | "-Z" | "-L" | "--target"
             | "--error-format" | "--cap-lints" | "--remap-path-prefix"
             | "--color" | "--diagnostic-width" | "-A" | "-W" | "-D" | "-F" => {
                 forward.push(flag.to_string());
                 if let Some(v) = take_value(inline, &mut i) {
                     forward.push(v);
                 }
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                // A glued codegen option (the spelling
+                // run-make-support emits, `-Cextra-filename=2`):
+                // forward as-is, but note the output-name
+                // suffix for the artifact recording below.
+                if let Some(suffix) = arg[2..].strip_prefix("extra-filename=") {
+                    extra_filename = Some(suffix.to_string());
+                }
+                forward.push(arg.clone());
             }
             _ if flag.starts_with('-') && flag.len() > 1 => {
                 // Any other flag spelling (single-token forms
@@ -996,13 +1139,20 @@ pub(crate) fn tool_run(
     };
     let input_abs = absolutize(&cwd, &input);
     let edition = edition.unwrap_or_else(|| "2015".to_string());
-    let crate_name = crate_name.unwrap_or_else(|| {
-        input_abs
-            .file_stem()
-            .map(|s| s.to_string_lossy().replace('-', "_"))
-            .unwrap_or_else(|| "crate".to_string())
-    });
     let source_text = std::fs::read_to_string(&input_abs).unwrap_or_default();
+    // The crate's name: the invocation's `--crate-name`,
+    // else the source's own `#![crate_name]` declaration
+    // (the name the compiler itself gives the crate, and
+    // the one the recipe looks its artifacts up by), else
+    // the file stem.
+    let crate_name = crate_name
+        .or_else(|| declared_crate_name(&source_text))
+        .unwrap_or_else(|| {
+            input_abs
+                .file_stem()
+                .map(|s| s.to_string_lossy().replace('-', "_"))
+                .unwrap_or_else(|| "crate".to_string())
+        });
     // The source tree this build converts, snapshotted
     // into every artifact it records: the recipe may
     // rewrite or delete the sources once the build returns,
@@ -1013,13 +1163,23 @@ pub(crate) fn tool_run(
     // Registered artifacts the input declares through
     // `extern crate` items bind too (the driver's session
     // binding counts them as declarations, as for `--aux`).
+    // A name the invocation bound through an explicit
+    // `--extern` is not scanned for: the explicit binding is
+    // the name's binding, as under rustc, and a scan-added
+    // second binding would shadow it in the session.
     for (_, art) in registry.all() {
+        if explicit_extern_names.contains(&art.name) {
+            continue;
+        }
         let needle = format!("extern crate {}", art.name);
-        if source_text.contains(&needle)
-            && !aux.iter().any(|s| s == &aux_spec_for(&art.name, &art))
-        {
-            aux_pins.push((art.source.clone(), art.source_tree.clone()));
-            aux.push(aux_spec_for(&art.name, &art));
+        if source_text.contains(&needle) {
+            bind_artifact_with_deps(
+                registry,
+                &art.name,
+                &art,
+                &mut aux,
+                &mut aux_pins,
+            );
         }
     }
 
@@ -1085,9 +1245,16 @@ pub(crate) fn tool_run(
     // Success: record and create the artifacts a real compiler
     // would have produced, so later invocations and the
     // recipe's own file checks find them.
+    // The crate types the invocation builds: its own
+    // `--crate-type` flags, else the source's `#![crate_type]`
+    // declaration, else the default (a test crate or a root
+    // with `main` builds a binary, anything else a library).
+    // A metadata emit is not a crate type: the emit loop
+    // below records it under the build's first type, the
+    // type a later `--extern` binding rebuilds the source
+    // as when it binds the artifact as an auxiliary crate.
     let types: Vec<String> = if crate_types.is_empty() {
         let has_main = crate_root_has_main(&input_abs, &source_text);
-        let wants_metadata = emits.iter().any(|(k, _)| k == "metadata");
         if test_crate {
             // A `--test` build's primary output is the test
             // binary, named after the crate, whether or not
@@ -1096,8 +1263,8 @@ pub(crate) fn tool_run(
             // is recorded by the emit loop below, as rustc
             // writes both.
             vec!["bin".to_string()]
-        } else if wants_metadata {
-            vec!["rmeta".to_string()]
+        } else if let Some(declared) = declared_crate_type(&source_text) {
+            vec![declared]
         } else if has_main {
             vec!["bin".to_string()]
         } else {
@@ -1106,6 +1273,17 @@ pub(crate) fn tool_run(
     } else {
         crate_types.clone()
     };
+    // The output-name suffix `-C extra-filename` gives every
+    // artifact of the build ("" when the invocation set
+    // none: `-C metadata` alone does not suffix the name).
+    let extra_suffix = extra_filename.as_deref().unwrap_or("");
+    // Whether the invocation produces its crate-type outputs
+    // at all: an `--emit` list replaces the default emit
+    // set, and only a `link` emit among it (or no `--emit`
+    // at all) writes them -- `--emit metadata` alone writes
+    // no rlib beside the rmeta.
+    let link_output =
+        emits.is_empty() || emits.iter().any(|(k, _)| k == "link");
     let mut primary: Option<std::path::PathBuf> = None;
     let mut record = |path: std::path::PathBuf,
                       crate_type: Option<String>,
@@ -1157,10 +1335,10 @@ pub(crate) fn tool_run(
             registry,
             &mut primary,
         );
-    } else {
+    } else if link_output {
         for ty in &types {
             record(
-                out_base.join(artifact_filename(&crate_name, ty)),
+                out_base.join(artifact_filename(&crate_name, ty, extra_suffix)),
                 Some(ty.clone()),
                 registry,
                 &mut primary,
@@ -1172,9 +1350,18 @@ pub(crate) fn tool_run(
             "metadata" => {
                 let p = match path {
                     Some(p) => absolutize(&cwd, p),
-                    None => out_base.join(artifact_filename(&crate_name, "rmeta")),
+                    None => out_base.join(artifact_filename(
+                        &crate_name,
+                        "rmeta",
+                        extra_suffix,
+                    )),
                 };
-                record(p, Some("rmeta".to_string()), registry, &mut primary);
+                // The recorded type is the build's own crate
+                // type, not the emit kind: a later `--extern`
+                // binding rebuilds the source as an auxiliary
+                // crate under this type, and `rmeta` is not a
+                // crate type a compiler accepts.
+                record(p, Some(types[0].clone()), registry, &mut primary);
             }
             "dep-info" => {
                 let p = match path {
@@ -1827,6 +2014,9 @@ pub(crate) fn render_aux_spec(spec: &AuxSpec) -> String {
     if let Some(edition) = &spec.edition {
         out.push_str(";edition=");
         out.push_str(edition);
+    }
+    if spec.force_unstable {
+        out.push_str(";force-unstable=yes");
     }
     out
 }

@@ -7,7 +7,7 @@ use super::Mode;
 /// (`#![crate_type = "..."]`), if any. When a source declares one,
 /// the declaration decides the artifact kind and the driver passes
 /// no `--crate-type` of its own.
-fn declared_crate_type(src: &str) -> Option<String> {
+pub(crate) fn declared_crate_type(src: &str) -> Option<String> {
     declared_inner_attr(src, "crate_type")
 }
 
@@ -17,7 +17,7 @@ fn declared_crate_type(src: &str) -> Option<String> {
 /// under it, and the test refers to it by it), so the driver passes
 /// no `--crate-name` of its own — rustc rejects a `--crate-name`
 /// that differs from the declaration.
-fn declared_crate_name(src: &str) -> Option<String> {
+pub(crate) fn declared_crate_name(src: &str) -> Option<String> {
     declared_inner_attr(src, "crate_name")
 }
 
@@ -529,11 +529,19 @@ pub(crate) struct AuxSpec {
     pub(crate) crate_type: Option<String>,
     pub(crate) edition: Option<String>,
     cfgs: Vec<String>,
+    /// Whether the producing build carried
+    /// `-Zforce-unstable-if-unmarked`: the aux build
+    /// reproduces it, since it shapes the crate's encoded
+    /// stability -- a consumer loading the artifact must
+    /// meet the same rustc_private gate the real artifact
+    /// raises.
+    pub(crate) force_unstable: bool,
 }
 
 /// Parse one `--aux` value: `<name>=<file.rs>` optionally followed
-/// by `;crate-type=<type>`, `;edition=<ed>` and/or `;cfg=<name>`
-/// attributes. Anything else is a usage error.
+/// by `;crate-type=<type>`, `;edition=<ed>`, `;cfg=<name>` and/or
+/// `;force-unstable=yes` attributes. Anything else is a usage
+/// error.
 pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
     let (name, rest) = spec
         .split_once('=')
@@ -550,6 +558,7 @@ pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
         crate_type: None,
         edition: None,
         cfgs: Vec::new(),
+        force_unstable: false,
     };
     for attr in parts {
         let (key, value) = attr
@@ -560,6 +569,15 @@ pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
             "crate-type" => parsed.crate_type = Some(value.to_string()),
             "edition" => parsed.edition = Some(value.to_string()),
             "cfg" => parsed.cfgs.push(value.to_string()),
+            "force-unstable" => match value {
+                "yes" => parsed.force_unstable = true,
+                "no" => parsed.force_unstable = false,
+                _ => {
+                    return Err(format!(
+                        "--aux force-unstable needs yes or no, got: {value}"
+                    ))
+                }
+            },
             _ => return Err(format!("unknown --aux attribute: {key}")),
         }
     }
@@ -845,6 +863,14 @@ pub(crate) fn compile_aux(
         && !own_flags.iter().any(|f| f.contains("prefer-dynamic"))
     {
         cmd.arg("-C").arg("prefer-dynamic");
+    }
+    // A build the recipe shaped with
+    // `-Zforce-unstable-if-unmarked` (the spec carries it from
+    // the producing invocation): the artifact's encoded
+    // stability is part of what a consumer of the artifact
+    // observes, so the aux build reproduces the flag.
+    if spec.force_unstable {
+        cmd.arg("-Zforce-unstable-if-unmarked");
     }
     // The auxiliary crate's own `//@ rustc-env:` /
     // `//@ unset-rustc-env:`: compiletest configures each
