@@ -22,6 +22,12 @@
 //!   recorded under the impl-block path form
 //!   (`...::<impl Trait for Self>::method`); the scan must
 //!   parse that form and match its `Self` section.
+//! * A closure `Self` is spelled with the compiler's span
+//!   form (`{closure@<file>:16:17: 16:23}`) in the impl
+//!   instance key but with the definition path's indexed
+//!   segment (`main::{closure#0}`) in the fat pointer's
+//!   concrete tag; the impl scan must equate the two
+//!   spellings (tests/ui/regions/issue-6157.rs).
 
 use super::{fixture, run_driver, run_driver_with_aux, temp_dir, Output};
 
@@ -176,4 +182,34 @@ fn dyn_impl_inside_method_body_foreign_self() {
     let aux = fixture(&dir, "foreign_self.rs", FOREIGN_SELF_AUX_SRC);
     let src = fixture(&dir, "main.rs", IMPL_IN_METHOD_SRC);
     assert_ok(&run_driver_with_aux(&src, &[("foreign_self", &aux)]));
+}
+
+const CLOSURE_SELF_DYN_SRC: &str = r#"
+pub trait OpInt { fn call(&mut self, _: isize, _: isize) -> isize; }
+
+impl<F> OpInt for F where F: FnMut(isize, isize) -> isize {
+    fn call(&mut self, a: isize, b: isize) -> isize { (*self)(a, b) }
+}
+
+fn apply<'a>(x: isize, op: &'a mut dyn OpInt) -> isize { op.call(x, x) }
+
+fn muli(x: isize, y: isize) -> isize { x * y }
+
+fn main() {
+    let mut f = |x, y| muli(x, y);
+    let r = {
+        let g = &mut f;
+        let h = g as &mut dyn OpInt;
+        apply(3, h)
+    };
+    assert_eq!(r, 9);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_call_on_closure_self_via_blanket_fn_impl() {
+    let dir = temp_dir("dyn-closure-self");
+    let src = fixture(&dir, "main.rs", CLOSURE_SELF_DYN_SRC);
+    assert_ok(&run_driver(&src));
 }
