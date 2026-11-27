@@ -11,14 +11,14 @@ Sparagmos の目標は「Rust 1.100.0 を 99% のレベルで実行できるこ�
 |---|---|
 | 1. MIR バリアント網羅率 | 77.5% (実装済み 31 / 母数 40) |
 | 2(a). 自前コーパスのパス率 | 100% (47 / 47) |
-| 2(b). rustc テストスイート部分集合のパス率 | 88.571% (パス 22,087 / 母数 24,937 の全母数換算) |
+| 2(b). rustc テストスイート部分集合のパス率 | 88.575% (パス 22,088 / 母数 24,937 の全母数換算) |
 | 2(c). rustc 自体の実行 | 未着手 |
 | 参考. コーパスの JIT 経路パス率 | 100% (47 / 47) |
 | 3. std 機能網羅率 | 98.070% (1,677 / 1,710) |
 | 4. テストスイート全体の JIT パス率 | 69.720% (17,386 / 24,937) |
 
-現在の実測値は、Official Measurement run 46011330082 (main ヘッド
-`0e57b9bf`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
+現在の実測値は、Official Measurement run 46015526965 (main ヘッド
+`2e06b0fb`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
 判定できました (詳細は指標2(b) の節)。
 
 ## 指標1: MIR バリアント網羅率
@@ -93,16 +93,16 @@ FFI を含むテスト、補助ファイルやビルドステップを要する�
 
 | 判定種別 | 件数 | 判定済み | 現在のパス |
 |---|---|---|---|
-| 実行 (exec) | 4,149 | 4,149 | 3,920 (94.481%) |
+| 実行 (exec) | 4,149 | 4,149 | 3,921 (94.505%) |
 | コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,940 (97.862%) |
 | 手順 (procedure / run-make) | 551 | 551 | 86 (15.608%) |
 | デバッガ実行 (exec-debugger) | 170 | 170 | 141 (82.941%) |
 | rustdoc 検証 | 1,735 | 1,735 | 0 |
-| 合計 | 24,937 | 24,937 | **22,087** |
+| 合計 | 24,937 | 24,937 | **22,088** |
 
-パス率は全母数換算で **88.571%** (22,087 / 24,937) です。パスして
-いないのは 2,850 件で、全て判定済みの失敗です (種別ごとの残りは、
-実行 229、コンパイル時検証 392、rustdoc 検証 1,735、手順 465、
+パス率は全母数換算で **88.575%** (22,088 / 24,937) です。パスして
+いないのは 2,849 件で、全て判定済みの失敗です (種別ごとの残りは、
+実行 228、コンパイル時検証 392、rustdoc 検証 1,735、手順 465、
 デバッガ実行 29)。
 
 #### Windows クラスの判定について
@@ -120,30 +120,20 @@ stage-3 のサポートビルド失敗) と
 
 #### 前回確定値との差分
 
-前回の確定値 (run 46002490516) と両方で判定できた範囲の差分は
-gain 12 / loss 10 です。前回未判定だった windows-gnu の 4 件は
-今回判定に入り、全て失敗でした。gain 12 件の内訳は、PR #857 が
-2 件 (`tests/ui/codegen/normalization-overflow/recursion-issue-118590.rs`
-と `tests/ui/recursion/recursion_limit/zero-overflow.rs`、いずれも
-コンパイル時検証)、PR #834 が 2 件
-(`tests/ui/attributes/used_with_archive.rs` と
-`tests/ui/runtime/stdout-before-main.rs`、いずれも実行)、PR #796 が
-2 件 (`tests/ui/test-attrs/test-panic-abort.rs` と
-`tests/ui/test-attrs/test-panic-abort-nocapture.rs`、いずれも実行)、
-PR #869 が 1 件 (`tests/coverage/async/await_ready.rs`、実行)、
-PR #856 が 1 件 (`tests/run-make/dep-info`、手順)、PR #864 が
-1 件 (`tests/run-make/dylib-chain`、手順)、PR #833 が 1 件
-(`tests/ui/statics/static-recursive.rs`、実行)、成果物バインディング
-家族が 1 件 (`tests/run-make/prefer-dylib`、手順)、既知フレークの
-揺らぎが 1 件 (`tests/ui/sanitizer/kcfi/fn-trait-objects.rs`、実行)
-です。前回の loss のうち
-`tests/ui/codegen/normalization-overflow/recursion-issue-118590.rs`
-は PR #857 で回復しました。前回新規 loss だった 4 件
-(`tests/ui/limits/vtable-try-as-dyn.rs`、
-`tests/ui/macros/rfc-2011-nicer-assert-messages/feature-gate-generic_assert.rs`、
+前回の確定値 (run 46011330082) と両方で判定できた範囲の差分は
+gain 1 / loss 0 です。唯一の gain は PR #832 の対象レコード
+`tests/ui/intrinsics/panic-uninitialized-zeroed.rs` (実行) で、
+`mem::zeroed` / `mem::uninitialized` / `assume_init` に対する
+zero/uninit validity 強制が公式計測でも確認されました。head 間隔の
+他の PR (#872、#874、#875、#877、#847、#876) は今回の公式値に
+flip を生みませんでした。以前の run で新規 loss となった 14 件は
+今回も全て同じ理由で失敗しています:
+`tests/ui/limits/vtable-try-as-dyn.rs` (コンパイル時検証、
+no-debuginfo リビジョンで compiler crash)、
+`tests/ui/macros/rfc-2011-nicer-assert-messages/feature-gate-generic_assert.rs`
+(実行、終了コード不一致)、
 `tests/ui/panics/issue-47429-short-backtraces.rs`、
-`tests/ui/panics/runtime-switch.rs`) は今回も同じ理由で失敗して
-います。新規の loss 10 件は帰属が未証明でトリアージ中です:
+`tests/ui/panics/runtime-switch.rs` (いずれも実行、標準エラー不一致)、
 `tests/run-make/prefer-rlib` (手順、レシピ失敗)、
 `tests/ui-fulldeps/internal-lints/` 配下の 4 件
 (`direct-use-of-rustc-type-ir.rs`、`import-of-type-ir-inherent.rs`、
@@ -157,6 +147,7 @@ PR #856 が 1 件 (`tests/run-make/dep-info`、手順)、PR #864 が
 (実行、タイムアウト)、
 `tests/ui/traits/next-solver/overflow/recursion-limit-zero-issue-115351.rs`
 (コンパイル時検証、成功すべきテストで再帰上限超過) です。
+これら 14 件は帰属が未証明でトリアージ中です。
 
 #### パスの定義
 
@@ -249,12 +240,8 @@ procedure / exec-debugger / rustdoc のレコードは現在 JIT 経路では
 
 **17,386 / 24,937 (69.720%)**。内訳はコンパイル時検証
 15,958 / 18,332、実行 1,428 / 4,149 で、procedure / exec-debugger /
-rustdoc の nature は 0 件です。前回の確定値との差分は gain 2 /
-loss 8 で、gain の 2 件は PR #857 の
-`tests/ui/codegen/normalization-overflow/recursion-issue-118590.rs`
-と `tests/ui/recursion/recursion_limit/zero-overflow.rs`
-(いずれもコンパイル時検証)、loss の 8 件は指標2(b) の新規 loss の
-うちコンパイル時検証の 8 件と同一集合です。主な失敗要因は、JIT ロワリング未対応 (その他) と、
+rustdoc の nature は 0 件です。前回の確定値との差分は gain 0 /
+loss 0 で、値と内訳は前回と同一です。主な失敗要因は、JIT ロワリング未対応 (その他) と、
 変換済み本体を持たない関数への呼び出しです。この値は、未対応の
 呼び出しを到達時点で失敗するトラップとして下げ、String をヒープ
 機構で処理する現在の jit-compile の意味論のもとで測ったものです。
