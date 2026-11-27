@@ -2127,6 +2127,107 @@ fn main() {
 }
 "##;
 
+const CONSUMED_FORM_GUEST_SRC: &str = r##"
+use std::process::Command;
+
+fn build(rustc: &str, name: &str, src: &str, extra: &[&str]) {
+    std::fs::write(format!("{name}.rs"), src).unwrap();
+    let out = Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg(format!("{name}.rs"))
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build of {name} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    let run = |prog: &str| Command::new(dir.join(prog)).output().unwrap();
+
+    // One invocation produces both forms of the library:
+    // a dylib and an rlib of the same crate, recorded
+    // side by side.
+    build(
+        &rustc,
+        "bothlib",
+        "pub fn v() -> u32 { 11 }\n",
+        &["--crate-type", "dylib", "--crate-type", "rlib"],
+    );
+    build(
+        &rustc,
+        "usesboth",
+        "extern crate bothlib; fn main() { println!(\"v={}\", bothlib::v()); }\n",
+        &[],
+    );
+    build(
+        &rustc,
+        "usesdyn",
+        "extern crate bothlib; fn main() { println!(\"v={}\", bothlib::v()); }\n",
+        &["-Cprefer-dynamic"],
+    );
+
+    let out = run("usesboth");
+    assert!(out.status.success(), "first run of usesboth failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "v=11\n");
+    let out = run("usesdyn");
+    assert!(out.status.success(), "first run of usesdyn failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "v=11\n");
+
+    std::fs::remove_file("libbothlib.so").unwrap();
+    std::fs::remove_file("libbothlib.rlib").unwrap();
+
+    // The plain build linked the rlib form: removing
+    // both forms changes nothing its run can observe.
+    let out = run("usesboth");
+    assert!(
+        out.status.success(),
+        "run of usesboth broke with both forms removed"
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "v=11\n");
+
+    // The prefer-dynamic build loads the dylib form: its
+    // run is the loader's failure, naming the library.
+    let out = run("usesdyn");
+    assert!(
+        !out.status.success(),
+        "run of usesdyn survived its library's removal"
+    );
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("libbothlib.so"),
+        "loader diagnostic does not name the library: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    println!("consumed form guest ok");
+}
+"##;
+
+#[test]
+fn run_mode_tool_interception_consumed_form_decides_loader_failure() {
+    let dir = temp_dir("tool-consumed-form");
+    let src = fixture(&dir, "consumed_form_guest.rs", CONSUMED_FORM_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "consumed form guest ok\n", "stderr={stderr}");
+}
+
 #[test]
 fn run_mode_tool_interception_deleted_dylib_fails_the_run() {
     let dir = temp_dir("tool-dylib-existence");
