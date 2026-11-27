@@ -2441,6 +2441,20 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 // the verdict is the driver's to report through
                 // the finding chain, not the session's.
                 tcx.dcx().reset_err_count();
+            } else if forced.is_err() && before == 0 && tcx.dcx().err_count() > 0 {
+                // The force panicked, so it is abandoned — but a
+                // `bug!` inside the query emits its ICE diagnostic
+                // into the session before the panic unwinds, and
+                // that diagnostic alone would fail the compilation
+                // at the end of the run. The instance is one the
+                // collector itself would never force (its types
+                // do not normalize in the monomorphized
+                // environment — a projection whose impl carries
+                // an unprovable assumed bound, say), so the
+                // abandoned force's diagnostics are discounted
+                // the same way: with no errors counted before the
+                // force, resetting restores exactly that state.
+                tcx.dcx().reset_err_count();
             }
         }
         // A body the collector collects is one rustc itself
