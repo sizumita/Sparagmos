@@ -3864,6 +3864,42 @@ impl<'a> Interpreter<'a> {
     /// shape a target is follows from the value it denotes: an
     /// aggregate value (a nested array's row included) takes the
     /// plain access; anything else is one element of the sequence.
+    /// A single element can also be denoted through a whole-value
+    /// entry path (a wrapper's field -- a `ManuallyDrop` payload,
+    /// a swap temporary's `MaybeUninit` field): the typed access
+    /// recognises that shape by the value's fit for the element
+    /// type (see `seq_target_denotes_single`).
+    /// Whether `target` denotes a single element of a typed
+    /// sequence access: the value at the target fits the element
+    /// type as it stands, while the component the plain indexed
+    /// access would take as element 0 does not -- the target is
+    /// an element position entered through a whole-value entry
+    /// path (a wrapper's field), and the indexed access would
+    /// fragment the element into its first component (a box
+    /// element read through its `ManuallyDrop` field came back
+    /// as the bare pointer, and the slot the copy stored it
+    /// into no longer held a box any consumer recognises). A
+    /// genuine sequence base fails the test on one side or the
+    /// other: its element 0 fits the type, or its whole value
+    /// is not one element.
+    fn seq_target_denotes_single(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem: &Ty,
+    ) -> bool {
+        let Ok(whole) = self.read_resolved(frames, target) else {
+            return false;
+        };
+        if !value_fits_ty(&whole, elem) {
+            return false;
+        }
+        match self.read_resolved_at(frames, target, 0) {
+            Ok(component) => !value_fits_ty(&component, elem),
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn read_seq_at(
         &self,
         frames: &[Frame],
@@ -3898,6 +3934,16 @@ impl<'a> Interpreter<'a> {
                 if let Some(view) = self.byte_view_read(frames, target, index as i128, true)
                 {
                     return view;
+                }
+                // A target denoting a single element (see
+                // `seq_target_denotes_single`): element 0 is
+                // the value at the target itself, whole.
+                if index == 0 {
+                    if let Some(ty) = elem {
+                        if self.seq_target_denotes_single(frames, target, ty) {
+                            return self.read_resolved(frames, target);
+                        }
+                    }
                 }
                 self.read_resolved_at(frames, target, index)
             }
@@ -3948,6 +3994,18 @@ impl<'a> Interpreter<'a> {
                     self.byte_view_write(frames, target, index as i128, &value, true)
                 {
                     return view;
+                }
+                // A target denoting a single element (see
+                // `seq_target_denotes_single`): element 0 is
+                // the position itself, so the value replaces
+                // it whole rather than landing in its first
+                // component.
+                if index == 0 {
+                    if let Some(ty) = elem {
+                        if self.seq_target_denotes_single(frames, target, ty) {
+                            return self.write_resolved(frames, target, value);
+                        }
+                    }
                 }
                 self.write_resolved_at(frames, target, index, value)
             }
