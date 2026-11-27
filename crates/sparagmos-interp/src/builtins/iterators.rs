@@ -6926,6 +6926,7 @@ fn into_iter_identity(ty: &str) -> bool {
         || ty.starts_with("std::iter::Enumerate<")
         || ty.starts_with("std::iter::Copied<")
         || ty.starts_with("std::iter::Cloned<")
+        || ty.starts_with("std::iter::Peekable<")
         || ty.starts_with("std::iter::Take<")
         || ty.starts_with("std::iter::Skip<")
         || ty.starts_with("std::iter::Chain<")

@@ -2058,6 +2058,26 @@ pub fn guest_stepped_iterator_ty(ty: &Ty) -> bool {
     false
 }
 
+/// Whether this type is a core adapter whose `Iterator::next`
+/// step the modelled state machine does not serve -- its state
+/// carries a slot no builtin-produced state has (`Peekable`'s
+/// peeked item) -- so a modelled consumer's drain must step its
+/// collected `next` body through the machine's unclaimed-tag
+/// fallback, exactly as for a guest-stepped iterator (see
+/// `guest_stepped_iterator_ty`). Judged on the head ADT, as
+/// the demand pass consumes the candidate; a reference names
+/// the blanket impl, whose step is the pointee's, so it is
+/// peeled first.
+pub fn body_stepped_iterator_ty(ty: &Ty) -> bool {
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return body_stepped_iterator_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    def.name() == "std::iter::Peekable"
+}
+
 /// Whether this type is a hash-collection iterator (the
 /// `hash_map` / `hash_set` view types or hashbrown's raw
 /// iterators), judged by the ADT definition name.

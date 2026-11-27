@@ -1233,7 +1233,11 @@ fn resolve_next_instance_via_trait(
 /// of every guest-stepped iterator type the converted bodies
 /// hand to a modelled consumer (see `consumer_iterator_ty`)
 /// or step through a direct `next` call (see
-/// `next_call_self_ty`). The consumer entries are
+/// `next_call_self_ty`), and of every body-stepped adapter
+/// type handed the same way (see `body_stepped_iterator_ty`
+/// in reach): a core adapter the modelled machine cannot
+/// step, whose own `next` body is a plain collected body the
+/// machine's fallback runs. The consumer entries are
 /// interpreter builtins, so the call-graph collection stops
 /// at them, and a generic guest impl has no monomorphic
 /// instance as an item either: the instance exists nowhere
@@ -1323,7 +1327,9 @@ pub(crate) fn demand_iterator_next_instances(
                 else {
                     continue;
                 };
-                if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty) {
+                if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty)
+                    && !sparagmos_driver::reach::body_stepped_iterator_ty(&ty)
+                {
                     continue;
                 }
                 if consumer_ty.is_some() {
