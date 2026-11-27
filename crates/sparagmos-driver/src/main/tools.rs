@@ -419,35 +419,94 @@ impl ToolRegistry {
 
     /// The recorded dynamic-library dependency of
     /// `artifact` a native loader would fail to find: the
-    /// first of the artifact's recorded dependencies, in
-    /// the order the loader reaches them (a dependent
-    /// before the libraries it itself needs -- the
-    /// recorded order reversed), whose crate type the
-    /// loader loads at run time (`dylib` / `cdylib`) and
-    /// whose file no longer stands at the path its build
-    /// produced it at. A statically linked dependency (an
-    /// rlib) is not the loader's concern: its code stands
-    /// in the binary itself, and removing its file after
-    /// the build changes nothing a run can observe, so it
-    /// is never reported here. `None` when every recorded
-    /// dynamic dependency still stands.
+    /// first of the dependencies the run's binary actually
+    /// loads, in the order the loader reaches them (a
+    /// dependent before the libraries it itself needs --
+    /// the recorded order reversed), whose file no longer
+    /// stands at the path its build produced it at.
+    ///
+    /// A dependency's recorded form is not necessarily the
+    /// form the binary linked: one build of a crate can
+    /// stand in the registry under several crate types at
+    /// once (a single invocation producing both a dylib and
+    /// an rlib of the same crate records both), and the
+    /// registry binds every form to a dependent's
+    /// `--extern`. Which form a build consumed is decided
+    /// the way the linker decides it (see `consumed_form`):
+    /// a build that preferred dynamic linking takes the
+    /// dylib, any other build takes the rlib when one
+    /// stands, and a name offered in only one form is
+    /// consumed in that form. Only the consumed form is
+    /// the loader's concern -- a statically linked
+    /// dependency's code stands in the binary itself, and
+    /// removing its file after the build changes nothing a
+    /// run can observe, even when a dylib of the same crate
+    /// was recorded beside it and is removed too.
+    ///
+    /// A consumed dependency's own dynamic dependencies
+    /// are the loader's concern as well, whichever form
+    /// was consumed here: a loaded dylib names them, and a
+    /// statically linked rlib's metadata propagates them
+    /// to the binary. The walk therefore descends into
+    /// every consumed dependency, with the dependency's
+    /// own recorded arguments deciding which of ITS
+    /// dependencies were consumed. `None` when every
+    /// dynamic dependency the binary loads still stands.
     fn missing_dynamic_dependency(
         &self,
         artifact: &ToolArtifact,
     ) -> Option<std::path::PathBuf> {
-        for (spec, pin) in artifact
-            .aux_specs
-            .iter()
-            .zip(artifact.aux_pins.iter())
-            .rev()
-        {
-            let Some((path, dep)) = self.entry_for_spec(spec, pin) else {
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        self.missing_dynamic_dependency_in(artifact, &mut seen)
+    }
+
+    fn missing_dynamic_dependency_in(
+        &self,
+        artifact: &ToolArtifact,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        // The names this build bound, in the order the
+        // loader reaches them: the recorded order reversed,
+        // each name once.
+        let mut names: Vec<&str> = Vec::new();
+        for spec in artifact.aux_specs.iter().rev() {
+            let name = spec.split('=').next().unwrap_or("");
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for name in names {
+            // Every recorded form of this name the build's
+            // specs resolve to.
+            let mut forms: Vec<(std::path::PathBuf, ToolArtifact)> = Vec::new();
+            for (spec, pin) in artifact
+                .aux_specs
+                .iter()
+                .zip(artifact.aux_pins.iter())
+            {
+                if spec.split('=').next().unwrap_or("") == name {
+                    if let Some(entry) = self.entry_for_spec(spec, pin) {
+                        forms.push(entry);
+                    }
+                }
+            }
+            let Some((path, dep)) = consumed_form(artifact, &forms) else {
                 continue;
             };
             if matches!(dep.crate_type.as_deref(), Some("dylib") | Some("cdylib"))
                 && !path.is_file()
             {
                 return Some(path);
+            }
+            if dep.crate_type.as_deref() != Some("proc-macro")
+                && seen.insert(path.clone())
+            {
+                if let Some(missing) =
+                    self.missing_dynamic_dependency_in(&dep, seen)
+                {
+                    return Some(missing);
+                }
             }
         }
         None
@@ -521,6 +580,57 @@ fn aux_spec_for(name: &str, artifact: &ToolArtifact) -> String {
         spec += ";force-unstable=yes";
     }
     spec
+}
+
+/// Whether a forwarded rustc argument list carries
+/// `-C prefer-dynamic` (the `--codegen` long spelling
+/// included), in either its glued one-token spelling or
+/// the split option + name pair.
+fn carried_prefer_dynamic(args: &[String]) -> bool {
+    let mut prev_codegen = false;
+    for arg in args {
+        if arg == "-Cprefer-dynamic"
+            || arg == "--codegen=prefer-dynamic"
+            || (prev_codegen && arg == "prefer-dynamic")
+        {
+            return true;
+        }
+        prev_codegen = arg == "-C" || arg == "--codegen";
+    }
+    false
+}
+
+/// The recorded form of one dependency that the build of
+/// `artifact` actually linked, among the forms its specs
+/// for the name resolve to (`forms`): the dylib form when
+/// the build preferred dynamic linking and one stands,
+/// otherwise the static form (an rlib, a staticlib, or a
+/// build that recorded no crate type -- a library built
+/// without naming one stands as an rlib) when one stands,
+/// otherwise the dylib form, a name offered in only one
+/// form being consumed in that form. `None` when no
+/// linkable form stands (a name offered only as a
+/// proc-macro is consumed by the compiler at build time,
+/// never by the binary's link).
+fn consumed_form(
+    artifact: &ToolArtifact,
+    forms: &[(std::path::PathBuf, ToolArtifact)],
+) -> Option<(std::path::PathBuf, ToolArtifact)> {
+    let dynamic = forms.iter().find(|(_, a)| {
+        matches!(a.crate_type.as_deref(), Some("dylib") | Some("cdylib"))
+    });
+    let static_form = forms.iter().find(|(_, a)| {
+        matches!(
+            a.crate_type.as_deref(),
+            Some("rlib") | Some("staticlib") | None
+        )
+    });
+    let chosen = if carried_prefer_dynamic(&artifact.rustc_args) {
+        dynamic.or(static_form)
+    } else {
+        static_form.or(dynamic)
+    };
+    chosen.map(|(path, a)| (path.clone(), cloned_artifact(a)))
 }
 
 /// Whether a forwarded rustc argument list carries
