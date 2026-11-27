@@ -14,6 +14,34 @@
 
 use std::process::Command;
 
+/// Fixture directories this test process created under the
+/// system temp directory, removed when the process exits.
+/// Tests spawn the driver per case and used to leave every
+/// fixture directory behind (#537); the registry keeps the
+/// per-test `temp_dir` shape and sweeps at exit instead.
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_scratch_dir(dir: &std::path::Path) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let _ = libc::atexit(remove_scratch_dirs);
+    });
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+}
+
+extern "C" fn remove_scratch_dirs() {
+    if let Ok(dirs) = SCRATCH_DIRS.try_lock() {
+        for dir in dirs.iter() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 fn run_driver(case: &str, source: &str, extra: &[&str])
               -> (i32, String, String, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
@@ -22,6 +50,7 @@ fn run_driver(case: &str, source: &str, extra: &[&str])
         case
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     let src = dir.join("case.rs");
     std::fs::write(&src, source).unwrap();
     let capture = dir.join("compiler-stdout.txt");
