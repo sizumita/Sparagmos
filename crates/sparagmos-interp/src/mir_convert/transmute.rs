@@ -2340,7 +2340,7 @@ let inner = match (&src, target) {
     /// pointee, or to an ADT whose last field is such a
     /// type (the unsized tail the metadata counts or
     /// names). `None` for a thin pointer type.
-    fn fat_tail_meta(&self, ty: &mir::Ty) -> Option<ir::FatMeta> {
+    pub(super) fn fat_tail_meta(&self, ty: &mir::Ty) -> Option<ir::FatMeta> {
         self.tail_meta(ptr_pointee(ty)?, 0)
     }
 
