@@ -1443,6 +1443,34 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         ) {
             return Ok(Some(x.cmp(&y)));
         }
+        // An `OsStr` value in its bare form -- the byte
+        // string itself, as a `Box<OsStr>`'s pointee and
+        // byte-view reads of OS-string storage hold it, or
+        // the text form when the bytes came from a string
+        // literal -- denotes the same bytes (see the bare
+        // arm of `values_equal`): against an OS-string
+        // shape, or against the other bare form, it orders
+        // as those bytes. Two bare byte strings never take
+        // this arm: a byte string there may be a scalar's
+        // storage, whose reading the scalar arm below
+        // decides by the partner's form.
+        for (side, other, flip) in [(&*a, &*b, false), (&*b, &*a, true)] {
+            let bare = match side {
+                Value::Bytes(bytes) => Some(bytes.clone()),
+                Value::Str(text) => Some(text.clone().into_bytes()),
+                _ => None,
+            };
+            let Some(bare) = bare else { continue };
+            let other_bytes = match other {
+                Value::Bytes(_) => None,
+                Value::Str(text) => Some(text.clone().into_bytes()),
+                _ => self.os_string_bytes_any(frames, other)?,
+            };
+            if let Some(other_bytes) = other_bytes {
+                let ord = bare.cmp(&other_bytes);
+                return Ok(Some(if flip { ord.reverse() } else { ord }));
+            }
+        }
         // A scalar in its byte form orders as the integer it
         // denotes, against the same scalar in its integer form
         // (see `values_equal` for the two byte shapes and why

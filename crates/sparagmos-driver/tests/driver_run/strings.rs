@@ -5034,3 +5034,53 @@ fn run_mode_os_str_detached_deref_ordering() {
         "eq=false\nlt=true\ngt=true\ncmp=Less\npcmp=Some(Less)\nsorted=[\"a\\xFFb\", \"a\\xFFc\"]\ntuple=(\"a\\xFFb\", 1)\nparent_tostr=None\nparent_debug=\"d\\xFF\"\nfname_tostr=None\nfname_debug=\"a\\xFFb\"\nfname_lt=true\n",
     );
 }
+
+const OS_STR_BARE_FORM_ORD_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+
+fn agg(s: &str) -> OsString {
+    let mut o = OsString::with_capacity(16);
+    o.push(s);
+    o
+}
+
+fn main() {
+    // A boxed `OsStr`'s pointee is the bare byte string;
+    // ordering it against a literal `OsStr` (the text
+    // form) and against `OsString` values in their
+    // element and real-aggregate forms reads the same
+    // bytes equality does, in both operand orders.
+    let boxed = OsString::from_vec(b"abc".to_vec()).into_boxed_os_str();
+    let lit = OsStr::new("abd");
+    println!("lit lt={} pc={:?}", &*boxed < lit, (*boxed).partial_cmp(lit));
+    println!("lit gt={} pc={:?}", lit > &*boxed, lit.partial_cmp(&*boxed));
+    let from = OsString::from("abd");
+    println!("from lt={} pc={:?}", &*boxed < from, (*boxed).partial_cmp(&from));
+    println!("from gt={} pc={:?}", from > &*boxed, from.partial_cmp(&*boxed));
+    let a = agg("abd");
+    println!("agg lt={} pc={:?}", &*boxed < a, (*boxed).partial_cmp(&a));
+    println!("agg gt={} pc={:?}", a > &*boxed, a.partial_cmp(&*boxed));
+    let same = OsString::from("abc");
+    println!("same pc={:?} lt={} le={}", (*boxed).partial_cmp(&same), &*boxed < same, &*boxed <= same);
+    // The text-form box (its bytes came from a string)
+    // orders the same way.
+    let text_boxed = OsString::from("abc").into_boxed_os_str();
+    println!("text lt={} pc={:?}", &*text_boxed < lit, (*text_boxed).partial_cmp(lit));
+    // Non-UTF-8 bytes order by their raw bytes, against
+    // another box and against a literal.
+    let raw = OsString::from_vec(vec![0xff, b'a']).into_boxed_os_str();
+    let raw2 = OsString::from_vec(vec![0xff, b'b']).into_boxed_os_str();
+    println!("raw lt={} pc={:?}", raw < raw2, raw.partial_cmp(&raw2));
+    println!("raw-lit pc={:?}", (*raw).partial_cmp(OsStr::new("a")));
+}
+"#;
+
+#[test]
+fn run_mode_os_str_bare_form_ordering() {
+    run_ok(
+        "os-str-bare-form-ordering",
+        OS_STR_BARE_FORM_ORD_SRC,
+        "lit lt=true pc=Some(Less)\nlit gt=true pc=Some(Greater)\nfrom lt=true pc=Some(Less)\nfrom gt=true pc=Some(Greater)\nagg lt=true pc=Some(Less)\nagg gt=true pc=Some(Greater)\nsame pc=Some(Equal) lt=false le=true\ntext lt=true pc=Some(Less)\nraw lt=true pc=Some(Less)\nraw-lit pc=Some(Greater)\n",
+    );
+}
