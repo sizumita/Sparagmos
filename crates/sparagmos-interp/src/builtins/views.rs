@@ -6,8 +6,8 @@ use std::borrow::Cow;
 use crate::error::{InterpError, InterpResult};
 use crate::ir::Ty;
 use crate::interp::{
-    project_value, rc_handle_id, scalar_storage_byte, scalar_storage_len,
-    Frame, Interpreter, Resolved,
+    layered_wrapper_pointer, project_value, rc_handle_id, scalar_storage_byte,
+    scalar_storage_len, Frame, Interpreter, Resolved,
 };
 use crate::value::{RefProj, RefTarget, Value};
 
@@ -1186,21 +1186,33 @@ impl<'a> Interpreter<'a> {
                     if let Value::DynRef { .. } = pointee {
                         return Ok(pointee);
                     }
-                    return match pointee {
+                    // The box's stored pointer: the single field
+                    // of the aggregate a builtin builds, or the
+                    // bottom of the field-0 wrapper chain
+                    // (`Box` / `Unique` / `NonNull`) a guest body
+                    // builds. A fat bottom is the slice view
+                    // itself; an allocation pointer is returned
+                    // as it stands.
+                    let inner = match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
-                            let inner =
-                                fields.into_iter().next().expect("len checked");
-                            Ok(match inner {
-                                Value::Ref(RefTarget::Alloc { .. }) => inner,
-                                other => Value::Ref(RefTarget::value(other)),
-                            })
+                            fields.into_iter().next().expect("len checked")
                         }
-                        other => Err(InterpError::type_mismatch(
-                            what,
-                            "boxed value",
-                            other.kind_name(),
-                        )),
+                        ref value => match layered_wrapper_pointer(value) {
+                            Some(ptr) => ptr,
+                            None => {
+                                return Err(InterpError::type_mismatch(
+                                    what,
+                                    "boxed value",
+                                    value.kind_name(),
+                                ));
+                            }
+                        },
                     };
+                    return Ok(match inner {
+                        Value::Ref(RefTarget::Alloc { .. }) => inner,
+                        Value::FatRef { .. } => inner,
+                        other => Value::Ref(RefTarget::value(other)),
+                    });
                 }
                 _ => {
                     return Err(unsupported(format!(
@@ -1362,34 +1374,46 @@ impl<'a> Interpreter<'a> {
             let inner_ty = first_generic_param(base_ty).ok_or_else(|| {
                 unsupported(format!("{what} for {base_ty}: no inner type"))
             })?;
-            return match value {
+            // The box's stored pointer: the single field of
+            // the aggregate a builtin builds, or the bottom of
+            // the field-0 wrapper chain (`Box` / `Unique` /
+            // `NonNull`) a guest body builds — the shape
+            // `Box::into_boxed_slice`'s body leaves behind.
+            let field = match value {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
-                    let field = fields.into_iter().next().expect("len checked");
-                    if target_ty == inner_ty {
-                        // The view is the pointee itself: the
-                        // result is a reference to the box's
-                        // storage, not the pointee value. The box
-                        // field already is that reference (the
-                        // allocation pointer); a non-reference
-                        // field is resolved and re-wrapped as a
-                        // value reference.
-                        return Ok(match field {
-                            Value::Ref(_) | Value::DynRef { .. } => field,
-                            other => {
-                                let pointee = self.resolve_value(frames, &other)?;
-                                Value::Ref(RefTarget::value(pointee))
-                            }
-                        });
-                    }
-                    let pointee = self.resolve_value(frames, &field)?;
-                    self.view_value_as(frames, pointee, &inner_ty, target_ty, what)
+                    fields.into_iter().next().expect("len checked")
                 }
-                other => Err(InterpError::type_mismatch(
-                    what,
-                    "boxed value",
-                    other.kind_name(),
-                )),
+                ref value => match layered_wrapper_pointer(value) {
+                    Some(ptr) => ptr,
+                    None => {
+                        return Err(InterpError::type_mismatch(
+                            what,
+                            "boxed value",
+                            value.kind_name(),
+                        ));
+                    }
+                },
             };
+            if target_ty == inner_ty {
+                // The view is the pointee itself: the result is
+                // a reference to the box's storage, not the
+                // pointee value. The box field already is that
+                // reference (the allocation pointer, or the fat
+                // pointer that is the slice view itself); a
+                // non-reference field is resolved and re-wrapped
+                // as a value reference.
+                return Ok(match field {
+                    Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                        field
+                    }
+                    other => {
+                        let pointee = self.resolve_value(frames, &other)?;
+                        Value::Ref(RefTarget::value(pointee))
+                    }
+                });
+            }
+            let pointee = self.resolve_value(frames, &field)?;
+            return self.view_value_as(frames, pointee, &inner_ty, target_ty, what);
         }
         if base_ty.starts_with("std::rc::Rc<")
             || base_ty.starts_with("std::sync::Arc<")
