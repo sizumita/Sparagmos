@@ -194,3 +194,30 @@ fn run_mode_deeply_nested_zst_wrapper_chain_return() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
 }
+
+const IMPORTED_MAIN_SRC: &str = r#"
+pub mod foo {
+    pub fn bar() {
+        println!("Hello world!");
+    }
+}
+use foo::bar as main;
+"#;
+
+#[test]
+fn run_mode_imported_main_from_inner_mod() {
+    // tests/ui/entry-point/imported_main_from_inner_mod.rs
+    // (Issue #532): the entry point is a re-export, not a
+    // definition in the root module; run mode enters through
+    // the compiler-designated entry id.
+    let dir = temp_dir("imported-main");
+    let src = fixture(&dir, "imported_main.rs", IMPORTED_MAIN_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello world!\n");
+}

@@ -834,3 +834,252 @@ fn run_mode_panic_abort_secondary_process_runs_one_named_test() {
         "the report carries the panic message; stderr={stderr}"
     );
 }
+
+const THREAD_CAPTURE_SRC: &str = r#"
+#[test]
+fn thready_pass() {
+    println!("fee");
+    std::thread::spawn(|| { println!("fie"); println!("foe"); }).join().unwrap();
+    println!("fum");
+}
+#[test]
+fn thready_fail() {
+    println!("fee");
+    std::thread::spawn(|| { println!("fie"); println!("foe"); }).join().unwrap();
+    println!("fum");
+    panic!();
+}
+"#;
+
+/// The parts of a harness run's output that depend on the run's
+/// environment, in compiletest's snapshot spellings: the
+/// fixture's own path ($DIR's file), the panic report's thread
+/// id ($TID) and a TypeId's hash digits ($HEX). The guest's
+/// summary time is not normalized: the model always reports
+/// 0.00s, which is part of what these tests pin.
+fn normalize_harness_output(out: &str, src: &std::path::Path) -> String {
+    let mut s = out.replace(&src.display().to_string(), "$FILE");
+    s = s.replace("(1) panicked", "($TID) panicked");
+    while let Some(i) = s.find("TypeId(0x") {
+        let end = s[i..].find(')').map(|j| i + j).expect("TypeId close");
+        s.replace_range(i..=end, "TypeId($HEX)");
+    }
+    s
+}
+
+#[test]
+fn run_mode_libtest_thread_capture_output_matches_snapshot() {
+    // tests/ui/test-attrs/test-thread-capture.rs (Issue #532):
+    // a failing test's captured section carries its own prints,
+    // its spawned thread's prints in join order, and its panic
+    // report; the passing test's captured output is discarded.
+    let dir = temp_dir("libtest-thread-capture");
+    let src = fixture(&dir, "thread_capture.rs", THREAD_CAPTURE_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--test-threads=1"],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 2 tests\n\
+         test thready_fail ... FAILED\n\
+         test thready_pass ... ok\n\
+         \n\
+         failures:\n\
+         \n\
+         ---- thready_fail stdout ----\n\
+         fee\n\
+         fie\n\
+         foe\n\
+         fum\n\
+         \n\
+         thread 'thready_fail' ($TID) panicked at $FILE:13:5:\n\
+         explicit panic\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         \n\
+         \n\
+         failures:\n\
+         \x20   thready_fail\n\
+         \n\
+         test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+}
+
+const SHOW_SPAN_SRC: &str = r#"
+#[test]
+#[should_panic]
+fn should_panic_with_any_message() { panic!("Panic!"); }
+#[test]
+#[should_panic = "message"]
+fn should_panic_with_message() { panic!("message"); }
+#[test]
+#[should_panic]
+fn should_panic_with_any_message_does_not_panic() {}
+#[test]
+#[should_panic = "message"]
+fn should_panic_with_message_does_not_panic() {}
+#[test]
+#[should_panic = "message"]
+fn should_panic_with_substring_panics_with_incorrect_string() { panic!("ZOMGWTFBBQ"); }
+#[test]
+#[should_panic = "message"]
+fn should_panic_with_substring_panics_with_non_string_value() { panic!(123); }
+"#;
+
+#[test]
+fn run_mode_libtest_nocapture_should_panic_output_matches_snapshot() {
+    // tests/ui/test-attrs/test-should-panic-failed-show-span.rs
+    // (Issue #532): in --nocapture mode the panic reports go to
+    // the guest's stderr as the tests run (the backtrace note on
+    // the first one only), and the failure sections carry the
+    // harness's notes alone.
+    let dir = temp_dir("libtest-show-span");
+    let src = fixture(&dir, "show_span.rs", SHOW_SPAN_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--edition",
+            "2015",
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--nocapture",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 6 tests\n\
+         test should_panic_with_any_message - should panic ... ok\n\
+         test should_panic_with_any_message_does_not_panic - should panic ... FAILED\n\
+         test should_panic_with_message - should panic ... ok\n\
+         test should_panic_with_message_does_not_panic - should panic ... FAILED\n\
+         test should_panic_with_substring_panics_with_incorrect_string - should panic ... FAILED\n\
+         test should_panic_with_substring_panics_with_non_string_value - should panic ... FAILED\n\
+         \n\
+         failures:\n\
+         \n\
+         ---- should_panic_with_any_message_does_not_panic stdout ----\n\
+         note: test did not panic as expected at $FILE:10:4\n\
+         ---- should_panic_with_message_does_not_panic stdout ----\n\
+         note: test did not panic as expected at $FILE:13:4\n\
+         ---- should_panic_with_substring_panics_with_incorrect_string stdout ----\n\
+         note: panic did not contain expected string\n\
+         \x20     panic message: \"ZOMGWTFBBQ\"\n\
+         \x20expected substring: \"message\"\n\
+         ---- should_panic_with_substring_panics_with_non_string_value stdout ----\n\
+         note: expected panic with string value,\n\
+         \x20found non-string value: `TypeId($HEX)`\n\
+         \x20    expected substring: \"message\"\n\
+         \n\
+         failures:\n\
+         \x20   should_panic_with_any_message_does_not_panic\n\
+         \x20   should_panic_with_message_does_not_panic\n\
+         \x20   should_panic_with_substring_panics_with_incorrect_string\n\
+         \x20   should_panic_with_substring_panics_with_non_string_value\n\
+         \n\
+         test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+    let stderr = normalize_harness_output(&String::from_utf8_lossy(&out.stderr), &src);
+    // The four panicking tests report to stderr in run order;
+    // the backtrace note appears on the first report only.
+    let names = [
+        "should_panic_with_any_message",
+        "should_panic_with_message",
+        "should_panic_with_substring_panics_with_incorrect_string",
+        "should_panic_with_substring_panics_with_non_string_value",
+    ];
+    let mut pos = 0;
+    for name in names {
+        let found = stderr[pos..]
+            .find(&format!("thread '{name}'"))
+            .unwrap_or_else(|| panic!("report for {name} missing; stderr={stderr}"));
+        pos += found;
+    }
+    assert_eq!(
+        stderr.matches("note: run with `RUST_BACKTRACE=1`").count(),
+        1,
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("Box<dyn Any>"), "stderr={stderr}");
+}
+
+const TERSE_ORDER_SRC: &str = r#"
+#[test]
+fn abc() { panic!(); }
+#[test]
+fn foo() { panic!(); }
+#[test]
+fn foo2() { panic!(); }
+#[test]
+fn pass1() {}
+#[test]
+fn pass2() {}
+"#;
+
+#[test]
+fn run_mode_libtest_terse_output_matches_snapshot() {
+    // tests/ui/test-attrs/terse.rs (Issue #532): the terse
+    // formatter puts each failure on its own line, packs the
+    // short results, and shares the pretty formatter's failure
+    // sections and summary.
+    let dir = temp_dir("libtest-terse-order");
+    let src = fixture(&dir, "terse.rs", TERSE_ORDER_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--test-threads=1",
+            "--guest-arg",
+            "--quiet",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(101));
+    let stdout = normalize_harness_output(&String::from_utf8_lossy(&out.stdout), &src);
+    assert_eq!(
+        stdout,
+        "\nrunning 5 tests\n\
+         abc --- FAILED\n\
+         foo --- FAILED\n\
+         foo2 --- FAILED\n\
+         ..\n\
+         failures:\n\
+         \n\
+         ---- abc stdout ----\n\
+         \n\
+         thread 'abc' ($TID) panicked at $FILE:3:12:\n\
+         explicit panic\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         \n\
+         ---- foo stdout ----\n\
+         \n\
+         thread 'foo' ($TID) panicked at $FILE:5:12:\n\
+         explicit panic\n\
+         \n\
+         ---- foo2 stdout ----\n\
+         \n\
+         thread 'foo2' ($TID) panicked at $FILE:7:13:\n\
+         explicit panic\n\
+         \n\
+         \n\
+         failures:\n\
+         \x20   abc\n\
+         \x20   foo\n\
+         \x20   foo2\n\
+         \n\
+         test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         \n",
+        "stdout={stdout}"
+    );
+}
