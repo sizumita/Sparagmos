@@ -5,7 +5,7 @@
 //! charged frame sizes cross the thread's stack budget, not
 //! at the interpreter's call-depth backstop.
 
-use super::{fixture, run_driver, temp_dir};
+use super::{fixture, run_driver, run_driver_extra, temp_dir};
 
 const RECURSE_SRC: &str = r#"
 #[allow(unconditional_recursion)]
@@ -130,6 +130,60 @@ fn recursion_within_the_stack_budget_completes() {
         out.status.code(),
         Some(0),
         "deep but small-frame recursion stays within budget; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
+const ZEROED_IN_THREAD_SRC: &str = r#"
+fn main() {
+    std::thread::spawn(|| {
+        let _memory: [u8; 1024 * 1024] = unsafe { std::mem::zeroed() };
+    })
+    .join()
+    .unwrap();
+    println!("done");
+}
+"#;
+
+#[test]
+fn zeroed_large_type_in_spawned_thread_completes() {
+    let dir = temp_dir("stack-zeroed-thread");
+    let src = fixture(&dir, "zeroed_thread.rs", ZEROED_IN_THREAD_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-O"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a zeroed 1 MiB array fits a default 2 MiB thread stack:          the construction pipelines the value through several          declared locals of the same size, but only the one the          memset's address names materialises natively; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
+
+const BOXED_ZEROED_SRC: &str = r#"
+fn main() {
+    const LEN: usize = 1 << 15;
+    std::thread::Builder::new()
+        .stack_size(LEN / 2)
+        .spawn(move || {
+            let vec: Vec<[u8; LEN]> = vec![unsafe { std::mem::zeroed() }];
+            assert_eq!(vec.len(), 1);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    println!("done");
+}
+"#;
+
+#[test]
+fn vec_of_zeroed_array_on_small_stack_thread_completes() {
+    let dir = temp_dir("stack-boxed-zeroed");
+    let src = fixture(&dir, "boxed_zeroed.rs", BOXED_ZEROED_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-O"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a vec![zeroed()] of a 32 KiB array fits a 16 KiB thread          stack natively: the value is written straight into the          box allocation, so no declared pipeline local          materialises; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
 }
