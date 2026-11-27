@@ -62,6 +62,7 @@ impl Converter {
             const_work_budget: MAX_CONST_WORK_BYTES,
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
+            foreign_static_defs: std::collections::HashMap::new(),
             alloc_cache_bytes: 0,
             const_memo: std::collections::HashMap::new(),
             source_line_cache: std::collections::HashMap::new(),

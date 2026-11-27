@@ -253,3 +253,76 @@ fn is_unicode_data_table(name: &str) -> bool {
     name.contains("::unicode_data::")
         && (name.ends_with("::SHORT_OFFSET_RUNS") || name.ends_with("::OFFSETS"))
 }
+
+/// The link symbol the compiler assigns to the static `def`,
+/// when it can be asked: `#[no_mangle]` / `#[export_name]`
+/// definitions carry their export name, foreign declarations
+/// the name they import (a `#[link_name]` included), and every
+/// other static its mangled name, which no other static
+/// shares. Asking can panic for shapes the compiler cannot
+/// name; the question is contained and such a static simply
+/// has no symbol here.
+fn static_link_symbol(def: &mir::mono::StaticDef) -> Option<String> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        let instance = rustc_middle::ty::Instance::mono(tcx, internal);
+        Some(tcx.symbol_name(instance).name.to_string())
+    })
+}
+
+/// The defined static whose storage a foreign static's import
+/// binds to, when the session contains one: a declaration in
+/// an `extern` block (or a `#[linkage]` declaration) names a
+/// link symbol, and a definition anywhere in the session's
+/// crates — the auxiliary crates a test links included —
+/// carrying the same symbol is the storage the declaration's
+/// references denote. The match is by the compiler's own
+/// symbol names, so it holds across crate boundaries and
+/// export attributes. A foreign static with no definition in
+/// the session (a C library's variable, say) gets `None`.
+pub(crate) fn foreign_static_definition(
+    def: &mir::mono::StaticDef,
+) -> Option<mir::mono::StaticDef> {
+    let symbol = static_link_symbol(def)?;
+    for krate in
+        std::iter::once(rustc_public::local_crate()).chain(rustc_public::external_crates())
+    {
+        for candidate in crate_statics(&krate) {
+            if candidate.def_id() == def.def_id() {
+                continue;
+            }
+            if static_link_symbol(&candidate).as_deref() != Some(symbol.as_str()) {
+                continue;
+            }
+            if static_is_foreign(&candidate) {
+                continue;
+            }
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether the foreign static `def` imports its symbol with
+/// weak linkage (`#[linkage = "extern_weak"]`): the symbol is
+/// allowed to be undefined, and an undefined weak symbol's
+/// address is the null address, so a program that takes the
+/// declaration's value reads the null pointer rather than
+/// storage contents.
+pub(crate) fn static_is_extern_weak(def: &mir::mono::StaticDef) -> bool {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        // A foreign item's `#[linkage]` is recorded in the
+        // codegen attrs' import linkage (the field the
+        // compiler's own `get_static` applies when it declares
+        // the import); the plain linkage field carries the
+        // attribute of definitions only.
+        Some(
+            tcx.codegen_fn_attrs(internal).import_linkage
+                == Some(rustc_attr_ir::Linkage::ExternalWeak),
+        )
+    })
+    .unwrap_or(false)
+}
