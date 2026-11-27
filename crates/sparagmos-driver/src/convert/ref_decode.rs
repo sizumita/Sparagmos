@@ -589,11 +589,24 @@ impl Converter {
                 sm::ConstValue::IntPtr(addr as u64)
             });
         };
-        let mir::alloc::GlobalAlloc::VTable(concrete_ty, _) =
+        let mir::alloc::GlobalAlloc::VTable(concrete_ty, trait_ref) =
             mir::alloc::GlobalAlloc::from(vtable_prov.0)
         else {
             return None;
         };
+        // The vtable this pointer carries is a trait-object
+        // formation no body cast names when it happens inside a
+        // constant -- a static's initializer, or a promoted
+        // constant like the generated test harness's tests
+        // array -- so record the vtable's identity exactly as
+        // a standalone vtable pointer's decode does. The demand
+        // pass then converts the vtable's method bodies (see
+        // `Converter::vtable_demand`), without which a dispatch
+        // through this pointer finds no concrete body for a
+        // method only a vtable entry names (a trait default the
+        // impl does not override).
+        let id = vtable_id(&concrete_ty, &trait_ref);
+        self.note_vtable_identity(id, &concrete_ty, &trait_ref);
         // The bounds the pointer answers to, in the name form
         // body conversion gives this same `dyn` type.
         let sm::Ty::Dynamic(traits, _, _) = self.ty(inner) else {
