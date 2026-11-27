@@ -2261,6 +2261,84 @@ fn run_mode_panic_hook_fires_with_location() {
     assert_eq!(stdout, "hook line 9\nfired 1\n", "stdout={stdout}");
 }
 
+const PANIC_UPDATE_HOOK_SRC: &str = r#"
+#![feature(panic_update_hook)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+static A: AtomicUsize = AtomicUsize::new(0);
+static B: AtomicUsize = AtomicUsize::new(0);
+static C: AtomicUsize = AtomicUsize::new(0);
+fn main() {
+    std::panic::set_hook(Box::new(|_| {
+        A.fetch_add(1, Ordering::SeqCst);
+    }));
+    std::panic::update_hook(move |prev, info| {
+        B.fetch_add(1, Ordering::SeqCst);
+        prev(info);
+    });
+    std::panic::update_hook(move |prev, info| {
+        C.fetch_add(1, Ordering::SeqCst);
+        prev(info);
+    });
+    let r = std::panic::catch_unwind(|| panic!("foobar"));
+    assert!(r.is_err());
+    println!(
+        "A={} B={} C={}",
+        A.load(Ordering::SeqCst),
+        B.load(Ordering::SeqCst),
+        C.load(Ordering::SeqCst)
+    );
+}
+"#;
+
+#[test]
+fn run_mode_panic_update_hook_chains_to_previous() {
+    // `std::panic::update_hook` wraps the hook installed
+    // before it: each wrapper runs and delegates to the
+    // previous hook through its first argument, which std
+    // passes as a `&dyn Fn` trait object. The interpreter
+    // models the chain itself (its panic path consults its
+    // own hook field, not std's static), so the registered
+    // builtin composes the wrappers around the current hook
+    // and a call through the previous-hook argument reaches
+    // the next link.
+    let dir = temp_dir("panic-update-hook");
+    let src = fixture(&dir, "updhook.rs", PANIC_UPDATE_HOOK_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "A=1 B=1 C=1\n", "stdout={stdout}");
+}
+
+const PANIC_UPDATE_HOOK_DEFAULT_SRC: &str = r#"
+#![feature(panic_update_hook)]
+fn main() {
+    std::panic::update_hook(|prev, info| {
+        println!("wrapped");
+        prev(info);
+    });
+    panic!("hello default");
+}
+"#;
+
+#[test]
+fn run_mode_panic_update_hook_over_default_still_reports() {
+    // With no `set_hook`, the previous hook an update wraps
+    // is the default hook: delegating to it prints the
+    // standard panic report.
+    let dir = temp_dir("panic-update-hook-default");
+    let src = fixture(&dir, "upddefault.rs", PANIC_UPDATE_HOOK_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert_eq!(stdout, "wrapped\n", "stdout={stdout}");
+    assert!(
+        stderr.contains("panicked at") && stderr.contains("hello default"),
+        "the default report must follow the wrapper; stderr={stderr}"
+    );
+}
+
 // ----- Location::file and the fat-pointer transmutes (Lane GE) --------------
 
 const LOCATION_FILE_SRC: &str = r#"

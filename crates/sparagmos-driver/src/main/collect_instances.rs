@@ -408,33 +408,44 @@ pub(crate) fn collect_local_instances(
             // is registered under the demanded instance either
             // way, the key its call sites resolve through.
             let mut body_inst = inst;
-            if !inst.has_body() {
-                // A compiler intrinsic the interpreter models
-                // is served by the builtin, the way a demanded
-                // data constructor is served by its callers'
-                // aggregate rvalues: there is no body to
-                // convert, and the demand is met. The model is
-                // looked up by the intrinsic's own name (see
-                // `builtins::intrinsic_lookup`): an intrinsic
-                // the guest crate declares itself is named by
-                // its declaration site, which the qualified
-                // registry never matches. An intrinsic with no
-                // model stays an unmet demand.
-                if matches!(
-                    inst.kind,
-                    rustc_public::mir::mono::InstanceKind::Intrinsic
-                ) {
-                    conv.note_intrinsic(&inst);
-                    let canonical = sparagmos_interp::builtins::canonical_name(
-                        &inst.def.def_id().name(),
-                    );
-                    if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
-                        for owner in &owners {
-                            demands.entry(*owner).or_default().converted += 1;
-                        }
-                        continue;
+            // A compiler intrinsic the interpreter models is
+            // served by the builtin, the way a demanded data
+            // constructor is served by its callers' aggregate
+            // rvalues: there is no body to convert, and the
+            // demand is met. The builtin serves the call even
+            // when the declaration carries a fallback body:
+            // the body is the fallback for backends without
+            // the intrinsic, and the model's presence is what
+            // makes this backend have it (a guest crate's own
+            // `#[rustc_intrinsic]` declaration relies on
+            // exactly this override). The model is looked up
+            // by the intrinsic's own name (see
+            // `builtins::intrinsic_lookup`): an intrinsic the
+            // guest crate declares itself is named by its
+            // declaration site, which the qualified registry
+            // never matches. An intrinsic with no model falls
+            // through: with a fallback body, the body is
+            // converted and run; without one, the demand is
+            // unmet below.
+            if matches!(
+                inst.kind,
+                rustc_public::mir::mono::InstanceKind::Intrinsic
+            ) || rustc_public::ty::FnDef(inst.def.def_id())
+                .as_intrinsic()
+                .is_some()
+            {
+                conv.note_intrinsic(&inst);
+                let canonical = sparagmos_interp::builtins::canonical_name(
+                    &inst.def.def_id().name(),
+                );
+                if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+                    for owner in &owners {
+                        demands.entry(*owner).or_default().converted += 1;
                     }
+                    continue;
                 }
+            }
+            if !inst.has_body() {
                 match sparagmos_driver::convert::eii_impl_instance(&inst) {
                     Some(impl_inst) => body_inst = impl_inst,
                     None => {

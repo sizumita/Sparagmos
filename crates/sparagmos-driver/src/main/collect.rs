@@ -393,6 +393,51 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
+        // A local `#[rustc_intrinsic]` definition the
+        // interpreter models is served by the builtin, not
+        // by its fallback body: the body is the fallback for
+        // backends without the intrinsic, and the model's
+        // presence is what makes this backend have it (a
+        // guest crate's own intrinsic declaration relies on
+        // exactly this override). Note the definition for
+        // the call-conversion gate and account the item
+        // converted, the way the demand collection accounts
+        // a modelled intrinsic. An intrinsic with no model
+        // falls through to the body fetch below.
+        if rustc_public::ty::FnDef(item.def_id())
+            .as_intrinsic()
+            .is_some()
+        {
+            // The id a call site carries is the one of the
+            // instance the call resolves to -- for an
+            // intrinsic declaration that instance's kind is
+            // `Intrinsic`, which differs from the item
+            // instance (kind `Item`) the loop holds, and the
+            // two key different ids. Note the resolved
+            // instance, the way the demand collection notes
+            // the instances it is handed; fall back to the
+            // item instance when resolution fails.
+            match sparagmos_driver::convert::resolve_instance_guarded(
+                rustc_public::ty::FnDef(item.def_id()),
+                &rustc_public::ty::GenericArgs(Vec::new()),
+            ) {
+                Some(resolved) => conv.note_intrinsic(&resolved),
+                None => conv.note_intrinsic(&instance),
+            }
+            let canonical = sparagmos_interp::builtins::canonical_name(
+                &instance.def.def_id().name(),
+            );
+            if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+                report.functions.push(FnReport {
+                    name,
+                    blocks: 0,
+                    locals: 0,
+                    arg_count: 0,
+                    outcome: FnOutcome::Converted,
+                });
+                continue;
+            }
+        }
         let screen_fetch = fetch_query_normalize_aware(
             &name,
             sparagmos_driver::convert::generated_simd_impl_method(&instance),

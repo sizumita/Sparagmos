@@ -932,7 +932,11 @@ impl<'a> Interpreter<'a> {
                             traits,
                             ..
                         },
-                    ) => (self.fat_data_word(base), vtable_word(concrete, traits)),
+                    ) => {
+                        let word = vtable_word(concrete, traits);
+                        self.note_vtable_word(word, concrete.clone());
+                        (self.fat_data_word(base), word)
+                    }
                     (
                         crate::ir::FatMeta::Len,
                         Value::Ref(RefTarget::Alloc { id, projection }),
@@ -1347,6 +1351,19 @@ impl<'a> Interpreter<'a> {
     /// driver recorded as a vtable identity counts -- the
     /// search descends aggregate fields, but an address is a
     /// vtable identity only when the table names it one.
+    /// Register the concrete type a vtable word names
+    /// (see the `vtable_words` field).
+    pub(crate) fn note_vtable_word(&self, word: u128, concrete: String) {
+        self.vtable_words.borrow_mut().insert(word, concrete);
+    }
+
+    /// The concrete type a vtable word names, if a `dyn`
+    /// value carrying it has been flattened (see the
+    /// `vtable_words` field).
+    pub(crate) fn vtable_word_concrete(&self, word: u128) -> Option<String> {
+        self.vtable_words.borrow().get(&word).cloned()
+    }
+
     pub(crate) fn vtable_id_in_metadata(&self, value: &Value) -> Option<u64> {
         match value {
             Value::Ref(RefTarget::Address(id)) => self

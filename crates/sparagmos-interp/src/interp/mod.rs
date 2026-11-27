@@ -315,6 +315,19 @@ pub(crate) enum PanicOrigin {
     Assert(&'static str),
 }
 
+/// The report context of the panic whose hook is running:
+/// everything the default panic report would print for it.
+/// An `update_hook` chain that bottoms out in the default
+/// hook prints that report from this context (see
+/// `Interpreter::invoke_panic_hook`).
+#[derive(Clone)]
+pub(crate) struct HookReportCtx {
+    pub(crate) message: String,
+    pub(crate) in_flight: usize,
+    pub(crate) origin: Option<PanicOrigin>,
+    pub(crate) no_backtrace: bool,
+}
+
 /// A resolved backtrace style for one panic report, mirroring
 /// std's `BacktraceStyle` plus the force-no-backtrace case,
 /// which prints neither a trace nor the note.
@@ -506,6 +519,13 @@ pub struct Interpreter<'a> {
     /// fabricated from its words, and only where the words
     /// carry the value (a length metadata).
     fat_values: std::cell::RefCell<std::collections::HashMap<u128, Value>>,
+    /// The concrete type each vtable word in circulation
+    /// names, registered when a `dyn` value is flattened to
+    /// its bit pattern (the word is all a transmuted
+    /// metadata half carries afterwards): the reverse of
+    /// `vtable_word`, which the `vtable_size` /
+    /// `vtable_align` intrinsics consult.
+    vtable_words: std::cell::RefCell<std::collections::HashMap<u128, String>>,
     /// Whether the lazy stdout buffer allocation has been
     /// modelled (see `note_stdout_use`): std's stdout handle
     /// allocates its line buffer through the global allocator on
@@ -556,6 +576,10 @@ pub struct Interpreter<'a> {
     /// [`Interpreter::fire_panic_hook`] prints itself.
     /// Interior-mutable: most execution paths hold only `&self`.
     panic_hook: std::cell::RefCell<Option<Value>>,
+    /// The report context of the panic whose hook is
+    /// currently running (see [`HookReportCtx`]); stashed by
+    /// `call_panic_hook` for the length of the invocation.
+    hook_report_ctx: std::cell::RefCell<Option<HookReportCtx>>,
     /// The backtrace style installed by
     /// `std::panic::set_backtrace_style`; recorded for the
     /// (currently unconverted) backtrace machinery.
@@ -1051,6 +1075,7 @@ impl<'a> Interpreter<'a> {
             heap_cursor: std::cell::Cell::new((0, 0)),
             alloc_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
             fat_values: std::cell::RefCell::new(std::collections::HashMap::new()),
+            vtable_words: std::cell::RefCell::new(std::collections::HashMap::new()),
             stdout_buffer_modelled: std::cell::Cell::new(false),
             output: String::new(),
             stdout_line_buffer: Vec::new(),
@@ -1061,6 +1086,7 @@ impl<'a> Interpreter<'a> {
             pending_asm_outgoing: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
+            hook_report_ctx: std::cell::RefCell::new(None),
             backtrace_style: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
             in_panic_hook: false,

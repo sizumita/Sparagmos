@@ -207,6 +207,34 @@ fn main() {
 }
 "#;
 
+const VTABLE_INTRINSIC_SRC: &str = r#"
+#![feature(intrinsics)]
+#[rustc_intrinsic]
+pub unsafe fn vtable_size(_ptr: *const ()) -> usize {
+    panic!("fallback body must not run");
+}
+#[rustc_intrinsic]
+pub unsafe fn vtable_align(_ptr: *const ()) -> usize {
+    panic!("fallback body must not run");
+}
+trait Trait {}
+struct S(u64, u32);
+impl Trait for S {}
+impl Trait for () {}
+fn main() {
+    let x: &dyn Trait = &();
+    let s: &dyn Trait = &S(1, 2);
+    unsafe {
+        let (_, vt0): (*const (), *const ()) = core::mem::transmute(x);
+        assert_eq!(vtable_size(vt0), 0);
+        let (_, vt1): (*const (), *const ()) = core::mem::transmute(s);
+        assert_eq!(vtable_size(vt1), 16);
+        assert_eq!(vtable_align(vt1), 8);
+    }
+    println!("ok");
+}
+"#;
+
 #[test]
 fn dyn_call_on_closure_self_via_blanket_fn_impl() {
     let dir = temp_dir("dyn-closure-self");
@@ -243,5 +271,19 @@ fn main() {
 fn dyn_call_on_fn_item_self_via_blanket_impl() {
     let dir = temp_dir("dyn-fn-item-self");
     let src = fixture(&dir, "main.rs", FN_ITEM_SELF_DYN_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+#[test]
+fn run_mode_guest_declared_vtable_intrinsics_override_fallback() {
+    // A guest crate's own `#[rustc_intrinsic]` declaration
+    // with a fallback body: the backend's model of the
+    // intrinsic overrides the fallback (the body serves
+    // backends without the intrinsic), so the call never
+    // enters the panicking body. `vtable_size` /
+    // `vtable_align` answer the size and alignment stored
+    // in the vtable -- the concrete type's layout.
+    let dir = temp_dir("vtable-intrinsic");
+    let src = fixture(&dir, "vtintr.rs", VTABLE_INTRINSIC_SRC);
     assert_ok(&run_driver(&src));
 }

@@ -1436,6 +1436,54 @@ pub(crate) fn is_default_hook(value: &Value) -> bool {
     matches!(value, Value::DynRef { concrete, .. } if concrete == "std::panic::default_hook")
 }
 
+/// The concrete tag of a panic hook produced by
+/// `std::panic::update_hook`: a `dyn Fn` marker whose base
+/// is the pair `(update closure, previous hook)`. Like the
+/// default hook's tag, it is a model-side name no guest type
+/// carries.
+pub(crate) const UPDATED_HOOK_CONCRETE: &str = "std::panic::updated_hook";
+
+/// The hook value `update_hook` installs: a `dyn Fn` marker
+/// carrying the update closure and the hook it wraps.
+pub(crate) fn updated_hook_value(update: Value, prev: Value) -> Value {
+    Value::DynRef {
+        base: Box::new(Value::Tuple(vec![update, prev])),
+        concrete: UPDATED_HOOK_CONCRETE.to_string(),
+        traits: vec![
+            "std::ops::Fn".to_string(),
+            "std::marker::Send".to_string(),
+            "std::marker::Sync".to_string(),
+        ],
+        drop_glue: None,
+    }
+}
+
+/// The `(update closure, previous hook)` an updated-hook
+/// marker carries, when `value` is one.
+pub(crate) fn updated_hook_parts(value: &Value) -> Option<(Value, Value)> {
+    let Value::DynRef { base, concrete, .. } = value else {
+        return None;
+    };
+    if concrete != UPDATED_HOOK_CONCRETE {
+        return None;
+    }
+    let Value::Tuple(items) = &**base else {
+        return None;
+    };
+    let [update, prev] = items.as_slice() else {
+        return None;
+    };
+    Some((update.clone(), prev.clone()))
+}
+
+/// Whether a hook value is a model-side panic-hook marker
+/// (the default hook or an `update_hook` chain link): no
+/// guest body serves a call on it; the hook machinery does
+/// (see `Interpreter::invoke_panic_hook`).
+pub(crate) fn is_panic_hook_marker(value: &Value) -> bool {
+    is_default_hook(value) || updated_hook_parts(value).is_some()
+}
+
 /// A reference to field `idx` of the value `recv` references:
 /// the same target with one more field projection. `None` when
 /// `recv` is not a reference a field can be taken of. This is

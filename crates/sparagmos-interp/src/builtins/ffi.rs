@@ -103,6 +103,38 @@ impl<'a> Interpreter<'a> {
         self.layout_of(&concrete)
     }
 
+    /// The `(size, align)` stored in the vtable a raw
+    /// pointer value denotes: the layout of the concrete
+    /// type the vtable is for, which is what the
+    /// `vtable_size` / `vtable_align` intrinsics read out
+    /// of the vtable's header. The pointer denotes the
+    /// vtable in any of the model's forms: the `dyn` value
+    /// itself, a value carrying a driver-recorded vtable
+    /// identity, or the interpreter's own vtable word (the
+    /// form a transmute of a fat pointer produces for the
+    /// metadata half), matched against the recorded
+    /// identities by recomputing each one's word.
+    pub(super) fn vtable_stored_layout(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+    ) -> Option<(u128, u128)> {
+        let resolved = self.resolve_value(frames, value).ok()?;
+        if let Value::DynRef { concrete, .. } = &resolved {
+            return self.layout_of(concrete);
+        }
+        if let Some(id) = self.vtable_id_in_metadata(&resolved) {
+            let identity = self.program().vtable_identities.get(&id)?;
+            return self.layout_of(&identity.concrete);
+        }
+        if let Value::Ref(RefTarget::Address(word)) = &resolved {
+            if let Some(concrete) = self.vtable_word_concrete(u128::from(*word)) {
+                return self.layout_of(&concrete);
+            }
+        }
+        None
+    }
+
     /// The `(size, align)` of a value of a dynamically sized
     /// type, composed from the value itself: the layout the
     /// `size_of_val` / `align_of_val` builtins answer when

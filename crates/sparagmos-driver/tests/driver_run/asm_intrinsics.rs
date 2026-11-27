@@ -1338,6 +1338,35 @@ fn main() {
 }
 "#;
 
+const SIMD_FUNNEL_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::{simd_funnel_shl, simd_funnel_shr};
+#[repr(simd)]
+#[derive(Clone, Copy, PartialEq)]
+struct I32x4([i32; 4]);
+fn main() {
+    let x1 = I32x4([1, 2, 3, 4]);
+    let x2 = I32x4([2, 3, 4, 5]);
+    // The funnel shifts are ternary: the concatenated pair
+    // (x1 high, x2 low) shifted by the third operand's lanes.
+    let l = unsafe { simd_funnel_shl(x1, x2, x1) };
+    assert!(l == I32x4([
+        (1 << 1) | (2 >> 31),
+        (2 << 2) | (3 >> 30),
+        (3 << 3) | (4 >> 29),
+        (4 << 4) | (5 >> 28),
+    ]));
+    let r = unsafe { simd_funnel_shr(I32x4([0; 4]), I32x4([16, 32, 64, 128]), x1) };
+    assert!(r == I32x4([8, 8, 8, 8]));
+    let r2 = unsafe { simd_funnel_shr(x1, I32x4([0; 4]), x1) };
+    assert!(r2 == I32x4([1 << 31, 2 << 30, 3 << 29, 4 << 28]));
+    // A zero shift takes the near operand whole.
+    assert!(unsafe { simd_funnel_shl(x1, x2, I32x4([0; 4])) } == x1);
+    assert!(unsafe { simd_funnel_shr(x1, x2, I32x4([0; 4])) } == x2);
+    println!("ok");
+}
+"#;
+
 #[test]
 fn run_mode_exact_div_intrinsic() {
     run_ok("exact-div", EXACT_DIV_SRC, "12 12 10\n");
@@ -1359,4 +1388,15 @@ fn main() {
 #[test]
 fn run_mode_raw_eq_intrinsic() {
     run_ok("raw-eq", RAW_EQ_SRC, "true false true\n");
+}
+
+#[test]
+fn run_mode_simd_funnel_shifts_are_ternary() {
+    let dir = temp_dir("simd-funnel");
+    let src = fixture(&dir, "funnel.rs", SIMD_FUNNEL_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert!(stdout.contains("ok"), "stdout={stdout}");
 }
