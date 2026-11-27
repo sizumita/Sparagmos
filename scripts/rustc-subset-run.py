@@ -5695,12 +5695,14 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # A crashes test
 # passes when the compilation crashes the driver process the way it
 # crashes rustc under compiletest (exit code other than 0 or 1),
-# with one evidence requirement: an exit code of 101 passes only
+# with two refinements: an exit code of 101 passes only
 # when the output carries an internal compiler error, because the
 # driver also exits 101 for its own escaped panics, and counting
 # those would credit the driver-side abnormal exit as a reproduced
 # crash (the same evidence rule the declared failure status 101
-# and the run-crash verdict apply).
+# and the run-crash verdict apply); and exit code 2 never passes,
+# because it is the driver's own named unsupported outcome, not a
+# crash at all.
 #
 # Per-test compile-flags are forwarded to the driver's embedded
 # rustc, screened for flags that would replace the compilation
@@ -6219,7 +6221,13 @@ def judge_compile(expectation, conv, declared_status=None,
     evidence in the conversion report (`ice`): the driver exits
     101 both for the embedded compiler's crash and for its own
     escaped panics, and only the former reproduces the crash the
-    test expects.
+    test expects. Exit code 2 never satisfies the expectation:
+    it is the driver's own named unsupported outcome (the code
+    sparagmos_side and judge_jit_compile both treat as a named
+    refusal, not a crash), so a compilation the driver declined
+    with a named reason has not crashed, whatever compiletest's
+    bare exit-code condition would say about a compiler whose
+    exit codes carry no such meaning.
     """
     if conv.get("mem_exceeded"):
         return ("fail",
@@ -6326,6 +6334,19 @@ def judge_compile(expectation, conv, declared_status=None,
                     "is not evidenced as the reference compiler "
                     "own internal error",
                     "compiler crash not evidenced")
+        if code == 2:
+            # Exit 2 is the driver's named unsupported outcome,
+            # not a compiler crash (see the docstring): the
+            # compilation was declined with a reason the driver
+            # names, so the crash the test expects was not
+            # reproduced. judge_jit_compile intercepts exit 2
+            # for the same reason before delegating here; in
+            # convert mode this branch is where it is judged.
+            return ("fail",
+                    "no longer crashes: the driver reported its "
+                    "named unsupported outcome (exit 2), which is "
+                    "not a compiler crash",
+                    "no crash (driver unsupported)")
         if code not in (0, 1):
             return ("pass", "", "")
         if code == 0:

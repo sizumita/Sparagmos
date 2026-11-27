@@ -1719,6 +1719,22 @@ class JudgeCompileTests(unittest.TestCase):
         self.assertEqual(bucket, "compiler crash not evidenced")
         self.assertIn("internal compiler error", reason)
 
+    def test_crash_driver_unsupported_exit_2_fails(self):
+        # Exit 2 is the driver's named unsupported outcome (the
+        # code sparagmos_side reports as "unsupported" and
+        # judge_jit_compile intercepts as not-a-crash): the
+        # compilation was declined with a named reason, so the
+        # crash the test expects was not reproduced, even though
+        # compiletest's bare condition (exit code other than 0
+        # or 1) would count the code for a compiler whose exit
+        # codes carry no such meaning.
+        status, reason, bucket = run.judge_compile(
+            "crash", conv(exit_code=2, converted=None,
+                          skipped=None))
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "no crash (driver unsupported)")
+        self.assertIn("exit 2", reason)
+
     def test_crash_signal_death_passes(self):
         # Death by signal is the compiler process crashing,
         # which is compiletest's crashes condition itself; it
