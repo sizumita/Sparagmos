@@ -44,6 +44,14 @@
 //!   segment (`main::{closure#0}`) in the fat pointer's
 //!   concrete tag; the impl scan must equate the two
 //!   spellings (tests/ui/regions/issue-6157.rs).
+//! * A `Self` carrying a function pointer with a concrete
+//!   region (`Foo<fn(&'static u8)>`) renders in the fat
+//!   pointer's concrete tag with the region dropped
+//!   (`Foo<fn(&u8)>`), while the impl key keeps it; the
+//!   scan's last pass matches up to region erasure, with
+//!   binder-carrying keys (`Foo<for<'a> fn(&'a u8)>`)
+//!   excluded, and resolves only a unique candidate
+//!   (tests/ui/codegen/subtyping-impacts-selection-1.rs).
 
 use super::{fixture, run_driver, run_driver_with_aux, temp_dir, Output};
 
@@ -378,4 +386,188 @@ fn dyn_call_final_trait_method() {
     let dir = temp_dir("dyn-final-method");
     let src = fixture(&dir, "main.rs", FINAL_DYN_SRC);
     assert_ok(&run_driver(&src));
+}
+
+const SUBTYPING_ERASED_RECEIVER_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn useful<'a>(_: &'a u8) {}
+trait GetInner {
+    type Assoc;
+    fn muahaha(&mut self) -> Self::Assoc;
+}
+impl GetInner for Foo<fn(&'static u8)> {
+    type Assoc = String;
+    fn muahaha(&mut self) -> String { String::from("I am a string") }
+}
+impl GetInner for Foo<for<'a> fn(&'a u8)> {
+    type Assoc = [usize; 3];
+    fn muahaha(&mut self) -> [usize; 3] { [100; 3] }
+}
+fn break_me(hr_fnptr: Box<Foo<for<'a> fn(&'a u8)>>) -> Box<dyn GetInner<Assoc = String>> {
+    let lr_fnptr = hr_fnptr as Box<Foo<fn(&'static u8)>>;
+    lr_fnptr as Box<dyn GetInner<Assoc = String>>
+}
+fn main() {
+    drop(Box::new(Foo(useful as fn(&'static u8))) as Box<dyn GetInner<Assoc = String>>);
+    drop(Box::new(Foo(useful as fn(&u8))) as Box<dyn GetInner<Assoc = [usize; 3]>>);
+    let mut any = break_me(Box::new(Foo(useful)));
+    let evil_string = any.muahaha();
+    assert_eq!(evil_string, "I am a string");
+    println!("ok");
+}
+"#;
+
+#[test]
+fn subtyping_erased_receiver_resolves_static_impl() {
+    // tests/ui/codegen/subtyping-impacts-selection-1.rs: the
+    // value reaching the call was reinterpreted to the
+    // `'static` shape, but its fat pointer's concrete tag
+    // drops the region (`Foo<fn(&u8)>`), so neither the
+    // `'static` key nor the higher-ranked key matches it
+    // under the canonical spelling. The scan's region-erasure
+    // pass excludes the binder-carrying key and resolves the
+    // unique binderless one.
+    let dir = temp_dir("subtyping-erased-receiver");
+    let src = fixture(&dir, "main.rs", SUBTYPING_ERASED_RECEIVER_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const STATIC_IMPL_DIRECT_UNSIZE_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn useful<'a>(_: &'a u8) {}
+trait GetInner {
+    type Assoc;
+    fn muahaha(&mut self) -> Self::Assoc;
+}
+impl GetInner for Foo<fn(&'static u8)> {
+    type Assoc = String;
+    fn muahaha(&mut self) -> String { String::from("I am a string") }
+}
+impl GetInner for Foo<for<'a> fn(&'a u8)> {
+    type Assoc = [usize; 3];
+    fn muahaha(&mut self) -> [usize; 3] { [100; 3] }
+}
+fn main() {
+    let mut any: Box<dyn GetInner<Assoc = String>> = Box::new(Foo(useful as fn(&'static u8)));
+    let s = any.muahaha();
+    assert_eq!(s, "I am a string");
+    println!("ok");
+}
+"#;
+
+#[test]
+fn erased_receiver_direct_unsize_resolves_static_impl() {
+    // The same erased tag as the subtyping record, formed by
+    // a direct unsizing cast rather than a reinterpretation:
+    // the call must still reach the `'static` impl, not the
+    // higher-ranked sibling.
+    let dir = temp_dir("erased-receiver-direct");
+    let src = fixture(&dir, "main.rs", STATIC_IMPL_DIRECT_UNSIZE_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const HRTB_IMPL_UNIQUE_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn useful<'a>(_: &'a u8) {}
+trait GetInner {
+    type Assoc;
+    fn muahaha(&mut self) -> Self::Assoc;
+}
+impl GetInner for Foo<for<'a> fn(&'a u8)> {
+    type Assoc = [usize; 3];
+    fn muahaha(&mut self) -> [usize; 3] { [100; 3] }
+}
+fn main() {
+    let mut any: Box<dyn GetInner<Assoc = [usize; 3]>> = Box::new(Foo(useful as fn(&u8)));
+    let v = any.muahaha();
+    assert_eq!(v, [100; 3]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn hrtb_impl_resolves_when_it_is_the_unique_impl() {
+    // With no binderless sibling, the higher-ranked impl is
+    // registered under the erased tag itself and the call
+    // resolves to it exactly as before the region-erasure
+    // pass existed.
+    let dir = temp_dir("hrtb-impl-unique");
+    let src = fixture(&dir, "main.rs", HRTB_IMPL_UNIQUE_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const HRTB_IMPL_STATIC_CALL_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn useful<'a>(_: &'a u8) {}
+trait GetInner {
+    type Assoc;
+    fn muahaha(&mut self) -> Self::Assoc;
+}
+impl GetInner for Foo<fn(&'static u8)> {
+    type Assoc = String;
+    fn muahaha(&mut self) -> String { String::from("I am a string") }
+}
+impl GetInner for Foo<for<'a> fn(&'a u8)> {
+    type Assoc = [usize; 3];
+    fn muahaha(&mut self) -> [usize; 3] { [100; 3] }
+}
+fn main() {
+    let mut f = Foo(useful as fn(&u8));
+    let v = f.muahaha();
+    assert_eq!(v, [100; 3]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn hrtb_impl_static_call_resolves() {
+    // A static call on the higher-ranked shape selects its
+    // impl by the exact instance, as before.
+    let dir = temp_dir("hrtb-impl-static-call");
+    let src = fixture(&dir, "main.rs", HRTB_IMPL_STATIC_CALL_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const REGION_ERASURE_DECLINE_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn helper(_: &'static u8, _: &u8) {}
+trait GetInner {
+    fn muahaha(&mut self) -> u32;
+}
+impl GetInner for Foo<fn(&'static u8, &u8)> {
+    fn muahaha(&mut self) -> u32 { 1 }
+}
+impl GetInner for Foo<fn(&u8, &'static u8)> {
+    fn muahaha(&mut self) -> u32 { 2 }
+}
+fn main() {
+    let mut f = Foo(helper as fn(&'static u8, &u8));
+    let d: &mut dyn GetInner = &mut f;
+    assert_eq!(d.muahaha(), 1);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn region_erasure_two_binderless_candidates_decline() {
+    // Both impls are binderless and region-carrying, in
+    // swapped positions of the same signature; both match
+    // the erased tag `Foo<fn(&u8, &u8)>` up to region
+    // erasure, so the scan must resolve nothing rather than
+    // guess: the run fails with exit code 2, as it did
+    // before the erasure pass existed.
+    let dir = temp_dir("region-erasure-decline");
+    let src = fixture(&dir, "main.rs", REGION_ERASURE_DECLINE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "ambiguous erasure candidates must stay unresolved; stderr={stderr}"
+    );
 }

@@ -3,7 +3,8 @@
 //! and evaluating callable operands through it.
 
 use super::lookup::{
-    impl_self_matches, normalize_impl_self, parse_impl_block_key, parse_impl_key,
+    impl_self_matches, impl_self_matches_erased, normalize_impl_self, parse_impl_block_key,
+    parse_impl_key,
 };
 use super::ref_shaped_receiver;
 use crate::error::{InterpError, InterpResult};
@@ -108,6 +109,7 @@ impl<'a> Interpreter<'a> {
             return Some(key.clone());
         }
         let mut found: Option<String> = None;
+        let mut ambiguous = false;
         for key in keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
             // An impl-block key (`...::<impl Trait for Self>::m`)
@@ -131,11 +133,50 @@ impl<'a> Interpreter<'a> {
                 continue;
             }
             if found.is_some() {
-                return None;
+                ambiguous = true;
+                break;
             }
             found = Some(key.clone());
         }
-        found
+        if ambiguous {
+            return None;
+        }
+        if let Some(key) = found {
+            return Some(key);
+        }
+        // A last pass for a receiver whose rendered concrete
+        // type dropped the regions its impl key spells (a
+        // function pointer's signature above all: the key
+        // spells `fn(&'static u8)`, the tag `fn(&u8)`), which
+        // neither pass above can equate. The match is up to
+        // region erasure, with binder-carrying keys excluded
+        // (see `impl_self_matches_erased`); as in every pass
+        // here, two distinct candidates resolve nothing.
+        let mut erased: Option<String> = None;
+        for key in keys() {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            let Some((self_part, trait_base, key_method)) = (if base.contains("::<impl ") {
+                parse_impl_block_key(base)
+            } else {
+                parse_impl_key(base)
+            }) else {
+                continue;
+            };
+            if key_method != method
+                || !paths.iter().any(|p| p == &trait_base)
+                || !impl_self_matches_erased(&self_part, concrete)
+            {
+                continue;
+            }
+            if erased.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            if erased.is_some() {
+                return None;
+            }
+            erased = Some(key.clone());
+        }
+        erased
     }
 
     /// Dispatch an `Fn`-trait call whose dyn concrete value is an

@@ -1129,8 +1129,14 @@ impl<'a> Converter<'a> {
     /// The unique body keyed as an impl of `trait_path` for
     /// `self_name` with method `method`, under any generic-argument
     /// spelling of the trait; `None` when there is not exactly one.
+    /// When no key matches under the canonical spelling, a second
+    /// pass matches up to region erasure (the rendered name of a
+    /// function pointer's signature drops the regions the instance
+    /// key spells), with binder-carrying keys excluded (see
+    /// `impl_self_matches_erased`).
     fn scan_impl_key(&self, self_name: &str, trait_path: &str, method: &str) -> Option<String> {
         let mut found: Option<&String> = None;
+        let mut ambiguous = false;
         for key in self.bodies.keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
             let Some((self_part, trait_base, key_method)) =
@@ -1145,11 +1151,37 @@ impl<'a> Converter<'a> {
                 continue;
             }
             if found.is_some() {
-                return None;
+                ambiguous = true;
+                break;
             }
             found = Some(key);
         }
-        found.cloned()
+        if ambiguous {
+            return None;
+        }
+        if let Some(key) = found {
+            return Some(key.clone());
+        }
+        let mut erased: Option<&String> = None;
+        for key in self.bodies.keys() {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            let Some((self_part, trait_base, key_method)) =
+                parse_impl_key(base).or_else(|| parse_impl_block_key(base))
+            else {
+                continue;
+            };
+            if key_method != method || trait_base != trait_path {
+                continue;
+            }
+            if !impl_self_matches_erased(&self_part, self_name) {
+                continue;
+            }
+            if erased.is_some() {
+                return None;
+            }
+            erased = Some(key);
+        }
+        erased.cloned()
     }
 
     /// Resolve a callee that has no converted body through the
