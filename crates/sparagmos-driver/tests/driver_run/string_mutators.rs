@@ -166,6 +166,54 @@ fn run_mode_string_replace_range_forms_and_drain() {
     );
 }
 
+// Regression coverage for stepping a `String::drain` over a
+// string built by `join` / `concat`: the drain's `Chars`
+// snapshots the stored element-form string's elements, whose
+// elements past the first keep the `MaybeUninit` union
+// wrapper (`Enum{0, [Uint]}`) the buffer's spare-capacity
+// region stores, and the snapshot byte reader rejected them
+// as ADT values. The reader now applies the same per-element
+// union peel the string readers apply. The drains here are
+// forgotten rather than dropped so the test pins the step
+// alone; the drop-side removal reads the string through the
+// mutation place read, a separate consumer.
+
+const DRAIN_STEP_JOIN_SRC: &str = r#"
+fn main() {
+    let mut m = ["a", "b", "c"].join("/");
+    let mut d = m.drain(0..2);
+    let mut got: Vec<char> = Vec::new();
+    while let Some(c) = d.next() {
+        got.push(c);
+    }
+    println!("{:?}", got);
+    std::mem::forget(d);
+    let mut n = ["alpha", "beta", "gamma"].concat();
+    let mut d2 = n.drain(2..9);
+    println!("{:?} {:?}", d2.next(), d2.next());
+    std::mem::forget(d2);
+    let mut u = ["h\u{e9}llo", "w\u{f6}rld"].join("\u{2192}");
+    let mut d3 = u.drain(..);
+    let mut s = String::new();
+    while let Some(c) = d3.next() {
+        s.push(c);
+    }
+    println!("{}", s);
+    std::mem::forget(d3);
+    let v = ["x", "y"].join("-");
+    println!("{}", v.chars().count());
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_step_over_join_built_string() {
+    run_ok(
+        "strdrainjoin",
+        DRAIN_STEP_JOIN_SRC,
+        "['a', '/']\nSome('p') Some('h')\nh\u{e9}llo\u{2192}w\u{f6}rld\n3\n",
+    );
+}
+
 fn run_panic(tag: &str, src: &str, message: &str) {
     let dir = temp_dir(tag);
     let src_path = fixture(&dir, "case.rs", src);
