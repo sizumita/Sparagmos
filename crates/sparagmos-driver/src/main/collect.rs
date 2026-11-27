@@ -1010,7 +1010,19 @@ fn collect() -> ControlFlow<()> {
         );
         // Newly collected foreign bodies and demanded instances
         // can also mention generic-context closures concretely.
+        // The previous round's local scan set joins them: bodies
+        // converted by the constant passes (and the coroutine and
+        // dyn passes) enter it for the instance demand, but no
+        // pass scanned them for closures -- a function
+        // materialized as a value out of a constant (the
+        // fn-pointer callee `inst_partition` selects, say) can
+        // itself create a closure concretely, and that closure
+        // was demanded by no pass, so calls to it failed as
+        // unknown functions. Every converted body is eventually
+        // scanned by every pass; this set restores that for the
+        // closure demand.
         let mut closure_scan = frontier.clone();
+        closure_scan.extend(local_scan.iter().cloned());
         closure_scan.extend(new_instances.iter().cloned());
         let new_closure_bodies = collect_closure_instances(
             &mut conv,
@@ -1171,7 +1183,28 @@ fn collect() -> ControlFlow<()> {
             &collected_ids,
             &mut demand_state,
         );
-        if new_const_bodies.is_empty() && new_const_fn_bodies.is_empty() {
+        // The bodies the constant passes just converted can
+        // themselves mention generic-context closures concretely
+        // (the same hole the fixpoint loop's closure scan covers
+        // for its own constant-pass conversions): scan them with
+        // the closure demand too, and walk what it converts.
+        let mut closure_scan = new_const_bodies.clone();
+        closure_scan.extend(new_const_fn_bodies.iter().cloned());
+        let new_closure_bodies = collect_closure_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred_closures,
+            &local_defs,
+            &closure_scan,
+            &collected_ids,
+            &mut demand_state,
+        );
+        if new_const_bodies.is_empty()
+            && new_const_fn_bodies.is_empty()
+            && new_closure_bodies.is_empty()
+        {
             break;
         }
         for id in &body_def_ids[ids_before..] {
@@ -1179,11 +1212,13 @@ fn collect() -> ControlFlow<()> {
         }
         alias_sources.extend(new_const_bodies.iter().cloned());
         alias_sources.extend(new_const_fn_bodies.iter().cloned());
+        alias_sources.extend(new_closure_bodies.iter().cloned());
         if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
             break;
         }
         let mut walk_seeds = new_const_bodies.clone();
         walk_seeds.extend(new_const_fn_bodies.iter().cloned());
+        walk_seeds.extend(new_closure_bodies.iter().cloned());
         let reached = sparagmos_driver::reach::collect_reachable(
             &mut conv,
             &walk_seeds,
