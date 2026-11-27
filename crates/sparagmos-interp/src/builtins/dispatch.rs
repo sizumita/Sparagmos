@@ -9880,11 +9880,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::LibcGetuid => {
                 arity(0)?;
-                self.exec_libc_getuid()
+                self.exec_libc_getuid(name)
             }
             Builtin::LibcGetgid => {
                 arity(0)?;
-                self.exec_libc_getgid()
+                self.exec_libc_getgid(name)
             }
             Builtin::LibcGetpid => {
                 arity(0)?;

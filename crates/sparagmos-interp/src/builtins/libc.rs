@@ -1,4 +1,9 @@
 //! Host libc functions backing the libc builtins.
+//!
+//! The identity and configuration calls (`sysconf`,
+//! `getuid`, `getgid`) are not declared here: they
+//! exist only on Unix hosts, so they live behind the
+//! platform seam (see `crate::platform`).
 
 use super::*;
 
@@ -65,23 +70,6 @@ extern "C" {
     /// faithful execution.
     #[link_name = "lgamma_r"]
     pub(super) fn host_lgamma_r(x: f64, signp: *mut std::ffi::c_int) -> f64;
-    /// The host C library's `sysconf`, backing
-    /// [`Builtin::LibcSysconf`]: the guest runs
-    /// in-process, so the host's configuration values
-    /// (page size, group maximum, ...) are the values the
-    /// guest observes.
-    #[link_name = "sysconf"]
-    pub(super) fn host_sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
-    /// The host C library's `getuid`, backing
-    /// [`Builtin::LibcGetuid`]: this process's real user
-    /// id, the identity the in-process guest runs with.
-    #[link_name = "getuid"]
-    pub(super) fn host_getuid() -> std::ffi::c_uint;
-    /// The host C library's `getgid`, backing
-    /// [`Builtin::LibcGetgid`]: this process's real group
-    /// id.
-    #[link_name = "getgid"]
-    pub(super) fn host_getgid() -> std::ffi::c_uint;
 }
 
 /// Registration fragment of the builtin name registry: the libc allocator surface.
