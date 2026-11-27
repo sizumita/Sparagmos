@@ -4599,3 +4599,48 @@ fn run_mode_wrapped_maybeuninit_byte_add_write_lands() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const DST_REF_PTR_ARITH_SRC: &str = r#"
+use std::ffi::OsStr;
+use std::path::Path;
+
+fn main() {
+    let mut v: Vec<&OsStr> = vec![OsStr::new("apple"), OsStr::new("banana")];
+    let base = v.as_mut_ptr();
+    unsafe {
+        let sift = base.add(1);
+        println!("diff={}", (sift as usize) - (base as usize));
+        println!("off={}", sift.offset_from(base));
+    }
+    let u: Vec<&Path> = vec![Path::new("apple"), Path::new("banana")];
+    let p = u.as_ptr();
+    unsafe {
+        println!("pdiff={}", (p.add(1) as usize) - (p as usize));
+        println!("poff={}", p.add(1).offset_from(p));
+    }
+    println!("sizes {} {}", std::mem::size_of::<&OsStr>(), std::mem::size_of::<&Path>());
+}
+"#;
+
+#[test]
+fn run_mode_ptr_arith_over_dst_ref_elements() {
+    // Regression for the pricing half of the #513 pin
+    // family: element pointers into a `Vec<&OsStr>` /
+    // `Vec<&Path>` buffer were priced 8 bytes apart (and
+    // `offset_from` answered 2), because the tag layout
+    // table priced a reference to a dynamically sized ADT
+    // as a thin pointer — it knew only `str` and slices as
+    // fat pointees. A fat reference is two words, so the
+    // stride is 16 and `offset_from` is 1. The same
+    // mispricing made the unstable sort's element copies
+    // fail their own pointer-range precondition checks.
+    run_ok(
+        "ptr-arith-dst-ref-elements",
+        DST_REF_PTR_ARITH_SRC,
+        "diff=16\n\
+         off=1\n\
+         pdiff=16\n\
+         poff=1\n\
+         sizes 16 16\n",
+    );
+}
