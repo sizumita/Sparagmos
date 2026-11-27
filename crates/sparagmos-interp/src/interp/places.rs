@@ -1051,6 +1051,41 @@ impl<'a> Interpreter<'a> {
                             } else {
                                 None
                             };
+                            // The anchor's depth counts the
+                            // wrapper levels the base's storage
+                            // position already encodes. The
+                            // pointee type's wrapper levels past
+                            // it are the same denomination steps:
+                            // a fat pointer over a bare buffer
+                            // allocation (a byte-string wrapper's
+                            // `from_raw_parts` result) descended
+                            // no storage levels at all, so its
+                            // anchor depth is 0 while the field
+                            // steps that follow still walk the
+                            // wrapper chain (an `OsStr` borrow
+                            // reaching its `[u8]` through the
+                            // sys `Slice`). Raise the anchor's
+                            // depth to the type's wrapper depth,
+                            // so every one of those steps is
+                            // consumed without moving. The
+                            // anchor engaged only when the
+                            // container's value is the spanned
+                            // sequence (the `spans` judgment
+                            // above), which is the wrapper
+                            // judgment's own gate, so no further
+                            // check is needed here.
+                            if let Some((container, depth)) = &fat_anchor {
+                                let wrapper_depth = pointee_ty
+                                    .as_ref()
+                                    .map_or(0, |ty| {
+                                        self.sequence_wrapper_depth(ty)
+                                    });
+                                if wrapper_depth > *depth {
+                                    let container = container.clone();
+                                    fat_anchor =
+                                        Some((container, wrapper_depth));
+                                }
+                            }
                             // A fat pointer whose base is the
                             // sequence value's own position: the
                             // walk already denotes the sequence, so

@@ -712,3 +712,105 @@ fn run_mode_hashset_large_clone_and_boxed_writes() {
         "len=1200 sum=719400\nhas0=true has1199=true has1200=false\nboxed sum=1438800\n",
     );
 }
+
+const HASHMAP_OSSTRING_AGG_KEY_SRC: &str = r#"
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
+fn hash_of(f: impl Fn(&mut DefaultHasher)) -> u64 {
+    let mut h = DefaultHasher::new();
+    f(&mut h);
+    h.finish()
+}
+fn main() {
+    // A real-aggregate OsString (with_capacity + push: the bytes sit
+    // behind the buffer allocation) used as a HashMap key. The hash
+    // reads through the as_os_str wrapper chain; the key's hash must
+    // be the encoded-bytes hash and must agree with the from-form
+    // key of the same bytes in both directions.
+    let mut agg = OsString::with_capacity(16);
+    agg.push("key");
+    let from = OsString::from("key");
+    let agg_hash = hash_of(|h| agg.hash(h));
+    let from_hash = hash_of(|h| from.hash(h));
+    let bytes_hash = hash_of(|h| "key".as_bytes().hash(h));
+    assert_eq!(agg_hash, from_hash);
+    assert_eq!(agg_hash, bytes_hash);
+    let mut m: HashMap<OsString, i32> = HashMap::new();
+    m.insert(agg.clone(), 7);
+    assert_eq!(m.get(&agg), Some(&7));
+    assert_eq!(m.get(&from), Some(&7));
+    assert!(m.contains_key(&OsString::from("key")));
+    let mut m2: HashMap<OsString, i32> = HashMap::new();
+    m2.insert(from, 7);
+    assert_eq!(m2.get(&agg), Some(&7));
+    assert_eq!(m2.remove(&agg), Some(7));
+    println!("osstring agg key ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_osstring_real_aggregate_key() {
+    let dir = temp_dir("hashmap-osstring-agg-key");
+    let src = fixture(
+        &dir,
+        "hashmap_osstring_agg_key.rs",
+        HASHMAP_OSSTRING_AGG_KEY_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "osstring agg key ok\n"
+    );
+}
+
+const OSSTRING_KEY_COLLECTIONS_SRC: &str = r#"
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+fn main() {
+    let mut agg = OsString::with_capacity(16);
+    agg.push("key");
+    let mut b: BTreeMap<OsString, i32> = BTreeMap::new();
+    b.insert(agg.clone(), 1);
+    assert_eq!(b.get(&OsString::from("key")), Some(&1));
+    let mut s: HashSet<OsString> = HashSet::new();
+    s.insert(agg.clone());
+    assert!(s.contains(&OsString::from("key")));
+    let mut pb = PathBuf::from("/tmp");
+    pb.push("key");
+    let mut p: HashMap<PathBuf, i32> = HashMap::new();
+    p.insert(pb, 5);
+    assert_eq!(p.get(&PathBuf::from("/tmp/key")), Some(&5));
+    // Non-UTF-8 bytes: hash and equality still agree across forms.
+    let bytes: &[u8] = &[107, 0, 255, 121];
+    let a2 = OsString::from_vec(bytes.to_vec());
+    let f2 = OsString::from_vec(bytes.to_vec());
+    let mut m: HashMap<OsString, i32> = HashMap::new();
+    m.insert(a2, 11);
+    assert_eq!(m.get(&f2), Some(&11));
+    assert_eq!(m.keys().next().unwrap().as_encoded_bytes(), bytes);
+    println!("osstring key collections ok");
+}
+"#;
+
+#[test]
+fn run_mode_osstring_key_collections_cross_form() {
+    let dir = temp_dir("osstring-key-collections");
+    let src = fixture(
+        &dir,
+        "osstring_key_collections.rs",
+        OSSTRING_KEY_COLLECTIONS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "osstring key collections ok\n"
+    );
+}
