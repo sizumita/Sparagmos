@@ -1,5 +1,6 @@
 //! Callee names and type tags: canonical_name and ty_tag.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use sparagmos_mir as mir;
@@ -53,6 +54,52 @@ pub fn canonical_name(name: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The `std::io` spelling of an I/O trait item name. The `Read`
+/// / `Write` / `Seek` / `BufRead` traits are defined in
+/// `core::io` and re-exported as `std::io`, and which prefix a
+/// callee renders with depends on the path it was reached by: a
+/// call from a `#![no_std]` guest (or through core's own
+/// machinery) renders as `core::io::Write::write_all` where the
+/// same call from a std guest renders as
+/// `std::io::Write::write_all`. The file-I/O and stream-I/O
+/// provision (diversion, dispatch and execution) is keyed on
+/// the `std::io` spelling, so its matching consults this
+/// normalisation; every other name is returned unchanged.
+pub(crate) fn io_spelling(name: &str) -> Cow<'_, str> {
+    let Some(rest) = name.strip_prefix("core::io::") else {
+        return Cow::Borrowed(name);
+    };
+    if rest.starts_with("Read::")
+        || rest.starts_with("Write::")
+        || rest.starts_with("Seek::")
+        || rest.starts_with("BufRead::")
+    {
+        Cow::Owned(format!("std::io::{rest}"))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// The comparison key for a `Self` type tag: the tag with a
+/// guest-crate prefix removed. Type tags render the defining
+/// path plainly for a std guest (`std::io::Stdout`), but a
+/// `#![no_std]` guest's tags carry the guest crate's name in
+/// front (`my_guest::std::io::Stdout`) for the same type. The
+/// I/O provision compares tags against the plain spellings, so
+/// it consults this key: a leading segment is dropped only
+/// when what follows starts with a library crate root, which
+/// a guest's own type path never does after one segment.
+pub(crate) fn self_ty_key(tag: &str) -> &str {
+    const ROOTS: [&str; 3] = ["std::", "core::", "alloc::"];
+    if ROOTS.iter().any(|root| tag.starts_with(root)) {
+        return tag;
+    }
+    match tag.split_once("::") {
+        Some((_, rest)) if ROOTS.iter().any(|root| rest.starts_with(root)) => rest,
+        _ => tag,
+    }
 }
 
 /// A callee the converter serves with a builtin node because the

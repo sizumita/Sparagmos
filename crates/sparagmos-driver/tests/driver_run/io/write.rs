@@ -251,3 +251,62 @@ fn run_mode_call_arg_box_dyn_to_ref_dyn() {
         "call-arg box dyn ok\n",
     );
 }
+
+
+const DYN_FILE_WRITE_SRC: &str = r#"
+use std::io::{Read, Write};
+fn main() {
+    let path = std::env::temp_dir().join("sparagmos-dyn-file-write.txt");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w: Box<dyn Write> = Box::new(f);
+        let n = w.write(b"dynfile").unwrap();
+        assert_eq!(n, 7);
+        w.flush().unwrap();
+    }
+    let mut f = std::fs::File::open(&path).unwrap();
+    let mut s = String::new();
+    let m = f.read_to_string(&mut s).unwrap();
+    assert_eq!(m, 7);
+    assert_eq!(s, "dynfile");
+    println!("dyn file write ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_write_on_file() {
+    // `Write::write` / `flush` on a `Box<dyn Write>` over a
+    // `File`: the vtable dispatch hands the file-I/O model a
+    // receiver whose outermost ADT wrapper holds a *reference*
+    // to the stored handle value, and the model must follow it
+    // to the file-table id (it refused the shape as not a file
+    // handle before).
+    run_ok("dyn-file-write", DYN_FILE_WRITE_SRC, "dyn file write ok\n");
+}
+
+const NOSTD_STDOUT_WRITE_SRC: &str = r#"
+#![no_std]
+extern crate std;
+use std::io::Write as _;
+fn main() {
+    let mut out = std::io::stdout();
+    out.write_all(b"nostd out\n").unwrap();
+    out.flush().unwrap();
+    std::println!("nostd stdout done");
+}
+"#;
+
+#[test]
+fn run_mode_nostd_stdout_write() {
+    // In a `#![no_std]` guest the same `Write` calls render
+    // with the defining crate's prefix (`core::io::Write::
+    // write_all`) and the `Self` tag carries the guest crate's
+    // name (`<guest>::std::io::Stdout`); the file-I/O diversion
+    // and dispatch match under the normalised spellings, so
+    // the calls are served like a std guest's.
+    run_ok(
+        "nostd-stdout-write",
+        NOSTD_STDOUT_WRITE_SRC,
+        "nostd out\nnostd stdout done\n",
+    );
+}

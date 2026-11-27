@@ -15,7 +15,28 @@ impl<'a> Interpreter<'a> {
     /// receiver value denotes (a reference to the handle, or the
     /// handle value itself).
     pub(super) fn file_id_of(&self, frames: &[Frame], receiver: &Value) -> InterpResult<u64> {
-        let value = self.resolve_value(frames, receiver)?;
+        let mut value = self.resolve_value(frames, receiver)?;
+        // The handle is an integer under a chain of one-field
+        // ADT wrappers (see `file_value`); a receiver recovered
+        // from a vtable dispatch hands over the outermost
+        // wrapper whose field is a *reference* to the stored
+        // handle value instead, so follow reference layers
+        // while unwrapping. (A `Box<dyn Read>` over a `File`
+        // arrived in exactly that shape and was refused as not
+        // a file handle.)
+        for _ in 0..8 {
+            match &value {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    match self.resolve_value(frames, &fields[0]) {
+                        Ok(resolved) => value = resolved,
+                        Err(_) => break,
+                    }
+                }
+                Value::Int(id) => return Ok(*id as u64),
+                Value::Uint(id) => return Ok(*id as u64),
+                _ => break,
+            }
+        }
         crate::interp::file_handle_id(&value).ok_or_else(|| {
             InterpError::type_mismatch(
                 "file operation",
@@ -150,11 +171,14 @@ impl<'a> Interpreter<'a> {
         generic_args: &[String],
         vals: Vec<Value>,
     ) -> InterpResult<Value> {
+        let name_cow = crate::builtins::io_spelling(name);
+        let name = &*name_cow;
         let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
         let self_ty = self_ty
             .strip_prefix("&mut ")
             .or_else(|| self_ty.strip_prefix("&"))
             .unwrap_or(self_ty);
+        let self_ty = crate::builtins::self_ty_key(self_ty);
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
                 Ok(())

@@ -343,6 +343,35 @@ def _parse_lookup_guards(body):
     return guards
 
 
+def read_file_io_unconditional(source):
+    """The name-wide file-I/O diversion set, read from
+    `is_file_io_call` in the builtins module.
+
+    Conversion diverts a file-I/O call to a builtin node under
+    the gates of `is_file_io_call` (see `file_io_terminator` in
+    `mir_convert`); most of its arms serve a trait name only
+    for admitted `Self` types, which a name-only registry
+    cannot express, so those arms stay unmodelled here. The
+    arms whose body is the unconditional `true` are inherent
+    method names - the name itself fixes the receiver
+    (`std::fs::File::sync_all` can only be called on a `File`,
+    `std::io::Stdin::read_line` only on a `Stdin`) - so every
+    call of one of those names is diverted, which is exactly
+    the name-wide claim this registry makes. The function
+    going missing, or losing every unconditional arm, is a
+    hard error.
+    """
+    body = _fn_body(source, "fn is_file_io_call(name")
+    names = set()
+    for pattern in re.findall(
+            r'((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>\s*true\s*,', body):
+        names.update(re.findall(r'"([^"]+)"', pattern))
+    if not names:
+        raise ValueError(
+            "builtins: no unconditional is_file_io_call arms found")
+    return names
+
+
 class BuiltinRegistry:
     """The interpreter's builtin support, read from the builtins module.
 
@@ -362,7 +391,12 @@ class BuiltinRegistry:
     whose `::lookup_slow` callee is modelled) and `float_method`
     (the `{core,std}::f{16,32,64,128}::<impl fN>::` prefixes, each
     served by the method-name table of `float_method_named`, or of
-    `float128_method` for f128). `lookup_qualified` additionally
+    `float128_method` for f128). One further serving path outside
+    `lookup` is modelled from its own gate function: the
+    unconditional arms of `is_file_io_call`, the inherent file-I/O
+    names the conversion diversion serves for every call (its
+    `Self`-gated trait arms cannot be expressed by a name-only
+    registry and stay unmodelled). `lookup_qualified` additionally
     retries `lookup` with leading path segments stripped one at a
     time, exactly like the interpreter. Any other guard shape, or a
     helper whose shape no longer matches these expectations, is a
@@ -429,6 +463,7 @@ class BuiltinRegistry:
         self.float_prefixes = _float_prefixes(
             _fn_body(source, "fn float_method(canonical"),
             self.float_methods, self.float128_methods)
+        self.file_io_names = read_file_io_unconditional(source)
 
     def lookup(self, canonical):
         if canonical in self.exact:
@@ -450,6 +485,8 @@ class BuiltinRegistry:
                     break
             if ok:
                 return True
+        if canonical in self.file_io_names:
+            return True
         return self._unicode_lookup_slow(canonical) \
             or self._float_method(canonical)
 

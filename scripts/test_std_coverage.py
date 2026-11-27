@@ -122,6 +122,19 @@ fn float128_method(method: &str) -> Option<Builtin> {
     };
     Some(Builtin::Float128Method { op })
 }
+
+fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
+    match name {
+        "std::fs::File::sync_all"
+        | "std::fs::File::set_len" => true,
+        "std::io::Read::read_to_end" => {
+            generic_args.first().map(|tag| tag.as_str()).unwrap_or("")
+                == "std::fs::File"
+        }
+        "std::io::Stdin::read_line" => true,
+        _ => false,
+    }
+}
 '''
 
 
@@ -152,6 +165,16 @@ class RegistryTests(unittest.TestCase):
             "core::unicode::unicode_data::white_space::lookup_slow"))
         self.assertFalse(reg.lookup(
             "core::unicode::unicode_data::alphabetic::lookup"))
+        # The file-I/O diversion's unconditional arms are inherent
+        # names (the name fixes the receiver), served for every
+        # call; its Self-gated trait arms stay unmodelled, so a
+        # gated name does not resolve even though the gate's own
+        # table names it.
+        self.assertTrue(reg.lookup("std::fs::File::sync_all"))
+        self.assertTrue(reg.lookup("std::fs::File::set_len"))
+        self.assertTrue(reg.lookup("std::io::Stdin::read_line"))
+        self.assertFalse(reg.lookup("std::io::Read::read_to_end"))
+        self.assertFalse(reg.lookup("std::io::Write::flush"))
         # lookup_qualified strips leading segments; lookup does not.
         self.assertFalse(reg.lookup("vendor::std::io::_print"))
         self.assertTrue(reg.lookup_qualified("vendor::std::io::_print"))
@@ -210,6 +233,22 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(reg.lookup("core::f64::<impl f64>::to_bits"))
         self.assertTrue(reg.lookup("std::f64::<impl f64>::sqrt"))
         self.assertTrue(reg.lookup("core::f32::<impl f32>::from_bits"))
+        # The file-I/O diversion's unconditional arms: inherent
+        # names only (the five `File` handle methods and
+        # `Stdin::read_line`); the Self-gated trait arms of
+        # `is_file_io_call` stay unmodelled.
+        self.assertEqual(reg.file_io_names, {
+            "std::fs::File::metadata",
+            "std::fs::File::try_clone",
+            "std::fs::File::sync_all",
+            "std::fs::File::sync_data",
+            "std::fs::File::set_len",
+            "std::io::Stdin::read_line",
+        })
+        self.assertTrue(reg.lookup("std::io::Stdin::read_line"))
+        self.assertFalse(reg.lookup("std::io::Write::flush"))
+        self.assertFalse(reg.lookup("std::io::Read::read_to_end"))
+        self.assertFalse(reg.lookup("std::io::BufRead::read_line"))
         self.assertTrue(reg.lookup("core::f16::<impl f16>::is_nan"))
         self.assertTrue(reg.lookup("core::f128::<impl f128>::from_bits"))
         self.assertTrue(reg.lookup(

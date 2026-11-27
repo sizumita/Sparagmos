@@ -348,6 +348,7 @@ pub(super) fn fmt_result_ok() -> Value {
 /// `std::sys` stdio handles the panic runtime writes through
 /// directly, or a `Vec<u8>`.
 pub(crate) fn stream_write_receiver(self_ty: &str) -> bool {
+    let self_ty = crate::builtins::self_ty_key(self_ty);
     matches!(
         self_ty,
         "std::io::Stdout"
@@ -362,6 +363,7 @@ pub(crate) fn stream_write_receiver(self_ty: &str) -> bool {
 /// Whether a standard-stream receiver writes to the captured
 /// error stream (rather than the captured output stream).
 pub(super) fn stream_is_stderr(self_ty: &str) -> bool {
+    let self_ty = crate::builtins::self_ty_key(self_ty);
     matches!(
         self_ty,
         "std::io::Stderr"
@@ -384,6 +386,8 @@ pub(super) fn stream_is_stderr(self_ty: &str) -> bool {
 /// `stream_write_receiver`), whose writes the interpreter
 /// models through its captured streams / an in-place append.
 pub(crate) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
+    let name_cow = crate::builtins::io_spelling(name);
+    let name = &*name_cow;
     match name {
         "std::fs::File::metadata"
         | "std::fs::File::try_clone"
@@ -402,9 +406,11 @@ pub(crate) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
             let self_ty = generic_args
                 .first()
                 .map(|tag| {
-                    tag.trim_start_matches("&mut ")
-                        .trim_start_matches('&')
-                        .trim()
+                    crate::builtins::self_ty_key(
+                        tag.trim_start_matches("&mut ")
+                            .trim_start_matches('&')
+                            .trim(),
+                    )
                 })
                 .unwrap_or("");
             // A child's piped output handles are files in the
@@ -427,9 +433,11 @@ pub(crate) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
             let self_ty = generic_args
                 .first()
                 .map(|tag| {
-                    tag.trim_start_matches("&mut ")
-                        .trim_start_matches('&')
-                        .trim()
+                    crate::builtins::self_ty_key(
+                        tag.trim_start_matches("&mut ")
+                            .trim_start_matches('&')
+                            .trim(),
+                    )
                 })
                 .unwrap_or("");
             matches!(
@@ -443,9 +451,11 @@ pub(crate) fn is_file_io_call(name: &str, generic_args: &[String]) -> bool {
             let self_ty = generic_args
                 .first()
                 .map(|tag| {
-                    tag.trim_start_matches("&mut ")
-                        .trim_start_matches('&')
-                        .trim()
+                    crate::builtins::self_ty_key(
+                        tag.trim_start_matches("&mut ")
+                            .trim_start_matches('&')
+                            .trim(),
+                    )
                 })
                 .unwrap_or("");
             self_ty == "std::fs::File"
@@ -468,6 +478,8 @@ pub(super) fn is_stream_io_call(
     name: &str,
     generic_args: &[String],
 ) -> bool {
+    let name_cow = crate::builtins::io_spelling(name);
+    let name = &*name_cow;
     if !matches!(
         name,
         "std::io::Read::read"
@@ -481,9 +493,11 @@ pub(super) fn is_stream_io_call(
     let self_ty = generic_args
         .first()
         .map(|tag| {
-            tag.trim_start_matches("&mut ")
-                .trim_start_matches('&')
-                .trim()
+            crate::builtins::self_ty_key(
+                tag.trim_start_matches("&mut ")
+                    .trim_start_matches('&')
+                    .trim(),
+            )
         })
         .unwrap_or("");
     self_ty == "std::net::TcpStream"
