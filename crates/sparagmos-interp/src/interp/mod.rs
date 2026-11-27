@@ -548,6 +548,15 @@ pub struct Interpreter<'a> {
     /// become known.
     heap_prices: std::cell::RefCell<std::collections::HashMap<u64, u128>>,
     heap_cursor: std::cell::Cell<(u64, u128)>,
+    /// Synthetic addresses of the data buffers of `Vec`
+    /// values held in frame locals, assigned from the buffer
+    /// region in first-pricing order (see
+    /// `Interpreter::buffer_price`): `buffer_prices` memoises
+    /// by (frame, local) of the holding local, and
+    /// `buffer_cursor` is the region's next free address.
+    buffer_prices:
+        std::cell::RefCell<std::collections::HashMap<(u64, usize), u128>>,
+    buffer_cursor: std::cell::Cell<u128>,
     /// Allocation layouts recorded by the raw allocator
     /// builtins (`__rust_alloc` and the libc family): (size,
     /// align) by allocation id. Typed creations are covered
@@ -1151,6 +1160,8 @@ impl<'a> Interpreter<'a> {
             static_cursor: std::cell::Cell::new(STATICS_BASE),
             heap_prices: std::cell::RefCell::new(std::collections::HashMap::new()),
             heap_cursor: std::cell::Cell::new((0, 0)),
+            buffer_prices: std::cell::RefCell::new(std::collections::HashMap::new()),
+            buffer_cursor: std::cell::Cell::new(BUFFER_BASE),
             alloc_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
             fat_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             vtable_words: std::cell::RefCell::new(std::collections::HashMap::new()),

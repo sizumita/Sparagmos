@@ -252,6 +252,14 @@ pub(crate) const STATICS_BASE: u128 = 1 << 61;
 /// were created, as natively).
 const HEAP_BASE: u128 = 1 << 62;
 
+/// Base of the synthetic buffer region: the data buffers of
+/// `Vec` values held in frame locals are priced upward from
+/// here in first-pricing order (see
+/// [`Interpreter::buffer_price`]). The region sits above the
+/// synthetic-hash range and below the statics region, so
+/// buffer addresses interleave with neither.
+pub(crate) const BUFFER_BASE: u128 = (1 << 60) + (1 << 59);
+
 /// The address a zero-sized root denotes: no storage backs
 /// it, so — exactly as codegen prices such a pointer — the
 /// address is the type's alignment, the canonical dangling
@@ -1671,6 +1679,36 @@ impl<'a> Interpreter<'a> {
                     let align = self.ty_align(root_ty)?;
                     return Some(dangling_displaced(align, projection));
                 }
+                let root_elem_size = body
+                    .local_elem_sizes
+                    .get(*local)
+                    .copied()
+                    .flatten();
+                // An element position in a `Vec` value held
+                // in this local denotes the vector's data
+                // buffer — a heap allocation in the guest's
+                // semantics, not the local's own storage — so
+                // it prices from the buffer's own base (see
+                // `vec_buffer_price`), not from the local's
+                // slot: the slot is sized by the `Vec` value's
+                // footprint, and walking a buffer-sized
+                // element space from it prices the buffer's
+                // positions over every neighbouring storage.
+                // Only the frame-carrying entry points can
+                // see the root's current value.
+                if let Some(frames) = frames {
+                    if let Some(price) = self.vec_buffer_price(
+                        frames,
+                        *frame,
+                        *local,
+                        projection,
+                        root_ty,
+                        root_elem_size,
+                        leaf_ty,
+                    ) {
+                        return Some(price);
+                    }
+                }
                 // A first-element position in an empty
                 // sequence value denotes a buffer the value
                 // does not have: its address is the element
@@ -1687,11 +1725,6 @@ impl<'a> Interpreter<'a> {
                 }
                 let layout = self.slot_layout(&func)?;
                 let slot = layout.slots.get(*local).copied()??;
-                let root_elem_size = body
-                    .local_elem_sizes
-                    .get(*local)
-                    .copied()
-                    .flatten();
                 let offset = self.projection_offset_with_root_elem(
                     Some(root_ty),
                     projection,
@@ -1845,6 +1878,125 @@ impl<'a> Interpreter<'a> {
         prices[&id]
     }
 
+    /// The price of an element position in the data buffer
+    /// of a `Vec` value held in a frame local (see
+    /// [`Self::price_target`]): the buffer's base in the
+    /// buffer region plus the projection's byte displacement,
+    /// so one buffer has one price base and its positions sit
+    /// at exact element steps from it. `None` when the root
+    /// is not a `Vec` place holding a vector value, the
+    /// projection does not step into the buffer (its first
+    /// structural step is not an element step — a position
+    /// in the `Vec` value's own fields denotes the local's
+    /// storage, not the buffer), or the element size cannot
+    /// be priced. A zero-capacity vector has no buffer: every
+    /// element position prices from the element type's
+    /// dangling address displaced by the projection's
+    /// offset, so an empty buffer has the one price domain
+    /// too.
+    fn vec_buffer_price(
+        &self,
+        frames: &[Frame],
+        frame_id: u64,
+        local: usize,
+        projection: &[RefProj],
+        root_ty: &Ty,
+        root_elem_size: Option<u64>,
+        leaf_ty: Option<&Ty>,
+    ) -> Option<u128> {
+        let Ty::Adt(name) = root_ty else {
+            return None;
+        };
+        if name.as_str() != "std::vec::Vec" && name.as_str() != "alloc::vec::Vec" {
+            return None;
+        }
+        match projection.first() {
+            Some(RefProj::Index(_)) | Some(RefProj::Subslice { .. }) => {}
+            _ => return None,
+        }
+        let frame = frames.iter().find(|f| f.id == frame_id)?;
+        // The storage extent the held vector value accounts
+        // (its capacity), in either of the value model's two
+        // vector forms — the dense aggregate form, whose
+        // extent is its element list, and the sparse form,
+        // which records it. This is the capacity every other
+        // capacity question in the model answers with (see
+        // `vec_stored_len`).
+        let cap = crate::builtins::vec_stored_len(frame.locals.get(local)?)?;
+        // The element denomination: the root type's own
+        // walk first (it resolves through the one recorded
+        // instance of the `Vec` type), then the element size
+        // conversion recorded for the local (the record that
+        // exists precisely because the IR root type drops
+        // the generic arguments), then the operand's
+        // declared pointee type. A program holding several
+        // `Vec` instances denominates through the fallbacks:
+        // the bare root name alone is ambiguous there.
+        let seq = self.sequence_elem(&WalkTy::Ty(root_ty.clone()));
+        let elem_size = seq
+            .as_ref()
+            .and_then(|(size, _)| *size)
+            .or(root_elem_size)
+            .or_else(|| leaf_ty.and_then(|t| self.ty_size_full(t)))?;
+        let align = seq
+            .as_ref()
+            .and_then(|(_, elem_ty)| match elem_ty {
+                WalkTy::Ty(t) => self.ty_align(t),
+                WalkTy::Tag(tag) => {
+                    u64::try_from(self.layout_of(tag)?.1).ok()
+                }
+            })
+            .or_else(|| leaf_ty.and_then(|t| self.ty_align(t)))?;
+        let offset = self.projection_offset_with_root_elem(
+            Some(root_ty),
+            projection,
+            leaf_ty,
+            root_elem_size,
+        )?;
+        if cap == 0 {
+            return displaced_price(dangling_address(align), offset);
+        }
+        let base = self.buffer_price(frame_id, local, cap, elem_size, align);
+        displaced_price(base, offset)
+    }
+
+    /// The synthetic address of the data buffer of the
+    /// `Vec` value held in the (`frame`, `local`) place,
+    /// assigned from the buffer region on first pricing:
+    /// each buffer reserves its capacity's extent
+    /// (`cap x elem_size` — the extent the guest can observe
+    /// the buffer spanning), so two live buffers' priced
+    /// ranges never overlap, and a buffer's positions price
+    /// at exact element steps from the one base for as long
+    /// as the value stays in its local. A buffer keeps the
+    /// base and the extent it was first priced with; a
+    /// growth past that extent after first pricing is the
+    /// one approximation, of the same kind [`Self::heap_price`]
+    /// documents for an allocation whose layout is unknown.
+    fn buffer_price(
+        &self,
+        frame: u64,
+        local: usize,
+        cap: u128,
+        elem_size: u64,
+        elem_align: u64,
+    ) -> u128 {
+        if let Some(p) = self.buffer_prices.borrow().get(&(frame, local)) {
+            return *p;
+        }
+        let align = elem_align.max(1);
+        let extent = u128::from(elem_size)
+            .saturating_mul(cap)
+            .max(u128::from(align))
+            .max(1);
+        let price = align_up_u128(self.buffer_cursor.get(), align);
+        self.buffer_cursor.set(price + extent);
+        self.buffer_prices
+            .borrow_mut()
+            .insert((frame, local), price);
+        price
+    }
+
     /// The price of a first-element position in an empty
     /// sequence value: the position denotes the sequence's
     /// buffer, and an empty sequence has no buffer storage
@@ -1965,7 +2117,25 @@ impl<'a> Interpreter<'a> {
                 }
                 RefProj::Index(i) => {
                     let c = cur.as_ref()?;
-                    let (elem_size, elem_ty) = self.sequence_elem(c)?;
+                    let Some((elem_size, elem_ty)) = self.sequence_elem(c)
+                    else {
+                        // The walk cannot denominate the root
+                        // step (a bare ADT name denoting
+                        // several recorded instances): the
+                        // recorded root element size prices
+                        // this step, and the walk cannot
+                        // continue past it — the same
+                        // fall-back a byte displacement makes.
+                        let size = if step_idx == 0 {
+                            root_elem_size?
+                        } else {
+                            return None;
+                        };
+                        offset +=
+                            i128::try_from(*i).ok()? * i128::from(size);
+                        cur = None;
+                        continue;
+                    };
                     let elem_size = elem_size
                         .or(if step_idx == 0 { root_elem_size } else { None })?;
                     offset +=
@@ -1974,7 +2144,20 @@ impl<'a> Interpreter<'a> {
                 }
                 RefProj::Subslice { offset: o, .. } => {
                     let c = cur.as_ref()?;
-                    let (elem_size, _) = self.sequence_elem(c)?;
+                    let Some((elem_size, _)) = self.sequence_elem(c) else {
+                        // See the `Index` arm: the recorded
+                        // root element size prices the root
+                        // step the walk cannot denominate.
+                        let size = if step_idx == 0 {
+                            root_elem_size?
+                        } else {
+                            return None;
+                        };
+                        offset +=
+                            i128::try_from(*o).ok()? * i128::from(size);
+                        cur = None;
+                        continue;
+                    };
                     let elem_size = elem_size
                         .or(if step_idx == 0 { root_elem_size } else { None })?;
                     offset +=
@@ -4584,5 +4767,101 @@ mod ptr_equality_tests {
             std::cmp::Ordering::Greater => 2,
         };
         assert_eq!(cmp.0, Value::Enum { variant: want, fields: vec![] });
+    }
+
+    /// A program with two `Vec<i32>` locals in one body,
+    /// for the buffer-pricing tests: the `Vec` instance's
+    /// layout is on record, so the root type denominates.
+    fn vec_probe_program() -> Program {
+        let mut program = Program::new();
+        program
+            .adt_layouts
+            .insert("std::vec::Vec<i32>".to_string(), (24, 8));
+        let block = BasicBlockData::new(vec![], TerminatorKind::Return);
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Adt("std::vec::Vec".to_string()),
+                Ty::Adt("std::vec::Vec".to_string()),
+            ],
+            vec![block],
+        ));
+        program
+    }
+
+    fn sparse_vec(len: u128, cap: u128) -> Value {
+        Value::SparseVec {
+            elems: vec![Value::Int(0); len as usize],
+            len,
+            cap,
+        }
+    }
+
+    /// Element positions in a `Vec` value held in a local
+    /// price from the buffer's own base in the buffer
+    /// region: exact element steps within the buffer, and
+    /// two buffers' capacity ranges are disjoint, however
+    /// close the holding locals' slots sit. The `Vec`
+    /// value's own root still prices as the local's storage.
+    #[test]
+    fn vec_buffer_positions_price_from_their_own_base() {
+        let program = vec_probe_program();
+        let interp = Interpreter::new(&program);
+        interp.register_frame_base(&[], 7, "probe::f");
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![Value::Unit, sparse_vec(4, 4), sparse_vec(4, 8)],
+        )];
+        let a0 = place_price(&interp, &frames, 1, vec![RefProj::Index(0)], None)
+            .expect("a0");
+        let a3 = place_price(&interp, &frames, 1, vec![RefProj::Index(3)], None)
+            .expect("a3");
+        let b0 = place_price(&interp, &frames, 2, vec![RefProj::Index(0)], None)
+            .expect("b0");
+        assert!(a0 >= BUFFER_BASE, "buffer positions price in the buffer region");
+        assert_eq!(a3 - a0, 12, "element steps are exact within a buffer");
+        assert!(
+            b0 >= a0 + 16 || a0 >= b0 + 32,
+            "distinct buffers' capacity ranges are disjoint"
+        );
+        // The same buffer reached through a subslice step
+        // prices from the same base.
+        let a_sub = place_price(
+            &interp,
+            &frames,
+            1,
+            vec![RefProj::Subslice { offset: 0, len: 4 }],
+            None,
+        )
+        .expect("a subslice base");
+        assert_eq!(a_sub, a0, "subslice and index forms share the buffer base");
+        // The Vec value itself (no element step) still
+        // prices as the local's storage, in the stack region.
+        let root = place_price(&interp, &frames, 1, vec![], None).expect("root");
+        assert!(root < BUFFER_BASE, "the Vec place itself keeps slot pricing");
+    }
+
+    /// A zero-capacity `Vec` has no buffer: every element
+    /// position — not just the first — prices from the
+    /// element type's dangling address, displaced by the
+    /// position's offset, so the empty buffer has the one
+    /// price domain.
+    #[test]
+    fn empty_vec_positions_price_at_the_dangling_address() {
+        let program = vec_probe_program();
+        let interp = Interpreter::new(&program);
+        interp.register_frame_base(&[], 7, "probe::f");
+        let frames = vec![probe_frame(
+            "probe::f",
+            vec![Value::Unit, sparse_vec(0, 0), sparse_vec(0, 0)],
+        )];
+        let p0 = place_price(&interp, &frames, 1, vec![RefProj::Index(0)], None)
+            .expect("p0");
+        let p3 = place_price(&interp, &frames, 1, vec![RefProj::Index(3)], None)
+            .expect("p3");
+        assert_eq!(p0, 4, "an empty buffer's base is the element alignment");
+        assert_eq!(p3, 4 + 12, "later positions displace from the same base");
     }
 }
