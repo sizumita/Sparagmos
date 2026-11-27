@@ -450,7 +450,9 @@ jobs:
       # class never silently runs on the runner's native
       # MSVC-hosted toolchain instead.
       - name: Verify the gnu-hosted toolchain is the default
-        run: "rustc -vV | grep -q '^host: x86_64-pc-windows-gnu$'"
+        run: |
+          version="$(rustc -vV)"
+          printf '%s\n' "$version" | grep -q '^host: x86_64-pc-windows-gnu$'
 
       - name: Cache cargo registry and driver target
         uses: Swatinem/rust-cache@v2
@@ -1938,7 +1940,9 @@ jobs:
       # class never silently runs on the runner's native
       # MSVC-hosted toolchain instead.
       - name: Verify the gnu-hosted toolchain is the default
-        run: "rustc -vV | grep -q '^host: x86_64-pc-windows-gnu$'"
+        run: |
+          version="$(rustc -vV)"
+          printf '%s\n' "$version" | grep -q '^host: x86_64-pc-windows-gnu$'
 
       - name: Restore rust source tree
         uses: actions/cache@v4
