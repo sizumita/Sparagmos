@@ -846,6 +846,34 @@ impl<'a> Interpreter<'a> {
                 ScalarShape::AdtField { index, inner, .. },
                 Value::Enum { fields, .. },
             ) => match fields.get(*index as usize) {
+                // A union value holds the field it was last
+                // written through and leaves every other slot
+                // uninit: when the payload slot is the uninit
+                // one, the aggregate is a union whose storage
+                // its one live field holds, and the crossing
+                // reads that field's bits at the payload's
+                // width -- the same reinterpretation a union
+                // field read performs (see `union_field_read`).
+                // With no live field, or several, the payload
+                // slot's own flattening stands (it reports the
+                // uninit read). A one-payload wrapper never
+                // presents a live sibling here: its remaining
+                // fields are zero-sized fills.
+                Some(Value::Uninit) => {
+                    let mut live = fields.iter().enumerate().filter(
+                        |(i, v)| *i as u32 != *index && **v != Value::Uninit,
+                    );
+                    let held = match (live.next(), live.next()) {
+                        (Some((_, held)), None) => Some(held.clone()),
+                        _ => None,
+                    };
+                    match held
+                        .and_then(|h| self.flatten_loose_bits(&h, inner.bits()))
+                    {
+                        Some(bits) => Ok(bits & bit_mask(inner.bits())),
+                        None => self.flatten_scalar(&Value::Uninit, inner),
+                    }
+                }
                 Some(field) => self.flatten_scalar(field, inner),
                 None => Err(InterpError::type_mismatch(
                     "transmute",
@@ -1130,6 +1158,89 @@ impl<'a> Interpreter<'a> {
 
     /// The value of `shape` whose bit pattern is `bits`
     /// (the low `shape.bits()` bits; higher bits are ignored).
+    /// The bit pattern of a value whose exact scalar shape
+    /// is not at hand, read at `width` bits: the loose
+    /// flattening a union crossing uses for the field that
+    /// actually holds the union's storage (see the `AdtField`
+    /// arm of `flatten_scalar`). The value's own kind fixes
+    /// the reading: integers are their values, floats their
+    /// bit patterns at the width, pointers their synthetic
+    /// addresses, byte blocks and tuples the little-endian
+    /// packing of their elements, and a wrapper aggregate the
+    /// one field it holds. Anything else has no loose pattern.
+    fn flatten_loose_bits(&self, value: &Value, width: u32) -> Option<u128> {
+        if width > 128 {
+            return None;
+        }
+        let bits = match value {
+            Value::Int(i) => *i as u128,
+            Value::Uint(u) => *u,
+            Value::Bool(b) => u128::from(*b),
+            Value::Float(f) => match width {
+                16 => u128::from(f64_to_f16_bits(*f)),
+                32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
+                _ => u128::from(f.to_bits()),
+            },
+            Value::Float128(b) => *b,
+            Value::Ref(_)
+            | Value::FatRef { .. }
+            | Value::DynRef { .. }
+            | Value::FnPtr(_)
+            | Value::Closure { .. } => {
+                let addr = self
+                    .arithmetic_price(value, None, None)
+                    .or_else(|| synthetic_address(value))?;
+                self.note_exposed_target(addr as u64, value);
+                addr
+            }
+            Value::Bytes(b) => {
+                let mut out = 0u128;
+                for (i, byte) in b.iter().enumerate().take(16) {
+                    out |= u128::from(*byte) << (8 * i);
+                }
+                out
+            }
+            Value::UnionBytes { bytes } => {
+                let mut out = 0u128;
+                for (i, b) in bytes.iter().enumerate().take(16) {
+                    if let Some(b) = b {
+                        out |= u128::from(*b) << (8 * i);
+                    }
+                }
+                out
+            }
+            Value::Tuple(items) => {
+                if items.is_empty() {
+                    0
+                } else {
+                    if width == 0 || width % items.len() as u32 != 0 {
+                        return None;
+                    }
+                    let ew = width / items.len() as u32;
+                    let mut out = 0u128;
+                    for (i, item) in items.iter().enumerate() {
+                        out |= (self.flatten_loose_bits(item, ew)?
+                            & bit_mask(ew))
+                            << (i as u32 * ew);
+                    }
+                    out
+                }
+            }
+            Value::Enum { fields, .. } => {
+                let mut live =
+                    fields.iter().filter(|v| **v != Value::Uninit);
+                match (live.next(), live.next()) {
+                    (Some(held), None) => {
+                        self.flatten_loose_bits(held, width)?
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        Some(bits & bit_mask(width))
+    }
+
     pub(crate) fn construct_scalar(
         &self,
         bits: u128,
