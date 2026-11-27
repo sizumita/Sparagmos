@@ -99,9 +99,6 @@ impl<'a> Converter<'a> {
     /// then fails naming the item, as before).
     pub(super) fn fn_def_value_key(&self, def: &mir::DefId, args: &[mir::Ty]) -> String {
         let key = self.body_key(def);
-        if self.bodies.contains_key(&key) {
-            return key;
-        }
         let name = self.def_display_name(def);
         if let Some((trait_path, method)) = name.rsplit_once("::") {
             if !trait_path.is_empty() && !method.is_empty() {
@@ -110,7 +107,30 @@ impl<'a> Converter<'a> {
                 {
                     return impl_key;
                 }
+                // No converted body carries this instance. For a
+                // `core::fmt` trait method the structural fmt
+                // engine is the designated server (see
+                // `builtins::fmt_trait_method`), and it recovers
+                // the `Self` type from the impl instance name —
+                // the name a collected impl body would carry.
+                // Name the value by that instance so a raw
+                // `fmt::Argument` built over the constant keeps
+                // its `Self` type; the bare trait path leaves
+                // the engine a value it cannot denominate (a
+                // `char` and a `u32` are the same value). This
+                // outranks the trait item's own key below: that
+                // body is the item's declaration, not this
+                // instance's impl.
+                if crate::builtins::fmt_trait_method(&name).is_some() {
+                    if let Some(self_ty) = args.first() {
+                        let self_name = self.concrete_ty_name(self_ty);
+                        return format!("<{self_name} as {trait_path}>::{method}");
+                    }
+                }
             }
+        }
+        if self.bodies.contains_key(&key) {
+            return key;
         }
         key
     }

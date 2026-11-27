@@ -112,6 +112,19 @@ pub fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::OrdCmp
             | Builtin::PartialOrdRel(_)
             | Builtin::CloneClone
+            // `ToOwned::to_owned` likewise computes from the
+            // argument value alone (a `str` receiver's owned
+            // form is the string itself, a slice's is its
+            // elements as a vector, any other modelled type's
+            // is its clone). The optimized `alloc::fmt::format`
+            // body reaches it only as a function item handed
+            // to `FnOnce::call_once` (`args.as_str().map_or_else(
+            // || format_inner(args), ToOwned::to_owned)`, taken
+            // for an all-constant `format!`), and that
+            // `call_once` instance has no MIR body at all, so
+            // the name fallback is the only dispatch that can
+            // serve the call.
+            | Builtin::ToOwned
             | Builtin::WakerWake
             | Builtin::WakerWakeByRef
             | Builtin::VecNew

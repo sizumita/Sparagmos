@@ -9807,6 +9807,18 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ToOwned => {
                 arity(1)?;
+                // A `str` receiver reached through a fat
+                // reference: the owned form is a `String`, whose
+                // value is the string itself -- not the byte
+                // vector the slice arm below builds from the
+                // same fat reference (that arm serves a slice
+                // receiver, whose pointee is an element
+                // sequence, never a string value).
+                if let Value::FatRef { base, .. } = &vals[0] {
+                    if let Ok(Value::Str(text)) = self.resolve_value(frames, base) {
+                        return Ok(Value::Str(text));
+                    }
+                }
                 match &vals[0] {
                     // A slice: the owned form is a vector of the
                     // elements.
