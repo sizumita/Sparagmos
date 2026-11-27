@@ -209,7 +209,8 @@ impl<'a> Interpreter<'a> {
             }
             return Some(ByteLayout::Seq(Box::new(elem_layout), elem_size, count));
         }
-        if self.program().adt_field_layouts.contains_key(tag) {
+        if self.program().adt_field_layouts.contains_key(tag) || self.adt_is_union(tag)
+        {
             return Some(ByteLayout::Adt(tag.to_string()));
         }
         None
@@ -226,6 +227,88 @@ impl<'a> Interpreter<'a> {
                 .adt_layouts
                 .get(name)
                 .map(|&(size, _)| size as usize),
+        }
+    }
+
+    /// Whether the recorded debug shape names a union.
+    /// The shape table is keyed like the layout tables, by
+    /// the rendered instance name, so a generic instance
+    /// under a bare `Ty::Adt` name is not detected — the
+    /// same denomination limit every name-keyed byte-view
+    /// lookup already has.
+    fn adt_is_union(&self, name: &str) -> bool {
+        matches!(
+            self.program().adt_debug_shapes.get(name),
+            Some(shape) if shape.kind == sparagmos_mir::AdtShapeKind::Union
+        )
+    }
+
+    /// The storage image of a union value: one entry per
+    /// byte of the union's recorded size, `Some` where the
+    /// byte is initialised. Every field of a union sits at
+    /// offset zero, so the image is the widest live field's
+    /// own image over uninitialised storage elsewhere —
+    /// the value model's invariant is that one union
+    /// value's fields are readings of the same bytes, so
+    /// the widest field's image covers the other fields'
+    /// spans. A value already in byte form carries its
+    /// image directly. A live field whose bytes the view
+    /// cannot judge declines the composition (`None`);
+    /// zero-sized fields hold no bytes and are skipped.
+    fn union_storage_image(
+        &self,
+        value: &Value,
+        name: &str,
+    ) -> Option<Vec<Option<u8>>> {
+        let size = self.program().adt_layouts.get(name)?.0 as usize;
+        match value {
+            Value::UnionBytes { bytes } => {
+                let mut image = bytes.clone();
+                image.truncate(size);
+                image.resize(size, None);
+                Some(image)
+            }
+            Value::Uninit => Some(vec![None; size]),
+            Value::Enum { fields, .. } => {
+                let mut widest: Option<Vec<Option<u8>>> = None;
+                for (f, field) in fields.iter().enumerate() {
+                    if *field == Value::Uninit {
+                        continue;
+                    }
+                    let tag = self.adt_field_tag(name, 0, f)?;
+                    let (field_size, _) = self.layout_of(&tag)?;
+                    let field_size = field_size as usize;
+                    if field_size == 0 {
+                        continue;
+                    }
+                    if widest
+                        .as_ref()
+                        .is_some_and(|image| image.len() >= field_size)
+                    {
+                        continue;
+                    }
+                    let layout = self.byte_layout_of_tag(&tag)?;
+                    let mut image = vec![None; field_size];
+                    for pos in 0..field_size {
+                        match self.storage_byte(field, &layout, pos) {
+                            Some(Ok(StorageByte::Byte(byte))) => {
+                                image[pos] = Some(byte);
+                            }
+                            Some(Ok(StorageByte::Padding))
+                            | Some(Err(ByteVerdict::Uninit)) => {}
+                            _ => return None,
+                        }
+                    }
+                    widest = Some(image);
+                }
+                let mut image = vec![None; size];
+                if let Some(field_image) = widest {
+                    let n = field_image.len().min(size);
+                    image[..n].copy_from_slice(&field_image[..n]);
+                }
+                Some(image)
+            }
+            _ => None,
         }
     }
 
@@ -422,6 +505,22 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ByteLayout::Adt(name) => {
+                // A union's fields all share offset zero, so
+                // no single field's slot holds the storage a
+                // byte access denotes: the byte view over a
+                // union answers from the value's composed
+                // storage image (see `union_storage_image`).
+                // Unions carry no recorded field-layout rows,
+                // so without this the field walk below
+                // declines every byte access to a union place.
+                if self.adt_is_union(name) {
+                    let image = self.union_storage_image(value, name)?;
+                    return match image.get(pos) {
+                        Some(Some(byte)) => Some(Ok(StorageByte::Byte(*byte))),
+                        Some(None) => Some(Err(ByteVerdict::Uninit)),
+                        None => Some(Err(ByteVerdict::Outside(pos))),
+                    };
+                }
                 let Value::Enum { variant, fields } = value else {
                     return None;
                 };
@@ -625,6 +724,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ByteLayout::Adt(name) => {
+                // The write side of the union byte view (see
+                // `storage_byte`): the byte lands in the
+                // composed storage image and the slot takes
+                // the byte form — the one value form that
+                // holds a union's bytes without naming a
+                // field. Later field reads decode from it
+                // through the union projection machinery, and
+                // later byte accesses read the image back.
+                if self.adt_is_union(name) {
+                    let mut image = self.union_storage_image(slot, name)?;
+                    if pos >= image.len() {
+                        return Some(Err(ByteVerdict::Outside(pos)));
+                    }
+                    image[pos] = Some(byte);
+                    *slot = Value::UnionBytes { bytes: image };
+                    return Some(Ok(()));
+                }
                 // Uninitialised storage under an ADT layout
                 // starts as the first variant's skeleton: the
                 // tag bytes spliced into it re-form the value
