@@ -1451,6 +1451,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1513,6 +1514,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1560,6 +1562,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1611,6 +1614,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -1744,6 +1748,7 @@ impl<'a> Converter<'a> {
             unique_elem: None,
             zeroed_value: None,
             generic_type_ids: None,
+            validity_panic: None,
         }))
     }
 
@@ -2396,6 +2401,7 @@ impl<'a> Converter<'a> {
     pub(super) fn convert_terminator(
         &self,
         body: &mir::Body,
+        bb_index: u32,
         kind: &mir::TerminatorKind,
         fn_abi: Option<&mir::Abi>,
         block_has_statements: bool,
@@ -3215,25 +3221,49 @@ impl<'a> Converter<'a> {
                                 .first()
                                 .and_then(|ty| self.zeroed_model_value(ty, 0))
                         } else if kind == crate::builtins::Builtin::WriteBytes
-                            && matches!(
-                                args.get(1).and_then(|arg| {
-                                    self.convert_operand(body, arg, None).ok()
-                                }),
-                                Some(ir::Operand::Constant(
-                                    ir::Constant::Uint(0)
-                                ))
-                            )
                         {
                             // A `write_bytes` whose fill byte is
-                            // the constant zero (`MaybeUninit::
-                            // zeroed` is its canonical use): the
-                            // filled region holds the zero
+                            // a constant (`MaybeUninit::zeroed`'s
+                            // zero fill and `mem::uninitialized`'s
+                            // 0x01 fill are the canonical uses):
+                            // the filled region holds that byte's
                             // pattern of the pointee type, whose
                             // denoted value is baked like
                             // `mem::zeroed`'s.
-                            raw_generic_args
-                                .first()
-                                .and_then(|ty| self.zeroed_model_value(ty, 0))
+                            match args.get(1).and_then(|arg| {
+                                self.convert_operand(body, arg, None).ok()
+                            }) {
+                                Some(ir::Operand::Constant(
+                                    ir::Constant::Uint(b),
+                                )) if b <= 0xff => raw_generic_args
+                                    .first()
+                                    .and_then(|ty| {
+                                        self.byte_filled_model_value(
+                                            ty,
+                                            b as u8,
+                                            0,
+                                        )
+                                    }),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        // The validity assertion of this call,
+                        // when the driver settled it against the
+                        // compiler's own check (see
+                        // `mir::Body::validity_panics`): only the
+                        // validity intrinsics and `mem::zeroed`
+                        // carry an entry, keyed by this block.
+                        let validity_panic = if matches!(
+                            kind,
+                            crate::builtins::Builtin::AssertValidity
+                                | crate::builtins::Builtin::MemZeroed
+                        ) {
+                            body.validity_panics
+                                .iter()
+                                .find(|(block, _)| *block == bb_index)
+                                .map(|(_, message)| message.clone())
                         } else {
                             None
                         };
@@ -3259,6 +3289,7 @@ impl<'a> Converter<'a> {
                                 unique_elem,
                                 zeroed_value,
                                 generic_type_ids,
+                                validity_panic,
                             }
                         }
                     } else if args.first().is_some_and(|a| {

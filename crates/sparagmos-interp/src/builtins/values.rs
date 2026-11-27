@@ -1121,6 +1121,42 @@ pub(super) fn tag_leaf_count(tag: &str) -> Option<usize> {
 /// and strings keep the sequence path (their fills are
 /// byte-wise), and a fat reference's pointee count is not a fact
 /// of the value alone: those are `None` here.
+/// Whether two values have the same structural shape: the
+/// same value kind at every position, with tuples and enum
+/// field lists of the same length (and the same enum
+/// variant). Scalar contents are not compared.
+pub(super) fn same_value_shape(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        // The unit value and the empty tuple are the same
+        // shape: the model stores a unit-typed payload in
+        // either form.
+        (Value::Unit, Value::Tuple(xs)) | (Value::Tuple(xs), Value::Unit)
+            if xs.is_empty() =>
+        {
+            true
+        }
+        (Value::Tuple(xs), Value::Tuple(ys)) => {
+            xs.len() == ys.len()
+                && xs.iter().zip(ys.iter()).all(|(x, y)| same_value_shape(x, y))
+        }
+        (
+            Value::Enum {
+                variant: va,
+                fields: xs,
+            },
+            Value::Enum {
+                variant: vb,
+                fields: ys,
+            },
+        ) => {
+            va == vb
+                && xs.len() == ys.len()
+                && xs.iter().zip(ys.iter()).all(|(x, y)| same_value_shape(x, y))
+        }
+        _ => a.kind_name() == b.kind_name(),
+    }
+}
+
 pub(super) fn value_leaf_count(value: &Value) -> Option<usize> {
     match value {
         Value::Tuple(items) => items.iter().map(value_leaf_count).sum(),
@@ -1188,8 +1224,80 @@ pub(super) fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
             let elem = byte_fill_value(elem, byte)?;
             Value::Tuple(vec![elem; n])
         }
+        _ if tag.starts_with('(') && tag.ends_with(')') => {
+            let inner = &tag[1..tag.len() - 1];
+            if inner.trim().is_empty() {
+                Value::Unit
+            } else {
+                if tag_leaf_count(tag)? > MAX_FILL_LEAVES {
+                    return None;
+                }
+                let mut vals = Vec::new();
+                for part in split_top_level(inner) {
+                    vals.push(byte_fill_value(part, byte)?);
+                }
+                Value::Tuple(vals)
+            }
+        }
+        // A filled thin pointer is the address-only pointer
+        // whose address is the byte repeated; a filled fat
+        // slice/string pointer carries the pattern as both
+        // address and length. A `dyn` pointee's vtable word
+        // names no vtable, so that fill stays unsupported.
+        _ if thin_pointer_tag(tag) => {
+            Value::Ref(RefTarget::Address(
+                u64::from(byte) * 0x0101_0101_0101_0101,
+            ))
+        }
+        _ if fat_pointer_tag(tag) => Value::FatRef {
+            base: Box::new(Value::Ref(RefTarget::Address(
+                u64::from(byte) * 0x0101_0101_0101_0101,
+            ))),
+            len: u128::from(byte) * 0x0101_0101_0101_0101,
+        },
         _ => return None,
     })
+}
+
+/// The pointee type a pointer tag denotes (`&mut [u8]` ->
+/// `[u8]`, `*const u8` -> `u8`), or `None` when the tag is
+/// not a raw pointer or reference.
+fn pointer_pointee(tag: &str) -> Option<&str> {
+    if let Some(rest) = tag
+        .strip_prefix("*const ")
+        .or_else(|| tag.strip_prefix("*mut "))
+    {
+        return Some(rest);
+    }
+    let rest = tag.strip_prefix('&')?;
+    Some(rest.strip_prefix("mut ").unwrap_or(rest))
+}
+
+/// Whether `tag` names a thin pointer: a raw pointer or
+/// reference to a sized pointee, or a function pointer.
+fn thin_pointer_tag(tag: &str) -> bool {
+    if tag.starts_with("fn(") || tag.starts_with("fn ") || tag.contains(" fn(") {
+        return true;
+    }
+    match pointer_pointee(tag) {
+        Some(pointee) => {
+            !(pointee.starts_with('[') && !pointee.contains(';'))
+                && pointee != "str"
+                && !pointee.starts_with("dyn ")
+        }
+        None => false,
+    }
+}
+
+/// Whether `tag` names a fat slice or string pointer (a raw
+/// pointer or reference whose pointee is a slice or `str`).
+fn fat_pointer_tag(tag: &str) -> bool {
+    match pointer_pointee(tag) {
+        Some(pointee) => {
+            (pointee.starts_with('[') && !pointee.contains(';')) || pointee == "str"
+        }
+        None => false,
+    }
 }
 
 /// The alignment an allocator call declares, read

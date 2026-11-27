@@ -189,6 +189,17 @@ impl<'a> Interpreter<'a> {
             return self.union_bytes_decode(bytes, dst, func, place);
         }
         let Value::Enum { ref fields, .. } = value else {
+            // A union place can hold the payload's bare storage
+            // form (see `normalize_for_ty`: a `MaybeUninit`
+            // place denotes the payload's own storage, and a
+            // zero-sized constant of the type is read as the
+            // payload value itself). The bare form IS the
+            // field-0 slot's content, so a read of that slot
+            // returns it as it stands; any other field's read
+            // has no honest form here and stays the mismatch.
+            if idx == 0 {
+                return Ok(value);
+            }
             return Err(InterpError::type_mismatch(
                 format!("union field read on {place}"),
                 "union (ADT) value",
