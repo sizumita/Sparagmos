@@ -168,6 +168,64 @@ pub(super) fn int_kind(ty: &mir::Ty) -> Option<IrIntKind> {
 /// JIT's bound is in leaves because its frames are physical.)
 pub(super) const MAX_ARRAY_LEAVES: usize = 4096;
 
+/// The byte size and alignment of a type, for the types whose
+/// layout is a pure function of the type itself (the scalar,
+/// tuple, array and reference shapes): the value
+/// `std::mem::size_of` / `align_of` reports, computed the way
+/// rustc's default layout algorithm lays the type out (tuple
+/// fields are packed in decreasing alignment order, as the
+/// algorithm orders them). `None` for a type whose layout this
+/// computation does not cover (an ADT other than the shapes the
+/// caller special-cases, a slice / `str`, a function item, ...).
+pub(super) fn byte_size_align(ty: &mir::Ty) -> Option<(u64, u64)> {
+    fn align_up(v: u64, align: u64) -> Option<u64> {
+        Some(v.checked_add(align - 1)? & !(align - 1))
+    }
+    match ty {
+        mir::Ty::Bool => Some((1, 1)),
+        mir::Ty::Char => Some((4, 4)),
+        mir::Ty::Int(it) => {
+            let b = u64::from(int_bits(*it) / 8);
+            Some((b, b.min(8)))
+        }
+        mir::Ty::Uint(ut) => {
+            let b = u64::from(uint_bits(*ut) / 8);
+            Some((b, b.min(8)))
+        }
+        mir::Ty::Float(mir::FloatTy::F32) => Some((4, 4)),
+        mir::Ty::Float(mir::FloatTy::F64) => Some((8, 8)),
+        mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => match &**pointee {
+            mir::Ty::Str | mir::Ty::Slice(_) | mir::Ty::Dynamic(..) => Some((16, 8)),
+            _ => Some((8, 8)),
+        },
+        mir::Ty::Tuple(fields) => {
+            if fields.is_empty() {
+                return Some((0, 1));
+            }
+            let mut parts: Vec<(u64, u64)> = Vec::with_capacity(fields.len());
+            for f in fields {
+                parts.push(byte_size_align(f)?);
+            }
+            // rustc's default layout orders fields by decreasing
+            // alignment (stable for equal alignments).
+            parts.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut size = 0u64;
+            let mut align = 1u64;
+            for (fsize, falign) in parts {
+                align = align.max(falign);
+                size = align_up(size, falign)?.checked_add(fsize)?;
+            }
+            Some((align_up(size, align)?, align))
+        }
+        mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+            let (esize, ealign) = byte_size_align(elem)?;
+            Some((esize.checked_mul(*n)?, ealign))
+        }
+        mir::Ty::Never => Some((0, 1)),
+        _ => None,
+    }
+}
+
 /// Number of scalar leaves a value of `ty` occupies, or the reason
 /// the type is outside the JIT's range.
 pub(super) fn flatten(ty: &mir::Ty, fname: &str, layouts: &AdtLayouts) -> Result<usize, JitError> {

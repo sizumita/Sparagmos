@@ -868,6 +868,30 @@ pub(super) fn builtin_adt_layout(
                 ]],
             })
         }
+        "std::time::Instant" | "std::time::SystemTime" => {
+            // A time value is its platform time: a (seconds,
+            // nanoseconds) pair in two leaves, the shape the
+            // interpreter's time model stores (`instant_value`)
+            // and the `now` builtins produce. No converted body
+            // projects the fields (the arithmetic methods are
+            // std bodies), so the scan cannot derive this
+            // layout; the builtin layer defines it. The field's
+            // declared type is the platform `Timespec` struct,
+            // whose own layout is the same pair; it is spelled
+            // here as the equivalent tuple type.
+            Some(AdtLayout {
+                tag: false,
+                total: 2,
+                variants: vec![vec![AdtFieldSlot {
+                    ty: mir::Ty::Tuple(vec![
+                        mir::Ty::Int(mir::IntTy::I64),
+                        mir::Ty::Int(mir::IntTy::I64),
+                    ]),
+                    offset: 0,
+                    width: 2,
+                }]],
+            })
+        }
         "std::mem::Alignment" => {
             // `Alignment` is its `AlignmentEnum` field alone.
             // The type flows through `Layout` values without any
