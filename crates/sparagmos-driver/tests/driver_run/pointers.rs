@@ -4473,3 +4473,41 @@ fn run_mode_displaced_ptr_access_into_union_uninit_storage() {
         "ok 10 20\n",
     );
 }
+
+const UNION_UNINIT_BYTE_DISPLACED_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ptr::NonNull;
+union SmallVecData {
+    inline: ManuallyDrop<MaybeUninit<[u32; 2]>>,
+    heap: (NonNull<u32>, usize),
+}
+struct SmallVec { data: SmallVecData }
+impl SmallVec {
+    fn new() -> Self { SmallVec { data: SmallVecData { inline: ManuallyDrop::new(MaybeUninit::uninit()) } } }
+    fn inline_mut(&mut self) -> *mut u32 { unsafe { std::ptr::addr_of_mut!(self.data.inline).cast::<MaybeUninit<[u32;2]>>().as_mut().unwrap().as_mut_ptr() as *mut u32 } }
+    fn inline_ref(&self) -> *const u32 { unsafe { std::ptr::addr_of!(self.data.inline).cast::<MaybeUninit<[u32;2]>>().as_ref().unwrap().as_ptr() as *const u32 } }
+}
+fn main() { unsafe {
+    let mut v = SmallVec::new();
+    v.inline_mut().write(10);
+    (v.inline_mut() as *mut u8).add(4).cast::<u32>().write(20);
+    println!("ok {} {}", *v.inline_ref(), *v.inline_ref().add(1));
+} }
+"#;
+
+#[test]
+fn run_mode_byte_displaced_ptr_access_into_union_uninit_storage() {
+    // Issue #502, byte-priced form: the displaced write is
+    // priced in bytes (a `*mut u8` advance of one element's
+    // width, cast back to the element type) rather than in
+    // elements. The offset counts in a sub-element unit, so
+    // the sequence denomination must be recovered from the
+    // deeper record whose size is a whole multiple of that
+    // unit; the write must still land on element 1 and read
+    // back, not splice into element 0 or stay uninitialized.
+    run_ok(
+        "union-uninit-byte-displaced",
+        UNION_UNINIT_BYTE_DISPLACED_SRC,
+        "ok 10 20\n",
+    );
+}

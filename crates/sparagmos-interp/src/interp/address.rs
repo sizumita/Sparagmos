@@ -4227,6 +4227,16 @@ impl<'a> Interpreter<'a> {
             // a union payload, so the descent is not a uniform
             // field-0 walk) -- provided it is the only deeper
             // record denominated in the offset element size.
+            // An offset denominated in a sub-element unit (a
+            // byte- or half-element-priced advance, as in a
+            // byte-priced advance cast back to the element type)
+            // counts in a unit that divides the element size:
+            // the caller's byte total is what decides
+            // absorption, and it only absorbs landings exactly
+            // on an element boundary, so a deeper record whose
+            // size is a whole multiple of the offset unit
+            // denominates the sequence just as an exact-size
+            // record does.
             // The rebuilt projection keeps the original prefix:
             // the index step the caller appends resolves through
             // the wrappers exactly as the position original
@@ -4244,24 +4254,56 @@ impl<'a> Interpreter<'a> {
                     // fields of a `Vec` element type, say) fails
                     // one of these and leaves the direct
                     // denomination standing.
+                    let descent = |recorded: &Vec<usize>| {
+                        recorded.len() > path.len()
+                            && recorded.len() <= path.len() + 2
+                            && recorded[..path.len()] == path[..]
+                            && (path.len() + 1..recorded.len()).all(|mid| {
+                                sizes
+                                    .get(&recorded[..mid])
+                                    .is_none_or(|mid_size| *mid_size == elem)
+                            })
+                    };
                     let mut deeper: Vec<u64> = sizes
                         .iter()
-                        .filter(|(recorded, size)| {
-                            recorded.len() > path.len()
-                                && recorded.len() <= path.len() + 2
-                                && recorded[..path.len()] == path[..]
-                                && Some(**size) == elem_size
-                                && (path.len() + 1..recorded.len()).all(|mid| {
-                                    sizes
-                                        .get(&recorded[..mid])
-                                        .is_none_or(|mid_size| *mid_size == elem)
-                                })
-                        })
+                        .filter(|(recorded, size)| descent(recorded) && Some(**size) == elem_size)
                         .map(|(_, size)| *size)
                         .collect();
                     deeper.dedup();
                     if deeper.len() == 1 {
                         elem = deeper[0];
+                    } else if deeper.is_empty() {
+                        // No deeper record is denominated in the
+                        // offset's own unit: the offset counts in
+                        // a sub-element unit (see above), so the
+                        // sequence's denomination is the deepest
+                        // deeper record whose size is a whole
+                        // multiple of that unit -- the size only
+                        // changes at the final step of the
+                        // descent, where the sequence itself
+                        // sits, and whole-size records at the
+                        // shallower steps are multiples of it
+                        // along the same chain.
+                        if let Some(unit) = elem_size.filter(|unit| *unit > 0) {
+                            let candidates: Vec<(usize, u64)> = sizes
+                                .iter()
+                                .filter(|(recorded, size)| {
+                                    descent(recorded) && **size > unit && **size % unit == 0
+                                })
+                                .map(|(recorded, size)| (recorded.len(), *size))
+                                .collect();
+                            if let Some(deepest) = candidates.iter().map(|(len, _)| *len).max() {
+                                let mut at_deepest: Vec<u64> = candidates
+                                    .iter()
+                                    .filter(|(len, _)| *len == deepest)
+                                    .map(|(_, size)| *size)
+                                    .collect();
+                                at_deepest.dedup();
+                                if at_deepest.len() == 1 {
+                                    elem = at_deepest[0];
+                                }
+                            }
+                        }
                     }
                 }
             }
