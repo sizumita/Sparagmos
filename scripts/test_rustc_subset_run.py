@@ -3986,6 +3986,62 @@ class ProcMacroExternTests(unittest.TestCase):
                          [("make_macro", None),
                           ("meta_macro", "proc-macro")])
 
+    def test_chain_excludes_aux_crates_that_consume_the_proc_macro(self):
+        # A test auxiliary crate that names the proc-macro crate
+        # is its consumer, not its input: it can only build after
+        # the proc-macro exists (token-site-span in
+        # mixed-site-span declares its own
+        # `//@ proc-macro: mixed-site-span.rs` and
+        # `extern crate mixed_site_span;`). It is no part of the
+        # proc-macro's chain; the conversion builds it through
+        # the ordinary --aux path.
+        main = self.write(
+            "t.rs",
+            "//@ aux-build: token.rs\n"
+            "//@ proc-macro: pm.rs\n")
+        self.write("auxiliary/token.rs",
+                   "extern crate pm;\npub fn f() {}\n")
+        self.write("auxiliary/pm.rs",
+                   "extern crate proc_macro;\n")
+        chain, err = run._proc_macro_chain(main, "pm.rs", "2021")
+        self.assertIsNone(err)
+        self.assertEqual([(n, f) for n, _, f, _mod in chain],
+                         [("pm", "proc-macro")])
+
+    def test_chain_build_passes_unstable_options_for_renamed_extern(self):
+        # A modifier-prefixed binding (`priv:priv_dep=...`) is
+        # the renamed --extern syntax, which rustc only accepts
+        # with -Zunstable-options; a chain build that receives
+        # such a binding must carry the flag (pub-priv1's pm
+        # build failed without it).
+        dep = self.write("auxiliary/priv_dep.rs", "pub fn f() {}\n")
+        pm = self.write("auxiliary/pm.rs",
+                        "extern crate proc_macro;\n")
+        chain = [("priv_dep", dep, None, "priv"),
+                 ("pm", pm, "proc-macro", None)]
+        outdir = self.tmp / "out"
+        outdir.mkdir()
+        seen = []
+
+        def fake_run_cmd(argv, **kw):
+            seen.append(list(argv))
+            (outdir / "libpriv_dep.rlib").write_bytes(b"")
+            (outdir / "libpm.so").write_bytes(b"")
+            return {"timeout": False, "exit_code": 0, "stderr": ""}
+
+        with unittest.mock.patch.object(run, "run_cmd",
+                                        fake_run_cmd):
+            name, artifact, err = run._build_proc_macro_chain(
+                chain, "2021", outdir)
+        self.assertIsNone(err)
+        self.assertEqual(name, "pm")
+        self.assertEqual(len(seen), 2)
+        pm_argv = seen[1]
+        self.assertIn("--extern", pm_argv)
+        self.assertTrue(any(a.startswith("priv:priv_dep=")
+                            for a in pm_argv))
+        self.assertIn("-Zunstable-options", pm_argv)
+
     def test_later_directive_build_sees_earlier_crate(self):
         seen_extra = []
 
