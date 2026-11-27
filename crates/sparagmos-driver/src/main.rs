@@ -388,6 +388,70 @@ fn session_sigpipe(args: &[String]) -> sparagmos_interp::SigpipeInit {
     mode
 }
 
+/// Whether the entry shim frame appears below the entry
+/// frame in the guest's short backtraces, resolved from the
+/// final rustc argument list the way the native build
+/// behaves: the `<fn() as FnOnce<()>>::call_once` shim
+/// `lang_start` calls the entry through is a real frame at
+/// opt-level 0; an optimising build inlines it into
+/// `__rust_begin_short_backtrace`, where it leaves no frame
+/// of its own unless debug info lets the backtrace printer
+/// reconstruct the inlined frame. The frame is therefore
+/// visible exactly when the resolved opt-level is 0 or any
+/// debug info is emitted. The last `-O` / `-C opt-level`
+/// and the last `-g` / `-C debuginfo` win, as rustc
+/// resolves them (see `InterpConfig::entry_shim_visible`).
+fn session_entry_shim_visible(args: &[String]) -> bool {
+    let mut opt_is_zero = true;
+    let mut debuginfo_present = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-O" {
+            opt_is_zero = false;
+            i += 1;
+            continue;
+        }
+        if a == "-g" {
+            debuginfo_present = true;
+            i += 1;
+            continue;
+        }
+        let text: Option<&str> = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(rest) = a.strip_prefix("--codegen=") {
+            Some(rest)
+        } else if let Some(rest) = a.strip_prefix("-C") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(t) = text {
+            let (name, value) = match t.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (t, None),
+            };
+            match name {
+                "opt-level" => {
+                    if let Some(v) = value {
+                        opt_is_zero = v == "0";
+                    }
+                }
+                "debuginfo" => {
+                    // A value-less `-C debuginfo` spells the
+                    // full level, like `-g`.
+                    debuginfo_present =
+                        !matches!(value, Some("0") | Some("none"));
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    opt_is_zero || debuginfo_present
+}
+
 /// Print the convert-mode conversion report for a collected
 /// program (the report `jit-compile` prints as well, before its
 /// own `jit-compiled:` line).
@@ -1288,6 +1352,7 @@ fn driver_main_inner() {
     );
     let panic_abort = session_panic_abort(&args);
     let sigpipe = session_sigpipe(&args);
+    let entry_shim_visible = session_entry_shim_visible(&args);
     if dep_info_verdict && mode == Mode::Convert {
         // A dep-info verdict run (see `run_resolution_verdict`
         // in collect.rs): the session the arguments assembled
@@ -1374,6 +1439,7 @@ fn driver_main_inner() {
                     overflow_checks,
                     panic_abort,
                     sigpipe,
+                    entry_shim_visible,
                     debug_script.as_deref(),
                     &debug_dialect,
                     hide_locals,
@@ -1448,6 +1514,7 @@ fn driver_main_inner() {
                     overflow_checks,
                     panic_abort,
                     sigpipe,
+                    entry_shim_visible,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
                     guest_stdout_passthrough,
