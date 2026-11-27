@@ -4047,6 +4047,54 @@ class ProcMacroExternTests(unittest.TestCase):
         self.assertIn("test_macros=/c/libtest_macros.so", seen["args"])
         self.assertEqual(rec_path.name, "t.rs")
 
+    def test_stage2_attempt_adds_auto_check_cfg_without_revision(self):
+        # compiletest appends `--check-cfg cfg(test,FALSE)` to
+        # every run, revision or not (compose_and_run_compiler);
+        # it is what activates the session's unexpected-cfg
+        # checking, which check-fail expectations like
+        # cfg/suggest-alternative-name-on-target (a denied
+        # unexpected_cfgs lint on well-known cfg values) rest on
+        # (issue #509). A revision run receives the argument from
+        # revision_args; a plain run must not lose it, and
+        # no-auto-check-cfg opts out.
+        rec = {"suite": "ui", "path": "tests/ui/t.rs",
+               "nature": "compile-check", "single_file": True,
+               "ffi": False, "env_excluded": False}
+        seen = {}
+        orig = run.convert_side
+
+        def capture(path, edition, driver_bin, rustc_args=(),
+                    aux_specs=(), env_extra=None, env_remove=(),
+                    jit=False, aux_env_scrub=(), capture_stdout=False,
+                    aux_libs=()):
+            seen["args"] = list(rustc_args)
+            return conv(exit_code=1, compilation_failed=True)
+
+        run.convert_side = capture
+        try:
+            self.write(
+                "t.rs",
+                "//@ check-fail\n#![deny(unexpected_cfgs)]\n"
+                "#[cfg(target_abi = \"arm\")]\nstruct A;\n"
+                "fn main() {}\n")
+            res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                                   stage2=True)
+            self.assertEqual(res["status"], "pass")
+            self.assertIn("--check-cfg", seen["args"])
+            self.assertEqual(
+                seen["args"][seen["args"].index("--check-cfg") + 1],
+                "cfg(test,FALSE)")
+            self.write(
+                "t.rs",
+                "//@ check-fail\n//@ no-auto-check-cfg\n"
+                "fn main() {}\n")
+            res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                                   stage2=True)
+            self.assertEqual(res["status"], "pass")
+            self.assertNotIn("--check-cfg", seen["args"])
+        finally:
+            run.convert_side = orig
+
     def test_stage2_attempt_not_attempted_when_proc_macro_unbuildable(
             self):
         self.write("t.rs",
