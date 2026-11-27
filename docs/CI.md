@@ -481,14 +481,19 @@ denominator. Runs on every push to `main` and on manual dispatch.
   condition as the reason; a condition that cannot be decided
   is `not attempted (unevaluatable condition)`).
 - The enabled classes are `linux-x86_64` (the `measure` shards
-  on `ubuntu-latest`) and `darwin-x86_64` (`macos-15-intel`);
-  the latter runs as the `measure-host` jobs, with a driver the
-  `build-host` job builds natively on the class's runner and the
-  runner's host model selected through
-  `SPARAGMOS_HOST_TARGET`. On the survey of run 45564001677 the
-  partition moves 29 records off the Linux class to
-  `darwin-x86_64`; every other record is judged exactly where it
-  was judged before.
+  on `ubuntu-latest`) and, as the `measure-host` jobs,
+  `linux-aarch64` (`ubuntu-24.04-arm`), `darwin-aarch64`
+  (`macos-15`) and `darwin-x86_64` (`macos-15-intel`); each
+  measure-host class runs with a driver the `build-host` job
+  builds natively on the class's runner and the runner's host
+  model selected through `SPARAGMOS_HOST_TARGET`. On the
+  survey of run 45564001677 the partition assigns 56 records
+  to `linux-aarch64`, 29 to `darwin-aarch64` and 2 to
+  `darwin-x86_64`: a record both macOS models admit goes to
+  `darwin-aarch64`, which precedes `darwin-x86_64` in the
+  partition order, so `darwin-x86_64` holds only the records
+  its model alone admits. Every other record stays in the
+  Linux class.
   The host jobs do not restore the rustdoc artifact tree (it is
   a Linux-built tree), so a class record whose stage 4 needs it
   records the same not-attempted verdict the Linux jobs record
@@ -515,18 +520,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   is classified out of environment. The remaining classes are
   defined in the runner's host profiles and in the partition
   rule but have no jobs yet, so their records stay in the
-  residual class: the aarch64 classes
-  (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`) wait on
-  the driver building for aarch64 -- sparagmos-jit's entry
-  trampoline (`crates/sparagmos-jit/src/program.rs`) is x86_64
-  naked assembly with no aarch64 counterpart, and the driver
-  links the JIT crate on every host (the class builds in run
-  45575305504 fail with 90 inline-asm errors each) -- and the
-  Windows classes (`x86_64-pc-windows-msvc`,
-  `x86_64-pc-windows-gnu`) wait on that plus the runner's
-  process layer (process groups, `/proc`-based memory
-  accounting), which is POSIX-only, so a Windows runner would
-  record internal errors instead of verdicts (issue #517).
+  residual class: the Windows classes
+  (`x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`) wait on
+  the runner's process layer (process groups, `/proc`-based
+  memory accounting), which is POSIX-only, so a Windows runner
+  would record internal errors instead of verdicts (issue
+  #517).
 - Auxiliary crates are built the way compiletest builds them:
   with the test's own compile arguments, which carry the
   revision's `--cfg` for a revised test (an incremental test's
