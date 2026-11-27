@@ -1143,7 +1143,7 @@ fn main() {
     std::env::set_current_dir(&dir).unwrap();
     std::fs::write(
         "p.rs",
-        "fn main() { println!(\"child ran\"); }\n",
+        "use std::os::unix::ffi::OsStrExt; fn main() { let arg = std::env::args_os().nth(1).unwrap(); println!(\"child arg bytes: {:?}\", arg.as_bytes()); }\n",
     )
     .unwrap();
     let out = Command::new(&rustc)
@@ -1161,29 +1161,34 @@ fn main() {
     let arg = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']);
     let out = Command::new(dir.join("p")).arg(arg).output().unwrap();
     assert!(out.status.success(), "run failed");
-    println!("arg guest unexpectedly ran the program");
+    // The child observes the argument byte for byte.
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "child arg bytes: [97, 255, 98]\n"
+    );
+    println!("arg guest ran the program");
 }"#;
 
 #[test]
-fn run_mode_tool_interception_non_utf8_argument_is_unsupported() {
+fn run_mode_tool_interception_non_utf8_argument_is_carried() {
     let dir = temp_dir("tool-non-utf8-arg");
     let src = fixture(&dir, "non_utf8_arg_guest.rs", NON_UTF8_ARG_GUEST_SRC);
     let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
     let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The argument's bytes cannot be carried to the run
-    // unchanged, so the invocation is unsupported with the
-    // reason named -- never run with a lossy replacement.
+    // The argument's bytes are carried to the run unchanged
+    // (in an arguments file, since they are not valid UTF-8),
+    // and the child observes them byte for byte -- never a
+    // lossy replacement. The guest itself asserts the bytes
+    // the child prints; the run's success and the guest's
+    // completion marker are what is observable here.
     assert_eq!(
         out.status.code(),
-        Some(2),
+        Some(0),
         "stdout={stdout} stderr={stderr}"
     );
-    assert!(
-        stderr.contains("a guest argument is not valid UTF-8"),
-        "stderr={stderr}"
-    );
+    assert_eq!(stdout, "arg guest ran the program\n", "stderr={stderr}");
 }
 
 const ADDED_MODULE_CANDIDATE_GUEST_SRC: &str = r#"use std::process::Command;
