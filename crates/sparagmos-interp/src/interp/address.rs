@@ -1606,6 +1606,90 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
             }
+            // Displacement: a slot that holds the local but
+            // is blocked only by some of its occupants --
+            // the classic case is a short-lived temporary
+            // squatting in a long-lived local's slot, which
+            // then blocks the temporary's own successor
+            // (the two block-scoped `v`s of the
+            // equal-pointers-unequal family: the first `v`
+            // shares the slot of the `usize` its address is
+            // stored into, and the second `v`, whose range
+            // overlaps that `usize`, is scattered to a
+            // different slot, so two addresses the
+            // compiler's stack colouring makes coincide
+            // come out unequal). Move the blockers -- which
+            // pairwise do not interfere, as they shared the
+            // slot -- to a fresh slot of their own and give
+            // this local the contested slot. The blockers
+            // keep a slot of their size class; only their
+            // offset changes. A placement displaces at
+            // most once and each local is placed once, so
+            // the assignment terminates even though a
+            // blocker may itself be displaced again by a
+            // later placement.
+            if chosen.is_none() {
+                // Among the slots that hold the local, prefer
+                // the one already holding the most non-blocking
+                // occupants, and among those the one with the
+                // fewest blockers: the local then joins the
+                // slot of its disjoint-range predecessors in
+                // its size class (the two `v`s above) rather
+                // than an unrelated slot that merely fits.
+                let mut best: Option<(usize, Vec<usize>)> = None;
+                for si in 0..placed.len() {
+                    let (off, ssize, occupants) =
+                        (placed[si].0, placed[si].1, placed[si].2.clone());
+                    if ssize < size || off % align != 0 {
+                        continue;
+                    }
+                    let blockers: Vec<usize> = occupants
+                        .iter()
+                        .copied()
+                        .filter(|&o| interferes(l, o))
+                        .collect();
+                    if blockers.is_empty() {
+                        continue;
+                    }
+                    let better = match &best {
+                        None => true,
+                        Some((bsi, bb)) => {
+                            let free = occupants.len() - blockers.len();
+                            let bfree = placed[*bsi].2.len() - bb.len();
+                            free > bfree || (free == bfree && blockers.len() < bb.len())
+                        }
+                    };
+                    if better {
+                        best = Some((si, blockers));
+                    }
+                }
+                if let Some((si, blockers)) = best {
+                    let fsize = blockers
+                        .iter()
+                        .map(|&b| sizes[b].unwrap_or(0))
+                        .max()
+                        .unwrap_or(0);
+                    let falign = blockers
+                        .iter()
+                        .map(|&b| aligns[b].max(1))
+                        .max()
+                        .unwrap_or(1);
+                    if let Ok(foff) = u64::try_from(align_up_u128(
+                        u128::from(extent),
+                        falign,
+                    )) {
+                        placed[si].2.retain(|o| !blockers.contains(o));
+                        for &b in &blockers {
+                            slots[b] = Some(foff);
+                        }
+                        placed.push((foff, fsize, blockers));
+                        if let Some(e) = foff.checked_add(fsize) {
+                            extent = e;
+                        }
+                        chosen = Some(si);
+                    }
+                }
+            }
             match chosen {
                 Some(si) => {
                     slots[l] = Some(placed[si].0);
@@ -4904,6 +4988,74 @@ mod ptr_equality_tests {
         let slots = slots_of(&interp, "probe::f");
         assert_eq!(slots[1], slots[2], "disjoint def/use ranges share");
         assert_ne!(slots[1], slots[3], "a spanning def/use range does not");
+    }
+
+    /// The equal-pointers-unequal shape without storage
+    /// markers: `a` (a `usize` holding the first `v`'s
+    /// address) is defined from `v1` and stays live across
+    /// `v2`'s whole range. In creation order `v1` squats
+    /// in `a`'s slot (their ranges are disjoint), which
+    /// leaves `v2` -- whose range overlaps `a` -- no slot
+    /// the colouring can reuse, so the two `v`s land at
+    /// different addresses even though native stack
+    /// colouring makes them coincide. Displacement moves
+    /// `a` to a fresh slot so both `v`s share one.
+    #[test]
+    fn displaced_blocker_lets_scoped_locals_share() {
+        let mut program = Program::new();
+        let block = BasicBlockData::new(
+            vec![
+                Statement::assign(
+                    Place::from_index(2),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(0))),
+                ),
+                Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::Use(Operand::Copy(Place::from_index(2))),
+                ),
+                Statement::assign(
+                    Place::from_index(3),
+                    Rvalue::Use(Operand::Constant(Constant::Uint(0))),
+                ),
+                Statement::assign(
+                    Place::from_index(4),
+                    Rvalue::Use(Operand::Copy(Place::from_index(3))),
+                ),
+                Statement::assign(
+                    Place::from_index(5),
+                    Rvalue::Use(Operand::Copy(Place::from_index(1))),
+                ),
+                Statement::assign(
+                    Place::from_index(6),
+                    Rvalue::Use(Operand::Copy(Place::from_index(4))),
+                ),
+            ],
+            TerminatorKind::Return,
+        );
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+                Ty::Int(IntTy::I32),
+                Ty::Uint(UintTy::Usize),
+                Ty::Uint(UintTy::Usize),
+                Ty::Uint(UintTy::Usize),
+            ],
+            vec![block],
+        ));
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(
+            slots[2], slots[3],
+            "the two block-scoped locals share a slot"
+        );
+        assert_ne!(
+            slots[1], slots[2],
+            "the long-lived address holder keeps its own slot"
+        );
     }
 
     /// A zero-sized local's address is its alignment (the
