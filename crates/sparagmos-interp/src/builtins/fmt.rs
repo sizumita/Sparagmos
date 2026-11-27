@@ -1970,6 +1970,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // std's `Display` for `process::ExitStatus` is a manual
+        // impl too: it reports the outcome the raw wait status
+        // encodes -- the exit code, or the signal that ended
+        // the process (with the core-dump note, when the status
+        // carries it) -- in the sys impl's shape.
+        if trait_ == FmtTrait::Display && pointee_tag(ty) == "std::process::ExitStatus" {
+            if let Value::Enum { fields, .. } = value {
+                if let [Value::Enum {
+                    fields: inner, ..
+                }] = fields.as_slice()
+                {
+                    if let [Value::Int(raw)] = inner.as_slice() {
+                        return Ok(exit_status_display(*raw));
+                    }
+                }
+            }
+        }
         // A one-field wrapper aggregate around string data,
         // formatted as a `String`: the storage form a
         // `MaybeUninit` payload slot leaves in raw storage (a
@@ -5317,6 +5334,69 @@ fn digits_in_radix(mut n: u128, radix: u32) -> String {
 /// Integer formatting through `pad_integral`. Radix 10 formats the
 /// magnitude with a sign; other radices format the two's-complement
 /// pattern at the type's width, as core does.
+/// `std::process::ExitStatus`'s `Display` rendering of a raw
+/// (unix) wait status, as the value model stores it (see
+/// `exit_status_value`): an exited process carries its code in
+/// the high byte; a process ended by a signal carries the
+/// signal number in the low seven bits and the core-dump flag
+/// in the next bit.
+fn exit_status_display(raw: i128) -> String {
+    let low = raw & 0x7f;
+    if low == 0 {
+        return format!("exit code: {}", (raw >> 8) & 0xff);
+    }
+    if low == 0x7f {
+        // A stopped/continued status: the process model never
+        // produces one; report it as the raw status, as std's
+        // fallback for an unclassifiable status does.
+        return format!("exit code: {raw}");
+    }
+    let core = if raw & 0x80 != 0 { " (core dumped)" } else { "" };
+    match signal_display_name(low as i32) {
+        Some(name) => format!("signal: {low} ({name}){core}"),
+        None => format!("signal: {low}{core}"),
+    }
+}
+
+/// The conventional name of a signal number, as the platform
+/// names it in an `ExitStatus` report (`signal: 6 (SIGABRT)`).
+fn signal_display_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGSTKFLT",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        20 => "SIGTSTP",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGURG",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGIO",
+        30 => "SIGPWR",
+        31 => "SIGSYS",
+        _ => return None,
+    })
+}
+
 fn format_int_radix(v: i128, ty: Option<&str>, radix: u32, prefix: &str, options: &FmtOptions) -> String {
     let (negative, digits) = if radix == 10 {
         (v < 0, v.unsigned_abs().to_string())

@@ -525,6 +525,8 @@ fn step_limit_stops_infinite_loop() {
         InterpConfig {
             max_steps: 1_000,
             max_call_depth: 16,
+            main_stack_size: 8 * 1024 * 1024,
+            thread_stack_size: 2 * 1024 * 1024,
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
@@ -643,6 +645,8 @@ fn call_depth_limit_stops_unbounded_recursion() {
         InterpConfig {
             max_steps: 1_000_000,
             max_call_depth: 8,
+            main_stack_size: 8 * 1024 * 1024,
+            thread_stack_size: 2 * 1024 * 1024,
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,

@@ -1990,3 +1990,34 @@ fn run_mode_env_vars_enumeration() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "env-vars-ok\n");
 }
+
+const STATUS_DISPLAY_SRC: &str = r#"
+use std::process::Command;
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        std::process::exit(5);
+    }
+    let me = std::env::current_exe().unwrap();
+    let out = Command::new(&me).arg("child").output().unwrap();
+    println!("status: {}", out.status);
+    println!("code: {:?}", out.status.code());
+}
+"#;
+
+#[test]
+fn run_mode_exit_status_display() {
+    let dir = temp_dir("status-display");
+    let src = fixture(&dir, "status_display.rs", STATUS_DISPLAY_SRC);
+    let out = run_driver_with_process_host(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the parent run completes; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status: exit code: 5\ncode: Some(5)\n"
+    );
+}

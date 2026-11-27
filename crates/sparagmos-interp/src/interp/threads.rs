@@ -53,6 +53,7 @@ impl<'a> Interpreter<'a> {
             id,
             ThreadSlot {
                 name: None,
+                stack_limit: None,
                 callable: Some(callable),
                 parked: None,
                 outcome: None,
@@ -69,6 +70,15 @@ impl<'a> Interpreter<'a> {
     pub(crate) fn set_thread_name(&self, id: u64, name: Option<String>) {
         if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
             slot.name = name;
+        }
+    }
+
+    /// Record the stack budget a `std::thread::Builder` set for
+    /// the thread `id` with `stack_size` (see
+    /// `Builtin::ThreadBuilderSpawn`).
+    pub(crate) fn set_thread_stack_limit(&self, id: u64, limit: Option<u64>) {
+        if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
+            slot.stack_limit = limit;
         }
     }
 

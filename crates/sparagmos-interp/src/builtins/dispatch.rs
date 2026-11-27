@@ -1272,9 +1272,11 @@ impl<'a> Interpreter<'a> {
                 let builder = vals.next().expect("arity checked");
                 let callable = vals.next().expect("arity checked");
                 let thread_name = builder_thread_name(&builder);
+                let stack_limit = builder_thread_stack_size(&builder);
                 let handle = self.spawn_callable(callable)?;
                 if let Some(id) = join_handle_id(&handle) {
                     self.set_thread_name(id, thread_name);
+                    self.set_thread_stack_limit(id, stack_limit);
                 }
                 Ok(ok_result(handle))
             }

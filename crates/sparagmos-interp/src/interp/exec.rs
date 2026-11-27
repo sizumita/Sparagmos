@@ -53,10 +53,12 @@ impl<'a> Interpreter<'a> {
         }
         let entry_id = self.fresh_frame_id();
         self.register_frame_base(&[], entry_id, entry);
+        let stack_bytes = self.charge_stack(&[], self.frame_stack_bytes(body))?;
         let mut frames: Vec<Frame> = vec![Frame {
             id: entry_id,
             func: entry.to_string(),
             locals,
+            stack_bytes,
             block: 0,
             stmt: 0,
             return_dest: None,

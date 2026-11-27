@@ -661,6 +661,11 @@ impl<'a> Converter<'a> {
             .iter()
             .map(|decl| self.local_elem_size(&decl.ty))
             .collect();
+        out.local_sizes = body
+            .local_decls
+            .iter()
+            .map(|decl| self.ty_layout(&decl.ty).map(|(size, _)| size))
+            .collect();
         out.char_locals = body
             .local_decls
             .iter()

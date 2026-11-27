@@ -14,7 +14,11 @@
 //!   references work across calls in both directions while the target
 //!   frame is live.
 //! * Execution is bounded by a step limit and a call-depth limit so a
-//!   looping program can never hang the oracle (or a test run).
+//!   looping program can never hang the oracle (or a test run). Each
+//!   thread's frames are also charged against a stack budget (see
+//!   [`InterpConfig::main_stack_size`]): a guest that would overflow
+//!   its native stack observes the native outcome instead -- the
+//!   runtime's overflow report on its stderr and an abort.
 //! * Host-panic freedom: every failure a guest program can cause is
 //!   an [`InterpError`], never a host `panic!`. The `expect` /
 //!   `unreachable!` sites in this crate are internal invariants only:
@@ -182,6 +186,22 @@ pub struct InterpConfig {
     pub thread_quantum: usize,
     /// Maximum number of simultaneously live call frames.
     pub max_call_depth: usize,
+    /// The entry (main) thread's stack budget, in bytes. A frame
+    /// push that would take the thread's charged stack usage (the
+    /// sum of its live frames' declared-local sizes) past this
+    /// budget ends the run the way a native stack overflow does:
+    /// the runtime's `has overflowed its stack` report on the
+    /// guest's stderr and an abort (see
+    /// [`Interpreter::charge_stack`]). The default is the native
+    /// main thread's usual stack size (the common `RLIMIT_STACK`
+    /// value a natively built test binary runs with).
+    pub main_stack_size: usize,
+    /// A spawned thread's default stack budget, in bytes: std's
+    /// default thread stack size, which a
+    /// `std::thread::Builder::stack_size` setting overrides for
+    /// the thread it spawns (see [`InterpConfig::main_stack_size`]
+    /// for the accounting).
+    pub thread_stack_size: usize,
     /// The guest program's command-line arguments after argv[0]
     /// (the run-flags a test prescribes), as handed to the driver
     /// through its `--guest-arg` options. The `env::args` /
@@ -255,6 +275,8 @@ impl Default for InterpConfig {
             max_steps: 1_000_000_000,
             thread_quantum: DEFAULT_THREAD_QUANTUM,
             max_call_depth: 8192,
+            main_stack_size: 8 * 1024 * 1024,
+            thread_stack_size: 2 * 1024 * 1024,
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
@@ -349,6 +371,10 @@ pub(crate) struct Frame {
     pub(crate) id: u64,
     pub(crate) func: String,
     pub(crate) locals: Vec<Value>,
+    /// The frame's stack charge: the total size of the body's
+    /// declared locals, accounted against the owning thread's
+    /// stack budget (see [`Interpreter::charge_stack`]).
+    pub(crate) stack_bytes: u64,
     block: usize,
     stmt: usize,
     /// Where (in the caller) the return value goes; `None` for the entry frame.
@@ -692,6 +718,10 @@ pub struct Interpreter<'a> {
     /// [`ThreadSlot`]), keyed by thread id. The entry thread is
     /// id 1, matching `std`'s numbering of the main thread.
     threads: std::cell::RefCell<HashMap<u64, ThreadSlot>>,
+    /// Memoised per-body stack charges (see
+    /// [`Interpreter::frame_stack_bytes`]), keyed by body name --
+    /// the key the program's body table itself resolves by.
+    frame_stack_sizes: std::cell::RefCell<HashMap<String, u64>>,
     /// The ids of the threads that can still be activated:
     /// a spawned thread whose callable has not been taken yet,
     /// or a started thread currently parked (see
@@ -1144,6 +1174,7 @@ impl<'a> Interpreter<'a> {
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
+            frame_stack_sizes: std::cell::RefCell::new(HashMap::new()),
             pending_threads: std::cell::RefCell::new(
                 std::collections::BTreeSet::new(),
             ),
@@ -1237,6 +1268,91 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn push_error_output(&mut self, text: &str) {
         self.error_output.push_str(text);
+    }
+
+    /// The stack charge of one frame of `body`, in bytes: the
+    /// total size of the body's declared locals, as the native
+    /// frame reserves room for them. A local's size is the one
+    /// conversion recorded for it (see `ir::Body::local_sizes`)
+    /// when it has one, else the size the declared type resolves
+    /// to here; a local neither can size contributes nothing
+    /// (the accounting undercharges rather than inventing a
+    /// size). Memoised per body name.
+    pub(crate) fn frame_stack_bytes(&self, body: &Body) -> u64 {
+        if let Some(size) = self.frame_stack_sizes.borrow().get(&body.name) {
+            return *size;
+        }
+        let size = body
+            .local_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                body.local_sizes
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| self.ty_size_full(ty))
+                    .unwrap_or(0)
+            })
+            .sum();
+        self.frame_stack_sizes
+            .borrow_mut()
+            .insert(body.name.clone(), size);
+        size
+    }
+
+    /// The stack budget of the thread currently executing: the
+    /// entry thread's is [`InterpConfig::main_stack_size`]; a
+    /// spawned thread's is the `stack_size` its
+    /// `std::thread::Builder` set, or
+    /// [`InterpConfig::thread_stack_size`] by default.
+    fn current_thread_stack_limit(&self) -> u64 {
+        let id = self.current_thread.get();
+        if id != 1 {
+            if let Some(slot) = self.threads.borrow().get(&id) {
+                if let Some(limit) = slot.stack_limit {
+                    return limit;
+                }
+            }
+            return self.config.thread_stack_size as u64;
+        }
+        self.config.main_stack_size as u64
+    }
+
+    /// Charge one frame against the current thread's stack
+    /// budget; `charge` is the frame's charge (see
+    /// [`Interpreter::frame_stack_bytes`], computed by the
+    /// caller first because the body it comes from borrows the
+    /// interpreter immutably). The usage is the sum of the
+    /// charges of the thread's live frames -- its segment of
+    /// the shared frame stack, from `thread_stack_base` up. A
+    /// push that would exceed the budget is the guest's stack
+    /// overflow: the runtime's report goes to the guest's
+    /// stderr in std's shape and the run aborts, exactly as
+    /// the native process dies at the guard page (std's stack
+    /// probes make a single oversized frame overflow at its
+    /// entry the same way). Returns the charge, for the caller
+    /// to store in the frame it pushes.
+    pub(crate) fn charge_stack(
+        &mut self,
+        frames: &[Frame],
+        charge: u64,
+    ) -> InterpResult<u64> {
+        let base = self.thread_stack_base.get().min(frames.len());
+        let used: u64 = frames[base..].iter().map(|f| f.stack_bytes).sum();
+        if used + charge > self.current_thread_stack_limit() {
+            let name = self
+                .thread_name(self.current_thread.get())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            self.push_error_output(&format!(
+                "\nthread '{name}' has overflowed its stack\n\
+                 fatal runtime error: stack overflow, aborting\n"
+            ));
+            return Err(InterpError::Abort {
+                message: "stack overflow".to_string(),
+            });
+        }
+        Ok(charge)
     }
 
     pub(crate) fn push_output(&mut self, text: &str) {
