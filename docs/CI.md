@@ -485,10 +485,16 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `linux-aarch64` (`ubuntu-24.04-arm`), `darwin-aarch64`
   (`macos-15`), `darwin-x86_64` (`macos-15-intel`),
   `windows-msvc` (`windows-latest`) and `windows-gnu`
-  (`windows-latest`); each measure-host class
-  runs with a driver the `build-host` job builds natively on
-  the class's runner and the runner's host model selected
-  through `SPARAGMOS_HOST_TARGET`. On the survey of run
+  (`windows-latest`); each class is a separate
+  `build-host-<class>` / `measure-host-<class>` job pair, and
+  runs with a driver its own build job builds natively on the
+  class's runner and the runner's host model selected through
+  `SPARAGMOS_HOST_TARGET`. A class's measure jobs need only
+  that class's build job, so one class's build failure leaves
+  the other classes' judging untouched; the aggregate still
+  requires every class's measure jobs to have succeeded, so a
+  class that went unjudged fails the run's publication instead
+  of dropping out of the denominator. On the survey of run
   45564001677 the partition assigns 56 records to
   `linux-aarch64`, 29 to `darwin-aarch64`, 2 to
   `darwin-x86_64`, 72 to `windows-msvc` and 9 to
@@ -529,8 +535,8 @@ denominator. Runs on every push to `main` and on manual dispatch.
   toolchain hosted on the gnu target (a MinGW-hosted rustc;
   the gnu toolchain is self-contained, linker included), so
   its `windows-latest` jobs install that toolchain through
-  the toolchain action's non-host install -- the matrix's
-  `host` key carries the gnu-hosted descriptor -- instead of
+  the toolchain action's non-host install -- their install
+  steps name the gnu-hosted descriptor -- instead of
   the runner's native MSVC-hosted toolchain, and a step
   asserts the gnu-hosted toolchain is the default before any
   judging, so the class cannot be silently judged by the
