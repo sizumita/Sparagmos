@@ -26,7 +26,12 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'sta
 /// and the constant-expression normalization bug site
 /// (`rustc_middle/src/mir/consts.rs:338`). Any other site
 /// keeps the plain non-string form; the location
-/// `panic_reason` appends still identifies it.
+/// `panic_reason` appends still identifies it. Every named
+/// form keeps the `(panic with a non-string payload)`
+/// suffix: the conversion's classifiers key on the payload
+/// kind through that suffix
+/// (`convert::message_is_non_string_payload`), so a name
+/// added here must keep it.
 fn non_string_payload_for(file: &str, line: u32) -> String {
     if file.ends_with("rustc_mir_transform/src/validate.rs") && line == 81 {
         "MIR validation failure (panic with a non-string payload)".to_string()
