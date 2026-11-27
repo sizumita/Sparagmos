@@ -3533,6 +3533,9 @@ impl<'a> Interpreter<'a> {
                             concrete,
                             traits,
                             drop_glue,
+                            // Runtime recovery has no conversion-time
+                            // segment source: tag comparison applies.
+                            type_id: None,
                         });
                     }
                     None => {}
