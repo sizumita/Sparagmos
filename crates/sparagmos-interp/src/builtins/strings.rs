@@ -664,6 +664,14 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // The byte form itself: a `str` value read out of
+        // byte storage (the tail field of a DST struct over a
+        // byte array, above all) resolves to the storage's
+        // bytes, which are the string's bytes under the
+        // field's declared type.
+        if let Value::Bytes(bytes) = cur {
+            return String::from_utf8(bytes.clone()).ok();
+        }
         let (elems, len): (&[Value], usize) = match cur {
             // A vector is a struct: its value carries variant
             // 0. (A one-field wrapper around an empty or
@@ -676,6 +684,14 @@ impl<'a> Interpreter<'a> {
             Value::SparseVec { elems, len, .. } => {
                 (elems, usize::try_from(*len).ok()?)
             }
+            // An array value is a byte sequence in the same
+            // sense as a vector's element list: the storage a
+            // DST struct's `str` tail field overlays is a sized
+            // byte array in the sized twin struct, and reading
+            // the tail through the fat pointer yields that
+            // array's value, whose elements are the string's
+            // bytes.
+            Value::Tuple(items) => (items, items.len()),
             _ => return None,
         };
         let mut bytes = Vec::with_capacity(len);

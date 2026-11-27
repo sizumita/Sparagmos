@@ -371,6 +371,89 @@ fn main() {
     assert_eq!(stdout, "3\nhello\n");
 }
 
+/// Fat reference -> DST-wrapper reference -> fat reference
+/// round trip: the metadata word travels with the value in
+/// both directions, so the round-tripped slice still
+/// answers `len` / indexing / a callee's `PtrMetadata` with
+/// the original length (the `issue-23649-1` shape, taken
+/// back out of the wrapper). Regression for #391: the
+/// wrapper direction used to materialise the operand into
+/// the pointee's storage form, dropping the metadata.
+#[test]
+fn fat_dst_roundtrip_keeps_metadata() {
+    let stdout = run_ok(
+        "fat-dst-roundtrip",
+        "fat_dst_roundtrip.rs",
+        r#"
+pub struct X([u8]);
+fn getlen(s: &[u8]) -> usize {
+    s.len()
+}
+fn main() {
+    let b: &[u8] = &[11; 42];
+    let v: &X = unsafe { std::mem::transmute(b) };
+    let back: &[u8] = unsafe { std::mem::transmute(v) };
+    println!("{}", back.len());
+    println!("{}", back[0]);
+    println!("{}", getlen(back));
+    println!("{}", getlen(unsafe { std::mem::transmute(v) }));
+}
+"#,
+    );
+    assert_eq!(stdout, "42\n11\n42\n42\n");
+}
+
+/// DST-wrapper structs over sized storage, reached by
+/// transmuting a `slice_from_raw_parts` fat pointer (the
+/// `unsized3-rpass` shapes): a slice tail read through the
+/// wrapper (`Foo::f` length and elements) and a `str` tail
+/// whose storage is a sized byte array (`Baz::f2` — its
+/// length, and its chars collected through a `str` method
+/// call, which takes the field as a string argument).
+#[test]
+fn dst_wrapper_over_sized_storage_tails() {
+    let stdout = run_ok(
+        "dst-sized-tails",
+        "dst_sized_tails.rs",
+        r#"
+use std::mem;
+use std::ptr;
+struct Foo<T> {
+    f: [T],
+}
+struct Foo_<T> {
+    f: [T; 3],
+}
+struct Baz {
+    f1: usize,
+    f2: str,
+}
+struct Baz_ {
+    f1: usize,
+    f2: [u8; 5],
+}
+fn main() {
+    unsafe {
+        let data: Box<Foo_<i32>> = Box::new(Foo_ { f: [1, 2, 3] });
+        let x: &Foo<i32> = mem::transmute(ptr::slice_from_raw_parts(&*data, 3));
+        println!("{}", x.f.len());
+        println!("{}", x.f[0]);
+        let data: Box<Baz_> =
+            Box::new(Baz_ { f1: 42, f2: [b'a', b'b', b'c', b'd', b'e'] });
+        let x: &Baz = mem::transmute(ptr::slice_from_raw_parts(&*data, 5));
+        println!("{}", x.f1);
+        println!("{}", x.f2.len());
+        let chs: Vec<char> = x.f2.chars().collect();
+        println!("{}", chs.len());
+        println!("{}", chs[0]);
+        println!("{}", chs[4]);
+    }
+}
+"#,
+    );
+    assert_eq!(stdout, "3\n1\n42\n5\n5\na\ne\n");
+}
+
 /// (pointer, length) tuple -> fat reference to a
 /// DST-wrapper struct: the `PackedSized::unsize` transmute.
 #[test]

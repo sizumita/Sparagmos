@@ -426,6 +426,19 @@ impl<'a> Converter<'a> {
         {
             return None;
         }
+        // A fat target whose pointee is a DST-wrapper ADT (or
+        // a tuple-tailed pointee): the pointee is unsized
+        // through its tail, exactly as a slice / `str` / `dyn`
+        // pointee is, so the cast keeps the metadata word
+        // instead of materialising the operand into the
+        // pointee's storage form -- materialising a fat
+        // operand strips its metadata (`eval_materialize`
+        // reduces a fat operand to its base), and a later
+        // `PtrMetadata` on the result then finds only the
+        // storage bytes.
+        if self.fat_tail_meta(target).is_some() {
+            return None;
+        }
         // A zero-sized pointee: the cast is the identity. The
         // erased block such a pointer denotes keeps its bytes
         // for a later cast to a sized type; materialising it
