@@ -2374,6 +2374,25 @@ pub(crate) fn project_value_ev(
                             }
                         }
                     }
+                    // A scalar value under a subslice: the
+                    // one-element view of the value (the
+                    // denomination `unsized_tail_len` names --
+                    // a scalar allocation ranged over as a
+                    // one-element slice, the storage
+                    // `Box::into_boxed_slice` leaves). The
+                    // window must fit the one element.
+                    Value::Bool(_)
+                    | Value::Int(_)
+                    | Value::Uint(_)
+                    | Value::Float(_)
+                    | Value::Float128(_) => {
+                        check_subslice(1, start, *len)?;
+                        if *len == 1 {
+                            Value::Tuple(vec![value.clone()])
+                        } else {
+                            Value::Tuple(Vec::new())
+                        }
+                    }
                     ref other => {
                         return Err(InterpError::type_mismatch(
                             format!("subslice projection on {place}"),
@@ -3672,6 +3691,22 @@ pub(crate) fn project_value_ref_ev<'a>(
                                     ))
                                 }
                             }
+                        }
+                    }
+                    // A scalar value under a subslice: the
+                    // one-element view of the value, as in
+                    // `project_value_ev`. The window must fit
+                    // the one element.
+                    scalar @ (Value::Bool(_)
+                    | Value::Int(_)
+                    | Value::Uint(_)
+                    | Value::Float(_)
+                    | Value::Float128(_)) => {
+                        check_subslice(1, start, *len)?;
+                        if *len == 1 {
+                            Value::Tuple(vec![scalar.clone()])
+                        } else {
+                            Value::Tuple(Vec::new())
                         }
                     }
                     other => {

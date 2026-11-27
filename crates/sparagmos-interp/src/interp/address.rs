@@ -1325,6 +1325,182 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // Address-taken exposure: def/use liveness ends a
+        // local's range at the statement that borrows it, but
+        // the borrow keeps the storage alive for as long as
+        // the reference lives -- the derefs flow through the
+        // holder local's value, invisible to def/use. A
+        // borrowed local (the cast temporary of `&(a as
+        // i32)`) whose range ends at the borrow would share
+        // its slot with the very local it must stay distinct
+        // from. Extend each unmanaged address-taken local's
+        // live points: from just after the take to the end of
+        // its block, and -- when the reference escapes the
+        // block's holder graph (stored through a
+        // dereference) or a holder is live in another block
+        // -- every boundary of every block.
+        if liveness_computed {
+            use std::collections::HashSet;
+            // carry[h]: the locals whose storage a reference
+            // held in `h` may denote.
+            let mut carry: Vec<HashSet<usize>> =
+                vec![HashSet::new(); n];
+            let mut escapes: HashSet<usize> = HashSet::new();
+            let mut takes: Vec<(usize, usize, usize)> = Vec::new();
+            fn plain_src(op: &Operand) -> Option<usize> {
+                match op {
+                    Operand::Copy(p) | Operand::Move(p)
+                        if p.projection.is_empty() =>
+                    {
+                        Some(p.local.0)
+                    }
+                    _ => None,
+                }
+            }
+            for (bi, block) in body.blocks.iter().enumerate() {
+                for (si, stmt) in block.statements.iter().enumerate() {
+                    let StatementKind::Assign(dest, rv) = &stmt.kind
+                    else {
+                        continue;
+                    };
+                    let dest_deref = dest.projection.iter().any(|s| {
+                        matches!(s, ProjectionElem::Deref)
+                    });
+                    if let Rvalue::Ref(place) = rv {
+                        let taken = place.local.0;
+                        if taken < n {
+                            takes.push((taken, bi, si + 1));
+                            if dest_deref {
+                                escapes.insert(taken);
+                            } else if dest.local.0 < n {
+                                carry[dest.local.0].insert(taken);
+                            }
+                        }
+                    }
+                    if dest_deref {
+                        // A carried reference stored through a
+                        // dereference leaves the frame's
+                        // holder graph.
+                        if let Rvalue::Use(op) = rv {
+                            if let Some(s) = plain_src(op) {
+                                for &t in &carry[s] {
+                                    escapes.insert(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Holder propagation to a fixpoint: copies,
+            // aggregate fields and call returns carry the
+            // references their sources hold.
+            loop {
+                let mut changed = false;
+                for block in &body.blocks {
+                    let mut absorb_pairs: Vec<(usize, usize)> =
+                        Vec::new();
+                    for stmt in &block.statements {
+                        let StatementKind::Assign(dest, rv) =
+                            &stmt.kind
+                        else {
+                            continue;
+                        };
+                        if !dest.projection.is_empty() {
+                            continue;
+                        }
+                        let dest = dest.local.0;
+                        match rv {
+                            Rvalue::Use(op) => {
+                                if let Some(s) = plain_src(op) {
+                                    absorb_pairs.push((dest, s));
+                                }
+                            }
+                            Rvalue::AggregateTuple(ops)
+                            | Rvalue::ClosureAggregate {
+                                operands: ops,
+                                ..
+                            } => {
+                                for op in ops {
+                                    if let Some(s) = plain_src(op) {
+                                        absorb_pairs.push((dest, s));
+                                    }
+                                }
+                            }
+                            Rvalue::AggregateAdt {
+                                operands, ..
+                            } => {
+                                for op in operands {
+                                    if let Some(s) = plain_src(op) {
+                                        absorb_pairs.push((dest, s));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let TerminatorKind::Call {
+                        args,
+                        destination,
+                        ..
+                    } = &block.terminator
+                    {
+                        if destination.projection.is_empty() {
+                            let dest = destination.local.0;
+                            for op in args {
+                                if let Some(s) = plain_src(op) {
+                                    absorb_pairs.push((dest, s));
+                                }
+                            }
+                        }
+                    }
+                    for (dest, s) in absorb_pairs {
+                        if dest < n && s < n && dest != s {
+                            let adds: Vec<usize> =
+                                carry[s].iter().copied().collect();
+                            for t in adds {
+                                changed |= carry[dest].insert(t);
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for (taken, bi, from) in takes {
+                if managed[taken] {
+                    continue;
+                }
+                let wide = escapes.contains(&taken)
+                    || (0..n).any(|h| {
+                        carry[h].contains(&taken)
+                            && live_points
+                                .keys()
+                                .any(|&(l, b)| l == h && b != bi)
+                    });
+                if wide {
+                    for (bj, block) in body.blocks.iter().enumerate() {
+                        let pts = live_points
+                            .entry((taken, bj))
+                            .or_default();
+                        for b in 0..=block.statements.len() {
+                            if !pts.contains(&b) {
+                                pts.push(b);
+                            }
+                        }
+                    }
+                } else {
+                    let block_len = body.blocks[bi].statements.len();
+                    let pts =
+                        live_points.entry((taken, bi)).or_default();
+                    for b in from..=block_len {
+                        if !pts.contains(&b) {
+                            pts.push(b);
+                        }
+                    }
+                }
+            }
+        }
         // Two locals interfere when some block has both live
         // at a common boundary. An unmanaged local whose
         // liveness was not computed (no sized unmanaged

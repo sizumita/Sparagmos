@@ -1277,3 +1277,35 @@ fn run_mode_boxed_slice_into_boxed_slice_asref() {
         "len=1 first=5\nafter=9\nnested=1 25\nboxed slice asref ok\n"
     );
 }
+
+const INTO_BOXED_SLICE_SRC: &str = r#"
+#![feature(box_into_boxed_slice)]
+fn main() {
+    let b = Box::into_boxed_slice(Box::new(5u8));
+    assert_eq!(b, Box::new([5u8]) as Box<[u8]>);
+    let b2 = Box::into_boxed_slice(Box::new([25u8]));
+    assert_eq!(b2, Box::new([[25u8]]) as Box<[[u8; 1]]>);
+    let b3 = Box::into_boxed_slice(Box::new(Box::new([5u8])));
+    assert_eq!(b3, Box::new([Box::new([5u8])]) as Box<[Box<[u8; 1]>]>);
+    println!("{:?}", b);
+    let s: &[u8] = &b[..];
+    assert_eq!(s, &[5u8][..]);
+    println!("sum {}", b.iter().sum::<u8>());
+}
+"#;
+
+#[test]
+fn run_mode_into_boxed_slice_scalar_storage() {
+    // `Box::into_boxed_slice` on a scalar box leaves the
+    // scalar itself in the allocation, denominated as a
+    // one-element slice only by the fat pointer over it:
+    // equality against an array-built box, the Debug form,
+    // the `[..]` subslice and iteration must all read the
+    // one element, not the scalar as the whole value (the
+    // rustc suite's `box/into-boxed-slice` shape).
+    run_ok(
+        "into-boxed-slice",
+        INTO_BOXED_SLICE_SRC,
+        "[5]\nsum 5\n",
+    );
+}

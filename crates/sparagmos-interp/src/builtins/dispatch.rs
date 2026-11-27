@@ -6349,6 +6349,13 @@ impl<'a> Interpreter<'a> {
                     &vals[1],
                 ) {
                     eq?
+                } else if let Some(eq) = self.box_pointee_equal(
+                    frames,
+                    generic_args,
+                    &vals[0],
+                    &vals[1],
+                ) {
+                    eq?
                 } else {
                     self.values_equal(frames, &vals[0], &vals[1])?
                 };

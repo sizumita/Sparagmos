@@ -61,6 +61,68 @@ fn unwrap_scalar_form<'x>(v: Cow<'x, Value>, other: &Value) -> Cow<'x, Value> {
 /// (`Option<*const T>`) is a field comparison, which the
 /// structural recursion in `values_equal` judges, not this
 /// dispatch.
+/// Whether a value has the shape an element type names,
+/// for the one judgement `box_slice_elements` makes: the
+/// coarse form only (a scalar against a scalar type, an
+/// aggregate against an aggregate type, an array's tuple
+/// or byte form at its length). Types whose shape this
+/// does not judge answer true, keeping the ordinary
+/// reading.
+fn elem_shape_matches(value: &Value, elem_ty: &Ty) -> bool {
+    match elem_ty {
+        Ty::Bool => matches!(value, Value::Bool(_)),
+        Ty::Int(_) | Ty::Uint(_) => {
+            matches!(value, Value::Int(_) | Value::Uint(_))
+        }
+        Ty::Float(_) => matches!(value, Value::Float(_) | Value::Float128(_)),
+        Ty::Array(_, n) => match value {
+            Value::Tuple(items) => items.len() as u64 == *n,
+            Value::Bytes(b) => b.len() as u64 == *n,
+            _ => false,
+        },
+        Ty::Slice(_) | Ty::Str => matches!(
+            value,
+            Value::Tuple(_)
+                | Value::Bytes(_)
+                | Value::Str(_)
+                | Value::FatRef { .. }
+                | Value::SparseVec { .. }
+        ),
+        Ty::Ref(_) => matches!(
+            value,
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+        ),
+        Ty::Adt(_) | Ty::Tuple(_) => {
+            matches!(value, Value::Enum { .. } | Value::Tuple(_))
+        }
+        _ => true,
+    }
+}
+
+/// The pointee tag a `Box` type tag names: the first
+/// generic argument inside the `Box<..>` (the allocator
+/// argument follows it). `None` when the tag is not a box
+/// tag.
+fn box_pointee_tag(tag: &str) -> Option<&str> {
+    let inner = tag
+        .strip_prefix("std::boxed::Box<")
+        .or_else(|| tag.strip_prefix("alloc::boxed::Box<"))?;
+    let inner = inner.strip_suffix('>')?;
+    // The pointee argument ends at the first top-level
+    // comma (the allocator separator); nested generic
+    // brackets nest.
+    let mut depth = 0i32;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => return Some(inner[..i].trim()),
+            _ => {}
+        }
+    }
+    Some(inner.trim())
+}
+
 pub(crate) fn comparison_subject_is_raw_pointer(generic_args: &[String]) -> bool {
     let Some(tag) = generic_args.first() else {
         return false;
@@ -287,6 +349,136 @@ impl<'a> Interpreter<'a> {
         let y = self
             .raw_pointer_operand_address(frames, b, pointee.as_ref(), layers)?;
         Some(Some(x.cmp(&y)))
+    }
+
+    /// Equality of two `Box` values through their pointees,
+    /// when the comparison's own `Self` tag names a `Box`:
+    /// std's `PartialEq for Box<T>` is the pointee's own
+    /// equality, but the two box values the model holds may
+    /// wrap their pointers in different aggregate shapes (the
+    /// one-field form a `Box::new` builds against the real
+    /// `Unique` / `NonNull` / allocator nest a collected body
+    /// assembles field by field, as `Box::into_boxed_slice`
+    /// does), which the structural comparison below reads as
+    /// different values. Extracting each side's pointer and
+    /// comparing those values compares the pointees in
+    /// whatever form each pointer carries. `None` when the
+    /// comparison is not a same-type box comparison or a
+    /// side's pointer cannot be extracted, in which case the
+    /// ordinary comparison judges. A `Path` / `PathBuf`
+    /// pointee keeps the ordinary path: its equality is
+    /// component-wise, not the pointee's structural one.
+    pub(crate) fn box_pointee_equal(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        a: &Value,
+        b: &Value,
+    ) -> Option<InterpResult<bool>> {
+        let self_tag = generic_args.first()?;
+        if generic_args.get(1) != Some(self_tag) {
+            return None;
+        }
+        let pointee = box_pointee_tag(self_tag)?;
+        if pointee.contains("::path::Path") {
+            return None;
+        }
+        let pa = self.box_cmp_pointer(frames, a)?;
+        let pb = self.box_cmp_pointer(frames, b)?;
+        // A slice pointee compares element-wise. The
+        // element reading needs the element type the tag
+        // names: a fat pointer of length 1 formed over the
+        // pointee value itself (the `into_boxed_slice`
+        // formation) and one formed over an array of that
+        // length hold identically shaped storage, and only
+        // the element type tells which reading is the
+        // slice's (see `box_slice_elements`).
+        if let Some(elem_tag) = pointee
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            if let Some(elem_ty) = ty_from_tag(elem_tag) {
+                let ea = self.box_slice_elements(frames, &pa, &elem_ty)?;
+                let eb = self.box_slice_elements(frames, &pb, &elem_ty)?;
+                return Some(
+                    self.seq_equal(frames, &ea, &eb)
+                        .map(|eq| ea.len() == eb.len() && eq),
+                );
+            }
+        }
+        Some(self.values_equal(frames, &pa, &pb))
+    }
+
+    /// The elements of one side of a box-of-slice
+    /// comparison, read under the slice's element type.
+    /// The ordinary element reading judges a fat pointer's
+    /// storage; the one ambiguous shape is a fat pointer of
+    /// length 1 whose storage is a one-element sequence: it
+    /// may be the slice's own storage (the array an unsize
+    /// coercion ranged over) or the single element itself
+    /// (a fat pointer formed over the pointee value, as
+    /// `Box::into_boxed_slice` forms over the boxed value).
+    /// The element type decides: when the reading's one
+    /// element does not have the element type's shape but
+    /// the stored value itself does, the stored value is
+    /// the element. A thin pointer (the model's own box
+    /// form) denotes the pointee's storage directly, whose
+    /// elements are the slice's.
+    fn box_slice_elements(
+        &self,
+        frames: &[Frame],
+        ptr: &Value,
+        elem_ty: &Ty,
+    ) -> Option<Vec<Value>> {
+        match ptr {
+            Value::FatRef { base, len } => {
+                let (elems, _) = self.slice_elements_ref(frames, ptr).ok()?;
+                let elems = elems.into_vec();
+                if *len == 1
+                    && elems.len() == 1
+                    && !elem_shape_matches(&elems[0], elem_ty)
+                {
+                    if let Ok(target) = self.deref_value(frames, base) {
+                        if let Ok(stored) = self.read_resolved(frames, &target) {
+                            if elem_shape_matches(&stored, elem_ty) {
+                                return Some(vec![stored]);
+                            }
+                        }
+                    }
+                }
+                Some(elems)
+            }
+            Value::Ref(_) => {
+                let stored = self.resolve_ref(frames, ptr).ok()?;
+                let elems = elements_of(stored).ok()?;
+                Some(elems.into_vec())
+            }
+            _ => None,
+        }
+    }
+
+    /// The pointer a box comparison operand denotes: the
+    /// call passes a reference to the box, resolving it
+    /// yields the box value, and the box aggregate wraps its
+    /// pointer in the one-field `Unique` / `NonNull` chain
+    /// with the allocator beside it, so first fields lead to
+    /// the pointer. `None` when the resolved value is not
+    /// such a nest ending in a pointer (a box the model holds
+    /// as a bare value has no pointer to extract either: the
+    /// resolution already followed it to the pointee).
+    fn box_cmp_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
+        let mut cur = self.resolve_ref(frames, arg).ok()?.into_owned();
+        loop {
+            match cur {
+                Value::Enum { fields, .. } if !fields.is_empty() => {
+                    cur = fields.into_iter().next()?;
+                }
+                ptr @ (Value::Ref(_)
+                | Value::FatRef { .. }
+                | Value::DynRef { .. }) => return Some(ptr),
+                _ => return None,
+            }
+        }
     }
 
     pub(crate) fn values_equal(

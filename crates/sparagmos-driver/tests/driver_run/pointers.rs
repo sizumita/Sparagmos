@@ -4096,6 +4096,7 @@ fn run_mode_nonnull_addr_round_trip() {
     run_ok("nonnull-addr", NONNULL_ADDR_SRC, "nonnull addr ok\n");
 }
 
+
 const PACKED_ENUM_STRIDE_SRC: &str = r#"
 #[repr(packed)]
 struct Packed<T: Copy>(#[allow(dead_code)] T);
@@ -4169,4 +4170,49 @@ fn run_mode_tuple_element_stride() {
         TUPLE_ELEMENT_STRIDE_SRC,
         "tuple 8\nnested 8\n",
     );
+}
+
+const FAT_PTR_CAST_TO_ARRAY_SRC: &str = r#"
+fn main() {
+    let a: *const [i32] = &[1, 2, 3];
+    let b = a as *const [i32; 2];
+    unsafe {
+        assert_eq!(*b, [1, 2]);
+    }
+    println!("{:?}", unsafe { *b });
+}
+"#;
+
+#[test]
+fn run_mode_fat_ptr_cast_to_array_keeps_window() {
+    // A fat-to-thin cast that re-denominates the pointer as
+    // an array pointer denotes the array at the head of the
+    // allocation, not the allocation's whole sequence (the
+    // rustc suite's `cast/fat-ptr-cast-rpass` shape).
+    run_ok(
+        "fat-ptr-cast-array",
+        FAT_PTR_CAST_TO_ARRAY_SRC,
+        "[1, 2]\n",
+    );
+}
+
+const CAST_TEMP_ADDRESS_SRC: &str = r#"
+fn main() {
+    let mut a = 0i32;
+    let b = &(a as i32);
+    a = 1;
+    assert_ne!(&a as *const i32, b as *const i32);
+    assert_eq!(*b, 0);
+    println!("cast temp ok");
+}
+"#;
+
+#[test]
+fn run_mode_cast_temporary_has_its_own_address() {
+    // `&(a as i32)` borrows the cast's temporary, whose
+    // storage must stay distinct from `a`'s for as long as
+    // the borrow lives, even though def/use liveness ends
+    // the temporary's range at the borrow (the rustc
+    // suite's `cast/cast-not-treated-as-lvalue` shape).
+    run_ok("cast-temp-address", CAST_TEMP_ADDRESS_SRC, "cast temp ok\n");
 }
