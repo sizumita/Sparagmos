@@ -1056,7 +1056,226 @@ impl<'a> Interpreter<'a> {
         if let Some(view) = self.byte_view_shaped_store(frames, target, &value, shape) {
             return view;
         }
+        // A byte-displaced target whose position crosses a
+        // union field (Issue #501): the byte view declines a
+        // union step, and the projected assignment judged the
+        // write by the written value's minimal byte width, so
+        // a whole-pointee write displaced by a whole element
+        // over a `ManuallyDrop<MaybeUninit<[T; N]>>` field
+        // could only decline or mis-splice. The store's shape
+        // is the pointee's declared width, so its bytes splice
+        // into the written field's byte image at the flat
+        // position the rest of the projection prices, and the
+        // composed field value is stored back through the
+        // union composition the crossing write path uses.
+        if let Some(view) = self.union_displaced_shaped_store(frames, target, &value, shape) {
+            return view;
+        }
         self.write_resolved_typed(frames, target, value, root_ty)
+    }
+
+    /// A shaped whole-pointee store through a byte-displaced
+    /// target crossing a union field (see [`Self::shaped_store`]):
+    /// the position inside the written field is priced over
+    /// the field's scalar shape (wrapper field steps at offset
+    /// 0, array index steps at the element width, a trailing
+    /// byte offset as the displacement), the store's bytes —
+    /// exactly the pointee shape's declared width — are
+    /// spliced into the field's byte image at that position,
+    /// and the decoded field value is composed back into the
+    /// union value at the projection's head. `None` when the
+    /// target does not cross a union field, the rest of the
+    /// projection is not a position this pricing judges, the
+    /// splice would run past the field's span, or the field's
+    /// current value has no byte image: the caller then keeps
+    /// the existing path and its verdicts.
+    fn union_displaced_shaped_store(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: &Value,
+        shape: &ScalarShape,
+    ) -> Option<InterpResult<()>> {
+        let width = Self::union_shape_width(shape)?;
+        if width > 16 {
+            return None;
+        }
+        let bits = self.flatten_scalar(value, shape).ok()?;
+        let effective;
+        let projection: &[RefProj] = match target {
+            Resolved::Alloc { id, projection } => {
+                effective = self.elem_block_projection(*id, projection);
+                &effective
+            }
+            Resolved::Place { projection, .. } | Resolved::Static { projection, .. } => {
+                projection
+            }
+            Resolved::Value(..) => return None,
+        };
+        let pos = projection
+            .iter()
+            .position(|s| matches!(s, RefProj::UnionField { .. }))?;
+        let RefProj::UnionField { idx, table } = projection[pos] else {
+            unreachable!("the position names a union field step")
+        };
+        let head = &projection[..pos];
+        let rest = &projection[pos + 1..];
+        if rest.iter().any(|s| matches!(s, RefProj::UnionField { .. })) {
+            return None;
+        }
+        let field_shape = self
+            .program
+            .union_tables
+            .get(table)
+            .and_then(|shapes| shapes.get(idx))
+            .and_then(|o| o.as_ref())?
+            .clone();
+        let field_width = Self::union_shape_width(&field_shape)?;
+        let off = Self::displaced_offset_in_shape(&field_shape, rest)?;
+        if off + width > field_width {
+            return None;
+        }
+        let head_target = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: head.to_vec(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: head.to_vec(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: head.to_vec(),
+            },
+            Resolved::Value(..) => unreachable!("value targets declined above"),
+        };
+        let (func, place_desc) = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => (
+                frames[*frame_pos].func.clone(),
+                describe_resolved(*local, projection),
+            ),
+            Resolved::Static { name, .. } => {
+                ("<static>".to_string(), format!("static {name}"))
+            }
+            Resolved::Alloc { id, .. } => {
+                ("<allocation>".to_string(), format!("allocation #{id}"))
+            }
+            Resolved::Value(..) => unreachable!("value targets declined above"),
+        };
+        let current = self.read_resolved(frames, &head_target).ok()?;
+        if current == Value::Uninit {
+            return None;
+        }
+        let plan = self.union_cross_plan(&current, idx, table);
+        // A plan of `None` stands when the union already holds
+        // the written field itself (no other field's value
+        // survives the write); any other unplanned shape (the
+        // union holds nothing, or a field without a shape)
+        // declines.
+        let holds_written = matches!(&current, Value::Enum { fields, .. }
+            if fields.get(idx).is_some_and(|v| *v != Value::Uninit));
+        if plan.is_none() && !holds_written {
+            return None;
+        }
+        let field_value =
+            self.union_field_read(current.clone(), idx, table, &func, &place_desc).ok()?;
+        let mut image = self.union_field_bytes(&field_value, &field_shape)?;
+        if image.len() < off + width {
+            image.resize(off + width, None);
+        }
+        for k in 0..width {
+            image[off + k] = Some(((bits >> (8 * k)) & 0xff) as u8);
+        }
+        let new_field = self
+            .union_bytes_decode(&image, &field_shape, &func, &place_desc)
+            .ok()?;
+        let new_union = match &plan {
+            Some(UnionCross::Bytes { source }) => {
+                match self.union_field_bytes(&new_field, &field_shape) {
+                    Some(new_image) => {
+                        let mut bytes = source.clone();
+                        Self::splice_union_bytes(&mut bytes, 0, &new_image);
+                        Value::UnionBytes { bytes }
+                    }
+                    None => Self::union_holding(idx, new_field, &current),
+                }
+            }
+            _ => Self::union_holding(idx, new_field, &current),
+        };
+        Some(self.store_union_at_head(frames, target, head, new_union))
+    }
+
+    /// The flat byte offset a displaced position denotes
+    /// inside a union field's storage, priced over the
+    /// field's scalar shape (see
+    /// [`Self::union_displaced_shaped_store`]): wrapper field
+    /// steps sit at offset 0, recorded-field steps at their
+    /// recorded offsets, array index steps at the element
+    /// width, a denomination step does not move the position,
+    /// and a trailing byte offset is the displacement itself.
+    /// The position must end at a byte offset step (the
+    /// displacement that made the store a displaced one).
+    /// `None` for any other step shape.
+    fn displaced_offset_in_shape(
+        shape: &ScalarShape,
+        rest: &[RefProj],
+    ) -> Option<usize> {
+        let mut cur: &ScalarShape = shape;
+        let mut off: usize = 0;
+        let mut displaced = false;
+        for (i, step) in rest.iter().enumerate() {
+            match step {
+                RefProj::Field(k) => match cur {
+                    ScalarShape::AdtField { index, inner, .. } => {
+                        if *k as u32 != *index {
+                            return None;
+                        }
+                        cur = inner;
+                    }
+                    ScalarShape::AdtFields { fields, .. } => {
+                        let (_, offset, fshape) = fields
+                            .iter()
+                            .find(|(index, _, _)| *index as usize == *k)?;
+                        off = off.checked_add((*offset / 8) as usize)?;
+                        cur = fshape;
+                    }
+                    ScalarShape::Fields { fields, .. } => {
+                        let (offset, fshape) = fields.get(*k)?;
+                        off = off.checked_add((*offset / 8) as usize)?;
+                        cur = fshape;
+                    }
+                    _ => return None,
+                },
+                RefProj::Index(k) => match cur {
+                    ScalarShape::Array(elem, _) => {
+                        let ew = Self::union_shape_width(elem)?;
+                        off = off.checked_add(k.checked_mul(ew)?)?;
+                        cur = elem;
+                    }
+                    _ => return None,
+                },
+                RefProj::View(_) => {}
+                RefProj::ByteOffset(d) => {
+                    if i + 1 != rest.len() || *d < 0 {
+                        return None;
+                    }
+                    off = off.checked_add(*d as usize)?;
+                    displaced = true;
+                }
+                _ => return None,
+            }
+        }
+        if displaced {
+            Some(off)
+        } else {
+            None
+        }
     }
 
     /// Map the elements a slice / array pointer denotes
