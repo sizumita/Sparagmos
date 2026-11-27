@@ -1133,6 +1133,100 @@ fn run_mode_o3_format_macro_uses_inlined_format_inner() {
     }
 }
 
+const PROJECTED_FIELD_DISPLAY_SRC: &str = r#"
+struct Firework { strength: i32 }
+impl Drop for Firework {
+    fn drop(&mut self) { println!("BOOM times {}!!!", self.strength); }
+}
+struct Letter { mark: char }
+struct Inner { x: i32 }
+struct Outer { inner: Inner }
+fn show(f: &Firework) { println!("shown {}", f.strength); }
+fn main() {
+    let f = Firework { strength: 100 };
+    show(&f);
+    println!("direct {}", f.strength);
+    let l = Letter { mark: 'z' };
+    println!("mark {}", l.mark);
+    let o = Outer { inner: Inner { x: 7 } };
+    println!("nested {}", o.inner.x);
+    drop(f);
+}
+"#;
+
+/// A raw fmt argument (see
+/// `run_mode_o3_format_macro_uses_inlined_format_inner`) whose
+/// erased reference denotes a *projected* place — a struct
+/// field read straight from its local, through a reference
+/// parameter, or inside a `Drop` impl — names the bare
+/// trait-item formatter, and the Self type is the local's
+/// declared type walked over the projection: the field's own
+/// type, stated exactly (a `char` field's tag comes from the
+/// field's recorded debug shape, the IR type rendering `char`
+/// as `u32`). Without the walk the run stops at "Display
+/// formatting for an ADT value (its impl lives in unconverted
+/// code)", formatting the whole struct aggregate instead of
+/// the field (the coverage corpus' `drop_trait` shape).
+#[test]
+fn run_mode_o2_projected_field_display_argument() {
+    let dir = temp_dir("projected-field-display");
+    let src = fixture(&dir, "case.rs", PROJECTED_FIELD_DISPLAY_SRC);
+    for opt in ["-Copt-level=2", "-Copt-level=3"] {
+        let out = run_driver_extra(&src, &["--rustc-arg", opt]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "projected field arguments must run at {opt}; stderr={stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "shown 100\ndirect 100\nmark z\nnested 7\nBOOM times 100!!!\n",
+            "formatted output must match native at {opt}; stderr={stderr}"
+        );
+    }
+}
+
+const GENERIC_FIELD_DISPLAY_SRC: &str = r#"
+struct Firework<T: Copy + std::fmt::Display> { strength: T }
+impl<T: Copy + std::fmt::Display> Drop for Firework<T> {
+    fn drop(&mut self) { println!("BOOM times {}!!!", self.strength); }
+}
+fn main() {
+    let _a = Firework { strength: 2 };
+    let _b = Firework { strength: 300.3f64 };
+}
+"#;
+
+/// The projected-field recovery for a field whose type is the
+/// ADT's generic parameter: the field-type table records no
+/// type for it, so the Self type comes from the debug shape
+/// recorded for the base local's exact instance (its
+/// variable-table entry names `Firework<f64>` /
+/// `Firework<i32>`), which states the field's type in that
+/// instance. Without it the run stops at the same
+/// unconverted-impl Display error (the coverage corpus'
+/// `generics` shape).
+#[test]
+fn run_mode_o2_generic_field_display_argument() {
+    let dir = temp_dir("generic-field-display");
+    let src = fixture(&dir, "case.rs", GENERIC_FIELD_DISPLAY_SRC);
+    for opt in ["-Copt-level=2", "-Copt-level=3"] {
+        let out = run_driver_extra(&src, &["--rustc-arg", opt]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "generic field arguments must run at {opt}; stderr={stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "BOOM times 300.3!!!\nBOOM times 2!!!\n",
+            "formatted output must match native at {opt}; stderr={stderr}"
+        );
+    }
+}
+
 const ITER_COLLECT_SRC: &str = r#"
 fn main() {
     let v: Vec<i32> = (0..5).collect();
