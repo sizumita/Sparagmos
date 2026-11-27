@@ -445,12 +445,23 @@ impl Converter {
             return FatPointerRead::NotFat;
         };
         let meta = meta as u64;
-        // The data is exactly the metadata's byte count: the
-        // backing allocation may extend past it (the file path
-        // allocation behind a `Location` constant carries a
-        // trailing NUL byte, for one), so read only that range
-        // rather than copying the whole backing allocation.
-        let Some(data) = alloc_bytes_in(&target, 0..meta as usize) else {
+        // The data is exactly the metadata's byte count, starting
+        // at the offset the data pointer itself stores: the
+        // backing allocation may extend past the denoted range on
+        // both sides (the file path allocation behind a `Location`
+        // constant carries a trailing NUL byte, and a subslice or
+        // substring constant minted in a const context points into
+        // the middle of its backing allocation), so read only the
+        // denoted range rather than copying the whole backing
+        // allocation or its prefix.
+        let offset = read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as usize;
+        let Some(range) = offset
+            .checked_add(meta as usize)
+            .map(|end| offset..end)
+        else {
+            return FatPointerRead::NotFat;
+        };
+        let Some(data) = alloc_bytes_in(&target, range) else {
             return FatPointerRead::NotFat;
         };
         if !self.spend_const_budget(data.len()) {
@@ -526,7 +537,8 @@ impl Converter {
                     if let Some((_, prov)) = alloc.provenance.ptrs.first() {
                         return sm::ConstValue::ByRef {
                             alloc_id: prov.0.to_index() as u64,
-                            offset: 0,
+                            offset: read_uint_at(alloc, 0, PTR_SIZE)
+                                .unwrap_or(0) as u64,
                         };
                     }
                 }
@@ -536,12 +548,25 @@ impl Converter {
         // Thin-pointer shape: follow the provenance to the pointee.
         if let Some((_, prov)) = alloc.provenance.ptrs.first() {
             let alloc_id = prov.0.to_index() as u64;
+            // The offset the pointer itself stores: a pointer into
+            // the middle of its allocation (a byte-array window or
+            // a substring minted in a const context) denotes the
+            // bytes from that offset on, not the allocation's
+            // prefix, so the plain-pointee shortcuts below read
+            // the denoted range instead of the whole allocation.
+            let target_off =
+                read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as usize;
             if let Some(pointee) = self.memory_alloc(prov) {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
                     Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
-                        return match pointee.raw_bytes().map(String::from_utf8) {
-                            Ok(Ok(s)) => sm::ConstValue::Str(s),
+                        return match alloc_bytes_in(
+                            &pointee,
+                            target_off..pointee.bytes.len(),
+                        )
+                        .map(String::from_utf8)
+                        {
+                            Some(Ok(s)) => sm::ConstValue::Str(s),
                             _ => {
                                 self.err("ConstantKind::Allocated (&str, unreadable)");
                                 sm::ConstValue::ZeroSized
@@ -553,12 +578,15 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
-                            return match pointee.raw_bytes() {
-                                Ok(data) => sm::ConstValue::Slice {
+                            return match alloc_bytes_in(
+                                &pointee,
+                                target_off..pointee.bytes.len(),
+                            ) {
+                                Some(data) => sm::ConstValue::Slice {
                                     meta: data.len() as u64,
                                     data,
                                 },
-                                Err(_) => {
+                                None => {
                                     self.err("ConstantKind::Allocated (&[u8], unreadable)");
                                     sm::ConstValue::ZeroSized
                                 }
@@ -570,9 +598,12 @@ impl Converter {
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
                         ) {
-                            return match pointee.raw_bytes() {
-                                Ok(data) => sm::ConstValue::Bytes(data),
-                                Err(_) => {
+                            return match alloc_bytes_in(
+                                &pointee,
+                                target_off..pointee.bytes.len(),
+                            ) {
+                                Some(data) => sm::ConstValue::Bytes(data),
+                                None => {
                                     self.err("ConstantKind::Allocated (&[u8; N], unreadable)");
                                     sm::ConstValue::ZeroSized
                                 }
@@ -591,7 +622,7 @@ impl Converter {
             }
             return sm::ConstValue::ByRef {
                 alloc_id,
-                offset: 0,
+                offset: read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as u64,
             };
         }
         // No provenance at all. A fat pointer (a slice reference)
