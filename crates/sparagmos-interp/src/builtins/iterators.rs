@@ -267,6 +267,18 @@ impl<'a> Interpreter<'a> {
                 return self.iterator_next_at(frames, flatmap_ty, &field);
             }
         }
+        // A `RepeatWith` on a place-based state is stepped
+        // in place (its producer is `FnMut`: the environment
+        // reference must name the closure field's own storage
+        // for by-value capture writes to persist);
+        // `repeat_with_next` declines a state that does not
+        // live in a place, and the value-level step below
+        // then applies.
+        if self_ty.starts_with("std::iter::RepeatWith<") {
+            if let Some(result) = self.repeat_with_next(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
         // A `Map` on a place-based state is stepped in place
         // (its closure's environment reference must name the
         // closure field's own storage); `map_next` declines a
@@ -2980,6 +2992,56 @@ impl<'a> Interpreter<'a> {
         ))
     }
 
+    /// One in-place step of a `RepeatWith` state at
+    /// `target`: call the producer closure stored in the
+    /// state's one field, with the environment reference
+    /// naming the closure field's own storage (the producer
+    /// is `FnMut`, so writes to its by-value captures must
+    /// land in that storage), and yield the call's return
+    /// value. The step never exhausts. Declines (returns
+    /// `Ok(None)`) when the closure field does not live in
+    /// a place, leaving the caller's value-level step --
+    /// and its verdict -- in place.
+    fn repeat_with_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(closure_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let callable = self.read_resolved(frames, &closure_target)?;
+        let env_ref = match &closure_target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => Value::Ref(RefTarget::place(
+                frames[*frame_pos].id,
+                *local,
+                projection.clone(),
+            )),
+            Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: projection.clone(),
+            }),
+            Resolved::Alloc { id, projection } => Value::Ref(RefTarget::Alloc {
+                id: *id,
+                projection: projection.clone(),
+            }),
+            Resolved::Value(..) => unreachable!("closure target is a place"),
+        };
+        let item = self.call_callable_sync_typed(
+            frames,
+            &callable,
+            first_generic_arg(self_ty).unwrap_or(""),
+            Some(env_ref),
+            vec![],
+        )?;
+        Ok(Some(some_value(item)))
+    }
+
     fn map_next(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4317,6 +4379,33 @@ impl<'a> Interpreter<'a> {
             }
             let elem = fields[0].clone();
             (fields, some_value(elem))
+        } else if self_ty.starts_with("std::iter::RepeatWith<") {
+            // `RepeatWith` is a one-field struct wrapping the
+            // producer closure: the step calls it and yields
+            // its return value, forever. The producer is
+            // `FnMut`, so the call itself is the step; as a
+            // value the state is the closure, returned
+            // unchanged -- mutations through reference
+            // captures persist through the references, and an
+            // iterator living in a place is stepped in place
+            // instead (see `repeat_with_next`), where by-value
+            // captures mutate in their own storage.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "RepeatWith state",
+                    "[closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let closure = fields[0].clone();
+            let item = self.call_callable_sync_typed(
+                frames,
+                &closure,
+                first_generic_arg(self_ty).unwrap_or(""),
+                None,
+                vec![],
+            )?;
+            (fields, some_value(item))
         } else if self_ty.starts_with("std::iter::Enumerate<") {
             // `Enumerate` is (inner iterator, count): the step
             // is the inner step paired with the current count.
@@ -6965,6 +7054,7 @@ fn into_iter_identity(ty: &str) -> bool {
         || self_ty_is(ty, "std::fs::ReadDir")
         || ty.starts_with("std::iter::Empty<")
         || ty.starts_with("std::iter::Repeat<")
+        || ty.starts_with("std::iter::RepeatWith<")
         || self_ty_is(ty, "std::str::Chars")
         || self_ty_is(ty, "core::str::Chars")
         || self_ty_is(ty, "std::str::Bytes")

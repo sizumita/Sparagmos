@@ -790,3 +790,113 @@ fn run_mode_box_into_iter_drop_discipline_2024() {
         "stdout={stdout}"
     );
 }
+
+// ----- repeat_with (RepeatWith) ---------------------------------------------
+
+const REPEAT_WITH_REF_CAPTURE_SRC: &str = r#"
+use std::iter::repeat_with;
+
+fn main() {
+    let mut state: u32 = 0;
+    let mut s = String::new();
+    for c in repeat_with(|| {
+        state += 1;
+        (b'a' + (state % 26) as u8) as char
+    })
+    .take(5)
+    {
+        s.push(c);
+    }
+    println!("{} {}", s, state);
+}
+"#;
+
+#[test]
+fn run_mode_repeat_with_ref_capture_take() {
+    // The shape `tempfile`'s name generation uses: a
+    // `RepeatWith` whose producer captures `&mut` state,
+    // consumed through `Take` by a for loop. The step calls
+    // the producer on every pull; the mutations land in the
+    // captured place through the reference.
+    let dir = temp_dir("repeatwithref");
+    let src = fixture(&dir, "repeatwithref.rs", REPEAT_WITH_REF_CAPTURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "repeat_with over a &mut capture must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bcdef 5\n");
+}
+
+const REPEAT_WITH_VALUE_CAPTURE_SRC: &str = r#"
+use std::iter::repeat_with;
+
+fn main() {
+    let mut n = 0u32;
+    let mut it = repeat_with(move || {
+        n += 1;
+        n * 10
+    });
+    println!("{:?} {:?} {:?}", it.next(), it.next(), it.next());
+}
+"#;
+
+#[test]
+fn run_mode_repeat_with_by_value_capture_next() {
+    // The producer is `FnMut` over a by-value capture: each
+    // `next()` on the iterator in its place must observe the
+    // previous call's writes to the capture, so the step is
+    // taken in place against the closure field's own storage.
+    let dir = temp_dir("repeatwithval");
+    let src = fixture(&dir, "repeatwithval.rs", REPEAT_WITH_VALUE_CAPTURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "repeat_with over a by-value capture must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Some(10) Some(20) Some(30)\n"
+    );
+}
+
+const REPEAT_WITH_CONSUMERS_SRC: &str = r#"
+use std::iter::repeat_with;
+
+fn main() {
+    let v: Vec<u32> = repeat_with(|| 7u32).take(3).collect();
+    let seed = 7u32;
+    let found = repeat_with(|| seed * 3)
+        .find_map(|x| if x > 20 { Some(x + 1) } else { None });
+    println!("{:?} {:?}", v, found);
+}
+"#;
+
+#[test]
+fn run_mode_repeat_with_collect_and_find_map() {
+    // `collect` over `Take<RepeatWith<_>>` drains the state
+    // functionally through the modelled step, and `find_map`
+    // pulls the bare `RepeatWith` until the closure's item
+    // matches; both must see the producer's values in order.
+    let dir = temp_dir("repeatwithconsumers");
+    let src = fixture(
+        &dir,
+        "repeatwithconsumers.rs",
+        REPEAT_WITH_CONSUMERS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collect/find_map over repeat_with must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[7, 7, 7] Some(22)\n"
+    );
+}
