@@ -30,6 +30,9 @@ pub(super) fn render_lldb_compact(
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
+    if !super::spend_render_node() {
+        return None;
+    }
     if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
         return render_lldb_compact(
             interp,

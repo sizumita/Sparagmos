@@ -42,6 +42,92 @@ mod render_gdb;
 mod render_lldb;
 mod session;
 
+// ---------------------------------------------------------------------------
+// Render budget (Issue #480)
+//
+// The renderers' depth cap (see `render_gdb::MAX_RENDER_DEPTH`)
+// bounds how *deep* one print unfolds, but not how much work it
+// does in total: a value whose rendering branches -- a union
+// read back through every declared field, a tuple tree that
+// doubles at every level, a collection provider walking its
+// storage -- multiplies the number of rendered nodes at each
+// level, so a shallow value can still expand without bound
+// (the debugger-session form of the balloon in Issue #480:
+// the process grows while a single print is being rendered).
+// A print therefore runs under a total node budget: every node
+// the gdb / lldb / pretty-printer renderers unfold spends one
+// unit, and a print that spends the whole budget fails as
+// unrenderable -- the session reports it with its ordinary
+// `<error: ... could not be rendered>` line -- instead of
+// ballooning, and instead of emitting a truncated rendering
+// that a check line could mistake for the value. The budget
+// is sized far past any rendering the debuginfo suite's check
+// lines expect (their prints are bounded by gdb's own
+// `print elements` in pretty mode and stay in the thousands of
+// nodes in raw mode), so legitimate prints never reach it.
+// ---------------------------------------------------------------------------
+
+/// The most value nodes one print may unfold across all of
+/// its renderers (see the module note above).
+pub(super) const MAX_RENDER_NODES: usize = 100_000;
+
+thread_local! {
+    /// Nodes left in the active print's render budget;
+    /// meaningful only while `RENDER_BUDGET_ACTIVE` is set.
+    static RENDER_NODES_LEFT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Whether a render budget is active on this thread.
+    static RENDER_BUDGET_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Activate a fresh render budget for one print; the returned
+/// guard restores the previous state when it drops, so a
+/// print rendered while no session print is in progress (a
+/// direct renderer call in a unit test, say) stays unbudgeted.
+pub(super) fn begin_render_budget() -> RenderBudgetGuard {
+    let prev_active = RENDER_BUDGET_ACTIVE.with(|a| a.replace(true));
+    let prev_left = RENDER_NODES_LEFT.with(|n| n.replace(MAX_RENDER_NODES));
+    RenderBudgetGuard {
+        prev_active,
+        prev_left,
+    }
+}
+
+/// The RAII handle of [`begin_render_budget`].
+pub(super) struct RenderBudgetGuard {
+    prev_active: bool,
+    prev_left: usize,
+}
+
+impl Drop for RenderBudgetGuard {
+    fn drop(&mut self) {
+        RENDER_BUDGET_ACTIVE.with(|a| a.set(self.prev_active));
+        RENDER_NODES_LEFT.with(|n| n.set(self.prev_left));
+    }
+}
+
+/// Spend one node of the active render budget: `false` when
+/// the budget is spent, which the renderers treat exactly
+/// like exceeding the depth cap (the value is unrenderable,
+/// never truncated). With no budget active every node is
+/// free.
+pub(super) fn spend_render_node() -> bool {
+    if !RENDER_BUDGET_ACTIVE.with(|a| a.get()) {
+        return true;
+    }
+    RENDER_NODES_LEFT.with(|n| {
+        let left = n.get();
+        if left == 0 {
+            false
+        } else {
+            n.set(left - 1);
+            true
+        }
+    })
+}
+
+
 pub use self::session::{
     DebugCommand, DebugDialect, DebugPrint, DebugRun, DebugSession, LldbFormats, LldbNumFormat,
     PrintFormat,

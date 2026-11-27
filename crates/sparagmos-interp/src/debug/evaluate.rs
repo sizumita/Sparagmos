@@ -82,6 +82,7 @@ pub(super) fn render_printf(
     format: &str,
     args: &[String],
 ) -> Vec<String> {
+    let _render_budget = super::begin_render_budget();
     match format_printf(interp, ctl, frames, format, args) {
         Ok(text) => text.lines().map(str::to_string).collect(),
         Err(e) => vec![format!("<error: {e}>")],
@@ -1879,6 +1880,10 @@ pub(super) fn evaluate_print(
     frames: &[Frame],
     print: &DebugPrint,
 ) -> Result<EvaluatedPrint, String> {
+    // One print, one render budget (Issue #480; see
+    // `super::MAX_RENDER_NODES`): every rendering this print
+    // performs, in either dialect, spends from it.
+    let _render_budget = super::begin_render_budget();
     let ev = evaluate_expr(interp, ctl, frames, &print.expr)?;
     let snapshot = ev.clone();
     let tyname = expr_type_name(&ev);

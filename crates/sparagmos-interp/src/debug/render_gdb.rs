@@ -163,6 +163,9 @@ fn render_gdb_mode(
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
+    if !super::spend_render_node() {
+        return None;
+    }
     if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
         return render_gdb_mode(
             interp,
@@ -1727,3 +1730,65 @@ fn render_adt_gdb(
     }
 }
 
+#[cfg(test)]
+mod render_budget_tests {
+    use super::*;
+    use crate::ir::Program;
+
+    /// A value tree that doubles at every level: a tuple of
+    /// two copies of the level below, down to an integer leaf.
+    /// Its depth is small (so the depth cap never binds), but
+    /// the number of nodes -- and, before the render budget,
+    /// the size of its rendering -- doubles per level, which
+    /// is the branching form of the Issue #480 balloon.
+    fn doubling_tree(depth: usize) -> Value {
+        if depth == 0 {
+            Value::Int(1)
+        } else {
+            Value::Tuple(vec![doubling_tree(depth - 1), doubling_tree(depth - 1)])
+        }
+    }
+
+    fn doubling_desc(depth: usize) -> Desc {
+        if depth == 0 {
+            Desc::Int("i32")
+        } else {
+            let inner = doubling_desc(depth - 1);
+            Desc::Tuple(vec![inner.clone(), inner])
+        }
+    }
+
+    fn interp() -> Interpreter<'static> {
+        let program: &'static Program = Box::leak(Box::new(Program::default()));
+        Interpreter::new(program)
+    }
+
+    /// A branching value past the render budget is
+    /// unrenderable under an active budget: the print fails
+    /// honestly instead of expanding without bound, and no
+    /// truncated rendering is produced.
+    #[test]
+    fn branching_value_past_the_budget_is_unrenderable() {
+        let interp = interp();
+        let value = doubling_tree(17);
+        let desc = doubling_desc(17);
+        let _budget = super::super::begin_render_budget();
+        assert!(
+            render_gdb(&interp, &value, Some(&desc), false, None, 0).is_none(),
+            "a 2^18-node rendering must exhaust the render budget"
+        );
+    }
+
+    /// A branching value well under the budget renders in
+    /// full, exactly as it did before the budget existed.
+    #[test]
+    fn branching_value_under_the_budget_renders_in_full() {
+        let interp = interp();
+        let value = doubling_tree(10);
+        let desc = doubling_desc(10);
+        let _budget = super::super::begin_render_budget();
+        let rendered = render_gdb(&interp, &value, Some(&desc), false, None, 0)
+            .expect("a 2^11-node rendering is far under the budget");
+        assert_eq!(rendered.matches('1').count(), 1024);
+    }
+}
