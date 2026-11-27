@@ -1023,6 +1023,12 @@ impl<'a> Interpreter<'a> {
                 let (_, size) = self.tuple_layout(ts)?;
                 Some(size)
             }
+            // An array of elements only the full walk can
+            // size (tuples, instance-resolved ADTs): the
+            // array is the element count times the element
+            // size, as `ty_size` computes for the elements
+            // it sizes directly.
+            Ty::Array(elem, n) => n.checked_mul(self.ty_size_full(elem)?),
             // A bare ADT name (the IR types drop generic
             // arguments) resolves to the one recorded
             // instance, as the field-layout lookups resolve
@@ -1095,7 +1101,28 @@ impl<'a> Interpreter<'a> {
         let sizes: Vec<Option<u64>> = body
             .local_tys
             .iter()
-            .map(|t| self.ty_size_full(t))
+            .enumerate()
+            .map(|(i, t)| {
+                self.ty_size_full(t).or_else(|| {
+                    // An array local whose element the type
+                    // walk cannot size (the element type
+                    // mentions an ADT whose bare name denotes
+                    // several recorded instances): conversion
+                    // recorded the element size while the
+                    // generic arguments were at hand (see
+                    // `ir::Body::local_elem_sizes`), and the
+                    // array's size is the count times it.
+                    match t {
+                        Ty::Array(_, n) => body
+                            .local_elem_sizes
+                            .get(i)
+                            .copied()
+                            .flatten()
+                            .and_then(|elem| n.checked_mul(elem)),
+                        _ => None,
+                    }
+                })
+            })
             .collect();
         let aligns: Vec<u64> = body
             .local_tys
@@ -1481,8 +1508,17 @@ impl<'a> Interpreter<'a> {
                 }
                 let layout = self.slot_layout(&func)?;
                 let slot = layout.slots.get(*local).copied()??;
-                let offset =
-                    self.projection_offset(Some(root_ty), projection, leaf_ty)?;
+                let root_elem_size = body
+                    .local_elem_sizes
+                    .get(*local)
+                    .copied()
+                    .flatten();
+                let offset = self.projection_offset_with_root_elem(
+                    Some(root_ty),
+                    projection,
+                    leaf_ty,
+                    root_elem_size,
+                )?;
                 displaced_price(base + u128::from(slot), offset)
             }
             RefTarget::Static { name, projection } => {
@@ -1701,8 +1737,30 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         leaf_ty: Option<&Ty>,
     ) -> Option<i128> {
+        self.projection_offset_with_root_elem(root_ty, projection, leaf_ty, None)
+    }
+
+    /// [`Self::projection_offset`] with the element size
+    /// conversion recorded for the root local (see
+    /// `ir::Body::local_elem_sizes`): the IR root type drops
+    /// the generic arguments the size is computed from, so
+    /// where the walk cannot size the root sequence's element
+    /// from the type alone (an element mentioning an ADT
+    /// whose bare name denotes several recorded instances),
+    /// the recorded size denominates the root step. Only the
+    /// root step is denominated this way; deeper steps walk
+    /// the types as before.
+    fn projection_offset_with_root_elem(
+        &self,
+        root_ty: Option<&Ty>,
+        projection: &[RefProj],
+        leaf_ty: Option<&Ty>,
+        root_elem_size: Option<u64>,
+    ) -> Option<i128> {
         match root_ty {
-            Some(root) => self.projection_offset_forward(root, projection),
+            Some(root) => {
+                self.projection_offset_forward(root, projection, root_elem_size)
+            }
             None => self.projection_offset_backward(projection, leaf_ty),
         }
     }
@@ -1714,11 +1772,12 @@ impl<'a> Interpreter<'a> {
         &self,
         root: &Ty,
         projection: &[RefProj],
+        root_elem_size: Option<u64>,
     ) -> Option<i128> {
         let mut offset: i128 = 0;
         let mut cur = Some(WalkTy::Ty(root.clone()));
         let mut variant: u32 = 0;
-        for step in projection {
+        for (step_idx, step) in projection.iter().enumerate() {
             match step {
                 RefProj::Field(idx) => {
                     let c = cur.as_ref()?;
@@ -1728,15 +1787,19 @@ impl<'a> Interpreter<'a> {
                 RefProj::Index(i) => {
                     let c = cur.as_ref()?;
                     let (elem_size, elem_ty) = self.sequence_elem(c)?;
+                    let elem_size = elem_size
+                        .or(if step_idx == 0 { root_elem_size } else { None })?;
                     offset +=
-                        i128::try_from(*i).ok()? * i128::from(elem_size?);
+                        i128::try_from(*i).ok()? * i128::from(elem_size);
                     cur = Some(elem_ty);
                 }
                 RefProj::Subslice { offset: o, .. } => {
                     let c = cur.as_ref()?;
                     let (elem_size, _) = self.sequence_elem(c)?;
+                    let elem_size = elem_size
+                        .or(if step_idx == 0 { root_elem_size } else { None })?;
                     offset +=
-                        i128::try_from(*o).ok()? * i128::from(elem_size?);
+                        i128::try_from(*o).ok()? * i128::from(elem_size);
                 }
                 RefProj::Downcast(v) => {
                     variant = *v;
@@ -1749,7 +1812,7 @@ impl<'a> Interpreter<'a> {
                     cur = None;
                 }
                 RefProj::ByteOffset(d) => {
-                    offset += d;
+                    offset += *d;
                     // The position a byte displacement denotes
                     // has no tracked type: a further structural
                     // step falls back.
@@ -1885,7 +1948,7 @@ impl<'a> Interpreter<'a> {
                 ProjectionElem::Deref => return None,
             }
         }
-        let offset = self.projection_offset_forward(&pointee_ty, &steps)?;
+        let offset = self.projection_offset_forward(&pointee_ty, &steps, None)?;
         let addr = base.checked_add(offset)?;
         let thin = Value::Ref(RefTarget::Address(u64::try_from(addr).ok()?));
         // A pointer to an unsized pointee is fat: it carries the
@@ -2451,13 +2514,13 @@ impl<'a> Interpreter<'a> {
     fn sequence_elem(&self, cur: &WalkTy) -> Option<(Option<u64>, WalkTy)> {
         match cur {
             WalkTy::Ty(Ty::Array(elem, _)) | WalkTy::Ty(Ty::Slice(elem)) => {
-                Some((self.ty_size(elem), WalkTy::Ty((**elem).clone())))
+                Some((self.ty_size_full(elem), WalkTy::Ty((**elem).clone())))
             }
             WalkTy::Ty(Ty::Ref(inner)) => match &**inner {
                 Ty::Array(elem, _) | Ty::Slice(elem) => {
-                    Some((self.ty_size(elem), WalkTy::Ty((**elem).clone())))
+                    Some((self.ty_size_full(elem), WalkTy::Ty((**elem).clone())))
                 }
-                _ => Some((self.ty_size(inner), WalkTy::Ty((**inner).clone()))),
+                _ => Some((self.ty_size_full(inner), WalkTy::Ty((**inner).clone()))),
             },
             WalkTy::Ty(Ty::Adt(name)) => {
                 let key = self.adt_instance_key(name)?;
