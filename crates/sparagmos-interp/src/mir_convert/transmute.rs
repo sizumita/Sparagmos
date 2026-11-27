@@ -902,16 +902,17 @@ let inner = match (&src, target) {
             {
                 ir::Rvalue::Use(v.clone())
             }
-            // (thin pointer, length) tuple -> fat reference
-            // to a DST-wrapper struct, and the reverse: the
-            // tuple's recorded layout is the fat pointer's
+            // (thin pointer, length) tuple or struct ->
+            // fat reference (to a plain slice / `str` pointee
+            // or to a DST-wrapper struct), and the reverse:
+            // the pair's recorded layout is the fat pointer's
             // two words — the data pointer at offset 0 and
             // the length at offset 64 — so the crossing is
-            // the reinterpretation between the tuple's
-            // Fields shape and the FatPtr shape (the
-            // `PackedSized::unsize` transmute, which builds
-            // a `&PackedUnsized` from `(self, len)`).
-            (Some(mir::Ty::Tuple(_)), t)
+            // the reinterpretation between the pair's
+            // Fields / AdtFields shape and the FatPtr shape
+            // (the `PackedSized::unsize` transmute, which
+            // builds a `&PackedUnsized` from `(self, len)`).
+            (Some(mir::Ty::Tuple(_) | mir::Ty::Adt(..)), t)
                 if self.fat_tail_meta(t).is_some()
                     && shape_from
                         .as_ref()
@@ -925,7 +926,7 @@ let inner = match (&src, target) {
                     ir::ScalarShape::FatPtr(meta),
                 )
             }
-            (Some(s), mir::Ty::Tuple(_))
+            (Some(s), mir::Ty::Tuple(_) | mir::Ty::Adt(..))
                 if self.fat_tail_meta(s).is_some()
                     && shape_to.as_ref().is_some_and(fat_words_fields) =>
             {

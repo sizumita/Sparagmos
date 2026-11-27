@@ -1698,6 +1698,76 @@ impl<'a> Interpreter<'a> {
                 ])),
                 _ => None,
             },
+            // A struct of the same two-word shape (Issue
+            // #392): its fields sit at the same offsets (the
+            // pointer field at offset 0, the length field at
+            // offset 64, in either declaration order), and its
+            // value is the aggregate holding those fields, so
+            // the crossing carries the pointer field's value
+            // across exactly as the tuple form does.
+            (
+                ScalarShape::AdtFields { fields, .. },
+                ScalarShape::FatPtr(crate::ir::FatMeta::Len),
+            ) if fat_words_adt_layout(fields) => match value {
+                Value::Enum { fields: vals, .. } | Value::Tuple(vals) => {
+                    let ptr_idx = fields
+                        .iter()
+                        .find(|(_, off, _)| *off == 0)
+                        .map(|(i, _, _)| *i as usize)?;
+                    let len_idx = fields
+                        .iter()
+                        .find(|(_, off, _)| *off == 64)
+                        .map(|(i, _, _)| *i as usize)?;
+                    let len = match vals.get(len_idx) {
+                        Some(Value::Uint(v)) => Some(*v),
+                        Some(Value::Int(v)) => Some(*v as u64 as u128),
+                        _ => None,
+                    }?;
+                    match vals.get(ptr_idx) {
+                        Some(
+                            v @ (Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }),
+                        ) => Some(Value::FatRef {
+                            base: Box::new(v.clone()),
+                            len,
+                        }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            (
+                ScalarShape::FatPtr(crate::ir::FatMeta::Len),
+                ScalarShape::AdtFields {
+                    count,
+                    fill,
+                    fields,
+                    ..
+                },
+            ) if fat_words_adt_layout(fields) => match value {
+                Value::FatRef { base, len } => {
+                    let ptr_idx = fields
+                        .iter()
+                        .find(|(_, off, _)| *off == 0)
+                        .map(|(i, _, _)| *i as usize)?;
+                    let len_idx = fields
+                        .iter()
+                        .find(|(_, off, _)| *off == 64)
+                        .map(|(i, _, _)| *i as usize)?;
+                    let mut vals = vec![Value::Uninit; *count];
+                    for (i, c) in fill {
+                        vals[*i as usize] = self.eval_constant(c).ok()?;
+                    }
+                    vals[ptr_idx] = (**base).clone();
+                    vals[len_idx] = Value::Uint(*len);
+                    Some(Value::Enum {
+                        variant: 0,
+                        fields: vals,
+                    })
+                }
+                _ => None,
+            },
             (
                 ScalarShape::AdtField {
                     index: si,
@@ -4935,6 +5005,22 @@ pub(crate) fn navigate_mut_grow<'x>(
 /// a pointer leaf at bit offset 0 and a 64-bit integer
 /// leaf at bit offset 64 (the runtime mirror of the
 /// conversion side's `fat_words_fields`).
+/// Whether an `AdtFields` shape is a fat pointer's two
+/// words: a pointer leaf at bit offset 0 and a 64-bit
+/// integer leaf at bit offset 64 (the fields are recorded
+/// as (index, offset, shape) triples, in declaration
+/// order, so the two words are found by offset).
+fn fat_words_adt_layout(fields: &[(u32, u32, ScalarShape)]) -> bool {
+    fields.len() == 2
+        && fields.iter().any(|(_, off, s)| {
+            *off == 0 && *s == ScalarShape::Ptr
+        })
+        && fields.iter().any(|(_, off, s)| {
+            *off == 64
+                && matches!(s, ScalarShape::Int { bits: 64, .. })
+        })
+}
+
 fn fat_words_layout(fields: &[(u32, ScalarShape)]) -> bool {
     fields.len() == 2
         && fields[0].0 == 0
