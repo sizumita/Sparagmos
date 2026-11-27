@@ -1476,3 +1476,70 @@ fn generic_export_name_still_rejected_in_check_mode() {
     assert_eq!(code, 1, "stderr={stderr}");
     assert!(stderr.contains("must be mangled"), "stderr={stderr}");
 }
+#[test]
+fn recursion_limit_instantiation_is_a_failure_not_a_crash() {
+    // A generic function that instantiates itself with a
+    // strictly larger type on every call: the collector
+    // rejects the crate with "reached the recursion limit
+    // while instantiating" and never codegen-checks any of
+    // the chain's instances. The walk used to force
+    // `check_mono_item` on the chain's instances anyway; past
+    // a few dozen layers the ABI check's layout computation
+    // fails on the adapter types and its error handler raises
+    // the failure as an internal compiler error, which the
+    // witness conversion reported as a compiler crash (exit
+    // 101) for a compilation the compiler itself fails
+    // cleanly. The walk now tracks the collector's
+    // instantiation depths, defers a force's crash behind
+    // the collection-phase verdicts, and contains a
+    // mention's resolution panic to that mention, so the
+    // chain reaches the limit verdict (this is the shape of
+    // tests/ui/codegen/normalization-overflow/
+    // recursion-issue-118590.rs).
+    let case = Case::new("recursion-limit-instantiation");
+    let src = case.write(
+        "case.rs",
+        "fn main() {\n\
+             recurse(std::iter::empty::<()>());\n\
+         }\n\
+         fn recurse(nums: impl Iterator) {\n\
+             if true { return; }\n\
+             recurse(nums.skip(42).peekable())\n\
+         }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("compilation failed"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Stable MIR conversion panicked"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn deep_but_finite_instantiation_converts() {
+    // The same adapter nesting, bounded and written out in
+    // the entry point: no definition is instantiated inside
+    // itself along any mention path, so the collector
+    // collects every instance and the compilation succeeds.
+    // The recursion-limit verdict must not fire, and the
+    // walk's forces on the deep (but collected) instances
+    // must not turn into a crash.
+    let case = Case::new("deep-finite-instantiation");
+    let mut source = String::from(
+        "fn consume(nums: impl Iterator<Item = ()>) { let _ = nums.count(); }\n\
+         fn main() {\n\
+             let it = std::iter::empty::<()>();\n",
+    );
+    for _ in 0..40 {
+        source.push_str("    let it = it.skip(1).peekable();\n");
+    }
+    source.push_str("    consume(it);\n}\n");
+    let src = case.write("case.rs", &source);
+    let (code, stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}

@@ -1584,8 +1584,11 @@ pub fn check_required_consts() -> Option<String> {
         queue: std::collections::VecDeque::new(),
         finding: None,
         crash: None,
+        pending_crash: None,
+        recursion_limit_finding: None,
         mono_finding: None,
         force_abandoned: false,
+        child_depths: std::rc::Rc::new(std::collections::HashMap::new()),
     };
     walk.collect_roots();
     walk.run();
@@ -1594,6 +1597,17 @@ pub fn check_required_consts() -> Option<String> {
     // it is reported through the crash slot, not as a
     // compilation failure (see `convert::note_compiler_crash`).
     if let Some(record) = walk.crash.take() {
+        crate::convert::note_compiler_crash(record);
+        return None;
+    }
+    // The collector's recursion-limit verdict pre-empts a
+    // crash the walk's forces recorded on the way (see
+    // `pending_crash`): the compiler aborts the compilation
+    // in collection, before any codegen-phase force exists.
+    if let Some(finding) = walk.recursion_limit_finding.take() {
+        return Some(finding);
+    }
+    if let Some(record) = walk.pending_crash.take() {
         crate::convert::note_compiler_crash(record);
         return None;
     }
@@ -2308,6 +2322,22 @@ fn verify_panic_linkage(
     None
 }
 
+/// The instance name the recursion-limit verdict reports,
+/// shrunk the way the collector's own diagnostic shrinks it
+/// (`shrunk_instance_name` in rustc_monomorphize): past the
+/// limit the name spells a type nested hundreds of layers
+/// deep, so only its head and tail are kept.
+fn shrunk_instance_name(instance: rustc_middle::ty::Instance<'_>) -> String {
+    let name = instance.to_string();
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= 64 {
+        return name;
+    }
+    let head: String = chars[..32].iter().collect();
+    let tail: String = chars[chars.len() - 32..].iter().collect();
+    format!("{head}...{tail}")
+}
+
 /// Whether every type `instance` drags in normalizes in the
 /// monomorphized environment, asked the way the collector
 /// asks it: the `try_` variant of instantiate-and-normalize,
@@ -2370,15 +2400,39 @@ struct RequiredConstWalk<'tcx> {
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     visited: std::collections::HashSet<rustc_middle::ty::Instance<'tcx>>,
     visited_allocs: std::collections::HashSet<rustc_middle::mir::interpret::AllocId>,
-    queue: std::collections::VecDeque<rustc_middle::ty::Instance<'tcx>>,
+    queue: std::collections::VecDeque<(
+        rustc_middle::ty::Instance<'tcx>,
+        std::rc::Rc<std::collections::HashMap<rustc_span::def_id::DefId, usize>>,
+    )>,
     finding: Option<String>,
     /// The record of a compiler-bug panic a force of this
     /// walk raised (see `convert::captured_panic_is_compiler_bug`):
     /// the walk's forces are the collector's own, so the
     /// compiler dying inside one is a crash verdict, kept
     /// apart from the findings and reported as one by
-    /// `check_required_consts`.
+    /// `check_required_consts`. This slot is for the crash
+    /// verdicts that stand immediately: a body-materialization
+    /// bug recorded during conversion, which `process`
+    /// surfaces for the instance that body belongs to.
     crash: Option<String>,
+    /// The first compiler-bug witness a force of this walk
+    /// raised, held back instead of ending the walk: the
+    /// walk's forces replay the compiler's codegen-phase
+    /// per-instance checks, but the collector's own verdicts
+    /// are collection-phase, and in the compiler collection
+    /// runs first — a compilation the collector aborts (the
+    /// recursion limit below) never reaches the forces at
+    /// all. So a force's crash is only a verdict once the
+    /// walk has run its course without a collection-phase
+    /// verdict pre-empting it; `check_required_consts`
+    /// reports it after the recursion-limit finding.
+    pending_crash: Option<String>,
+    /// The collector's instantiation recursion-limit verdict
+    /// (`check_recursion_limit` in rustc_monomorphize), kept
+    /// apart from `finding`: it is a collection-phase failure
+    /// and pre-empts a pending force crash (see
+    /// `pending_crash`), which ordinary findings do not.
+    recursion_limit_finding: Option<String>,
     /// The first `check_mono_item` rejection the walk's forces
     /// produced, kept apart from `finding`: it is reported
     /// after `check_bodies`, whose findings name some of the
@@ -2397,14 +2451,63 @@ struct RequiredConstWalk<'tcx> {
     /// one the collector itself makes for a collected
     /// instance, and its witness stays a crash.
     force_abandoned: bool,
+    /// The instantiation recursion-depth map the instances
+    /// enqueued while the current instance is processed are
+    /// queued under: for each definition, how many nested
+    /// instantiations of it stand above them on the path the
+    /// walk reached them by — the counts the collector's own
+    /// `check_recursion_limit` consults (see
+    /// `beyond_recursion_limit`). Roots are seeded under the
+    /// empty map; `run` replaces this with the popped
+    /// instance's child map before processing it.
+    child_depths:
+        std::rc::Rc<std::collections::HashMap<rustc_span::def_id::DefId, usize>>,
 }
 
 impl<'tcx> RequiredConstWalk<'tcx> {
     fn run(&mut self) {
-        while let Some(instance) = self.queue.pop_front() {
-            if self.finding.is_some() || self.crash.is_some() {
+        while let Some((instance, depths)) = self.queue.pop_front() {
+            if self.finding.is_some()
+                || self.crash.is_some()
+                || self.recursion_limit_finding.is_some()
+            {
                 return;
             }
+            // The collector's instantiation recursion limit
+            // (`check_recursion_limit` in rustc_monomorphize):
+            // an instance the walk reached through more nested
+            // instantiations of its own definition than the
+            // session's recursion limit allows is one the
+            // collector rejects with a fatal error before it is
+            // ever collected, so the walk records that verdict
+            // and never processes the instance. The verdict
+            // matters beyond this instance: the forces on the
+            // shallower instances of a runaway chain are not
+            // safe either — the ABI check inside
+            // `check_mono_item` asks for the layout of types
+            // nested scores of layers deep, the layout
+            // computation fails, and the check's error handler
+            // raises that failure as an internal compiler
+            // error — yet the compiler itself never makes any
+            // of those forces, because collection aborts
+            // first. That is why a force's crash is deferred
+            // (see `pending_crash`) and this finding pre-empts
+            // it.
+            if self.beyond_recursion_limit(instance, &depths) {
+                if self.recursion_limit_finding.is_none() {
+                    self.recursion_limit_finding = Some(format!(
+                        "reached the recursion limit while instantiating `{}`",
+                        shrunk_instance_name(instance)
+                    ));
+                }
+                continue;
+            }
+            // The depth map this instance's mentions are
+            // enqueued under: its own definition's count rises
+            // by one for the descent, as in the collector.
+            let mut child_depths = (*depths).clone();
+            *child_depths.entry(instance.def_id()).or_insert(0) += 1;
+            self.child_depths = std::rc::Rc::new(child_depths);
             // The bug-witness snapshot for this instance's
             // processing, diffed below.
             let witnesses_before = crate::convert::compiler_bug_witness_len();
@@ -2425,26 +2528,69 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             // evaluations, the vtable allocations of mentioned
             // unsize casts), so the compiler dying inside one
             // is the compiler crashing on a collected
-            // instance — a crash verdict, and the walk ends.
-            // The diff is scoped to this instance's processing,
-            // so bug panics contained on speculative paths the
-            // walk does not decide (and the findings computed
-            // after the walk) never reach it. One exemption: a
-            // force `process` abandoned on an instance whose
-            // types do not normalize (see `force_abandoned`)
-            // leaves its bug witness discounted with its
-            // diagnostics: the collector would never make that
-            // force, so the compiler dying inside it is not a
-            // crash on a collected instance.
-            if self.crash.is_none() && !self.force_abandoned {
+            // instance — a crash verdict. The verdict is
+            // deferred, not immediate (see `pending_crash`):
+            // the walk first has to run its course, because a
+            // collection-phase verdict further along the
+            // mention graph — the recursion limit above —
+            // pre-empts it, the way collection pre-empts
+            // codegen in the compiler. The diff is scoped to
+            // this instance's processing, so bug panics
+            // contained on speculative paths the walk does not
+            // decide (and the findings computed after the
+            // walk) never reach it. One exemption: a force
+            // `process` abandoned on an instance whose types do
+            // not normalize (see `force_abandoned`) leaves its
+            // bug witness discounted with its diagnostics: the
+            // collector would never make that force, so the
+            // compiler dying inside it is not a crash on a
+            // collected instance.
+            if self.crash.is_none()
+                && self.pending_crash.is_none()
+                && !self.force_abandoned
+            {
                 if let Some(record) =
                     crate::convert::compiler_bug_witness_since(witnesses_before)
                 {
-                    self.crash = Some(record);
-                    return;
+                    self.pending_crash = Some(record);
                 }
             }
         }
+    }
+
+    /// The collector's recursion-limit question for one
+    /// queued instance (`check_recursion_limit` in
+    /// rustc_monomorphize): `depths` counts, per definition,
+    /// how many nested instantiations of it stand above this
+    /// instance on the path the walk reached it by, and the
+    /// instance is beyond the limit when that count for its
+    /// own definition — quartered for `drop_in_place`, whose
+    /// tight monomorphization loops the collector gives more
+    /// margin — is not within the session's recursion limit.
+    /// The walk discovers instances breadth-first, so the
+    /// path it holds for an instance is the shallowest one:
+    /// an instance is declared beyond the limit only when
+    /// every path to it is, which is exactly the set of
+    /// instances the collector cannot collect either.
+    fn beyond_recursion_limit(
+        &self,
+        instance: rustc_middle::ty::Instance<'tcx>,
+        depths: &std::collections::HashMap<rustc_span::def_id::DefId, usize>,
+    ) -> bool {
+        let def_id = instance.def_id();
+        let depth = depths.get(&def_id).copied().unwrap_or(0);
+        let adjusted =
+            if matches!(
+                instance.def,
+                rustc_middle::ty::InstanceKind::Shim(
+                    rustc_middle::ty::ShimKind::DropGlue(..)
+                )
+            ) {
+                depth / 4
+            } else {
+                depth
+            };
+        !self.tcx.recursion_limit().value_within_limit(adjusted)
     }
 
     fn enqueue(&mut self, instance: rustc_middle::ty::Instance<'tcx>) {
@@ -2463,7 +2609,8 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             return;
         }
         if self.visited.insert(instance) {
-            self.queue.push_back(instance);
+            self.queue
+                .push_back((instance, self.child_depths.clone()));
         }
     }
 
@@ -2924,7 +3071,27 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             let Some(item) = self.monomorphize(instance, item) else {
                 continue;
             };
-            self.visit_mentioned(item);
+            // A mention's resolution goes through the
+            // compiler's trait and layout machinery, which
+            // has its own recursion ceilings: on a type
+            // nested deeply enough (a runaway instantiation
+            // chain's adapter types, say) resolving one
+            // mention — the drop glue of a deeply-nested
+            // type is the shape this was measured on —
+            // panics where the shallower mentions resolved
+            // cleanly. The panic abandons that mention,
+            // never the body's remaining mentions: the
+            // collector's descent along them is what
+            // carries a runaway chain to the recursion-limit
+            // verdict in `run`, and losing the whole body to
+            // one mention's ceiling would strand the chain
+            // below it. A compiler-bug panic among them is
+            // still recorded by the hook and read by the
+            // scoped witness diff in `run`, exactly as if it
+            // had unwound to there.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.visit_mentioned(item);
+            }));
             if self.finding.is_some() {
                 return;
             }
