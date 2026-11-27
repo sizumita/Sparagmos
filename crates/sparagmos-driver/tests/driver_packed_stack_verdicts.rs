@@ -28,6 +28,17 @@
 //! 1.100.0 before implementing: the rejection shapes
 //! exit 0 under `--emit=metadata` and 1 under
 //! `--emit=link`; the acceptances exit 0 under both.
+//!
+//! The conversions run for s390x targets, so they
+//! need the targets' libraries in the pinned 1.100.0
+//! sysroot: rustup's std for s390x-unknown-linux-gnu
+//! and a build-std core for
+//! s390x-unknown-none-softfloat (both present on the
+//! dev host; the pr-verify job installs neither).
+//! Each test gates on that presence (see
+//! `require_target_libraries`): absent libraries are
+//! reported and the test returns unrun, present
+//! libraries run the full assertions.
 
 use std::process::Command;
 
@@ -95,6 +106,59 @@ extern "C" fn remove_scratch_dirs() {
     }
 }
 
+/// The sysroot the driver under test resolves for
+/// its compilations: the tests pass no `--sysroot`,
+/// so the driver's own fallback chain applies -- the
+/// `SPARAGMOS_SYSROOT` environment variable, then
+/// the sysroot baked in at build time.
+fn driver_sysroot() -> std::path::PathBuf {
+    match std::env::var("SPARAGMOS_SYSROOT") {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => std::path::PathBuf::from(env!("SPARAGMOS_BUILD_SYSROOT")),
+    }
+}
+
+/// Whether the pinned sysroot carries target
+/// libraries for `triple`, judged the way the subset
+/// runner's `installed_targets` judges it: a `lib`
+/// directory under `lib/rustlib/<triple>`. That
+/// covers both the stds rustup installs and the
+/// per-triple libraries that
+/// scripts/build-tier3-std.py installs into the
+/// sysroot (the only source of core for
+/// s390x-unknown-none-softfloat, which rustup does
+/// not distribute).
+fn target_libraries_installed(triple: &str) -> bool {
+    driver_sysroot()
+        .join("lib")
+        .join("rustlib")
+        .join(triple)
+        .join("lib")
+        .is_dir()
+}
+
+/// The environment gate for the tests below.
+/// Converting for a target whose libraries the
+/// sysroot does not carry stops in the front end
+/// (E0463: can't find crate for `std` / `core`)
+/// before any verdict exists, so where the libraries
+/// are absent a test has nothing to assert: it
+/// reports the absence and returns, the
+/// not-attempted treatment the subset runner gives
+/// records whose `--target` is not installed. Where
+/// the libraries are present the test runs its
+/// assertions in full.
+fn require_target_libraries(triple: &str) -> bool {
+    if target_libraries_installed(triple) {
+        return true;
+    }
+    eprintln!(
+        "skipping: no target libraries for {triple} in the pinned sysroot ({})",
+        driver_sysroot().display()
+    );
+    false
+}
+
 const S390X_PACKED_STACK: &[&str] = &[
     "--rustc-arg",
     "--target=s390x-unknown-linux-gnu",
@@ -104,6 +168,9 @@ const S390X_PACKED_STACK: &[&str] = &[
 
 #[test]
 fn backchain_attribute_rejected() {
+    if !require_target_libraries("s390x-unknown-linux-gnu") {
+        return;
+    }
     // The record's own shape (tests/ui/target-feature/
     // packedstack-combinations, backchain_attr revision):
     // an exported function whose `#[target_feature]`
@@ -128,6 +195,9 @@ fn backchain_attribute_rejected() {
 
 #[test]
 fn backchain_from_session_rejected() {
+    if !require_target_libraries("s390x-unknown-linux-gnu") {
+        return;
+    }
     // The session-carried shape of the same verdict:
     // `backchain` enabled for every function by
     // `-C target-feature`, with no attribute anywhere.
@@ -158,6 +228,9 @@ fn backchain_from_session_rejected() {
 
 #[test]
 fn packed_stack_without_backchain_converts() {
+    if !require_target_libraries("s390x-unknown-linux-gnu") {
+        return;
+    }
     // The record's only_packedstack shape: packed-stack
     // alone enables neither feature, so nothing is
     // rejected.
@@ -175,6 +248,9 @@ fn packed_stack_without_backchain_converts() {
 
 #[test]
 fn backchain_attribute_without_packed_stack_converts() {
+    if !require_target_libraries("s390x-unknown-linux-gnu") {
+        return;
+    }
     // The attribute alone is not the rejection: without
     // `-Zpacked-stack` the same function converts.
     let case = Case::new("backchain-no-packed-stack");
@@ -194,6 +270,9 @@ fn backchain_attribute_without_packed_stack_converts() {
 
 #[test]
 fn backchain_on_softfloat_target_converts() {
+    if !require_target_libraries("s390x-unknown-none-softfloat") {
+        return;
+    }
     // The record's with_softfloat shape: the
     // s390x-unknown-none-softfloat target spec enables
     // `soft-float`, which lifts the rejection even with
@@ -223,6 +302,9 @@ fn backchain_on_softfloat_target_converts() {
 
 #[test]
 fn backchain_attribute_is_a_note_in_check_mode() {
+    if !require_target_libraries("s390x-unknown-linux-gnu") {
+        return;
+    }
     // The verdict is codegen-level: under
     // `--emit=metadata` the pinned compiler accepts the
     // crate, so in check mode the verdict is reported as
