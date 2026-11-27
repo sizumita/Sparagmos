@@ -651,8 +651,9 @@ impl<'a> Interpreter<'a> {
     /// the body's debug info, which states the exact type
     /// (generic arguments and `char` included) where the IR
     /// type cannot — the IR renders `char` as `u32`. `None`
-    /// when the type cannot be stated exactly (a projected or
-    /// value-backed target, or a `u32` local no variable entry
+    /// when the type cannot be stated exactly (a value-backed
+    /// target, a projection the declared types do not
+    /// determine, or a `u32` local no variable entry
     /// disambiguates from `char`): the argument then keeps the
     /// existing explicit error instead of a guessed rendering.
     fn coerce_raw_fmt_arg(&self, frames: &[Frame], value: &Value) -> Option<Value> {
@@ -669,6 +670,142 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// The declared type a runtime projection denotes over a
+    /// place of declared type `root`, walked the way the
+    /// resolved read walks the value: a structural step first
+    /// follows the reference layers the target's formation
+    /// absorbed (a MIR place spells those as `Deref` steps; the
+    /// runtime projection drops them, so the step applies to
+    /// the pointee), then steps through the field, index or
+    /// sub-slice it names. Returns the resulting type and the
+    /// (ADT instance, variant, field) of the last ADT field
+    /// step, whose recorded debug shape states the field's
+    /// exact type tag where the IR type cannot. `None` when a
+    /// step names a position the declared types do not
+    /// determine.
+    fn ref_projection_result_ty(
+        &self,
+        root: &crate::ir::Ty,
+        projection: &[RefProj],
+    ) -> Option<(crate::ir::Ty, Option<(String, usize, usize)>)> {
+        use crate::ir::Ty;
+        // The pointee type a structural step applies to.
+        fn deref_ty(ty: &Ty) -> Option<Ty> {
+            match ty {
+                Ty::Ref(inner) => Some((**inner).clone()),
+                _ => None,
+            }
+        }
+        let mut ty = root.clone();
+        let mut variant = 0usize;
+        let mut last_field: Option<(String, usize, usize)> = None;
+        for step in projection {
+            match step {
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                    last_field = None;
+                }
+                RefProj::View(t) => {
+                    ty = t.clone();
+                    variant = 0;
+                    last_field = None;
+                }
+                RefProj::Field(i) => {
+                    while let Some(inner) = deref_ty(&ty) {
+                        ty = inner;
+                    }
+                    match &ty {
+                        Ty::Adt(name) => {
+                            let name = name.clone();
+                            ty = self.adt_field_ty(&ty, variant, *i)?;
+                            last_field = Some((name, variant, *i));
+                        }
+                        Ty::Tuple(_) => {
+                            ty = self.adt_field_ty(&ty, variant, *i)?;
+                            last_field = None;
+                        }
+                        _ => return None,
+                    }
+                    variant = 0;
+                }
+                RefProj::Index(_) => {
+                    while let Some(inner) = deref_ty(&ty) {
+                        ty = inner;
+                    }
+                    match &ty {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => {
+                            ty = (**elem).clone();
+                        }
+                        _ => return None,
+                    }
+                    last_field = None;
+                }
+                RefProj::Subslice { len, .. } => {
+                    while let Some(inner) = deref_ty(&ty) {
+                        ty = inner;
+                    }
+                    match &ty {
+                        Ty::Array(elem, _) => {
+                            ty = Ty::Array(elem.clone(), u64::try_from(*len).ok()?);
+                        }
+                        Ty::Slice(elem) => {
+                            ty = Ty::Slice(elem.clone());
+                        }
+                        _ => return None,
+                    }
+                    last_field = None;
+                }
+                _ => return None,
+            }
+        }
+        Some((ty, last_field))
+    }
+
+    /// The exact type tag at the end of a field projection
+    /// over the local `local` of `body`, read from the debug
+    /// shapes of the ADT instances the projection steps
+    /// through: the local's variable-table entry names its
+    /// exact instance (generic arguments included), and the
+    /// shape recorded for an instance states each field's
+    /// type in that instance — the channel that states a
+    /// field whose type is a generic parameter, which the
+    /// declared-type walk cannot. Only field and downcast
+    /// steps compose in this domain; any other step keeps the
+    /// recovery unstated.
+    fn projected_shape_tag(
+        &self,
+        body: &crate::ir::Body,
+        local: usize,
+        projection: &[RefProj],
+    ) -> Option<String> {
+        let mut tag: Option<String> = None;
+        for entry in &body.debug_vars {
+            if let crate::ir::DebugVar::Place(l, proj) = &entry.source {
+                if *l == local && proj.is_empty() {
+                    if let Some(ty) = &entry.ty {
+                        tag = Some(ty.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        let mut tag = tag?;
+        let mut variant = 0usize;
+        for step in projection {
+            match step {
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                }
+                RefProj::Field(i) => {
+                    tag = self.adt_field_tag(&tag, variant, *i)?;
+                    variant = 0;
+                }
+                _ => return None,
+            }
+        }
+        Some(tag)
+    }
+
     /// The declared type tag of the place a raw fmt argument's
     /// erased reference denotes (see
     /// [`Self::coerce_raw_fmt_arg`]).
@@ -679,11 +816,43 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             }) => {
-                if !projection.is_empty() {
-                    return None;
-                }
                 let frame = frames.iter().find(|f| f.id == *frame)?;
                 let body = self.program().get(&frame.func)?;
+                if !projection.is_empty() {
+                    // A projected place (a field of a local, an
+                    // element of an array): the Self type is the
+                    // local's declared type walked over the
+                    // projection, the same walk the resolved
+                    // read performs over the value.
+                    let root = body.local_tys.get(*local)?;
+                    if let Some((ty, last_field)) =
+                        self.ref_projection_result_ty(root, projection)
+                    {
+                        return match ir_ty_tag(&ty) {
+                            Some(tag) => Some(tag),
+                            None => {
+                                // The walk's one inexact
+                                // rendering is a `char` / `u32`
+                                // the IR type spells alike
+                                // (also nested inside a field's
+                                // own type): the field's recorded
+                                // debug shape states its exact
+                                // tag.
+                                let (name, variant, field) = last_field?;
+                                self.adt_field_tag(&name, variant, field)
+                            }
+                        };
+                    }
+                    // The declared-type walk cannot state a
+                    // field whose type is one of the ADT's
+                    // generic parameters (the field-type table
+                    // records no type for it). The base local's
+                    // variable-table entry names the exact
+                    // instance, and the debug shape recorded
+                    // for that instance states each field's
+                    // type in it.
+                    return self.projected_shape_tag(body, *local, projection);
+                }
                 for entry in &body.debug_vars {
                     if let crate::ir::DebugVar::Place(l, proj) = &entry.source {
                         if *l == *local && proj.is_empty() {
