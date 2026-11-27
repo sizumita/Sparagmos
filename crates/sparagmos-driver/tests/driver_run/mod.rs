@@ -38,6 +38,7 @@ mod stack_overflow;
 mod string_mutators;
 mod strings;
 mod summary_mode;
+mod sort;
 mod sync;
 mod tool_interception;
 mod transmute;

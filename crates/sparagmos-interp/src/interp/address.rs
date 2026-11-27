@@ -3822,6 +3822,37 @@ impl<'a> Interpreter<'a> {
     /// entered value instead would index the offset into the
     /// value's own fields — a different position entirely (the
     /// `MaybeUninit` buffer walk behind array clone).
+    /// The element count of a container an offset position
+    /// can sit in, denominated for an offset of element size
+    /// `size`: a tuple's or ADT value's fields are its
+    /// elements; a vector value in sparse form ranges over
+    /// its storage (see `Value::SparseVec`), spare-capacity
+    /// slots included; a byte string or string is a container
+    /// only for a byte-sized offset. Any other shape denotes
+    /// no container an offset can range over.
+    fn offset_container_count(container: &Value, size: i128) -> Option<i128> {
+        match container {
+            Value::Tuple(items) => i128::try_from(items.len()).ok(),
+            Value::Enum { fields, .. } => i128::try_from(fields.len()).ok(),
+            Value::SparseVec { elems, cap, .. } => {
+                i128::try_from((*cap).max(elems.len() as u128)).ok()
+            }
+            Value::Bytes(b) => {
+                if size != 1 {
+                    return None;
+                }
+                i128::try_from(b.len()).ok()
+            }
+            Value::Str(text) => {
+                if size != 1 {
+                    return None;
+                }
+                i128::try_from(text.len()).ok()
+            }
+            _ => None,
+        }
+    }
+
     fn absorb_displacement(
         &self,
         base: &Value,
@@ -3850,12 +3881,6 @@ impl<'a> Interpreter<'a> {
         let mut cur: &Value = base;
         let mut prefix = projection.len();
         let mut index: i128 = 0;
-        // The container the pending index ranges over, once an
-        // index step has set the position (an owned snapshot: the
-        // walk may materialise further sub-values into `temps`
-        // after the step); `None` while the walk denotes the
-        // container it has navigated to itself.
-        let mut pending_container: Option<Value> = None;
         // The last index step the walk crossed — its position in
         // the projection, the container it ranges over and the
         // index it selects — and whether every step since then
@@ -3865,7 +3890,7 @@ impl<'a> Interpreter<'a> {
         // and an offset over it ranges over the container of
         // that index step, not over the entered value (see the
         // doc comment above).
-        let mut index_level: Option<(usize, Value, i128)> = None;
+        let mut index_level: Option<(usize, Option<i128>, bool, i128)> = None;
         let mut trailing_entry = true;
         for (j, step) in projection.iter().enumerate() {
             match step {
@@ -3943,13 +3968,23 @@ impl<'a> Interpreter<'a> {
                     cur = temps.last().expect("just pushed");
                 }
                 RefProj::Index(idx) => {
-                    index_level =
-                        Some((j, cur.clone(), i128::try_from(*idx).ok()?));
+                    // The trailing-entry judgment below reads
+                    // only the container's element count and
+                    // whether it is a tuple, so the step records
+                    // those, not a clone of the container: a
+                    // clone per index step made an offset over a
+                    // position inside a large container cost the
+                    // container's length.
+                    index_level = Some((
+                        j,
+                        Self::offset_container_count(cur, size),
+                        matches!(cur, Value::Tuple(_)),
+                        i128::try_from(*idx).ok()?,
+                    ));
                     trailing_entry = true;
                     if j + 1 == projection.len() {
                         prefix = j;
                         index = i128::try_from(*idx).ok()?;
-                        pending_container = Some(cur.clone());
                     } else {
                         // Descend into the selected element: the
                         // remaining steps navigate inside it, and
@@ -3965,7 +4000,6 @@ impl<'a> Interpreter<'a> {
                         };
                         prefix = projection.len();
                         index = 0;
-                        pending_container = None;
                     }
                 }
                 _ => return None,
@@ -3982,36 +4016,15 @@ impl<'a> Interpreter<'a> {
         // container, is not absorbed at this level — and is not
         // judged at the entered value either, whose fields the
         // offset does not denominate.
-        if let Some((pos, snap_container, snap_index)) = &index_level {
+        if let Some((pos, snap_count, snap_is_tuple, snap_index)) = &index_level {
             let trailing = &projection[pos + 1..];
             if !trailing.is_empty() && trailing_entry {
-                let count: i128 = match snap_container {
-                    Value::Tuple(items) => i128::try_from(items.len()).ok()?,
-                    Value::Enum { fields, .. } => {
-                        i128::try_from(fields.len()).ok()?
-                    }
-                    Value::SparseVec { elems, cap, .. } => {
-                        i128::try_from((*cap).max(elems.len() as u128)).ok()?
-                    }
-                    Value::Bytes(b) => {
-                        if size != 1 {
-                            return None;
-                        }
-                        i128::try_from(b.len()).ok()?
-                    }
-                    Value::Str(text) => {
-                        if size != 1 {
-                            return None;
-                        }
-                        i128::try_from(text.len()).ok()?
-                    }
-                    _ => return None,
-                };
+                let count: i128 = (*snap_count)?;
                 let new_index =
                     Self::offset_elem_index(*snap_index, total, size, off_count)?;
                 if new_index > count
                     && !(storage_grows
-                        && matches!(snap_container, Value::Tuple(_))
+                        && *snap_is_tuple
                         && new_index
                             <= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS as i128)
                 {
@@ -4030,7 +4043,12 @@ impl<'a> Interpreter<'a> {
         // single-field ADT whose only field is an element
         // aggregate is indexed through that field (the
         // `#[repr(simd)]` pun `project_value` also honours).
-        let mut container: &Value = pending_container.as_ref().unwrap_or(cur);
+        // The container the pending index ranges over is
+        // the value the walk ends on: the index-last arm
+        // above does not advance `cur` past the container it
+        // selects, and every other path leaves the position's
+        // container in `cur` as well.
+        let mut container: &Value = cur;
         loop {
             match container {
                 Value::FatRef { base, .. } => container = base,
@@ -4044,31 +4062,7 @@ impl<'a> Interpreter<'a> {
                 _ => break,
             }
         }
-        let count: i128 = match container {
-            Value::Tuple(items) => i128::try_from(items.len()).ok()?,
-            Value::Enum { fields, .. } => i128::try_from(fields.len()).ok()?,
-            // A vector value in sparse form is an element
-            // container whose extent is its storage (see
-            // `Value::SparseVec`): a displacement in whole
-            // element units denotes the element at that index,
-            // spare-capacity slots included.
-            Value::SparseVec { elems, cap, .. } => {
-                i128::try_from((*cap).max(elems.len() as u128)).ok()?
-            }
-            Value::Bytes(b) => {
-                if size != 1 {
-                    return None;
-                }
-                i128::try_from(b.len()).ok()?
-            }
-            Value::Str(text) => {
-                if size != 1 {
-                    return None;
-                }
-                i128::try_from(text.len()).ok()?
-            }
-            _ => return None,
-        };
+        let count: i128 = Self::offset_container_count(container, size)?;
         let new_index = Self::offset_elem_index(index, total, size, off_count)?;
         // The stored length is the container's extent only
         // for storage that cannot grow: a sequence tuple in
@@ -4189,9 +4183,29 @@ impl<'a> Interpreter<'a> {
             };
             let field_steps: Vec<RefProj> =
                 path.iter().map(|f| RefProj::Field(*f)).collect();
-            let held = self.value_target_value(base?, &field_steps).ok()?;
+            // Only the held value's shape is read here, so
+            // the projection borrows it where it can: the
+            // owning projection (`value_target_value`) clones
+            // the whole element container -- a sort's scratch
+            // buffer, say -- and this judgment runs on every
+            // pointer offset over a field-held sequence, which
+            // made offset-heavy guest code cost the
+            // container's length per offset. The borrowed
+            // projection is the owning one's own segment
+            // projector with the same evidence, so the value
+            // judged (and the errors, discarded here) are the
+            // same; only the clone is gone.
+            let held = project_value_ref_ev(
+                Some(self.program()),
+                None,
+                base?,
+                &field_steps,
+                "<constant>",
+                "constant aggregate",
+            )
+            .ok()?;
             if !matches!(
-                held,
+                held.as_ref(),
                 Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
             ) {
                 return None;
