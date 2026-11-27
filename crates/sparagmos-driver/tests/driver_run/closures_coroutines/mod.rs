@@ -16,5 +16,6 @@ include!("convert_limits.rs");
 include!("wakers.rs");
 include!("coroutine_drop.rs");
 include!("async_futures.rs");
+include!("precise_captures.rs");
 include!("drop_order.rs");
 include!("misc.rs");

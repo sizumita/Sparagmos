@@ -126,19 +126,33 @@ pub(super) fn coroutine_closure_creation(
     None
 }
 
-/// The per-capture "taken by reference" flags of an async
-/// closure, from its creation aggregate's generic arguments:
-/// the upvars tuple (second-to-last) gives the environment's
-/// field types, and the by-reference signature (last, a
-/// fn-pointer type whose output is the tuple of the types the
-/// closure's coroutine borrows for a call) gives each capture's
-/// borrowed type. A capture whose borrowed type is a reference
-/// TO its environment type was taken by value - the call borrows
-/// the environment field itself. Any other capture was taken by
-/// reference - the environment field is itself a reference, and
-/// the call reborrows it. `None` when the arguments do not have
-/// the expected shape.
-pub(super) fn async_capture_by_ref(generic_args: &[mir::Ty]) -> Option<Vec<bool>> {
+/// The per-capture plan of an async closure, from its creation
+/// aggregate's generic arguments: the upvars tuple (second-to-last)
+/// gives the environment's field types, and the by-reference
+/// signature (last, a fn-pointer type whose output is the tuple of
+/// the types the closure's coroutine borrows for a call) gives the
+/// coroutine's capture types, in borrow order.
+///
+/// A capture whose borrowed type is a reference TO its environment
+/// type was taken by value - the call borrows the environment field
+/// itself (`Single(false)`). A capture whose borrowed type equals
+/// its environment type was taken by reference - the environment
+/// field is itself a reference, and the call reborrows it
+/// (`Single(true)`). When neither holds, the environment field is a
+/// reference whose pointee's fields the coroutine borrows
+/// disjointly - a deref (precise) capture: the borrowed types are
+/// matched against the pointee's field types in field order, each
+/// borrowed type taking the first not-yet-taken field of that type
+/// (the order the compiler's own capture list uses for the fields
+/// of one base), and the environment field fans out to one
+/// coroutine field per matched pointee field (`FanOut`).
+/// `pointee_field_ty` answers a pointee type's field types by
+/// index. `None` when the arguments do not have the expected shape
+/// or a borrowed type matches nothing.
+pub(super) fn async_capture_plan(
+    generic_args: &[mir::Ty],
+    pointee_field_ty: &dyn Fn(&mir::Ty, u32) -> Option<mir::Ty>,
+) -> Option<Vec<ir::AsyncCapture>> {
     let upvars = match generic_args.iter().rev().nth(1) {
         Some(mir::Ty::Tuple(ts)) => ts,
         _ => return None,
@@ -150,18 +164,68 @@ pub(super) fn async_capture_by_ref(generic_args: &[mir::Ty]) -> Option<Vec<bool>
         },
         _ => return None,
     };
-    if upvars.len() != borrowed.len() {
+    let mut plan = Vec::with_capacity(upvars.len());
+    let mut cursor = 0usize;
+    for env_ty in upvars {
+        if let Some(b) = borrowed.get(cursor) {
+            if matches!(b, mir::Ty::Ref(_, inner, _) if &**inner == env_ty) {
+                plan.push(ir::AsyncCapture::Single(false));
+                cursor += 1;
+                continue;
+            }
+            if b == env_ty {
+                plan.push(ir::AsyncCapture::Single(true));
+                cursor += 1;
+                continue;
+            }
+        }
+        let mir::Ty::Ref(_, pointee, env_mut) = env_ty else {
+            return None;
+        };
+        let mut used: Vec<bool> = Vec::new();
+        let mut fields: Vec<u32> = Vec::new();
+        while let Some(b) = borrowed.get(cursor) {
+            let mir::Ty::Ref(_, want, b_mut) = b else {
+                break;
+            };
+            if !(env_mut == b_mut || (env_mut.is_mut() && !b_mut.is_mut())) {
+                break;
+            }
+            let mut k = 0u32;
+            let found = loop {
+                if used.get(k as usize).copied().unwrap_or(false) {
+                    k += 1;
+                    continue;
+                }
+                match pointee_field_ty(pointee, k) {
+                    Some(fty) => {
+                        if fty == **want {
+                            break Some(k);
+                        }
+                        k += 1;
+                    }
+                    None => break None,
+                }
+            };
+            let Some(k) = found else {
+                break;
+            };
+            while used.len() <= k as usize {
+                used.push(false);
+            }
+            used[k as usize] = true;
+            fields.push(k);
+            cursor += 1;
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        plan.push(ir::AsyncCapture::FanOut(fields));
+    }
+    if cursor != borrowed.len() {
         return None;
     }
-    Some(
-        upvars
-            .iter()
-            .zip(borrowed.iter())
-            .map(|(env_ty, borrowed_ty)| {
-                !matches!(borrowed_ty, mir::Ty::Ref(_, inner, _) if &**inner == env_ty)
-            })
-            .collect(),
-    )
+    Some(plan)
 }
 
 pub(super) fn fn_self_is_closure_or_dyn(ty: &mir::Ty) -> bool {

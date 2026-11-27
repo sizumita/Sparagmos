@@ -159,7 +159,7 @@ pub(super) struct Converter<'a> {
     /// computed in `Converter::new` from the creation aggregates:
     /// a pure function of the program, so every conversion round
     /// computes the same table.
-    pub(super) async_closure_captures: HashMap<String, Vec<bool>>,
+    pub(super) async_closure_captures: HashMap<String, Vec<ir::AsyncCapture>>,
     /// Materialisation plans of the program (see
     /// [`MirProgram::mat_plans`]), interned in `Converter::new`
     /// into `mat_table` in sorted-key order: every conversion
@@ -318,9 +318,9 @@ impl<'a> Converter<'a> {
             .unwrap_or(false)
     }
 
-    /// Record the per-capture "taken by reference" flags of
-    /// every async closure the program creates (see
-    /// [`async_capture_by_ref`]), keyed by the closure's program
+    /// Record the per-capture plan of every async closure the
+    /// program creates (see [`async_capture_plan`]), keyed by the
+    /// closure's program
     /// key - the key the created `Value::Closure` carries.
     fn compute_async_closure_captures(&mut self, program: &MirProgram) {
         // Definitions the driver recorded as coroutine closures
@@ -352,10 +352,32 @@ impl<'a> Converter<'a> {
                     else {
                         continue;
                     };
-                    if let Some(flags) = async_capture_by_ref(generic_args) {
-                        self.async_closure_captures
+                    let plan = {
+                        let field_ty = |pointee: &mir::Ty, field: u32| -> Option<mir::Ty> {
+                            match pointee {
+                                mir::Ty::Tuple(ts) => ts.get(field as usize).cloned(),
+                                mir::Ty::Adt(def, args) => {
+                                    self.adt_fields.get(*def, args, 0, field).cloned()
+                                }
+                                _ => None,
+                            }
+                        };
+                        async_capture_plan(generic_args, &field_ty)
+                    };
+                    if let Some(plan) = plan {
+                        // A computed plan replaces the empty
+                        // placeholder the `async_closure_defs` pass
+                        // above recorded for the same definition
+                        // (that placeholder stands only for a
+                        // definition no creation aggregate names);
+                        // among computed plans the first wins.
+                        let entry = self
+                            .async_closure_captures
                             .entry(self.body_key(def))
-                            .or_insert(flags);
+                            .or_insert_with(Vec::new);
+                        if entry.is_empty() {
+                            *entry = plan;
+                        }
                     }
                 }
             }
