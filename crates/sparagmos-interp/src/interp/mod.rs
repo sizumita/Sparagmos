@@ -188,7 +188,8 @@ pub struct InterpConfig {
     pub max_call_depth: usize,
     /// The entry (main) thread's stack budget, in bytes. A frame
     /// push that would take the thread's charged stack usage (the
-    /// sum of its live frames' declared-local sizes) past this
+    /// sum of its live frames' materialised-local sizes; see
+    /// `body_stack_charge`) past this
     /// budget ends the run the way a native stack overflow does:
     /// the runtime's `has overflowed its stack` report on the
     /// guest's stderr and an abort (see
@@ -372,8 +373,9 @@ pub(crate) struct Frame {
     pub(crate) func: String,
     pub(crate) locals: Vec<Value>,
     /// The frame's stack charge: the total size of the body's
-    /// declared locals, accounted against the owning thread's
-    /// stack budget (see [`Interpreter::charge_stack`]).
+    /// materialised locals, accounted against the owning
+    /// thread's stack budget (see [`body_stack_charge`] and
+    /// [`Interpreter::charge_stack`]).
     pub(crate) stack_bytes: u64,
     block: usize,
     stmt: usize,
@@ -1035,6 +1037,494 @@ pub struct Interpreter<'a> {
     mat_origins: std::cell::RefCell<HashMap<String, Value>>,
 }
 
+/// How an assignment's rvalue treats an operand that carries
+/// a pointer into the assigning frame (see
+/// [`body_stack_charge`]'s address-escape accounting).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PointerFlow {
+    /// The rvalue's result is a pointer derived from the
+    /// operand (a move, cast, offset or pointer projection):
+    /// the flow travels on to the destination local.
+    Propagate,
+    /// The operand's bits are observed as data, or the pointer
+    /// is stored into a constructed value: every frame local
+    /// the operand may address materialises.
+    Escape,
+    /// A modelled operation consumes the pointer in place (a
+    /// memcpy's endpoints): the flow neither travels nor
+    /// escapes.
+    Modelled,
+}
+
+/// Note one operand read for the address-escape accounting:
+/// when the operand is a plain place naming a local that
+/// carries a pointer into the frame (`flow` maps such a local
+/// to the frame locals it may address), apply `mode`. A
+/// projected place reads through (or into) the root's value,
+/// not the pointer itself, and is not a pointer read. Returns
+/// whether `flow` or `escaped` changed.
+fn note_pointer_operand(
+    flow: &mut std::collections::HashMap<usize, Vec<usize>>,
+    escaped: &mut Vec<bool>,
+    dest: Option<&Place>,
+    operand: &Operand,
+    mode: PointerFlow,
+) -> bool {
+    let place = match operand {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Constant(_) => return false,
+    };
+    if !place.projection.is_empty() {
+        return false;
+    }
+    let Some(targets) = flow.get(&place.local.0).cloned() else {
+        return false;
+    };
+    let mut escape_targets = |escaped: &mut Vec<bool>| {
+        let mut changed = false;
+        for t in &targets {
+            if *t < escaped.len() && !escaped[*t] {
+                escaped[*t] = true;
+                changed = true;
+            }
+        }
+        changed
+    };
+    match mode {
+        PointerFlow::Modelled => false,
+        PointerFlow::Escape => escape_targets(escaped),
+        PointerFlow::Propagate => {
+            match dest {
+                // A plain destination other than the return
+                // place keeps the pointer inside the frame's
+                // plain locals: the flow travels.
+                Some(dest) if dest.projection.is_empty() && dest.local.0 != 0 => {
+                    let entry = flow.entry(dest.local.0).or_default();
+                    let mut changed = false;
+                    for t in targets {
+                        if !entry.contains(&t) {
+                            entry.push(t);
+                            changed = true;
+                        }
+                    }
+                    changed
+                }
+                // Stored into a projected place, returned in
+                // the return place, or consumed with no
+                // destination: the address leaves the frame's
+                // plain locals.
+                _ => escape_targets(escaped),
+            }
+        }
+    }
+}
+
+/// The stack charge of one frame of `body`: the total size of
+/// the locals that materialise as stack storage in the native
+/// frame. A local materialises when it is an argument (the
+/// caller marshals it into the frame's argument area), when a
+/// call or drop terminator reads it (its value must be
+/// marshalled into, or preserved across, the callee -- a
+/// modelled builtin callee counts the same: `mem::drop` of a
+/// large local really does pass it by value), or when its
+/// address escapes the body's modelled pointer flow.
+///
+/// Every other local is a value in flight between a definition
+/// and its uses within the frame: the interpreter holds those
+/// as values, and the native compiler likewise keeps them in
+/// registers or eliminates them. The measured shape that pins
+/// this down is a `vec![zeroed::<[u8; 32_768]>()]` built on a
+/// 16 KiB thread stack: the construction pipelines the array
+/// through three declared locals of 32 KiB each (the
+/// `MaybeUninit` the memset writes into and its two move
+/// destinations), yet the native frame is a few hundred bytes,
+/// because the value is written straight into the box
+/// allocation -- charging every declared local charged that
+/// frame 98,529 bytes and reported an overflow the native run
+/// never has.
+///
+/// Address escape: a `Ref` / `Reborrow` rvalue gives a local
+/// an address. The address stays inside the frame's modelled
+/// flow while it only travels between plain locals through
+/// pointer-preserving rvalues (moves, casts, offsets, pointer
+/// projections) and is read only by modelled operations -- a
+/// `CallBuiltin` terminator's arguments (a `write_bytes`
+/// memset writes through it in place, into the value the
+/// frame already holds) and `CopyNonOverlapping` (a memcpy
+/// between two such pointers). The rooted local materialises
+/// as soon as the address leaves that flow: passed to a guest
+/// call, stored into a projected place or a constructed
+/// aggregate, returned in the return place, converted to an
+/// integer, or read as data by anything else. `size_of`
+/// resolves each materialised local's size (the
+/// conversion-recorded size when there is one, else the
+/// declared type's size, else 0).
+fn body_stack_charge(body: &Body, size_of: &mut dyn FnMut(usize, &Ty) -> u64) -> u64 {
+    let n = body.local_tys.len();
+    let mut materialised = vec![false; n];
+    let mut mark = |materialised: &mut Vec<bool>, local: usize| {
+        if local < n {
+            materialised[local] = true;
+        }
+    };
+    // Arguments: locals 1..=arg_count (local 0 is the return
+    // place, whose storage is the caller's).
+    for local in 1..=body.arg_count {
+        mark(&mut materialised, local);
+    }
+    let operand_root = |operand: &Operand| -> Option<usize> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => Some(place.local.0),
+            Operand::Constant(_) => None,
+        }
+    };
+    // Terminator reads: a value a terminator consumes must be
+    // marshalled into (or preserved across) the callee.
+    for block in &body.blocks {
+        match &block.terminator {
+            TerminatorKind::Call { args, .. }
+            | TerminatorKind::CallBuiltin { args, .. } => {
+                for arg in args {
+                    if let Some(root) = operand_root(arg) {
+                        mark(&mut materialised, root);
+                    }
+                }
+            }
+            TerminatorKind::CallIndirect { func, args, .. } => {
+                if let Some(root) = operand_root(func) {
+                    mark(&mut materialised, root);
+                }
+                for arg in args {
+                    if let Some(root) = operand_root(arg) {
+                        mark(&mut materialised, root);
+                    }
+                }
+            }
+            TerminatorKind::CallTrait {
+                receiver, args, ..
+            } => {
+                if let Some(root) = operand_root(receiver) {
+                    mark(&mut materialised, root);
+                }
+                if let Some(root) = operand_root(args) {
+                    mark(&mut materialised, root);
+                }
+            }
+            TerminatorKind::Drop { place, .. } => {
+                mark(&mut materialised, place.local.0)
+            }
+            _ => {}
+        }
+    }
+    // Address escape: seeds and propagation, to a fixpoint
+    // (the flow only grows).
+    let mut flow: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut escaped = vec![false; n];
+    loop {
+        let mut changed = false;
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    StatementKind::Assign(dest, rvalue) => {
+                        let dest = Some(dest);
+                        match rvalue {
+                            Rvalue::Ref(place) | Rvalue::Reborrow(place) => {
+                                // The seed: a pointer to `place`'s
+                                // root, or -- through a deref --
+                                // whatever the dereferenced pointer
+                                // itself may address.
+                                let targets: Vec<usize> = if place
+                                    .projection
+                                    .first()
+                                    == Some(&ProjectionElem::Deref)
+                                {
+                                    flow.get(&place.local.0).cloned().unwrap_or_default()
+                                } else {
+                                    vec![place.local.0]
+                                };
+                                if targets.is_empty() {
+                                    continue;
+                                }
+                                match dest {
+                                    Some(d)
+                                        if d.projection.is_empty() && d.local.0 != 0 =>
+                                    {
+                                        let entry =
+                                            flow.entry(d.local.0).or_default();
+                                        for t in targets {
+                                            if !entry.contains(&t) {
+                                                entry.push(t);
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        for t in targets {
+                                            if t < n && !escaped[t] {
+                                                escaped[t] = true;
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Rvalue::Use(op)
+                            | Rvalue::Cast(op, _)
+                            | Rvalue::Unsize(op, _)
+                            | Rvalue::BoxDerefTransmute(op)
+                            | Rvalue::DataPtr(op)
+                            | Rvalue::PtrField(op, _)
+                            | Rvalue::PtrFieldFirstElem(op, _)
+                            | Rvalue::PtrCastUnits(op, _)
+                            | Rvalue::PtrFirstElem(op)
+                            | Rvalue::PtrArrayBase(op)
+                            | Rvalue::PtrFieldBase(op, _)
+                            | Rvalue::WrapArrayElems(op)
+                            | Rvalue::UnwrapArrayElems(op)
+                            | Rvalue::UnwrapSliceElems(op)
+                            | Rvalue::WrapSliceElems(op)
+                            | Rvalue::BytesToStr(op)
+                            | Rvalue::FnPtrToPtr(op)
+                            | Rvalue::SliceEnumToInt(op, ..)
+                            | Rvalue::SliceIntToEnum(op, ..) => {
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    op,
+                                    PointerFlow::Propagate,
+                                );
+                            }
+                            Rvalue::PtrOffset(base, count, ..) => {
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    base,
+                                    PointerFlow::Propagate,
+                                );
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    count,
+                                    PointerFlow::Escape,
+                                );
+                            }
+                            Rvalue::RawPtrAggregate { data, meta } => {
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    data,
+                                    PointerFlow::Propagate,
+                                );
+                                if let Some(meta) = meta {
+                                    changed |= note_pointer_operand(
+                                        &mut flow,
+                                        &mut escaped,
+                                        dest,
+                                        meta,
+                                        PointerFlow::Escape,
+                                    );
+                                }
+                            }
+                            Rvalue::AggregateTuple(ops)
+                            | Rvalue::CoroutineAggregate(ops) => {
+                                for op in ops {
+                                    changed |= note_pointer_operand(
+                                        &mut flow,
+                                        &mut escaped,
+                                        dest,
+                                        op,
+                                        PointerFlow::Escape,
+                                    );
+                                }
+                            }
+                            Rvalue::AggregateAdt { operands, .. }
+                            | Rvalue::ClosureAggregate { operands, .. } => {
+                                for op in operands {
+                                    changed |= note_pointer_operand(
+                                        &mut flow,
+                                        &mut escaped,
+                                        dest,
+                                        op,
+                                        PointerFlow::Escape,
+                                    );
+                                }
+                            }
+                            Rvalue::UnaryOp(_, op)
+                            | Rvalue::PtrToInt(op)
+                            | Rvalue::IntToPtr(op)
+                            | Rvalue::Materialize(op, _)
+                            | Rvalue::EnumToInt(op, ..)
+                            | Rvalue::IntToEnum(op, ..)
+                            | Rvalue::Reinterpret(op, ..) => {
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    op,
+                                    PointerFlow::Escape,
+                                );
+                            }
+                            Rvalue::IntToPtrWrapped { operand, .. }
+                            | Rvalue::ScalarToPtrWrapped { operand, .. }
+                            | Rvalue::EnumToPtrWrapped { operand, .. }
+                            | Rvalue::IntToEnumWrapped { operand, .. } => {
+                                changed |= note_pointer_operand(
+                                    &mut flow,
+                                    &mut escaped,
+                                    dest,
+                                    operand,
+                                    PointerFlow::Escape,
+                                );
+                            }
+                            Rvalue::ShapedLoad(place, ..)
+                            | Rvalue::Len(place)
+                            | Rvalue::Discriminant(place, _)
+                            | Rvalue::CopyForDeref(place) => {
+                                // A place read: through a
+                                // projection it reads the root's
+                                // value, not the pointer itself; a
+                                // plain place naming a pointer
+                                // local observes the pointer as
+                                // data of some unmodelled kind.
+                                if place.projection.is_empty() {
+                                    if let Some(targets) =
+                                        flow.get(&place.local.0).cloned()
+                                    {
+                                        for t in targets {
+                                            if t < n && !escaped[t] {
+                                                escaped[t] = true;
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    StatementKind::CopyNonOverlapping { src, dst, count } => {
+                        note_pointer_operand(
+                            &mut flow,
+                            &mut escaped,
+                            None,
+                            src,
+                            PointerFlow::Modelled,
+                        );
+                        note_pointer_operand(
+                            &mut flow,
+                            &mut escaped,
+                            None,
+                            dst,
+                            PointerFlow::Modelled,
+                        );
+                        changed |= note_pointer_operand(
+                            &mut flow,
+                            &mut escaped,
+                            None,
+                            count,
+                            PointerFlow::Escape,
+                        );
+                    }
+                    StatementKind::Assume(op) => {
+                        changed |= note_pointer_operand(
+                            &mut flow,
+                            &mut escaped,
+                            None,
+                            op,
+                            PointerFlow::Escape,
+                        );
+                    }
+                    StatementKind::ShapedStore { value, .. } => {
+                        changed |= note_pointer_operand(
+                            &mut flow,
+                            &mut escaped,
+                            None,
+                            value,
+                            PointerFlow::Escape,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Terminator uses of a flow pointer: a guest call (or an
+    // assertion reading the value) observes the address; a
+    // modelled builtin call does not.
+    let mut escape_operand = |flow: &std::collections::HashMap<usize, Vec<usize>>,
+                              escaped: &mut Vec<bool>,
+                              operand: &Operand| {
+        if let Operand::Copy(place) | Operand::Move(place) = operand {
+            if place.projection.is_empty() {
+                if let Some(targets) = flow.get(&place.local.0) {
+                    for t in targets.clone() {
+                        if t < n {
+                            escaped[t] = true;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    for block in &body.blocks {
+        match &block.terminator {
+            TerminatorKind::Call { args, .. } => {
+                for arg in args {
+                    escape_operand(&flow, &mut escaped, arg);
+                }
+            }
+            TerminatorKind::CallIndirect { func, args, .. } => {
+                escape_operand(&flow, &mut escaped, func);
+                for arg in args {
+                    escape_operand(&flow, &mut escaped, arg);
+                }
+            }
+            TerminatorKind::CallTrait {
+                receiver, args, ..
+            } => {
+                escape_operand(&flow, &mut escaped, receiver);
+                escape_operand(&flow, &mut escaped, args);
+            }
+            TerminatorKind::SwitchInt { discr, .. } => {
+                escape_operand(&flow, &mut escaped, discr);
+            }
+            TerminatorKind::Assert {
+                cond, operands, ..
+            } => {
+                escape_operand(&flow, &mut escaped, cond);
+                for op in operands {
+                    escape_operand(&flow, &mut escaped, op);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (local, is_escaped) in escaped.iter().enumerate() {
+        if *is_escaped {
+            mark(&mut materialised, local);
+        }
+    }
+    body.local_tys
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            if materialised[i] {
+                size_of(i, ty)
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 impl<'a> Interpreter<'a> {
     pub fn new(program: &'a Program) -> Self {
         Interpreter::with_config(program, InterpConfig::default())
@@ -1290,8 +1780,9 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The stack charge of one frame of `body`, in bytes: the
-    /// total size of the body's declared locals, as the native
-    /// frame reserves room for them. A local's size is the one
+    /// total size of the locals the native frame reserves room
+    /// for -- the ones that materialise as stack storage (see
+    /// [`body_stack_charge`]). A local's size is the one
     /// conversion recorded for it (see `ir::Body::local_sizes`)
     /// when it has one, else the size the declared type resolves
     /// to here; a local neither can size contributes nothing
@@ -1301,19 +1792,14 @@ impl<'a> Interpreter<'a> {
         if let Some(size) = self.frame_stack_sizes.borrow().get(&body.name) {
             return *size;
         }
-        let size = body
-            .local_tys
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| {
-                body.local_sizes
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .or_else(|| self.ty_size_full(ty))
-                    .unwrap_or(0)
-            })
-            .sum();
+        let size = body_stack_charge(body, &mut |i, ty| {
+            body.local_sizes
+                .get(i)
+                .copied()
+                .flatten()
+                .or_else(|| self.ty_size_full(ty))
+                .unwrap_or(0)
+        });
         self.frame_stack_sizes
             .borrow_mut()
             .insert(body.name.clone(), size);
