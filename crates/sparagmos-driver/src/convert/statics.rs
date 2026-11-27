@@ -23,6 +23,22 @@ pub(crate) fn static_is_foreign(def: &mir::mono::StaticDef) -> bool {
     tcx.is_foreign_item(internal)
 }
 
+/// The alignment the static item `def_id`'s own attributes
+/// demand (`#[rustc_align_static(N)]`, recorded by the compiler
+/// in the item's codegen attributes alongside its link section
+/// and import linkage), in bytes. `None` when the item carries
+/// no such attribute, when there is no compilation context to
+/// ask, or when the question cannot be answered.
+pub(crate) fn static_declared_align(def_id: &rustc_public::DefId) -> Option<u64> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, *def_id);
+        tcx.codegen_fn_attrs(internal)
+            .alignment
+            .map(|align| align.bytes())
+    })
+}
+
 /// The static that provides the storage of the extern-item-impl
 /// (EII) declaration `def`, when `def` is one. An EII
 /// declaration (`#[eii(name)] static X: T;`, or one carrying a

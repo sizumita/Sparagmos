@@ -136,6 +136,9 @@ pub struct MirProgram {
     /// Declared types of the program's statics, as recorded by
     /// the driver (see `mir::StaticTys`).
     pub static_tys: mir::StaticTys,
+    /// Declared alignments of the program's statics, as recorded
+    /// by the driver (see `mir::StaticAligns`).
+    pub static_aligns: mir::StaticAligns,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, as recorded by the driver
     /// (see `mir::AdtInstanceShapes`). Consulted for an ADT
