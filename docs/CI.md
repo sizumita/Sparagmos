@@ -471,6 +471,26 @@ denominator. Runs on every push to `main` and on manual dispatch.
   spawn a child to feed its stdin (the process model
   fabricates no child handle, and tool requests carry no
   stdin) stay unsupported.
+- One class of intercepted invocation is not judged by
+  conversion: when a recipe's compiler invocation carries
+  an emit set that is dep-info alone, the real compiler
+  answers it at its dep-info phase boundary -- it stops
+  after parsing, macro expansion and name resolution, so
+  the invocation succeeds exactly when the crate parses,
+  expands and resolves, and diagnostics from type checking
+  or any later phase (a type error, a borrow error) do not
+  bear on it. The interception honours that verdict: when
+  the conversion of such an invocation fails, the verdict
+  is re-taken by a session run only to that same phase
+  boundary (the driver's `--dep-info-verdict` mode), and a
+  crate that resolves cleanly succeeds, producing the
+  dep-info file and no primary artifact, as the real
+  compiler does. An invocation carrying any further emit
+  kind (dep-info with link or metadata included) keeps the
+  conversion verdict, as the real compiler judges it in
+  full. The cargo shim's side-channel verdicts are
+  unaffected: they record the conversion verdict by design
+  (see the cargo-shim paragraph above).
 - Metric 3 runs in its own job (`metric3`), alongside the shards:
   `scripts/std-coverage.py --survey-json` takes the stage-1
   candidates (exec, single-file, ui / ui-fulldeps) from the survey

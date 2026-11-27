@@ -129,7 +129,7 @@ pub(crate) fn execute(
                 .map(|prog| prog.as_bytes().to_vec())
                 .collect(),
             runner: sparagmos_interp::ToolRunner(std::sync::Arc::new(
-                move |request| tool_run(request, &registry, &exe),
+                move |request| tool_run(request, &registry, &exe, true),
             )),
             // Programs the guest itself produced during the run
             // (a recipe executing a binary it built) are answered

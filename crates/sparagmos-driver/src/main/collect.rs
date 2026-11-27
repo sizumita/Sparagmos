@@ -69,6 +69,61 @@ pub(crate) fn run_conversion_compiler(args: &[String]) -> Result<(), rustc_publi
     ConversionCallbacks { result: None }.run(args)
 }
 
+/// The callbacks driving a dep-info verdict run: the session
+/// is assembled exactly as a conversion's is, but stops after
+/// expansion -- the phase boundary the real compiler's
+/// dep-info mode stops at, where parsing, macro expansion and
+/// all of name resolution are complete and no type checking
+/// has run -- and records whether the session reached that
+/// boundary error-free. Nothing is converted or collected:
+/// the run answers only the verdict a `--emit dep-info`-only
+/// invocation carries (see `tool_run` in tools.rs).
+struct ResolutionVerdictCallbacks {
+    resolved: Option<bool>,
+}
+
+impl ResolutionVerdictCallbacks {
+    fn run(&mut self, args: &[String]) -> Result<bool, rustc_public::CompilerError<()>> {
+        let compiler_result =
+            rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                rustc_driver::run_compiler(args, self);
+                Ok(())
+            });
+        match (compiler_result, self.resolved.take()) {
+            (Ok(Ok(())), Some(resolved)) => Ok(resolved),
+            // The compiler died on a fatal diagnostic before
+            // expansion completed (a parse error is the
+            // ordinary case): the crate did not resolve.
+            (Ok(Err(_)), _) | (Err(_), _) => Ok(false),
+            // The run completed without the callback firing:
+            // the invocation never reached expansion (an
+            // informational one), so it carries no resolution
+            // verdict to report.
+            (Ok(Ok(())), None) => Err(rustc_public::CompilerError::Skipped),
+        }
+    }
+}
+
+impl rustc_driver::Callbacks for ResolutionVerdictCallbacks {
+    fn after_expansion(
+        &mut self,
+        _compiler: &rustc_interface::interface::Compiler,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+    ) -> rustc_driver::Compilation {
+        self.resolved = Some(tcx.dcx().err_count() == 0);
+        rustc_driver::Compilation::Stop
+    }
+}
+
+/// Run the compiler over `args` only as far as the dep-info
+/// phase boundary and report whether the crate resolved
+/// (see `ResolutionVerdictCallbacks`).
+pub(crate) fn run_resolution_verdict(
+    args: &[String],
+) -> Result<bool, rustc_public::CompilerError<()>> {
+    ResolutionVerdictCallbacks { resolved: None }.run(args)
+}
+
 /// The compiler callback, in the `run_with_tcx` form: the
 /// context is installed for the conversion's span resolution
 /// (see `sparagmos_driver::convert::set_compiler_tcx`) and

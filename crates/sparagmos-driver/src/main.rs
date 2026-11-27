@@ -799,6 +799,7 @@ fn driver_main_inner() {
     let mut tool_programs: Vec<String> = Vec::new();
     let mut guest_process_host = false;
     let mut compiletest_check_mode = false;
+    let mut dep_info_verdict = false;
     let mut coverage_color = false;
     let mut dump_path: Option<String> = None;
     let mut compiler_stdout: Option<String> = None;
@@ -944,6 +945,9 @@ fn driver_main_inner() {
             "--compiletest-check-mode" => {
                 compiletest_check_mode = true;
             }
+            "--dep-info-verdict" => {
+                dep_info_verdict = true;
+            }
             "--coverage-color" => {
                 coverage_color = true;
             }
@@ -962,7 +966,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--dep-info-verdict] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -1284,6 +1288,37 @@ fn driver_main_inner() {
     );
     let panic_abort = session_panic_abort(&args);
     let sigpipe = session_sigpipe(&args);
+    if dep_info_verdict && mode == Mode::Convert {
+        // A dep-info verdict run (see `run_resolution_verdict`
+        // in collect.rs): the session the arguments assembled
+        // runs only to the phase boundary the real compiler's
+        // dep-info mode stops at, and the exit code is that
+        // boundary's own verdict -- 0 when the crate parses,
+        // expands and resolves, 1 when it does not. Nothing is
+        // converted or collected, and no report is printed.
+        // Only the tool interception asks for this, and only
+        // for a guest invocation whose emit set is dep-info
+        // alone; the compiler's own diagnostics have already
+        // reached stderr through the session's emitter, as the
+        // real compiler's would.
+        let verdict_hook = begin_panic_capture();
+        let mut verdict_stdout_guard = StdoutToStderr::new();
+        let verdict_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_resolution_verdict(args.as_slice())
+        }));
+        verdict_stdout_guard.restore();
+        end_panic_capture(verdict_hook);
+        match verdict_outcome {
+            Ok(Ok(true)) => exit_process(0),
+            Ok(Ok(false)) | Ok(Err(_)) => exit_process(1),
+            Err(payload) => {
+                let reason = take_captured_panic()
+                    .or_else(|| payload_reason(&*payload))
+                    .unwrap_or_else(|| "panic with a non-string payload".to_string());
+                report_escaped_panic(&reason, exec_mode, mode);
+            }
+        }
+    }
     let previous_hook = begin_panic_capture();
     let mut stdout_guard = match &compiler_stdout {
         Some(path) => StdoutToStderr::to_file(std::path::Path::new(path)),
