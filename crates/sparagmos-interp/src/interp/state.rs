@@ -255,6 +255,17 @@ pub(crate) struct CommandState {
     /// wiring; the tool model never feeds a child's stdin and
     /// ignores it.
     pub stdin_stdio: Option<StdioConfig>,
+    /// The child user id set through `CommandExt::uid`,
+    /// when the guest set one; the process host applies
+    /// it at spawn, so an id the host process may not
+    /// assume fails the spawn the way the native one
+    /// does.
+    pub uid: Option<u32>,
+    /// The child group id set through `CommandExt::gid`.
+    pub gid: Option<u32>,
+    /// The supplementary groups set through
+    /// `CommandExt::groups`.
+    pub groups: Option<Vec<u32>>,
 }
 
 /// One live child process started through the process host
@@ -371,6 +382,35 @@ pub(crate) struct BarrierState {
 /// model builds (`File` -> sys `File` -> `FileDesc` ->
 /// `OwnedFd` -> descriptor), each layer a one-field aggregate.
 /// A value of any other shape is not a modelled handle.
+/// What one guest descriptor number currently denotes in
+/// the interpreter's descriptor routing (see the `desc_*`
+/// accessors on the interpreter in this module). The
+/// descriptor space is one space: a number names a
+/// file-table entry, a socket-table entry, or one of the
+/// three standard streams, and the guest's `dup` / `dup2` /
+/// `close` calls reroute numbers between those denotations.
+/// `File` / `Socket` carry the table id of the entry the
+/// descriptor denotes (the descriptor's own number for an
+/// unrouted descriptor, a duplicate's entry for a rerouted
+/// one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescRoute {
+    File(u64),
+    Socket(u64),
+    /// Descriptor 0's default denotation: the stdin file
+    /// entry (`STDIN_FILE_ID`).
+    Stdin,
+    /// The guest's captured stdout (descriptor 1's default
+    /// denotation).
+    Stdout,
+    /// The guest's captured stderr (descriptor 2's default
+    /// denotation).
+    Stderr,
+    /// The descriptor names nothing: never issued, or
+    /// closed since.
+    Closed,
+}
+
 pub(crate) fn file_handle_id(value: &Value) -> Option<u64> {
     let mut cur = value;
     for _ in 0..8 {
@@ -935,6 +975,259 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn file_handle_closed(&self, id: u64) {
         self.files.borrow_mut().remove(&id);
+    }
+
+    /// The file-table id of the `/dev/null` entry, opened
+    /// on first use: the standard-input model hands its
+    /// handle out while descriptor 0 is closed, since std
+    /// reads a closed stdin as end-of-file and a null
+    /// device answers reads with exactly that.
+    pub(crate) fn null_file_id(&self) -> u64 {
+        if let Some(id) = *self.null_file.borrow() {
+            return id;
+        }
+        let file = std::fs::File::open("/dev/null")
+            .expect("opening /dev/null cannot fail");
+        let id = self.register_file(file);
+        *self.null_file.borrow_mut() = Some(id);
+        id
+    }
+
+    /// The allocation id of the main-program handle the
+    /// `dlopen` model hands out: an opaque allocation
+    /// whose address is the handle value, allocated on
+    /// first use. Every `dlopen` of the main program
+    /// answers this same handle, as the native one does.
+    pub(crate) fn dlopen_main_handle_id(&self) -> u64 {
+        if let Some(id) = *self.dlopen_main_handle.borrow() {
+            return id;
+        }
+        let id = self.alloc_insert(Value::Bytes(vec![0; 8]));
+        *self.dlopen_main_handle.borrow_mut() = Some(id);
+        id
+    }
+
+    /// What the guest descriptor `fd` currently denotes:
+    /// the rerouting a `dup2` recorded for it if any, else
+    /// the default route -- the standard streams for
+    /// 0/1/2, the same-numbered file or socket entry above
+    /// them, and `Closed` for a number no entry carries.
+    pub(crate) fn desc_route(&self, fd: u64) -> DescRoute {
+        if let Some(route) = self.desc_routes.borrow().get(&fd) {
+            return *route;
+        }
+        match fd {
+            0 => DescRoute::Stdin,
+            1 => DescRoute::Stdout,
+            2 => DescRoute::Stderr,
+            _ if self.files.borrow().contains_key(&fd) => {
+                DescRoute::File(fd)
+            }
+            _ if self.sockets.borrow().contains_key(&fd) => {
+                DescRoute::Socket(fd)
+            }
+            _ => DescRoute::Closed,
+        }
+    }
+
+    /// The file-table entry a descriptor's route runs its
+    /// file operations on: the entry itself for a file
+    /// route, the stdin entry for the stdin route. `None`
+    /// for the captured streams, a socket, or a closed
+    /// descriptor.
+    pub(crate) fn desc_entry_id(&self, fd: u64) -> Option<u64> {
+        match self.desc_route(fd) {
+            DescRoute::File(id) => Some(id),
+            DescRoute::Stdin => Some(self.stdin_file_id()),
+            _ => None,
+        }
+    }
+
+    /// A duplicate of the host file a descriptor denotes
+    /// (its file entry, or the stdin entry), for wiring
+    /// into a spawned child: the duplicate shares the open
+    /// file description, as a spawn's dup of the named
+    /// descriptor does. `None` when the descriptor denotes
+    /// no host file.
+    pub(crate) fn desc_file_clone(
+        &self,
+        fd: u64,
+    ) -> Option<std::fs::File> {
+        let id = self.desc_entry_id(fd)?;
+        self.with_file(id, |file| file.try_clone())
+            .and_then(|result| result.ok())
+    }
+
+    /// Close the guest descriptor `fd`: drop what it
+    /// denotes (a rerouting's entry is dropped with the
+    /// rerouting; a standard stream is recorded closed).
+    /// `false` when the descriptor was already closed --
+    /// the shape `close` reports with `EBADF`.
+    pub(crate) fn desc_close(&self, fd: u64) -> bool {
+        match self.desc_route(fd) {
+            DescRoute::Closed => false,
+            DescRoute::File(id) => {
+                self.desc_routes.borrow_mut().remove(&fd);
+                self.file_handle_closed(id);
+                true
+            }
+            DescRoute::Socket(id) => {
+                self.desc_routes.borrow_mut().remove(&fd);
+                self.socket_handle_closed(id);
+                true
+            }
+            DescRoute::Stdin | DescRoute::Stdout | DescRoute::Stderr => {
+                self.desc_routes
+                    .borrow_mut()
+                    .insert(fd, DescRoute::Closed);
+                true
+            }
+        }
+    }
+
+    /// The fresh descriptor number a duplication of `fd`
+    /// gets: the descriptor counter's next number (the
+    /// counter only grows, so the number is always one no
+    /// live descriptor carries; in the common case -- no
+    /// unrelated descriptor opened since -- it is also the
+    /// lowest free number, as a native `dup` answers).
+    fn desc_fresh_id(&self) -> u64 {
+        let id = *self.next_file.borrow();
+        *self.next_file.borrow_mut() = id + 1;
+        id
+    }
+
+    /// Duplicate the host socket behind a socket-table
+    /// entry into a fresh entry of the same kind and
+    /// guest-visible state, as a descriptor duplication
+    /// requires: the duplicate shares the socket itself
+    /// (its address, its queue, its options).
+    fn desc_clone_socket(&self, id: u64) -> Option<u64> {
+        use std::os::fd::AsFd as _;
+        let cloned = self.with_socket(id, |entry| match entry {
+            SocketEntry::Listener {
+                socket,
+                nonblocking,
+            } => socket
+                .as_fd()
+                .try_clone_to_owned()
+                .map(|owned| {
+                    use std::os::fd::IntoRawFd as _;
+                    use std::os::fd::FromRawFd as _;
+                    let listener = unsafe {
+                        std::net::TcpListener::from_raw_fd(
+                            owned.into_raw_fd(),
+                        )
+                    };
+                    SocketEntry::Listener {
+                        socket: listener,
+                        nonblocking: *nonblocking,
+                    }
+                })
+                .ok(),
+            SocketEntry::Stream {
+                socket,
+                nonblocking,
+                read_timeout,
+                write_timeout,
+            } => socket.try_clone().ok().map(|socket| {
+                SocketEntry::Stream {
+                    socket,
+                    nonblocking: *nonblocking,
+                    read_timeout: *read_timeout,
+                    write_timeout: *write_timeout,
+                }
+            }),
+            SocketEntry::Udp {
+                socket,
+                nonblocking,
+            } => socket.try_clone().ok().map(|socket| {
+                SocketEntry::Udp {
+                    socket,
+                    nonblocking: *nonblocking,
+                }
+            }),
+        })??;
+        Some(self.register_socket(cloned))
+    }
+
+    /// Duplicate the guest descriptor `fd` (`dup`): the
+    /// new descriptor denotes the same open file, socket
+    /// or standard stream. A file or socket is duplicated
+    /// into a fresh table entry sharing the open
+    /// description (a `try_clone` of the host object), so
+    /// either descriptor can be closed without disturbing
+    /// the other, exactly as native descriptors behave. A
+    /// standard stream has no host object to duplicate:
+    /// the new number is recorded as denoting the same
+    /// stream. `None` when `fd` is closed (the `EBADF`
+    /// shape).
+    pub(crate) fn desc_dup(&self, fd: u64) -> Option<u64> {
+        match self.desc_route(fd) {
+            DescRoute::Closed => None,
+            DescRoute::File(id) => {
+                let file = self
+                    .with_file(id, |file| file.try_clone())
+                    .and_then(|result| result.ok())?;
+                Some(self.register_file(file))
+            }
+            DescRoute::Socket(id) => self.desc_clone_socket(id),
+            DescRoute::Stdin => {
+                let id = self.stdin_file_id();
+                let file = self
+                    .with_file(id, |file| file.try_clone())
+                    .and_then(|result| result.ok())?;
+                Some(self.register_file(file))
+            }
+            route @ (DescRoute::Stdout | DescRoute::Stderr) => {
+                let new = self.desc_fresh_id();
+                self.desc_routes.borrow_mut().insert(new, route);
+                Some(new)
+            }
+        }
+    }
+
+    /// Reroute the guest descriptor `newfd` onto what
+    /// `oldfd` denotes (`dup2`): what `newfd` denoted is
+    /// closed first, then `newfd` is recorded as denoting
+    /// a duplicate of `oldfd`'s open file or socket, or
+    /// the same standard stream. `None` when `oldfd` is
+    /// closed (the `EBADF` shape).
+    pub(crate) fn desc_dup2(
+        &self,
+        oldfd: u64,
+        newfd: u64,
+    ) -> Option<u64> {
+        let route = self.desc_route(oldfd);
+        if route == DescRoute::Closed {
+            return None;
+        }
+        if oldfd == newfd {
+            return Some(newfd);
+        }
+        self.desc_close(newfd);
+        let new_route = match route {
+            DescRoute::File(id) => {
+                let file = self
+                    .with_file(id, |file| file.try_clone())
+                    .and_then(|result| result.ok())?;
+                DescRoute::File(self.register_file(file))
+            }
+            DescRoute::Socket(id) => {
+                DescRoute::Socket(self.desc_clone_socket(id)?)
+            }
+            DescRoute::Stdin => {
+                let id = self.stdin_file_id();
+                let file = self
+                    .with_file(id, |file| file.try_clone())
+                    .and_then(|result| result.ok())?;
+                DescRoute::File(self.register_file(file))
+            }
+            stream @ (DescRoute::Stdout | DescRoute::Stderr) => stream,
+            DescRoute::Closed => unreachable!("checked above"),
+        };
+        self.desc_routes.borrow_mut().insert(newfd, new_route);
+        Some(newfd)
     }
 
     pub(crate) fn channel_handle_dropped(&self, id: u64, kind: &str) {

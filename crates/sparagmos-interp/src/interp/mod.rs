@@ -782,6 +782,28 @@ pub struct Interpreter<'a> {
     /// Interior-mutable for the same reason as the file
     /// table.
     errno_cell: std::cell::RefCell<Option<u64>>,
+    /// Descriptor reroutings the guest's `dup2` / `close`
+    /// calls record (see [`DescRoute`] and the `desc_*`
+    /// accessors in `interp::state`): the route of a
+    /// descriptor number the guest has rerouted, keyed by
+    /// the guest-visible number. A number with no entry
+    /// keeps its default route (the standard streams for
+    /// 0/1/2, the same-numbered table entry above them).
+    /// Interior-mutable for the same reason as the file
+    /// table.
+    desc_routes: std::cell::RefCell<HashMap<u64, DescRoute>>,
+    /// The file-table id of the `/dev/null` entry the
+    /// standard-input model hands out while descriptor 0
+    /// is closed (see `null_file_id` in `interp::state`):
+    /// std reads a closed stdin as end-of-file, which a
+    /// null device answers exactly. `None` until first
+    /// use. Interior-mutable for the same reason as the
+    /// file table.
+    null_file: std::cell::RefCell<Option<u64>>,
+    /// The allocation id of the main-program handle the
+    /// `dlopen` model hands out, allocated on first use
+    /// (see `dlopen_main_handle_id` in `interp::state`).
+    dlopen_main_handle: std::cell::RefCell<Option<u64>>,
     /// Modelled process commands under construction (see
     /// [`CommandState`]), keyed by the id inside the handle
     /// values. Interior-mutable for the same reason as the
@@ -1123,6 +1145,11 @@ impl<'a> Interpreter<'a> {
             sockets: std::cell::RefCell::new(HashMap::new()),
             next_file: std::cell::RefCell::new(3),
             errno_cell: std::cell::RefCell::new(None),
+            desc_routes: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
+            null_file: std::cell::RefCell::new(None),
+            dlopen_main_handle: std::cell::RefCell::new(None),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),
             children: std::cell::RefCell::new(HashMap::new()),
@@ -1207,6 +1234,29 @@ impl<'a> Interpreter<'a> {
     /// run's write would have produced (a broken pipe above
     /// all).
     pub(crate) fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        // The descriptor routing decides where the
+        // guest's standard output currently goes: a
+        // reroute onto a file (a `dup2` onto descriptor 1)
+        // sends the bytes to that file and nowhere else,
+        // and a closed descriptor 1 discards them -- std's
+        // own answer to a write on an invalid descriptor
+        // is success with the bytes dropped (see
+        // `write_stdout_partial`).
+        match self.desc_route(1) {
+            DescRoute::File(id) => {
+                use std::io::Write as _;
+                return self
+                    .with_file(id, |file| file.write_all(bytes))
+                    .unwrap_or_else(|| {
+                        Err(std::io::Error::from_raw_os_error(9))
+                    });
+            }
+            DescRoute::Closed => return Ok(()),
+            DescRoute::Stdout => {}
+            _ => {
+                return Err(std::io::Error::from_raw_os_error(9));
+            }
+        }
         self.push_output(&String::from_utf8_lossy(bytes));
         if self.config.stdout_sink.is_none() {
             return Ok(());
@@ -1237,8 +1287,52 @@ impl<'a> Interpreter<'a> {
         &mut self,
         bytes: &[u8],
     ) -> std::io::Result<usize> {
+        // A reroute of descriptor 1 onto a file accepts
+        // what the file accepts (a single `write` may come
+        // back short); the captured stream and a closed
+        // descriptor 1 accept everything handed over (std
+        // reports a write on an invalid descriptor as
+        // fully written, dropping the bytes).
+        if let DescRoute::File(id) = self.desc_route(1) {
+            use std::io::Write as _;
+            return self
+                .with_file(id, |file| file.write(bytes))
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::from_raw_os_error(9))
+                });
+        }
         self.write_stdout(bytes)?;
         Ok(bytes.len())
+    }
+
+    /// Write bytes to the guest's standard error, under
+    /// the descriptor routing as `write_stdout` does for
+    /// descriptor 1: the captured error stream records
+    /// them, a reroute onto a file sends them there, and
+    /// a closed descriptor 2 drops them with success, as
+    /// std answers a write on an invalid descriptor. The
+    /// count is the bytes accepted.
+    pub(crate) fn write_stderr_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        match self.desc_route(2) {
+            DescRoute::Stderr => {
+                self.push_error_output(
+                    &String::from_utf8_lossy(bytes),
+                );
+                Ok(bytes.len())
+            }
+            DescRoute::File(id) => {
+                use std::io::Write as _;
+                self.with_file(id, |file| file.write(bytes))
+                    .unwrap_or_else(|| {
+                        Err(std::io::Error::from_raw_os_error(9))
+                    })
+            }
+            DescRoute::Closed => Ok(bytes.len()),
+            _ => Err(std::io::Error::from_raw_os_error(9)),
+        }
     }
 
     /// Send the first `n` buffered stdout bytes to the
@@ -1262,6 +1356,12 @@ impl<'a> Interpreter<'a> {
     /// captured stream is unbuffered and there is nothing
     /// to do.
     pub(crate) fn flush_stdout(&mut self) -> std::io::Result<()> {
+        if self.desc_route(1) != DescRoute::Stdout {
+            // A rerouted descriptor 1 is written unbuffered
+            // (see `write_stdout`), and a closed one holds
+            // nothing: there is no line buffer to settle.
+            return Ok(());
+        }
         if self.config.stdout_sink.is_none() {
             return Ok(());
         }

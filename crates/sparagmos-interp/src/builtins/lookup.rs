@@ -253,6 +253,25 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
         // `tests/ui/extern/lgamma-linkage.rs`): the signature
         // carries the sign pointer, which is `lgamma_r`'s.
         "lgamma" => Builtin::LgammaR,
+        // The C string length, reached under its symbol
+        // name by crates that declare it themselves under
+        // a `#[link_name = "strlen"]` (the libc crate's own
+        // declaration resolves through the qualified
+        // registry instead).
+        "strlen" => Builtin::LibcStrlen,
+        // The process exit, reached under its versioned
+        // symbol (`exit@GLIBC_2.2.5`) by raw-dylib
+        // declarations; the version-stripped retry in the
+        // conversion fallback lands here.
+        "exit" => Builtin::ProcessExit,
+        // The file-tree walk under its versioned symbols:
+        // the 2.2.5 binding predates flag validation, the
+        // 2.3.3 binding validates the flag word the way
+        // current glibc does. The unversioned name serves
+        // a plain `#[link_name = "nftw"]` declaration with
+        // the current behaviour.
+        "nftw@GLIBC_2.2.5" => Builtin::LibcNftwLegacy,
+        "nftw@GLIBC_2.3.3" | "nftw" => Builtin::LibcNftw,
         "rust_dbg_abi_1" => Builtin::FfiDbgAbi1,
         "rust_dbg_abi_2" => Builtin::FfiDbgAbi2,
         "rust_dbg_abi_3" => Builtin::FfiDbgAbi3,
@@ -504,6 +523,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         .or_else(|| command_lookup(canonical))
         .or_else(|| io_error_lookup(canonical))
         .or_else(|| command_api_lookup(canonical))
+        .or_else(|| raw_fd_lookup(canonical))
         .or_else(|| time_arith_lookup(canonical))
         .or_else(|| thread_api_lookup(canonical))
         .or_else(|| spin_lookup(canonical))
@@ -547,6 +567,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         .or_else(|| libc_alloc_lookup(canonical))
         .or_else(|| signals_lookup(canonical))
         .or_else(|| libc_io_lookup(canonical))
+        .or_else(|| libc_sys_lookup(canonical))
         .or_else(|| f16_lookup(canonical))
         .or_else(|| rc_arc_lookup(canonical))
         .or_else(|| unicode_lookup_slow(canonical))

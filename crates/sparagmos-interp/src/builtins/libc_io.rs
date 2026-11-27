@@ -61,7 +61,7 @@ impl<'a> Interpreter<'a> {
     /// Record `code` in the guest's errno cell: the write
     /// a failing descriptor operation leaves for
     /// `std::io::Error::last_os_error` to read back.
-    fn set_errno(
+    pub(super) fn set_errno(
         &mut self,
         frames: &mut Vec<Frame>,
         code: i32,
@@ -112,19 +112,36 @@ impl<'a> Interpreter<'a> {
         }
         let id = fd as u64;
         let mut buf = vec![0u8; count.min(READ_CAP)];
-        // Descriptor 0 is the file model's stdin entry,
-        // registered on first use; any other descriptor is
-        // looked up in the file table first, then the
-        // socket table (one descriptor space, two tables).
-        let file_read = if id == 0 {
-            let stdin_id = self.stdin_file_id();
-            self.with_file(stdin_id, |f| f.read(&mut buf))
-        } else {
-            self.with_file(id, |f| f.read(&mut buf))
-        };
-        let result = match file_read {
-            Some(result) => Some(result),
-            None => self.libc_socket_read(frames, name, id, &mut buf)?,
+        // The descriptor routing decides what the number
+        // denotes (see `desc_route` in `interp::state`):
+        // a file entry (the stdin entry for descriptor 0's
+        // default route) reads on its host object, a
+        // socket on the socket path, and the captured
+        // output streams and a closed descriptor answer
+        // `EBADF`, as a read on a write-only or invalid
+        // descriptor does.
+        let result = match self.desc_route(id) {
+            crate::interp::DescRoute::File(file_id) => {
+                self.with_file(file_id, |f| f.read(&mut buf))
+            }
+            crate::interp::DescRoute::Stdin => {
+                let stdin_id = self.stdin_file_id();
+                self.with_file(stdin_id, |f| f.read(&mut buf))
+            }
+            crate::interp::DescRoute::Socket(socket_id) => {
+                match self.libc_socket_read(
+                    frames,
+                    name,
+                    socket_id,
+                    &mut buf,
+                )? {
+                    Some(result) => Some(result),
+                    None => None,
+                }
+            }
+            crate::interp::DescRoute::Stdout
+            | crate::interp::DescRoute::Stderr
+            | crate::interp::DescRoute::Closed => None,
         };
         match result {
             Some(Ok(n)) => {
@@ -187,6 +204,28 @@ impl<'a> Interpreter<'a> {
             return Ok(Value::Int(-1));
         }
         let bytes = self.read_write_bytes(frames, &vals[1], count)?;
+        let id = fd as u64;
+        // The descriptor routing decides what the number
+        // denotes (see `desc_route` in `interp::state`):
+        // descriptors 1 and 2 in their default route are
+        // the guest's captured streams (a reroute onto a
+        // file is honoured by the stream writers
+        // themselves), a file entry writes on its host
+        // object (which answers for the entry's own
+        // direction: a write against a read-only file or
+        // the stdin entry fails with the host's errno), a
+        // socket takes the socket path, and a closed
+        // descriptor answers `EBADF`.
+        // A closed descriptor 1 or 2 fails here with
+        // `EBADF`: the stream writers' drop-on-closed
+        // answer is std's stdio layer behaviour, not the
+        // raw call's.
+        if (fd == 1 || fd == 2)
+            && self.desc_route(id) == crate::interp::DescRoute::Closed
+        {
+            self.set_errno(frames, EBADF)?;
+            return Ok(Value::Int(-1));
+        }
         if fd == 1 {
             return match self.write_stdout_partial(&bytes) {
                 Ok(n) => Ok(Value::Int(n as i128)),
@@ -198,26 +237,37 @@ impl<'a> Interpreter<'a> {
             };
         }
         if fd == 2 {
-            self.push_error_output(&String::from_utf8_lossy(&bytes));
-            return Ok(Value::Int(bytes.len() as i128));
+            return match self.write_stderr_bytes(&bytes) {
+                Ok(n) => Ok(Value::Int(n as i128)),
+                Err(error) => {
+                    let code = error.raw_os_error().unwrap_or(EIO);
+                    self.set_errno(frames, code)?;
+                    Ok(Value::Int(-1))
+                }
+            };
         }
-        let id = fd as u64;
-        // Descriptor 0 is the file model's stdin entry,
-        // registered on first use; any other descriptor is
-        // looked up in the file table first, then the
-        // socket table (one descriptor space, two tables).
-        // The host object answers for the entry's own
-        // direction: a write against a read-only file or
-        // the stdin duplicate fails with the host's errno.
-        let file_write = if id == 0 {
-            let stdin_id = self.stdin_file_id();
-            self.with_file(stdin_id, |f| f.write(&bytes))
-        } else {
-            self.with_file(id, |f| f.write(&bytes))
-        };
-        let result = match file_write {
-            Some(result) => Some(result),
-            None => self.libc_socket_write(frames, name, id, &bytes)?,
+        let result = match self.desc_route(id) {
+            crate::interp::DescRoute::File(file_id) => {
+                self.with_file(file_id, |f| f.write(&bytes))
+            }
+            crate::interp::DescRoute::Stdin => {
+                let stdin_id = self.stdin_file_id();
+                self.with_file(stdin_id, |f| f.write(&bytes))
+            }
+            crate::interp::DescRoute::Socket(socket_id) => {
+                match self.libc_socket_write(
+                    frames,
+                    name,
+                    socket_id,
+                    &bytes,
+                )? {
+                    Some(result) => Some(result),
+                    None => None,
+                }
+            }
+            crate::interp::DescRoute::Stdout
+            | crate::interp::DescRoute::Stderr
+            | crate::interp::DescRoute::Closed => None,
         };
         match result {
             Some(Ok(n)) => Ok(Value::Int(n as i128)),
@@ -534,7 +584,10 @@ pub(crate) fn libc_io_lookup(canonical: &str) -> Option<Builtin> {
         "libc::write" | "libc::unix::write" => Builtin::LibcWrite,
         "std::sys::io::error::unix::errno_location"
         | "libc::__errno_location"
-        | "libc::unix::__errno_location" => Builtin::ErrnoLocation,
+        | "libc::unix::__errno_location"
+        | "libc::unix::linux_like::linux_l4re_shared::__errno_location" => {
+            Builtin::ErrnoLocation
+        }
         _ => return None,
     })
 }

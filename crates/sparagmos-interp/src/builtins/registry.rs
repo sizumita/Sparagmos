@@ -907,6 +907,25 @@ pub enum Builtin {
     /// child is ever started, so no descriptor is ever wired),
     /// so it is accepted and dropped.
     ProcessCommandStdio,
+    /// `std::os::unix::process::CommandExt::uid(&mut self,
+    /// u32)`: record the child user id on the command; the
+    /// process host applies it at spawn.
+    ProcessCommandUid,
+    /// `std::os::unix::process::CommandExt::gid(&mut self,
+    /// u32)`: record the child group id on the command.
+    ProcessCommandGid,
+    /// `std::os::unix::process::CommandExt::groups(&mut
+    /// self, &[u32])`: record the child's supplementary
+    /// groups on the command.
+    ProcessCommandGroups,
+    /// `std::os::fd::FromRawFd::from_raw_fd(i32) -> Self`:
+    /// build the handle value of the `Self` type (a
+    /// `File`, a `Stdio`) around a guest descriptor
+    /// number: in the descriptor model the number the
+    /// guest holds IS the handle's identity, so the
+    /// value is the file-handle chain over the number
+    /// (see `exec_from_raw_fd` in `builtins::process`).
+    FromRawFd,
     /// `std::sys::process::unix::unix::Command::spawn(&mut self,
     /// Stdio, bool) -> io::Result<(Process, StdioPipes)>`:
     /// resolve the program against the command's state; a
@@ -1809,6 +1828,96 @@ pub enum Builtin {
     /// `std::io::Error::last_os_error` reads and the
     /// failing descriptor operations write.
     ErrnoLocation,
+    /// `libc::sysconf(name) -> c_long`: the host call
+    /// itself (see `exec_libc_sysconf` in
+    /// `builtins::libc_sys`): the guest runs in-process,
+    /// so the host's configuration values are the values
+    /// the guest observes, and a failing query records
+    /// the host errno in the errno cell.
+    LibcSysconf,
+    /// `libc::getuid() -> uid_t`: the host process's real
+    /// user id (see `exec_libc_getuid` in
+    /// `builtins::libc_sys`): the guest runs in-process,
+    /// so the identity calls answer with this process's
+    /// own credentials, as `std::process::id` answers
+    /// with its own process id.
+    LibcGetuid,
+    /// `libc::getgid() -> gid_t`: the twin of
+    /// `LibcGetuid` for the real group id.
+    LibcGetgid,
+    /// `libc::getpid() -> pid_t`: this process's own id,
+    /// the same value `std::process::id` answers (the
+    /// process host starts the guest's children from this
+    /// process, so their parent id is this value).
+    LibcGetpid,
+    /// `libc::clearenv() -> c_int`: clear the host
+    /// environment (see `exec_libc_clearenv` in
+    /// `builtins::libc_sys`): the guest's environment
+    /// model reads and mutates the host environment
+    /// directly (see `Builtin::EnvVars`), so clearing it
+    /// is the faithful execution.
+    LibcClearenv,
+    /// `libc::prctl(option, ...) -> c_int`: the host call
+    /// itself with the variadic tail zero-padded (see
+    /// `exec_libc_prctl` in `builtins::libc_sys`).
+    LibcPrctl,
+    /// `libc::dlopen(filename, flags) -> *mut c_void`:
+    /// only the null filename (the main program) is
+    /// modelled, answering a sentinel handle `dlsym`
+    /// resolves against the program's own exported
+    /// symbols (see `exec_libc_dlopen` in
+    /// `builtins::libc_sys`); a named library is an
+    /// explicit unsupported call.
+    LibcDlopen,
+    /// `libc::dlsym(handle, symbol) -> *mut c_void`: a
+    /// lookup in the program's link exports for the
+    /// main-program handle (or `RTLD_DEFAULT`), answering
+    /// the exported body's function pointer, or null when
+    /// the program exports no such symbol (see
+    /// `exec_libc_dlsym` in `builtins::libc_sys`).
+    LibcDlsym,
+    /// `libc::dup(oldfd) -> c_int`: duplicate a guest
+    /// descriptor in the interpreter's descriptor routing
+    /// (see `exec_libc_dup` in `builtins::libc_sys`): the
+    /// new descriptor denotes the same open file, socket
+    /// or standard stream as the old one.
+    LibcDup,
+    /// `libc::dup2(oldfd, newfd) -> c_int`: reroute the
+    /// guest descriptor `newfd` onto the open file,
+    /// socket or standard stream `oldfd` denotes, closing
+    /// what `newfd` denoted first (see `exec_libc_dup2`
+    /// in `builtins::libc_sys`).
+    LibcDup2,
+    /// `libc::close(fd) -> c_int`: close a guest
+    /// descriptor in the descriptor routing (see
+    /// `exec_libc_close` in `builtins::libc_sys`): the
+    /// table entry it denotes is dropped, or the standard
+    /// stream it names is marked closed.
+    LibcClose,
+    /// `libc::pipe(fds) -> c_int`: create a host pipe,
+    /// register both ends in the file table, and write
+    /// the two descriptor numbers through `fds` (see
+    /// `exec_libc_pipe` in `builtins::libc_sys`).
+    LibcPipe,
+    /// `libc::fcntl(fd, cmd, ...) -> c_int`: only
+    /// `F_GETFD` is modelled (0 for an open descriptor,
+    /// -1 with `EBADF` for a closed one); any other
+    /// command is an explicit unsupported call (see
+    /// `exec_libc_fcntl` in `builtins::libc_sys`).
+    LibcFcntl,
+    /// The `nftw` of glibc 2.2.5, reached through a
+    /// versioned-symbol extern declaration
+    /// (`#[link_name = "nftw@GLIBC_2.2.5"]`): walk the
+    /// host directory tree, invoking the guest callback
+    /// per entry; this version does not validate the
+    /// flags word (see `exec_libc_nftw` in
+    /// `builtins::libc_sys`).
+    LibcNftwLegacy,
+    /// The `nftw` of glibc 2.3.3 and later
+    /// (`#[link_name = "nftw@GLIBC_2.3.3"]`): the twin
+    /// of `LibcNftwLegacy`, except an unknown flag bit
+    /// fails the call with `EINVAL` before any walking.
+    LibcNftw,
     /// `core::num::imp::overflow_panic::pow(base, exp)`: the
     /// exponentiation behind the primitive `pow` methods,
     /// panicking on overflow exactly like the checked

@@ -196,16 +196,21 @@ impl<'a> Interpreter<'a> {
             state.stderr_stdio,
         ]) {
             if let Some(crate::interp::StdioConfig::File(id)) = config {
-                *slot = Some(
-                    self.with_file(id, |file| file.try_clone())
-                        .and_then(|result| result.ok())
-                        .ok_or_else(|| {
-                            unsupported(
-                                "a stdio configuration naming a file this run does not hold"
-                                    .to_string(),
-                            )
-                        })?,
-                );
+                // The configuration names a guest
+                // descriptor: what it denotes is the
+                // descriptor routing's current answer (a
+                // `from_raw_fd` handle over a descriptor
+                // the guest rerouted with `dup2` denotes
+                // the reroute's file, not the number's
+                // default).
+                *slot = Some(self.desc_file_clone(id).ok_or_else(
+                    || {
+                        unsupported(
+                            "a stdio configuration naming a file this run does not hold"
+                                .to_string(),
+                        )
+                    },
+                )?);
             }
         }
         Ok(files)
@@ -226,7 +231,9 @@ impl<'a> Interpreter<'a> {
         if let Some(crate::interp::StdioConfig::File(id)) =
             state.stdin_stdio
         {
-            self.file_handle_closed(id);
+            if let Some(entry) = self.desc_entry_id(id) {
+                self.file_handle_closed(entry);
+            }
         }
     }
 
@@ -244,10 +251,12 @@ impl<'a> Interpreter<'a> {
         bytes: &[u8],
     ) {
         if let Some(crate::interp::StdioConfig::File(id)) = config {
-            self.with_file(id, |file| {
-                use std::io::Write as _;
-                let _ = file.write_all(bytes);
-            });
+            if let Some(entry) = self.desc_entry_id(id) {
+                self.with_file(entry, |file| {
+                    use std::io::Write as _;
+                    let _ = file.write_all(bytes);
+                });
+            }
         }
     }
 
@@ -516,6 +525,9 @@ pub(super) fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState
         stdout_stdio: None,
         stderr_stdio: None,
         stdin_stdio: None,
+        uid: None,
+        gid: None,
+        groups: None,
     }
 }
 
@@ -1024,6 +1036,9 @@ fn process_spawn_request(
             stderr_file,
         ),
         child_sigpipe,
+        uid: state.uid,
+        gid: state.gid,
+        groups: state.groups.clone(),
     }
 }
 
@@ -1369,6 +1384,9 @@ pub(crate) fn command_api_lookup(canonical: &str) -> Option<Builtin> {
         "std::process::Command::stdin" => Builtin::ProcessCommandStdioPublic,
         "std::process::Command::stdout" => Builtin::ProcessCommandStdioPublic,
         "std::process::Command::stderr" => Builtin::ProcessCommandStdioPublic,
+        "std::os::unix::process::CommandExt::uid" => Builtin::ProcessCommandUid,
+        "std::os::unix::process::CommandExt::gid" => Builtin::ProcessCommandGid,
+        "std::os::unix::process::CommandExt::groups" => Builtin::ProcessCommandGroups,
         "std::process::Command::spawn" => Builtin::ProcessSpawn,
         "std::process::Command::output" => Builtin::ProcessOutput,
         "std::process::Command::status" => Builtin::ProcessSpawn,
@@ -1382,4 +1400,66 @@ pub(crate) fn command_api_lookup(canonical: &str) -> Option<Builtin> {
         "std::sys::process::output" => Builtin::ProcessOutput,
         _ => return None,
     })
+}
+
+/// Registration fragment of the builtin name registry:
+/// the raw-descriptor constructor trait.
+///
+/// One contiguous slice of the table that [`lookup`]
+/// chains in registry order; the fragment lives with
+/// the family that serves these builtins, so a new name
+/// is registered here, in the family's own module, and
+/// nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn raw_fd_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::os::fd::FromRawFd::from_raw_fd"
+        | "std::os::unix::io::FromRawFd::from_raw_fd" => Builtin::FromRawFd,
+        _ => return None,
+    })
+}
+
+impl<'a> Interpreter<'a> {
+    /// `FromRawFd::from_raw_fd(fd) -> Self`: build the
+    /// handle value of the call's `Self` type around a
+    /// guest descriptor number. In the descriptor model
+    /// the number the guest holds is the handle's
+    /// identity (a file handle's table id, a descriptor
+    /// the routing rerouted), so a `File` is the
+    /// file-handle chain over the number and a `Stdio`
+    /// is the file-form configuration wrapping that
+    /// chain — the shapes the file and stdio models
+    /// already read back. A socket `Self` has a
+    /// different value shape and is declined.
+    pub(super) fn exec_from_raw_fd(
+        &mut self,
+        _frames: &mut Vec<Frame>,
+        name: &str,
+        generic_args: &[String],
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        let fd = as_i128(&vals[0], name)?;
+        if fd < 0 {
+            return Err(unsupported(format!(
+                "call to {name}: a negative descriptor number"
+            )));
+        }
+        let self_ty = generic_args.first().map(|t| t.as_str()).unwrap_or("");
+        if self_ty == "std::process::Stdio" {
+            return Ok(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 3,
+                    fields: vec![file_value(fd as u64)],
+                }],
+            });
+        }
+        if self_ty == "std::fs::File" || self_ty.is_empty() {
+            return Ok(file_value(fd as u64));
+        }
+        Err(unsupported(format!(
+            "call to {name}: from_raw_fd for {self_ty} is not modelled"
+        )))
+    }
 }

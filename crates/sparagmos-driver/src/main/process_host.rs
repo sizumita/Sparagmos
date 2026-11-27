@@ -407,6 +407,15 @@ impl DriverProcessHost {
         } else {
             std::process::Command::new(os(&request.program))
         };
+        {
+            use std::os::unix::process::CommandExt as _;
+            if let Some(uid) = request.uid {
+                cmd.uid(uid);
+            }
+            if let Some(gid) = request.gid {
+                cmd.gid(gid);
+            }
+        }
         let mut stderr_file = None;
         if self_run {
             // The nested run carries its arguments as
@@ -494,6 +503,26 @@ impl DriverProcessHost {
         if let Some(cwd) = &request.cwd {
             cmd.current_dir(os(cwd));
         }
+        // The child's supplementary groups the guest set
+        // through `CommandExt::groups`: std's own setter
+        // for them is not stable, so a `pre_exec` hook
+        // makes the `setgroups` call in the child before
+        // exec — the call std's implementation makes —
+        // and its failure (too many groups, no privilege)
+        // fails the spawn with the host error, as the
+        // native spawn fails.
+        if let Some(groups) = &request.groups {
+            use std::os::unix::process::CommandExt as _;
+            let groups = groups.clone();
+            unsafe {
+                cmd.pre_exec(move || {
+                    if host_setgroups(groups.len(), groups.as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         // The child starts with the `SIGPIPE`
         // disposition the guest's spawn semantics name
         // (see `ProcessSpawnRequest::child_sigpipe`):
@@ -566,6 +595,8 @@ impl DriverProcessHost {
 extern "C" {
     #[link_name = "signal"]
     fn host_signal(signum: i32, handler: usize) -> usize;
+    #[link_name = "setgroups"]
+    fn host_setgroups(count: usize, groups: *const u32) -> i32;
 }
 
 impl sparagmos_interp::ProcessHostOps for DriverProcessHost {

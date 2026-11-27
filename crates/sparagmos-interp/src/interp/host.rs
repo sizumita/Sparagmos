@@ -150,6 +150,14 @@ pub struct ProcessSpawnRequest {
     /// exec, since the host process's own runtime setup
     /// follows its own rule, not the guest's.
     pub child_sigpipe: u64,
+    /// The child user id the guest set through
+    /// `CommandExt::uid`, applied by the host at spawn.
+    pub uid: Option<u32>,
+    /// The child group id (`CommandExt::gid`).
+    pub gid: Option<u32>,
+    /// The child's supplementary groups
+    /// (`CommandExt::groups`).
+    pub groups: Option<Vec<u32>>,
 }
 
 /// The outcome of one finished child process: its exit code
