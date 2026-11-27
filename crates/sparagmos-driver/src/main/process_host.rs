@@ -58,6 +58,7 @@ pub(crate) struct HostChild {
 /// The pipe end a spawned child hands over, as the file the
 /// interpreter's file table holds: the descriptor the pipe
 /// value owns transfers to the file.
+#[cfg(unix)]
 fn pipe_file<P: std::os::unix::io::IntoRawFd>(
     pipe: P,
 ) -> std::fs::File {
@@ -66,6 +67,20 @@ fn pipe_file<P: std::os::unix::io::IntoRawFd>(
     // relinquishes it and the file takes ownership, so the
     // descriptor is closed exactly once, by the file.
     unsafe { std::fs::File::from_raw_fd(pipe.into_raw_fd()) }
+}
+
+/// The pipe end a spawned child hands over, as the file the
+/// interpreter's file table holds: the handle the pipe
+/// value owns transfers to the file.
+#[cfg(windows)]
+fn pipe_file<P: std::os::windows::io::IntoRawHandle>(
+    pipe: P,
+) -> std::fs::File {
+    use std::os::windows::io::FromRawHandle as _;
+    // SAFETY: `pipe` owns its handle; `into_raw_handle`
+    // relinquishes it and the file takes ownership, so the
+    // handle is closed exactly once, by the file.
+    unsafe { std::fs::File::from_raw_handle(pipe.into_raw_handle()) }
 }
 
 /// Whether a self-child's end is the nested driver's own
@@ -102,9 +117,25 @@ fn self_run_failure(exit_code: i32, drained: &[u8]) -> Option<String> {
     }))
 }
 
-fn os_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
-    use std::os::unix::ffi::OsStrExt as _;
-    std::ffi::OsStr::from_bytes(bytes)
+/// A host string from a byte string the interpreter's
+/// model carries (a program name, an argument, an
+/// environment name or value, a working directory). On
+/// Unix the bytes are the host string itself. On other
+/// hosts the byte strings this process host carries are
+/// UTF-8 text -- the form the spawn plumbing produces
+/// there -- and the host string is that text.
+fn os_string(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::OsString::from(
+            String::from_utf8_lossy(bytes).into_owned(),
+        )
+    }
 }
 
 fn drain_pipe<R: std::io::Read>(mut pipe: R) -> Vec<u8> {
@@ -180,10 +211,23 @@ struct RunChild {
 /// interpreter's convention: the exit code, or the negated
 /// signal number for a child ended by a signal.
 fn host_exit_code(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt as _;
     match status.code() {
         Some(code) => code,
-        None => -status.signal().unwrap_or(0),
+        None => {
+            // A status without a code is a child ended by a
+            // signal, which only Unix reports; hosts without
+            // signals always carry a code, so this arm is
+            // unreachable there and answers 0.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                -status.signal().unwrap_or(0)
+            }
+            #[cfg(not(unix))]
+            {
+                0
+            }
+        }
     }
 }
 
@@ -333,15 +377,14 @@ impl DriverProcessHost {
         sparagmos_interp::ProcessHostError,
     > {
         use sparagmos_interp::ProcessHostError as HostErr;
-        use std::os::unix::ffi::OsStrExt as _;
-        let os = os_bytes;
+        let os = os_string;
         // The program the invocation denotes, for the self
         // check: the interpreter's own resolution when it
         // resolved; else the spelled program resolved against
         // the child's working directory, where a native spawn
         // resolves it.
         let spelled =
-            std::path::Path::new(os(&request.program)).to_path_buf();
+            std::path::Path::new(&os(&request.program)).to_path_buf();
         let candidate = match &request.resolved_program {
             Some(resolved) => {
                 Some(std::path::PathBuf::from(os(resolved)))
@@ -417,8 +460,19 @@ impl DriverProcessHost {
             stderr_file = Some(file);
         } else {
             if let Some(argv0) = &request.argv0 {
-                use std::os::unix::process::CommandExt as _;
-                cmd.arg0(os(argv0));
+                // std offers an argv[0] override only on
+                // Unix; elsewhere the spawned program's own
+                // name stands as its argv[0], the native
+                // convention there.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt as _;
+                    cmd.arg0(os(argv0));
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = argv0;
+                }
             }
             for arg in &request.args {
                 cmd.arg(os(arg));
@@ -449,7 +503,11 @@ impl DriverProcessHost {
         // under the default setup, so a `pre_exec` hook
         // — which std runs in the child after its own
         // reset, before exec — installs the guest's
-        // disposition.
+        // disposition. Hosts without signals have no
+        // SIGPIPE disposition to install: the guest's rule
+        // names a Unix disposition, so there is nothing to
+        // carry out there.
+        #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
             let disposition = request.child_sigpipe as usize;
@@ -504,6 +562,7 @@ impl DriverProcessHost {
 /// directly: the process host needs this one call in a
 /// spawned child (see `assemble`), and the driver takes
 /// no libc dependency for it.
+#[cfg(unix)]
 extern "C" {
     #[link_name = "signal"]
     fn host_signal(signum: i32, handler: usize) -> usize;

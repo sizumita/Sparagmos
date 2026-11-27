@@ -111,15 +111,45 @@ fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
     }
 }
 
+/// A host string from a byte string the interpreter's
+/// model carries (an environment name or value, a working
+/// directory). On Unix the bytes are the host string
+/// itself. On other hosts the byte strings this driver
+/// carries are UTF-8 text -- the form the guest
+/// environment file and the tool plumbing produce there --
+/// and the host string is that text.
+fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 /// The identity (device and inode numbers) of the file at
 /// `path`: what distinguishes one artifact's placeholder
 /// file from another's after a recipe moves files around,
 /// given every placeholder holds the same (empty) bytes.
-/// `None` when the file cannot be stat'ed.
+/// `None` when the file cannot be stat'ed, or when the
+/// host exposes no such identity for a file.
 fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-    let md = std::fs::metadata(path).ok()?;
-    Some((md.dev(), md.ino()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::metadata(path).ok()?;
+        Some((md.dev(), md.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        // The caller falls back to the path record alone,
+        // as it does for a file that cannot be stat'ed.
+        let _ = path;
+        None
+    }
 }
 
 impl ToolRegistry {
@@ -194,10 +224,9 @@ impl ToolRegistry {
             return source.to_path_buf();
         }
         use std::hash::Hasher as _;
-        use std::os::unix::ffi::OsStrExt as _;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for (rel, bytes) in tree {
-            hasher.write(rel.as_os_str().as_bytes());
+            hasher.write(rel.as_os_str().as_encoded_bytes());
             hasher.write(bytes);
         }
         let hash = hasher.finish();
@@ -231,11 +260,14 @@ impl ToolRegistry {
                 // CI). The restriction below is still applied
                 // on each visit, so a directory an older run
                 // left at this pid's name is tightened too.
-                use std::os::unix::fs::DirBuilderExt as _;
-                let _ = std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent);
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    builder.mode(0o700);
+                }
+                let _ = builder.create(parent);
                 for ancestor in parent.ancestors() {
                     if !ancestor.starts_with(&base) {
                         break;
@@ -250,12 +282,14 @@ impl ToolRegistry {
             // and tightened again after the write in case a
             // file of that name already stood there.
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let _ = options
                 .open(&target)
                 .and_then(|mut f| f.write_all(bytes));
             restrict_to_owner(&target, 0o600);
@@ -437,7 +471,6 @@ fn run_convert_subprocess(
     envs: &[(Vec<u8>, Option<Vec<u8>>)],
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     use std::io::Read as _;
-    use std::os::unix::ffi::OsStrExt as _;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(tail)
         .current_dir(cwd)
@@ -449,13 +482,10 @@ fn run_convert_subprocess(
     for (key, value) in envs {
         match value {
             Some(v) => {
-                cmd.env(
-                    std::ffi::OsStr::from_bytes(key),
-                    std::ffi::OsStr::from_bytes(v),
-                );
+                cmd.env(os_string_from_bytes(key), os_string_from_bytes(v));
             }
             None => {
-                cmd.env_remove(std::ffi::OsStr::from_bytes(key));
+                cmd.env_remove(os_string_from_bytes(key));
             }
         }
     }
@@ -519,12 +549,21 @@ fn run_convert_subprocess(
 /// scratch tree in the shared temporary directory must
 /// not be traversable or readable by other accounts.
 pub(crate) fn restrict_to_owner(path: &std::path::Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        // The owner-only mode model does not transfer to
+        // this host, whose temporary directories are
+        // already per-account; there is nothing to tighten.
+        let _ = (path, mode);
+    }
 }
 
 fn create_private_temp_file(tag: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..100 {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -536,12 +575,14 @@ fn create_private_temp_file(tag: &str) -> std::io::Result<(std::path::PathBuf, s
             "sparagmos-{tag}-{}-{seq}-{nanos:x}",
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
@@ -621,15 +662,11 @@ pub(crate) fn read_guest_env_file(path: &std::path::Path) -> std::io::Result<Vec
 /// environment the program was invoked with, not the one its
 /// source was converted under.
 pub(crate) fn apply_guest_env(env: &[(Vec<u8>, Vec<u8>)]) {
-    use std::os::unix::ffi::OsStrExt as _;
     for (key, _) in std::env::vars_os() {
         std::env::remove_var(&key);
     }
     for (key, value) in env {
-        std::env::set_var(
-            std::ffi::OsStr::from_bytes(key),
-            std::ffi::OsStr::from_bytes(value),
-        );
+        std::env::set_var(os_string_from_bytes(key), os_string_from_bytes(value));
     }
 }
 
@@ -734,10 +771,8 @@ pub(crate) fn tool_run(
     registry: &ToolRegistry,
     exe: &std::path::Path,
 ) -> Result<sparagmos_interp::ToolRunOutcome, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
-        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        Some(dir) => std::path::PathBuf::from(os_string_from_bytes(dir)),
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
     };
@@ -1069,8 +1104,11 @@ pub(crate) fn tool_run(
             // A real compiler's binary output is executable:
             // the recipe's spawn of it (and its own executable
             // checks) must find it so.
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+            }
         }
         let file_id = file_identity(&path);
         registry.record(
@@ -1270,12 +1308,11 @@ pub(crate) fn tool_run(
 fn request_guest_env(
     request: &sparagmos_interp::ToolRunRequest,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use std::os::unix::ffi::OsStrExt as _;
     let mut guest_env: Vec<(Vec<u8>, Vec<u8>)> = if request.env_clear {
         Vec::new()
     } else {
         std::env::vars_os()
-            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .map(|(k, v)| (k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec()))
             .collect()
     };
     for (key, value) in &request.envs {
@@ -1298,10 +1335,8 @@ pub(crate) fn artifact_run(
     registry: &ToolRegistry,
     exe: &std::path::Path,
 ) -> Result<sparagmos_interp::ToolRunOutcome, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
-        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        Some(dir) => std::path::PathBuf::from(os_string_from_bytes(dir)),
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
     };
@@ -1326,7 +1361,7 @@ pub(crate) fn artifact_run(
     // name remains what the run presents as argv[0].
     let path = match &request.resolved_program {
         Some(resolved) => {
-            let resolved = std::path::PathBuf::from(std::ffi::OsString::from_vec(resolved.clone()));
+            let resolved = std::path::PathBuf::from(os_string_from_bytes(resolved));
             if resolved.is_absolute() {
                 resolved
             } else {
@@ -1517,10 +1552,8 @@ pub(crate) fn self_run(
     ctx: &SelfRunContext,
     exe: &std::path::Path,
 ) -> Result<sparagmos_interp::ToolRunOutcome, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
-        Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
+        Some(dir) => std::path::PathBuf::from(os_string_from_bytes(dir)),
         None => std::env::current_dir()
             .map_err(|e| format!("self spawn: no working directory: {e}"))?,
     };

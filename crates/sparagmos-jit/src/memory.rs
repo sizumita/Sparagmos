@@ -1,8 +1,11 @@
 //! Executable memory management.
 //!
 //! NOTE on the `libc` dependency: `libc` is used ONLY here, and only for the
-//! OS primitives `mmap` / `mprotect` / `munmap` / `sysconf` (allocating pages
-//! and flipping them between writable and executable). `libc` is an OS
+//! OS primitives that allocate pages and flip them between writable and
+//! executable: `mmap` / `mprotect` / `munmap` / `sysconf`. On Windows the
+//! corresponding primitives (`VirtualAlloc` / `VirtualProtect` /
+//! `VirtualFree` / `GetSystemInfo`) are declared directly below, as
+//! `libc`'s Windows bindings do not carry them. `libc` is an OS
 //! foundation crate, not a code generator — all machine code bytes are
 //! encoded by hand in [`crate::emitter`]. The mapping follows W^X: pages are
 //! mapped RW, code is written, then they are flipped to RX before execution.
@@ -13,7 +16,7 @@ use std::ptr;
 /// A page-aligned region of memory that holds JIT-compiled code.
 ///
 /// Lifecycle: allocate (RW) -> write code -> `make_executable` (RX) -> call.
-/// Freed with `munmap` on drop.
+/// Freed on drop (`munmap`, or `VirtualFree` on Windows).
 pub struct JitMemory {
     ptr: *mut u8,
     /// Mapped length (page-rounded).
@@ -29,9 +32,74 @@ pub struct JitMemory {
 unsafe impl Send for JitMemory {}
 unsafe impl Sync for JitMemory {}
 
+#[cfg(not(windows))]
 fn page_size() -> usize {
     // SAFETY: sysconf with a valid name returns the page size (or -1).
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as usize
+    } else {
+        4096
+    }
+}
+
+/// The Windows memory primitives, declared directly:
+/// `libc`'s Windows bindings do not carry them, and this
+/// crate takes no `windows-sys` dependency for four calls.
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_RELEASE: u32 = 0x8000;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    /// `SYSTEM_INFO`, up to the fields this module reads;
+    /// the layout is the documented one.
+    #[repr(C)]
+    pub struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        pub page_size: u32,
+        minimum_application_address: *mut c_void,
+        maximum_application_address: *mut c_void,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+
+    extern "system" {
+        pub fn VirtualAlloc(
+            addr: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualProtect(
+            addr: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+        pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+        pub fn GetSystemInfo(info: *mut SystemInfo);
+    }
+}
+
+#[cfg(windows)]
+fn page_size() -> usize {
+    // SAFETY: GetSystemInfo fills the whole struct it is given;
+    // its page_size field is the host page size.
+    let v = unsafe {
+        let mut info = std::mem::zeroed::<win32::SystemInfo>();
+        win32::GetSystemInfo(&mut info);
+        info.page_size
+    };
     if v > 0 {
         v as usize
     } else {
@@ -47,22 +115,44 @@ impl JitMemory {
     /// Allocate at least `capacity` bytes of RW (not yet executable) memory.
     pub fn new(capacity: usize) -> std::io::Result<Self> {
         let len = round_up(capacity.max(1), page_size());
-        // SAFETY: standard anonymous private mmap; result checked below.
-        let p = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
+        #[cfg(not(windows))]
+        let p = {
+            // SAFETY: standard anonymous private mmap; result
+            // checked below.
+            let p = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            p as *mut u8
         };
-        if p == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
+        #[cfg(windows)]
+        let p = {
+            // SAFETY: standard reserve-and-commit VirtualAlloc
+            // of `len` bytes; result checked below.
+            let p = unsafe {
+                win32::VirtualAlloc(
+                    ptr::null_mut(),
+                    len,
+                    win32::MEM_COMMIT | win32::MEM_RESERVE,
+                    win32::PAGE_READWRITE,
+                )
+            };
+            if p.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            p as *mut u8
+        };
         Ok(Self {
-            ptr: p as *mut u8,
+            ptr: p,
             len,
             used: 0,
             executable: false,
@@ -111,16 +201,35 @@ impl JitMemory {
         if self.executable {
             return Ok(());
         }
-        // SAFETY: ptr/len describe our own live mapping.
-        let rc = unsafe {
-            libc::mprotect(
-                self.ptr as *mut c_void,
-                self.len,
-                libc::PROT_READ | libc::PROT_EXEC,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+        #[cfg(not(windows))]
+        {
+            // SAFETY: ptr/len describe our own live mapping.
+            let rc = unsafe {
+                libc::mprotect(
+                    self.ptr as *mut c_void,
+                    self.len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(windows)]
+        {
+            // SAFETY: ptr/len describe our own live allocation.
+            let mut old = 0;
+            let rc = unsafe {
+                win32::VirtualProtect(
+                    self.ptr as *mut c_void,
+                    self.len,
+                    win32::PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            };
+            if rc == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         self.executable = true;
         Ok(())
@@ -152,9 +261,24 @@ impl JitMemory {
 impl Drop for JitMemory {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: ptr/len describe our own live mapping, freed once here.
-            unsafe {
-                libc::munmap(self.ptr as *mut c_void, self.len);
+            #[cfg(not(windows))]
+            {
+                // SAFETY: ptr/len describe our own live mapping, freed once here.
+                unsafe {
+                    libc::munmap(self.ptr as *mut c_void, self.len);
+                }
+            }
+            #[cfg(windows)]
+            {
+                // SAFETY: ptr describes our own live allocation,
+                // released once here (MEM_RELEASE takes size 0).
+                unsafe {
+                    win32::VirtualFree(
+                        self.ptr as *mut c_void,
+                        0,
+                        win32::MEM_RELEASE,
+                    );
+                }
             }
             self.ptr = ptr::null_mut();
         }
