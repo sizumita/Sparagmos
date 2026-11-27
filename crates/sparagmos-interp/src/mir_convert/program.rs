@@ -125,6 +125,14 @@ pub struct MirProgram {
     /// the runtime model that reads them finds the storage a
     /// converted reference would have seeded.
     pub extra_static_seeds: mir::ExtraStaticSeeds,
+    /// Pre-main constructors of the program, as recorded by
+    /// the driver (see `ir::Program::init_constructors`): the
+    /// program names of the function bodies the initialiser
+    /// sections (`.init_array` and its platform spellings)
+    /// name, in the order the sections run them. The
+    /// interpreter runs them before the entry point in run
+    /// mode.
+    pub init_constructors: Vec<String>,
     /// Declared types of the program's statics, as recorded by
     /// the driver (see `mir::StaticTys`).
     pub static_tys: mir::StaticTys,

@@ -30,6 +30,7 @@ mod net;
 mod numerics;
 mod panic_unwind;
 mod pointers;
+mod premain_ctors;
 mod process;
 mod run_basics;
 mod rustdoc_path;

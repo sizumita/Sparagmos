@@ -65,6 +65,7 @@ pub(crate) fn build_program(
     program.env_debug_shapes = c.env_debug_shapes.clone();
     program.thread_locals = c.thread_locals.clone();
     program.extra_static_seeds = c.extra_static_seeds.clone();
+    program.init_constructors = c.init_constructors.clone();
     program.static_tys = c.static_tys.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();

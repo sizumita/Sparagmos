@@ -304,6 +304,131 @@ pub(crate) fn foreign_static_definition(
     None
 }
 
+impl Converter {
+    /// Record the program's pre-main constructors in
+    /// [`Converter::init_constructors`]: for every static in
+    /// every crate of the compilation whose `#[link_section]`
+    /// places it in an initialiser section (`.init_array` and
+    /// its platform spellings), decode the static's
+    /// initialiser and record the name of each function body
+    /// it names, in the order the sections run them.
+    ///
+    /// These are the `#[used]` function-pointer statics a
+    /// crate graph leaves for the platform to call before
+    /// `main` (the shapes of
+    /// `tests/ui/runtime/stdout-before-main.rs` and
+    /// `tests/ui/attributes/used_with_archive.rs`): nothing in
+    /// a converted body references them, so without this
+    /// record the interpreter has no way to know they exist.
+    /// A constructor whose body the collection did not hold
+    /// is not recorded -- it names nothing the interpreter
+    /// could run, the same policy as the crate graph's
+    /// `panic_handler` record.
+    pub fn note_init_constructors(&mut self, body_names: &std::collections::HashSet<&str>) {
+        let mut found: Vec<((u8, u64), String)> = Vec::new();
+        let mut crates = vec![rustc_public::local_crate()];
+        crates.extend(rustc_public::external_crates());
+        for def in crates.iter().flat_map(|krate| crate_statics(krate)) {
+            // An anonymous static the compiler generated
+            // for a nested allocation cannot be asked for
+            // its type (see `static_is_nested`), and it
+            // cannot name a constructor either: skip it
+            // before any question is asked of it.
+            if static_is_nested(&def) {
+                continue;
+            }
+            // An initialiser section holds function pointers:
+            // any other static shape cannot name a
+            // constructor, and asking after its section is
+            // wasted work over the whole crate graph's
+            // statics.
+            let Ok(ty) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            else {
+                continue;
+            };
+            if !init_section_candidate_ty(&ty) {
+                continue;
+            }
+            let Some(section) = static_link_section(&def) else {
+                continue;
+            };
+            let Some(order) = init_section_order(&section) else {
+                continue;
+            };
+            let Some(alloc) = self.static_initializer(&def) else {
+                continue;
+            };
+            let Some(value) = self.decode_const(&ty, &alloc, 0, 0) else {
+                continue;
+            };
+            for target in const_fn_targets(&value) {
+                if target.krate != 0 {
+                    continue;
+                }
+                let Some(name) = self.def_names.get(target.index as usize) else {
+                    continue;
+                };
+                if body_names.contains(name.as_str()) {
+                    found.push((order, name.clone()));
+                }
+            }
+        }
+        // Stable: entries of one order class keep the
+        // enumeration order (the local crate first, then the
+        // external crates in session order).
+        found.sort_by_key(|(order, _)| *order);
+        self.init_constructors = found.into_iter().map(|(_, name)| name).collect();
+    }
+}
+
+/// Whether a static's declared type can hold initialiser
+/// entries: a function pointer, or an array of function
+/// pointers.
+fn init_section_candidate_ty(ty: &rustc_public::ty::Ty) -> bool {
+    use rustc_public::ty::{RigidTy, TyKind};
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::FnPtr(_)) => true,
+        TyKind::RigidTy(RigidTy::Array(elem, _)) => {
+            matches!(elem.kind(), TyKind::RigidTy(RigidTy::FnPtr(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `section` (a `#[link_section]` spelling) names an
+/// initialiser section whose entries the platform runs
+/// before `main`, with the order key the section carries:
+/// ELF `.init_array.<priority>` sections run first, in
+/// ascending priority order, ahead of the plain
+/// `.init_array`; the legacy `.ctors` sections fold in after
+/// them; the Mach-O (`__mod_init_func`) and PE (`.CRT$XCU`)
+/// spellings keep enumeration order among themselves.
+/// `None` for any other section.
+fn init_section_order(section: &str) -> Option<(u8, u64)> {
+    if let Some(suffix) = section.strip_prefix(".init_array.") {
+        return Some(match suffix.parse::<u64>() {
+            Ok(priority) => (0, priority),
+            Err(_) => (1, 0),
+        });
+    }
+    if section == ".init_array" {
+        return Some((1, 0));
+    }
+    if let Some(suffix) = section.strip_prefix(".ctors.") {
+        return Some(match suffix.parse::<u64>() {
+            Ok(priority) => (2, priority),
+            Err(_) => (3, 0),
+        });
+    }
+    if section == ".ctors" {
+        return Some((3, 0));
+    }
+    if section.contains("__mod_init_func") || section.starts_with(".CRT$XCU") {
+        return Some((4, 0));
+    }
+    None
+}
+
 /// Whether the foreign static `def` imports its symbol with
 /// weak linkage (`#[linkage = "extern_weak"]`): the symbol is
 /// allowed to be undefined, and an undefined weak symbol's
@@ -325,4 +450,56 @@ pub(crate) fn static_is_extern_weak(def: &mir::mono::StaticDef) -> bool {
         )
     })
     .unwrap_or(false)
+}
+
+/// Whether the static is an anonymous one the compiler
+/// generated for a nested allocation inside another
+/// item's initialiser (the promoted temporary of
+/// `static X: &T = &expr;`): its HIR node is synthetic
+/// and the compiler's `type_of` has no case for it — it
+/// ICEs, and the bug diagnostic the ICE emits fails the
+/// compilation even though the panic itself is
+/// contained, so the question must not be asked at all.
+/// A generated static cannot name a pre-main
+/// constructor either: an initialiser section comes
+/// from a `#[link_section]` attribute on a named item,
+/// which a generated def never carries.
+fn static_is_nested(def: &mir::mono::StaticDef) -> bool {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        match tcx.def_kind(internal) {
+            rustc_hir::def::DefKind::Static { nested, .. } => Some(nested),
+            _ => Some(false),
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// The `#[link_section]` spelling of a static, from the
+/// compiler's codegen attributes for the item: the fact the
+/// pre-main constructor record rests on, which Stable MIR
+/// does not carry.
+fn static_link_section(def: &mir::mono::StaticDef) -> Option<String> {
+    screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        tcx.codegen_fn_attrs(internal)
+            .link_section
+            .map(|section| section.as_str().to_string())
+    })
+}
+
+/// The callable items a decoded initialiser value names: a
+/// function item or non-capturing closure value itself, or
+/// the elements of an array of them (an initialiser section
+/// is an array of function pointers by construction, and a
+/// static may spell it as one array instead of one pointer
+/// per static).
+fn const_fn_targets(value: &sm::ConstValue) -> Vec<sm::DefId> {
+    match value {
+        sm::ConstValue::FnDef(def) | sm::ConstValue::Closure(def) => vec![*def],
+        sm::ConstValue::Tuple(elems) => elems.iter().flat_map(const_fn_targets).collect(),
+        _ => Vec::new(),
+    }
 }

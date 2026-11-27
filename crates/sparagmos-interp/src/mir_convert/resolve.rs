@@ -662,6 +662,7 @@ fn convert_all_with(
     out.impl_tag_bodies = impl_tag_bodies(program, &keys, &out.functions);
     out.alloc_shims = conv.alloc_shims.clone();
     out.panic_handler = program.panic_handler.clone();
+    out.init_constructors = program.init_constructors.clone();
     out.links_std = program.links_std;
     merge_static_seeds(&mut all_static_seeds, &conv);
     out.static_seeds = all_static_seeds

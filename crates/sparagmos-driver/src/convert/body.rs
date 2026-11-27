@@ -35,6 +35,7 @@ impl Converter {
             debug_shape_depth: 0,
             thread_locals: sm::ThreadLocals::new(),
             extra_static_seeds: sm::ExtraStaticSeeds::new(),
+            init_constructors: Vec::new(),
             adt_instance_shapes: sm::AdtInstanceShapes::new(),
             adt_niches: sm::AdtNiches::new(),
             source_files: Vec::new(),

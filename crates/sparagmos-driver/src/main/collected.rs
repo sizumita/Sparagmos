@@ -80,6 +80,9 @@ pub(crate) struct Collected {
     /// Seeds of statics no converted body references, for
     /// the interpreter (see `Converter::extra_static_seeds`).
     pub(crate) extra_static_seeds: sparagmos_mir::ExtraStaticSeeds,
+    /// The program's pre-main constructors, for the
+    /// interpreter (see `Converter::init_constructors`).
+    pub(crate) init_constructors: Vec<String>,
     /// Declared types of the converted program's statics, for
     /// the interpreter (see `Converter::static_tys_mir`).
     pub(crate) static_tys: sparagmos_mir::StaticTys,

@@ -2763,6 +2763,11 @@ pub struct Program {
     /// (`__rdl`) panic to this body in a program that links
     /// no std and defines no `#[alloc_error_handler]`.
     pub panic_handler: Option<String>,
+    /// Program keys of the program's pre-main constructors,
+    /// in the order the platform runs them (see
+    /// `MirProgram::init_constructors`): the interpreter runs
+    /// each body once, before the entry point, in run mode.
+    pub init_constructors: Vec<String>,
     /// Whether the program's crate graph links `std`, as
     /// recorded by the driver (see `MirProgram::links_std`):
     /// the allocation-error model runs std's default hook
