@@ -205,6 +205,12 @@ pub enum Builtin {
     /// end the run as an abort (see `InterpError::Abort`), the
     /// guest-side equivalent of dying on `SIGABRT`.
     IntrinsicsAbort,
+    /// `core::intrinsics::unreachable()`: the point is
+    /// unreachable by construction, so executing it is
+    /// undefined behaviour; the run ends as an abort (see
+    /// `InterpError::Abort`), the same crash class as
+    /// executing a MIR `Unreachable` terminator.
+    IntrinsicsUnreachable,
     /// `std::io::stdout() -> Stdout`: the standard output handle.
     /// The handle value is a marker in this model: writes through
     /// it are modelled by the `Write` builtins, which dispatch on

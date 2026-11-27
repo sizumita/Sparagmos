@@ -177,6 +177,69 @@ fn convert_mode_locally_declared_intrinsics_convert() {
     );
 }
 
+const LOCAL_UNREACHABLE_SRC: &str = r#"
+#![feature(intrinsics)]
+#[rustc_intrinsic]
+const unsafe fn unreachable() -> !;
+fn do_or_die(cond: bool) {
+    if !cond {
+        unsafe { unreachable() }
+    }
+}
+fn main() {
+    do_or_die(true);
+    println!("alive");
+    do_or_die(false);
+    println!("must not print");
+}
+"#;
+
+#[test]
+fn convert_mode_locally_declared_unreachable_converts() {
+    // The shape of tests/ui/target-feature/no-llvm-leaks.rs: a
+    // minicore-style crate declares `unreachable` itself and a
+    // body calls it. The intrinsic is modelled (executing it is
+    // undefined behaviour, so the run aborts), so the demand is
+    // met and the crate converts fully.
+    let dir = temp_dir("local-unreachable-convert");
+    let src = fixture(&dir, "local_unreachable.rs", LOCAL_UNREACHABLE_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        target_crate_line(&stdout).ends_with("skipped: 0"),
+        "a crate calling the modelled unreachable intrinsic must convert fully; stdout={stdout}"
+    );
+}
+
+#[test]
+fn run_mode_locally_declared_unreachable_aborts() {
+    // rustc's MIR building turns a direct call to the
+    // intrinsic into an `Unreachable` terminator, whose
+    // execution is the guest panic "entered unreachable code"
+    // (exit 101); what the model changes is that the crate
+    // converts at all — without it the caller stays
+    // unconverted and the run exits 2.
+    let dir = temp_dir("local-unreachable");
+    let src = fixture(&dir, "local_unreachable.rs", LOCAL_UNREACHABLE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "reaching the unreachable intrinsic ends the guest run; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("entered unreachable code"),
+        "the report names the unreachable point: {stderr}"
+    );
+    assert!(stdout.contains("alive"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("must not print"),
+        "the run must not continue past the intrinsic: {stdout}"
+    );
+}
+
 #[test]
 fn convert_mode_locally_declared_unmodelled_intrinsic_stays_skipped() {
     let dir = temp_dir("local-intrinsic-unmodelled");

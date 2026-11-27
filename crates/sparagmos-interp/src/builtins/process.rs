@@ -1387,7 +1387,7 @@ pub(crate) fn env_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
-/// Registration fragment of the builtin name registry: process exit and abort.
+/// Registration fragment of the builtin name registry: process exit, abort and unreachable.
 ///
 /// One contiguous slice of the table that [`lookup`] chains in
 /// registry order; the fragment lives with the family that serves
@@ -1401,6 +1401,9 @@ pub(crate) fn process_exit_lookup(canonical: &str) -> Option<Builtin> {
         "std::process::abort" => Builtin::IntrinsicsAbort,
         "std::intrinsics::abort" | "core::intrinsics::abort" => {
             Builtin::IntrinsicsAbort
+        }
+        "std::intrinsics::unreachable" | "core::intrinsics::unreachable" => {
+            Builtin::IntrinsicsUnreachable
         }
         _ => return None,
     })
