@@ -198,5 +198,58 @@ class HostMatrixTest(unittest.TestCase):
                 aggregate)
 
 
+FLIP_DIFF_WORKFLOW = (Path(__file__).parent.parent / ".github" / "workflows"
+                      / "flip-diff.yml")
+
+
+def target_lists(text):
+    """Every `targets: >-` block in a workflow, as a list of triples."""
+    lists = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "targets: >-":
+            triples = []
+            for entry in lines[i + 1:]:
+                if not entry.startswith("            ") or not entry.strip():
+                    break
+                triples.append(entry.strip().rstrip(","))
+            lists.append(triples)
+    return lists
+
+
+class TargetCatalogueTest(unittest.TestCase):
+    def test_every_judging_job_installs_the_full_catalogue(self):
+        # Issue #516: the subset runner screens a record's
+        # compile-flags --target against the judging host's own
+        # installed targets, so every job that runs the runner
+        # (the Linux measure and measure-jit jobs, every
+        # measure-host-<class> job, and flip-diff) must install
+        # one and the same target list: the complete catalogue
+        # rustup distributes for 1.100.0 (119 triples). A shorter
+        # list in any one job leaves that job's records
+        # "not attempted (compile-flags)" for triples rustup
+        # does distribute.
+        official = target_lists(workflow_text())
+        # measure, measure-jit and the five measure-host classes.
+        self.assertEqual(len(official), 7, [len(x) for x in official])
+        for triples in official:
+            self.assertEqual(triples, official[0])
+        self.assertEqual(len(official[0]), 119, official[0])
+        flip = target_lists(FLIP_DIFF_WORKFLOW.read_text())
+        self.assertEqual(len(flip), 1)
+        self.assertEqual(flip[0], official[0])
+        # The triples Issue #516 names as distributed by rustup
+        # for 1.100.0 (11 record-reasons) are in the catalogue.
+        for triple in ("i686-pc-windows-gnullvm", "aarch64-apple-ios",
+                       "powerpc64-unknown-linux-musl",
+                       "aarch64-unknown-uefi",
+                       "arm-unknown-linux-gnueabihf",
+                       "arm-linux-androideabi",
+                       "riscv32imafc-unknown-none-elf",
+                       "aarch64-unknown-linux-musl"):
+            self.assertIn(triple, official[0])
+
+
+
 if __name__ == "__main__":
     unittest.main()
