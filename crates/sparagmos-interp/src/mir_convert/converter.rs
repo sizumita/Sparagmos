@@ -731,6 +731,22 @@ impl<'a> Converter<'a> {
             .iter()
             .map(|decl| self.ty_layout(&decl.ty).map(|(size, _)| size))
             .collect();
+        out.local_field_layouts = body
+            .local_decls
+            .iter()
+            .map(|decl| {
+                let mut layouts = std::collections::HashMap::new();
+                let mut budget = 4096usize;
+                self.collect_field_layouts(
+                    &decl.ty,
+                    &mut Vec::new(),
+                    &mut layouts,
+                    0,
+                    &mut budget,
+                );
+                layouts
+            })
+            .collect();
         out.char_locals = body
             .local_decls
             .iter()
@@ -975,6 +991,62 @@ impl<'a> Converter<'a> {
     /// entered (their positions carry a downcast step the
     /// sequence judgment does not read), and the walk is depth-
     /// and budget-bounded like that one.
+    /// The (size, align) of every field of a local's declared
+    /// type, by field-index path (see
+    /// `ir::Body::local_field_layouts`): the layouts the
+    /// projection-offset walk prices field steps with when the
+    /// IR type of a field is a bare ADT name denoting several
+    /// recorded instances. Mirrors `collect_field_elem_sizes`'
+    /// walk (tuples and non-enum ADTs, through instantiated
+    /// field types); the empty path records the root type's
+    /// own layout.
+    fn collect_field_layouts(
+        &self,
+        ty: &mir::Ty,
+        path: &mut Vec<usize>,
+        out: &mut std::collections::HashMap<Vec<usize>, (u64, u64)>,
+        depth: u32,
+        budget: &mut usize,
+    ) {
+        if depth > 8 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let mut ty = ty.clone();
+        while let mir::Ty::Pat(inner, _) = ty {
+            ty = *inner;
+        }
+        if path.is_empty() {
+            if let Some((size, align)) = self.ty_layout(&ty) {
+                out.insert(path.clone(), (size, align));
+            }
+        }
+        let fields: Vec<mir::Ty> = match &ty {
+            mir::Ty::Tuple(ts) => ts.clone(),
+            mir::Ty::Adt(def, args) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return;
+                };
+                if shape.kind == mir::AdtShapeKind::Enum {
+                    return;
+                }
+                match self.instantiated_field_tys(def, args, 0) {
+                    Some(fields) => fields,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        for (i, field_ty) in fields.iter().enumerate() {
+            path.push(i);
+            if let Some((size, align)) = self.ty_layout(field_ty) {
+                out.insert(path.clone(), (size, align));
+            }
+            self.collect_field_layouts(field_ty, path, out, depth + 1, budget);
+            path.pop();
+        }
+    }
+
     fn collect_field_elem_sizes(
         &self,
         ty: &mir::Ty,

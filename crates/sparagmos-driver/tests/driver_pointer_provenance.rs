@@ -293,3 +293,33 @@ fn main() {
 "#;
     assert_run("raw-fat-ptr", src, "ok\n");
 }
+
+// A zero-length `copy_from_slice` between subslices of two
+// distinct Vec allocations: the `ptr::copy_nonoverlapping`
+// ub_checks precondition (aligned, non-null, non-overlapping)
+// must accept the pair. The two slice pointers price through
+// the Vec/RawVec field chain, whose steps the recorded field
+// layouts also price; at this change's original base the two
+// empty ranges priced onto one address and the precondition
+// aborted the run (the driver/corpus failure that blocked
+// PR #921). The full-length copy after it pins that the same
+// field pricing still lands the elements exactly.
+#[test]
+fn zero_length_copy_between_distinct_vecs_passes_ub_checks() {
+    let src = r#"
+fn main() {
+    let a: Vec<i32> = (0..10).collect();
+    let mut b: Vec<i32> = vec![0; 10];
+    b[..0].copy_from_slice(&a[..0]);
+    b.copy_from_slice(&a);
+    println!("copied {:?}", b);
+    let disjoint = (a.as_ptr() as usize) != (b.as_ptr() as usize);
+    println!("disjoint {}", disjoint);
+}
+"#;
+    assert_run(
+        "zero-length-copy-distinct-vecs",
+        src,
+        "copied [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\ndisjoint true\n",
+    );
+}
