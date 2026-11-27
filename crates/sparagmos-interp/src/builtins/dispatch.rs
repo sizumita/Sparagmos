@@ -4968,6 +4968,23 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if target.starts_with("std::borrow::Cow<")
+                    || target.starts_with("alloc::borrow::Cow<")
+                {
+                    // std's `From` impls for a `Cow<'_, B>`
+                    // itself (see `cow_from_value`): the owned
+                    // form of `B` wraps in the `Owned` variant;
+                    // a `&B`, or a reference to the owned form,
+                    // wraps in the `Borrowed` variant. Any
+                    // other source keeps the unsupported error
+                    // below.
+                    let borrowed = last_generic_param(target).unwrap_or_default();
+                    match self.cow_from_value(frames, &borrowed, source, value)? {
+                        Some(cow) => Ok(cow),
+                        None => Err(unsupported(format!(
+                            "From::from from {source} to {target} is not runtime-supported"
+                        ))),
+                    }
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -5167,6 +5184,51 @@ impl<'a> Interpreter<'a> {
                                     base: Box::new(base),
                                     len,
                                 })
+                            } else if matches!(
+                                borrowed_ty.as_deref(),
+                                Some("std::ffi::OsStr") | Some("OsStr")
+                            ) {
+                                // An owned `Cow<OsStr>` holds an
+                                // `OsString`; its deref is the
+                                // byte slice over the string's
+                                // bytes, the shape `OsString`'s
+                                // own deref produces (see the
+                                // `OsString` arm above).
+                                let field = self.resolve_value(frames, &field)?;
+                                let bytes = match self
+                                    .os_string_bytes_any(frames, &field)?
+                                {
+                                    Some(bytes) => bytes,
+                                    None => self.os_str_bytes(frames, &field)?,
+                                };
+                                Ok(sub_path_value(&bytes))
+                            } else if matches!(
+                                borrowed_ty.as_deref(),
+                                Some("std::path::Path") | Some("Path")
+                            ) {
+                                // An owned `Cow<Path>` holds a
+                                // `PathBuf`; its deref is the
+                                // path over the buffer's bytes,
+                                // the shape `PathBuf`'s own deref
+                                // produces.
+                                let field = self.resolve_value(frames, &field)?;
+                                let bytes = match self
+                                    .path_buf_bytes_any(frames, &field)?
+                                {
+                                    Some(bytes) => bytes,
+                                    None => self.os_str_bytes(frames, &field)?,
+                                };
+                                Ok(sub_path_value(&bytes))
+                            } else if matches!(
+                                borrowed_ty.as_deref(),
+                                Some("std::ffi::CStr") | Some("CStr")
+                            ) {
+                                // An owned `Cow<CStr>` holds a
+                                // `CString`; its deref is the fat
+                                // reference over the owned
+                                // buffer, as `CString`'s own
+                                // deref produces.
+                                self.c_string_deref(frames, &field)
                             } else {
                                 Ok(field)
                             }
@@ -10506,6 +10568,123 @@ impl<'a> Interpreter<'a> {
                 },
             ],
         })
+    }
+
+    /// std's `From` impls for a `Cow<'_, B>` itself, as a
+    /// value conversion: from `B`'s owned form (the `Owned`
+    /// variant over the value itself), from a `&B` (the
+    /// `Borrowed` variant over the reference value — the
+    /// shape aggregate construction of `Cow::Borrowed`
+    /// stores), and from a reference to the owned form (the
+    /// `Borrowed` variant over the owned value's own deref
+    /// shape). Any other (borrowed, source) pair is not a
+    /// conversion std provides for a Cow and yields `None`.
+    pub(super) fn cow_from_value(
+        &self,
+        frames: &[Frame],
+        borrowed: &str,
+        source: &str,
+        value: Value,
+    ) -> InterpResult<Option<Value>> {
+        fn cow(variant: u32, field: Value) -> Option<Value> {
+            Some(Value::Enum {
+                variant,
+                fields: vec![field],
+            })
+        }
+        // Whether `source` names the slice type's element
+        // vector (`Vec<T>` for a `[T]` borrowed type) under
+        // exactly the given prefixes: the owned form's
+        // prefixes carry no `&`, the reference form's do,
+        // and the two must not be confused (a `&Vec<T>`
+        // source wrapped as the owned variant would leave
+        // the Cow holding a reference where the vector
+        // itself belongs).
+        let vec_of_borrowed = |source: &str, prefixes: &[&str]| {
+            borrowed.starts_with('[')
+                && borrowed.ends_with(']')
+                && prefixes
+                    .iter()
+                    .filter_map(|prefix| generic_first_arg(source, prefix))
+                    .next()
+                    .is_some_and(|elem| borrowed[1..borrowed.len() - 1] == *elem)
+        };
+        let owned_form = match borrowed {
+            "str" => matches!(source, "std::string::String" | "alloc::string::String"),
+            "std::ffi::OsStr" => source == "std::ffi::OsString",
+            "std::path::Path" => source == "std::path::PathBuf",
+            "std::ffi::CStr" => source == "std::ffi::CString",
+            _ => vec_of_borrowed(source, &["std::vec::Vec<", "alloc::vec::Vec<"]),
+        };
+        if owned_form {
+            return Ok(cow(1, value));
+        }
+        if source == format!("&{borrowed}") {
+            return Ok(cow(0, value));
+        }
+        // A reference to the owned form: the borrowed
+        // variant holds the owned value's deref shape.
+        let ref_owned_form = match borrowed {
+            "str" => matches!(
+                source,
+                "&std::string::String" | "&alloc::string::String"
+            ),
+            "std::ffi::OsStr" => source == "&std::ffi::OsString",
+            "std::path::Path" => source == "&std::path::PathBuf",
+            "std::ffi::CStr" => source == "&std::ffi::CString",
+            _ => vec_of_borrowed(source, &["&std::vec::Vec<", "&alloc::vec::Vec<"]),
+        };
+        if !ref_owned_form {
+            return Ok(None);
+        }
+        let field = match borrowed {
+            "str" => self.resolve_value(frames, &value)?,
+            "std::ffi::OsStr" => {
+                let pointee = self.resolve_value(frames, &value)?;
+                let bytes = self
+                    .os_string_bytes_any(frames, &pointee)?
+                    .ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "From::from to Cow<OsStr>",
+                            "an OS string value",
+                            pointee.kind_name(),
+                        )
+                    })?;
+                sub_path_value(&bytes)
+            }
+            "std::path::Path" => {
+                let pointee = self.resolve_value(frames, &value)?;
+                let bytes = self
+                    .path_buf_bytes_any(frames, &pointee)?
+                    .ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "From::from to Cow<Path>",
+                            "a path buffer value",
+                            pointee.kind_name(),
+                        )
+                    })?;
+                sub_path_value(&bytes)
+            }
+            "std::ffi::CStr" => self.c_string_deref(frames, &value)?,
+            _ => {
+                // A slice target: the fat reference over the
+                // vector, the shape `Vec`'s own deref
+                // produces.
+                let pointee = self.resolve_value(frames, &value)?;
+                let len = pointee.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "From::from to a borrowed Cow slice",
+                        "array value",
+                        pointee.kind_name(),
+                    )
+                })?;
+                Value::FatRef {
+                    base: Box::new(value),
+                    len,
+                }
+            }
+        };
+        Ok(cow(0, field))
     }
 
     /// The `IntoIterator::into_iter` value transformation: the
