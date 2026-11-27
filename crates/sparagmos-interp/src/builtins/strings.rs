@@ -1499,6 +1499,21 @@ pub(crate) fn str_predicate_lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::ends_with") => {
             Builtin::StrEndsWith
         }
+        _ if canonical.starts_with("core::str::<impl")
+            && canonical.ends_with(">::trim_matches") =>
+        {
+            Builtin::StrTrimMatches(TrimSide::Both)
+        }
+        _ if canonical.starts_with("core::str::<impl")
+            && canonical.ends_with(">::trim_start_matches") =>
+        {
+            Builtin::StrTrimMatches(TrimSide::Start)
+        }
+        _ if canonical.starts_with("core::str::<impl")
+            && canonical.ends_with(">::trim_end_matches") =>
+        {
+            Builtin::StrTrimMatches(TrimSide::End)
+        }
         _ => return None,
     })
 }
