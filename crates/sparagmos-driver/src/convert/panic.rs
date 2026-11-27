@@ -167,10 +167,16 @@ pub(crate) fn coroutine_closure_const_parts(
     })
 }
 
-pub fn guarded_ty_kind(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::TyKind> {
+/// Run a Stable MIR query under the coroutine-closure guard:
+/// a query whose answer needs to render or inspect a
+/// coroutine-closure (async closure) type panics inside
+/// rustc_public (see [`COROUTINE_CLOSURE_TYPE_REASON`]); the
+/// guard classifies that panic and answers `None`, and
+/// re-raises any other panic untouched.
+pub fn guarded_query<T>(f: impl FnOnce() -> T) -> Option<T> {
     clear_captured_panic();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.kind())) {
-        Ok(kind) => Some(kind),
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
         Err(payload) => {
             if is_coroutine_closure_panic(&payload) {
                 // Consume this panic's hook record, so no outer
@@ -194,6 +200,10 @@ pub fn guarded_ty_kind(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty
             }
         }
     }
+}
+
+pub fn guarded_ty_kind(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::TyKind> {
+    guarded_query(|| ty.kind())
 }
 
 /// Why a body containing a tail call cannot be converted:

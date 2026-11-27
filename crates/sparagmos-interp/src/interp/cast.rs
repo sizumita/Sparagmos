@@ -26,6 +26,7 @@ impl<'a> Interpreter<'a> {
                 concrete,
                 traits,
                 glue,
+                type_id,
             } => match v {
                 // A supertrait upcast: the data pointer, the
                 // concrete type and its drop glue carry over;
@@ -35,12 +36,14 @@ impl<'a> Interpreter<'a> {
                     base,
                     concrete: existing,
                     drop_glue,
+                    type_id: existing_id,
                     ..
                 } => Ok(Value::DynRef {
                     base,
                     concrete: existing,
                     traits: traits.clone(),
                     drop_glue,
+                    type_id: existing_id,
                 }),
                 Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
                     match concrete {
@@ -49,6 +52,7 @@ impl<'a> Interpreter<'a> {
                             concrete: concrete.clone(),
                             traits: traits.clone(),
                             drop_glue: glue.clone().map(Box::new),
+                            type_id: *type_id,
                         }),
                         // A `dyn`-to-`dyn` coercion whose operand
                         // is a reference to a place holding a
@@ -69,12 +73,14 @@ impl<'a> Interpreter<'a> {
                                 Value::DynRef {
                                     base,
                                     concrete: stored_concrete,
+                                    type_id: stored_id,
                                     ..
                                 } => Ok(Value::DynRef {
                                     base,
                                     concrete: stored_concrete,
                                     traits: traits.clone(),
                                     drop_glue: None,
+                                    type_id: stored_id,
                                 }),
                                 _ => Err(InterpError::UnsupportedRvalue {
                                     kind: "Unsize to dyn (no concrete type recorded)"

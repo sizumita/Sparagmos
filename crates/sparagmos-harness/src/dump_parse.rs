@@ -535,6 +535,7 @@ impl Conv {
             coverage_owners: Vec::new(),
             span: mir::Span::DUMMY,
             required_consts: Vec::new(),
+            unsize_type_ids: Vec::new(),
         })
     }
 
@@ -916,6 +917,7 @@ impl Conv {
             literal: Self::const_kind(field(f, "literal")?)?,
             user_ty,
             ty,
+            generic_type_ids: None,
         })
     }
 
@@ -1002,6 +1004,9 @@ impl Conv {
                     }
                     traits
                 },
+                // A reconstructed body has no driver pass to
+                // compute the concrete type's `TypeId` segments.
+                type_id: None,
             },
             ("ByRef", Payload::Fields(f)) => mir::ConstValue::ByRef {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,

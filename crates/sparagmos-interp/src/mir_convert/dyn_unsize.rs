@@ -20,6 +20,21 @@ pub(super) fn dyn_traits_in(ty: &mir::Ty) -> Option<Vec<String>> {
     }
 }
 
+/// Whether the `dyn` type inside `ty` is reached through
+/// reference and raw-pointer layers only (no ADT generic
+/// argument in between): a cast whose target has this shape
+/// and whose source names a trait object under the same
+/// layers reborrows the stored trait-object pointer instead
+/// of erasing a new value.
+pub(super) fn dyn_reached_through_refs_only(ty: &mir::Ty) -> bool {
+    match dyn_path_in(ty) {
+        Some(path) => path
+            .iter()
+            .all(|step| matches!(step, DynStep::Ref | DynStep::RawPtr)),
+        None => false,
+    }
+}
+
 /// The sized pointee an unsizing coercion starts from: the inner
 /// type of a reference or raw pointer, the first generic argument
 /// of a pointer-shaped ADT (`Box`, `Rc`, `Arc` share the shape), or

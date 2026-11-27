@@ -352,6 +352,7 @@ fn zst_const_through_black_box_keeps_adt_value() {
                             literal: mir::ConstKind::Ty(mir::Ty::FnDef(BLACK_BOX, Vec::new())),
                             user_ty: None,
                             ty: None,
+                            generic_type_ids: None,
                         }),
                         args: vec![mir::Operand::constant(mir::Constant::from_value(
                             mir::ConstValue::Adt { variant: 0, fields: Vec::new() },

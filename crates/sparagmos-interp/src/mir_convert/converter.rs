@@ -651,8 +651,8 @@ impl<'a> Converter<'a> {
         }
         let fn_abi = func.def_id.and_then(|id| self.fn_abis.get(&id));
         let mut blocks = Vec::with_capacity(body.basic_blocks.len());
-        for bb in &body.basic_blocks {
-            blocks.push(self.convert_block(body, bb, fn_abi)?);
+        for (index, bb) in body.basic_blocks.iter().enumerate() {
+            blocks.push(self.convert_block(body, index as u32, bb, fn_abi)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
         out.return_discriminants = self.return_discriminants(body);
@@ -1266,12 +1266,13 @@ impl<'a> Converter<'a> {
     fn convert_block(
         &self,
         body: &mir::Body,
+        bb_index: u32,
         bb: &mir::BasicBlockData,
         fn_abi: Option<&mir::Abi>,
     ) -> Result<ir::BasicBlockData, ConvertError> {
         let mut statements = Vec::with_capacity(bb.statements.len());
         for stmt in &bb.statements {
-            statements.push(self.convert_statement(body, stmt)?);
+            statements.push(self.convert_statement(body, bb_index, stmt)?);
         }
         let terminator = match &bb.terminator {
             Some(term) => {

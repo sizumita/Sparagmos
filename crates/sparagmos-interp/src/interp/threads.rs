@@ -319,6 +319,7 @@ impl<'a> Interpreter<'a> {
                 Err(payload.unwrap_or_else(|| PanicPayload {
                     ty: "&str".to_string(),
                     value: Box::new(Value::Str(message)),
+                    type_id: None,
                 }))
             }
             Err(e) => return Err(e),

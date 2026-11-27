@@ -94,6 +94,7 @@ fn fndef(def: mir::DefId, generic_args: Vec<mir::Ty>) -> mir::Operand {
         literal: mir::ConstKind::Ty(mir::Ty::FnDef(def, generic_args)),
         user_ty: None,
         ty: None,
+        generic_type_ids: None,
     })
 }
 

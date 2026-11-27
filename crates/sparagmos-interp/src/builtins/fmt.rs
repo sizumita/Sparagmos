@@ -48,15 +48,16 @@ pub(super) fn expect_generic_ty_at(
 }
 
 /// Resolve a `Box<dyn Any ...>` value (or a reference to one) to
-/// the payload it carries: the concrete type tag, the payload
-/// value, and the box value itself (handed back to the caller on
-/// a failed by-value downcast).
+/// the payload it carries: the concrete type tag, the concrete
+/// type's `TypeId` segments when the value carries them, the
+/// payload value, and the box value itself (handed back to the
+/// caller on a failed by-value downcast).
 pub(super) fn resolve_dyn_box(
     interp: &mut Interpreter,
     frames: &mut Vec<Frame>,
     value: &Value,
     name: &str,
-) -> InterpResult<(String, Value, Value)> {
+) -> InterpResult<(String, Option<(u64, u64)>, Value, Value)> {
     // Resolve references down to the box value itself (that value
     // is what a failed by-value downcast hands back).
     let mut current = value.clone();
@@ -71,8 +72,11 @@ pub(super) fn resolve_dyn_box(
     loop {
         match current {
             Value::DynRef {
-                base, concrete, ..
-            } => return Ok((concrete, (*base).clone(), original)),
+                base,
+                concrete,
+                type_id,
+                ..
+            } => return Ok((concrete, type_id, (*base).clone(), original)),
             Value::Enum { fields, .. } if fields.len() == 1 => {
                 let field = fields.into_iter().next().expect("one field");
                 // A built box's field is its allocation pointer:
@@ -97,6 +101,24 @@ pub(super) fn resolve_dyn_box(
                 ));
             }
         }
+    }
+}
+
+/// Whether a `dyn Any` value's concrete type is the type a
+/// downcast asks for: the rendered tags decide, unless both
+/// sides carry `TypeId` segments, in which case the segments
+/// decide -- the tags erase the regions the segments
+/// distinguish, so two region variants of one type share a tag
+/// but never segments.
+pub(super) fn dyn_any_matches(
+    concrete: &str,
+    concrete_id: Option<(u64, u64)>,
+    want: &str,
+    want_id: Option<(u64, u64)>,
+) -> bool {
+    match (concrete_id, want_id) {
+        (Some(c), Some(w)) => c == w,
+        _ => concrete == want,
     }
 }
 
@@ -1724,6 +1746,7 @@ impl<'a> Interpreter<'a> {
                 let payload = Some(PanicPayload {
                     ty: "&str".to_string(),
                     value: Box::new(Value::Str(message.to_string())),
+                    type_id: None,
                 });
                 self.fire_panic_hook(&mut Vec::new(), 0, message, &payload);
                 Err(InterpError::panic_str_payload(message))

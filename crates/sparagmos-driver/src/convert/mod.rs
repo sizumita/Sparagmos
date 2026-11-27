@@ -120,7 +120,7 @@ pub struct Converter {
     /// pointer that reaches it as a bare address (recovered
     /// from a metadata aggregate, or read back from a stored
     /// header word) resolves through this table.
-    pub vtable_identities: HashMap<u64, (sm::Ty, Vec<String>)>,
+    pub vtable_identities: HashMap<u64, (sm::Ty, Vec<String>, Option<(u64, u64)>)>,
     /// Vtable trait references named by the constants decoded
     /// so far, in the order their identities were first
     /// recorded: a vtable formed inside a constant (a

@@ -100,6 +100,7 @@ fn unevaluated_operand(def: mir::DefId) -> mir::Operand {
         },
         user_ty: None,
         ty: None,
+        generic_type_ids: None,
     })
 }
 

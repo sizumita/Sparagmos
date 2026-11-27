@@ -4567,3 +4567,64 @@ fn run_mode_adapter_step_drop_counts() {
         "filter 4\ncount 3 9\nnext Some(2) 11\ndone 12\n",
     );
 }
+
+
+const DYN_ANY_LIFETIME_SRC: &str = r#"
+use std::any::Any;
+
+struct Foo<'a>(&'a str);
+
+fn good(s: &String) -> Foo<'_> {
+    Foo(s)
+}
+
+trait AsStr<'a, 'b> {
+    fn get(&'a self) -> &'b str;
+}
+
+impl<'a> AsStr<'a, 'a> for String {
+    fn get(&'a self) -> &'a str {
+        self
+    }
+}
+
+fn main() {
+    let s = String::from("foo");
+    // A downcast target that differs from the stored type only
+    // in a lifetime argument must not match: the stored value
+    // is a fn pointer returning `Foo` borrowed from its
+    // argument, not a `Foo<'static>`.
+    let a: Box<dyn Any> = Box::new(good as fn(&String) -> Foo);
+    assert!(a.downcast_ref::<fn(&String) -> Foo<'static>>().is_none());
+    assert!(!a.is::<fn(&String) -> Foo<'static>>());
+    // The identical type still matches.
+    assert!(a.downcast_ref::<fn(&String) -> Foo<'_>>().is_some());
+    assert!(a.is::<fn(&String) -> Foo<'_>>());
+    // Same for a nested trait object whose second lifetime
+    // argument is `'static` only in the downcast target.
+    let b: Box<dyn Any> =
+        Box::new(Box::new(s) as Box<dyn for<'a> AsStr<'a, 'a>>);
+    assert!(b
+        .downcast_ref::<Box<dyn for<'a> AsStr<'a, 'static>>>()
+        .is_none());
+    assert!(b
+        .downcast_ref::<Box<dyn for<'a> AsStr<'a, 'a>>>()
+        .is_some());
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_any_downcast_lifetime_only_difference_rejected() {
+    // `Any` downcasts compare types by their `TypeId`
+    // segments, which distinguish lifetime arguments the
+    // converted type model erases: a target differing from
+    // the stored type only in a lifetime must be rejected
+    // (tests/ui/lifetimes/any-lifetime-escape-higher-rank.rs),
+    // while the identical type still matches.
+    run_ok(
+        "dyn-any-lifetime",
+        DYN_ANY_LIFETIME_SRC,
+        "ok\n",
+    );
+}

@@ -160,8 +160,22 @@ pub(crate) fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<
 /// The two pointer-sized segments of a `TypeId` value for `ty`:
 /// a 128-bit FNV-1a hash (two lanes) of the type's debug form,
 /// which is stable within a run - all the equality semantics of
-/// `TypeId` need.
-pub(crate) fn type_id_segments(ty: &rustc_public::ty::Ty) -> (u64, u64) {
+/// `TypeId` need. `None` when the type cannot be spelled at
+/// all: rendering the debug form of a coroutine-closure (async
+/// closure) type panics inside rustc_public, like asking its
+/// kind, so the segments are computed under the same guard
+/// (see `guarded_ty_kind`) and an unspellable type carries no
+/// segments - its downcasts fall back to tag comparison.
+/// Also `None` for a type past the conversion size limit: the
+/// debug form is materialized in full, so an exponentially
+/// large type (the nested-closure shape of Issue #481) would
+/// render without bound - the guard there catches panics, not
+/// work. Such a type's bodies are refused for size anyway, so
+/// losing its segments loses nothing.
+pub(crate) fn type_id_segments(ty: &rustc_public::ty::Ty) -> Option<(u64, u64)> {
+    if !crate::reach::ty_within_expanded_size(ty, crate::reach::MAX_TY_EXPANDED_SIZE) {
+        return None;
+    }
     fn lane(bytes: &[u8], seed: u64) -> u64 {
         let mut h = seed;
         for b in bytes {
@@ -170,12 +184,14 @@ pub(crate) fn type_id_segments(ty: &rustc_public::ty::Ty) -> (u64, u64) {
         }
         h
     }
-    let text = format!("{ty:?}");
-    let bytes = text.as_bytes();
-    (
-        lane(bytes, 0xcbf2_9ce4_8422_2325),
-        lane(bytes, 0x8422_2325_cbf2_9ce4),
-    )
+    guarded_query(|| {
+        let text = format!("{ty:?}");
+        let bytes = text.as_bytes();
+        (
+            lane(bytes, 0xcbf2_9ce4_8422_2325),
+            lane(bytes, 0x8422_2325_cbf2_9ce4),
+        )
+    })
 }
 
 /// The identity number of a vtable for the (concrete type, trait

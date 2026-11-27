@@ -173,6 +173,7 @@ fn strip_trailing_offsets_value(value: &Value) -> (Value, i128) {
             concrete,
             traits,
             drop_glue,
+            type_id,
         } => {
             let (base, total) = strip_trailing_offsets_value(base);
             (
@@ -181,6 +182,7 @@ fn strip_trailing_offsets_value(value: &Value) -> (Value, i128) {
                     concrete: concrete.clone(),
                     traits: traits.clone(),
                     drop_glue: drop_glue.clone(),
+                    type_id: *type_id,
                 },
                 total,
             )
@@ -2985,6 +2987,7 @@ impl<'a> Interpreter<'a> {
                 concrete,
                 traits,
                 drop_glue,
+                type_id,
             } => match *base {
                 Value::Ref(_) => {
                     let base = self.ptr_offset_value(frames, *base, count, elem_size, wrapping)?;
@@ -2993,6 +2996,7 @@ impl<'a> Interpreter<'a> {
                         concrete,
                         traits,
                         drop_glue,
+                        type_id,
                     })
                 }
                 ref other => Err(InterpError::type_mismatch(
@@ -4119,6 +4123,7 @@ mod panic_report_tests {
         let payload = Some(PanicPayload {
             ty: "&str".to_string(),
             value: Box::new(Value::Str("hook boom".to_string())),
+            type_id: None,
         });
         let mut frames = Vec::new();
         interp.fire_panic_hook(&mut frames, 0, "hook boom", &payload);
@@ -4542,12 +4547,14 @@ mod ptr_equality_tests {
             concrete: "probe::C".to_string(),
             traits: vec!["probe::T1".to_string()],
             drop_glue: None,
+            type_id: None,
         };
         let d2 = Value::DynRef {
             base: Box::new(base),
             concrete: "probe::C".to_string(),
             traits: vec!["probe::T2".to_string()],
             drop_glue: None,
+            type_id: None,
         };
         let addr_of = |v: &Value| interp.pointer_address(&[], v, None);
         let eq = eval_binary(BinOp::Eq, &d1, &d2, None, false, &addr_of)

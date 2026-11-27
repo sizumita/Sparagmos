@@ -106,6 +106,19 @@ pub struct Body {
     /// then attributes every statement to the executing body,
     /// which is exact for bodies without inlined coverage).
     pub coverage_owners: Vec<Option<String>>,
+    /// The `TypeId` segments of the concrete type of each
+    /// unsizing cast to a `dyn` target in this body, recorded by
+    /// the driver from the compiler's cast types (whose spelling
+    /// still carries the regions conversion erases), keyed by the
+    /// cast's block index and destination place: the entry names
+    /// the one cast statement that writes that place in that
+    /// block. The interpreter's conversion reads the entry when
+    /// it builds the cast's vtable identity, so a `dyn Any`
+    /// downcast can compare identities per cast site. Empty for
+    /// hand-built bodies and for casts whose concrete type the
+    /// driver's walk could not name (the cast then carries no
+    /// segments, as before).
+    pub unsize_type_ids: Vec<(u32, Place, (u64, u64))>,
 }
 impl Body {
     pub fn new(
@@ -122,6 +135,7 @@ impl Body {
             required_consts: Vec::new(),
             source_lines: Vec::new(),
             coverage_owners: Vec::new(),
+            unsize_type_ids: Vec::new(),
         }
     }
     pub fn return_ty(&self) -> Option<&Ty> {

@@ -53,6 +53,7 @@ impl<'a> Converter<'a> {
     pub(super) fn convert_statement(
         &self,
         body: &mir::Body,
+        bb_index: u32,
         stmt: &mir::Statement,
     ) -> Result<ir::Statement, ConvertError> {
         use mir::StatementKind as S;
@@ -76,7 +77,26 @@ impl<'a> Converter<'a> {
                     }
                 }
                 let ir_place = self.convert_place(body, place)?;
-                let ir_rv = self.convert_rvalue(body, rv, dest_ty.as_ref())?;
+                // The `TypeId` segments the driver recorded for
+                // this statement's unsizing cast, if it is one
+                // (see `mir::Body::unsize_type_ids`).
+                let site_type_id = match rv {
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(
+                            mir::PointerCoercion::Unsize,
+                        ),
+                        ..,
+                    ) => body
+                        .unsize_type_ids
+                        .iter()
+                        .find(|(block, dest, _)| {
+                            *block == bb_index && dest == place
+                        })
+                        .map(|(_, _, ids)| *ids),
+                    _ => None,
+                };
+                let ir_rv =
+                    self.convert_rvalue(body, rv, dest_ty.as_ref(), site_type_id)?;
                 ir::Statement::assign(ir_place, ir_rv)
             }
             S::StorageLive(l) => ir::Statement {
@@ -1223,6 +1243,22 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The `TypeId` segments of the callee's generic type
+    /// arguments at this call site, when the call's
+    /// function-item constant carries them (see
+    /// `mir::Constant::generic_type_ids`): entry `i` is the
+    /// identity of the type the `i`-th rendered generic
+    /// argument tag names.
+    pub(super) fn resolve_external_callee_type_ids(
+        &self,
+        func: &mir::Operand,
+    ) -> Option<Vec<(u64, u64)>> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        c.generic_type_ids.clone()
+    }
+
     /// Whether `name` (a body key, possibly carrying an
     /// instance suffix) denotes one of the `Vec` collect
     /// specialization entries the `VecFromIterNested` builtin
@@ -1334,6 +1370,7 @@ impl<'a> Converter<'a> {
             result_unsize: None,
             unique_elem: None,
             zeroed_value: None,
+            generic_type_ids: None,
         }))
     }
 
@@ -1395,6 +1432,7 @@ impl<'a> Converter<'a> {
             result_unsize: None,
             unique_elem: None,
             zeroed_value: None,
+            generic_type_ids: None,
         }))
     }
 
@@ -1441,6 +1479,7 @@ impl<'a> Converter<'a> {
             result_unsize: None,
             unique_elem: None,
             zeroed_value: None,
+            generic_type_ids: None,
         }))
     }
 
@@ -1491,6 +1530,7 @@ impl<'a> Converter<'a> {
             result_unsize: None,
             unique_elem: None,
             zeroed_value: None,
+            generic_type_ids: None,
         }))
     }
 
@@ -1616,6 +1656,7 @@ impl<'a> Converter<'a> {
             result_unsize: None,
             unique_elem: None,
             zeroed_value: None,
+            generic_type_ids: None,
         }))
     }
 
@@ -1926,6 +1967,7 @@ impl<'a> Converter<'a> {
         destination: &mir::Place,
         arg: Option<&mir::Operand>,
         source_ty: Option<&mir::Ty>,
+        source_type_id: Option<(u64, u64)>,
     ) -> Option<ir::UnsizeMeta> {
         let dest_ty = self.place_ty(body, destination)?;
         let mir::Ty::Adt(def, dest_args) = &dest_ty else {
@@ -1941,9 +1983,10 @@ impl<'a> Converter<'a> {
         // callee's generic arguments still name the source type
         // (the caller picks it out, as `mem_drop_glue` does for
         // the dropped type).
-        let arg_ty = self
-            .operand_place_ty(body, arg?)
-            .or_else(|| source_ty.cloned())?;
+        let (arg_ty, arg_type_id) = match self.operand_place_ty(body, arg?) {
+            Some(t) => (t, None),
+            None => (source_ty.cloned()?, source_type_id),
+        };
         if dyn_traits_in(&arg_ty).is_some() {
             return None;
         }
@@ -1957,6 +2000,19 @@ impl<'a> Converter<'a> {
             concrete: Some(concrete),
             traits,
             glue,
+            // The segments name the source type itself: they
+            // serve only when the concrete type is that type
+            // (no reference layer was peeled to name it) and the
+            // type came from the callee's generic arguments,
+            // whose segments the call site recorded.
+            type_id: if matches!(
+                arg_ty,
+                mir::Ty::Ref(..) | mir::Ty::RawPtr(..)
+            ) {
+                None
+            } else {
+                arg_type_id
+            },
         })
     }
 
@@ -2519,6 +2575,8 @@ impl<'a> Converter<'a> {
                 } else if let Some((name, generic_args, raw_generic_args)) =
                     self.resolve_external_callee(func)
                 {
+                    let generic_type_ids =
+                        self.resolve_external_callee_type_ids(func);
                     let canonical = crate::builtins::canonical_name(&name);
                     let kind = crate::builtins::lookup_qualified(&canonical)
                         .filter(|kind| {
@@ -2723,11 +2781,27 @@ impl<'a> Converter<'a> {
                             } else {
                                 raw_generic_args.get(1)
                             };
+                            // The source type's `TypeId` segments:
+                            // the same generic argument the source
+                            // type was picked from.
+                            let source_type_id = if matches!(
+                                kind,
+                                crate::builtins::Builtin::IntoInto
+                            ) {
+                                generic_type_ids
+                                    .as_ref()
+                                    .and_then(|ids| ids.first().copied())
+                            } else {
+                                generic_type_ids
+                                    .as_ref()
+                                    .and_then(|ids| ids.get(1).copied())
+                            };
                             self.from_result_unsize(
                                 body,
                                 destination,
                                 args.first(),
                                 source_ty,
+                                source_type_id,
                             )
                         } else {
                             None
@@ -3065,6 +3139,7 @@ impl<'a> Converter<'a> {
                                 result_unsize,
                                 unique_elem,
                                 zeroed_value,
+                                generic_type_ids,
                             }
                         }
                     } else if args.first().is_some_and(|a| {

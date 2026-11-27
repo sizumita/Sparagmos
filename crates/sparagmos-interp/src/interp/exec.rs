@@ -1450,6 +1450,7 @@ impl<'a> Interpreter<'a> {
                 TerminatorKind::CallBuiltin {
                     name,
                     generic_args,
+                    generic_type_ids,
                     args,
                     destination,
                     target,
@@ -1579,6 +1580,7 @@ impl<'a> Interpreter<'a> {
                             body,
                             name,
                             generic_args,
+                            generic_type_ids.as_deref(),
                             args,
                             cmp_discriminants.as_deref(),
                             unique_elem.as_ref(),

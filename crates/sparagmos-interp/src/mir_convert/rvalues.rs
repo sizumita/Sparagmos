@@ -23,6 +23,7 @@ impl<'a> Converter<'a> {
         body: &mir::Body,
         rv: &mir::Rvalue,
         dest_ty: Option<&mir::Ty>,
+        site_type_id: Option<(u64, u64)>,
     ) -> Result<ir::Rvalue, ConvertError> {
         use mir::Rvalue as R;
         Ok(match rv {
@@ -152,13 +153,43 @@ impl<'a> Converter<'a> {
                                     // (supertrait upcast): the
                                     // concrete type rides on the
                                     // value; only the bounds change.
-                                    Some(src) if dyn_traits_in(&src).is_some() => {
+                                    // The coercion is one when the
+                                    // type at the target's `dyn`
+                                    // position in the source is
+                                    // itself a trait object, or
+                                    // when the `dyn` is reached
+                                    // through references only and
+                                    // the stored value is a
+                                    // trait-object pointer (the
+                                    // reborrow of a stored
+                                    // pointer). A sized type at
+                                    // that position -- a
+                                    // `Box<dyn Trait>` boxed into
+                                    // another `dyn`, say -- is a
+                                    // fresh erasure of that type,
+                                    // even though it contains a
+                                    // trait object deeper down.
+                                    Some(src)
+                                        if matches!(
+                                            unsize_concrete_pointee(
+                                                self, &src, target
+                                            ),
+                                            mir::Ty::Dynamic(..)
+                                        ) || (dyn_reached_through_refs_only(
+                                            target,
+                                        ) && dyn_traits_in(
+                                            unsize_concrete_pointee(
+                                                self, &src, target
+                                            ),
+                                        )
+                                        .is_some()) => {
                                         ir::Rvalue::Unsize(
                                             v,
                                             ir::UnsizeMeta::Dyn {
                                                 concrete: None,
                                                 traits,
                                                 glue: None,
+                                                type_id: None,
                                             },
                                         )
                                     }
@@ -179,6 +210,7 @@ impl<'a> Converter<'a> {
                                                 concrete: Some(concrete),
                                                 traits,
                                                 glue,
+                                                type_id: site_type_id,
                                             },
                                         )
                                     }

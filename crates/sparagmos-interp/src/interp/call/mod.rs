@@ -256,6 +256,7 @@ impl<'a> Interpreter<'a> {
             kind,
             canonical,
             generic_args,
+            None,
             arg_values,
             None,
             None,
@@ -1076,6 +1077,7 @@ impl<'a> Interpreter<'a> {
                     kind,
                     &canonical,
                     &generic_args,
+                    None,
                     arg_values,
                     None,
                     None,
@@ -1485,6 +1487,7 @@ pub(crate) fn default_hook_value() -> Value {
             "std::marker::Sync".to_string(),
         ],
         drop_glue: None,
+        type_id: None,
     }
 }
 
@@ -1512,6 +1515,7 @@ pub(crate) fn updated_hook_value(update: Value, prev: Value) -> Value {
             "std::marker::Sync".to_string(),
         ],
         drop_glue: None,
+        type_id: None,
     }
 }
 

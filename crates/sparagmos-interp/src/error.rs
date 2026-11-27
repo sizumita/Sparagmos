@@ -156,6 +156,7 @@ impl InterpError {
             payload: Some(PanicPayload {
                 ty: "&str".to_string(),
                 value: Box::new(crate::value::Value::Str(message.clone())),
+                type_id: None,
             }),
             message,
         }
@@ -170,6 +171,7 @@ impl InterpError {
             payload: Some(PanicPayload {
                 ty: "std::string::String".to_string(),
                 value: Box::new(crate::value::Value::Str(message.clone())),
+                type_id: None,
             }),
             message,
         }

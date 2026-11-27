@@ -82,6 +82,7 @@ fn never_body_like_real_mir() {
             literal: ConstKind::Ty(Ty::FnDef(DefId::new(0, 1), vec![])),
             user_ty: None,
             ty: None,
+            generic_type_ids: None,
         }),
         args: vec![],
         destination: p(2),

@@ -1341,6 +1341,7 @@ impl<'a> Interpreter<'a> {
             concrete: identity.concrete.clone(),
             traits: identity.traits.clone(),
             drop_glue: identity.glue.clone().map(Box::new),
+            type_id: identity.type_id,
         })
     }
 
@@ -1391,12 +1392,14 @@ impl<'a> Interpreter<'a> {
                 concrete,
                 traits,
                 drop_glue,
+                type_id,
                 ..
             } => Some(Value::DynRef {
                 base: Box::new(base),
                 concrete: concrete.clone(),
                 traits: traits.clone(),
                 drop_glue: drop_glue.clone(),
+                type_id: *type_id,
             }),
             _ => {
                 let id = self.vtable_id_in_metadata(meta)?;
