@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rustc_middle::mir::coverage as rcov;
+use rustc_middle::mir::visit::Visitor as _;
 use rustc_middle::mono::MonoItem;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::source_map::SourceMap;
@@ -30,6 +31,30 @@ use sparagmos_mir as sm;
 pub fn instrument_coverage_enabled(tcx: TyCtxt) -> bool {
     tcx.sess.opts.cg.instrument_coverage
         != rustc_session::config::InstrumentCoverage::No
+}
+
+/// Collects every `FnDef` definition mentioned in a body
+/// (call operands, function-pointer constants, ...): the
+/// mention is evidence that the mentioning body's crate uses
+/// the definition in its own code.
+#[derive(Default)]
+struct FnDefMentions {
+    defs: Vec<rustc_span::def_id::DefId>,
+}
+
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for FnDefMentions {
+    fn visit_ty(
+        &mut self,
+        ty: ty::Ty<'tcx>,
+        _: rustc_middle::mir::visit::TyContext,
+    ) {
+        if let ty::TyKind::FnDef(def_id, _) = ty.kind() {
+            if !self.defs.contains(def_id) {
+                self.defs.push(*def_id);
+            }
+        }
+        self.super_ty(ty);
+    }
 }
 
 /// Capture the coverage mapping table of the crate being
@@ -128,6 +153,22 @@ pub fn capture<'tcx>(
     // and every converted body (auxiliary crates' bodies are
     // codegenned by their own compilations, whose coverage
     // statements mark their own instances the same way).
+    // Home-crate usage evidence for the foreign unused sweep
+    // below: (crate, def) pairs where some walked body of that
+    // crate uses the definition -- a coverage statement
+    // attributed to an instantiation of it through inlining, or
+    // an `FnDef` mention (a call, a function pointer) in the
+    // body. A foreign definition its home crate's own code uses
+    // is a mono item of the home compilation, so the home
+    // mapgen emits no unused record for it; the sweep must not
+    // invent one either. Usage by another crate's bodies does
+    // not count (the pair is keyed by the using body's crate),
+    // and a body's mention of its own definition does not
+    // count (a converted instantiation is not home usage).
+    let mut home_used: HashSet<(
+        rustc_span::def_id::CrateNum,
+        rustc_span::def_id::DefId,
+    )> = HashSet::new();
     let mut marked: Vec<ty::Instance<'tcx>> = Vec::new();
     {
         let mut marked_set: HashSet<ty::Instance<'tcx>> = HashSet::new();
@@ -165,6 +206,8 @@ pub fn capture<'tcx>(
             let walked = std::panic::catch_unwind(
                 std::panic::AssertUnwindSafe(|| {
                     let mut found: Vec<ty::Instance<'tcx>> = Vec::new();
+                    let mut attributed_all: Vec<ty::Instance<'tcx>> =
+                        Vec::new();
                     let body = tcx.instance_mir(instance.def);
                     for block in body.basic_blocks.iter() {
                         for stmt in &block.statements {
@@ -195,6 +238,7 @@ pub fn capture<'tcx>(
                             ) {
                                 continue;
                             }
+                            attributed_all.push(attributed);
                             let has_counter = tcx
                                 .coverage_codegen_info(attributed.def)
                                 .map(|info| {
@@ -207,10 +251,24 @@ pub fn capture<'tcx>(
                             }
                         }
                     }
-                    found
+                    let mut mentions = FnDefMentions::default();
+                    mentions.visit_body(body);
+                    (found, attributed_all, mentions.defs)
                 }),
             );
-            if let Ok(found) = walked {
+            if let Ok((found, attributed_all, mentioned)) = walked {
+                let walker_crate = instance.def_id().krate;
+                for attributed in &attributed_all {
+                    if *attributed != *instance {
+                        home_used
+                            .insert((walker_crate, attributed.def_id()));
+                    }
+                }
+                for def in mentioned {
+                    if def != instance.def_id() {
+                        home_used.insert((walker_crate, def));
+                    }
+                }
                 for attributed in found {
                     if marked_set.insert(attributed) {
                         marked.push(attributed);
@@ -344,6 +402,12 @@ pub fn capture<'tcx>(
             }
         }
         for def in candidates {
+            // The home crate's own code uses this definition,
+            // so its home compilation monomorphised it and
+            // emitted no unused record (see `home_used`).
+            if home_used.contains(&(krate, def)) {
+                continue;
+            }
             // (Eligibility is local-only as a query; a foreign
             // definition without coverage info simply yields
             // no record from prepare.)
@@ -1715,11 +1779,29 @@ fn attribute_body<'tcx>(
                 rcov::CoverageKind::VirtualCounter { bcb },
             ) = &stmt.kind
             {
+                // The scope's inlined instance is stated in
+                // terms of this body's own generic parameters;
+                // instantiate it with this instance, exactly as
+                // the capture's marking walk instantiates it,
+                // so the owner symbol is the record's symbol
+                // (the raw instance's symbol names the
+                // parameters instead of the arguments, and no
+                // record carries it).
                 let owner = stmt
                     .source_info
                     .scope
                     .inlined_instance(&ibody.source_scopes)
-                    .map(|inst| tcx.symbol_name(inst).name.to_string());
+                    .map(|inlined| {
+                        let attributed = instance
+                            .instantiate_mir_and_normalize_erasing_regions(
+                                tcx,
+                                ty::TypingEnv::fully_monomorphized(),
+                                rustc_middle::ty::EarlyBinder::bind(
+                                    tcx, inlined,
+                                ),
+                            );
+                        tcx.symbol_name(attributed).name.to_string()
+                    });
                 internal.push((bcb.as_u32(), owner));
             }
         }

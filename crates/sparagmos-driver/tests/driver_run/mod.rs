@@ -14,6 +14,7 @@ mod cargo_shim;
 mod closures_coroutines;
 mod collections;
 mod constants;
+mod coverage;
 mod debug_mode;
 mod drop_box;
 mod dst_size_of_val;
