@@ -242,6 +242,11 @@ impl ToolRegistry {
             .unwrap_or_else(|| "source.rs".to_string());
         let base =
             std::env::temp_dir().join(format!("sparagmos-artifact-sources-{}", std::process::id()));
+        // The tree is read only by this process and by the
+        // child driver processes it waits for, so it is dead
+        // once this process exits: register the base for
+        // removal on every exit path (#537).
+        register_process_scratch(&base);
         let dir = base.join(format!("{hash:016x}"));
         for (rel, bytes) in tree {
             let target = dir.join(rel);

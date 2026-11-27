@@ -22,6 +22,34 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// Fixture directories this test process created under the
+/// system temp directory, removed when the process exits.
+/// Tests spawn the driver per case and used to leave every
+/// fixture directory behind (#537); the registry keeps the
+/// per-test `temp_dir` shape and sweeps at exit instead.
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_scratch_dir(dir: &std::path::Path) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let _ = libc::atexit(remove_scratch_dirs);
+    });
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+}
+
+extern "C" fn remove_scratch_dirs() {
+    if let Ok(dirs) = SCRATCH_DIRS.try_lock() {
+        for dir in dirs.iter() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 fn fixture(dir: &Path, name: &str, src: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, src).unwrap();
@@ -34,6 +62,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    register_scratch_dir(&dir);
     dir
 }
 

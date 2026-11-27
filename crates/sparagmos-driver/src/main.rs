@@ -542,12 +542,12 @@ const DRIVER_STACK_SIZE: usize = 8 * 1024 * 1024 * 1024;
 /// Scratch paths this process created under the system temp
 /// directory and must remove before it exits: the compile flow's
 /// output directory (`sparagmos-driver-out-{pid}`, the rustc
-/// `--out-dir` and the auxiliary builds) and the informational
-/// scratch source file. (The materialised artifact source trees,
-/// `sparagmos-artifact-sources-{pid}`, are deliberately not
-/// covered: the snapshot-privacy test sweeps for the tree after
-/// the driver exits, so its post-exit observability is
-/// load-bearing -- see #537.) Nothing outside
+/// `--out-dir` and the auxiliary builds), the materialised
+/// artifact source trees (`sparagmos-artifact-sources-{pid}`,
+/// registered by the tool registry when it materialises a
+/// snapshot: the tree is read only by this process and by the
+/// child driver processes it waits for, so it is dead at exit)
+/// and the informational scratch source file. Nothing outside
 /// this process reads them once it exits -- the subset runner
 /// and the harness consume only the driver's stdout, stderr and
 /// exit code -- but they are large (the out dir carries an
@@ -605,6 +605,12 @@ fn exit_process(code: i32) -> ! {
 /// `PROCESS_SCRATCH`).
 const SCRATCH_OUT_DIR_PREFIX: &str = "sparagmos-driver-out-";
 
+/// The prefix of the materialised artifact source tree
+/// directory names in the system temp directory; the suffix
+/// is the creating process's pid
+/// (`sparagmos-artifact-sources-{pid}`, see `PROCESS_SCRATCH`).
+const SCRATCH_ARTIFACT_SOURCES_PREFIX: &str = "sparagmos-artifact-sources-";
+
 /// How long a scratch output directory must go unmodified
 /// before the startup reaper (see `reap_stale_scratch`) may
 /// remove it. The creator's death is the primary signal; the
@@ -626,7 +632,9 @@ const SCRATCH_REAP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs
 /// produced.
 fn scratch_out_dir_pid(file_name: &std::ffi::OsStr) -> Option<u32> {
     let name = file_name.to_str()?;
-    let suffix = name.strip_prefix(SCRATCH_OUT_DIR_PREFIX)?;
+    let suffix = name
+        .strip_prefix(SCRATCH_OUT_DIR_PREFIX)
+        .or_else(|| name.strip_prefix(SCRATCH_ARTIFACT_SOURCES_PREFIX))?;
     if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -685,10 +693,11 @@ fn scratch_out_dir_reapable(
 /// `SPARAGMOS_DRIVER_KEEP_SCRATCH` opt-out disables the
 /// sweep as well: a session that keeps its own scratch for
 /// inspection does not have other sessions' scratch removed
-/// from under it either. Only `sparagmos-driver-out-{pid}`
-/// directories are candidates -- the materialised artifact
-/// source trees keep their deliberate exemption (see
-/// `PROCESS_SCRATCH`). Best-effort throughout: a directory a
+/// from under it either. Both per-pid scratch directory
+/// families are candidates -- `sparagmos-driver-out-{pid}`
+/// and `sparagmos-artifact-sources-{pid}` -- since a killed
+/// process's exit-path removal never ran for either.
+/// Best-effort throughout: a directory a
 /// concurrent reaper already removed, or one that cannot be
 /// read, is not an error.
 fn reap_stale_scratch() {
@@ -1479,16 +1488,17 @@ mod scratch_reap_tests {
     fn parses_creator_pid_from_out_dir_names() {
         assert_eq!(pid_of("sparagmos-driver-out-1"), Some(1));
         assert_eq!(pid_of("sparagmos-driver-out-4194304"), Some(4194304));
+        assert_eq!(pid_of("sparagmos-artifact-sources-123"), Some(123));
         // Not names this driver produces: no pid, pid 0 (a
         // process-group address), a sign, trailing junk, a pid
-        // that does not fit a `pid_t`, and the deliberately
-        // exempt artifact-source trees.
+        // that does not fit a `pid_t`.
         assert_eq!(pid_of("sparagmos-driver-out-"), None);
         assert_eq!(pid_of("sparagmos-driver-out-0"), None);
         assert_eq!(pid_of("sparagmos-driver-out--1"), None);
         assert_eq!(pid_of("sparagmos-driver-out-12x"), None);
         assert_eq!(pid_of("sparagmos-driver-out-99999999999"), None);
-        assert_eq!(pid_of("sparagmos-artifact-sources-123"), None);
+        assert_eq!(pid_of("sparagmos-artifact-sources-0"), None);
+        assert_eq!(pid_of("sparagmos-artifact-sources-12x"), None);
         assert_eq!(pid_of("sparagmos-driver-out"), None);
     }
 
@@ -1500,6 +1510,28 @@ mod scratch_reap_tests {
         assert!(!scratch_out_dir_reapable(4242, 1111, true, old));
         assert!(!scratch_out_dir_reapable(4242, 1111, false, young));
         assert!(!scratch_out_dir_reapable(1111, 1111, false, old));
+    }
+
+    #[test]
+    fn registered_scratch_paths_are_removed() {
+        // Registration is what the exit wrapper drains on
+        // every exit path (#537): a registered directory and
+        // a registered file both go away, and a path that was
+        // never created is not an error.
+        let dir = std::env::temp_dir().join(format!(
+            "sparagmos-scratch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("scratch.txt");
+        std::fs::write(&file, b"x").unwrap();
+        register_process_scratch(&dir);
+        register_process_scratch(&file);
+        register_process_scratch(&dir.join("never-created"));
+        remove_process_scratch();
+        assert!(!dir.exists());
+        assert!(!file.exists());
     }
 
     #[cfg(unix)]
