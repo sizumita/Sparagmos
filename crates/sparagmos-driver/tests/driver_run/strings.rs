@@ -4016,6 +4016,65 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
     );
 }
 
+const OS_STRING_INTO_BOXED_OS_STR_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+fn check(tag: &str, os: OsString) {
+    // `into_boxed_os_str` hands the bytes to a fresh box;
+    // every `OsStr` consumer reads the same bytes back,
+    // whichever form the `OsString` was built in.
+    let b = os.into_boxed_os_str();
+    println!("{} len={} empty={} bytes={:?} lossy={} eq={} dbg={:?}",
+        tag, b.len(), b.is_empty(), b.as_bytes(), b.to_string_lossy(),
+        &*b == OsStr::new("hello"), b);
+}
+
+fn main() {
+    check("from", OsString::from("hello"));
+    let mut os = OsString::with_capacity(16);
+    os.push("hel");
+    os.push("lo");
+    check("push", os);
+    check("vec", OsString::from_vec(b"hello".to_vec()));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_into_boxed_os_str() {
+    run_ok(
+        "os-string-into-boxed-os-str",
+        OS_STRING_INTO_BOXED_OS_STR_SRC,
+        "from len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\npush len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\nvec len=5 empty=false bytes=[104, 101, 108, 108, 111] lossy=hello eq=true dbg=\"hello\"\n",
+    );
+}
+
+const OS_STRING_INTO_BOXED_OS_STR_EDGE_SRC: &str = r#"
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+fn main() {
+    // The empty string boxes to an empty `OsStr`, non-UTF-8
+    // bytes survive the round trip unaltered, and the box
+    // converts back into the `OsString` it came from.
+    let empty = OsString::new().into_boxed_os_str();
+    println!("empty len={} empty={}", empty.len(), empty.is_empty());
+    let raw = OsString::from_vec(vec![0xff, b'a', 0x80]).into_boxed_os_str();
+    println!("nonutf8 bytes={:?}", raw.as_bytes());
+    let back: OsString = OsString::from(OsString::from("hello").into_boxed_os_str());
+    println!("back={:?}", back);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_into_boxed_os_str_edges() {
+    run_ok(
+        "os-string-into-boxed-os-str-edges",
+        OS_STRING_INTO_BOXED_OS_STR_EDGE_SRC,
+        "empty len=0 empty=true\nnonutf8 bytes=[255, 97, 128]\nback=\"hello\"\n",
+    );
+}
+
 const SORT_STRING_ELEMENTS_SRC: &str = r#"
 fn main() {
     // Sorting more than twenty `String` elements takes the

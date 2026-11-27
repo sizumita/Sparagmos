@@ -4126,6 +4126,27 @@ impl<'a> Interpreter<'a> {
                             value.kind_name(),
                         )),
                     }
+                } else if target == "std::ffi::OsString"
+                    && (generic_first_arg(source, "std::boxed::Box<")
+                        == Some("std::ffi::OsStr")
+                        || generic_first_arg(source, "alloc::boxed::Box<")
+                            == Some("std::ffi::OsStr"))
+                {
+                    // `OsString: From<Box<OsStr>>`: the byte
+                    // string moves out of the box, releasing
+                    // its allocation; the `OsString` value is
+                    // the buffer form over those bytes.
+                    match self.unbox_take(&value) {
+                        Some(pointee) => {
+                            let bytes = self.os_str_bytes(frames, &pointee)?;
+                            Ok(os_string_value(&bytes))
+                        }
+                        _ => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "boxed OS string value",
+                            value.kind_name(),
+                        )),
+                    }
                 } else if target == "std::string::String"
                     && (source == "&str" || source == "&mut str")
                 {
@@ -5594,6 +5615,20 @@ impl<'a> Interpreter<'a> {
                 let s = self.resolve_string(frames, &vals[0])?;
                 let boxed = self.new_box(Value::Str(s));
                 self.record_box_ty(&boxed, Ty::Str);
+                Ok(boxed)
+            }
+            Builtin::OsStringIntoBoxedOsStr => {
+                arity(1)?;
+                let pointee = self.resolve_value(frames, &vals[0])?;
+                let bytes = self.os_string_bytes_any(frames, &pointee)?.ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "an OS string value",
+                        pointee.kind_name(),
+                    )
+                })?;
+                let boxed = self.new_box(Value::Bytes(bytes));
+                self.record_box_ty(&boxed, Ty::Slice(Box::new(Ty::Uint(crate::ir::UintTy::U8))));
                 Ok(boxed)
             }
             Builtin::NoAllocShimMarker => {
