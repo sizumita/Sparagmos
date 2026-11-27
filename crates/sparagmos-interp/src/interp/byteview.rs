@@ -248,7 +248,7 @@ impl<'a> Interpreter<'a> {
     /// `debug_shape_for_def`): a recorded instance entry
     /// answers for a bare definition name, and a rendered
     /// instance name answers for itself.
-    fn adt_is_union(&self, name: &str) -> bool {
+    pub(crate) fn adt_is_union(&self, name: &str) -> bool {
         matches!(
             self.debug_shape_for_def(name),
             Some(shape) if shape.kind == sparagmos_mir::AdtShapeKind::Union
@@ -338,6 +338,77 @@ impl<'a> Interpreter<'a> {
             .map(|f| f.ty.clone())
     }
 
+    /// The declared type of field `i` of variant `variant` of
+    /// the ADT instance `key` (the walk's own name for it is
+    /// `name`), for the type walk in
+    /// [`Self::projection_storage_offset`]: the field's
+    /// recorded tag when it names another laid-out ADT
+    /// instance, else the conversion-recorded field type --
+    /// the answer that keeps the walk going across a field
+    /// whose type is not itself an ADT (an array field's
+    /// element steps price from it, where the tag recovery
+    /// alone ended the walk and left a displaced store into
+    /// the array unjudged).
+    fn walk_field_ty(
+        &self,
+        key: &str,
+        name: &str,
+        variant: usize,
+        i: usize,
+    ) -> Option<Ty> {
+        let primary = self
+            .adt_field_tag(key, variant, i)
+            .and_then(|tag| self.ty_of_field_tag(&tag))
+            .or_else(|| {
+                adt_field_ty_in(self.program(), &Ty::Adt(key.to_string()), variant, i)
+            })
+            .or_else(|| {
+                adt_field_ty_in(self.program(), &Ty::Adt(name.to_string()), variant, i)
+            });
+        // A union's stored value holds one field, and the
+        // recorded shape may list a zero-sized field first
+        // (a union's `uninit: ()` field precedes the payload
+        // in `MaybeUninit`'s shape): a unit recovery for a
+        // union field whose walk continues into the payload
+        // is the payload field's type, found by its size --
+        // the union's own.
+        if matches!(primary, Some(Ty::Unit) | None) && self.adt_is_union(key) {
+            let union_size = self.program().adt_layouts.get(key).map(|&(size, _)| size)?;
+            for g in 0..8 {
+                let Some(tag) = self.adt_field_tag(key, variant, g) else {
+                    continue;
+                };
+                match self.layout_of(&tag) {
+                    Some((size, _)) if size == u128::from(union_size) && size > 0 => {
+                        if let Some(ty) = self.ty_of_field_tag(&tag) {
+                            return Some(ty);
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        primary
+    }
+
+    /// The `Ty` a field's recorded tag names, for the type
+    /// walk: an ADT instance tag (whether or not the
+    /// instance has recorded field layouts -- a union
+    /// instance, the `MaybeUninit` a displaced pointer's
+    /// prefix crosses, carries none, and the tag recovery
+    /// that required layouts ended the walk there), or a
+    /// scalar / array tag in the form the walk prices (an
+    /// array field's element steps, above all).
+    fn ty_of_field_tag(&self, tag: &str) -> Option<Ty> {
+        let tag = tag.trim();
+        if self.program().adt_debug_shapes.contains_key(tag)
+            || self.program().adt_layouts.contains_key(tag)
+        {
+            return Some(Ty::Adt(tag.to_string()));
+        }
+        ty_of_simple_tag(tag)
+    }
+
     /// Walk a structural projection prefix over the declared
     /// type `base_ty`, returning the byte offset of the position
     /// it denotes within the base value's storage and the
@@ -380,27 +451,97 @@ impl<'a> Interpreter<'a> {
                         let key = self
                             .adt_instance_key(name)
                             .unwrap_or_else(|| name.clone());
+                        // A union's fields all sit at offset
+                        // zero, and unions carry no recorded
+                        // field-layout rows: the step prices
+                        // at the base's own position, and the
+                        // walk continues at the field's type
+                        // (the `MaybeUninit` a displaced
+                        // pointer's prefix crosses on its way
+                        // to the array it holds).
+                        if !self.program().adt_field_layouts.contains_key(&key)
+                            && self.adt_is_union(&key)
+                        {
+                            ty = self.walk_field_ty(&key, name, variant, *i);
+                            size = ty
+                                .as_ref()
+                                .and_then(|t| self.ty_size(t))
+                                .and_then(|sz| usize::try_from(sz).ok());
+                            variant = 0;
+                            continue;
+                        }
                         let rows = self.program().adt_field_layouts.get(&key)?;
                         let row = rows.get(variant)?;
                         let &(field_off, field_size) = row.get(*i)?;
                         off = off.checked_add(usize::try_from(field_off).ok()?)?;
                         size = Some(usize::try_from(field_size).ok()?);
-                        ty = self
-                            .adt_field_tag(&key, variant, *i)
-                            .filter(|tag| {
-                                self.program().adt_field_layouts.contains_key(tag)
-                            })
-                            .map(Ty::Adt);
+                        ty = self.walk_field_ty(&key, name, variant, *i);
                         variant = 0;
                     }
                     _ => return None,
                 },
-                RefProj::Index(k) => match &ty {
-                    Some(Ty::Array(elem, _)) => {
-                        let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
-                        off = off.checked_add(k.checked_mul(elem_size)?)?;
-                        size = Some(elem_size);
-                        ty = Some((**elem).clone());
+                RefProj::Index(k) => {
+                    // A one-field wrapper between the walk and
+                    // the array it holds (the `ManuallyDrop`
+                    // a `MaybeUninit` field's payload wears,
+                    // flattened in the value model so the
+                    // projection indexes the array directly):
+                    // descend into the wrapper's field first,
+                    // at its recorded offset.
+                    if let Some(Ty::Adt(name)) = &ty {
+                        let key = self
+                            .adt_instance_key(name)
+                            .unwrap_or_else(|| name.clone());
+                        if let Some(inner) =
+                            self.walk_field_ty(&key, name, variant, 0)
+                        {
+                            if matches!(inner, Ty::Array(..)) {
+                                if let Some(&(field_off, _)) = self
+                                    .program()
+                                    .adt_field_layouts
+                                    .get(&key)
+                                    .and_then(|rows| rows.get(variant))
+                                    .and_then(|row| row.get(0))
+                                {
+                                    off = off.checked_add(
+                                        usize::try_from(field_off).ok()?,
+                                    )?;
+                                }
+                                ty = Some(inner);
+                                variant = 0;
+                            }
+                        }
+                    }
+                    match &ty {
+                        Some(Ty::Array(elem, _)) => {
+                            let elem_size =
+                                usize::try_from(self.ty_size(elem)?).ok()?;
+                            off = off.checked_add(k.checked_mul(elem_size)?)?;
+                            size = Some(elem_size);
+                            ty = Some((**elem).clone());
+                        }
+                        _ => return None,
+                    }
+                }
+                RefProj::UnionField { idx, table } => match &ty {
+                    // A union field step does not move the
+                    // position (every field sits at offset
+                    // zero); the walk continues at the field's
+                    // declared type, from the union's recorded
+                    // shape where it names one.
+                    Some(Ty::Adt(name)) => {
+                        let cur = Ty::Adt(name.clone());
+                        ty = self
+                            .program()
+                            .union_tables
+                            .get(*table)
+                            .and_then(|shapes| shapes.get(*idx))
+                            .and_then(|o| o.as_ref())
+                            .and_then(scalar_shape_to_ty)
+                            .or_else(|| {
+                                adt_field_ty_in(self.program(), &cur, 0, *idx)
+                            });
+                        variant = 0;
                     }
                     _ => return None,
                 },
@@ -766,6 +907,105 @@ impl<'a> Interpreter<'a> {
                 // through the union projection machinery, and
                 // later byte accesses read the image back.
                 if self.adt_is_union(name) {
+                    // A union holding one live field whose own
+                    // layout judges the byte: the splice lands
+                    // in that field's value, keeping the
+                    // aggregate form the structural projections
+                    // read (the `MaybeUninit` a displaced store
+                    // crosses holds its payload this way, and a
+                    // field projection over the byte form has
+                    // no field to read). The byte form below is
+                    // for the writes no held field's layout
+                    // judges -- a cross-field write, or a union
+                    // value holding no field.
+                    let held = match &*slot {
+                        Value::Enum { fields, .. } => {
+                            let live: Vec<usize> = fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, f)| **f != Value::Uninit)
+                                .map(|(i, _)| i)
+                                .collect();
+                            match live[..] {
+                                [f] => Some((f, fields[f].clone())),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((f, field)) = held {
+                        // The held field's tag: the recorded
+                        // shape may list a zero-sized sibling
+                        // first (a union's `uninit: ()` field
+                        // precedes the payload in
+                        // `MaybeUninit`'s shape, while the
+                        // stored value holds the payload
+                        // alone), so a zero-sized tag at the
+                        // held index gives way to the field
+                        // whose size is the union's own.
+                        let tag = self
+                            .adt_field_tag(name, 0, f)
+                            .and_then(|tag| match self.layout_of(&tag) {
+                                Some((size, _)) if size > 0 => Some(tag),
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                let union_size = self
+                                    .program()
+                                    .adt_layouts
+                                    .get(name)
+                                    .map(|&(size, _)| size)?;
+                                (0..8).find_map(|g| {
+                                    let tag = self.adt_field_tag(name, 0, g)?;
+                                    match self.layout_of(&tag) {
+                                        Some((size, _))
+                                            if size == u128::from(union_size) && size > 0 =>
+                                        {
+                                            Some(tag)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            });
+                        let layout = tag
+                            .and_then(|tag| {
+                                self.byte_layout_of_tag(&tag).or_else(|| {
+                                    let (field_size, _) =
+                                        self.layout_of(&tag)?;
+                                    self.field_byte_layout(
+                                        name,
+                                        0,
+                                        f,
+                                        usize::try_from(field_size).ok()?,
+                                        &field,
+                                    )
+                                })
+                            })
+                            // The tag lookup is keyed by the
+                            // instance's recorded name, which a
+                            // layout name under another root
+                            // spelling of the same definition
+                            // misses: the type walk's recovery
+                            // names the field's type, and its
+                            // layout is the field's.
+                            .or_else(|| {
+                                let ty = self.walk_field_ty(name, name, 0, f)?;
+                                self.byte_layout_of_ty(&ty)
+                            });
+                        if let Some(layout) = layout {
+                            let mut field = field;
+                            if let Some(r) =
+                                self.splice_storage_byte(&mut field, &layout, pos, byte)
+                            {
+                                if r.is_ok() {
+                                    if let Value::Enum { fields, .. } = slot {
+                                        fields[f] = field;
+                                    }
+                                }
+                                return Some(r);
+                            }
+                        }
+                    }
                     let mut image = self.union_storage_image(slot, name)?;
                     if pos >= image.len() {
                         return Some(Err(ByteVerdict::Outside(pos)));
@@ -789,6 +1029,36 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![Value::Uninit; first.len()],
                     };
+                }
+                // A one-field wrapper the value model stores
+                // flattened (the slot holds the field's own
+                // aggregate value, not an `Enum` -- a
+                // `ManuallyDrop` payload held directly in its
+                // `MaybeUninit` slot): the byte lands in the
+                // field's storage at its recorded offset,
+                // priced by the field's layout.
+                if matches!(slot, Value::Tuple(_) | Value::Bytes(_) | Value::Str(_)) {
+                    let rows = self.program().adt_field_layouts.get(name)?;
+                    let row = rows.first()?;
+                    if row.len() != 1 {
+                        return None;
+                    }
+                    let (field_off, field_size) =
+                        (row[0].0 as usize, row[0].1 as usize);
+                    if pos < field_off || pos >= field_off + field_size {
+                        return Some(Err(ByteVerdict::Outside(pos)));
+                    }
+                    let layout =
+                        self.field_byte_layout(name, 0, 0, field_size, slot)?;
+                    if self.byte_layout_size(&layout)? > field_size {
+                        return None;
+                    }
+                    return self.splice_storage_byte(
+                        slot,
+                        &layout,
+                        pos - field_off,
+                        byte,
+                    );
                 }
                 let (variant, row) = {
                     let Value::Enum { variant, .. } = &*slot else {
@@ -4262,6 +4532,26 @@ pub(crate) fn scalar_shape_of_ty(ty: &Ty) -> Option<ScalarShape> {
 /// reference or pointer wrappers stripped: `&u32`, `*const f32`
 /// and `u32` all name the same shape. `None` when the tag names
 /// no scalar type.
+/// The `Ty` a rendered field tag names, for the forms the
+/// byte view's type walk prices directly: a scalar tag, or
+/// an array tag `[elem; N]` whose element tag is itself one
+/// of these forms (an ADT instance tag is the caller's own
+/// recovery, keyed by the program's shape tables). `None`
+/// for every other tag.
+fn ty_of_simple_tag(tag: &str) -> Option<Ty> {
+    let tag = tag.trim();
+    if let Some(shape) = scalar_shape_of_tag(tag) {
+        return scalar_shape_to_ty(&shape);
+    }
+    if tag.starts_with('[') && tag.ends_with(']') {
+        let inner = &tag[1..tag.len() - 1];
+        let (elem, count) = inner.rsplit_once(';')?;
+        let count: u64 = count.trim().parse().ok()?;
+        return Some(Ty::Array(Box::new(ty_of_simple_tag(elem)?), count));
+    }
+    None
+}
+
 pub(crate) fn scalar_shape_of_tag(tag: &str) -> Option<ScalarShape> {
     let mut tag = tag;
     loop {

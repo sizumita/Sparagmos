@@ -3994,6 +3994,7 @@ impl<'a> Interpreter<'a> {
         // applies, so a byte displacement into a typed sequence is
         // never reinterpreted this way.
         if !array_judged
+            && !self.absorb_denomination_mismatch(frames, place, &projection, elem_size)
             && !self.byte_view_covers(frames, place, static_name, &projection, base)
         {
             if let Some(base) = base {
@@ -4057,6 +4058,166 @@ impl<'a> Interpreter<'a> {
             }
             Some(new_index)
         }
+    }
+
+    /// Whether absorbing an offset into an element index over
+    /// the position `projection` denotes would denominate the
+    /// index in the wrong element size: the declared type at the
+    /// position prices the sequence the offset ranges over, and
+    /// its element size differs from the offset's own element
+    /// size. The shape behind Issue #501's remaining family: a
+    /// byte pointer's offset over a `ManuallyDrop<MaybeUninit<
+    /// [u32; 2]>>` field -- conversion records no `array_position`
+    /// verdict for the wrapper path, so the value-shape absorption
+    /// below denominated the array's elements in bytes and turned
+    /// a one-byte displacement into element index 1, splicing a
+    /// four-byte write over the second element. A mismatched
+    /// offset is not absorbed: it is carried as a byte
+    /// displacement, which the byte view resolves at the true
+    /// position. A position whose sequence element size the
+    /// declared types cannot price keeps the value shape's own
+    /// judgment, as before.
+    fn absorb_denomination_mismatch(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        projection: &[RefProj],
+        elem_size: Option<u64>,
+    ) -> bool {
+        let Some(offset_elem) = elem_size else {
+            return false;
+        };
+        match self.declared_sequence_elem_size(frames, place, projection) {
+            Some(seq_elem) => seq_elem != offset_elem,
+            None => false,
+        }
+    }
+
+    /// The element size of the sequence an offset over the
+    /// position `projection` denotes ranges over, priced from the
+    /// target local's declared type: the sequence the projection
+    /// ends at, or the one its last index step ranges over when
+    /// only whole-value entry steps (field-0 entries and
+    /// downcasts, the transparent wrappers) follow that step.
+    /// `None` when the walk cannot price the position -- a step
+    /// it cannot follow, or an ending inside a sub-value whose
+    /// denomination is not the recorded sequence's.
+    fn declared_sequence_elem_size(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        projection: &[RefProj],
+    ) -> Option<u64> {
+        let (frame_id, local) = place?;
+        let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
+        let body = self.program().functions.get(&frame.func)?;
+        let mut cur = WalkTy::Ty(body.local_tys.get(local)?.clone());
+        let mut variant = 0u32;
+        // The element size of the sequence the most recent index
+        // step ranged over, kept across the whole-value entry
+        // steps that may follow it.
+        let mut ranged_elem: Option<u64> = None;
+        let mut at_sequence_end = false;
+        for step in projection {
+            at_sequence_end = false;
+            match step {
+                RefProj::Field(f) => {
+                    if *f != 0 {
+                        ranged_elem = None;
+                    }
+                    cur = self.field_walk_ty_union_aware(&cur, variant, *f)?;
+                }
+                RefProj::UnionField { idx, .. } => {
+                    if *idx != 0 {
+                        ranged_elem = None;
+                    }
+                    cur = self.field_walk_ty_union_aware(&cur, variant, *idx)?;
+                }
+                RefProj::Downcast(v) => {
+                    variant = *v;
+                }
+                RefProj::Index(_) => {
+                    let (size, elem) = self.sequence_elem(&cur)?;
+                    ranged_elem = size;
+                    cur = elem;
+                }
+                RefProj::View(view) => {
+                    cur = WalkTy::Ty(view.clone());
+                    variant = 0;
+                    ranged_elem = None;
+                }
+                _ => return None,
+            }
+            at_sequence_end = matches!(step, RefProj::Index(_));
+        }
+        if at_sequence_end {
+            return ranged_elem;
+        }
+        // The position may sit behind single-field wrappers
+        // the value model flattens (the `ManuallyDrop` a
+        // `MaybeUninit` payload wears): descend through them
+        // until the sequence the position ranges over prices.
+        let mut cur = cur;
+        for _ in 0..4 {
+            if let Some((size, _)) = self.sequence_elem(&cur) {
+                return size;
+            }
+            match self.field_walk_ty_union_aware(&cur, 0, 0) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        ranged_elem
+    }
+
+    /// [`Self::field_walk_ty`] with the union payload rule
+    /// the value model keeps: a union's stored value holds
+    /// its payload field alone, while the recorded shape may
+    /// list a zero-sized field first (a union's `uninit: ()`
+    /// field precedes the payload in `MaybeUninit`'s shape),
+    /// so a step landing on a zero-sized field of a union
+    /// continues at the field whose size is the union's own.
+    fn field_walk_ty_union_aware(
+        &self,
+        cur: &WalkTy,
+        variant: u32,
+        idx: usize,
+    ) -> Option<WalkTy> {
+        let direct = self.field_walk_ty(cur, variant, idx)?;
+        let union_key = match cur {
+            WalkTy::Ty(Ty::Adt(name)) => self.adt_instance_key(name),
+            WalkTy::Tag(tag) => Some(tag.trim().to_string()),
+            _ => None,
+        };
+        let Some(key) = union_key else {
+            return Some(direct);
+        };
+        if !self.adt_is_union(&key) {
+            return Some(direct);
+        }
+        let zero_sized = match &direct {
+            WalkTy::Ty(t) => self.ty_size_full(t) == Some(0),
+            WalkTy::Tag(tag) => {
+                matches!(self.layout_of(tag.trim()), Some((0, _)))
+            }
+        };
+        if !zero_sized {
+            return Some(direct);
+        }
+        let union_size = self.layout_of(&key).map(|(size, _)| size);
+        for g in 0..8 {
+            let Some(candidate) = self.field_walk_ty(cur, variant, g) else {
+                continue;
+            };
+            let size = match &candidate {
+                WalkTy::Ty(t) => self.ty_size_full(t).map(u128::from),
+                WalkTy::Tag(tag) => self.layout_of(tag.trim()).map(|(size, _)| size),
+            };
+            if size.is_some_and(|sz| sz > 0 && Some(sz) == union_size) {
+                return Some(candidate);
+            }
+        }
+        Some(direct)
     }
 
     /// Absorb a byte displacement into an element index over the
