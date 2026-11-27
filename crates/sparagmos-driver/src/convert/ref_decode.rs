@@ -386,7 +386,25 @@ impl Converter {
                     return Some(sm::ConstValue::Bytes(bytes));
                 }
                 let stride = elem.layout().ok()?.shape().size.bytes();
-                if stride == 0 && count > 0 { return None; }
+                if stride == 0 {
+                    // A zero-sized element type stores nothing
+                    // per element: every element of the constant
+                    // reads the same zero bytes at the base, so
+                    // one decode replicated to the length is the
+                    // exact value (a `[Z; 2]` slice constant, Z a
+                    // unit struct, is the canonical case). The
+                    // replication is charged to the expansion
+                    // budget like the per-element decodes below.
+                    if count == 0 {
+                        return Some(sm::ConstValue::SliceVal(Vec::new()));
+                    }
+                    if !self.spend_const_budget(count) {
+                        return None;
+                    }
+                    let elem_value =
+                        self.decode_const(&elem, &target, target_off, depth + 1)?;
+                    return Some(sm::ConstValue::SliceVal(vec![elem_value; count]));
+                }
                 let mut elems = Vec::new();
                 for i in 0..count {
                     elems.push(self.decode_const(
@@ -541,8 +559,40 @@ impl Converter {
                         }
                     }
                 }
-                let pointee = self.decode_const(inner, &target, target_off, depth + 1)?;
-                Some(sm::ConstValue::Ref(Box::new(pointee)))
+                if let Some(pointee) =
+                    self.decode_const(inner, &target, target_off, depth + 1)
+                {
+                    return Some(sm::ConstValue::Ref(Box::new(pointee)));
+                }
+                // A partially initialised pointee defeats the
+                // typed decode -- a scalar leaf spanning
+                // initialised and uninitialised bytes has no
+                // value form (a union written through one field
+                // and read through its bytes is the canonical
+                // case) -- but the allocation itself is exact:
+                // preserve it as an erased block, the form a
+                // type-erased pointee takes above, and let the
+                // materialisation at the guest's casts and reads
+                // interpret it. A decode that failed on budget
+                // keeps the constant undecoded, as the other
+                // fallbacks in this function rule.
+                if !self.const_budget_failed && !self.const_work_failed {
+                    if let Ok(size) = inner.layout().map(|l| l.shape().size.bytes()) {
+                        let size = size as usize;
+                        if size > 0
+                            && self.range_partially_uninit(&target, target_off, size)
+                        {
+                            if let Some(block) = self.decode_erased_alloc(
+                                &target,
+                                target_off,
+                                depth + 1,
+                            ) {
+                                return Some(sm::ConstValue::Ref(Box::new(block)));
+                            }
+                        }
+                    }
+                }
+                None
             }
         }
     }
@@ -707,7 +757,26 @@ impl Converter {
             });
         };
         let projection = self.static_offset_path(&static_ty, target_off, inner, depth)?;
-        let seed = self.decode_const(&static_ty, alloc, 0, depth + 1)?;
+        // A reference back to this static from inside its own
+        // seed decode closes an initializer cycle: the seed
+        // cannot be decoded by value (the decode would recurse
+        // until the depth budget refuses the whole constant),
+        // so the nested reference carries the uninitialized
+        // placeholder seed the `static_seed_decoding` field
+        // describes. The enclosing decode produces the real
+        // seed, and the interpreter's seed table ranks it above
+        // the placeholder.
+        if !self.static_seed_decoding.insert(def_id) {
+            return Some(sm::ConstValue::StaticRef {
+                def: def_id,
+                value: Box::new(sm::ConstValue::Uninit),
+                projection,
+                len: None,
+            });
+        }
+        let seed = self.decode_const(&static_ty, alloc, 0, depth + 1);
+        self.static_seed_decoding.remove(&def_id);
+        let seed = seed?;
         Some(sm::ConstValue::StaticRef {
             def: def_id,
             value: Box::new(seed),
@@ -743,7 +812,45 @@ impl Converter {
             return None;
         }
         let def_id = self.crate_def_id(def);
-        let seed = match self.static_tys.get(&def_id).cloned() {
+        // As in `decode_static_ref`: a slice reference back to
+        // a static whose seed decode is on the path closes an
+        // initializer cycle and carries the placeholder seed
+        // (see the `static_seed_decoding` field).
+        if !self.static_seed_decoding.insert(def_id) {
+            return Some(sm::ConstValue::StaticRef {
+                def: def_id,
+                value: Box::new(sm::ConstValue::Uninit),
+                projection: Vec::new(),
+                len: Some(count as u64),
+            });
+        }
+        let seed = self.decode_static_slice_seed(def_id, elem, alloc, count, depth);
+        self.static_seed_decoding.remove(&def_id);
+        let seed = seed?;
+        Some(sm::ConstValue::StaticRef {
+            def: def_id,
+            value: Box::new(seed),
+            projection: Vec::new(),
+            len: Some(count as u64),
+        })
+    }
+
+    /// The seed of the array static a fat slice reference
+    /// denotes whole (see `decode_static_slice_ref`): the
+    /// static's initializer decoded against its declared array
+    /// type, or, for an anonymous promoted static with no
+    /// recorded type, the target allocation decoded element by
+    /// element exactly as the array arm of `decode_const`
+    /// decodes an array value.
+    fn decode_static_slice_seed(
+        &mut self,
+        def_id: sm::DefId,
+        elem: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        count: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        match self.static_tys.get(&def_id).cloned() {
             Some(static_ty) => {
                 // The static's declared type must be the array
                 // the slice covers whole: an unsizing of the
@@ -758,30 +865,31 @@ impl Converter {
                 {
                     return None;
                 }
-                self.decode_const(&static_ty, alloc, 0, depth + 1)?
+                self.decode_const(&static_ty, alloc, 0, depth + 1)
             }
             None => {
-                // An anonymous promoted static: the target
-                // allocation is the array itself, decoded element
-                // by element exactly as the array arm of
-                // `decode_const` decodes an array value.
                 let stride = elem.layout().ok()?.shape().size.bytes();
-                if stride == 0 && count > 0 {
-                    return None;
+                if stride == 0 {
+                    // A zero-sized element type stores nothing
+                    // per element: one decode replicated to the
+                    // length is the exact value, as in
+                    // `decode_ref`'s slice arm.
+                    if count == 0 {
+                        return Some(sm::ConstValue::Tuple(Vec::new()));
+                    }
+                    if !self.spend_const_budget(count) {
+                        return None;
+                    }
+                    let elem_value = self.decode_const(elem, alloc, 0, depth + 1)?;
+                    return Some(sm::ConstValue::Tuple(vec![elem_value; count]));
                 }
                 let mut elems = Vec::new();
                 for i in 0..count {
                     elems.push(self.decode_const(elem, alloc, i * stride, depth + 1)?);
                 }
-                sm::ConstValue::Tuple(elems)
+                Some(sm::ConstValue::Tuple(elems))
             }
-        };
-        Some(sm::ConstValue::StaticRef {
-            def: def_id,
-            value: Box::new(seed),
-            projection: Vec::new(),
-            len: Some(count as u64),
-        })
+        }
     }
 
     /// Whether two types denote the same type up to their

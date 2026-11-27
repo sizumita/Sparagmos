@@ -3056,3 +3056,82 @@ fn run_mode_maybe_uninit_ptr_read_then_assume_init_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
 }
+
+// ----- by-reference constants the allocation determines exactly -------------
+// A reference constant whose pointee the typed decoder used to
+// refuse outright (the constant fell back to the by-reference
+// form and conversion rejected it): statics whose initializers
+// reference each other in a cycle, a pointee left partially
+// initialised by its constant initializer, and a slice of
+// zero-sized elements. Each shape is exact in the allocation,
+// so each decodes and runs.
+
+const CYCLIC_STATICS_SRC: &str = r#"
+struct Node { prev: &'static Node, data: i32, head: bool }
+static L1: Node = Node { prev: &L2, data: 1, head: true };
+static L2: Node = Node { prev: &L1, data: 2, head: false };
+fn main() {
+    let mut cur = &L1;
+    let mut sum = 0;
+    loop {
+        sum += cur.data;
+        cur = cur.prev;
+        if cur.head { break; }
+    }
+    println!("{sum}");
+}
+"#;
+
+#[test]
+fn run_mode_cyclic_statics() {
+    run_ok("cyclic-statics", CYCLIC_STATICS_SRC, "3\n");
+}
+
+const SELF_REFERENTIAL_STATIC_SRC: &str = r#"
+struct Node { next: Option<&'static Node>, data: i32 }
+static L: Node = Node { next: Some(&L), data: 7 };
+fn main() {
+    let n = L.next.unwrap();
+    println!("{} {}", L.data, n.data);
+}
+"#;
+
+#[test]
+fn run_mode_self_referential_static() {
+    run_ok("self-referential-static", SELF_REFERENTIAL_STATIC_SRC, "7 7\n");
+}
+
+const ZST_SLICE_CONST_SRC: &str = r#"
+#[derive(PartialEq, Debug)]
+struct Z;
+const C: Option<&'static [Z]> = Some(&[Z, Z, Z]);
+fn main() {
+    let runtime: Option<&'static [Z]> = Some(&[Z, Z, Z]);
+    assert_eq!(C, runtime);
+    println!("{}", C.unwrap().len());
+}
+"#;
+
+#[test]
+fn run_mode_zst_element_slice_constant() {
+    run_ok("zst-slice-const", ZST_SLICE_CONST_SRC, "3\n");
+}
+
+const PARTIAL_INIT_UNION_CONST_SRC: &str = r#"
+pub union BagOfBits<T: Copy> { uninit: (), _storage: T }
+pub const fn make_1u8_bag<T: Copy>() -> BagOfBits<T> {
+    let mut bag = BagOfBits { uninit: () };
+    unsafe { (&mut bag as *mut _ as *mut u8).write(1); };
+    bag
+}
+fn main() {
+    const C: BagOfBits<usize> = make_1u8_bag();
+    let val = unsafe { (&C as *const BagOfBits<usize> as *const u8).read() };
+    println!("{val}");
+}
+"#;
+
+#[test]
+fn run_mode_partial_init_union_constant() {
+    run_ok("partial-init-union-const", PARTIAL_INIT_UNION_CONST_SRC, "1\n");
+}

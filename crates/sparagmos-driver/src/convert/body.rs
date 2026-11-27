@@ -60,6 +60,7 @@ impl Converter {
             const_scan_budget: MAX_CONST_SCAN_BYTES,
             const_work_failed: false,
             const_work_budget: MAX_CONST_WORK_BYTES,
+            static_seed_decoding: std::collections::HashSet::new(),
             alloc_cache: std::collections::HashMap::new(),
             static_inits: std::collections::HashMap::new(),
             alloc_cache_bytes: 0,

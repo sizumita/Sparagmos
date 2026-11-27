@@ -721,6 +721,42 @@ impl Converter {
         Some(all)
     }
 
+    /// Whether the byte range `offset..offset+size` of `alloc`
+    /// is partially initialised: at least one initialised byte
+    /// and at least one uninitialised byte. The scan is charged
+    /// against the scan budget exactly as `range_all_uninit`'s
+    /// is; a range the budget cannot pay for, and a range
+    /// leaving the allocation, report `false` (the caller's
+    /// fallback then does not fire). Unlike the decode's own
+    /// scans this gate sets no failure flag: it is not part of
+    /// a typed decode, only of the fallback decision after one.
+    pub(crate) fn range_partially_uninit(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+        size: usize,
+    ) -> bool {
+        let Some(range) = alloc.bytes.get(offset..offset + size) else {
+            return false;
+        };
+        let mut examined = 0usize;
+        let mut any_init = false;
+        let mut any_uninit = false;
+        for b in range {
+            examined += 1;
+            if b.is_some() {
+                any_init = true;
+            } else {
+                any_uninit = true;
+            }
+        }
+        if examined > self.const_scan_budget {
+            return false;
+        }
+        self.const_scan_budget -= examined;
+        any_init && any_uninit
+    }
+
     /// Decode the value of type `ty` stored in `alloc` at `offset`
     /// into a structured constant. Aggregates are laid out with the
     /// type's own layout (`Ty::layout`), pointers are followed
@@ -729,7 +765,7 @@ impl Converter {
     /// has no faithful value form: unions, function pointers and
     /// vtables, references to functions, null pointers,
     /// unsized values behind no pointer, and nesting deeper than
-    /// the depth budget (cyclic statics exhaust it).
+    /// the depth budget.
     pub(crate) fn decode_const(
         &mut self,
         ty: &rustc_public::ty::Ty,
