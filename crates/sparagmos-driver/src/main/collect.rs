@@ -595,10 +595,11 @@ fn collect() -> ControlFlow<()> {
 
     // Demand the `Iterator::next` instances of the
     // guest-stepped iterators the converted bodies hand to a
-    // modelled consumer: the consumer's name is builtin-served,
-    // so the call-graph collection stops there, and a generic
-    // guest impl has no monomorphic instance as an item, while
-    // the builtin drain's fallback step runs the impl body.
+    // modelled consumer or step through a direct `next` call:
+    // those names are builtin-served, so the call-graph
+    // collection stops there, and a generic guest impl has no
+    // monomorphic instance as an item, while the builtin
+    // drain's fallback step runs the impl body.
     // The credit and failure accounting folds into the drop
     // demand's maps, which are applied to the deferred
     // placeholders below.

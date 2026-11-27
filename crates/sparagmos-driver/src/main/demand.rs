@@ -1112,19 +1112,143 @@ fn next_impl_methods(
     out
 }
 
+/// The `Self` type a call to the `Iterator::next` trait
+/// method steps, or `None` when the callee is not that
+/// method. A direct `next` call is served by the
+/// interpreter's modelled machine, as the consumers in
+/// `consumer_iterator_ty` are, so the type it names is a
+/// demand root for the same reason: the machine's
+/// unclaimed-tag fallback runs the type's own collected
+/// `next` body, and a composition's step reaches the guest
+/// leaves inside it without any call edge naming them.
+fn next_call_self_ty(
+    def: &rustc_public::ty::FnDef,
+    args: &rustc_public::ty::GenericArgs,
+) -> Option<Ty> {
+    match def.name().as_str() {
+        "std::iter::Iterator::next" | "core::iter::Iterator::next" => args
+            .0
+            .iter()
+            .filter_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            })
+            .next(),
+        _ => None,
+    }
+}
+
+/// Collect the guest iterator types inside a stepped
+/// iterator type: the ADT instantiations whose `next` step
+/// the modelled machine cannot serve itself. A foreign ADT
+/// (its definition is in neither `std` nor `core` nor
+/// `alloc`) is such a type; a core adapter is stepped by
+/// the machine through its source, so the walk descends
+/// into the adapter's arguments instead. References name
+/// the blanket impl, whose step is the pointee's, and are
+/// peeled first. This mirrors the judgement of
+/// `guest_stepped_iterator_ty`: it yields exactly the
+/// types that predicate's guest head can hide inside a
+/// composition.
+fn guest_leaf_candidates(
+    ty: &Ty,
+    seen: &mut std::collections::HashSet<Ty>,
+    out: &mut Vec<(
+        Ty,
+        rustc_public::ty::AdtDef,
+        rustc_public::ty::GenericArgs,
+    )>,
+) {
+    let mut peeled = *ty;
+    while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
+        sparagmos_driver::convert::guarded_ty_kind(&peeled)
+    {
+        peeled = inner;
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
+        sparagmos_driver::convert::guarded_ty_kind(&peeled)
+    else {
+        return;
+    };
+    let name = adt_def.name();
+    if !name.starts_with("std::") && !name.starts_with("core::") && !name.starts_with("alloc::")
+    {
+        if seen.insert(peeled) {
+            out.push((peeled, adt_def, adt_args));
+        }
+        return;
+    }
+    if name.starts_with("std::iter::") || name.starts_with("core::iter::") {
+        for arg in &adt_args.0 {
+            if let GenericArgKind::Type(inner) = arg {
+                guest_leaf_candidates(inner, seen, out);
+            }
+        }
+    }
+}
+
+/// Resolve the `Iterator::next` instance of a self type
+/// through trait selection on the trait method itself, for
+/// the impls whose generic parameters the self type does
+/// not determine: an impl can carry a parameter that only
+/// a bound pins down (the grouping key of a `group_by`
+/// adapter is the output of the closure's `FnMut` bound,
+/// say), and unification over the self type has no binding
+/// for it, while a call site's resolution -- which is what
+/// this repeats -- lets the trait solver recover it from
+/// the bound. The instance is kept only when it lands on
+/// the very impl method the caller selected, so a solver
+/// answer for a different impl is never converted in its
+/// place. The trait method definition is looked up once,
+/// over every crate as in the foreign impl scans, and
+/// cached in `trait_fn`.
+fn resolve_next_instance_via_trait(
+    impl_fn: &rustc_public::ty::FnDef,
+    self_ty: &Ty,
+    trait_fn: &mut Option<Option<rustc_public::ty::FnDef>>,
+) -> Option<rustc_public::mir::mono::Instance> {
+    let trait_fn = trait_fn.get_or_insert_with(|| {
+        let mut found = None;
+        for krate in rustc_public::external_crates()
+            .into_iter()
+            .chain([rustc_public::local_crate()])
+        {
+            for f in foreign_fn_defs(&krate) {
+                if f.name() == "std::iter::Iterator::next"
+                    || f.name() == "core::iter::Iterator::next"
+                {
+                    found = Some(f);
+                }
+            }
+        }
+        found
+    });
+    let trait_fn = (*trait_fn)?;
+    let args = rustc_public::ty::GenericArgs(vec![GenericArgKind::Type(*self_ty)]);
+    sparagmos_driver::convert::resolve_instance_guarded(trait_fn, &args)
+        .filter(|inst| inst.has_body() && inst.def.def_id() == impl_fn.def_id())
+}
+
 /// Demand a converted body for the `Iterator::next` instance
 /// of every guest-stepped iterator type the converted bodies
-/// hand to a modelled consumer (see `consumer_iterator_ty`).
-/// The consumer entries are interpreter builtins, so the
-/// call-graph collection stops at them, and a generic guest
-/// impl has no monomorphic instance as an item either: the
-/// instance exists nowhere until something demands it, while
-/// the builtin's drain steps the source through the modelled
-/// `next` machine, whose unclaimed-tag fallback runs exactly
-/// this body. Each demanded body is converted like a local
-/// item and added to the seed bodies, so the reachability
-/// collection walks its callees too; demanded bodies are
-/// scanned for further consumer calls in turn.
+/// hand to a modelled consumer (see `consumer_iterator_ty`)
+/// or step through a direct `next` call (see
+/// `next_call_self_ty`). The consumer entries are
+/// interpreter builtins, so the call-graph collection stops
+/// at them, and a generic guest impl has no monomorphic
+/// instance as an item either: the instance exists nowhere
+/// until something demands it, while the builtin's drain
+/// steps the source through the modelled `next` machine,
+/// whose unclaimed-tag fallback runs exactly this body. A
+/// composition's guest leaves are demanded as well as the
+/// handed type itself (see `guest_leaf_candidates`): the
+/// machine steps an adapter through its source, so the
+/// leaf a `zip` or `collect` names only inside its own
+/// type is reached the same way. Each demanded body is
+/// converted like a local item and added to the seed
+/// bodies, so the reachability collection walks its
+/// callees too; demanded bodies are scanned for further
+/// consumer calls in turn.
 ///
 /// The returned accounting credits each converted instance
 /// to its impl method's definition (instance count and the
@@ -1159,6 +1283,10 @@ pub(crate) fn demand_iterator_next_instances(
     let mut foreign_impl_methods: Option<
         std::collections::HashMap<String, rustc_public::ty::FnDef>,
     > = None;
+    // The `Iterator::next` trait method definition, looked
+    // up once on first use by the trait-resolution fallback
+    // (see `resolve_next_instance_via_trait`).
+    let mut trait_next_fn: Option<Option<rustc_public::ty::FnDef>> = None;
     let mut credited: std::collections::HashMap<
         rustc_public::DefId,
         (usize, (usize, usize, usize)),
@@ -1184,29 +1312,46 @@ pub(crate) fn demand_iterator_next_instances(
         let mut seen: std::collections::HashSet<Ty> = Default::default();
         for body in &batch {
             for (def, args) in sparagmos_driver::reach::call_targets(body) {
-                let Some(ty) = consumer_iterator_ty(&def, &args) else {
+                // A modelled consumer call names the iterator
+                // it drains; a direct `Iterator::next` call
+                // names the iterator it steps. Both hand the
+                // type to the modelled machine, whose
+                // unclaimed-tag fallback runs the guest impl
+                // body, so both are demand roots.
+                let consumer_ty = consumer_iterator_ty(&def, &args);
+                let Some(ty) = consumer_ty.or_else(|| next_call_self_ty(&def, &args))
+                else {
                     continue;
                 };
                 if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty) {
                     continue;
                 }
-                // A reference names the blanket impl, whose
-                // step is the pointee's: the candidate is the
-                // ADT instantiation behind the references.
-                let mut peeled = ty;
-                while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
-                    sparagmos_driver::convert::guarded_ty_kind(&peeled)
-                {
-                    peeled = inner;
+                if consumer_ty.is_some() {
+                    // A reference names the blanket impl, whose
+                    // step is the pointee's: the candidate is
+                    // the ADT instantiation behind the
+                    // references.
+                    let mut peeled = ty;
+                    while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
+                        sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                    {
+                        peeled = inner;
+                    }
+                    if let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
+                        sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                    {
+                        if seen.insert(peeled) {
+                            candidates.push((peeled, adt_def, adt_args));
+                        }
+                    }
                 }
-                let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
-                    sparagmos_driver::convert::guarded_ty_kind(&peeled)
-                else {
-                    continue;
-                };
-                if seen.insert(peeled) {
-                    candidates.push((peeled, adt_def, adt_args));
-                }
+                // The composition's guest leaves, for either
+                // root: an adapter over a guest iterator is
+                // stepped by the modelled machine through the
+                // guest's own body, which no call edge names --
+                // a `zip`ped source, say, is stepped by the
+                // `Zip` arm, never called.
+                guest_leaf_candidates(&ty, &mut seen, &mut candidates);
             }
         }
         // Local types first, as in the drop demand: the shared
@@ -1253,20 +1398,42 @@ pub(crate) fn demand_iterator_next_instances(
             // simply means the shape differs or this ADT has no
             // applicable impl, and a compiler panic on an odd
             // instantiation must not take the whole conversion
-            // down with it.
+            // down with it. When the impl carries a parameter
+            // the self type does not determine, unification has
+            // no binding for it and the instance is instead
+            // resolved through trait selection (see
+            // `resolve_next_instance_via_trait`).
             let impl_fn = *impl_fn;
+            let materialize = |inst: rustc_public::mir::mono::Instance| {
+                sparagmos_driver::convert::with_body_materialization(
+                    &inst.name(),
+                    || inst.body(),
+                )
+                .map(|body| (inst, body))
+            };
+            // Each route runs under its own containment: an
+            // impl whose parameters the self type does not
+            // determine can panic the unification route's
+            // positional fallback, and that panic must not
+            // take the trait-selection route down with it.
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 resolve_drop_instance(&impl_fn, &cand_ty, &args)
                     .filter(|inst| inst.has_body())
-                    .and_then(|inst| {
-                        sparagmos_driver::convert::with_body_materialization(
-                            &inst.name(),
-                            || inst.body(),
-                        )
-                        .map(|body| (inst, body))
-                    })
-            }));
-            let Ok(Some((inst, sm_body))) = resolved else {
+                    .and_then(materialize)
+            }))
+            .unwrap_or_default()
+            .or_else(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resolve_next_instance_via_trait(
+                        &impl_fn,
+                        &cand_ty,
+                        &mut trait_next_fn,
+                    )
+                    .and_then(materialize)
+                }))
+                .unwrap_or_default()
+            });
+            let Some((inst, sm_body)) = resolved else {
                 continue;
             };
             // Identity, not spelling, as in the drop demand:

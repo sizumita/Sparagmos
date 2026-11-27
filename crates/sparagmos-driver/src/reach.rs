@@ -1598,6 +1598,13 @@ fn consumer_instance_needs_body(
     // table's control-byte walk, so hash iterator and hash
     // collection instances keep their bodies (the interpreter's
     // conversion prefers a collected body for these shapes).
+    // `Peekable` joins the `next` shapes for a different
+    // reason: the modelled state machine has no `Peekable`
+    // step at all -- its state is the genuine struct the
+    // collected `peek` body manipulates -- so the instance
+    // body is the only faithful execution, preferred by
+    // conversion when present and run by the machine's
+    // unclaimed-tag fallback for builtin-drained states.
     if matches!(
         canonical,
         "std::iter::Iterator::next" | "std::iter::IntoIterator::into_iter"
@@ -1610,6 +1617,7 @@ fn consumer_instance_needs_body(
                 || btree_iterator_ty(ty)
                 || (str_iter_ty(ty) && !str_split_char_ty(ty))
                 || foreign_adt_ty(ty)
+                || peekable_ty(ty)
         } else {
             hash_collection_ty(ty)
                 || collection_collection_ty(ty)
@@ -2231,6 +2239,22 @@ fn default_self_served(ty: &Ty) -> bool {
 /// (a crate's own iterator wrapper, a support crate's type):
 /// no builtin models its iteration step, so the real body is
 /// the only route.
+/// Whether `ty` is a `Peekable` iterator (references
+/// peeled): see the `Iterator::next` arm of
+/// `consumer_instance_needs_body`.
+fn peekable_ty(ty: &Ty) -> bool {
+    let mut peeled = ty.clone();
+    loop {
+        match guarded_ty_kind(&peeled) {
+            Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => peeled = inner,
+            Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => {
+                return def.name() == "std::iter::Peekable";
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn foreign_adt_ty(ty: &Ty) -> bool {
     let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
         return false;
