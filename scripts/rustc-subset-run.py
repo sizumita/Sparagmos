@@ -5353,9 +5353,10 @@ def pretty_unpretty_args(suite, view):
     for printing (an undefined name, a delegation whose attribute
     validation only runs in later passes) are not held to a
     whole-program conversion compiletest never asks of them. The
-    printed-output comparison itself, and the typecheck of the
-    printed source for tests without pretty-compare-only, remain
-    outside what a conversion outcome can judge.
+    printed output itself is the test's assertion, so a stage-2
+    pretty view is captured and judged by it (see
+    judge_pretty_output): the exit outcome alone never passes a
+    pretty test.
     """
     if suite != "pretty":
         return []
@@ -6396,6 +6397,89 @@ def judge_print_stdout(suite, view, path, revision, conv):
             "compiler stdout mismatch")
 
 
+def judge_pretty_output(view, path, conv, print_again, check_printed):
+    """The printed-output verdict of a pretty test.
+
+    compiletest's Pretty mode (runtest/pretty.rs) judges a test
+    entirely by what `-Zunpretty=<mode>` prints, so the stage-2
+    conversion outcome (the compiler printed and stopped, which
+    the driver reports as an empty successful conversion) is
+    only the run's exit half:
+
+    - with `//@ pp-exact` (optionally naming a file), one
+      printing round whose output must equal the expected text
+      exactly -- the named file's text, or the test source
+      itself for a bare `pp-exact` -- with carriage returns
+      stripped from both sides, as compiletest strips them;
+    - without it, two printing rounds whose outputs must agree
+      (the printing has converged): `print_again` re-runs the
+      printing over the first round's output;
+    - then, unless the view declares
+      `//@ pretty-compare-only`, the printed source must
+      typecheck: `check_printed` converts it under the view's
+      own arguments without the printing request, and only the
+      compilation outcome counts (a printed source is typechecked
+      by compiletest with -Zno-codegen, which converts nothing,
+      so conversion completeness is not part of the verdict).
+
+    A capture that was not produced fails the view rather than
+    passing it silently: the output the test asserts was never
+    produced for comparison. Returns None when the judging
+    passes, else a (status, reason, bucket) triple replacing
+    the verdict.
+    """
+    captured = conv.get("compiler_stdout")
+    if captured is None:
+        return ("fail",
+                "the driver's compiler-stdout capture was not "
+                "produced, so the pretty-printed output the test "
+                "asserts could not be compared",
+                "pretty output mismatch")
+    pp_exact = view.values("pp-exact")
+    if pp_exact:
+        name = pp_exact[-1].strip()
+        if name:
+            try:
+                expected = (path.parent / name).read_text(
+                    errors="replace")
+            except OSError:
+                return ("fail",
+                        f"the pp-exact expected file {name} could "
+                        "not be read",
+                        "pretty output mismatch")
+        else:
+            expected = path.read_text(errors="replace")
+        if captured.replace("\r", "") != expected.replace("\r", ""):
+            return ("fail",
+                    "pretty-printed source does not match the "
+                    "pp-exact expected source",
+                    "pretty output mismatch")
+    else:
+        second = print_again(captured)
+        if second.get("exit_code") != 0 \
+                or second.get("compiler_stdout") is None:
+            return ("fail",
+                    "the second pretty-printing round did not "
+                    "produce output",
+                    "pretty output mismatch")
+        if second["compiler_stdout"] != captured:
+            return ("fail",
+                    "pretty-printed source does not converge: "
+                    "the second printing round's output differs "
+                    "from the first",
+                    "pretty output mismatch")
+    if view.has("pretty-compare-only"):
+        return None
+    checked = check_printed(captured)
+    if checked.get("exit_code") != 0 \
+            or checked.get("compilation_failed"):
+        return ("fail",
+                "the pretty-printed source does not typecheck "
+                "under conversion",
+                "pretty output mismatch")
+    return None
+
+
 def jit_bucket(reason):
     """Aggregate bucket for a JIT-lowering unsupported reason."""
     r = reason.lower()
@@ -6699,6 +6783,11 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
             view, path, revision, expectation):
         flags = strip_unpretty(flags)
     print_view = print_invocation(rec["suite"], flags)
+    # A pretty view's printing request is supplied by the runner
+    # itself (pretty_unpretty_args), not by the view's flags, so
+    # it is not a print_invocation; it is captured and judged by
+    # its printed output all the same (judge_pretty_output).
+    pretty_view = rec["suite"] == "pretty"
     screened = screen_flags(flags, known=known_targets() or None,
                             expectation=expectation,
                             allow_print=print_view)
@@ -6748,7 +6837,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                 path.read_text(errors="ignore")):
             args += ["--crate-type", "lib"]
     args += compiletest_mode_args(rec["suite"], flags)
-    args += pretty_unpretty_args(rec["suite"], view)
+    pretty_args = pretty_unpretty_args(rec["suite"], view)
+    args += pretty_args
     args += (check_mode_lint_args(expectation) if lint_args is None
              else lint_args)
     args += flags
@@ -6800,7 +6890,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                         env_extra=cenv,
                         env_remove=cunset,
                         aux_env_scrub=tuple(cenv),
-                        capture_stdout=print_view,
+                        capture_stdout=print_view or pretty_view,
                         check_mode=compiletest_check_mode(
                             rec["suite"], view),
                         **({"jit": True} if jit else {}))
@@ -6817,6 +6907,39 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     if print_view and verdict == "pass":
         refined = judge_print_stdout(rec["suite"], view, path,
                                      revision, conv)
+        if refined is not None:
+            verdict, reason, bucket = refined
+    if pretty_view and verdict == "pass":
+        def _pretty_rerun(source_text, printing):
+            # compiletest's later pretty rounds read the printed
+            # source from stdin; the subset writes it to a
+            # scratch file of the same name and drives the same
+            # conversion over it, under the view's arguments --
+            # the printing request kept for a printing round,
+            # removed for the typecheck round.
+            with tempfile.TemporaryDirectory(
+                    prefix="subset-pretty-") as ptd:
+                printed_path = Path(ptd) / path.name
+                printed_path.write_text(source_text)
+                rerun_args = list(args)
+                if not printing:
+                    rerun_args = [a for a in rerun_args
+                                  if a not in pretty_args]
+                return convert_side(
+                    printed_path, edition, driver_bin,
+                    rustc_args=rerun_args,
+                    aux_specs=specs, aux_libs=aux_libs,
+                    env_extra=cenv, env_remove=cunset,
+                    aux_env_scrub=tuple(cenv),
+                    capture_stdout=printing,
+                    check_mode=compiletest_check_mode(
+                        rec["suite"], view),
+                    **({"jit": True} if jit else {}))
+
+        refined = judge_pretty_output(
+            view, path, conv,
+            lambda src: _pretty_rerun(src, True),
+            lambda src: _pretty_rerun(src, False))
         if refined is not None:
             verdict, reason, bucket = refined
     if incr_dir is not None and conv["compilation_failed"] and \

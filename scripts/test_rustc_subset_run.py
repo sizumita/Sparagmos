@@ -2580,7 +2580,9 @@ class ProcessStage2Tests(unittest.TestCase):
         # (it stops at -Zunpretty output); the conversion proxy keeps
         # the lib shape.
         rec = self.write_test("pub fn f() {}\n", suite="pretty")
-        res, captured = self.run_with_conv_capture(rec, conv())
+        res, captured = self.run_with_conv_capture(
+            rec, conv(compiler_stdout="pub fn f() {}\n",
+                      compiler_stdout_dir=""))
         self.assertEqual(res["status"], "pass")
         args = captured["rustc_args"]
         i = args.index("--crate-type")
@@ -2589,7 +2591,9 @@ class ProcessStage2Tests(unittest.TestCase):
     def test_pretty_declared_crate_type_is_left_alone(self):
         rec = self.write_test("#![crate_type = \"rlib\"]\n"
                               "pub fn f() {}\n", suite="pretty")
-        res, captured = self.run_with_conv_capture(rec, conv())
+        res, captured = self.run_with_conv_capture(
+            rec, conv(compiler_stdout="pub fn f() {}\n",
+                      compiler_stdout_dir=""))
         self.assertEqual(res["status"], "pass")
         self.assertNotIn("--crate-type", captured["rustc_args"])
 
@@ -2726,6 +2730,119 @@ class ProcessStage2Tests(unittest.TestCase):
             rec, conv(compiler_stdout="anything\n",
                       compiler_stdout_dir=""))
         self.assertEqual(res["status"], "pass")
+
+    def run_with_conv_seq(self, rec, results):
+        """process_test(stage2) with convert_side returning the
+        given results in call order (the last one repeats)."""
+        calls = []
+        seq = list(results)
+
+        def stub(path, edition, driver_bin, **kw):
+            calls.append(kw)
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        orig = run.convert_side
+        run.convert_side = stub
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+        return res, calls
+
+    def test_pretty_pp_exact_bare_match_passes(self):
+        # A bare pp-exact compares the printed output against the
+        # test source itself.
+        body = "//@ pp-exact\npub fn f() {}\n"
+        rec = self.write_test(body, suite="pretty")
+        res, calls = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout=body, compiler_stdout_dir=""),
+            conv(),
+        ])
+        self.assertEqual(res["status"], "pass")
+        # One printing round, then the typecheck conversion (no
+        # capture, no -Zunpretty argument).
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(calls[1]["capture_stdout"])
+        self.assertNotIn("-Zunpretty=normal",
+                         calls[1]["rustc_args"])
+
+    def test_pretty_pp_exact_mismatch_fails(self):
+        body = "//@ pp-exact\npub fn f() {}\n"
+        rec = self.write_test(body, suite="pretty")
+        res, _ = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout="pub fn g() {}\n",
+                 compiler_stdout_dir=""),
+        ])
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "pretty output mismatch")
+
+    def test_pretty_pp_exact_named_file(self):
+        body = "//@ pp-exact:t.pp\npub fn f() {}\n"
+        rec = self.write_test(body, suite="pretty")
+        (self.rust_dir / "tests" / "ui" / "t.pp").write_text(
+            "printed\n")
+        res, _ = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout="printed\n",
+                 compiler_stdout_dir=""),
+            conv(),
+        ])
+        self.assertEqual(res["status"], "pass")
+
+    def test_pretty_converging_print_passes(self):
+        rec = self.write_test("pub fn f() {}\n", suite="pretty")
+        res, calls = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout="pub fn f() {}\n",
+                 compiler_stdout_dir=""),
+            conv(compiler_stdout="pub fn f() {}\n",
+                 compiler_stdout_dir=""),
+            conv(),
+        ])
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(len(calls), 3)
+
+    def test_pretty_non_converging_print_fails(self):
+        rec = self.write_test("pub fn f() {}\n", suite="pretty")
+        res, _ = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout="pub fn f() {}\n",
+                 compiler_stdout_dir=""),
+            conv(compiler_stdout="pub fn f() { }\n",
+                 compiler_stdout_dir=""),
+        ])
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "pretty output mismatch")
+        self.assertIn("converge", res["reason"])
+
+    def test_pretty_missing_capture_fails(self):
+        rec = self.write_test("pub fn f() {}\n", suite="pretty")
+        res, _ = self.run_with_conv_seq(rec, [conv()])
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "pretty output mismatch")
+        self.assertIn("capture", res["reason"])
+
+    def test_pretty_printed_source_must_typecheck(self):
+        body = "//@ pp-exact\npub fn f() {}\n"
+        rec = self.write_test(body, suite="pretty")
+        res, _ = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout=body, compiler_stdout_dir=""),
+            conv(exit_code=1, compilation_failed=True,
+                 converted=None, skipped=None),
+        ])
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "pretty output mismatch")
+        self.assertIn("typecheck", res["reason"])
+
+    def test_pretty_compare_only_skips_typecheck(self):
+        body = ("//@ pp-exact\n//@ pretty-compare-only\n"
+                "pub fn f() {}\n")
+        rec = self.write_test(body, suite="pretty")
+        res, calls = self.run_with_conv_seq(rec, [
+            conv(compiler_stdout=body, compiler_stdout_dir=""),
+            conv(exit_code=1, compilation_failed=True,
+                 converted=None, skipped=None),
+        ])
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(len(calls), 1)
 
 
 
