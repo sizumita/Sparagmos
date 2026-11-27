@@ -506,3 +506,82 @@ fn run_mode_sort_unstable_by_guest_closure_past_smallsort() {
         "desc=true calls>0=true sum=693174496791170142 first=8957930565218848 last=23941204646919\n",
     );
 }
+
+const SORT_LARGE_BUFFER_ACCESS_SRC: &str = r#"
+fn checksum(v: &[i32]) -> i64 {
+    let mut s: i64 = 0;
+    for i in 0..v.len() {
+        s += v[i] as i64;
+    }
+    s
+}
+
+fn raw_checksum(v: &[i32]) -> i64 {
+    let mut s: i64 = 0;
+    unsafe {
+        let p = v.as_ptr();
+        for i in 0..v.len() {
+            s += *p.add(i) as i64;
+        }
+    }
+    s
+}
+
+fn sorted(v: &[i32]) -> bool {
+    v.windows(2).all(|w| w[0] <= w[1])
+}
+
+fn main() {
+    let mut e: Vec<i32> = Vec::new();
+    e.sort();
+    println!("empty {} {}", e.len(), sorted(&e));
+    let mut one = vec![42];
+    one.sort();
+    println!("one {} {} {}", one.len(), one[0], sorted(&one));
+
+    let mut r: Vec<i32> = (0..2000).rev().collect();
+    r.sort();
+    println!(
+        "rev {} {} {} {} {}",
+        sorted(&r),
+        checksum(&r),
+        raw_checksum(&r),
+        r[0],
+        r[1999]
+    );
+
+    let mut d: Vec<i32> = Vec::new();
+    for i in 0..2000usize {
+        d.push((i % 7) as i32);
+    }
+    d.sort();
+    println!(
+        "dup {} {} {} {} {} {}",
+        sorted(&d),
+        checksum(&d),
+        raw_checksum(&d),
+        d[285],
+        d[286],
+        d[1999]
+    );
+
+}
+"#;
+
+#[test]
+fn run_mode_sort_large_buffer_access_shapes() {
+    // Adversarial shapes at a size where every element
+    // access crosses the buffer's place machinery: an empty
+    // sort, a one-element sort, a reversed two-thousand, a
+    // duplicate-heavy two-thousand (seven distinct values).
+    // The readbacks judge the results through
+    // both access forms the sort itself uses -- the indexed
+    // (fat-pointer) read and the raw-pointer read -- so a
+    // denomination slip in either surfaces as a wrong sum or
+    // a wrong endpoint, not just a slow run.
+    run_ok(
+        "sort-large-buffer-access",
+        SORT_LARGE_BUFFER_ACCESS_SRC,
+        "empty 0 true\none 1 42 true\nrev true 1999000 1999000 0 1999\ndup true 5995 5995 0 1 6\n",
+    );
+}

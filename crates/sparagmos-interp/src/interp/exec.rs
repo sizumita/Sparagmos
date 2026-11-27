@@ -2698,16 +2698,21 @@ impl<'a> Interpreter<'a> {
             },
             _ => return base,
         };
+        // The head sequence is only inspected -- its length,
+        // and the form and length of the element at the
+        // window's start -- so it is read in its borrowing
+        // form: a formation over a large buffer does not
+        // clone the whole sequence to judge it.
         let head_value = self
             .deref_value(frames, &head)
-            .and_then(|target| self.read_resolved(frames, &target))
+            .and_then(|target| self.read_resolved_peek(frames, &target))
             .ok();
         let head_len = head_value.as_ref().and_then(|value| value.len());
         let collides = head_value
             .as_ref()
             .and_then(|value| {
-                project_value(
-                    value.clone(),
+                project_value_ref(
+                    value,
                     &[RefProj::Index(start)],
                     "raw parts base",
                     "raw parts base",
@@ -2716,7 +2721,7 @@ impl<'a> Interpreter<'a> {
             })
             .is_some_and(|element| {
                 matches!(
-                    element,
+                    &*element,
                     Value::Tuple(_)
                         | Value::Bytes(_)
                         | Value::Str(_)
@@ -3691,7 +3696,7 @@ impl<'a> Interpreter<'a> {
                     {
                         self.fat_deref_len(frames, body, place)
                             .or_else(|| {
-                                self.read_resolved(frames, &target)
+                                self.read_resolved_peek(frames, &target)
                                     .ok()
                                     .and_then(|v| v.len())
                             })

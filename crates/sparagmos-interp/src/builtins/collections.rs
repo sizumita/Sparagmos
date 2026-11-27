@@ -777,9 +777,15 @@ impl<'a> Interpreter<'a> {
         uninit_elem: &Value,
         elem_size: usize,
     ) -> InterpResult<()> {
-        let current = self.read_resolved(frames, target)?;
+        // The form check only inspects the current value, so
+        // it reads in the borrowing form: appending to a
+        // large vector does not clone every element to learn
+        // the form. The real-aggregate branch materialises
+        // the owned value it rewrites, exactly as the owned
+        // read produced it.
+        let current = self.read_resolved_peek(frames, target)?;
         if vec_real_aggregate_parts(&current).is_some() {
-            let mut value = current;
+            let mut value = current.into_owned();
             vec_ensure_capacity(
                 self,
                 &mut value,

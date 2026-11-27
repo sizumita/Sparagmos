@@ -1329,8 +1329,8 @@ impl<'a> Interpreter<'a> {
         };
         let mut rebased = resolved.clone();
         projection_of_mut(&mut rebased).pop();
-        let stored = self.read_resolved(frames, &rebased).ok()?;
-        let total = match &stored {
+        let stored = self.read_resolved_peek(frames, &rebased).ok()?;
+        let total = match &*stored {
             Value::Tuple(items) => items.len() as u64,
             Value::Bytes(bytes) => bytes.len() as u64,
             Value::SparseVec { len, .. } => {
@@ -1397,10 +1397,10 @@ impl<'a> Interpreter<'a> {
         {
             return rebased;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let stored_len = match &stored {
+        let stored_len = match &*stored {
             Value::Tuple(items) => items.len() as u64,
             Value::Bytes(bytes) => bytes.len() as u64,
             Value::SparseVec { len, .. } => {
@@ -1435,10 +1435,10 @@ impl<'a> Interpreter<'a> {
         if len == 1 {
             return resolved;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Tuple(items) = &stored else {
+        let Value::Tuple(items) = &*stored else {
             return resolved;
         };
         if items.len() == 1
@@ -1590,10 +1590,10 @@ impl<'a> Interpreter<'a> {
         if !scalar_pointee {
             return false;
         }
-        let Ok(value) = self.read_resolved(frames, resolved) else {
+        let Ok(value) = self.read_resolved_peek(frames, resolved) else {
             return false;
         };
-        matches!(value, Value::Tuple(_) | Value::Bytes(_))
+        matches!(&*value, Value::Tuple(_) | Value::Bytes(_))
     }
 
     fn peel_maybe_uninit_entry(
@@ -1674,10 +1674,10 @@ impl<'a> Interpreter<'a> {
         if home_is_foreign_adt {
             return resolved;
         }
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Enum { variant, fields } = &stored else {
+        let Value::Enum { variant, fields } = &*stored else {
             return resolved;
         };
         // The payload sits in the wrapper's first field. A
@@ -1754,10 +1754,10 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         resolved: Resolved,
     ) -> Resolved {
-        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+        let Ok(stored) = self.read_resolved_peek(frames, &resolved) else {
             return resolved;
         };
-        let Value::Enum { fields, .. } = &stored else {
+        let Value::Enum { fields, .. } = &*stored else {
             return resolved;
         };
         let Some(field) = fields.first() else {
@@ -2181,7 +2181,7 @@ impl<'a> Interpreter<'a> {
         // The base must currently hold a vector value: a
         // wrapper-typed reference over any other storage is an
         // ordinary aggregate reference.
-        let held = self.read_resolved(frames, &base)?;
+        let held = self.read_resolved_peek(frames, &base)?;
         if crate::builtins::vec_stored_len(&held).is_none() {
             return Ok(None);
         }
@@ -2222,18 +2222,23 @@ impl<'a> Interpreter<'a> {
     /// payload the type tracking could not name (see the
     /// `buf_suspect` state in `resolve_place_mode`).
     fn suspected_vec_position(&self, frames: &[Frame], pos: &Resolved) -> bool {
-        match self.read_resolved(frames, pos) {
-            Ok(Value::SparseVec { .. }) => true,
-            Ok(Value::Enum { fields, .. }) => Self::fields_form_element_list(&fields),
-            _ => false,
+        match self.read_resolved_peek(frames, pos) {
+            Ok(value) => match &*value {
+                Value::SparseVec { .. } => true,
+                Value::Enum { fields, .. } => Self::fields_form_element_list(fields),
+                _ => false,
+            },
+            Err(_) => false,
         }
     }
 
     fn vec_position_materialised(&self, frames: &[Frame], pos: &Resolved) -> bool {
-        matches!(
-            self.read_resolved(frames, pos),
-            Ok(Value::Enum { .. } | Value::SparseVec { .. })
-        )
+        match self.read_resolved_peek(frames, pos) {
+            Ok(value) => {
+                matches!(&*value, Value::Enum { .. } | Value::SparseVec { .. })
+            }
+            Err(_) => false,
+        }
     }
 
     /// Whether an aggregate's fields form an element list
@@ -2338,7 +2343,7 @@ impl<'a> Interpreter<'a> {
         // two-element slice (the array clone guard's partial drop)
         // for the slice's storage.
         if let Some((container, base)) = entered_element_container(cur) {
-            if let Ok(value) = self.read_resolved(frames, &container) {
+            if let Ok(value) = self.read_resolved_peek(frames, &container) {
                 if let Some(count) = value.len() {
                     if base as u128 + fat_len <= count {
                         return false;
@@ -2356,7 +2361,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        match self.read_resolved(frames, cur) {
+        match self.read_resolved_peek(frames, cur) {
             // The position denotes the slice's storage only when
             // the value there is the aggregate whose elements the
             // slice ranges over. A fat pointer or string value at
@@ -2366,12 +2371,12 @@ impl<'a> Interpreter<'a> {
             // `len()` reports the length it carries, not a
             // storage element count, and judging by it appended a
             // second index step that read into the element.
-            Ok(
-                value @ (Value::Tuple(_)
-                | Value::Enum { .. }
-                | Value::SparseVec { .. }),
-            ) => value.len() == Some(fat_len),
-            Ok(_) => false,
+            Ok(value) => {
+                matches!(
+                    &*value,
+                    Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
+                ) && value.len() == Some(fat_len)
+            }
             Err(_) => false,
         }
     }
