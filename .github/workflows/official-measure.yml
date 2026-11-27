@@ -462,8 +462,13 @@ jobs:
       - name: Cache tier-3 std sysroots
         uses: actions/cache@v4
         with:
-          path: ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
-          key: tier3-std-1.100.0-v1-aarch64v8r-unknown-none-core-alloc
+          path: |
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/avr-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32e-unknown-none-elf
+          key: tier3-std-1.100.0-v2
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py
@@ -716,8 +721,13 @@ jobs:
       - name: Cache tier-3 std sysroots
         uses: actions/cache@v4
         with:
-          path: ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
-          key: tier3-std-1.100.0-v1-aarch64v8r-unknown-none-core-alloc
+          path: |
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64v8r-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/avr-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32e-unknown-none-elf
+          key: tier3-std-1.100.0-v2
 
       - name: Build tier-3 std from source
         run: python3 scripts/build-tier3-std.py
