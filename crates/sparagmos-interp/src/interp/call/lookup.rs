@@ -139,6 +139,7 @@ pub(super) fn impl_path_trait_method(name: &str) -> Option<crate::builtins::Buil
         ("PartialOrd", "ge", Builtin::PartialOrdRel(crate::builtins::RelOp::Ge)),
         ("Ord", "cmp", Builtin::OrdCmp),
         ("Clone", "clone", Builtin::CloneClone),
+        ("ToOwned", "to_owned", Builtin::ToOwned),
     ];
     for (trait_seg, method, kind) in METHODS {
         if !name.ends_with(&format!(">::{method}")) {
