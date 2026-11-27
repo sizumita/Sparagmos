@@ -479,6 +479,14 @@ pub enum Builtin {
     /// string model can serve; the box over the string value
     /// itself is the same observable value.
     StringIntoBoxedStr,
+    /// `OsString::into_boxed_os_str(OsString) -> Box<OsStr>`:
+    /// the OS string's bytes in a fresh box allocation, the
+    /// counterpart of `StringIntoBoxedStr`. The collected body
+    /// rebuilds the box from the buffer's raw parts, which the
+    /// OS-string model cannot serve; the box over the byte
+    /// value itself is the same observable value (in this
+    /// model an `OsStr` is its byte string).
+    OsStringIntoBoxedOsStr,
     /// `Vec::into_boxed_slice(Vec<T>) -> Box<[T]>`: the element
     /// aggregate in a fresh box allocation, for the same reason
     /// as `String::into_boxed_str`.
