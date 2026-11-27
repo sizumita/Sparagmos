@@ -221,3 +221,67 @@ fn run_mode_dst_wrapper_scalar_read() {
         "e0 1\ne1 2\ne3 4\nidx 3\nproj 1\n",
     );
 }
+
+const FIELD_OFFSET_SRC: &str = r#"
+use std::mem;
+#[repr(packed, C)]
+struct PackedSized { f: u8, d: [u32; 4] }
+#[repr(packed, C)]
+struct PackedUnsized { f: u8, d: [u32] }
+impl PackedSized {
+    fn unsize(&self) -> &PackedUnsized {
+        let len = 4usize;
+        unsafe { mem::transmute((self, len)) }
+    }
+}
+fn main() { unsafe {
+    let p = PackedSized { f: 0, d: [1, 2, 3, 4] };
+    let p = p.unsize() as *const PackedUnsized;
+    assert_eq!(mem::size_of_val_raw(p), 1 + 4*4);
+    let d = std::ptr::addr_of!((*p).d);
+    assert_eq!(d.cast::<u32>().read_unaligned(), 1);
+    println!("ok");
+} }
+"#;
+
+#[test]
+fn run_mode_size_of_val_raw_packed_field_offset() {
+    // The record form of the packed field-offset case: the
+    // fat pointer is formed inside a method from `(self, len)`
+    // and consumed as a raw pointer by `size_of_val_raw`,
+    // whose size must not count padding in front of `d`.
+    run_ok("dst-field-offset", FIELD_OFFSET_SRC, "ok\n");
+}
+
+const FIELD_OFFSET_ICE_SRC: &str = r#"
+use std::mem;
+#[repr(packed(4))]
+struct Slice(#[allow(dead_code)] [u32]);
+#[repr(packed(2), C)]
+struct PackedSized { f: u8, d: [u32; 4] }
+#[repr(packed(2), C)]
+struct PackedUnsized { f: u8, d: Slice }
+impl PackedSized {
+    fn unsize(&self) -> &PackedUnsized {
+        let len = 4usize;
+        unsafe { mem::transmute((self, len)) }
+    }
+}
+fn main() { unsafe {
+    let p = PackedSized { f: 0, d: [1, 2, 3, 4] };
+    let p = p.unsize() as *const PackedUnsized;
+    assert_eq!(mem::size_of_val_raw(p), 1 + 1 + 4*4);
+    let d = std::ptr::addr_of!((*p).d);
+    assert_eq!(d.cast::<u32>().read_unaligned(), 1);
+    println!("ok");
+} }
+"#;
+
+#[test]
+fn run_mode_size_of_val_raw_packed_field_offset_ice() {
+    // The -ice record form: `packed(2)` puts exactly one byte
+    // of padding in front of the wrapper tail, and the tail
+    // is a one-field slice wrapper, so the raw size is
+    // 1 + 1 + 4*4 and the field read goes through the wrapper.
+    run_ok("dst-field-offset-ice", FIELD_OFFSET_ICE_SRC, "ok\n");
+}
