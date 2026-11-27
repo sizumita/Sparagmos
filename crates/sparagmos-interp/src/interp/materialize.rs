@@ -127,11 +127,13 @@ impl<'a> Interpreter<'a> {
                 concrete,
                 traits,
                 glue,
+                type_id,
             } => Value::DynRef {
                 base: Box::new(self.eval_constant(base)?),
                 concrete: concrete.clone(),
                 traits: traits.clone(),
                 drop_glue: glue.clone().map(Box::new),
+                type_id: *type_id,
             },
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
             Constant::Closure(def, env) => Value::Closure {

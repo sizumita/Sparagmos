@@ -775,11 +775,13 @@ pub(super) fn project_pointee_cell(pointer: Value) -> InterpResult<Value> {
             concrete,
             traits,
             drop_glue,
+            type_id,
         } => Value::DynRef {
             base: Box::new(project_pointee_cell(*base)?),
             concrete,
             traits,
             drop_glue,
+            type_id,
         },
         other => other,
     })

@@ -619,13 +619,14 @@ fn convert_all_with(
     out.vtable_identities = program
         .vtable_identities
         .iter()
-        .map(|(id, (concrete, traits))| {
+        .map(|(id, (concrete, traits, type_id))| {
             (
                 *id,
                 ir::VTableIdentity {
                     concrete: conv.concrete_ty_name(concrete),
                     traits: traits.clone(),
                     glue: DropGlueBuilder::build(&conv, concrete),
+                    type_id: *type_id,
                 },
             )
         })

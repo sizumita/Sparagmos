@@ -72,6 +72,7 @@ fn fndef(d: mir::DefId) -> mir::Operand {
         literal: mir::ConstKind::Ty(mir::Ty::FnDef(d, vec![])),
         user_ty: None,
         ty: None,
+        generic_type_ids: None,
     })
 }
 

@@ -601,12 +601,17 @@ impl Converter {
             .collect();
         let mut source_lines: Vec<sm::BlockSourceLines> =
             Vec::with_capacity(body.blocks.len());
+        let mut unsize_type_ids: Vec<(u32, sm::Place, (u64, u64))> =
+            Vec::new();
         let mut blocks: Vec<sm::BasicBlockData> = body
             .blocks
             .iter()
-            .map(|b| {
-                let (block, lines) = self.basic_block(body, b);
+            .enumerate()
+            .map(|(index, b)| {
+                let (block, lines, ids) =
+                    self.basic_block(body, index as u32, b);
                 source_lines.push(lines);
+                unsize_type_ids.extend(ids);
                 block
             })
             .collect();
@@ -657,6 +662,7 @@ impl Converter {
             let mut b = sm::Body::new(locals, body.arg_locals().len(), blocks);
             b.var_debug_info = debug_info;
             b.source_lines = source_lines;
+            b.unsize_type_ids = unsize_type_ids;
             Ok(b)
         } else {
             Err(std::mem::take(&mut self.errors))
@@ -939,13 +945,30 @@ impl Converter {
     fn basic_block(
         &mut self,
         body: &mir::Body,
+        bb_index: u32,
         bb: &mir::BasicBlock,
-    ) -> (sm::BasicBlockData, sm::BlockSourceLines) {
-        let statements = bb
+    ) -> (
+        sm::BasicBlockData,
+        sm::BlockSourceLines,
+        Vec<(u32, sm::Place, (u64, u64))>,
+    ) {
+        let statements: Vec<sm::Statement> = bb
             .statements
             .iter()
             .map(|s| sm::Statement::new(self.statement_kind(&s.kind)))
             .collect();
+        // The `TypeId` segments of each unsizing cast's concrete
+        // type in this block, keyed the way the converted body
+        // states them (see `sm::Body::unsize_type_ids`).
+        let mut unsize_type_ids = Vec::new();
+        for (stmt, converted) in bb.statements.iter().zip(&statements) {
+            let Some(ids) = self.unsize_cast_type_id(body, stmt) else {
+                continue;
+            };
+            if let sm::StatementKind::Assign(pair) = &converted.kind {
+                unsize_type_ids.push((bb_index, pair.0.clone(), ids));
+            }
+        }
         let lines = sm::BlockSourceLines {
             statements: bb
                 .statements
@@ -961,7 +984,43 @@ impl Converter {
         // cleanup region is recovered structurally in
         // `convert_body` (see `mark_cleanup_region`).
         data.is_cleanup = false;
-        (data, lines)
+        (data, lines, unsize_type_ids)
+    }
+
+    /// The `TypeId` segments of the concrete type of an unsizing
+    /// cast statement, when the statement is a cast to a `dyn`
+    /// target and the concrete type can be named by walking the
+    /// cast's source and target types in parallel (see
+    /// `unsize_concrete_ty`). A cast whose concrete type is
+    /// itself a `dyn` type (a supertrait upcast: the value
+    /// carries its own identity, segments included) and a cast
+    /// whose shapes diverge record nothing.
+    fn unsize_cast_type_id(
+        &mut self,
+        body: &mir::Body,
+        stmt: &mir::Statement,
+    ) -> Option<(u64, u64)> {
+        let mir::StatementKind::Assign(_, rv) = &stmt.kind else {
+            return None;
+        };
+        let mir::Rvalue::Cast(
+            mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+            operand,
+            target,
+        ) = rv
+        else {
+            return None;
+        };
+        let locals = body.locals();
+        let source = operand.ty(&locals).ok()?;
+        let concrete = unsize_concrete_ty(&source, target)?;
+        if matches!(
+            guarded_ty_kind(&concrete),
+            Some(TyKind::RigidTy(RigidTy::Dynamic(..)))
+        ) {
+            return None;
+        }
+        Some(type_id_segments(&concrete))
     }
 
     /// The source line of one block's terminator. A call is
@@ -1177,4 +1236,74 @@ fn coroutine_resume_def_span(
             .find(|id| tcx.item_name(**id) == resume)?;
         Some(rustc_public::rustc_internal::stable(tcx.def_span(*item)))
     })
+}
+
+/// Whether a compiler type mentions a `dyn` type through
+/// references, raw pointers and ADT generic arguments -- the
+/// traversal the interpreter's conversion performs on the
+/// converted type when it decides an unsizing cast's target.
+fn dyn_in_ty(ty: &rustc_public::ty::Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Dynamic(..))) => true,
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _))) => {
+            dyn_in_ty(&inner)
+        }
+        Some(TyKind::RigidTy(RigidTy::Adt(_, args))) => args
+            .0
+            .iter()
+            .any(|a| matches!(a, GenericArgKind::Type(t) if dyn_in_ty(t))),
+        _ => false,
+    }
+}
+
+/// The concrete type an unsizing cast's value answers for, read
+/// off the compiler's types: walk the source and target types
+/// in parallel along the target's wrapper path to its `dyn`
+/// type and return the source type at the same position (the
+/// walk the interpreter's conversion performs on the converted
+/// types, so the two name the same type). `None` when the
+/// target holds no `dyn` type or the shapes diverge.
+fn unsize_concrete_ty(
+    src: &rustc_public::ty::Ty,
+    target: &rustc_public::ty::Ty,
+) -> Option<rustc_public::ty::Ty> {
+    match (guarded_ty_kind(src)?, guarded_ty_kind(target)?) {
+        (_, TyKind::RigidTy(RigidTy::Dynamic(..))) => Some(*src),
+        (
+            TyKind::RigidTy(RigidTy::Ref(_, s, _)),
+            TyKind::RigidTy(RigidTy::Ref(_, t, _)),
+        ) => unsize_concrete_ty(&s, &t),
+        (
+            TyKind::RigidTy(RigidTy::RawPtr(s, _)),
+            TyKind::RigidTy(RigidTy::RawPtr(t, _)),
+        ) => unsize_concrete_ty(&s, &t),
+        (
+            TyKind::RigidTy(RigidTy::Adt(_, sargs)),
+            TyKind::RigidTy(RigidTy::Adt(_, targs)),
+        ) => {
+            let s_types: Vec<&rustc_public::ty::Ty> = sargs
+                .0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            let t_types: Vec<&rustc_public::ty::Ty> = targs
+                .0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            for (sa, ta) in s_types.iter().zip(t_types.iter()) {
+                if dyn_in_ty(ta) {
+                    return unsize_concrete_ty(sa, ta);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }

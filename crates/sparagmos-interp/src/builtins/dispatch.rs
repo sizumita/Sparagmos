@@ -40,6 +40,7 @@ impl<'a> Interpreter<'a> {
         body: &Body,
         name: &str,
         generic_args: &[String],
+        generic_type_ids: Option<&[(u64, u64)]>,
         args: &[Operand],
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
@@ -192,7 +193,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("five arguments");
             self.note_forwarded_panic_stamp(frames, stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue, zeroed_value)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, generic_type_ids, vals, cmp_discriminants, unique_elem, skipped_glue, elem_glue, receiver_glue, zeroed_value)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -207,6 +208,7 @@ impl<'a> Interpreter<'a> {
         kind: Builtin,
         name: &str,
         generic_args: &[String],
+        generic_type_ids: Option<&[(u64, u64)]>,
         vals: Vec<Value>,
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
@@ -1271,6 +1273,7 @@ impl<'a> Interpreter<'a> {
                             "std::marker::Send".to_string(),
                         ],
                         drop_glue: None,
+                        type_id: payload.type_id,
                     })),
                     // The joined thread is blocked and no
                     // scheduling round can unblock it: the join
@@ -6172,6 +6175,7 @@ impl<'a> Interpreter<'a> {
                         drop_glue: self
                             .payload_drop_glue(&payload.ty)
                             .map(Box::new),
+                        type_id: payload.type_id,
                     }),
                     other => Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -6218,6 +6222,11 @@ impl<'a> Interpreter<'a> {
                     PanicPayload {
                         ty,
                         value: Box::new(value),
+                        // The payload type is this call's first
+                        // generic argument: its segments are the
+                        // call site's own recording of that type.
+                        type_id: generic_type_ids
+                            .and_then(|ids| ids.first().copied()),
                     },
                 ))
             }
@@ -6251,7 +6260,8 @@ impl<'a> Interpreter<'a> {
                 // fire again, which the unwinder's resumed flag
                 // records.
                 self.note_resumed_panic();
-                let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
+                let (concrete, type_id, value, _) =
+                    resolve_dyn_box(self, frames, &vals[0], name)?;
                 // The re-raised payload is the pointee the dyn
                 // value's base denotes (the box's contents), not
                 // the box itself: the cleanup that later turns a
@@ -6267,14 +6277,21 @@ impl<'a> Interpreter<'a> {
                     PanicPayload {
                         ty: concrete,
                         value: Box::new(value),
+                        type_id,
                     },
                 ))
             }
             Builtin::DynAnyDowncastRef => {
                 arity(1)?;
                 let want = expect_generic_ty(generic_args, name)?;
-                let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
-                if concrete == want {
+                let (concrete, type_id, value, _) =
+                    resolve_dyn_box(self, frames, &vals[0], name)?;
+                if dyn_any_matches(
+                    &concrete,
+                    type_id,
+                    &want,
+                    generic_type_ids.and_then(|ids| ids.first().copied()),
+                ) {
                     // The result denotes the payload the dyn
                     // value's base points at (the box's pointee),
                     // not the box itself.
@@ -6293,9 +6310,14 @@ impl<'a> Interpreter<'a> {
             Builtin::DynAnyDowncast(t_index) => {
                 arity(1)?;
                 let want = expect_generic_ty_at(generic_args, name, t_index)?;
-                let (concrete, value, original) =
+                let (concrete, type_id, value, original) =
                     resolve_dyn_box(self, frames, &vals[0], name)?;
-                if concrete == want {
+                if dyn_any_matches(
+                    &concrete,
+                    type_id,
+                    &want,
+                    generic_type_ids.and_then(|ids| ids.get(t_index).copied()),
+                ) {
                     // `Ok` holds a `Box<T>`: the dyn value's base
                     // itself, which is the box in the shape the
                     // sized value had (see `Value::DynRef`) — an
@@ -6319,8 +6341,14 @@ impl<'a> Interpreter<'a> {
             Builtin::DynAnyIs => {
                 arity(1)?;
                 let want = expect_generic_ty(generic_args, name)?;
-                let (concrete, _, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
-                Ok(Value::Bool(concrete == want))
+                let (concrete, type_id, _, _) =
+                    resolve_dyn_box(self, frames, &vals[0], name)?;
+                Ok(Value::Bool(dyn_any_matches(
+                    &concrete,
+                    type_id,
+                    &want,
+                    generic_type_ids.and_then(|ids| ids.first().copied()),
+                )))
             }
             Builtin::PartialEqEq | Builtin::PartialEqNe => {
                 arity(2)?;

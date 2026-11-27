@@ -418,6 +418,10 @@ pub enum Constant {
         concrete: String,
         traits: Vec<String>,
         glue: Option<DropGlue>,
+        /// The concrete type's `TypeId` segments, carried from
+        /// the decoded constant (see
+        /// `sparagmos_mir::ConstValue::DynRef`).
+        type_id: Option<(u64, u64)>,
     },
     /// A function item constant: evaluates to the callable value
     /// naming the function.
@@ -1356,6 +1360,16 @@ pub enum UnsizeMeta {
         /// explicitly) and for supertrait upcasts, where the value
         /// already carries its own glue.
         glue: Option<DropGlue>,
+        /// The concrete type's `TypeId` segments, recorded by
+        /// the driver for this cast site (see
+        /// `sparagmos_mir::Body::unsize_type_ids`): the converted
+        /// concrete type erases the regions the segments
+        /// distinguish, so the `DynRef` the cast forms carries
+        /// them for `dyn Any` downcast comparisons. `None` when
+        /// the driver could not name the concrete type for this
+        /// cast, and for supertrait upcasts (whose `concrete` is
+        /// `None`: the value's own segments carry over instead).
+        type_id: Option<(u64, u64)>,
     },
 }
 
@@ -2085,6 +2099,18 @@ pub enum TerminatorKind {
         /// builtin call, and when the zero pattern denotes no
         /// value conversion can build.
         zeroed_value: Option<Value>,
+        /// The `TypeId` segments of the callee's generic type
+        /// arguments, parallel to `generic_args` (entry `i` is
+        /// the identity of the type `generic_args[i]` renders),
+        /// carried from the call site's function-item constant
+        /// (see `sparagmos_mir::Constant::generic_type_ids`): the
+        /// rendered tags erase the regions the segments
+        /// distinguish, so the `dyn Any` downcast builtins
+        /// compare the target type's segments when both sides
+        /// carry them. `None` when the driver did not record
+        /// them for this call (a hand-built body, or a callee
+        /// that is not a function-item constant).
+        generic_type_ids: Option<Vec<(u64, u64)>>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and
@@ -2474,6 +2500,11 @@ pub struct VTableIdentity {
     pub concrete: String,
     pub traits: Vec<String>,
     pub glue: Option<DropGlue>,
+    /// The concrete type's `TypeId` segments, as the driver
+    /// computed them from the compiler's spelling of the type:
+    /// a trait object recovered through this identity carries
+    /// them, so its `dyn Any` downcasts compare exactly.
+    pub type_id: (u64, u64),
 }
 
 /// A whole program: a set of named function bodies in one module.

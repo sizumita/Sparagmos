@@ -321,6 +321,16 @@ pub struct PanicPayload {
     pub ty: String,
     /// The payload value itself.
     pub value: Box<Value>,
+    /// The payload type's `TypeId` segments, when the raise
+    /// recorded them (a `panic_any` call's generic arguments, or
+    /// the segments of the `dyn Any` box a resumed payload was
+    /// read out of): the box the payload is later rebuilt into
+    /// carries them, so a downcast of the caught payload
+    /// compares exactly. `None` for payloads the interpreter
+    /// fabricates itself (a string panic, an allocation
+    /// failure), whose types are region-free scalars and
+    /// strings in practice.
+    pub type_id: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -405,6 +415,16 @@ pub enum Value {
         /// for the concrete type's glue: dropping the value is then
         /// an explicit error.
         drop_glue: Option<Box<crate::ir::DropGlue>>,
+        /// The concrete type's `TypeId` segments, attached where
+        /// the value was formed (an unsizing cast, a decoded
+        /// constant, a vtable identity, a rebuilt panic payload):
+        /// `concrete` is the type's rendered tag, which erases
+        /// regions, so two region variants of one type share it;
+        /// the segments are the identity `TypeId::of` itself
+        /// compares, and a `dyn Any` downcast compares them when
+        /// the call site recorded the target type's segments too.
+        /// `None` when the forming site could not name them.
+        type_id: Option<(u64, u64)>,
     },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
@@ -584,9 +604,9 @@ impl Value {
                 Value::FatRef { base: bb, len: lb },
             ) => la == lb && ba.bit_identical(bb),
             (
-                Value::DynRef { base: ba, concrete: ca, traits: ta, drop_glue: ga },
-                Value::DynRef { base: bb, concrete: cb, traits: tb, drop_glue: gb },
-            ) => ca == cb && ta == tb && ga == gb && ba.bit_identical(bb),
+                Value::DynRef { base: ba, concrete: ca, traits: ta, drop_glue: ga, type_id: ia },
+                Value::DynRef { base: bb, concrete: cb, traits: tb, drop_glue: gb, type_id: ib },
+            ) => ca == cb && ta == tb && ga == gb && ia == ib && ba.bit_identical(bb),
             (
                 Value::ErasedBlock { bytes: ba, relocs: ra },
                 Value::ErasedBlock { bytes: bb, relocs: rb },

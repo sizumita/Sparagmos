@@ -260,6 +260,7 @@ fn builtin_copy_with_array_element_fills_maybeuninit_place() {
             literal: mir::ConstKind::Ty(mir::Ty::FnDef(COPY_DEF, vec![array4_ty()])),
             user_ty: None,
             ty: None,
+            generic_type_ids: None,
         }),
         args: vec![copy(3), copy(4), const_usize(1)],
         destination: place(6),

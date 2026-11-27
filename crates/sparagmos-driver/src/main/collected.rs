@@ -29,7 +29,7 @@ pub(crate) struct Collected {
     /// Vtable identities minted while decoding constants (see
     /// `Converter::vtable_identities`).
     pub(crate) vtable_identities:
-        std::collections::HashMap<u64, (sparagmos_mir::Ty, Vec<String>)>,
+        std::collections::HashMap<u64, (sparagmos_mir::Ty, Vec<String>, (u64, u64))>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
     pub(crate) adt_discriminants: sparagmos_mir::AdtDiscriminants,

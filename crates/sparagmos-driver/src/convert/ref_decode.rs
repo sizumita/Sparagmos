@@ -620,6 +620,7 @@ impl Converter {
             base: Box::new(base),
             concrete: self.ty(&concrete_ty),
             traits,
+            type_id: Some(type_id_segments(&concrete_ty)),
         })
     }
 
@@ -642,7 +643,13 @@ impl Converter {
             .as_ref()
             .map(|binder| vec![binder.value.def_id.name()])
             .unwrap_or_default();
-        self.vtable_identities.insert(id, (concrete, traits));
+        // The concrete type's `TypeId` segments, from the
+        // compiler's own spelling of the type: a trait object
+        // recovered through this identity answers `dyn Any`
+        // downcasts with them (see `ir::VTableIdentity`).
+        let type_id = type_id_segments(vty);
+        self.vtable_identities
+            .insert(id, (concrete, traits, type_id));
         if let Some(binder) = trait_ref {
             // As in `dyn_trait_refs`: erase the existential
             // arguments' binder regions so the demanded

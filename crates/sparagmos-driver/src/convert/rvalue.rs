@@ -138,8 +138,38 @@ impl Converter {
         }
     }
 
+    /// The `TypeId` segments of a function-item constant's
+    /// generic type arguments, parallel to the converted
+    /// argument list (see `sm::Constant::generic_type_ids`):
+    /// the compiler's generic arguments still spell the regions
+    /// conversion erases, so the segments are computed from
+    /// them directly, one per type argument, in order.
+    fn constant_fn_type_ids(
+        &mut self,
+        c: &mir::ConstOperand,
+    ) -> Option<Vec<(u64, u64)>> {
+        let kind = guarded_ty_kind(&c.const_.ty())?;
+        let TyKind::RigidTy(RigidTy::FnDef(_, args)) = kind else {
+            return None;
+        };
+        Some(
+            args.0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(type_id_segments(t)),
+                    GenericArgKind::Const(_) | GenericArgKind::Lifetime(_) => {
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn constant(&mut self, c: &mir::ConstOperand) -> sm::Constant {
         let mut k = self.constant_literal(c);
+        if k.generic_type_ids.is_none() {
+            k.generic_type_ids = self.constant_fn_type_ids(c);
+        }
         if k.ty.is_none() {
             k.ty = self.constant_scalar_ty(c);
         }
@@ -227,6 +257,7 @@ impl Converter {
                         literal: sm::ConstKind::Ty(t),
                         user_ty: None,
                         ty: None,
+                        generic_type_ids: None,
                     };
                 }
                 // A zero-sized constant whose type is a
@@ -253,6 +284,7 @@ impl Converter {
                         )),
                         user_ty: None,
                         ty: None,
+                        generic_type_ids: None,
                     };
                 }
                 // Any other zero-sized constant still has a typed
@@ -297,6 +329,7 @@ impl Converter {
                             literal: sm::ConstKind::Ty(t),
                             user_ty: None,
                             ty: None,
+                            generic_type_ids: None,
                         };
                     }
                     // A zero-sized type constant of
@@ -315,6 +348,7 @@ impl Converter {
                             )),
                             user_ty: None,
                             ty: None,
+                            generic_type_ids: None,
                         };
                     }
                     if let Some(v) = self.zst_const_value(ty, 0) {
@@ -331,6 +365,7 @@ impl Converter {
                         },
                         user_ty: None,
                         ty: None,
+                        generic_type_ids: None,
                     }
                 }
                 TyConstKind::Param(p) => {
@@ -351,6 +386,7 @@ impl Converter {
                     },
                     user_ty: None,
                     ty: None,
+                    generic_type_ids: None,
                 }
             }
             CK::Param(p) => {

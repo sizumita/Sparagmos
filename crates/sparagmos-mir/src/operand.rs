@@ -155,6 +155,16 @@ pub enum ConstValue {
         base: Box<ConstValue>,
         concrete: Ty,
         traits: Vec<String>,
+        /// The `TypeId` segments of the concrete type, as the
+        /// driver computes them from the compiler's spelling of
+        /// the type (see `type_id_segments` in the driver): the
+        /// converted `concrete` type erases the regions the
+        /// segments distinguish, so a `dyn Any` downcast compares
+        /// these when it has them (see
+        /// `sparagmos_interp::value::Value::DynRef`). `None`
+        /// only for bodies reconstructed without the driver
+        /// (the harness dump reader).
+        type_id: Option<(u64, u64)>,
     },
 }
 
@@ -177,6 +187,21 @@ pub struct Constant {
     /// comparison of two literals is the canonical case) reads the
     /// bits under this type instead of guessing from the sign bit.
     pub ty: Option<Ty>,
+    /// The `TypeId` segments of this constant's generic type
+    /// arguments, when the constant names a function item: entry
+    /// `i` is the identity of the `i`-th converted generic type
+    /// argument (the argument list [`crate::ty`] conversion
+    /// produces -- lifetimes and const arguments dropped), computed
+    /// by the driver from the compiler's generic arguments, whose
+    /// spelling still carries the regions the converted types
+    /// erase. A `dyn Any` downcast call reads the entry for its
+    /// target type, so the comparison is made at this call site,
+    /// not through a program-wide table keyed by the erased type
+    /// (two region variants of one erased type in one program
+    /// would collide there). `None` for constants that do not name
+    /// a function item, and for function items the driver did not
+    /// record (hand-built bodies).
+    pub generic_type_ids: Option<Vec<(u64, u64)>>,
 }
 impl Constant {
     pub fn from_value(v: ConstValue) -> Self {
@@ -184,6 +209,7 @@ impl Constant {
             literal: ConstKind::Value(v),
             user_ty: None,
             ty: None,
+            generic_type_ids: None,
         }
     }
     pub fn int(v: u64) -> Self {

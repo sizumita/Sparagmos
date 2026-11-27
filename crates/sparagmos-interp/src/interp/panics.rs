@@ -881,6 +881,7 @@ thread '{name}' ({tid}) panicked:
         let payload = payload.unwrap_or_else(|| PanicPayload {
             ty: "&str".to_string(),
             value: Box::new(Value::Str(message.to_string())),
+            type_id: None,
         });
         let info = Value::Enum {
             variant: 0,
@@ -896,6 +897,7 @@ thread '{name}' ({tid}) panicked:
                         "std::marker::Send".to_string(),
                     ],
                     drop_glue: None,
+                    type_id: payload.type_id,
                 },
                 location,
                 Value::Bool(can_unwind),
@@ -1133,6 +1135,7 @@ thread '{name}' ({tid}) panicked:
                 let payload = payload.unwrap_or_else(|| PanicPayload {
                     ty: "&str".to_string(),
                     value: Box::new(Value::Str(message)),
+                    type_id: None,
                 });
                 self.call_to_completion(
                     frames,
