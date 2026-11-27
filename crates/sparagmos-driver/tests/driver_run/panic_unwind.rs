@@ -3442,6 +3442,48 @@ fn run_mode_nounwind_panic_reports_cannot_unwind() {
     );
 }
 
+const INVALID_ENUM_ABORT_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+enum Two {
+    A,
+    B,
+}
+fn main() {
+    let v: Two = unsafe { std::mem::transmute(9u8) };
+    println!("is_a={}", v == Two::A);
+}
+"#;
+
+#[test]
+fn run_mode_invalid_enum_assert_aborts_without_a_second_report() {
+    // The `CheckEnums` assertion's MIR unwind edge is
+    // `unreachable`: its panic (`panic_invalid_enum_construction`)
+    // is itself a `panic_nounwind_fmt` panic, so the run prints
+    // the assertion's own report and the non-unwinding line and
+    // then aborts (134), exactly as natively -- there is no
+    // `panic_cannot_unwind` second report (that report belongs to
+    // the `Terminate` shape above, a regular panic crossing a
+    // nounwind boundary). The assertion's message text is covered
+    // separately; this test pins the abort shape.
+    let dir = temp_dir("invalid-enum-abort");
+    let src = fixture(&dir, "invalid_enum_abort.rs", INVALID_ENUM_ABORT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a nounwind assertion panic aborts: {stderr}"
+    );
+    assert!(
+        stderr.contains("thread caused non-unwinding panic. aborting."),
+        "the non-unwinding line follows the report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panic in a function that cannot unwind"),
+        "no synthetic cannot-unwind second report: {stderr}"
+    );
+}
+
 const ASSERT_ARRAY_SRC: &str = r#"
 fn main() { assert_eq!([1, 2, 3], [1, 2, 4]); }
 "#;
