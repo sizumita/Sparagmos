@@ -720,7 +720,12 @@ fn fn_item_at(bytes: &[u8], start: usize) -> Option<(&str, usize)> {
 /// the definition's parameter list). The crate prefix may be
 /// present on either side or on neither. A function item inside
 /// the type may be spelled by its signature on one side and by
-/// its path on the other (see `fn_item_spelling`).
+/// its path on the other (see `fn_item_spelling`). When both
+/// sides spell a generic argument list, the lists must agree as
+/// canonical spellings (see `normalize_impl_self`): the base
+/// name alone never equates two instantiations of one generic
+/// type. Mirrors the copy of the same name in
+/// `interp::call::lookup`.
 pub(super) fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
     // The section and the queried name can be the very same
     // rendering (a `Self` that is itself an impl-path type,
@@ -732,6 +737,27 @@ pub(super) fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
     // item inside the type is spelled.
     if fn_item_spelling(self_part) == fn_item_spelling(self_name) {
         return true;
+    }
+    // When both sides spell a generic argument list, the
+    // lists are part of the type's identity: two
+    // instantiations of one generic type are different
+    // types, and a body collected for one must never serve
+    // a call monomorphised at another (a `Map` over one
+    // guest adapter and a `Map` over another share the
+    // base name and nothing else). The comparison is
+    // therefore the canonical spelling (see
+    // `normalize_impl_self`), which erases only the parts
+    // the two sides legitimately spell differently,
+    // compared argument by argument with the key's bare
+    // parameter names standing for any instantiation (see
+    // `canonical_self_matches`). The
+    // base-name comparison below remains for a side that
+    // carries no argument list at all.
+    if self_part.contains('<') && self_name.contains('<') {
+        return canonical_self_matches(
+            &normalize_impl_self(self_part),
+            &normalize_impl_self(self_name),
+        );
     }
     let self_base = self_part.split('<').next().unwrap_or(self_part);
     // The queried name may itself carry a generic argument list
@@ -774,6 +800,276 @@ pub(super) fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
     let self_short = self_base.rsplit("::").next().unwrap_or(self_base);
     self_short == short
 }
+
+/// The spelling of an impl `Self` type (or of a queried
+/// concrete type) with the parts the two sides legitimately
+/// differ in removed, so spellings of one type compare
+/// equal: lifetime arguments (`'_`, `'static`, named
+/// lifetimes), which rendered type names drop and instance
+/// keys keep, and the defaulted allocator argument
+/// (`std::alloc::Global`), which rendered names spell out
+/// and instance keys elide. Argument lists are processed at
+/// every nesting level; a list emptied by the removals is
+/// dropped with its brackets. A closure-type argument, in
+/// either of its two spellings, renders as the bare segment
+/// `{closure}` (see `canonical_arg`). Function-item types are first
+/// canonicalised to the item's path (see `fn_item_spelling`),
+/// which the two sides spell differently. Mirrors the copy
+/// of the same name in `interp::call::lookup`.
+pub(super) fn normalize_impl_self(name: &str) -> String {
+    let name = &fn_item_spelling(name);
+    fn list(chars: &[char], start: usize) -> (String, usize) {
+        // `chars[start]` is '<': render the argument list
+        // (possibly to nothing) and return the index just
+        // past its closing '>'.
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut i = start + 1;
+        let mut depth = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '-' && chars.get(i + 1) == Some(&'>') {
+                current.push_str("->");
+                i += 2;
+            } else if c == '<' {
+                let (rendered, next) = list(chars, i);
+                current.push_str(&rendered);
+                i = next;
+            } else if c == '>' && depth == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(canonical_arg(arg));
+                }
+                let kept: Vec<&str> = args
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|a| {
+                        !a.starts_with('\'')
+                            && *a != "std::alloc::Global"
+                            && *a != "alloc::alloc::Global"
+                    })
+                    .collect();
+                if kept.is_empty() {
+                    return (String::new(), i + 1);
+                }
+                return (format!("<{}>", kept.join(", ")), i + 1);
+            } else if c == '(' || c == '[' {
+                depth += 1;
+                current.push(c);
+                i += 1;
+            } else if c == ')' || c == ']' {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+                i += 1;
+            } else if c == ',' && depth == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(canonical_arg(arg));
+                }
+                current = String::new();
+                i += 1;
+            } else {
+                current.push(c);
+                i += 1;
+            }
+        }
+        (current, i)
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            let (rendered, next) = list(&chars, i);
+            out.push_str(&rendered);
+            i = next;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    canonical_arg(out.trim().to_string())
+}
+
+/// The canonical rendering of one generic argument of a
+/// `Self` spelling (or of a whole `Self` spelling): an
+/// argument that is a closure type, in either of its two
+/// spellings — the span segment an instance key carries
+/// (`{closure@<file>:16:17: 16:23}`, with no argument
+/// list), the indexed path segment a rendered type
+/// carries (`main::{closure#0}`, with the closure's own
+/// generic arguments appended) — renders as the bare
+/// segment `{closure}`. The two spellings name one type
+/// and share no text, and neither carries the other's
+/// discriminant (the span has no index, the path no
+/// span), so the discriminant is erased here and the
+/// scans' uniqueness contract (see `impl_self_matches`)
+/// keeps two closures holding impls of one trait method
+/// in one program unresolved rather than mis-dispatched.
+/// Any other argument renders as itself. Mirrors the copy
+/// of the same name in `interp::call::lookup`.
+fn canonical_arg(arg: String) -> String {
+    let head = arg.split('<').next().unwrap_or(&arg);
+    let segment = head
+        .rsplit("::")
+        .next()
+        .unwrap_or(head)
+        .trim_start_matches('&')
+        .trim();
+    if segment.starts_with("{closure@") || segment.starts_with("{closure#") {
+        "{closure}".to_string()
+    } else {
+        arg
+    }
+}
+/// Whether two canonical `Self` spellings (see
+/// `normalize_impl_self`) denote the same type, where the
+/// first spelling is a recorded key's: an argument of the
+/// key that is a bare identifier is the generic
+/// definition's parameter standing in that position — a
+/// body recorded under its generic definition name
+/// (`YCombinator<F, A, R>`, or a partially instantiated
+/// `GroupBy<InGroup<...>, F, I>`) serves a call
+/// monomorphised at any instantiation of that parameter —
+/// and matches any one argument of the query. A bare
+/// identifier that names a primitive type is not a
+/// parameter: `Foo<i32>` and `Foo<u8>` are different
+/// types. Every other part of the two spellings must
+/// agree exactly, argument list by argument list.
+/// Mirrors the copy of the same name in the other
+/// `impl_self_matches` home.
+fn canonical_self_matches(key: &str, query: &str) -> bool {
+    // A spelling split into its head and, when it carries
+    // one that runs to the spelling's end, the arguments
+    // of its outermost list.
+    fn split(spelling: &str) -> Option<(String, Option<Vec<String>>)> {
+        let chars: Vec<char> = spelling.chars().collect();
+        let mut i = 0usize;
+        let mut head = String::new();
+        while i < chars.len() && chars[i] != '<' {
+            head.push(chars[i]);
+            i += 1;
+        }
+        if i == chars.len() {
+            return Some((head.trim().to_string(), None));
+        }
+        i += 1;
+        let mut args = Vec::new();
+        let mut current = String::new();
+        let mut angle = 0usize;
+        let mut paren = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '-' && chars.get(i + 1) == Some(&'>') {
+                current.push_str("->");
+                i += 2;
+            } else if c == '<' {
+                angle += 1;
+                current.push(c);
+                i += 1;
+            } else if c == '>' && angle == 0 && paren == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                i += 1;
+                if i != chars.len() {
+                    return None;
+                }
+                return Some((head.trim().to_string(), Some(args)));
+            } else if c == '>' && angle == 0 {
+                // The '>' of a fn-pointer return inside
+                // parentheses, already shielded by the `->`
+                // case; a bare one here is unbalanced.
+                return None;
+            } else if c == '>' {
+                angle -= 1;
+                current.push(c);
+                i += 1;
+            } else if c == '(' || c == '[' {
+                paren += 1;
+                current.push(c);
+                i += 1;
+            } else if c == ')' || c == ']' {
+                paren = paren.saturating_sub(1);
+                current.push(c);
+                i += 1;
+            } else if c == ',' && angle == 0 && paren == 0 {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                current = String::new();
+                i += 1;
+            } else {
+                current.push(c);
+                i += 1;
+            }
+        }
+        None
+    }
+    let Some((key_head, key_args)) = split(key) else {
+        return false;
+    };
+    let Some((query_head, query_args)) = split(query) else {
+        return false;
+    };
+    if key_head != query_head {
+        // The crate prefix may be present on either side
+        // or on neither; two different qualified heads are
+        // different types.
+        let key_short = key_head.rsplit("::").next().unwrap_or(&key_head);
+        let query_short = query_head.rsplit("::").next().unwrap_or(&query_head);
+        if (key_head.contains("::") && query_head.contains("::"))
+            || key_short != query_short
+        {
+            return false;
+        }
+    }
+    match (key_args, query_args) {
+        (None, None) => true,
+        (Some(key_args), Some(query_args)) => {
+            key_args.len() == query_args.len()
+                && key_args.iter().zip(&query_args).all(|(key_arg, query_arg)| {
+                    is_definition_param(key_arg)
+                        || canonical_self_matches(key_arg, query_arg)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a canonical argument is a generic definition's
+/// parameter name standing alone: a single identifier that
+/// does not name a primitive type.
+fn is_definition_param(arg: &str) -> bool {
+    let arg = arg.trim();
+    !arg.is_empty()
+        && arg.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            arg,
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f16"
+                | "f32"
+                | "f64"
+                | "f128"
+                | "bool"
+                | "char"
+                | "str"
+        )
+}
+
 
 /// Whether `name` is the driver name of `adt_name`'s `Drop` impl:
 /// `<{adt_name} as std::ops::Drop>::drop`, with any generic
