@@ -4678,4 +4678,108 @@ mod resolved_route_tests {
             Value::Int(20),
         );
     }
+
+    /// Issue #501: a byte splice at or past a scalar's
+    /// declared width does not apply — the model's word is
+    /// wider than the declared width, so an evidence-free
+    /// splice there widened the stored value past its type
+    /// (a `u32` holding `0xFFFF_FFFF` spliced at byte 4 became
+    /// `0x9_FFFF_FFFF`). A splice inside the width still
+    /// applies.
+    #[test]
+    fn splice_past_declared_width_declines() {
+        let kind = Some(ByteScalar::Uint(UintTy::U32));
+        let mut slot = Value::Uint(0xFFFF_FFFF);
+        assert!(!splice_scalar_storage_byte_as(&mut slot, kind, 4, 9));
+        assert_eq!(slot, Value::Uint(0xFFFF_FFFF));
+        assert!(splice_scalar_storage_byte_as(&mut slot, kind, 3, 9));
+        assert_eq!(slot, Value::Uint(0x09FF_FFFF));
+    }
+
+    /// Issue #501: a multi-byte scalar write displaced by a
+    /// whole element from the element's base (the projection
+    /// an `as_mut_ptr` cast plus an element add produces over
+    /// a `ManuallyDrop<MaybeUninit<[u32; 2]>>` field value)
+    /// must not be judged by the written value's own byte
+    /// width: the value 9 fits in a byte, but the write is a
+    /// `u32` write denoting the *next* element, and splicing
+    /// its low byte into the head element at byte 4 corrupted
+    /// that element (`0x9_FFFF_FFFF`) and left the denoted
+    /// element unwritten. With the declared type threaded
+    /// through, the byte splice declines at the declared
+    /// width and the write is the navigation's explicit
+    /// unsupported-projection error, with the storage
+    /// untouched. A byte write inside the head element's
+    /// declared width still splices.
+    #[test]
+    fn displaced_scalar_write_past_width_does_not_mis_splice() {
+        let program = Program::default();
+        let base = || {
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![
+                        Value::Uint(0xFFFF_FFFF),
+                        Value::Uint(0xFFFF_FFFF),
+                    ])],
+                }],
+            }
+        };
+        let ty = Some(Ty::Tuple(vec![Ty::Tuple(vec![Ty::Array(
+            Box::new(Ty::Uint(UintTy::U32)),
+            2,
+        )])]));
+        let mut slot = base();
+        let projection = vec![
+            RefProj::Field(0),
+            RefProj::Field(0),
+            RefProj::Index(0),
+            RefProj::ByteOffset(4),
+        ];
+        let result = assign_projected(
+            &mut slot,
+            &projection,
+            Value::Uint(9),
+            "probe",
+            "displaced u32 write",
+            false,
+            Some(&program),
+            ty.clone(),
+        );
+        assert!(result.is_err(), "the displaced write must not splice");
+        assert_eq!(slot, base(), "the storage is untouched");
+
+        let mut slot = base();
+        let projection = vec![
+            RefProj::Field(0),
+            RefProj::Field(0),
+            RefProj::Index(0),
+            RefProj::ByteOffset(2),
+        ];
+        assign_projected(
+            &mut slot,
+            &projection,
+            Value::Uint(0xAB),
+            "probe",
+            "displaced byte write",
+            false,
+            Some(&program),
+            ty,
+        )
+        .expect("a byte write inside the declared width splices");
+        assert_eq!(
+            slot,
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(vec![
+                        Value::Uint(0xFFAB_FFFF),
+                        Value::Uint(0xFFFF_FFFF),
+                    ])],
+                }],
+            }
+        );
+    }
 }

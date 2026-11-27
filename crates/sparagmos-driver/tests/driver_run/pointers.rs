@@ -1556,6 +1556,58 @@ fn run_mode_ptr_byte_add_and_byte_offset() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const UNION_DISPLACED_SCALAR_WRITE_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+union U { arr: ManuallyDrop<MaybeUninit<[u32; 2]>>, bytes: [u8; 8] }
+fn main() {
+    let mut u = U { bytes: [0xFF; 8] };
+    unsafe {
+        let p = (*u.arr).as_mut_ptr() as *mut u32;
+        *p.add(1) = 9;
+        let arr = (*u.arr).assume_init_ref();
+        assert_eq!(arr[0], 0xFFFF_FFFF);
+        assert_eq!(arr[1], 9);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_union_displaced_scalar_write_never_mis_splices() {
+    // Issue #501: a `u32` write through a pointer displaced
+    // by a whole element from the element base of a union's
+    // `ManuallyDrop<MaybeUninit<[u32; 2]>>` field, where the
+    // union currently holds its `[u8; 8]` field. The written
+    // value (9) fits in a byte, and the projected assignment's
+    // byte splice judged the write by that minimal width: it
+    // spliced the low byte into the *first* element at byte 4,
+    // past its declared width, producing `0x9_FFFF_FFFF`
+    // there and leaving the denoted element unwritten — the
+    // run exited 0 with corrupted values. The write now
+    // declines the splice at the declared width and is an
+    // explicit unsupported-projection error instead of a
+    // silent wrong value. (A future composition of this
+    // write should change this test to assert the correct
+    // values above.)
+    let dir = temp_dir("union-displaced-scalar-write");
+    let src = fixture(
+        &dir,
+        "union_displaced_scalar_write.rs",
+        UNION_DISPLACED_SCALAR_WRITE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the displaced write must not silently corrupt; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("write through a pointer displaced 4 bytes"),
+        "the failure is the explicit displaced-write error: {stderr}"
+    );
+}
+
 const PTR_BYTE_DISPLACED_READ_SRC: &str = r#"
 fn main() {
     let arr = [10i32, 20, 30, 40];

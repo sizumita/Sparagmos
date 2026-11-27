@@ -2772,6 +2772,72 @@ fn stepped_index_ty(ty: Option<&Ty>) -> Option<Ty> {
     }
 }
 
+/// The declared type a union field's scalar shape describes,
+/// in the form the projected assignment's type walk consumes
+/// (see `Interpreter::crossing_rest_ty`): a one-payload
+/// wrapper shape becomes a one-field tuple holding the
+/// payload's type at the payload's index (the walk's field
+/// step on a tuple reads the element at the index, exactly
+/// the step the wrapper's field step performs), a multi-field
+/// shape a tuple of its fields' types, and a scalar or array
+/// shape its own type. Shapes with no honest `Ty` form here
+/// (niche/tagged encodings, fat pointers) decline, and the
+/// caller keeps the field-table walk's answer.
+pub(crate) fn scalar_shape_to_ty(shape: &ScalarShape) -> Option<Ty> {
+    Some(match shape {
+        ScalarShape::Int { bits, signed } => match (bits, signed) {
+            (8, true) => Ty::Int(IntTy::I8),
+            (16, true) => Ty::Int(IntTy::I16),
+            (32, true) => Ty::Int(IntTy::I32),
+            (64, true) => Ty::Int(IntTy::I64),
+            (128, true) => Ty::Int(IntTy::I128),
+            (8, false) => Ty::Uint(UintTy::U8),
+            (16, false) => Ty::Uint(UintTy::U16),
+            (32, false) => Ty::Uint(UintTy::U32),
+            (64, false) => Ty::Uint(UintTy::U64),
+            (128, false) => Ty::Uint(UintTy::U128),
+            _ => return None,
+        },
+        ScalarShape::Float { bits } => Ty::Float(match bits {
+            16 => FloatTy::F16,
+            32 => FloatTy::F32,
+            64 => FloatTy::F64,
+            128 => FloatTy::F128,
+            _ => return None,
+        }),
+        ScalarShape::Bool => Ty::Bool,
+        ScalarShape::Char => Ty::Uint(UintTy::U32),
+        ScalarShape::Ptr | ScalarShape::FnPtr => Ty::Uint(UintTy::U64),
+        ScalarShape::Array(elem, n) => {
+            Ty::Array(Box::new(scalar_shape_to_ty(elem)?), *n)
+        }
+        ScalarShape::AdtField {
+            index,
+            count,
+            inner,
+            ..
+        } => {
+            let mut fields = vec![Ty::Unit; *count];
+            *fields.get_mut(*index as usize)? = scalar_shape_to_ty(inner)?;
+            Ty::Tuple(fields)
+        }
+        ScalarShape::AdtFields { count, fields, .. } => {
+            let mut tys = vec![Ty::Unit; *count];
+            for (index, _, fshape) in fields {
+                *tys.get_mut(*index as usize)? = scalar_shape_to_ty(fshape)?;
+            }
+            Ty::Tuple(tys)
+        }
+        ScalarShape::Fields { fields, .. } => Ty::Tuple(
+            fields
+                .iter()
+                .map(|(_, fshape)| scalar_shape_to_ty(fshape))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    })
+}
+
 /// Whether `value` is a *complete* value of `ty` under the
 /// program's declared field types: every declared field of an
 /// aggregate is present and itself complete, and scalars match

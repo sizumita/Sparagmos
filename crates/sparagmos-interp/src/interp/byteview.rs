@@ -3807,6 +3807,24 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+/// The scalar shape a declared type names, when it names a
+/// scalar at all: the `Ty` form of [`scalar_shape_of_tag`].
+pub(crate) fn scalar_shape_of_ty(ty: &Ty) -> Option<ScalarShape> {
+    Some(match ty {
+        Ty::Bool => ScalarShape::Bool,
+        Ty::Int(t) => ScalarShape::Int {
+            bits: t.bits(),
+            signed: true,
+        },
+        Ty::Uint(t) => ScalarShape::Int {
+            bits: t.bits(),
+            signed: false,
+        },
+        Ty::Float(t) => ScalarShape::Float { bits: t.bits() },
+        _ => return None,
+    })
+}
+
 /// The scalar shape a rendered type tag names (a format
 /// argument's type tag, a builtin's element tag), with any
 /// reference or pointer wrappers stripped: `&u32`, `*const f32`
@@ -4480,6 +4498,18 @@ pub(crate) fn splice_scalar_storage_byte_as(
     idx: usize,
     byte: u8,
 ) -> bool {
+    // A byte position at or past the declared width is not a
+    // byte of this scalar's storage: splicing there would
+    // widen the stored value past its type (the model's word
+    // is wider than every declared integer width), corrupting
+    // the value the storage holds. The evidence-free splice
+    // below keeps the widened-word convention for callers
+    // without declared-kind evidence.
+    if let Some(kind) = kind {
+        if idx >= kind.width() {
+            return false;
+        }
+    }
     match (kind, &*slot) {
         (Some(kind), Value::Float(f)) if narrowed_float_kind(kind) => {
             if idx >= kind.width() {

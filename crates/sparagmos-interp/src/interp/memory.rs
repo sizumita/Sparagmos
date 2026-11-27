@@ -2276,6 +2276,77 @@ impl<'a> Interpreter<'a> {
         self.write_resolved_typed(frames, target, value, None)
     }
 
+    /// The declared type at the position the remainder of a
+    /// union-crossing write addresses (see
+    /// [`Self::write_resolved_typed`]): the target root's
+    /// declared type — the same evidence the ordinary path's
+    /// per-target arms compute — walked through the projection
+    /// prefix the crossing consumed, up to and including its
+    /// union field step. `None` when the walk cannot follow
+    /// the prefix (the crossing's remainder then keeps the
+    /// shape-only judgments, as before).
+    fn crossing_rest_ty(
+        &self,
+        target: &Resolved,
+        func: &str,
+        rest: &[RefProj],
+    ) -> Option<Ty> {
+        let effective;
+        let (projection, root_ty) = match target {
+            Resolved::Place { local, projection, .. } => {
+                let root_ty = self
+                    .program()
+                    .get(func)
+                    .and_then(|body| body.local_ty(Local(*local)))
+                    .cloned()?;
+                (projection.as_slice(), root_ty)
+            }
+            Resolved::Static { name, projection } => {
+                let root_ty = self.program().static_tys.get(name).cloned()?;
+                (projection.as_slice(), root_ty)
+            }
+            Resolved::Alloc { id, projection } => {
+                effective = self.elem_block_projection(*id, projection);
+                let root_ty = self.alloc_ty(*id)?;
+                let root_ty = if self.is_elem_block(*id) {
+                    Ty::Slice(Box::new(root_ty))
+                } else {
+                    root_ty
+                };
+                (effective.as_slice(), root_ty)
+            }
+            Resolved::Value(..) => return None,
+        };
+        let pos = projection
+            .iter()
+            .position(|s| matches!(s, RefProj::UnionField { .. }))?;
+        if projection[pos + 1..] != *rest {
+            return None;
+        }
+        // The written field's type: its recorded scalar shape
+        // names it with the generics instantiated, where the
+        // field-table walk through a generic wrapper (a
+        // `ManuallyDrop<T>` field, a `MaybeUninit<T>` field)
+        // loses the type at the wrapper's parameter. The
+        // shape's answer therefore stands when it has one;
+        // the walk's answer covers the rest.
+        let RefProj::UnionField { idx, table } = projection[pos] else {
+            unreachable!("the position names a union field step")
+        };
+        if let Some(shape) = self
+            .program()
+            .union_tables
+            .get(table)
+            .and_then(|shapes| shapes.get(idx))
+            .and_then(|o| o.as_ref())
+        {
+            if let Some(ty) = scalar_shape_to_ty(shape) {
+                return Some(ty);
+            }
+        }
+        step_ty_across(Some(self.program()), Some(root_ty), &projection[..=pos])
+    }
+
     /// [`Self::write_resolved`] with the caller's type evidence:
     /// `root_ty`, the declared type of the value at the target's
     /// root (for an allocation target, its pointee type), is
@@ -2316,6 +2387,16 @@ impl<'a> Interpreter<'a> {
                 let value = pending
                     .take()
                     .expect("a crossing write applies the value once");
+                // The declared type at the position `rest`
+                // addresses, walked from the target root's
+                // declared type through the projection prefix
+                // the crossing consumed: the projected
+                // assignment's byte-splice judgments need the
+                // declared widths at the written position (a
+                // displaced scalar write judged by the value's
+                // own byte width alone splices into the wrong
+                // scalar; see `assign_projected`).
+                let rest_ty = self.crossing_rest_ty(target, func, rest);
                 assign_projected(
                     temp,
                     rest,
@@ -2324,7 +2405,7 @@ impl<'a> Interpreter<'a> {
                     place,
                     grow,
                     Some(self.program()),
-                    None,
+                    rest_ty,
                 )
             },
         );
@@ -3089,6 +3170,44 @@ fn truncate_to_declared_array(
             self.foreign_write(frames, body, place, &target, &value)
         {
             return written;
+        }
+        // A scalar write through a byte-displaced target (a
+        // wider pointer cast from a byte pointer, or a pointer
+        // displaced by a whole element from an element's
+        // base): the position is a byte position in the base
+        // value's storage and the write covers the pointee's
+        // declared width, which the shaped store's byte-view
+        // path splices at that position. Judging the write by
+        // the value's own byte width instead (the projected
+        // assignment's byte splice) writes only the low byte
+        // when the value happens to fit in one, leaving the
+        // rest of the pointee's width stale. A target the byte
+        // view cannot judge falls through to the ordinary
+        // path inside the shaped store, unchanged.
+        if let Some(ty) = &place_ty {
+            if let Some(shape) = scalar_shape_of_ty(ty) {
+                let projection = match &target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection,
+                };
+                let displaced = projection
+                    .iter()
+                    .any(|s| matches!(s, RefProj::ByteOffset(d) if *d != 0));
+                let elem_block = matches!(&target, Resolved::Alloc { id, .. }
+                    if self.is_elem_block(*id));
+                if displaced && !elem_block {
+                    let root_ty = self.resolved_root_ty(body, place);
+                    return self.shaped_store(
+                        frames,
+                        &target,
+                        value,
+                        &shape,
+                        root_ty.as_ref(),
+                    );
+                }
+            }
         }
         // A write of a zero-sized value through a dereference
         // that denoted no storage (see
