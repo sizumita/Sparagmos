@@ -380,7 +380,10 @@ denominator. Runs on every push to `main` and on manual dispatch.
   declared failure status of 101 and the run-crash verdict
   apply. Death by signal needs no further evidence: the
   compiler process crashing is compiletest's condition
-  itself.
+  itself. Exit 2 never passes either: it is the driver's own
+  named unsupported outcome (a compilation declined with a
+  named reason), not a crash, so such a record fails as
+  `no crash (driver unsupported)`.
 - A failure-expecting compile-check test that declares the
   failure status it expects (`//@ failure-status: N`, scoped
   to the revision being judged) passes stage 2 on either of
