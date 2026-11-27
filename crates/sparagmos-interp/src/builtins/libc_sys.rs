@@ -133,10 +133,17 @@ impl<'a> Interpreter<'a> {
 
     /// `int clearenv(void)`: the environment model is
     /// the host environment itself (reads and writes go
-    /// to it directly), so the host clear is the faithful
-    /// execution.
-    pub(super) fn exec_libc_clearenv(&mut self) -> InterpResult<Value> {
-        Ok(Value::Int(unsafe { host_clearenv() } as i128))
+    /// to it directly), so on hosts whose libc provides
+    /// the call the host clear is the faithful execution.
+    /// Hosts without it (macOS, Windows) name the call
+    /// unsupported through the platform seam.
+    pub(super) fn exec_libc_clearenv(&mut self, name: &str) -> InterpResult<Value> {
+        match crate::platform::host_clearenv() {
+            Some(result) => Ok(Value::Int(result as i128)),
+            None => Err(unsupported(format!(
+                "call to {name}: clearenv is not modelled on this host platform"
+            ))),
+        }
     }
 
     /// `int prctl(int, ...)`: the host call with the
@@ -155,9 +162,12 @@ impl<'a> Interpreter<'a> {
         for (slot, value) in words.iter_mut().zip(vals.iter().skip(1)) {
             *slot = as_u128(value, name)? as std::ffi::c_ulong;
         }
-        let result = unsafe {
-            host_prctl(option, words[0], words[1], words[2], words[3])
-        };
+        let result = crate::platform::host_prctl(option, words[0], words[1], words[2], words[3])
+            .ok_or_else(|| {
+                unsupported(format!(
+                    "call to {name}: prctl is not modelled on this host platform"
+                ))
+            })?;
         if result == -1 {
             let code = std::io::Error::last_os_error()
                 .raw_os_error()
