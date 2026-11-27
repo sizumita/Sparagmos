@@ -663,6 +663,123 @@ fn whatis_of_a_function_pointer_uses_the_raw_pointer_spelling() {
 }
 
 #[test]
+fn whatis_of_a_function_pointer_with_a_signature_tag() {
+    // A declared `fn(...)` type's recorded tag is the
+    // signature itself; gdb spells the type as a raw pointer
+    // to that signature.
+    for (tag, want) in [
+        ("fn()", "type = *mut fn ()"),
+        (
+            "unsafe fn(i32) -> bool",
+            "type = *mut unsafe fn (i32) -> bool",
+        ),
+        (
+            "extern \"C\" fn()",
+            "type = *mut extern \"C\" fn ()",
+        ),
+    ] {
+        let p = program_with_vars(vec![DebugVarEntry {
+            name: "f".to_string(),
+            source: DebugVar::Constant(Constant::Int(0)),
+            is_char: false,
+            ty: Some(tag.to_string()),
+            lines: (2, 2),
+        }]);
+        let mut s = session(p);
+        s.set_breakpoint("test.rs", 3);
+        let run = s.run_script(
+            vec![
+                DebugCommand::Run,
+                DebugCommand::WhatIs(DebugPrint {
+                    expr: "f".to_string(),
+                    format: None,
+                }),
+            ],
+            DebugDialect::Gdb,
+        );
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "tag {tag}: transcript: {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn sizeof_print_reports_the_declared_types_layout_size() {
+    // The size comes from the declared type's layout: an
+    // array of three i64 is 24, an (i64, bool) tuple is 16.
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("sizeof(a)"),
+            print("sizeof(t)"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "$1 = 24"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "$2 = 16"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn printf_formats_its_arguments_into_the_transcript() {
+    // The formatted text is output, not a print: it creates
+    // no `$N` line, and the following print keeps the first
+    // history number.
+    let p = program_with_vars(vec![
+        DebugVarEntry {
+            name: "x".to_string(),
+            source: DebugVar::Place(1, vec![]),
+            is_char: false,
+            ty: Some("i64".to_string()),
+            lines: (2, 2),
+        },
+        DebugVarEntry {
+            name: "s".to_string(),
+            source: DebugVar::Constant(Constant::Str("abcd".to_string())),
+            is_char: false,
+            ty: Some("&str".to_string()),
+            lines: (2, 2),
+        },
+    ]);
+    let mut s = session(p);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            DebugCommand::Printf {
+                format: "x = %d, s = %s".to_string(),
+                args: vec!["x".to_string(), "s".to_string()],
+            },
+            print("x"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "x = 42, s = abcd"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "$1 = 42"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
 fn ptype_of_a_struct_prints_its_layout() {
     let mut s = session(aggregate_program());
     s.set_breakpoint("test.rs", 3);

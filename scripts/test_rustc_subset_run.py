@@ -4676,19 +4676,33 @@ class DebuggerHarnessTests(unittest.TestCase):
             run.translate_debugger_command(
                 "gdb", "print /x *(_ptr as *const u64)"),
             "print/x *(_ptr as *const u64)")
-        # Call expressions and printf stay outside the scope.
+        # Call expressions stay outside the scope.
         self.assertIsNone(
             run.translate_debugger_command("gdb", "print fun(45, true)"))
+        # gdb printf whose arguments stay within the grammar
+        # is in scope and reaches the session verbatim; an
+        # argument outside the grammar keeps it out.
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", 'printf "s = \\"%s\\"\\n", s'),
+            'printf "s = \\"%s\\"\\n", s')
         self.assertIsNone(
-            run.translate_debugger_command("gdb", 'printf "x\\n"'))
+            run.translate_debugger_command("gdb", 'printf "%d", fun(1)'))
+        # sizeof of a value expression is a print expression.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print sizeof(packed)"),
+            "print sizeof(packed)")
         self.assertIsNone(
-            run.translate_debugger_command("gdb", "print sizeof(packed)"))
+            run.translate_debugger_command("gdb", "print sizeof(fun(1))"))
 
     def test_translate_lldb(self):
         self.assertEqual(
             run.translate_debugger_command("lldb", "v x"), "v x")
         self.assertEqual(
             run.translate_debugger_command("lldb", "expr x"), "v x")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "expr sizeof(packed)"),
+            "v sizeof(packed)")
         self.assertEqual(
             run.translate_debugger_command("lldb", "settings set a b"),
             "# inert: settings set a b")

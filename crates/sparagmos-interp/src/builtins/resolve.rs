@@ -410,7 +410,7 @@ impl<'a> Interpreter<'a> {
     /// element, as [`Self::read_byte_range`] reads a fixed
     /// range. Storage with no NUL in it is an explicit error,
     /// never a silently truncated length.
-    pub(super) fn read_c_str(&self, frames: &[Frame], ptr: &Value) -> InterpResult<Vec<u8>> {
+    pub(crate) fn read_c_str(&self, frames: &[Frame], ptr: &Value) -> InterpResult<Vec<u8>> {
         let target = self.deref_value(frames, ptr)?;
         let base = self.read_resolved(frames, &target)?;
         let direct: Option<&[u8]> = match &base {

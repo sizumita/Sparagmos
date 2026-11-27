@@ -3430,10 +3430,12 @@ def bucket_reason(reason):
 # vocabulary — line stops, scalar and aggregate prints (locals
 # and statics, the latter also before `run`), type queries
 # (`whatis`/`ptype`), the `repr` pseudo-command, counted steps,
-# frame navigation, function and file breakpoints, and the
-# `info functions`/`info locals` listings. Anything beyond
-# that (call expressions, `printf`, `sizeof`, info queries
-# other than functions/locals) keeps a not-attempted bucket.
+# frame navigation, function and file breakpoints, the
+# `info functions`/`info locals` listings, gdb `printf` whose
+# arguments stay within the print-expression grammar, and
+# `sizeof(<expr>)` as a print expression. Anything beyond
+# that (call expressions, info queries other than
+# functions/locals) keeps a not-attempted bucket.
 # ---------------------------------------------------------------------------
 
 DEBUGGER_VARIANT_DIRECTIVES = frozenset({
@@ -3593,6 +3595,29 @@ def _split_debugger_comparison(s):
     return None
 
 
+def _split_debugger_top_level(s, sep):
+    """Split `s` at every occurrence of the single character
+    `sep` outside any parenthesis, bracket or brace, or None
+    when the nesting is unbalanced."""
+    parts = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(s):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif ch == sep and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    if depth != 0:
+        return None
+    parts.append(s[start:])
+    return parts
+
+
 def _debugger_expr_ok(expr):
     """Whether `expr` stays within the print-expression grammar
     (see the note above): a value expression, or one top-level
@@ -3617,6 +3642,24 @@ def _debugger_value_expr_ok(expr):
     s = expr.strip()
     while s.startswith("*"):
         s = s[1:].lstrip()
+    if s.startswith("sizeof("):
+        # `sizeof(<expr>)`: the operand is a value expression
+        # of this same grammar, and the form must span the
+        # whole expression (the session answers it from the
+        # operand's declared type).
+        depth = 0
+        close = None
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close is None or s[close + 1:].strip():
+            return False
+        return _debugger_value_expr_ok(s[len("sizeof("):close])
     if s.startswith("("):
         depth = 0
         close = None
@@ -3738,6 +3781,20 @@ def _translate_gdb_command(cmd):
         return f"{head} {rest if rest else '-'}"
     if cmd == "info locals":
         return "info-locals"
+    m = re.match(r'^printf\s+("(?:\\.|[^"\\])*")\s*(?:,(.*))?$', cmd)
+    if m:
+        # gdb `printf "<fmt>", <args>`: the format is a C
+        # string literal; each argument must stay within the
+        # print-expression grammar. The command reaches the
+        # session verbatim (the driver's script parser decodes
+        # the literal and splits the arguments).
+        args_text = m.group(2)
+        if args_text is not None:
+            args = _split_debugger_top_level(args_text, ",")
+            if args is None or any(
+                    not _debugger_expr_ok(arg) for arg in args):
+                return None
+        return cmd
     m = re.match(r"^(?:print|p)\s*(?:/([a-z]))?\s+(.+)$", cmd)
     if m:
         fmt, expr = m.group(1), m.group(2).strip()

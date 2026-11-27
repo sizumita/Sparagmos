@@ -114,6 +114,22 @@ fn split_top_level_cast(inner: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// The operand of a `sizeof(<expr>)` print expression, when
+/// the whole text is that form: both dialects spell the size
+/// operator this way, and the session answers it from the
+/// operand's declared type (see `expr_size_of` in the
+/// evaluator). The closing parenthesis must end the text, so
+/// a longer expression that merely starts with a sizeof form
+/// is not one.
+pub(super) fn parse_sizeof_operand(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("sizeof")?.trim_start();
+    let close = matching_paren(rest)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(rest[1..close].trim())
+}
+
 pub(super) fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
     let text = text.trim();
     // Leading dereferences prefix the whole expression.
