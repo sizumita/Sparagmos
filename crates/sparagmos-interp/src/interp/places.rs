@@ -1608,35 +1608,26 @@ impl<'a> Interpreter<'a> {
         {
             return resolved;
         }
-        // A slice pointee payload is the whole sequence, so
-        // the wrapper can only sit at the position of the
-        // sequence itself. A position ending in an element
-        // step is an element of the sequence a fat pointer
-        // spans -- the base a fat dereference resolves to is
-        // denominated at its first element -- and the value
-        // stored there is that element itself: an element
-        // held in enum form whose first field is a tuple of
-        // values that fit the element type is
-        // indistinguishable from the payload of the wrapper
-        // by the evidence below, but it is the own value of
-        // the position, never a wrapper around the sequence.
-        // A sized payload (an array) can itself be an
-        // element of an outer sequence, so this refusal is
-        // for the slice alone.
-        if matches!(pointee, Ty::Slice(_)) {
+        // Whether this position is an element of the sequence
+        // a slice pointee spans: a slice payload is the whole
+        // sequence, so a wrapper can only sit at the position
+        // of the sequence itself, while the base a fat
+        // dereference resolves to is denominated at its first
+        // element -- a position ending in an element step. The
+        // refusal this flag drives is scoped to the
+        // live-payload entry below; see there.
+        let at_slice_element = matches!(pointee, Ty::Slice(_)) && {
             let projection = match &resolved {
                 Resolved::Place { projection, .. }
                 | Resolved::Static { projection, .. }
                 | Resolved::Alloc { projection, .. }
                 | Resolved::Value(_, projection) => projection,
             };
-            if matches!(
+            matches!(
                 projection.last(),
                 Some(RefProj::Index(_)) | Some(RefProj::Subslice { .. })
-            ) {
-                return resolved;
-            }
-        }
+            )
+        };
         // The position's own declared type, where the model
         // records it, outranks the stored form: a place with no
         // projection is its home local itself, whose declared
@@ -1727,6 +1718,26 @@ impl<'a> Interpreter<'a> {
             return resolved;
         };
         if *field != Value::Uninit {
+            // At an element position of a slice the stored
+            // enum may be the element itself: an element held
+            // in enum form whose first field is a tuple of
+            // values that fit the element type is
+            // indistinguishable from the payload of the wrapper
+            // by the evidence below, but it is the own value of
+            // the position, never a wrapper around the
+            // sequence. A sized payload (an array) can itself
+            // be an element of an outer sequence, so this
+            // refusal is for the slice alone. The raw-form
+            // entry further below is not refused: its skeleton
+            // (a never-written first member, one live member in
+            // one-field form) is the shape a field-by-field
+            // write through a union's declared members leaves
+            // behind, and its payload must match the whole
+            // slice type, which an element's own member does
+            // not hold.
+            if at_slice_element {
+                return resolved;
+            }
             if !self.wrapper_payload_matches(field, *variant, pointee, fields.len()) {
                 return resolved;
             }
