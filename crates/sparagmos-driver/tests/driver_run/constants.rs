@@ -3265,3 +3265,109 @@ fn main() {
 fn run_mode_const_extracted_scalar_switch() {
     run_ok("const-extracted-switch", CONST_EXTRACTED_SWITCH_SRC, "one\nneg\n");
 }
+
+// ----- byte-form scalar formatting (Issue #513) -----------------------------
+//
+// The same byte-form scalars the comparisons above read reach
+// formatting as the allocation's bytes from the scalar on,
+// while the fmt argument's tag still names the scalar type.
+// Formatting must denominate the bytes by the tag's width and
+// signedness -- the scalar those bytes denote -- on every
+// trait route (Display, Debug and the radix traits alike),
+// instead of refusing the form.
+
+const CONST_EXTRACTED_REF_FMT_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct N(u8);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+const C3: Option<&'static u8> = if let [_, _, N(x), _] = &[N(1), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+
+fn main() {
+    println!("{}", *C.unwrap());
+    println!("{:?}", *C.unwrap());
+    println!("{}", *C3.unwrap());
+    let b: &[u8] = &[10, 20, 30];
+    println!("{b:?}");
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_ref_fmt_display_debug() {
+    run_ok(
+        "const-extracted-ref-fmt",
+        CONST_EXTRACTED_REF_FMT_SRC,
+        "1\n1\n3\n[10, 20, 30]\n",
+    );
+}
+
+const CONST_EXTRACTED_I8_REF_FMT_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct K(i8);
+
+const C: Option<&'static i8> = if let [K(x), .., _] = &[K(-1), K(2), K(3), K(4)] as &[K] { Some(x) } else { None };
+
+fn main() {
+    println!("{}", *C.unwrap());
+    println!("{:?}", *C.unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_i8_ref_fmt() {
+    run_ok("const-extracted-i8-ref-fmt", CONST_EXTRACTED_I8_REF_FMT_SRC, "-1\n-1\n");
+}
+
+const CONST_EXTRACTED_REF_FMT_COMPOSED_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct N(u8);
+#[derive(Debug)]
+struct Wrap(u8, bool);
+
+const C: Option<&'static u8> = if let [N(x), .., _] = &[N(26), N(2), N(3), N(4)] as &[N] { Some(x) } else { None };
+
+fn main() {
+    println!("{:?}", C);
+    println!("{:?}", C.unwrap());
+    println!("{:x}", *C.unwrap());
+    println!("{:b}", *C.unwrap());
+    println!("{:?}", Wrap(*C.unwrap(), true));
+    println!("{:?}", (*C.unwrap(), *C.unwrap()));
+    println!("{}", *C.unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_ref_fmt_composed() {
+    run_ok(
+        "const-extracted-ref-fmt-composed",
+        CONST_EXTRACTED_REF_FMT_COMPOSED_SRC,
+        "Some(26)\n26\n1a\n11010\nWrap(26, true)\n(26, 26)\n26\n",
+    );
+}
+
+const CONST_EXTRACTED_BOOL_CHAR_FMT_SRC: &str = r#"
+#[derive(PartialEq, Debug, Clone)]
+struct B(bool);
+#[derive(PartialEq, Debug, Clone)]
+struct H(char);
+
+const CB: Option<&'static bool> = if let [B(x), .., _] = &[B(true), B(false)] as &[B] { Some(x) } else { None };
+const CH: Option<&'static char> = if let [H(x), .., _] = &[H('z'), H('a')] as &[H] { Some(x) } else { None };
+
+fn main() {
+    println!("{}", *CB.unwrap());
+    println!("{:?}", *CB.unwrap());
+    println!("{}", *CH.unwrap());
+    println!("{:?}", *CH.unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_const_extracted_bool_char_ref_fmt() {
+    run_ok(
+        "const-extracted-bool-char-fmt",
+        CONST_EXTRACTED_BOOL_CHAR_FMT_SRC,
+        "true\ntrue\nz\n'z'\n",
+    );
+}
