@@ -1653,6 +1653,22 @@ pub(crate) fn ref_to_field(recv: &Value, idx: usize) -> Option<Value> {
     Some(Value::Ref(target))
 }
 
+/// A reference to field `idx` of the pointee of the reference
+/// `recv`: the same target with one more field projection. This
+/// is the reference an `AsyncFn` coroutine creation forms for a
+/// deref capture: the closure environment holds one reference to
+/// an aggregate, and the coroutine borrows the aggregate's fields
+/// disjointly, each through that reference. `None` when `recv`
+/// is not a reference a field can be taken of.
+pub(crate) fn ref_projected(recv: &Value, idx: u32) -> Option<Value> {
+    let Value::Ref(target) = recv else {
+        return None;
+    };
+    target
+        .projected(RefProj::Field(idx as usize))
+        .map(Value::Ref)
+}
+
 /// Materialize the result of a type-directed `Fn`-family
 /// dispatch (see `Interpreter::call_callable_sync_typed`) when
 /// it is a fat pointer into value-form string data: the impl

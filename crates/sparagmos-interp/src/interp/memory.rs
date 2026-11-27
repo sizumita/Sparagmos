@@ -636,6 +636,24 @@ impl<'a> Interpreter<'a> {
                     depth,
                 ));
             }
+            // The operand place holds the extracted pointer
+            // itself, not the wrapper chain this classification
+            // presumes: a read out of the chain's pointer fields
+            // (a copy of `box.0.0` is the canonical case) already
+            // unwrapped the layers and denominated the pointer,
+            // so the value in the operand slot is the pointer the
+            // cast must yield, and the strict wrapper-chain
+            // reading of the cast arm yields exactly it. A
+            // pointee place fabricated from the operand place
+            // below would instead name the operand slot itself,
+            // and every access through the extracted pointer
+            // would land in that slot rather than the pointee.
+            if matches!(
+                value,
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+            ) {
+                return None;
+            }
         }
         let Resolved::Place {
             frame_pos,
@@ -2267,6 +2285,151 @@ impl<'a> Interpreter<'a> {
         self.allocs.borrow().get(id).cloned()
     }
 
+    /// The target a stored-pointer crossing denotes, when a
+    /// write target's projection denominates an allocation's
+    /// contents under their birth place: the resolved place of
+    /// `(*box_ptr).field` walks the box wrapper chain in the
+    /// owning local and crosses the wrapper's stored allocation
+    /// pointer at an `Index` step (the allocation-element
+    /// marker the denomination appends), so the steps past
+    /// that step address the pointee, not the pointer slot.
+    /// The value-tree navigation the write paths perform has
+    /// no access to the allocation store, so a write through
+    /// such a projection would land in the pointer slot itself
+    /// and replace the pointer with the pointee's field value.
+    /// Returns the crossed pointer's own target with the steps
+    /// after the crossing step appended, or `None` when the
+    /// projection crosses no stored pointer — the walk is then
+    /// the ordinary path's business, its errors included: a
+    /// walk that fails declines, an `Index` step into a
+    /// sequence value is the sequence's own indexing, and a
+    /// projection that merely ends at a pointer field names
+    /// that field's slot.
+    pub(crate) fn pointer_crossed_target(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> Option<Resolved> {
+        // The effective projection: an allocation target's
+        // projection is canonicalised exactly as the write
+        // path canonicalises it, so the steps walked are the
+        // steps the store will navigate.
+        let effective;
+        let (root, projection): (Resolved, &[RefProj]) = match target {
+            Resolved::Alloc { id, projection } => {
+                effective = self.elem_block_projection(*id, projection);
+                (
+                    Resolved::Alloc {
+                        id: *id,
+                        projection: Vec::new(),
+                    },
+                    &effective,
+                )
+            }
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => (
+                Resolved::Place {
+                    frame_pos: *frame_pos,
+                    local: *local,
+                    projection: Vec::new(),
+                },
+                projection,
+            ),
+            Resolved::Static { name, projection } => (
+                Resolved::Static {
+                    name: name.clone(),
+                    projection: Vec::new(),
+                },
+                projection,
+            ),
+            Resolved::Value(..) => return None,
+        };
+        if projection.is_empty() {
+            return None;
+        }
+        let root_value = self.read_resolved(frames, &root).ok()?;
+        // The walk, staged exactly as `project_value_ref_t`
+        // stages it: a step that materialises a value (a
+        // sub-slice, a union field) stages it in `stage`, and
+        // the walk continues into the staged value.
+        let mut stage: Option<Value> = None;
+        let mut cur: &Value = &root_value;
+        for (i, step) in projection.iter().enumerate() {
+            if matches!(step, RefProj::Index(_)) {
+                // The pointer this step crosses, when its input
+                // is pointer-shaped: the pointer value itself
+                // (a flattened wrapper local), or the one-field
+                // wrapper holding it (a `Unique` around the
+                // allocation pointer is the canonical shape).
+                let pointer = match cur {
+                    Value::Ref(target) => Some(target),
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        match &fields[0] {
+                            Value::Ref(target) => Some(target),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(pointer) = pointer {
+                    let rest = &projection[i + 1..];
+                    match pointer {
+                        RefTarget::Alloc { id, projection } => {
+                            let mut projection = projection.clone();
+                            projection.extend_from_slice(rest);
+                            return Some(Resolved::Alloc {
+                                id: *id,
+                                projection,
+                            });
+                        }
+                        RefTarget::Static { name, projection } => {
+                            let mut projection = projection.clone();
+                            projection.extend_from_slice(rest);
+                            return Some(Resolved::Static {
+                                name: name.clone(),
+                                projection,
+                            });
+                        }
+                        RefTarget::Place {
+                            frame,
+                            local,
+                            projection,
+                        } => {
+                            let frame_pos =
+                                frames.iter().position(|f| f.id == *frame)?;
+                            let mut projection = projection.clone();
+                            projection.extend_from_slice(rest);
+                            return Some(Resolved::Place {
+                                frame_pos,
+                                local: *local,
+                                projection,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            match crate::interp::project::project_value_ref(
+                cur,
+                std::slice::from_ref(step),
+                "<pointer crossing>",
+                "<pointer crossing>",
+            )
+            .ok()?
+            {
+                std::borrow::Cow::Borrowed(v) => cur = v,
+                std::borrow::Cow::Owned(v) => {
+                    stage = Some(v);
+                    cur = stage.as_ref().expect("staged walk value");
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn write_resolved(
         &self,
         frames: &mut Vec<Frame>,
@@ -2334,6 +2497,15 @@ impl<'a> Interpreter<'a> {
         let value = pending
             .take()
             .expect("a declined crossing leaves the value unapplied");
+        // A write whose projection crosses a stored pointer
+        // (see `pointer_crossed_target`) denotes the pointee's
+        // storage past the pointer, which the value-tree
+        // navigation below cannot reach: it runs there instead.
+        // The crossed target's own root evidence governs, so
+        // the caller's root type does not carry over.
+        if let Some(crossed) = self.pointer_crossed_target(frames, target) {
+            return self.write_resolved_typed(frames, &crossed, value, None);
+        }
         match target {
             Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
@@ -2569,6 +2741,14 @@ impl<'a> Interpreter<'a> {
         let f = pending
             .take()
             .expect("a declined crossing leaves the modification unapplied");
+        // A modification whose projection crosses a stored
+        // pointer denotes the pointee's storage past the
+        // pointer (see `pointer_crossed_target`), which the
+        // value-tree navigation below cannot reach: it runs
+        // there instead.
+        if let Some(crossed) = self.pointer_crossed_target(frames, target) {
+            return self.modify_resolved(frames, &crossed, f);
+        }
         // A read-modify-write through a vector length-slot
         // reference (see [`RefProj::VecLen`]): the slot is not
         // storage inside the vector value, so the modification

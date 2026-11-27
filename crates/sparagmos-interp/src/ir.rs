@@ -2543,6 +2543,26 @@ pub struct VTableIdentity {
     pub type_id: Option<(u64, u64)>,
 }
 
+/// How one field of an async closure's environment maps to the
+/// fields of the coroutine an `AsyncFn` call creates from it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AsyncCapture {
+    /// The environment field maps to exactly one coroutine
+    /// field. `true`: the capture was taken into the closure by
+    /// reference, so the environment field is itself the
+    /// reference the coroutine borrows. `false`: the capture was
+    /// taken by value, so the call borrows the environment field
+    /// itself.
+    Single(bool),
+    /// A deref capture: the environment field is one reference
+    /// whose pointee's fields the coroutine borrows disjointly
+    /// (a precise capture of several fields of one borrowed
+    /// aggregate). The coroutine's fields for this environment
+    /// field are references to the pointee's fields at these
+    /// indices, in the order the coroutine borrows them.
+    FanOut(Vec<u32>),
+}
+
 /// A whole program: a set of named function bodies in one module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
@@ -2743,16 +2763,13 @@ pub struct Program {
     /// and aborts for such a program, and alloc's `__rdl`
     /// panic otherwise.
     pub links_std: bool,
-    /// Per-capture "taken by reference" flags of the program's
-    /// async closures, keyed by the closure's program key (the
-    /// key a `Value::Closure` carries): entry `i` is true when
-    /// capture `i` was taken into the closure by reference, so
-    /// the environment's field `i` is itself a reference and an
-    /// `AsyncFn` call reborrows it into the created coroutine;
-    /// false when the capture was taken by value, so the call
-    /// borrows the environment field itself. Recorded by
-    /// conversion from the creation aggregates.
-    pub async_closure_captures: HashMap<String, Vec<bool>>,
+    /// Per-capture plans of the program's async closures, keyed
+    /// by the closure's program key (the key a `Value::Closure`
+    /// carries): entry `i` says how environment field `i` maps
+    /// to the fields of the coroutine an `AsyncFn` call creates
+    /// (see [`AsyncCapture`]). Recorded by conversion from the
+    /// creation aggregates.
+    pub async_closure_captures: HashMap<String, Vec<AsyncCapture>>,
     /// Materialisation plans for the pointee types of the
     /// program's pointer casts, interned by conversion in
     /// sorted-key order (see [`Rvalue::Materialize`]): a cast

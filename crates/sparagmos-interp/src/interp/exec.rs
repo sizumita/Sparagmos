@@ -947,6 +947,26 @@ impl<'a> Interpreter<'a> {
                                     self.eval_operand(frames, body, receiver)?;
                                 match value {
                                     Value::Closure { env, .. } => {
+                                        // The coroutine takes the
+                                        // environment's fields
+                                        // verbatim. A deref capture
+                                        // is NOT expanded here, as
+                                        // it is in the `async_call`
+                                        // arm below: a future
+                                        // created by `async_call_once`
+                                        // is typically nested inside
+                                        // another coroutine's storage
+                                        // (the `call_once` shim's),
+                                        // and a reference rooted at
+                                        // the enclosing frame's
+                                        // coroutine-self place gains
+                                        // a spurious field step when
+                                        // it is read back through
+                                        // that storage, so the
+                                        // derived per-field
+                                        // references land one field
+                                        // off. The expansion waits
+                                        // on that read-back rebase.
                                         fields.extend(env);
                                     }
                                     // A zero-sized async closure
@@ -998,7 +1018,38 @@ impl<'a> Interpreter<'a> {
                                         }
                                     }
                                     Value::Closure { def, env } => {
+                                        let plan = self
+                                            .program
+                                            .async_closure_captures
+                                            .get(&def);
                                         for (i, field) in env.iter().enumerate() {
+                                            // A deref capture: the
+                                            // environment field is
+                                            // one reference whose
+                                            // pointee's fields the
+                                            // coroutine borrows
+                                            // disjointly - one
+                                            // coroutine field per
+                                            // borrowed pointee
+                                            // field, each a
+                                            // reference to that
+                                            // field through the
+                                            // environment reference.
+                                            if let Some(crate::ir::AsyncCapture::FanOut(idxs)) =
+                                                plan.and_then(|p| p.get(i))
+                                            {
+                                                for k in idxs {
+                                                    let Some(r) = ref_projected(field, *k) else {
+                                                        return Err(InterpError::type_mismatch(
+                                                            "AsyncFn::async_call receiver",
+                                                            "reference to an async closure value",
+                                                            recv.kind_name(),
+                                                        ));
+                                                    };
+                                                    fields.push(r);
+                                                }
+                                                continue;
+                                            }
                                             // A capture taken into
                                             // the closure by
                                             // reference: the
@@ -1012,13 +1063,14 @@ impl<'a> Interpreter<'a> {
                                             // capture: the field is
                                             // a reference to the
                                             // environment field.
-                                            let by_ref = self
-                                                .program
-                                                .async_closure_captures
-                                                .get(&def)
-                                                .and_then(|flags| {
-                                                    flags.get(i).copied()
-                                                });
+                                            let by_ref = match plan
+                                                .and_then(|p| p.get(i))
+                                            {
+                                                Some(crate::ir::AsyncCapture::Single(b)) => {
+                                                    Some(*b)
+                                                }
+                                                _ => None,
+                                            };
                                             let field_ref = match by_ref {
                                                 Some(true) => Some(field.clone()),
                                                 Some(false) => {
@@ -2227,6 +2279,16 @@ impl<'a> Interpreter<'a> {
                 ) {
                     return set;
                 }
+                // A discriminant set whose projection crosses a
+                // stored pointer denotes the pointee past the
+                // pointer (see
+                // `Interpreter::pointer_crossed_target`), whose
+                // storage the navigation below cannot reach from
+                // the root value: it runs on the crossed target
+                // instead.
+                let target = self
+                    .pointer_crossed_target(frames, &target)
+                    .unwrap_or(target);
                 match target {
                     Resolved::Place {
                         frame_pos,
