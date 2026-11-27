@@ -5433,9 +5433,13 @@ fn split_tag_list(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            // The `>` of a function pointer signature's `->`
+            // closes nothing (see `split_top_level`).
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(s[start..i].trim());
@@ -5443,6 +5447,7 @@ fn split_tag_list(s: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        prev = c;
     }
     let tail = s[start..].trim();
     if !tail.is_empty() {
@@ -5460,6 +5465,9 @@ fn tag_group_inner(tag: &str, open: usize) -> Option<&str> {
     while i < bytes.len() {
         match bytes[i] {
             b'<' | b'(' | b'[' => depth += 1,
+            // The `>` of a function pointer signature's `->`
+            // closes nothing (see `split_top_level`).
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
             b'>' | b')' | b']' => {
                 depth -= 1;
                 if depth == 0 {

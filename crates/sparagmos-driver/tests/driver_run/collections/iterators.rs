@@ -1103,6 +1103,210 @@ fn run_mode_group_by_guest_iterator_impl() {
     run_ok("group-by-demand", GROUP_BY_SRC, "group_by ok\n");
 }
 
+/// The `example-calendar` compositions around the same
+/// guest adapters: two `GroupBy` instances over one source
+/// type, differing only in their key closure, stepped side
+/// by side through a modelled `Zip` (the impl scan must
+/// tell the instances apart by their rendered type tags,
+/// not by the shared base name); an `InGroup` over a
+/// `RangeFrom` stepped through two nested modelled `Map`s
+/// (the adapter step extracts the inner type from a tag
+/// whose closure argument carries a function-pointer
+/// signature); and `GroupBy`s consumed only through
+/// adapter constructors -- a `map` source and a `chain`
+/// second source -- inside generic helper bodies, whose
+/// instance bodies the second `next`-demand run scans.
+/// Mirrors the shapes of
+/// `tests/ui/impl-trait/example-calendar.rs`'s
+/// `test_group_by`, `test_isoweekdate` and `format_month`.
+const GROUP_BY_COMPOSITIONS_SRC: &str = r#"
+struct GroupBy<It: Iterator, F> {
+    it: std::iter::Peekable<It>,
+    f: F,
+}
+
+impl<It, F> Clone for GroupBy<It, F>
+where
+    It: Iterator + Clone,
+    It::Item: Clone,
+    F: Clone,
+{
+    fn clone(&self) -> Self {
+        GroupBy { it: self.it.clone(), f: self.f.clone() }
+    }
+}
+
+impl<G, It, F> Iterator for GroupBy<It, F>
+where
+    It: Iterator + Clone,
+    It::Item: Clone,
+    F: Clone + FnMut(&It::Item) -> G,
+    G: Eq + Clone,
+{
+    type Item = (G, InGroup<std::iter::Peekable<It>, F, G>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.peek().map(&mut self.f).map(|key| {
+            let start = self.it.clone();
+            while let Some(k) = self.it.peek().map(&mut self.f) {
+                if key != k {
+                    break;
+                }
+                self.it.next();
+            }
+            (key.clone(), InGroup { it: start, f: self.f.clone(), g: key })
+        })
+    }
+}
+
+#[derive(Copy, Clone)]
+struct InGroup<It, F, G> {
+    it: It,
+    f: F,
+    g: G,
+}
+
+impl<It: Iterator, F: FnMut(&It::Item) -> G, G: Eq> Iterator for InGroup<It, F, G> {
+    type Item = It::Item;
+
+    fn next(&mut self) -> Option<It::Item> {
+        self.it.next().and_then(|x| {
+            if (self.f)(&x) == self.g { Some(x) } else { None }
+        })
+    }
+}
+
+trait IteratorExt: Iterator + Sized {
+    fn group_by<G, F>(self, f: F) -> GroupBy<Self, F>
+    where
+        F: Clone + FnMut(&Self::Item) -> G,
+        G: Eq,
+    {
+        GroupBy { it: self.peekable(), f }
+    }
+}
+
+impl<It> IteratorExt for It where It: Iterator {}
+
+fn dates() -> impl Iterator<Item = i32> + Clone {
+    InGroup { it: 0.., f: |x: &i32| *x / 10, g: 0 }
+}
+
+fn weeks_uniq() -> Vec<(i32, i32)> {
+    let mut weeks = dates().map(|d| (d / 7, d)).map(|(w, _)| w);
+    let mut out = vec![];
+    let mut acc = (weeks.next().unwrap(), 1);
+    for w in weeks {
+        if acc.0 == w {
+            acc.1 += 1;
+        } else {
+            out.push(acc);
+            acc = (w, 1);
+        }
+    }
+    out.push(acc);
+    out
+}
+
+fn summarize<I>(it: I) -> Vec<(i32, usize)>
+where
+    I: Iterator<Item = i32> + Clone,
+{
+    it.group_by(|x| x / 10).map(|(k, g)| (k, g.count())).collect()
+}
+
+struct Countdown(u32);
+
+impl Iterator for Countdown {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<i32> {
+        if self.0 == 0 {
+            None
+        } else {
+            self.0 -= 1;
+            Some(self.0 as i32)
+        }
+    }
+}
+
+fn chained_groups<I>(it: I) -> usize
+where
+    I: Iterator<Item = i32> + Clone,
+{
+    it.group_by(|x| x / 10)
+        .map(|(k, _)| k)
+        .chain(Countdown(2))
+        .count()
+}
+
+"#;
+
+const GROUP_BY_ZIP_MAIN: &str = r#"
+fn main() {
+    // Two instances of one adapter type, told apart by
+    // their key closures, stepped through one `Zip`.
+    let input = [[1, 1], [1, 1], [1, 2], [2, 2], [2, 3], [2, 3], [3, 3]];
+    let by_x = input.iter().cloned().group_by(|a| a[0]);
+    let by_y = input.iter().cloned().group_by(|a| a[1]);
+    let expected: &[(&[[i32; 2]], &[[i32; 2]])] = &[
+        (&[[1, 1], [1, 1], [1, 2]], &[[1, 1], [1, 1]]),
+        (&[[2, 2], [2, 3], [2, 3]], &[[1, 2], [2, 2]]),
+        (&[[3, 3]], &[[2, 3], [2, 3], [3, 3]]),
+    ];
+    for (((kx, gx), (ky, gy)), (ex, ey)) in by_x.zip(by_y).zip(expected.iter()) {
+        assert_eq!(kx, ky);
+        assert_eq!(&gx.collect::<Vec<_>>()[..], *ex);
+        assert_eq!(&gy.collect::<Vec<_>>()[..], *ey);
+    }
+    println!("group_by zip ok");
+}
+"#;
+
+#[test]
+fn run_mode_group_by_instances_through_zip() {
+    run_ok(
+        "group-by-zip",
+        &format!("{GROUP_BY_COMPOSITIONS_SRC}{GROUP_BY_ZIP_MAIN}"),
+        "group_by zip ok\n",
+    );
+}
+
+const GROUP_BY_WEEKS_MAIN: &str = r#"
+fn main() {
+    // An `InGroup` over a `RangeFrom` through two `Map`s.
+    assert_eq!(weeks_uniq(), vec![(0, 7), (1, 3)]);
+    println!("group_by weeks ok");
+}
+"#;
+
+#[test]
+fn run_mode_group_by_through_maps() {
+    run_ok(
+        "group-by-weeks",
+        &format!("{GROUP_BY_COMPOSITIONS_SRC}{GROUP_BY_WEEKS_MAIN}"),
+        "group_by weeks ok\n",
+    );
+}
+
+const GROUP_BY_HELPERS_MAIN: &str = r#"
+fn main() {
+    // Adapter-only consumption inside generic helpers.
+    assert_eq!(summarize(dates()), vec![(0, 10)]);
+    assert_eq!(chained_groups(dates()), 3);
+    println!("group_by helpers ok");
+}
+"#;
+
+#[test]
+fn run_mode_group_by_adapter_only_consumption() {
+    run_ok(
+        "group-by-helpers",
+        &format!("{GROUP_BY_COMPOSITIONS_SRC}{GROUP_BY_HELPERS_MAIN}"),
+        "group_by helpers ok\n",
+    );
+}
+
 /// `Peekable::next` has no modelled state-machine step:
 /// its state is the genuine struct the collected `peek`
 /// body manipulates, so a direct `next` call on a

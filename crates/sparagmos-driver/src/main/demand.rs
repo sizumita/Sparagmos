@@ -766,6 +766,155 @@ fn consumer_iterator_ty(
     }
 }
 
+/// Whether a `RangeFrom` over a primitive integer or
+/// float occurs anywhere in the type's generic arguments
+/// (the machine's state form for such a range is the bare
+/// start value, which a converted body's nested place
+/// steps do not accept). The walk is depth-bounded; type
+/// arguments repeat long before the bound matters.
+fn ty_contains_primitive_range_from(ty: &Ty, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match sparagmos_driver::convert::guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Adt(def, args))) => {
+            if def.name() == "std::ops::RangeFrom" {
+                if let Some(rustc_public::ty::GenericArgKind::Type(inner)) =
+                    args.0.iter().next()
+                {
+                    match sparagmos_driver::convert::guarded_ty_kind(inner) {
+                        Some(TyKind::RigidTy(RigidTy::Int(_)))
+                        | Some(TyKind::RigidTy(RigidTy::Uint(_)))
+                        | Some(TyKind::RigidTy(RigidTy::Float(_))) => return true,
+                        _ => {}
+                    }
+                }
+            }
+            args.0.iter().any(|arg| match arg {
+                rustc_public::ty::GenericArgKind::Type(inner) => {
+                    ty_contains_primitive_range_from(inner, depth + 1)
+                }
+                _ => false,
+            })
+        }
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => {
+            ty_contains_primitive_range_from(&inner, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+/// The source iterator type a call to a modelled adapter
+/// constructor hands to the adapter, or `None` when the
+/// callee is not such a constructor. An adapter's step is
+/// served by the interpreter's modelled machine, which steps
+/// the source through its own tag (see `next_call_self_ty`
+/// for the same judgement on a direct `next` call), so the
+/// source type is a demand root for the `next` demand
+/// exactly as a drained consumer's type is: a composition
+/// whose only named call is an adapter constructor -- a
+/// guest iterator `.map`ped and handed on to generic code,
+/// say -- names its source nowhere else, and without the
+/// root the source's `next` body is never demanded. The
+/// root's own candidate is narrow: a source type is made
+/// a candidate only when it is a `Map` whose stepped
+/// chain does not bottom out in a primitive `RangeFrom`
+/// (see the candidate push in
+/// `demand_iterator_next_instances`); every other source
+/// contributes only its guest leaves to the candidate
+/// walk. The stepped source of every constructor here is
+/// its first type argument.
+fn adapter_source_ty(
+    def: &rustc_public::ty::FnDef,
+    args: &rustc_public::ty::GenericArgs,
+) -> Option<Ty> {
+    match def.name().as_str() {
+        "std::iter::Iterator::map"
+        | "core::iter::Iterator::map"
+        | "std::iter::Iterator::filter"
+        | "core::iter::Iterator::filter"
+        | "std::iter::Iterator::filter_map"
+        | "core::iter::Iterator::filter_map"
+        | "std::iter::Iterator::flat_map"
+        | "core::iter::Iterator::flat_map"
+        | "std::iter::Iterator::flatten"
+        | "core::iter::Iterator::flatten"
+        | "std::iter::Iterator::zip"
+        | "core::iter::Iterator::zip"
+        | "std::iter::Iterator::chain"
+        | "core::iter::Iterator::chain"
+        | "std::iter::Iterator::take"
+        | "core::iter::Iterator::take"
+        | "std::iter::Iterator::skip"
+        | "core::iter::Iterator::skip"
+        | "std::iter::Iterator::step_by"
+        | "core::iter::Iterator::step_by"
+        | "std::iter::Iterator::enumerate"
+        | "core::iter::Iterator::enumerate"
+        | "std::iter::Iterator::peekable"
+        | "core::iter::Iterator::peekable"
+        | "std::iter::Iterator::rev"
+        | "core::iter::Iterator::rev"
+        | "std::iter::Iterator::fuse"
+        | "core::iter::Iterator::fuse"
+        | "std::iter::Iterator::inspect"
+        | "core::iter::Iterator::inspect"
+        | "std::iter::Iterator::copied"
+        | "core::iter::Iterator::copied"
+        | "std::iter::Iterator::cloned"
+        | "core::iter::Iterator::cloned"
+        | "std::iter::Iterator::cycle"
+        | "core::iter::Iterator::cycle"
+        | "std::iter::Iterator::skip_while"
+        | "core::iter::Iterator::skip_while"
+        | "std::iter::Iterator::take_while"
+        | "core::iter::Iterator::take_while"
+        | "std::iter::Iterator::scan"
+        | "core::iter::Iterator::scan"
+        | "std::iter::Iterator::map_while"
+        | "core::iter::Iterator::map_while"
+        | "std::iter::Iterator::by_ref"
+        | "core::iter::Iterator::by_ref"
+        | "std::iter::Iterator::nth"
+        | "core::iter::Iterator::nth" => args
+            .0
+            .iter()
+            .filter_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            })
+            .next(),
+        _ => None,
+    }
+}
+
+/// The second source iterator type a call to a two-source
+/// modelled adapter constructor hands to the adapter, or
+/// `None` when the callee is not such a constructor: a
+/// `zip` or `chain` machine steps both of its sources
+/// through their own tags, so the second source is a demand
+/// root for the `next` demand on the same terms as the
+/// first (see `adapter_source_ty`).
+fn adapter_second_source_ty(
+    def: &rustc_public::ty::FnDef,
+    args: &rustc_public::ty::GenericArgs,
+) -> Option<Ty> {
+    match def.name().as_str() {
+        "std::iter::Iterator::zip"
+        | "core::iter::Iterator::zip"
+        | "std::iter::Iterator::chain"
+        | "core::iter::Iterator::chain" => args
+            .0
+            .iter()
+            .filter_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            })
+            .nth(1),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn demand_drop_instances(
     conv: &mut Converter,
@@ -1231,9 +1380,10 @@ fn resolve_next_instance_via_trait(
 
 /// Demand a converted body for the `Iterator::next` instance
 /// of every guest-stepped iterator type the converted bodies
-/// hand to a modelled consumer (see `consumer_iterator_ty`)
-/// or step through a direct `next` call (see
-/// `next_call_self_ty`), and of every body-stepped adapter
+/// hand to a modelled consumer (see `consumer_iterator_ty`),
+/// hand to a modelled adapter constructor (see
+/// `adapter_source_ty`), or step through a direct `next` call
+/// (see `next_call_self_ty`), and of every body-stepped adapter
 /// type handed the same way (see `body_stepped_iterator_ty`
 /// in reach): a core adapter the modelled machine cannot
 /// step, whose own `next` body is a plain collected body the
@@ -1318,46 +1468,84 @@ pub(crate) fn demand_iterator_next_instances(
             for (def, args) in sparagmos_driver::reach::call_targets(body) {
                 // A modelled consumer call names the iterator
                 // it drains; a direct `Iterator::next` call
-                // names the iterator it steps. Both hand the
-                // type to the modelled machine, whose
-                // unclaimed-tag fallback runs the guest impl
-                // body, so both are demand roots.
-                let consumer_ty = consumer_iterator_ty(&def, &args);
-                let Some(ty) = consumer_ty.or_else(|| next_call_self_ty(&def, &args))
-                else {
-                    continue;
-                };
-                if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty)
-                    && !sparagmos_driver::reach::body_stepped_iterator_ty(&ty)
-                {
-                    continue;
+                // names the iterator it steps; an adapter
+                // constructor names the source (or, for the
+                // two-source constructors, both sources) it
+                // hands to the adapter. All hand the type to
+                // the modelled machine, whose unclaimed-tag
+                // fallback runs the guest impl body, so all
+                // are demand roots.
+                let mut roots: Vec<(Ty, bool, bool)> = Vec::new();
+                if let Some(ty) = consumer_iterator_ty(&def, &args) {
+                    roots.push((ty, true, false));
                 }
-                if consumer_ty.is_some() {
-                    // A reference names the blanket impl, whose
-                    // step is the pointee's: the candidate is
-                    // the ADT instantiation behind the
-                    // references.
-                    let mut peeled = ty;
-                    while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
-                        sparagmos_driver::convert::guarded_ty_kind(&peeled)
-                    {
-                        peeled = inner;
+                if let Some(ty) = adapter_source_ty(&def, &args) {
+                    roots.push((ty, true, true));
+                }
+                if let Some(ty) = adapter_second_source_ty(&def, &args) {
+                    roots.push((ty, true, true));
+                }
+                if roots.is_empty() {
+                    if let Some(ty) = next_call_self_ty(&def, &args) {
+                        roots.push((ty, false, false));
                     }
-                    if let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
-                        sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                }
+                for (ty, handed, adapter_root) in roots {
+                    if !sparagmos_driver::reach::guest_stepped_iterator_ty(&ty)
+                        && !sparagmos_driver::reach::body_stepped_iterator_ty(&ty)
                     {
-                        if seen.insert(peeled) {
-                            candidates.push((peeled, adt_def, adt_args));
+                        continue;
+                    }
+                    if handed {
+                        // A reference names the blanket impl,
+                        // whose step is the pointee's: the
+                        // candidate is the ADT instantiation
+                        // behind the references.
+                        let mut peeled = ty;
+                        while let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) =
+                            sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                        {
+                            peeled = inner;
+                        }
+                        if let Some(TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args))) =
+                            sparagmos_driver::convert::guarded_ty_kind(&peeled)
+                        {
+                            // An adapter root makes its source a
+                            // candidate only in the one case the
+                            // compositions need a converted body
+                            // for: a `Map` whose stepped chain
+                            // does not bottom out in a
+                            // `RangeFrom` over a primitive. Any
+                            // other adapter source is stepped by
+                            // the modelled machine, and a
+                            // demanded adapter body would be
+                            // bound in place of the machine for
+                            // the compositions the machine
+                            // serves; a `Map` over a chain that
+                            // reaches a primitive `RangeFrom`
+                            // breaks the same way, because the
+                            // body's nested place steps meet the
+                            // machine's bare state form for the
+                            // range. The source's guest leaves
+                            // are candidates through the walk
+                            // below, as for any root.
+                            let adapter_push = !adapter_root
+                                || (adt_def.name().ends_with("::Map")
+                                    && !ty_contains_primitive_range_from(&peeled, 0));
+                            if adapter_push && seen.insert(peeled) {
+                                candidates.push((peeled, adt_def, adt_args));
+                            }
                         }
                     }
+                    // The composition's guest leaves, for
+                    // any root: an adapter over a guest
+                    // iterator is stepped by the modelled
+                    // machine through the guest's own body,
+                    // which no call edge names -- a `zip`ped
+                    // source, say, is stepped by the `Zip`
+                    // arm, never called.
+                    guest_leaf_candidates(&ty, &mut seen, &mut candidates);
                 }
-                // The composition's guest leaves, for either
-                // root: an adapter over a guest iterator is
-                // stepped by the modelled machine through the
-                // guest's own body, which no call edge names --
-                // a `zip`ped source, say, is stepped by the
-                // `Zip` arm, never called.
-                guest_leaf_candidates(&ty, &mut seen, &mut candidates);
             }
         }
         // Local types first, as in the drop demand: the shared
