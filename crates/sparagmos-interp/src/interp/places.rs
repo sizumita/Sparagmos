@@ -965,6 +965,58 @@ impl<'a> Interpreter<'a> {
                                     resolved
                                 }
                             };
+                            // A dereference target that is an
+                            // allocation or an inline aggregate
+                            // value at a bare base (an empty
+                            // projection) is the aggregate-base
+                            // twin of the rule above: the target
+                            // holds a sequence of elements as a
+                            // tuple, and a pointer the interpreter
+                            // itself fabricated over it (the
+                            // entry point's argument vector is
+                            // the canonical case -- guest-side
+                            // casts insert their own element
+                            // step, so no guest-formed pointer
+                            // reaches this shape) denotes the
+                            // first element whenever the pointee
+                            // denominates an element there (see
+                            // `aggregate_base_denotes_elem0`). As
+                            // for the bare array base, the entry
+                            // applies on the write path too, and
+                            // a following sequence step continues
+                            // the aggregate's flat reading.
+                            let resolved = {
+                                let next_is_structural = matches!(
+                                    place.projection.get(step_idx + 1),
+                                    Some(
+                                        ProjectionElem::Field(_)
+                                            | ProjectionElem::Downcast(_)
+                                            | ProjectionElem::UnionField { .. },
+                                    )
+                                );
+                                let denotes_elem0 = (is_last || next_is_structural)
+                                    && matches!(value, Value::Ref(_))
+                                    && pointee_ty.as_ref().is_some_and(|pointee| {
+                                        self.aggregate_base_denotes_elem0(
+                                            frames, &resolved, pointee,
+                                        )
+                                    });
+                                if denotes_elem0 {
+                                    let mut resolved = resolved;
+                                    match &mut resolved {
+                                        Resolved::Alloc {
+                                            projection, ..
+                                        }
+                                        | Resolved::Value(_, projection) => {
+                                            projection.push(RefProj::Index(0));
+                                        }
+                                        _ => {}
+                                    }
+                                    resolved
+                                } else {
+                                    resolved
+                                }
+                            };
                             let resolved = match &pointee_ty {
                                 Some(pointee) => {
                                     let resolved = self.peel_maybe_uninit_entry(
@@ -1594,6 +1646,82 @@ impl<'a> Interpreter<'a> {
             return false;
         };
         matches!(value, Value::Tuple(_) | Value::Bytes(_))
+    }
+
+    /// Whether a dereference target that is an allocation or
+    /// an inline aggregate value at a bare base (an empty
+    /// projection) denotes its first element for a pointee of
+    /// `pointee`: the aggregate-base twin of
+    /// [`Self::bare_array_base_denotes_elem0`] for the targets
+    /// that rule cannot judge (it reads the declared types of
+    /// places and statics). An allocation whose creation point
+    /// recorded an array type is judged by that record, exactly
+    /// as a static is judged by its declared type: the pointee
+    /// either is the array's element type or is a scalar. A
+    /// target with no recorded array type is judged by the
+    /// stored value's own shape (see
+    /// [`Self::aggregate_shape_denotes_elem0`]). This is the
+    /// shape of the pointers the interpreter itself fabricates
+    /// over aggregate storage -- the entry point's argument and
+    /// environment vectors -- since guest-side pointer
+    /// formation inserts its own element step at the cast that
+    /// produces an element pointer.
+    fn aggregate_base_denotes_elem0(
+        &self,
+        frames: &[Frame],
+        resolved: &Resolved,
+        pointee: &Ty,
+    ) -> bool {
+        let scalar_pointee = matches!(
+            pointee,
+            Ty::Bool | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_)
+        );
+        match resolved {
+            Resolved::Alloc { id, projection } => {
+                if !projection.is_empty() {
+                    return false;
+                }
+                match self.alloc_ty(*id) {
+                    Some(Ty::Array(elem, _)) => pointee == &*elem || scalar_pointee,
+                    Some(_) => false,
+                    None => {
+                        self.aggregate_shape_denotes_elem0(frames, resolved, pointee)
+                    }
+                }
+            }
+            Resolved::Value(_, projection) => {
+                projection.is_empty()
+                    && self.aggregate_shape_denotes_elem0(frames, resolved, pointee)
+            }
+            _ => false,
+        }
+    }
+
+    /// The value-shape half of
+    /// [`Self::aggregate_base_denotes_elem0`]: the stored value
+    /// is a tuple of elements each plausible for `pointee`,
+    /// while the tuple as a whole is not plausible for it --
+    /// a sequence of pointees, whose bare base therefore
+    /// denotes the first of them. A tuple the pointee could
+    /// itself denote (an array or tuple pointee) keeps the
+    /// whole-value reading.
+    fn aggregate_shape_denotes_elem0(
+        &self,
+        frames: &[Frame],
+        resolved: &Resolved,
+        pointee: &Ty,
+    ) -> bool {
+        let Ok(value) = self.read_resolved(frames, resolved) else {
+            return false;
+        };
+        let Value::Tuple(items) = &value else {
+            return false;
+        };
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| self.value_plausible_for_ty(item, pointee, 0))
+            && !self.value_plausible_for_ty(&value, pointee, 0)
     }
 
     fn peel_maybe_uninit_entry(

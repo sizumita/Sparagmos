@@ -4268,3 +4268,105 @@ fn run_mode_cast_temporary_has_its_own_address() {
     // suite's `cast/cast-not-treated-as-lvalue` shape).
     run_ok("cast-temp-address", CAST_TEMP_ADDRESS_SRC, "cast temp ok\n");
 }
+
+const FABRICATED_ARGV_READ_SRC: &str = r#"
+use std::os::raw::{c_char, c_int};
+
+#[used]
+#[link_section = ".init_array"]
+static INIT: extern "C" fn(c_int, *const *const u8, *const *const u8) = {
+    extern "C" fn init(argc: c_int, argv: *const *const u8, envp: *const *const u8) {
+        unsafe {
+            let mut n = 0usize;
+            while !(*argv.add(n)).is_null() {
+                n += 1;
+            }
+            println!("argc={} walked={}", argc, n);
+            let arg0 = std::ffi::CStr::from_ptr(*argv as *const c_char);
+            println!("argv0_suffix_ok={}", arg0.to_bytes().ends_with(b"argv_read.rs"));
+            let arg1 = std::ffi::CStr::from_ptr(*argv.add(1) as *const c_char);
+            println!("argv1={}", arg1.to_str().unwrap());
+            println!("term_null={}", (*argv.add(n)).is_null());
+            println!("envp0_nonnull={}", !(*envp).is_null());
+        }
+    }
+    init
+};
+
+fn main() {
+    println!("main");
+}
+"#;
+
+#[test]
+fn run_mode_fabricated_argv_base_denotes_first_element() {
+    // The entry point's argument vector is an allocation
+    // holding a tuple of string pointers, and a pre-main
+    // constructor receives a bare pointer to it (an empty
+    // projection over the allocation): reading `*argv` must
+    // denote the first element -- the program-path pointer --
+    // not the tuple as a whole. Without the aggregate-base
+    // denomination in the dereference walk, the read handed
+    // the whole tuple to a consumer expecting a pointer and
+    // the run stopped with a type mismatch (`expected
+    // Ref(Uint(U8)), found tuple`).
+    let dir = temp_dir("fabricated-argv-read");
+    let src = fixture(&dir, "argv_read.rs", FABRICATED_ARGV_READ_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "hello"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the argv-reading constructor must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "argc=2 walked=2\nargv0_suffix_ok=true\nargv1=hello\nterm_null=true\nenvp0_nonnull=true\nmain\n",
+        "the fabricated argv reads match the native ones"
+    );
+}
+
+const FABRICATED_ARGV_WRITE_SRC: &str = r#"
+use std::os::raw::{c_char, c_int};
+
+#[used]
+#[link_section = ".init_array"]
+static INIT: extern "C" fn(c_int, *const *const u8, *const *const u8) = {
+    extern "C" fn init(_argc: c_int, argv: *const *const u8, _envp: *const *const u8) {
+        unsafe {
+            let margv = argv as *mut *const u8;
+            *margv = *argv.add(1);
+            let arg0 = std::ffi::CStr::from_ptr(*argv as *const c_char);
+            println!("argv0_now={}", arg0.to_str().unwrap());
+        }
+    }
+    init
+};
+
+fn main() {
+    println!("main");
+}
+"#;
+
+#[test]
+fn run_mode_fabricated_argv_slot_write_through_bare_base() {
+    // The write side of the same denomination: storing
+    // through the bare argument-vector base writes the first
+    // element slot, so the readback of `*argv` afterwards is
+    // the pointer that was stored (the second argument's
+    // string), not a replacement of the whole vector.
+    let dir = temp_dir("fabricated-argv-write");
+    let src = fixture(&dir, "argv_write.rs", FABRICATED_ARGV_WRITE_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "hello"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the argv-writing constructor must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "argv0_now=hello\nmain\n",
+        "the slot write through the bare base lands on element 0"
+    );
+}
