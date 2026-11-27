@@ -277,6 +277,9 @@ pub(super) fn render_pretty_gdb(
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
+    if !super::spend_render_node() {
+        return None;
+    }
     match desc {
         Some(Desc::Ref(inner) | Desc::RefMut(inner)) => match inner.as_ref() {
             Desc::Slice(elem) => {
