@@ -1,5 +1,7 @@
 // Slice sort tests.
 
+use super::run_ok;
+
 // A 400-element vector in the shape a round-robin collect
 // from four producers leaves behind (the `concurrent_writes`
 // shape of tests/ui/threads-sendsync/mpsc_stress.rs): each
