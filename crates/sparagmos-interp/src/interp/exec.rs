@@ -587,6 +587,15 @@ impl<'a> Interpreter<'a> {
                                 // `-C panic=abort` the panic's own
                                 // report is all that prints, as in
                                 // the `Terminate` arm.
+                                // The abort's account text
+                                // deliberately keeps the
+                                // `may not unwind past` form: the
+                                // `panic=abort` harness model
+                                // reads a panic out of exactly
+                                // that wording
+                                // (`abort_panic_message` in the
+                                // harness builtins), so the form
+                                // is a contract, not prose.
                                 let InterpError::Panic { message, .. } = &panic else {
                                     unreachable!("panic is a Panic")
                                 };
@@ -597,7 +606,7 @@ impl<'a> Interpreter<'a> {
                                 }
                                 return Err(InterpError::Abort {
                                     message: format!(
-                                        "panic `{message}` is a nounwind panic in `{func}`: \
+                                        "panic `{message}` may not unwind past `{func}`: \
                                          the run aborts"
                                     ),
                                 });
