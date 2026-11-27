@@ -1823,7 +1823,22 @@ def header_bucket(reason):
 # Process execution
 # ---------------------------------------------------------------------------
 
-_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+def _on_windows():
+    """Whether the runner itself is running on Windows. Read
+    from sys.platform at call time (tests select the branch by
+    patching it). The process layer's historical form is the
+    POSIX one; the Windows branches exist so the runner can
+    judge the Windows host classes on a Windows host (Issue
+    #517) with the same semantics wherever the platforms allow
+    them to be the same."""
+    return sys.platform == "win32"
+
+
+# os.sysconf does not exist on Windows. The page size only
+# feeds the /proc RSS accounting, which already degrades to a
+# no-op where /proc is unavailable, so a fallback value does.
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 _MEM_POLL_SECONDS = 0.25
 # Grace for draining a killed child's output pipes. After the
 # process group is SIGKILLed every pipe writer in it is dead and
@@ -1894,6 +1909,31 @@ def _proc_tree(root_pid):
     return members, total
 
 
+def _kill_process_tree_windows(root_pid, extra_pids=()):
+    """The Windows form of the tree kill: taskkill /T /F ends
+    the whole process tree rooted at a pid, descendants
+    included -- the reach the POSIX group kill has. Remembered
+    members are named individually as well, as on POSIX: a
+    member whose root died first is no longer under root_pid's
+    tree. Windows has no zombie state and no process groups:
+    a process taskkill reports killed is terminated outright,
+    and the bounded path reaps the root through its own handle
+    in the post-kill drain, so the termination judgement the
+    POSIX side needs /proc for has no counterpart here. A pid
+    that is already gone makes taskkill exit nonzero; that is
+    the OSError the POSIX path ignores, and is ignored alike."""
+    targets = [root_pid]
+    for pid in extra_pids:
+        if pid != root_pid and pid not in targets:
+            targets.append(pid)
+    for pid in targets:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def _kill_process_tree(root_pid, pgid=None, extra_pids=()):
     """SIGKILL the whole process tree rooted at root_pid,
     descendants first, so nothing in the tree survives to hold the
@@ -1909,7 +1949,12 @@ def _kill_process_tree(root_pid, pgid=None, extra_pids=()):
     individually as well. A descendant that made its own session is
     in neither the root's group nor, once the root dies and it is
     reparented, the /proc tree; only a pid remembered from while
-    the root lived still reaches it."""
+    the root lived still reaches it. On Windows the same
+    contract is served by _kill_process_tree_windows: os.killpg
+    and signal.SIGKILL do not exist there."""
+    if _on_windows():
+        _kill_process_tree_windows(root_pid, extra_pids)
+        return
     members, _rss = _proc_tree(root_pid)
     if pgid is not None:
         try:
@@ -2047,6 +2092,22 @@ def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=(),
             "timeout": True,
             "mem_exceeded": False,
         }
+
+
+def _lib_path_entry(lib_dirs):
+    """(name, value) putting lib_dirs on a child process's
+    dynamic-library search path, in the form the host's loader
+    uses: LD_LIBRARY_PATH joined with ':' on POSIX; PATH joined
+    with ';' on Windows, whose loader searches PATH for DLLs
+    and has no LD_LIBRARY_PATH. The variable's inherited value
+    is appended after the new dirs, as the POSIX code has
+    always done."""
+    if _on_windows():
+        name, sep = "PATH", ";"
+    else:
+        name, sep = "LD_LIBRARY_PATH", ":"
+    prev = os.environ.get(name, "")
+    return name, sep.join(list(lib_dirs) + ([prev] if prev else []))
 
 
 def rustc_cmd():
@@ -2340,14 +2401,22 @@ def resolve_aux_specs(test_path, revision=None, top=None,
 
 def find_artifact(libdir, name):
     """The linkable artifact a library compilation produced."""
+    ranks = {"rlib": 0, "rmeta": 1, "so": 2, "dylib": 2, "dll": 2}
+    patterns = [f"lib{name}.*"]
+    if _on_windows():
+        # Windows artifacts carry no lib prefix (a dylib or
+        # proc-macro crate is `{name}.dll`, a staticlib
+        # `{name}.lib`), so the bare name is a candidate too.
+        ranks["lib"] = 2
+        patterns.append(f"{name}.*")
     best = None
-    for cand in Path(libdir).glob(f"lib{name}.*"):
-        rank = {"rlib": 0, "rmeta": 1, "so": 2, "dylib": 2,
-                "dll": 2}.get(cand.suffix.lstrip("."))
-        if rank is None:
-            continue
-        if best is None or rank < best[0]:
-            best = (rank, cand)
+    for pattern in patterns:
+        for cand in Path(libdir).glob(pattern):
+            rank = ranks.get(cand.suffix.lstrip("."))
+            if rank is None:
+                continue
+            if best is None or rank < best[0]:
+                best = (rank, cand)
     return best[1] if best else None
 
 
@@ -3111,9 +3180,8 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
     if aux_specs or bins_built_libs:
         lib_dirs.append(str(auxdir))
     if lib_dirs:
-        prev = os.environ.get("LD_LIBRARY_PATH", "")
-        run_env["LD_LIBRARY_PATH"] = ":".join(
-            lib_dirs + ([prev] if prev else []))
+        name, value = _lib_path_entry(lib_dirs)
+        run_env[name] = value
     if run_env_extra:
         run_env.update(run_env_extra)
     run = run_cmd([str(binpath)] + list(run_args),
@@ -3217,9 +3285,8 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     if cwd is not None:
         lib_dirs.append(str(Path(cwd) / "auxlibs"))
     if lib_dirs:
-        prev = os.environ.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = ":".join(
-            lib_dirs + ([prev] if prev else []))
+        name, value = _lib_path_entry(lib_dirs)
+        env[name] = value
     if env_extra:
         env.update(env_extra)
     res = run_cmd(argv,
@@ -4358,9 +4425,8 @@ def coverage_side(driver_bin, mode, path, edition, cwd, rustc_args,
     if cwd is not None:
         lib_dirs.append(str(Path(cwd) / "auxlibs"))
     if lib_dirs:
-        prev = os.environ.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = ":".join(
-            lib_dirs + ([prev] if prev else []))
+        name, value = _lib_path_entry(lib_dirs)
+        env[name] = value
     if env_extra:
         env.update(env_extra)
     res = run_cmd(argv,
@@ -7140,6 +7206,17 @@ def ensure_stage3_support(rust_dir):
         return _stage3_support
 
 
+def _support_artifact_suffixes():
+    """Suffixes of the linkable artifacts a build tree can
+    hold, copied into the flat support dir: rlib on every
+    platform, the dylib spellings (.so / .dylib / .dll), and
+    the Windows staticlib spelling (.lib)."""
+    suffixes = [".rlib", ".so", ".dylib"]
+    if _on_windows():
+        suffixes += [".dll", ".lib"]
+    return tuple(suffixes)
+
+
 def _build_stage3_support(rust_dir):
     key = hashlib.sha256(str(rust_dir).encode()).hexdigest()[:16]
     root = Path(tempfile.gettempdir()) / f"sparagmos-stage3-support-{key}"
@@ -7186,7 +7263,7 @@ def _build_stage3_support(rust_dir):
     if build_dir.exists():
         for out_dir in build_dir.glob("*/*/out"):
             for f in out_dir.iterdir():
-                if f.suffix in (".rlib", ".so", ".dylib"):
+                if f.suffix in _support_artifact_suffixes():
                     shutil.copy2(f, flat / f.name)
                     copied += 1
     if not rlib.exists() or copied < 2:
@@ -7205,6 +7282,19 @@ def stage3_recipe_env(rust_dir, build_root, suite):
     run-make-support's helpers require.
     """
     paths = stage3_toolchain_paths()
+    # The dylib path variable is the platform one (PATH on
+    # Windows). The recipe env is merged over the runner's own
+    # environment, so on Windows the inherited PATH is appended
+    # to keep the recipe's own tools reachable; on POSIX the
+    # value is exactly the two toolchain dirs, as before.
+    if _on_windows():
+        lib_var = "PATH"
+        prev = os.environ.get("PATH", "")
+        lib_path = ";".join([paths["sysroot_lib"], paths["target_lib"]]
+                            + ([prev] if prev else []))
+    else:
+        lib_var = "LD_LIBRARY_PATH"
+        lib_path = paths["sysroot_lib"] + ":" + paths["target_lib"]
     env = {
         "RUSTC": paths["rustc"],
         "RUSTDOC": paths["rustdoc"],
@@ -7218,8 +7308,8 @@ def stage3_recipe_env(rust_dir, build_root, suite):
         "CC_DEFAULT_FLAGS": "",
         "CXX_DEFAULT_FLAGS": "",
         "LLVM_COMPONENTS": "",
-        "LD_LIB_PATH_ENVVAR": "LD_LIBRARY_PATH",
-        "LD_LIBRARY_PATH": paths["sysroot_lib"] + ":" + paths["target_lib"],
+        "LD_LIB_PATH_ENVVAR": lib_var,
+        lib_var: lib_path,
         "HOST_RUSTC_DYLIB_PATH": paths["sysroot_lib"],
         "TARGET_EXE_DYLIB_PATH": paths["target_lib"],
         "__BOOTSTRAP_JOBS": "8",
