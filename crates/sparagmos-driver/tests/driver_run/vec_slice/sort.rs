@@ -431,3 +431,78 @@ fn run_mode_sort_ord_violation_panics_with_core_message() {
         "stderr={stderr}"
     );
 }
+
+const SORT_UNSTABLE_BRANCHLESS_PARTITION_SRC: &str = r#"
+fn main() {
+    let mut state: u64 = 0x9e3779b97f4a7c15;
+    let mut v: Vec<i32> = Vec::with_capacity(200);
+    for _ in 0..200 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        v.push((state >> 16) as i32);
+    }
+    v.sort_unstable();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for x in &v {
+        h ^= (*x as u32) as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let sorted = v.windows(2).all(|w| w[0] <= w[1]);
+    println!("sorted={} hash={:016x} first={} last={}", sorted, h, v[0], v[199]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_unstable_branchless_partition_closure() {
+    // Past the smallsort limit (32 elements for i32), ipnsort
+    // partitions through the callee a `const` block selects:
+    // `partition` calls the fn pointer `const { inst_partition() }`
+    // evaluates to, so `partition_lomuto_branchless_cyclic` is
+    // materialized as a value out of a constant and converted by
+    // the constant-fn demand pass. Its `loop_body` closure is
+    // created inside that body, but the body never joined the
+    // closure demand's scan set (it entered the fixpoint only as
+    // instance-demand input), so the closure was demanded by no
+    // pass and the run failed with `unknown function
+    // partition_lomuto_branchless_cyclic::{closure#0}`. The
+    // closure scan now covers the constant-pass conversions too.
+    run_ok(
+        "sort-unstable-branchless-partition",
+        SORT_UNSTABLE_BRANCHLESS_PARTITION_SRC,
+        "sorted=true hash=1dc988434e17bb50 first=-2132131122 last=2141907897\n",
+    );
+}
+
+const SORT_UNSTABLE_BY_GUEST_CLOSURE_SRC: &str = r#"
+fn main() {
+    let mut state: u64 = 0x243f6a8885a308d3;
+    let mut v: Vec<u64> = Vec::with_capacity(150);
+    for _ in 0..150 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        v.push(state >> 11);
+    }
+    let mut calls = 0u32;
+    v.sort_unstable_by(|a, b| {
+        calls += 1;
+        b.cmp(a)
+    });
+    let desc = v.windows(2).all(|w| w[0] >= w[1]);
+    let sum: u64 = v.iter().fold(0u64, |acc, x| acc.wrapping_add(*x));
+    println!("desc={} calls>0={} sum={} first={} last={}", desc, calls > 0, sum, v[0], v[149]);
+}
+"#;
+
+#[test]
+fn run_mode_sort_unstable_by_guest_closure_past_smallsort() {
+    // The same partition path with a guest closure as the
+    // comparator: the partition instantiation's own inner closure
+    // must be collected whatever the comparator's provenance.
+    run_ok(
+        "sort-unstable-by-guest-closure",
+        SORT_UNSTABLE_BY_GUEST_CLOSURE_SRC,
+        "desc=true calls>0=true sum=693174496791170142 first=8957930565218848 last=23941204646919\n",
+    );
+}
