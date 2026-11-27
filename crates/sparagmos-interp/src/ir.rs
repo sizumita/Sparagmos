@@ -1099,10 +1099,17 @@ pub enum Rvalue {
     /// storage are likewise unchanged; only the resulting
     /// pointer's element view differs.
     WrapSliceElems(Operand),
-    /// A pointer cast / transmute that lands on a `str`
-    /// pointee from a byte-string pointee (`[u8]`, `OsStr`,
-    /// `Path`): `core::str::from_utf8_unchecked`'s transmute
-    /// is the canonical case. The operand denotes the bytes;
+    /// A transmute that lands on a `str` pointee from a
+    /// byte-string pointee (`[u8]`, `OsStr`, `Path`):
+    /// `core::str::from_utf8_unchecked`'s transmute is the
+    /// canonical case. Raw-pointer casts to a `str` pointee
+    /// do not emit this: a fat raw pointer's length metadata
+    /// is reinterpreted by later casts in the target's
+    /// denomination (the `*mut str` -> `*const [u16]`
+    /// crossing in cast-rfc0401), so the pointer keeps its
+    /// identity there and only the transmute -- whose result
+    /// is the string itself -- re-denominates. The operand
+    /// denotes the bytes;
     /// the result is the string data value those bytes form
     /// -- the shape this model holds a `str` over materialised
     /// data in, and the shape its consumers (the string

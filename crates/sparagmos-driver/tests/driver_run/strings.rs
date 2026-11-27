@@ -3625,11 +3625,10 @@ fn run_mode_from_utf8_unchecked_denominates_str() {
 const STR_BYTE_SLICE_CAST_SRC: &str = r#"
 fn main() {
     let data: &[u8] = b"ab";
-    let p = data as *const [u8] as *const str;
-    let s: &str = unsafe { &*p };
+    let s: &str = unsafe { std::mem::transmute(data) };
     println!("{:?} {}", s, s.len());
     let b: &[u8] = unsafe { std::mem::transmute(s) };
-    println!("{:?} {}", b, b.len());
+    println!("{} {} {}", b.len(), b[0], b[1]);
     let s2: &str = unsafe { std::mem::transmute(b) };
     println!("{:?} {}", s2, s2.len());
 }
@@ -3637,11 +3636,17 @@ fn main() {
 
 #[test]
 fn run_mode_str_byte_slice_casts_denominate_both_ways() {
-    // The raw-pointer cast form of the same crossing
-    // (`as *const str` over a byte slice) denominates as
-    // the string too, and the round trip back through a
-    // transmute reads the string value as the byte
-    // sequence it denotes.
+    // The transmute crossing denominates in both
+    // directions: a byte slice transmuted to a `str`
+    // reads as the string, and the round trip back
+    // through a transmute reads the string value as the
+    // byte sequence it denotes. (The raw-pointer cast
+    // form -- `as *const str` over a byte slice -- is
+    // deliberately not denominated at the cast: a fat
+    // raw pointer's length metadata is reinterpreted by
+    // later casts, as cast-rfc0401's `*mut str` ->
+    // `*const [u16]` crossing exercises, so the pointer
+    // keeps its identity there.)
     let dir = temp_dir("str-byte-slice-casts");
     let src = fixture(&dir, "strbyteslicecasts.rs", STR_BYTE_SLICE_CAST_SRC);
     let out = run_driver(&src);
@@ -3649,7 +3654,7 @@ fn run_mode_str_byte_slice_casts_denominate_both_ways() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(
-        stdout, "\"ab\" 2\n[97, 98] 2\n\"ab\" 2\n",
+        stdout, "\"ab\" 2\n2 97 98\n\"ab\" 2\n",
         "stdout={stdout}"
     );
 }
