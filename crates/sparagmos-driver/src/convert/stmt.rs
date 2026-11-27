@@ -155,16 +155,27 @@ impl Converter {
         // expression's own start, and for a method call it is
         // the method name — the terminator's own span covers
         // the whole receiver expression and would name the
-        // receiver instead.
+        // receiver instead. The exception is a call the
+        // compiler itself rewrote around a moved argument —
+        // the `const_eval_select` substitution calls the
+        // runtime branch directly, with the branch operand in
+        // the function position keeping its argument span —
+        // where the operand names no callee of this call and
+        // the terminator's own span, the original call
+        // expression, is the location the compiler names.
         let mut term = term.clone();
         // The stamp is located by the function operand's span
         // (see below), but an optimized body can carry the
         // operand as a promoted constant whose span was erased
         // (it resolves to line 0): the terminator's own span
         // still names the call site then, so it takes over.
-        // A span with a real position always wins, because for
-        // a method call the terminator span covers the whole
-        // receiver expression and would name the receiver.
+        // A span with a real position wins when the operand
+        // opens the call (see `operand_opens_call`), because
+        // for a method call the terminator span covers the
+        // whole receiver expression and would name the
+        // receiver; an operand the source text shows to be a
+        // moved argument does not win, and a span the source
+        // text cannot adjudicate keeps the standing rule.
         let operand_has_position = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.collapsed_filename_lines(c.span, body.span)
                 .unwrap_or_else(|| (c.span.get_filename(), c.span.get_lines()))
@@ -173,16 +184,20 @@ impl Converter {
                 != 0
         }))
         .unwrap_or(false);
-        if operand_has_position {
-            term.source_info.span = c.span;
-        } else if let Some(span) =
-            self.method_call_name_span(term.source_info.span, &canonical)
+        if operand_has_position
+            && self.operand_opens_call(c.span, term.source_info.span) != Some(false)
         {
-            // The operand's span was erased, and the terminator's
-            // own span starts at the receiver: for a method call
-            // the stamp must name the method name's own span,
-            // recovered from the call's source text.
-            term.source_info.span = span;
+            term.source_info.span = c.span;
+        } else if !operand_has_position {
+            if let Some(span) =
+                self.method_call_name_span(term.source_info.span, &canonical)
+            {
+                // The operand's span was erased, and the terminator's
+                // own span starts at the receiver: for a method call
+                // the stamp must name the method name's own span,
+                // recovered from the call's source text.
+                term.source_info.span = span;
+            }
         }
         let mc = body.caller_location(&term, None);
         let constant = self.constant(&mir::ConstOperand {
