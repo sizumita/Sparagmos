@@ -2156,3 +2156,181 @@ fn run_mode_process_command_debug_format() {
         "stderr={stderr}"
     );
 }
+
+const PROCESS_HOST_SIGNAL_SRC: &str = r#"
+use std::os::unix::process::ExitStatusExt;
+use std::process::Command;
+fn main() {
+    // A child ended by a signal reports no exit code, and
+    // the signal number survives the round trip through the
+    // host wait status, for both `output` and `spawn`+`wait`.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("kill -TERM $$")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), None);
+    assert_eq!(out.status.signal(), Some(15));
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("kill -KILL $$")
+        .spawn()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), None);
+    assert_eq!(status.signal(), Some(9));
+    println!("process-host-signal-ok");
+}
+"#;
+
+#[cfg(unix)]
+#[test]
+fn run_mode_process_host_signal_status() {
+    let dir = temp_dir("proc-host-signal");
+    let src = fixture(&dir, "process_host_signal.rs", PROCESS_HOST_SIGNAL_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-signal-ok\n"
+    );
+}
+
+const PROCESS_HOST_ENV_REMOVE_SRC: &str = r#"
+use std::process::Command;
+fn main() {
+    // The driver run itself carries the variable, so the
+    // guest and (by inheritance) its children see it; a
+    // command that removes it must not pass it on, while a
+    // command that leaves the environment alone inherits it
+    // unchanged (the `inherit-env` / `process-remove-from-env`
+    // shapes).
+    assert_eq!(
+        std::env::var("SPARAGMOS_PROBE_INHERITED").unwrap(),
+        "present"
+    );
+    let out = Command::new("env").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("SPARAGMOS_PROBE_INHERITED=present\n"), "{text}");
+    let out = Command::new("env")
+        .env_remove("SPARAGMOS_PROBE_INHERITED")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("SPARAGMOS_PROBE_INHERITED"), "{text}");
+    println!("process-host-env-remove-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_env_remove_inherited() {
+    let dir = temp_dir("proc-host-env-remove");
+    let src = fixture(
+        &dir,
+        "process_host_env_remove.rs",
+        PROCESS_HOST_ENV_REMOVE_SRC,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--guest-process-host")
+        .env("SPARAGMOS_PROBE_INHERITED", "present")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-env-remove-ok\n"
+    );
+}
+
+const PROCESS_HOST_GRANDCHILD_SRC: &str = r#"
+use std::env;
+use std::process::Command;
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        // Child mode: this run is itself a spawned child of
+        // the guest; a real program it spawns is served by
+        // its own process host, as the parent run serves it.
+        let out = Command::new("echo")
+            .arg("grandchild-bytes")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "grandchild-bytes\n"
+        );
+        println!("child-served-grandchild");
+        return;
+    }
+    let me = env::current_exe().unwrap();
+    let out = Command::new(&me).arg("child").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "child-served-grandchild\n"
+    );
+    println!("process-host-grandchild-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_grandchild() {
+    let dir = temp_dir("proc-host-grandchild");
+    let src = fixture(
+        &dir,
+        "process_host_grandchild.rs",
+        PROCESS_HOST_GRANDCHILD_SRC,
+    );
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-grandchild-ok\n"
+    );
+}
+
+const PROCESS_HOST_STATUS_DRAIN_SRC: &str = r#"
+use std::process::{Command, Stdio};
+fn main() {
+    // `status` collects no output, but a child whose piped
+    // stdout nobody collects must still run to its end: the
+    // host drains the pipe while the child writes far more
+    // than a pipe buffer holds.
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("head -c 1000000 /dev/zero")
+        .stdout(Stdio::piped())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    println!("process-host-status-drain-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_status_piped_large_output() {
+    let dir = temp_dir("proc-host-status-drain");
+    let src = fixture(
+        &dir,
+        "process_host_status_drain.rs",
+        PROCESS_HOST_STATUS_DRAIN_SRC,
+    );
+    let out = run_driver_with_process_host_timeout(
+        &src,
+        &[],
+        &dir,
+        std::time::Duration::from_secs(120),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "process-host-status-drain-ok\n"
+    );
+}
