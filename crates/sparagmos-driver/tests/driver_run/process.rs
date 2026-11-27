@@ -682,6 +682,43 @@ fn run_mode_process_spawn_resolvable_is_named_error() {
     );
 }
 
+
+const PROCESS_HOST_NON_UTF8_ARG_SRC: &str = r#"
+// The `process/issue-20091` shape: the guest re-executes
+// itself with an argument that is not valid UTF-8; the
+// child run observes two arguments and exits successfully.
+#[cfg(unix)]
+fn main() {
+    use std::env;
+    use std::ffi::OsStr;
+    use std::os::unix::prelude::*;
+    use std::process::Command;
+    if env::args().len() == 1 {
+        assert!(Command::new(&env::current_exe().unwrap())
+            .arg(<OsStr as OsStrExt>::from_bytes(b"\xff"))
+            .status()
+            .unwrap()
+            .success());
+        println!("non-utf8-arg-ok");
+    }
+}
+#[cfg(not(unix))]
+fn main() {}
+"#;
+
+#[test]
+fn run_mode_process_host_non_utf8_self_arg() {
+    let dir = temp_dir("proc-host-non-utf8-arg");
+    let src = fixture(&dir, "non_utf8_arg.rs", PROCESS_HOST_NON_UTF8_ARG_SRC);
+    let out = run_driver_with_process_host(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "non-utf8-arg-ok\n"
+    );
+}
+
 // ---- Process host (issue #515) ----
 // With `--guest-process-host`, a run's children really start
 // on the host: `output` / `status` report the child's real

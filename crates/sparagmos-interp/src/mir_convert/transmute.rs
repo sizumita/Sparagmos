@@ -459,7 +459,11 @@ impl<'a> Converter<'a> {
     /// * scalar or thin pointer <-> union: the bit
     ///   reinterpretation between the leaf shape and the
     ///   storage shape of the union field whose own shape
-    ///   is the leaf's;
+    ///   is the leaf's; a union with no leaf-matching field
+    ///   shape takes the shape derived from its field types
+    ///   and its total size (`union_transmute_shape`), and a
+    ///   pointer constant (the form a raw pointer takes at
+    ///   higher opt levels) carries the thin-pointer shape;
     /// * a byte-string constant in pointer position (it
     ///   carries no place type) -> a thin pointer or a
     ///   transparent wrapper over one: const propagation
@@ -586,9 +590,13 @@ impl<'a> Converter<'a> {
         // result this does not reproduce (fieldless enums carry
         // no scalar shape, and the bare pointer pairs are claimed
         // by their own arms before this one is reached).
-        let shape_to = self.scalar_shape(target, 0);
+        let shape_to = self.scalar_shape(target, 0).or_else(|| {
+            self.union_transmute_shape_for_ty(target)
+        });
         let shape_from = match &src {
-            Some(s) => self.scalar_shape(s, 0),
+            Some(s) => self.scalar_shape(s, 0).or_else(|| {
+                self.union_transmute_shape_for_ty(s)
+            }),
             // A constant operand carries no place type; its
             // shape comes from the constant itself (see
             // `constant_scalar_shape`).
@@ -2340,7 +2348,7 @@ let inner = match (&src, target) {
     /// pointee, or to an ADT whose last field is such a
     /// type (the unsized tail the metadata counts or
     /// names). `None` for a thin pointer type.
-    fn fat_tail_meta(&self, ty: &mir::Ty) -> Option<ir::FatMeta> {
+    pub(super) fn fat_tail_meta(&self, ty: &mir::Ty) -> Option<ir::FatMeta> {
         self.tail_meta(ptr_pointee(ty)?, 0)
     }
 
@@ -2429,6 +2437,76 @@ let inner = match (&src, target) {
         }
         let storage = self.union_storage_shape(def, args, &leaf)?;
         Some((leaf, storage))
+    }
+
+    /// The scalar shape of a union type for the transmute
+    /// path, derived from the union field types and the
+    /// ADT total size: the payload is the first field whose
+    /// own scalar shape spans the whole storage of the union
+    /// (its width is the total size the layout records), every
+    /// zero-sized field is a fill constant, and every other
+    /// field is left uninit -- the same one-live-field
+    /// convention [`Self::union_storage_shape`] uses. The
+    /// generic scalar-shape path cannot select this shape:
+    /// a union with several scalar-shaped fields is not a
+    /// one-payload struct, and the multi-field shape it would
+    /// try next reads the per-field layout offsets, which
+    /// unions have no entry for (their fields share one
+    /// offset). `None` when the union has no layout entry, its
+    /// total width is outside the reinterpretation budget, or
+    /// no field spans the whole storage.
+    fn union_transmute_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::ScalarShape> {
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let (size, _) = self.adt_layouts.get(&tag)?;
+        let total_bits = size.checked_mul(8)?;
+        if total_bits == 0 || total_bits > 128 {
+            return None;
+        }
+        let total_bits = total_bits as u32;
+        let mut payload: Option<(u32, ir::ScalarShape)> = None;
+        let mut fill = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            match self.scalar_shape(fty, 0) {
+                Some(fs) if fs.bits() == total_bits && payload.is_none() => {
+                    payload = Some((i as u32, fs));
+                }
+                Some(fs) if fs.bits() == 0 => {
+                    let zv = self.zst_value(fty, 0)?;
+                    fill.push((i as u32, value_to_constant(&zv)?));
+                }
+                _ => {}
+            }
+        }
+        let (index, inner) = payload?;
+        Some(ir::ScalarShape::AdtField {
+            index,
+            count: fields.len(),
+            fill,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// [`Self::union_transmute_shape`] for a type: the shape
+    /// when the type is a union ADT, `None` for any other type.
+    fn union_transmute_shape_for_ty(
+        &self,
+        ty: &mir::Ty,
+    ) -> Option<ir::ScalarShape> {
+        let mir::Ty::Adt(def, args) = ty else {
+            return None;
+        };
+        if !self.adt_is_union(def) {
+            return None;
+        }
+        self.union_transmute_shape(def, args)
     }
 
     /// The storage shape of a union read through the
@@ -3833,6 +3911,17 @@ let inner = match (&src, target) {
                 (width == 128).then_some(S::Float { bits: 128 })
             }
             ir::Constant::Bool(_) => (width == 8).then_some(S::Bool),
+            // A pointer constant (a null pointer, or an
+            // integer-to-pointer constant): its value is an
+            // address only, so its shape is the thin-pointer
+            // leaf at the pointer width -- the shape a typed
+            // pointer operand would have given the crossing
+            // (a raw pointer transmuted into a union is the
+            // canonical case: at higher opt levels the pointer
+            // reaches the transmute as such a constant).
+            ir::Constant::NullPtr | ir::Constant::IntPtr(_) => {
+                (width == 64).then_some(S::Ptr)
+            }
             ir::Constant::Bytes(b) => {
                 (width == 8 * b.len() as u32).then(|| {
                     S::Array(

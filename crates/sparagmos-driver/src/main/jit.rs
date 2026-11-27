@@ -48,11 +48,11 @@ pub(crate) fn jit_compile_program(c: &Collected) -> Result<sparagmos_jit::JitPro
 /// the run-jit process exit code (see the crate docs). The entry
 /// contract mirrors the harness's `JitRunner`: the entry is called
 /// with no arguments, a normal return is exit 0, and a guest panic
-/// is exit 101 with the panic message on stderr. Shapes the JIT
+/// is exit 101 with std's default panic report on stderr. Shapes the JIT
 /// entry cannot model — guest arguments, a C-convention
 /// `main(argc, argv)`, an entry returning `ExitCode` — are
 /// reported as unsupported (exit 2), never guessed.
-pub(crate) fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
+pub(crate) fn execute_jit(c: &Collected, guest_args: &[Vec<u8>]) -> i32 {
     if !guest_args.is_empty() {
         eprintln!(
             "sparagmos-driver run-jit: unsupported: guest arguments are not supported by JIT execution"
@@ -143,8 +143,17 @@ pub(crate) fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
             let _ = out.flush();
             let mut err = std::io::stderr().lock();
             let _ = err.write_all(stderr.as_bytes());
+            // std's default panic report for the guest panic
+            // (#540): the JIT path's invented
+            // `thread 'main' panicked:` line is gone, as on the
+            // interpreter path; the report goes through the
+            // same stderr lock, after the guest's own stderr.
+            let report = sparagmos_jit::std_default_panic_report(
+                &rec.message,
+                rec.location.as_deref(),
+            );
+            let _ = err.write_all(report.as_bytes());
             let _ = err.flush();
-            eprintln!("thread 'main' panicked: {}", rec.message);
             101
         }
         Err(other) => {

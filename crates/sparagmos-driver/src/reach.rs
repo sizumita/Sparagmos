@@ -2523,7 +2523,9 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         | "std::str::RSplitTerminator"
         | "core::str::RSplitTerminator"
         | "std::str::SplitInclusive"
-        | "core::str::SplitInclusive" => true,
+        | "core::str::SplitInclusive"
+        | "std::string::Drain"
+        | "alloc::string::Drain" => true,
         // A `Rev`'s back step is its inner iterator's front
         // step, so it is modelled exactly when the inner
         // iterator's `next` is.

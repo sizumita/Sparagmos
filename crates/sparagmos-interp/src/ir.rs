@@ -2757,6 +2757,13 @@ pub struct Program {
     /// the driver. Consulted when a pointer offset over a static
     /// must be denominated in the declared type's element size.
     pub static_tys: std::collections::HashMap<String, Ty>,
+    /// Declared alignments of the program's statics, in bytes,
+    /// keyed like [`Self::static_tys`]: the alignment a static's
+    /// own attributes demand, which can exceed its declared
+    /// type's alignment (see `mir::StaticAligns`). The address
+    /// pricing of a static's storage uses the greater of the
+    /// two alignments.
+    pub static_aligns: std::collections::HashMap<String, u64>,
     /// Declared types of the program's statics rendered as type
     /// tags (the rendering [`crate::builtins::ty_tag`] produces,
     /// the same form the debug variable table records for

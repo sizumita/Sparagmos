@@ -699,7 +699,18 @@ impl<'a> Interpreter<'a> {
                     items.push(Value::Str(self.program_path().to_string()));
                 }
                 for arg in self.guest_args() {
-                    items.push(Value::Str(arg.clone()));
+                    // An argument that is valid UTF-8 is the
+                    // text element the argument iterators have
+                    // always carried; one that is not is
+                    // carried in the `OsString` form instead,
+                    // so its bytes survive unchanged (the
+                    // `ArgsOs` step yields it as-is, and the
+                    // `Args` step panics on it, as std's own
+                    // conversion does).
+                    match String::from_utf8(arg.clone()) {
+                        Ok(text) => items.push(Value::Str(text)),
+                        Err(_) => items.push(os_string_value(arg)),
+                    }
                 }
                 let common_args = Value::Enum {
                     variant: 0,
@@ -1504,7 +1515,11 @@ impl<'a> Interpreter<'a> {
                 // json request, is refused as before. The json
                 // format without the unlocking option is likewise
                 // refused before listing or running.
-                let raw_args: Vec<String> = self.guest_args().to_vec();
+                let raw_args: Vec<String> = self
+            .guest_args()
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
                 let opts = HarnessOpts::parse(&raw_args);
                 let bootstrap = std::env::var("RUSTC_BOOTSTRAP").is_ok();
                 let mut unstable_options = false;
@@ -4269,25 +4284,21 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if target == "std::path::PathBuf" && source == "std::string::String" {
                     // `PathBuf: From<String>` moves the string's
-                    // bytes into the path.
-                    match &value {
-                        Value::Str(s) => Ok(pathbuf_value(s.as_bytes())),
-                        other => Err(InterpError::type_mismatch(
-                            "From::from to PathBuf",
-                            "string value",
-                            other.kind_name(),
-                        )),
-                    }
+                    // bytes into the path. The string arrives in
+                    // whichever form its producer built -- the
+                    // string value itself, or the real aggregate
+                    // a converted body hands back (`slice::join`
+                    // and `concat` build one through
+                    // `join_generic_copy`, its buffer elements in
+                    // the `MaybeUninit` union form) -- so the
+                    // bytes are read through the string readers,
+                    // as at every other string consumer.
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(pathbuf_value(text.as_bytes()))
                 } else if target == "std::ffi::OsString" && source == "std::string::String" {
                     // `OsString: From<String>` likewise.
-                    match &value {
-                        Value::Str(s) => Ok(os_string_value(s.as_bytes())),
-                        other => Err(InterpError::type_mismatch(
-                            "From::from to OsString",
-                            "string value",
-                            other.kind_name(),
-                        )),
-                    }
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(os_string_value(text.as_bytes()))
                 } else if target == "std::ffi::OsString"
                     && (source == "&std::ffi::OsStr" || source == "std::ffi::OsStr")
                 {
@@ -4295,12 +4306,94 @@ impl<'a> Interpreter<'a> {
                     // string into an owned buffer.
                     let bytes = self.os_str_bytes(frames, &value)?;
                     Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString" && source == "std::path::PathBuf" {
+                    // `OsString: From<PathBuf>` is std's
+                    // `PathBuf::into_os_string`: the path's
+                    // bytes move into the OS string. The path
+                    // value arrives in any of the model's
+                    // shapes for it (the buffer form
+                    // `pathbuf_value` builds, the element form,
+                    // the real aggregate form a converted body
+                    // filled through raw-pointer writes), so
+                    // read it through the composition the
+                    // `PathBuf` target arm reads its sources
+                    // with, with the path-specific accessor in
+                    // place of the OS-string one.
+                    let bytes = match string_aggregate_bytes(&value) {
+                        Some(bytes) => bytes,
+                        None => match self.path_buf_bytes_any(frames, &value)? {
+                            Some(bytes) => bytes,
+                            None => self.path_bytes_of(frames, &value)?.0,
+                        },
+                    };
+                    Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString"
+                    && (source == "&std::path::Path" || source == "std::path::Path")
+                {
+                    // `OsString: From<&Path>` clones the
+                    // path's byte string; a path's bytes are
+                    // an OS string's bytes, read by the
+                    // `&OsStr` reader.
+                    let bytes = self.os_str_bytes(frames, &value)?;
+                    Ok(os_string_value(&bytes))
+                } else if target == "std::ffi::OsString"
+                    && (source == "&std::string::String" || source == "&alloc::string::String")
+                {
+                    // `OsString: From<&String>` clones the
+                    // text into an owned buffer.
+                    let s = self.resolve_string(frames, &value)?;
+                    Ok(os_string_value(s.as_bytes()))
+                } else if target == "std::ffi::OsString"
+                    && (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                    && last_generic_param(source).as_deref() == Some("std::ffi::OsStr")
+                {
+                    // `OsString: From<Cow<'_, OsStr>>` is
+                    // `into_owned`: the borrowed variant's
+                    // field is the `&OsStr`, the owned
+                    // variant's field is the `OsString`
+                    // itself, and the `&OsStr` reader reads
+                    // the bytes out of either shape.
+                    let cow = self.resolve_value(frames, &value)?;
+                    match cow {
+                        Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                            let held = fields.pop().expect("len checked");
+                            let bytes = self.os_str_bytes(frames, &held)?;
+                            Ok(os_string_value(&bytes))
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if target == "std::path::PathBuf"
                     && (source == "&std::path::Path" || source == "std::path::Path")
                 {
                     // `PathBuf: From<&Path>` clones the path.
                     let bytes = self.path_bytes(frames, &value)?;
                     Ok(pathbuf_value(&bytes))
+                } else if target.starts_with("std::vec::Vec<")
+                    && generic_first_arg(target, "std::vec::Vec<") == Some("u8")
+                    && source == "std::string::String"
+                {
+                    // `Vec<u8>: From<String>` is
+                    // `String::into_bytes` by definition: the
+                    // string's bytes as the vector's element
+                    // form, read through the string readers like
+                    // the `into_bytes` model itself (the string
+                    // may arrive in the real aggregate form a
+                    // converted body built, as in the `PathBuf`
+                    // arm above).
+                    let text = self.resolve_string(frames, &value)?;
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: text
+                            .into_bytes()
+                            .into_iter()
+                            .map(|b| Value::Uint(b as u128))
+                            .collect(),
+                    })
                 } else if target.starts_with("std::vec::Vec<") {
                     // `Vec::from([T; N])`: the array's elements become
                     // the vector's.
@@ -4848,6 +4941,33 @@ impl<'a> Interpreter<'a> {
                         ));
                     };
                     Ok(self.rc_new_handle(text))
+                } else if target == "std::path::PathBuf"
+                    && (source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                    && last_generic_param(source).as_deref() == Some("std::path::Path")
+                {
+                    // `PathBuf: From<Cow<'_, Path>>` is
+                    // `into_owned`: the borrowed variant's
+                    // field is the `&Path`, the owned
+                    // variant's field is the `PathBuf` itself,
+                    // and the `&OsStr` reader reads the bytes
+                    // out of either shape (the generic
+                    // `PathBuf` arm below cannot: the Cow
+                    // aggregate is neither a wrapper aggregate
+                    // nor a byte string to it).
+                    let cow = self.resolve_value(frames, &value)?;
+                    match cow {
+                        Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                            let held = fields.pop().expect("len checked");
+                            let bytes = self.os_str_bytes(frames, &held)?;
+                            Ok(pathbuf_value(&bytes))
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to PathBuf",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:

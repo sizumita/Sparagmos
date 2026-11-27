@@ -22,6 +22,17 @@
 //! operand whose evaluation fails (E0080) is a compilation
 //! failure even though the operands live outside every body
 //! and no required-constant list names them. The
+//! The missing-MIR verdict is pinned as well: the collector
+//! fatally rejects a demand to monomorphize an item whose
+//! optimized MIR its home crate did not encode (an item
+//! outside the home crate's reachable set, or any item of a
+//! metadata-only build). The driver's own auxiliary builds
+//! compile with `-Zalways-encode-mir`, so an auxiliary's
+//! metadata encodes that MIR anyway and conversion accepted
+//! the demand; the verdict replays the native encoding rule
+//! for the auxiliary crates, over the conclusive evidence
+//! (a metadata-only auxiliary build, or a demand from a local
+//! body for a non-trait-impl item under a non-public module).
 //! The target-cpu session validation is pinned as well:
 //! rustc rejects, as code generation starts, a target whose
 //! spec requires an explicit cpu when none is set, and a
@@ -85,6 +96,29 @@ impl Case {
         }
         if bootstrap {
             cmd.env("RUSTC_BOOTSTRAP", "1");
+        }
+        let out = cmd.output().expect("failed to run sparagmos-driver");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Run the driver in convert mode on `src` with auxiliary
+    /// crates: each `(name, path)` pair is handed over with
+    /// `--aux`, the shape the subset runner uses for a test's
+    /// `//@ aux-crate:` / `//@ aux-build:` files (the driver
+    /// compiles them itself, with `-Zalways-encode-mir`).
+    fn convert_aux(
+        &self,
+        src: &std::path::Path,
+        aux: &[(&str, &std::path::Path)],
+    ) -> (i32, String, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+        cmd.arg(src).arg("--edition").arg("2021");
+        for (name, path) in aux {
+            cmd.arg("--aux").arg(format!("{}={}", name, path.display()));
         }
         let out = cmd.output().expect("failed to run sparagmos-driver");
         (
@@ -1566,4 +1600,183 @@ fn trait_method_no_mangle_accepted() {
     );
     let (code, _stdout, stderr) = case.convert(&src, &[], false);
     assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn missing_mir_priv_bounds_aux_rejected() {
+    // The record's own shape (tests/ui/privacy/
+    // missing-mir-priv-bounds): a private associated-type
+    // bound leaks a type from a private module of the
+    // auxiliary crate, and monomorphizing the local caller
+    // demands that type's inherent generic method. The
+    // auxiliary's native metadata encodes no MIR for it (it
+    // is outside the auxiliary's reachable set), so rustc
+    // fails with "missing optimized MIR"; the driver's
+    // auxiliary build encodes it under
+    // `-Zalways-encode-mir`, and the verdict replays the
+    // native rule.
+    let case = Case::new("missing-mir-priv");
+    let aux = case.write(
+        "missing-mir-priv-bounds-extern.rs",
+        r##"pub trait ToPriv {
+    type AssocPriv;
+}
+
+pub trait PubTr {
+    #[expect(private_bounds)]
+    type Assoc: ToPriv<AssocPriv = Priv>;
+}
+
+struct Dummy;
+struct DummyToPriv;
+impl PubTr for Dummy {
+    type Assoc = DummyToPriv;
+}
+impl ToPriv for DummyToPriv {
+    type AssocPriv = Priv;
+}
+
+pub fn get_dummy() -> impl PubTr {
+    Dummy
+}
+
+struct Priv;
+
+pub trait GetUnreachable {
+    type Assoc;
+}
+
+mod m {
+    pub struct Unreachable;
+
+    impl Unreachable {
+        #[expect(dead_code)]
+        pub fn generic<T>() {}
+    }
+
+    impl crate::GetUnreachable for crate::Priv {
+        type Assoc = Unreachable;
+    }
+}
+"##,
+    );
+    let src = case.write(
+        "case.rs",
+        r##"//@ aux-crate:dep=missing-mir-priv-bounds-extern.rs
+
+extern crate dep;
+use dep::{get_dummy, GetUnreachable, PubTr, ToPriv};
+
+fn main() {
+    wut(get_dummy());
+}
+
+fn wut<T: PubTr>(_: T) {
+    <T as Access>::AccessAssoc::generic::<i32>();
+}
+
+trait Access: PubTr {
+    type AccessAssoc;
+}
+
+impl<T: PubTr> Access for T {
+    type AccessAssoc = <<T::Assoc as ToPriv>::AssocPriv as GetUnreachable>::Assoc;
+}
+"##,
+    );
+    let (code, _stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("missing optimized MIR"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn missing_mir_metadata_only_aux_rejected() {
+    // The record's own shape (tests/ui/rmeta/
+    // no_optimized_mir): the auxiliary's own build is
+    // metadata-only (`--emit=metadata` among its compile
+    // flags), so a native metadata encodes no optimized MIR
+    // at all, and monomorphizing its plain public function
+    // from the main crate is the collector's fatal error.
+    let case = Case::new("missing-mir-rmeta");
+    let aux = case.write(
+        "rmeta_aux.rs",
+        "//@ compile-flags: --emit=metadata\n\npub fn missing_optimized_mir() {}\n",
+    );
+    let src = case.write(
+        "case.rs",
+        "//@ aux-crate:dep=rmeta_aux.rs\nextern crate dep;\nfn main() { dep::missing_optimized_mir(); }\n",
+    );
+    let (code, _stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("missing optimized MIR"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn missing_mir_transitive_macro_aux_rejected() {
+    // The record's own shape (tests/ui/definition-reachable/
+    // transitive): a public macro of the auxiliary crate
+    // expands, in the main crate, to a call of a plain
+    // function under two private modules. The function is
+    // neither generic nor inlinable and outside the
+    // auxiliary's reachable set, so its MIR is not encoded
+    // natively and the demand is the collector's fatal error.
+    let case = Case::new("missing-mir-transitive");
+    let aux = case.write(
+        "transitive-macro.rs",
+        r##"#![feature(decl_macro)]
+
+mod mod1 {
+    mod mod2 {
+        pub fn foo() {}
+    }
+
+    pub(crate) macro m1() {
+        mod2::foo()
+    }
+}
+
+pub macro m() {
+    mod1::m1!()
+}
+"##,
+    );
+    let src = case.write(
+        "case.rs",
+        "//@ aux-build:transitive-macro.rs\nextern crate transitive_macro;\nfn main() {\n    transitive_macro::m!();\n}\n",
+    );
+    let (code, _stdout, stderr) = case.convert_aux(&src, &[("transitive_macro", &aux)]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("missing optimized MIR"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn aux_private_helper_demanded_through_aux_caller_converts() {
+    // The guard for the missing-MIR verdict's demand-origin
+    // evidence: a generic helper under a private module of
+    // the auxiliary crate, demanded through the auxiliary's
+    // own public generic caller. The home crate's
+    // reachability visitor follows the caller's body, so the
+    // helper is in the reachable set, its MIR is encoded
+    // natively, and rustc accepts the program.
+    let case = Case::new("missing-mir-helper-ok");
+    let aux = case.write(
+        "guard_aux.rs",
+        "mod m {\n    pub fn helper<T>(x: T) -> T { x }\n}\npub fn caller<T>(x: T) -> T { m::helper(x) }\npub fn plain() -> i32 { 7 }\n",
+    );
+    let src = case.write(
+        "case.rs",
+        "extern crate dep;\nfn main() {\n    let _ = dep::caller(1i32);\n    let _ = dep::plain();\n}\n",
+    );
+    let (code, stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
 }

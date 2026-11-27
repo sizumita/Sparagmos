@@ -69,6 +69,46 @@ pub struct PanicRecord {
     pub location: Option<String>,
 }
 
+/// Render std's default panic report for a guest panic, in the
+/// shape the interpreter's default-hook path prints (see
+/// `sparagmos-interp`'s `print_default_panic_report`): a leading
+/// newline, the head naming the thread (`main`, guest thread id
+/// 1 — the JIT path runs only the entry thread), the location
+/// when the record carries one, and the message, followed by
+/// the backtrace part the environment prescribes. The JIT
+/// records no guest frames, so a backtrace style (Short or
+/// Full) renders no trace here and prints no note; the Off
+/// style prints the `RUST_BACKTRACE=1` note, as std does.
+/// The style resolution mirrors std's `default_hook`:
+/// `RUST_LIB_BACKTRACE` first (only `0` / `1` / `full` count),
+/// then `RUST_BACKTRACE` (unset or `0` is Off, `full` is Full,
+/// anything else is Short), read from the process environment
+/// the guest itself observes.
+pub fn std_default_panic_report(message: &str, location: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    match location {
+        Some(loc) => out.push_str(&format!(
+            "thread 'main' (1) panicked at {loc}:\n{message}\n"
+        )),
+        None => out.push_str(&format!("thread 'main' (1) panicked:\n{message}\n")),
+    }
+    let off = match std::env::var("RUST_LIB_BACKTRACE").ok().as_deref() {
+        Some("0") => true,
+        Some("1") | Some("full") => false,
+        _ => matches!(
+            std::env::var("RUST_BACKTRACE").ok().as_deref(),
+            None | Some("0")
+        ),
+    };
+    if off {
+        out.push_str(
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        );
+    }
+    out
+}
+
 static LAST_PANIC: Mutex<Option<PanicRecord>> = Mutex::new(None);
 pub fn record_panic(message: impl Into<String>, location: Option<String>) {
     if let Ok(mut g) = LAST_PANIC.lock() {
@@ -105,6 +145,27 @@ pub(crate) static PANIC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_panic_report_shape() {
+        // The head is std's: leading newline, thread name and
+        // guest id, the location when one is recorded, then the
+        // message. (The note line depends on the process
+        // backtrace environment, so it is not asserted here.)
+        let with_loc = std_default_panic_report("boom", Some("guest.rs:3:7"));
+        assert!(
+            with_loc.starts_with("\nthread 'main' (1) panicked at guest.rs:3:7:\nboom\n"),
+            "report: {with_loc:?}"
+        );
+        let without_loc = std_default_panic_report("boom", None);
+        assert!(
+            without_loc.starts_with("\nthread 'main' (1) panicked:\nboom\n"),
+            "report: {without_loc:?}"
+        );
+        // The invented single-line form is not produced.
+        assert!(!with_loc.contains("panicked: boom"));
+        assert!(!without_loc.contains("panicked: boom"));
+    }
+
     #[test]
     fn panic_record_roundtrip() {
         let _g = PANIC_TEST_LOCK.lock().unwrap();

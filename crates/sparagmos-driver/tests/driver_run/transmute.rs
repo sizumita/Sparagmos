@@ -64,3 +64,83 @@ fn run_mode_simd_wrapper_int_transmute_o2() {
     );
     assert_eq!(stdout, "ok\n", "stdout={stdout} stderr={stderr}");
 }
+
+const NICHE_ENUM_IN_TUPLE_SRC: &str = r#"
+#[allow(dead_code)]
+enum Foo { A, B }
+#[allow(dead_code)]
+struct Bar { a: usize, b: usize }
+fn main() {
+    // The niche of `Option<(usize, Foo)>` lives in the
+    // tuple payload's second field: the fieldless enum's
+    // invalid value 2 at that field's offset encodes `None`,
+    // its valid discriminants encode `Some((_, Foo))`.
+    let v1: Option<(usize, Foo)> = unsafe { std::mem::transmute::<_, Option<(usize, Foo)>>(Bar { a: 0, b: 0 }) };
+    let v2: Option<(usize, Foo)> = unsafe { std::mem::transmute::<_, Option<(usize, Foo)>>(Bar { a: 1, b: 0 }) };
+    let v3: Option<(usize, Foo)> = unsafe { std::mem::transmute::<_, Option<(usize, Foo)>>(Bar { a: 5, b: 2 }) };
+    match v1 { Some((n, Foo::A)) => println!("v1 some {} A", n), Some((n, Foo::B)) => println!("v1 some {} B", n), None => println!("v1 none") }
+    match v2 { Some((n, Foo::A)) => println!("v2 some {} A", n), Some((n, Foo::B)) => println!("v2 some {} B", n), None => println!("v2 none") }
+    match v3 { Some((n, _)) => println!("v3 some {}", n), None => println!("v3 none") }
+    // A niche-encoded enum as a tuple field itself: the
+    // tuple's fields sit at their recorded layout offsets,
+    // so the `Option<bool>` field's pattern lands at its
+    // own offset in both directions of the transmute.
+    let w1: (usize, Option<bool>) = unsafe { std::mem::transmute((7usize, true)) };
+    let w2: (usize, Option<bool>) = unsafe { std::mem::transmute((9usize, false)) };
+    println!("w1 {} {:?}", w1.0, w1.1);
+    println!("w2 {} {:?}", w2.0, w2.1);
+    let back: (usize, bool) = unsafe { std::mem::transmute(w1) };
+    println!("back {} {:?}", back.0, back.1);
+    // The tuple's storage order is the compiler's choice:
+    // `(bool, usize)` stores the `usize` first, and the
+    // niche field still lands at its recorded offset.
+    let r1: (Option<bool>, usize) = unsafe { std::mem::transmute((true, 7usize)) };
+    println!("r1 {:?} {}", r1.0, r1.1);
+    // `None` through a tuple field: the bool niche value 2
+    // in the source tuple's second field.
+    let n1: (u8, Option<bool>) = unsafe { std::mem::transmute((3u8, 2u8)) };
+    println!("n1 {} {:?}", n1.0, n1.1);
+}
+"#;
+
+const NICHE_ENUM_IN_TUPLE_EXPECTED: &str =
+    "v1 some 0 A\nv2 some 1 A\nv3 none\nw1 7 Some(true)\nw2 9 Some(false)\nback 7 true\nr1 Some(true) 7\nn1 3 None\n";
+
+#[test]
+fn run_mode_transmute_niche_enum_in_tuple_payload() {
+    // A niche-encoded enum inside a tuple payload, and a
+    // niche-encoded enum as a tuple field: both placements
+    // go through the tuple shape's per-field recorded
+    // offsets (Issue #389, the `niche_option_tuple_ok`
+    // record family).
+    super::run_ok(
+        "transmute-niche-tuple",
+        NICHE_ENUM_IN_TUPLE_SRC,
+        NICHE_ENUM_IN_TUPLE_EXPECTED,
+    );
+}
+
+#[test]
+fn run_mode_transmute_niche_enum_in_tuple_payload_debug_assertions() {
+    // The record's own compile flags (`-C debug-assertions`):
+    // the compiler's transmute validity checks read the
+    // construction's bytes back and validate the niche
+    // field's discriminant range inside the tuple.
+    let dir = temp_dir("transmute-niche-tuple-debug");
+    let src = fixture(&dir, "case.rs", NICHE_ENUM_IN_TUPLE_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-C", "--rustc-arg", "debug-assertions"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the niche-in-tuple transmutes must run under debug assertions; stderr={stderr}"
+    );
+    assert_eq!(
+        stdout, NICHE_ENUM_IN_TUPLE_EXPECTED,
+        "stdout={stdout} stderr={stderr}"
+    );
+}

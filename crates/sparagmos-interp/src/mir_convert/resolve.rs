@@ -810,6 +810,13 @@ fn convert_all_with(
             Some((conv.static_key(def), ty))
         })
         .collect();
+    // The statics' declared alignments, keyed like the type
+    // table above.
+    out.static_aligns = program
+        .static_aligns
+        .iter()
+        .map(|(def, align)| (conv.static_key(def), *align))
+        .collect();
     // The statics' declared types as rendered type tags, keyed
     // like the type table above: the debugger interface's
     // record of each static's full instance type (see

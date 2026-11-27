@@ -635,7 +635,11 @@ impl<'a> Interpreter<'a> {
         // `TestMainEnvArgs` arm): a `-Z` option is refused
         // before anything else happens, and the json format
         // requires `-Z unstable-options` under a bootstrap.
-        let raw_args: Vec<String> = self.guest_args().to_vec();
+        let raw_args: Vec<String> = self
+            .guest_args()
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
         let opts = HarnessOpts::parse(&raw_args);
         let bootstrap = std::env::var("RUSTC_BOOTSTRAP").is_ok();
         let mut unstable_options = false;

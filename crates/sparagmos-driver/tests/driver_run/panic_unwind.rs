@@ -3250,6 +3250,81 @@ fn run_mode_short_backtrace_elides_the_marked_region() {
     );
 }
 
+const PLAIN_PANIC_SRC: &str = r#"
+fn main() {
+    panic!("explicit panic");
+}
+"#;
+
+#[test]
+fn run_mode_short_backtrace_ends_at_main_when_optimised_without_debuginfo() {
+    // The shape of tests/ui/panics/issue-47429-short-backtraces.rs
+    // and runtime-switch.rs: an optimised build without debug
+    // info inlines the `lang_start` entry shim into
+    // `__rust_begin_short_backtrace`, so std's short trace ends
+    // at the entry frame -- no `call_once` frame is printed.
+    let dir = temp_dir("short-backtrace-optimised");
+    let src = fixture(&dir, "plain_panic.rs", PLAIN_PANIC_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .args(["--rustc-arg", "-O", "--rustc-arg", "-Cdebuginfo=0"])
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "\nthread 'main' (1) panicked at {0}:3:5:\nexplicit panic\nstack backtrace:\n\
+             \u{20}  0: __rustc::rust_begin_unwind\n\
+             \u{20}  1: core::panicking::panic_fmt\n\
+             \u{20}  2: plain_panic::main\n\
+             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n",
+            src.display()
+        )
+        .as_str()
+    );
+}
+
+#[test]
+fn run_mode_short_backtrace_keeps_entry_shim_when_unoptimised_or_debuggable() {
+    // The two shapes in which the native trace does show the
+    // entry shim below `main`: an unoptimised build (the shim
+    // is a real frame) and an optimised build with debug info
+    // (the printer reconstructs the inlined frame).
+    for (tag, extra) in [
+        ("plain", Vec::new()),
+        ("debuginfo", vec!["--rustc-arg", "-O", "--rustc-arg", "-Cdebuginfo=2"]),
+    ] {
+        let dir = temp_dir(&format!("short-backtrace-shim-{tag}"));
+        let src = fixture(&dir, "plain_panic.rs", PLAIN_PANIC_SRC);
+        let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+            .arg("run")
+            .arg(&src)
+            .args(&extra)
+            .env("RUST_BACKTRACE", "1")
+            .output()
+            .expect("failed to run sparagmos-driver");
+        assert_eq!(out.status.code(), Some(101), "tag={tag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "\nthread 'main' (1) panicked at {0}:3:5:\nexplicit panic\nstack backtrace:\n\
+                 \u{20}  0: __rustc::rust_begin_unwind\n\
+                 \u{20}  1: core::panicking::panic_fmt\n\
+                 \u{20}  2: plain_panic::main\n\
+                 \u{20}  3: <fn() as core::ops::function::FnOnce<()>>::call_once\n\
+                 note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n",
+                src.display()
+            )
+            .as_str(),
+            "tag={tag}"
+        );
+    }
+}
+
 #[test]
 fn run_mode_full_backtrace_keeps_the_marked_region() {
     // The full shape does not elide: every frame is listed,
@@ -3543,6 +3618,68 @@ fn run_mode_generic_assert_captures_render_like_core() {
          M2|Assertion failed: nd == NoDebug(3)\nWith captures:\n  nd = N/A\n|\n\
          M3|Assertion failed: wd == WithDebug(3)\nWith captures:\n  wd = WD(7)\n|\n",
         "capture renderings match core's"
+    );
+}
+
+const GENERIC_ASSERT_STRAIGHT_SRC: &str = r##"
+#![feature(generic_assert)]
+use std::panic;
+
+#[derive(Clone, Copy, PartialEq)]
+struct CopyDebug(i32);
+impl std::fmt::Debug for CopyDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CONSTDEBUG")
+    }
+}
+
+fn grab<F: FnOnce() + panic::UnwindSafe>(f: F) -> String {
+    let err = panic::catch_unwind(f).unwrap_err();
+    if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        panic!("payload not a string");
+    }
+}
+
+fn check() {
+    let copy_debug = CopyDebug(1);
+    assert!(copy_debug == CopyDebug(3));
+}
+
+fn main() {
+    let m = grab(|| { check(); });
+    println!("M|{m}|");
+}
+"##;
+
+#[test]
+fn run_mode_generic_assert_capture_straight_line_keeps_payload_form() {
+    // The shape of tests/ui/macros/rfc-2011-nicer-assert-messages/
+    // feature-gate-generic_assert.rs: the capture is stored by a
+    // straight-line `assert!` in a plain function (no closure
+    // between the capture and the store). The store of
+    // `Capture::elem` is a shaped store through the capture's
+    // dereference whose shape covers the field exactly; it must
+    // keep the payload's own denomination (the newtype's `Debug`
+    // renders through it), not rebuild the field from the
+    // shape's flattened bytes, which denominates the payload by
+    // its scalar layout and renders the bare integer instead.
+    let dir = temp_dir("genericassert-straight");
+    let src = fixture(&dir, "genericassert_straight.rs", GENERIC_ASSERT_STRAIGHT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "caught assert panic terminates normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "M|Assertion failed: copy_debug == CopyDebug(3)\nWith captures:\n  copy_debug = CONSTDEBUG\n|\n",
+        "the capture renders the payload's own Debug"
     );
 }
 

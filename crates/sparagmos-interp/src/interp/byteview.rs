@@ -1436,6 +1436,28 @@ impl<'a> Interpreter<'a> {
                 position_value,
                 Value::Tuple(_) | Value::Enum { .. } | Value::Bytes(_) | Value::Str(_)
             );
+            // A shape covering the position exactly is a
+            // whole-value store of that position: the plain
+            // store denominates the value by the position's
+            // own type, while splicing the shape's flattened
+            // bytes through the base's byte layout rebuilds
+            // the position from its storage image and loses
+            // the denomination of any field whose byte
+            // layout is a bare scalar (a newtype payload
+            // stored through a dereference -- the
+            // `Capture::elem` store of an `assert!` capture
+            // -- comes back as the bare integer). The splice
+            // exists for a shape narrower than the position
+            // it lands in, whose whole-value store would
+            // replace more than the shape denotes.
+            if let Some(t) = &pos_ty {
+                if self
+                    .ty_size(t)
+                    .is_some_and(|s| s as usize == width)
+                {
+                    return None;
+                }
+            }
             if !wider_scalar && !aggregate {
                 return None;
             }
@@ -1560,6 +1582,141 @@ impl<'a> Interpreter<'a> {
                 Some(Err(self.byte_view_error(verdict, &func, &place_desc, true)))
             }
         }
+    }
+
+    /// A whole-value store of an aggregate (array) value
+    /// through a byte-displaced target (see
+    /// [`Self::byte_view_shaped_store`] for the scalar form):
+    /// the value's byte image is spliced into a clone of the
+    /// base value through the byte view at the displaced
+    /// position, and the composed base is written back whole.
+    /// This is the store a transmuted reference performs when
+    /// it denotes an array at a byte offset inside differently
+    /// typed storage (a `[u8; 32]` written one byte into a
+    /// `[u64; 8]`): the position crosses the base storage's
+    /// element boundaries, so no structural projection can
+    /// denote it, but every byte of it is judged by the byte
+    /// view. `None` when the target is not a displaced position
+    /// this view judges, the value has no complete byte image,
+    /// or a byte cannot be spliced: the caller then keeps the
+    /// existing path and its verdicts.
+    pub(crate) fn byte_view_displaced_store(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: &Value,
+        place_ty: &Ty,
+    ) -> Option<InterpResult<()>> {
+        let size = usize::try_from(self.ty_size(place_ty)?).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let (projection, mut base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        if !projection
+            .iter()
+            .any(|s| matches!(s, RefProj::ByteOffset(_)))
+        {
+            return None;
+        }
+        let pos = match self.byte_view_position(&base_ty, projection, 0)? {
+            Ok(p) => p,
+            Err(neg) => {
+                return Some(Err(InterpError::UnsupportedProjection {
+                    kind: format!(
+                        "write through a pointer displaced {neg} bytes from a value boundary"
+                    ),
+                }))
+            }
+        };
+        let bytes = self.written_value_bytes(value, place_ty, size)?;
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(b) = b else { continue };
+            match self.splice_storage_byte(&mut base, &layout, pos + i, *b)? {
+                Ok(()) => {}
+                Err(ByteVerdict::Padding(_)) => {}
+                Err(verdict) => {
+                    return Some(Err(self.byte_view_error(
+                        verdict,
+                        &func,
+                        &place_desc,
+                        false,
+                    )))
+                }
+            }
+        }
+        let base_target = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: Vec::new(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: Vec::new(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: Vec::new(),
+            },
+            _ => return None,
+        };
+        Some(self.write_resolved(frames, &base_target, base))
+    }
+
+    /// The load side of [`Self::byte_view_displaced_store`]:
+    /// the bytes at the displaced position are read through
+    /// the byte view of the base value's storage and composed
+    /// into a value of the place's declared type. `None` under
+    /// the same conditions as the store; a judged
+    /// uninitialised byte in the span is the load's error, as
+    /// on the foreign path.
+    pub(crate) fn byte_view_displaced_load(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        place_ty: &Ty,
+    ) -> Option<InterpResult<Value>> {
+        let size = usize::try_from(self.ty_size(place_ty)?).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let (projection, base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        if !projection
+            .iter()
+            .any(|s| matches!(s, RefProj::ByteOffset(_)))
+        {
+            return None;
+        }
+        let pos = match self.byte_view_position(&base_ty, projection, 0)? {
+            Ok(p) => p,
+            Err(neg) => {
+                return Some(Err(InterpError::UnsupportedProjection {
+                    kind: format!(
+                        "read through a pointer displaced {neg} bytes from a value boundary"
+                    ),
+                }))
+            }
+        };
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        let mut bytes = Vec::with_capacity(size);
+        for i in 0..size {
+            match self.foreign_byte(&base, &layout, pos + i)? {
+                ForeignByte::Byte(b) => bytes.push(Some(b)),
+                ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit => {
+                    return Some(Err(InterpError::UninitializedRead {
+                        func,
+                        place: place_desc,
+                    }))
+                }
+            }
+        }
+        self.construct_from_bytes(place_ty, &bytes).map(Ok)
     }
 
     /// Write `value` (a byte value) through a byte-displaced

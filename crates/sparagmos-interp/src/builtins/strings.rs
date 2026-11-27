@@ -412,17 +412,38 @@ impl<'a> Interpreter<'a> {
                 )),
             });
         }
-        let text = match self.string_from_real_aggregate(frames, &stored)? {
-            Some(text) => Some(text),
-            None => string_aggregate_bytes(&stored)
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        };
+        let text = self.string_text_of_stored(frames, &stored)?;
         let mut text = text.ok_or_else(|| {
             InterpError::type_mismatch(name, "string value", stored.kind_name())
         })?;
         let result = f(&mut text)?;
         self.write_resolved(frames, target, Value::Str(text))?;
         Ok(result)
+    }
+
+    /// The text a stored (non-abstract) string value denotes,
+    /// through the same reader composition `resolve_string`
+    /// applies to operand values: the real aggregate form, the
+    /// element form (the shape a `join` / `concat` result takes
+    /// once it is stored in a place -- the vector as an element
+    /// list whose elements past the first keep the
+    /// `MaybeUninit` union wrapper the buffer's spare-capacity
+    /// region stores), and the plain aggregate byte shapes.
+    /// Any other shape returns `None` and leaves the caller's
+    /// ordinary judgement to stand.
+    pub(super) fn string_text_of_stored(
+        &self,
+        frames: &[Frame],
+        stored: &Value,
+    ) -> InterpResult<Option<String>> {
+        if let Some(text) = self.string_from_real_aggregate(frames, stored)? {
+            return Ok(Some(text));
+        }
+        if let Some(text) = self.string_from_element_form(stored) {
+            return Ok(Some(text));
+        }
+        Ok(string_aggregate_bytes(stored)
+            .and_then(|bytes| String::from_utf8(bytes).ok()))
     }
 
     /// The text of the string stored at `target`, read through
@@ -439,11 +460,7 @@ impl<'a> Interpreter<'a> {
         if let Value::Str(text) = stored {
             return Ok(text);
         }
-        let text = match self.string_from_real_aggregate(frames, &stored)? {
-            Some(text) => Some(text),
-            None => string_aggregate_bytes(&stored)
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        };
+        let text = self.string_text_of_stored(frames, &stored)?;
         text.ok_or_else(|| {
             InterpError::type_mismatch(name, "string value", stored.kind_name())
         })
@@ -664,6 +681,14 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // The byte form itself: a `str` value read out of
+        // byte storage (the tail field of a DST struct over a
+        // byte array, above all) resolves to the storage's
+        // bytes, which are the string's bytes under the
+        // field's declared type.
+        if let Value::Bytes(bytes) = cur {
+            return String::from_utf8(bytes.clone()).ok();
+        }
         let (elems, len): (&[Value], usize) = match cur {
             // A vector is a struct: its value carries variant
             // 0. (A one-field wrapper around an empty or
@@ -676,6 +701,14 @@ impl<'a> Interpreter<'a> {
             Value::SparseVec { elems, len, .. } => {
                 (elems, usize::try_from(*len).ok()?)
             }
+            // An array value is a byte sequence in the same
+            // sense as a vector's element list: the storage a
+            // DST struct's `str` tail field overlays is a sized
+            // byte array in the sized twin struct, and reading
+            // the tail through the fat pointer yields that
+            // array's value, whose elements are the string's
+            // bytes.
+            Value::Tuple(items) => (items, items.len()),
             _ => return None,
         };
         let mut bytes = Vec::with_capacity(len);

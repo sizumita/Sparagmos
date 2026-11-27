@@ -388,6 +388,70 @@ fn session_sigpipe(args: &[String]) -> sparagmos_interp::SigpipeInit {
     mode
 }
 
+/// Whether the entry shim frame appears below the entry
+/// frame in the guest's short backtraces, resolved from the
+/// final rustc argument list the way the native build
+/// behaves: the `<fn() as FnOnce<()>>::call_once` shim
+/// `lang_start` calls the entry through is a real frame at
+/// opt-level 0; an optimising build inlines it into
+/// `__rust_begin_short_backtrace`, where it leaves no frame
+/// of its own unless debug info lets the backtrace printer
+/// reconstruct the inlined frame. The frame is therefore
+/// visible exactly when the resolved opt-level is 0 or any
+/// debug info is emitted. The last `-O` / `-C opt-level`
+/// and the last `-g` / `-C debuginfo` win, as rustc
+/// resolves them (see `InterpConfig::entry_shim_visible`).
+fn session_entry_shim_visible(args: &[String]) -> bool {
+    let mut opt_is_zero = true;
+    let mut debuginfo_present = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-O" {
+            opt_is_zero = false;
+            i += 1;
+            continue;
+        }
+        if a == "-g" {
+            debuginfo_present = true;
+            i += 1;
+            continue;
+        }
+        let text: Option<&str> = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(rest) = a.strip_prefix("--codegen=") {
+            Some(rest)
+        } else if let Some(rest) = a.strip_prefix("-C") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(t) = text {
+            let (name, value) = match t.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (t, None),
+            };
+            match name {
+                "opt-level" => {
+                    if let Some(v) = value {
+                        opt_is_zero = v == "0";
+                    }
+                }
+                "debuginfo" => {
+                    // A value-less `-C debuginfo` spells the
+                    // full level, like `-g`.
+                    debuginfo_present =
+                        !matches!(value, Some("0") | Some("none"));
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    opt_is_zero || debuginfo_present
+}
+
 /// Print the convert-mode conversion report for a collected
 /// program (the report `jit-compile` prints as well, before its
 /// own `jit-compiled:` line).
@@ -730,6 +794,22 @@ fn reap_stale_scratch() {
     }
 }
 
+
+/// The raw bytes of one of this process's own argv entries:
+/// on Unix the entry itself; on other hosts the entries this
+/// driver receives are text, and the bytes are that text.
+fn os_bytes(arg: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        arg.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        arg.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 fn main() {
     reap_stale_scratch();
     let worker = std::thread::Builder::new()
@@ -755,7 +835,16 @@ fn driver_main() {
 }
 
 fn driver_main_inner() {
-    let argv: Vec<String> = std::env::args().collect();
+    // The driver's own options are text, but a `--guest-arg`
+    // value is a guest argument and need not be valid UTF-8
+    // (a self-spawned child can carry one unchanged, see
+    // issue #515): keep the raw `OsString` argv alongside the
+    // lossy text view the option matching uses.
+    let argv_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let argv: Vec<String> = argv_os
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     // The cargo rustc-wrapper shim (see `rustc_shim` in
     // tools.rs) is not a session mode: it converts one
     // compilation unit, records its verdict on a side
@@ -811,7 +900,8 @@ fn driver_main_inner() {
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
-    let mut guest_args: Vec<String> = Vec::new();
+    let mut guest_args: Vec<Vec<u8>> = Vec::new();
+    let mut guest_args_file: Option<String> = None;
     let mut i = if mode == Mode::Convert { 1 } else { 2 };
     while i < argv.len() {
         match argv[i].as_str() {
@@ -876,8 +966,16 @@ fn driver_main_inner() {
             }
             "--guest-arg" => {
                 i += 1;
-                guest_args.push(argv.get(i).cloned().unwrap_or_else(|| {
+                let raw = argv_os.get(i).unwrap_or_else(|| {
                     eprintln!("--guest-arg needs a value");
+                    exit_process(2);
+                });
+                guest_args.push(os_bytes(raw));
+            }
+            "--guest-args-file" => {
+                i += 1;
+                guest_args_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-args-file needs a path");
                     exit_process(2);
                 }));
             }
@@ -966,7 +1064,7 @@ fn driver_main_inner() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--dep-info-verdict] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>[;collect=no]] [--aux-native-lib <dir>] [--aux-env-scrub <name>] [--tool-program <path>] [--guest-process-host] [--compiletest-check-mode] [--dep-info-verdict] [--coverage-color] [--rustc-arg <arg>] [--guest-arg <arg>] [--guest-args-file <path>] [--dump <path>] [--compiler-stdout <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -996,6 +1094,23 @@ fn driver_main_inner() {
     let sysroot = sysroot
         .or_else(|| std::env::var("SPARAGMOS_SYSROOT").ok())
         .unwrap_or_else(|| env!("SPARAGMOS_BUILD_SYSROOT").to_string());
+
+    // A caller reconstructing a run whose guest arguments
+    // include a non-UTF-8 one hands them over in a file (the
+    // command line of a conversion subprocess is text in this
+    // driver's plumbing; see `write_guest_args_file`): the
+    // file's arguments are the run's, in order.
+    if let Some(path) = &guest_args_file {
+        match read_guest_args_file(std::path::Path::new(path)) {
+            Ok(args) => guest_args.extend(args),
+            Err(e) => {
+                eprintln!(
+                    "sparagmos-driver run: unsupported: cannot read the guest arguments file {path}: {e}"
+                );
+                exit_process(2);
+            }
+        }
+    }
 
     // The process host of a run that opted into real child
     // processes: assembled from this invocation's own shape,
@@ -1093,6 +1208,11 @@ fn driver_main_inner() {
             // main compilation's own setting for prebuilt
             // libraries when it publishes the table (below).
             overflow_checks: true,
+            // A prebuilt artifact is a native build: its
+            // metadata answers MIR availability truthfully,
+            // so the missing-MIR verdict never replays for it
+            // (it is not published either; see below).
+            native_metadata_only: false,
         })
         .collect();
     let mut visible: Vec<AuxBuilt> = prebuilt.clone();
@@ -1125,6 +1245,20 @@ fn driver_main_inner() {
             }
         }
     }
+    // Publish the auxiliary crates this process built for
+    // the missing-MIR verdict (see
+    // `mono_check::set_aux_crates`): their metadata encodes
+    // MIR under `-Zalways-encode-mir` that a native build
+    // would have left out, so the verdict replays the native
+    // encoding rule for them. The prebuilt libraries are not
+    // published: their artifacts are native builds whose
+    // metadata answers truthfully.
+    sparagmos_driver::mono_check::set_aux_crates(
+        aux_built
+            .iter()
+            .map(|b| (b.name.clone(), b.native_metadata_only))
+            .collect(),
+    );
     aux_built.extend(prebuilt);
     let collect_names: Vec<String> = aux_built
         .iter()
@@ -1257,6 +1391,45 @@ fn driver_main_inner() {
             }
         }
     }
+    // Pin the sysroot crates the main source itself declares
+    // that the sysroot offers ambiguously (sysroot_extern_pins):
+    // the same disambiguation the auxiliary builds get. A main
+    // source that declares an extern crate libc item itself — the
+    // tests/ui/runtime/on-broken-pipe/inherit.rs record does,
+    // to install SIG_IGN for SIGPIPE through libc::signal
+    // — otherwise fails its front end with E0464 (multiple
+    // candidates for the crate) in a rustup sysroot carrying
+    // the rustc-dev component, before any guest code runs. A
+    // name already bound above (an auxiliary crate, a prebuilt
+    // library, a caller --extern) keeps that binding.
+    {
+        let main_text = std::fs::read_to_string(&input).unwrap_or_default();
+        let mut bound: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut args_iter = args.iter();
+        while let Some(a) = args_iter.next() {
+            if a == "--extern" {
+                if let Some(spec) = args_iter.next() {
+                    if let Some((name, _)) = spec.split_once('=') {
+                        bound.insert(name.to_string());
+                    }
+                }
+            } else if let Some(spec) = a.strip_prefix("--extern=") {
+                if let Some((name, _)) = spec.split_once('=') {
+                    bound.insert(name.to_string());
+                }
+            }
+        }
+        for (name, rmeta, rlib) in sysroot_extern_pins(&sysroot, &main_text) {
+            if bound.contains(&name) {
+                continue;
+            }
+            args.push("--extern".to_string());
+            args.push(format!("{name}={}", rmeta.display()));
+            args.push("--extern".to_string());
+            args.push(format!("{name}={}", rlib.display()));
+        }
+    }
     // The compiler runs in-process, under two disciplines:
     // - A panic raised inside Stable MIR conversion (the
     //   `unimplemented!()`s hit by explicit tail calls, async
@@ -1288,6 +1461,7 @@ fn driver_main_inner() {
     );
     let panic_abort = session_panic_abort(&args);
     let sigpipe = session_sigpipe(&args);
+    let entry_shim_visible = session_entry_shim_visible(&args);
     if dep_info_verdict && mode == Mode::Convert {
         // A dep-info verdict run (see `run_resolution_verdict`
         // in collect.rs): the session the arguments assembled
@@ -1374,6 +1548,7 @@ fn driver_main_inner() {
                     overflow_checks,
                     panic_abort,
                     sigpipe,
+                    entry_shim_visible,
                     debug_script.as_deref(),
                     &debug_dialect,
                     hide_locals,
@@ -1448,6 +1623,7 @@ fn driver_main_inner() {
                     overflow_checks,
                     panic_abort,
                     sigpipe,
+                    entry_shim_visible,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
                     guest_stdout_passthrough,

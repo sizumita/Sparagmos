@@ -29,7 +29,7 @@ pub(crate) struct BuiltProgram {
 pub(crate) fn build_program(
     c: &Collected,
     program_name: &str,
-    guest_args: &[String],
+    guest_args: &[Vec<u8>],
 ) -> Result<BuiltProgram, i32> {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
@@ -67,6 +67,7 @@ pub(crate) fn build_program(
     program.extra_static_seeds = c.extra_static_seeds.clone();
     program.init_constructors = c.init_constructors.clone();
     program.static_tys = c.static_tys.clone();
+    program.static_aligns = c.static_aligns.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
     program.mat_plans = c.mat_plans.clone();
@@ -142,10 +143,10 @@ pub(crate) fn build_program(
     let entry_arg_count = c.bodies[entry_index].1.arg_count;
     let entry_args: Vec<sparagmos_interp::Value> = if entry_arg_count == 2 {
         let mut argv: Vec<sparagmos_interp::Value> = Vec::new();
-        let mut all_args = vec![program_name.to_string()];
+        let mut all_args = vec![program_name.as_bytes().to_vec()];
         all_args.extend(guest_args.iter().cloned());
         for arg in &all_args {
-            let mut bytes = arg.as_bytes().to_vec();
+            let mut bytes = arg.clone();
             bytes.push(0);
             argv.push(sparagmos_interp::Value::Ref(
                 sparagmos_interp::RefTarget::value(sparagmos_interp::Value::Bytes(bytes)),

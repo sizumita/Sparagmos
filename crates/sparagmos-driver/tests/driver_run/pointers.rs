@@ -4432,3 +4432,44 @@ fn run_mode_maybe_uninit_box_assume_init_field_zero_access() {
         "next some true\nnext elem z 9\nafter writes a true true\nok\n"
     );
 }
+
+const UNION_UNINIT_DISPLACED_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ptr::NonNull;
+union SmallVecData {
+    inline: ManuallyDrop<MaybeUninit<[u32; 2]>>,
+    heap: (NonNull<u32>, usize),
+}
+struct SmallVec { data: SmallVecData, len: usize }
+impl SmallVec {
+    fn new() -> Self { SmallVec { data: SmallVecData { inline: ManuallyDrop::new(MaybeUninit::uninit()) }, len: 0 } }
+    fn inline_mut(&mut self) -> *mut u32 { unsafe { std::ptr::addr_of_mut!(self.data.inline).cast::<MaybeUninit<[u32;2]>>().as_mut().unwrap().as_mut_ptr() as *mut u32 } }
+    fn inline_ref(&self) -> *const u32 { unsafe { std::ptr::addr_of!(self.data.inline).cast::<MaybeUninit<[u32;2]>>().as_ref().unwrap().as_ptr() as *const u32 } }
+    fn push(&mut self, v: u32) { unsafe { self.inline_mut().add(self.len).write(v); } self.len += 1; }
+    fn get(&self, i: usize) -> u32 { unsafe { self.inline_ref().add(i).read() } }
+}
+fn main() {
+    let mut v = SmallVec::new();
+    v.push(10);
+    v.push(20);
+    assert_eq!(v.get(0), 10);
+    assert_eq!(v.get(1), 20);
+    println!("ok {} {}", v.get(0), v.get(1));
+}
+"#;
+
+#[test]
+fn run_mode_displaced_ptr_access_into_union_uninit_storage() {
+    // Issue #502: displaced writes/reads through a pointer
+    // derived from a union field into nested uninit-born
+    // storage (`ManuallyDrop<MaybeUninit<[T; N]>>`) must land
+    // on the displaced element: the second push writes element
+    // 1, and reading it back must see the written value rather
+    // than splicing the write into element 0 or reporting the
+    // element uninitialized.
+    run_ok(
+        "union-uninit-displaced",
+        UNION_UNINIT_DISPLACED_SRC,
+        "ok 10 20\n",
+    );
+}

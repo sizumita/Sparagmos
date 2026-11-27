@@ -394,7 +394,12 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `check-fail`, a UI view with no pass/fail/run directive —
   compiletest's UI default is check-fail — or an incremental
   `cpass` revision) is judged on the metadata-visible
-  verdicts only. The reference check compilation never runs
+  verdicts only, unless the view's own compile-flags add an
+  `--emit` kind beyond the analysis-level ones (metadata,
+  dep-info): the added emit accumulates with compiletest's
+  `--emit=metadata` and makes the reference compilation
+  evaluate what a metadata-only compilation never reaches,
+  so such a view keeps the full verdict chain. The reference check compilation never runs
   the monomorphization collector or code generation, so the
   driver's codegen-level verdicts — the collector walk's
   required-constant and `check_mono_item` findings, the
@@ -408,6 +413,19 @@ denominator. Runs on every push to `main` and on manual dispatch.
   `--compiletest-check-mode` for such views; build-mode
   views (build-pass / build-fail / run modes) and every
   other suite keep the full verdict chain.
+- A failure-expecting compile-check test whose expected
+  failure is the collector's missing-MIR error (an item its
+  home crate did not encode optimized MIR for) is judged
+  against the auxiliary crates the driver built for the
+  record: those builds carry `-Zalways-encode-mir`, so
+  their metadata encodes MIR a native build would have
+  left out, and the walk replays the native encoding rule
+  for them -- a metadata-only auxiliary build encodes
+  nothing, and otherwise an item is reported only on
+  conclusive evidence (demanded from a local body, not a
+  trait impl item, under a non-public module). Prebuilt
+  libraries and sysroot crates keep the truthful metadata
+  answer, which the collector hook itself raises.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact

@@ -356,9 +356,33 @@ impl<'a> Converter<'a> {
                         let field_ty = |pointee: &mir::Ty, field: u32| -> Option<mir::Ty> {
                             match pointee {
                                 mir::Ty::Tuple(ts) => ts.get(field as usize).cloned(),
-                                mir::Ty::Adt(def, args) => {
-                                    self.adt_fields.get(*def, args, 0, field).cloned()
-                                }
+                                mir::Ty::Adt(def, args) => self
+                                    .adt_fields
+                                    .get(*def, args, 0, field)
+                                    .cloned()
+                                    .or_else(|| {
+                                        // The projection-recovered
+                                        // table only holds a field
+                                        // some collected body
+                                        // projects, and a capture's
+                                        // pointee fields may be
+                                        // projected nowhere in the
+                                        // program (their accesses
+                                        // live in the closure's own
+                                        // body, which conversion
+                                        // never sees). The declared
+                                        // shape is complete by
+                                        // construction, so fall back
+                                        // to it, as other consumers
+                                        // of the table do.
+                                        self.adt_shapes
+                                            .get(def)
+                                            .and_then(|shape| shape.variants.first())
+                                            .and_then(|fields| {
+                                                fields.get(field as usize)
+                                            })
+                                            .map(|fty| subst_ty(fty, args))
+                                    }),
                                 _ => None,
                             }
                         };
@@ -424,6 +448,19 @@ impl<'a> Converter<'a> {
             mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
         ) || self.pointee_is_byte_string_dst(pointee)
         {
+            return None;
+        }
+        // A fat target whose pointee is a DST-wrapper ADT (or
+        // a tuple-tailed pointee): the pointee is unsized
+        // through its tail, exactly as a slice / `str` / `dyn`
+        // pointee is, so the cast keeps the metadata word
+        // instead of materialising the operand into the
+        // pointee's storage form -- materialising a fat
+        // operand strips its metadata (`eval_materialize`
+        // reduces a fat operand to its base), and a later
+        // `PtrMetadata` on the result then finds only the
+        // storage bytes.
+        if self.fat_tail_meta(target).is_some() {
             return None;
         }
         // A zero-sized pointee: the cast is the identity. The

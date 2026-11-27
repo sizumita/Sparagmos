@@ -57,10 +57,11 @@ fn own_stdout_sink() -> Option<sparagmos_interp::StdoutSink> {
 pub(crate) fn execute(
     c: &Collected,
     input: &str,
-    guest_args: &[String],
+    guest_args: &[Vec<u8>],
     overflow_checks: bool,
     panic_abort: bool,
     sigpipe: sparagmos_interp::SigpipeInit,
+    entry_shim_visible: bool,
     tool_programs: &[String],
     guest_stderr_file: Option<&str>,
     guest_stdout_passthrough: bool,
@@ -147,6 +148,7 @@ pub(crate) fn execute(
         overflow_checks,
         panic_abort,
         sigpipe,
+        entry_shim_visible,
         // Real child processes coexist with tool
         // interception in any run that configured a host:
         // the interception is consulted first (the named
@@ -409,10 +411,11 @@ pub(crate) fn execute(
 pub(crate) fn execute_debug(
     c: &Collected,
     input: &str,
-    guest_args: &[String],
+    guest_args: &[Vec<u8>],
     overflow_checks: bool,
     panic_abort: bool,
     sigpipe: sparagmos_interp::SigpipeInit,
+    entry_shim_visible: bool,
     script_path: Option<&str>,
     dialect_name: &str,
     hide_locals: bool,
@@ -456,6 +459,7 @@ pub(crate) fn execute_debug(
         overflow_checks,
         panic_abort,
         sigpipe,
+        entry_shim_visible,
         ..sparagmos_interp::InterpConfig::default()
     };
     let mut session = match sparagmos_interp::debug_mir(

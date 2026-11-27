@@ -419,35 +419,94 @@ impl ToolRegistry {
 
     /// The recorded dynamic-library dependency of
     /// `artifact` a native loader would fail to find: the
-    /// first of the artifact's recorded dependencies, in
-    /// the order the loader reaches them (a dependent
-    /// before the libraries it itself needs -- the
-    /// recorded order reversed), whose crate type the
-    /// loader loads at run time (`dylib` / `cdylib`) and
-    /// whose file no longer stands at the path its build
-    /// produced it at. A statically linked dependency (an
-    /// rlib) is not the loader's concern: its code stands
-    /// in the binary itself, and removing its file after
-    /// the build changes nothing a run can observe, so it
-    /// is never reported here. `None` when every recorded
-    /// dynamic dependency still stands.
+    /// first of the dependencies the run's binary actually
+    /// loads, in the order the loader reaches them (a
+    /// dependent before the libraries it itself needs --
+    /// the recorded order reversed), whose file no longer
+    /// stands at the path its build produced it at.
+    ///
+    /// A dependency's recorded form is not necessarily the
+    /// form the binary linked: one build of a crate can
+    /// stand in the registry under several crate types at
+    /// once (a single invocation producing both a dylib and
+    /// an rlib of the same crate records both), and the
+    /// registry binds every form to a dependent's
+    /// `--extern`. Which form a build consumed is decided
+    /// the way the linker decides it (see `consumed_form`):
+    /// a build that preferred dynamic linking takes the
+    /// dylib, any other build takes the rlib when one
+    /// stands, and a name offered in only one form is
+    /// consumed in that form. Only the consumed form is
+    /// the loader's concern -- a statically linked
+    /// dependency's code stands in the binary itself, and
+    /// removing its file after the build changes nothing a
+    /// run can observe, even when a dylib of the same crate
+    /// was recorded beside it and is removed too.
+    ///
+    /// A consumed dependency's own dynamic dependencies
+    /// are the loader's concern as well, whichever form
+    /// was consumed here: a loaded dylib names them, and a
+    /// statically linked rlib's metadata propagates them
+    /// to the binary. The walk therefore descends into
+    /// every consumed dependency, with the dependency's
+    /// own recorded arguments deciding which of ITS
+    /// dependencies were consumed. `None` when every
+    /// dynamic dependency the binary loads still stands.
     fn missing_dynamic_dependency(
         &self,
         artifact: &ToolArtifact,
     ) -> Option<std::path::PathBuf> {
-        for (spec, pin) in artifact
-            .aux_specs
-            .iter()
-            .zip(artifact.aux_pins.iter())
-            .rev()
-        {
-            let Some((path, dep)) = self.entry_for_spec(spec, pin) else {
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        self.missing_dynamic_dependency_in(artifact, &mut seen)
+    }
+
+    fn missing_dynamic_dependency_in(
+        &self,
+        artifact: &ToolArtifact,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        // The names this build bound, in the order the
+        // loader reaches them: the recorded order reversed,
+        // each name once.
+        let mut names: Vec<&str> = Vec::new();
+        for spec in artifact.aux_specs.iter().rev() {
+            let name = spec.split('=').next().unwrap_or("");
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for name in names {
+            // Every recorded form of this name the build's
+            // specs resolve to.
+            let mut forms: Vec<(std::path::PathBuf, ToolArtifact)> = Vec::new();
+            for (spec, pin) in artifact
+                .aux_specs
+                .iter()
+                .zip(artifact.aux_pins.iter())
+            {
+                if spec.split('=').next().unwrap_or("") == name {
+                    if let Some(entry) = self.entry_for_spec(spec, pin) {
+                        forms.push(entry);
+                    }
+                }
+            }
+            let Some((path, dep)) = consumed_form(artifact, &forms) else {
                 continue;
             };
             if matches!(dep.crate_type.as_deref(), Some("dylib") | Some("cdylib"))
                 && !path.is_file()
             {
                 return Some(path);
+            }
+            if dep.crate_type.as_deref() != Some("proc-macro")
+                && seen.insert(path.clone())
+            {
+                if let Some(missing) =
+                    self.missing_dynamic_dependency_in(&dep, seen)
+                {
+                    return Some(missing);
+                }
             }
         }
         None
@@ -521,6 +580,57 @@ fn aux_spec_for(name: &str, artifact: &ToolArtifact) -> String {
         spec += ";force-unstable=yes";
     }
     spec
+}
+
+/// Whether a forwarded rustc argument list carries
+/// `-C prefer-dynamic` (the `--codegen` long spelling
+/// included), in either its glued one-token spelling or
+/// the split option + name pair.
+fn carried_prefer_dynamic(args: &[String]) -> bool {
+    let mut prev_codegen = false;
+    for arg in args {
+        if arg == "-Cprefer-dynamic"
+            || arg == "--codegen=prefer-dynamic"
+            || (prev_codegen && arg == "prefer-dynamic")
+        {
+            return true;
+        }
+        prev_codegen = arg == "-C" || arg == "--codegen";
+    }
+    false
+}
+
+/// The recorded form of one dependency that the build of
+/// `artifact` actually linked, among the forms its specs
+/// for the name resolve to (`forms`): the dylib form when
+/// the build preferred dynamic linking and one stands,
+/// otherwise the static form (an rlib, a staticlib, or a
+/// build that recorded no crate type -- a library built
+/// without naming one stands as an rlib) when one stands,
+/// otherwise the dylib form, a name offered in only one
+/// form being consumed in that form. `None` when no
+/// linkable form stands (a name offered only as a
+/// proc-macro is consumed by the compiler at build time,
+/// never by the binary's link).
+fn consumed_form(
+    artifact: &ToolArtifact,
+    forms: &[(std::path::PathBuf, ToolArtifact)],
+) -> Option<(std::path::PathBuf, ToolArtifact)> {
+    let dynamic = forms.iter().find(|(_, a)| {
+        matches!(a.crate_type.as_deref(), Some("dylib") | Some("cdylib"))
+    });
+    let static_form = forms.iter().find(|(_, a)| {
+        matches!(
+            a.crate_type.as_deref(),
+            Some("rlib") | Some("staticlib") | None
+        )
+    });
+    let chosen = if carried_prefer_dynamic(&artifact.rustc_args) {
+        dynamic.or(static_form)
+    } else {
+        static_form.or(dynamic)
+    };
+    chosen.map(|(path, a)| (path.clone(), cloned_artifact(a)))
 }
 
 /// Whether a forwarded rustc argument list carries
@@ -808,6 +918,77 @@ pub(crate) fn read_guest_env_file(path: &std::path::Path) -> std::io::Result<Vec
         env.push((key, value));
     }
     Ok(env)
+}
+
+/// Write a run's guest arguments to a fresh private
+/// temporary file (see `create_private_temp_file`), in the
+/// length-prefixed binary form `read_guest_args_file`
+/// reads: a sequence of u32-LE-length-prefixed byte
+/// strings, one per argument, in invocation order. This is
+/// the channel for an argument that is not valid UTF-8: the
+/// command line of a conversion subprocess is text in this
+/// driver's plumbing, so such an argument cannot travel on
+/// it without changing its bytes, while the file carries
+/// it unchanged (the guest environment file's standing
+/// solution to the same problem). Returns the file's path;
+/// the caller removes it once the run is over.
+fn write_guest_args_file(args: &[Vec<u8>]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    for arg in args {
+        buf.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+        buf.extend_from_slice(arg);
+    }
+    let (path, mut file) = create_private_temp_file("guest-args")?;
+    if let Err(e) = file.write_all(&buf) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// Read back a file `write_guest_args_file` wrote.
+pub(crate) fn read_guest_args_file(path: &std::path::Path) -> std::io::Result<Vec<Vec<u8>>> {
+    let buf = std::fs::read(path)?;
+    let mut args = Vec::new();
+    let mut at = 0usize;
+    while at < buf.len() {
+        let len_bytes = buf.get(at..at + 4).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated args file")
+        })?;
+        at += 4;
+        let n = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let bytes = buf.get(at..at + n).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated args file")
+        })?;
+        at += n;
+        args.push(bytes.to_vec());
+    }
+    Ok(args)
+}
+
+/// Append a spawn request's guest arguments to a conversion
+/// subprocess's command line: as `--guest-arg` values when
+/// every argument is valid UTF-8, and otherwise as one
+/// `--guest-args-file` naming a file that carries the whole
+/// list byte for byte (see `write_guest_args_file`). Returns
+/// the arguments file's path when one was written, for the
+/// caller to remove once the run is over.
+fn push_guest_args(
+    tail: &mut Vec<String>,
+    args: &[Vec<u8>],
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    if args.iter().all(|arg| std::str::from_utf8(arg).is_ok()) {
+        for arg in args {
+            tail.push("--guest-arg".to_string());
+            tail.push(String::from_utf8_lossy(arg).into_owned());
+        }
+        return Ok(None);
+    }
+    let path = write_guest_args_file(args)?;
+    tail.push("--guest-args-file".to_string());
+    tail.push(path.display().to_string());
+    Ok(Some(path))
 }
 
 /// Replace this process's environment with the complete
@@ -1960,22 +2141,19 @@ pub(crate) fn artifact_run(
     tail.push(env_path.display().to_string());
     tail.push("--guest-program-name".to_string());
     tail.push(program_name);
-    // The arguments travel as command-line strings, and
-    // the interpreter's argument model holds text: an
-    // argument that is not valid UTF-8 cannot be carried
-    // without changing its bytes, so the invocation is
-    // unsupported rather than silently lossy.
-    for arg in &request.args {
-        if std::str::from_utf8(arg).is_err() {
+    // The arguments travel as command-line strings, or in
+    // an arguments file when one is not valid UTF-8 (see
+    // `push_guest_args`).
+    let args_path = match push_guest_args(&mut tail, &request.args) {
+        Ok(path) => path,
+        Err(e) => {
             let _ = std::fs::remove_file(&stderr_path);
             let _ = std::fs::remove_file(&env_path);
             return Err(format!(
-                "tool interception: running artifact `{program}`: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
+                "tool interception: running artifact `{program}`: cannot record the guest arguments: {e}"
             ));
         }
-        tail.push("--guest-arg".to_string());
-        tail.push(String::from_utf8_lossy(arg).into_owned());
-    }
+    };
     let outcome = run_convert_subprocess(
         exe,
         &tail,
@@ -1986,6 +2164,9 @@ pub(crate) fn artifact_run(
     let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stderr_path);
     let _ = std::fs::remove_file(&env_path);
+    if let Some(path) = &args_path {
+        let _ = std::fs::remove_file(path);
+    }
     let (code, stdout, stderr) = outcome?;
     if code == 2 {
         // Exit 2 is both the subprocess's driver-failure code
@@ -2110,28 +2291,28 @@ pub(crate) fn self_run(
     // this spawn wired as its stdout, as a native child's
     // would (see `InterpConfig::stdout_sink`).
     tail.push("--guest-stdout-passthrough".to_string());
-    // The arguments travel as command-line strings, as in
-    // `artifact_run`: an argument that is not valid UTF-8
-    // cannot be carried without changing its bytes, so the
-    // invocation is unsupported rather than silently lossy.
-    for arg in &request.args {
-        if std::str::from_utf8(arg).is_err() {
+    // The arguments travel as command-line strings, or in
+    // an arguments file when one is not valid UTF-8, as in
+    // `artifact_run` (see `push_guest_args`).
+    let args_path = match push_guest_args(&mut tail, &request.args) {
+        Ok(path) => path,
+        Err(e) => {
             let _ = std::fs::remove_file(&stderr_path);
             let _ = std::fs::remove_file(&env_path);
-            return Err(
-                "self spawn: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
-                    .to_string(),
-            );
+            return Err(format!(
+                "self spawn: cannot record the guest arguments: {e}"
+            ));
         }
-        tail.push("--guest-arg".to_string());
-        tail.push(String::from_utf8_lossy(arg).into_owned());
-    }
+    };
     let start_dir = std::env::current_dir()
         .map_err(|e| format!("self spawn: no working directory: {e}"))?;
     let outcome = run_convert_subprocess(exe, &tail, &start_dir, false, &[]);
     let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stderr_path);
     let _ = std::fs::remove_file(&env_path);
+    if let Some(path) = &args_path {
+        let _ = std::fs::remove_file(path);
+    }
     let (code, stdout, stderr) = outcome?;
     if code == 2 {
         // As in `artifact_run`: exit 2 is both the

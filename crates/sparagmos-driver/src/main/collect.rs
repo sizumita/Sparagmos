@@ -1599,6 +1599,7 @@ fn collect() -> ControlFlow<()> {
     // precedence), the collector verdicts `mono_check` replays
     // over the instances it collects (the required-constant
     // evaluation, the per-instance `check_mono_item` checks, the
+    // missing-MIR verdict for auxiliary crates, the
     // duplicate-symbol verdict, the common-linkage verdict, the
     // panic-runtime validation and the LTO / prefer-dynamic
     // session validation; also collection-time
@@ -1831,6 +1832,7 @@ fn collect() -> ControlFlow<()> {
         extra_static_seeds: conv.extra_static_seeds.clone(),
         init_constructors: conv.init_constructors.clone(),
         static_tys: conv.static_tys_mir.clone(),
+        static_aligns: conv.static_aligns.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
         mat_plans: conv.mat_plans.clone(),

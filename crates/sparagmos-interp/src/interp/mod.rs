@@ -205,11 +205,13 @@ pub struct InterpConfig {
     pub thread_stack_size: usize,
     /// The guest program's command-line arguments after argv[0]
     /// (the run-flags a test prescribes), as handed to the driver
-    /// through its `--guest-arg` options. The `env::args` /
-    /// `env::args_os` runtime support reads them from here;
-    /// argv[0] itself is the interpreter's policy, not part of
-    /// this list.
-    pub guest_args: Vec<String>,
+    /// through its `--guest-arg` options. The arguments are raw
+    /// bytes: a guest argument need not be valid UTF-8 (a
+    /// self-spawned child can carry one, see issue #515), and
+    /// the `env::args` / `env::args_os` runtime support reads
+    /// them from here; argv[0] itself is the interpreter's
+    /// policy, not part of this list.
+    pub guest_args: Vec<Vec<u8>>,
     /// The guest program's argv[0]: the path the program was
     /// invoked as. The driver sets it to the source path it was
     /// handed (the stand-in for the compiled binary's path: a
@@ -240,6 +242,20 @@ pub struct InterpConfig {
     /// non-unwinding line) never appears. Defaults to `false`
     /// (the unwind strategy).
     pub panic_abort: bool,
+    /// Whether the entry shim frame (the
+    /// `<fn() as FnOnce<()>>::call_once` frame `lang_start`
+    /// calls the entry function pointer through) appears
+    /// below the entry frame in a short backtrace, as the
+    /// driver resolved it from the compilation's flags.
+    /// Natively the shim is a real frame in an unoptimised
+    /// build; an optimising build inlines it into
+    /// `__rust_begin_short_backtrace`, where it leaves no
+    /// frame of its own unless debug info lets the
+    /// backtrace printer reconstruct the inlined frame.
+    /// The frame is therefore visible exactly when the
+    /// build is unoptimised or carries debug info.
+    /// Defaults to `true` (the unoptimised shape).
+    pub entry_shim_visible: bool,
     /// The guest's `SIGPIPE` setup, as the driver
     /// resolved it from the compilation's flags (see
     /// [`SigpipeInit`]). The disposition it names is
@@ -282,6 +298,7 @@ impl Default for InterpConfig {
             program_path: String::new(),
             overflow_checks: true,
             panic_abort: false,
+            entry_shim_visible: true,
             sigpipe: SigpipeInit::Default,
             tool_interception: None,
             process_host: None,
@@ -1547,7 +1564,7 @@ impl<'a> Interpreter<'a> {
 
     /// The guest program's command-line arguments after argv[0],
     /// as configured for this run (see [`InterpConfig::guest_args`]).
-    pub fn guest_args(&self) -> &[String] {
+    pub fn guest_args(&self) -> &[Vec<u8>] {
         &self.config.guest_args
     }
 
@@ -1560,6 +1577,13 @@ impl<'a> Interpreter<'a> {
     /// (see the `overflow_checks` field of `InterpConfig`).
     pub fn overflow_checks(&self) -> bool {
         self.config.overflow_checks
+    }
+
+    /// Whether the entry shim frame appears below the
+    /// entry frame in a short backtrace (see the
+    /// `entry_shim_visible` field of `InterpConfig`).
+    pub fn entry_shim_visible(&self) -> bool {
+        self.config.entry_shim_visible
     }
 
     /// The overflow-checks setting in force for an operation

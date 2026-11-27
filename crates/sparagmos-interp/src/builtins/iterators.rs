@@ -2430,6 +2430,21 @@ impl<'a> Interpreter<'a> {
                     Value::Str(text) => os_string_value(text.as_bytes()),
                     other => other,
                 })
+            } else if self_ty_is(self_ty, "std::env::Args") {
+                // An element carried in the `OsString` form is
+                // an argument that is not valid UTF-8; std's
+                // `Args::next` converts each element with an
+                // unwrap, so stepping over one panics in the
+                // guest, exactly as natively.
+                match item {
+                    Some(Value::Str(_)) | None => item,
+                    Some(_) => {
+                        return Err(InterpError::Panic {
+                            message: "called `Result::unwrap()` on an `Err` value: argument is not valid Unicode".to_string(),
+                            payload: None,
+                        })
+                    }
+                }
             } else {
                 item
             };
@@ -7268,8 +7283,15 @@ pub fn iterator_consumer_modelled(self_ty: &str) -> bool {
 /// Whether the modelled `DoubleEndedIterator::next_back` step
 /// transitions this iterator type's state directly: the leaf
 /// shapes of `iterator_next_back_state` plus the `IterMut`
-/// state the back step serves in `next_back_on_state`. Adapter
-/// types are absent on purpose — their collected bodies
+/// state the back step serves in `next_back_on_state`. The
+/// string `Drain` state is served there too (through
+/// `string_drain_next_state`, which normalizes a storage-backed
+/// `Chars` state before stepping it); its collected body is
+/// not the primary execution, because the body forwards the
+/// drain's stored `Chars` state to the `Chars` back step
+/// without that normalization, and the step's snapshot reader
+/// cannot read storage-backed pointers. Adapter types are
+/// absent on purpose — their collected bodies
 /// compose the modelled steps and stay the primary execution
 /// (see `consumer_instance_needs_body` in the driver).
 pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
@@ -7316,6 +7338,8 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
+        || self_ty.starts_with("std::string::Drain")
+        || self_ty.starts_with("alloc::string::Drain")
     {
         return true;
     }
@@ -7593,6 +7617,19 @@ fn iterator_next_back_state(
                 Value::Str(text) => os_string_value(text.as_bytes()),
                 other => other,
             })
+        } else if self_ty_is(self_ty, "std::env::Args") {
+            // As in the front step: an element in the
+            // `OsString` form is not valid UTF-8, and std's
+            // conversion panics on it.
+            match item {
+                Some(Value::Str(_)) | None => item,
+                Some(_) => {
+                    return Err(InterpError::Panic {
+                        message: "called `Result::unwrap()` on an `Err` value: argument is not valid Unicode".to_string(),
+                        payload: None,
+                    })
+                }
+            }
         } else {
             item
         };

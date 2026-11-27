@@ -4072,6 +4072,109 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
     );
 }
 
+const OS_STRING_FROM_PATHBUF_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+fn main() {
+    // `OsString: From<PathBuf>` hands the path's bytes to
+    // the OS string, whichever shape the path value was
+    // built in: pushed, joined, converted from a `String`,
+    // wrapped around a real aggregate `OsString`, or read
+    // back out of a vector of paths.
+    let mut p = PathBuf::from("/tmp");
+    p.push("alpha");
+    p.push("beta.txt");
+    let o = OsString::from(p);
+    println!("{:?} len={} eq={}", o, o.len(), o == OsString::from("/tmp/alpha/beta.txt"));
+    let j = PathBuf::from("/base").join("x").join("y");
+    let oj: OsString = j.into();
+    println!("{:?} len={}", oj, oj.len());
+    let s = PathBuf::from(String::from("hello/world"));
+    let os = OsString::from(s);
+    println!("{:?} len={}", os, os.len());
+    let mut a = OsString::with_capacity(16);
+    a.push("real/path");
+    let oa = OsString::from(PathBuf::from(a));
+    println!("{:?} len={}", oa, oa.len());
+    let v: Vec<PathBuf> = vec![PathBuf::from("one"), PathBuf::from("two/three")];
+    for p in v {
+        let o = OsString::from(p);
+        println!("{:?} len={}", o, o.len());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_pathbuf() {
+    run_ok(
+        "os-string-from-pathbuf",
+        OS_STRING_FROM_PATHBUF_SRC,
+        "\"/tmp/alpha/beta.txt\" len=19 eq=true\n\"/base/x/y\" len=9\n\"hello/world\" len=11\n\"real/path\" len=9\n\"one\" len=3\n\"two/three\" len=9\n",
+    );
+}
+
+const OS_STRING_FROM_REF_PATH_STRING_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // The borrowed conversions clone: `From<&Path>` (a
+    // path literal and a buffer's `as_path`) and
+    // `From<&String>` (the source string is untouched).
+    let o = OsString::from(Path::new("/a/b"));
+    println!("{:?} len={}", o, o.len());
+    let pb = PathBuf::from("/c/d");
+    let o2 = OsString::from(pb.as_path());
+    println!("{:?} len={} eq={}", o2, o2.len(), o2 == OsString::from("/c/d"));
+    let s = String::from("refstr");
+    let o3 = OsString::from(&s);
+    println!("{:?} len={} eq={}", o3, o3.len(), o3 == OsString::from("refstr"));
+    println!("src={}", s);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_ref_path_and_string() {
+    run_ok(
+        "os-string-from-ref-path-string",
+        OS_STRING_FROM_REF_PATH_STRING_SRC,
+        "\"/a/b\" len=4\n\"/c/d\" len=4 eq=true\n\"refstr\" len=6 eq=true\nsrc=refstr\n",
+    );
+}
+
+const OS_STRING_FROM_COW_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // `From<Cow<'_, OsStr>>` for `OsString` and
+    // `From<Cow<'_, Path>>` for `PathBuf` are `into_owned`:
+    // the borrowed variant clones the bytes, the owned
+    // variant hands its buffer over.
+    let borrowed: Cow<'_, OsStr> = Cow::Borrowed(OsStr::new("cowb"));
+    let o = OsString::from(borrowed);
+    println!("{:?} len={}", o, o.len());
+    let owned: Cow<'_, OsStr> = Cow::Owned(OsString::from("cowo"));
+    let o2 = OsString::from(owned);
+    println!("{:?} len={}", o2, o2.len());
+    let bp: Cow<'_, Path> = Cow::Borrowed(Path::new("cpb"));
+    println!("{:?}", PathBuf::from(bp));
+    let op: Cow<'_, Path> = Cow::Owned(PathBuf::from("cpo"));
+    println!("{:?}", PathBuf::from(op));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_cow() {
+    run_ok(
+        "os-string-from-cow",
+        OS_STRING_FROM_COW_SRC,
+        "\"cowb\" len=4\n\"cowo\" len=4\n\"cpb\"\n\"cpo\"\n",
+    );
+}
+
 const OS_STRING_INTO_BOXED_OS_STR_SRC: &str = r#"
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -4449,5 +4552,174 @@ fn run_mode_os_string_copy_from_wrapper_place() {
         "os-string-copy-from-wrapper-place",
         OS_STRING_COPY_WRAPPER_SRC,
         "eq0: true\nlen0: 11\nlossy0: hello-world\n",
+    );
+}
+
+const STRING_DRAIN_NEXT_BACK_STORAGE_SRC: &str = r#"
+fn main() {
+    let mut j = ["a", "b", "c"].join("/");
+    let mut dj = j.drain(0..1);
+    println!("{:?}", dj.next_back());
+    println!("{:?}", dj.next_back());
+    std::mem::forget(dj);
+    println!("[{}]", j);
+    let mut c = ["a/", "b/", "c"].concat();
+    let mut dc = c.drain(0..1);
+    println!("{:?}", dc.next_back());
+    println!("{:?}", dc.next_back());
+    std::mem::forget(dc);
+    println!("[{}]", c);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_storage_backed() {
+    // A drain over a join/concat-built string holds a `Chars`
+    // state whose byte pointers denote the string's own
+    // storage. The back step is served by the modelled state
+    // machine (as the front step is), which snapshots the
+    // remaining bytes through the pointers before stepping;
+    // the collected `Drain::next_back` body forwarded the
+    // stored storage-backed state to the `Chars` back step
+    // directly, and its snapshot reader only reads value
+    // snapshots. The drained range is the first byte, the one
+    // element whose stored form is plain, so the step is
+    // judged on the pointer form alone. The drain values are
+    // forgotten: the drop-side removal over a join/concat
+    // string is a separate consumer.
+    run_ok(
+        "string-drain-next-back-storage-backed",
+        STRING_DRAIN_NEXT_BACK_STORAGE_SRC,
+        "Some('a')\nNone\n[a/b/c]\nSome('a')\nNone\n[a/b/c]\n",
+    );
+}
+
+const STRING_DRAIN_NEXT_BACK_VALUE_SRC: &str = r#"
+fn main() {
+    let mut m = String::new();
+    m.push_str("a/b/c");
+    {
+        let mut d = m.drain(1..4);
+        println!("{:?}", d.next_back());
+    }
+    println!("[{}]", m);
+}
+"#;
+
+#[test]
+fn run_mode_string_drain_next_back_value_snapshot() {
+    // The same back step over a push-built string, whose
+    // drain state already denotes a value snapshot: the
+    // modelled route serves it identically, and the drain's
+    // drop still removes the stepped range.
+    run_ok(
+        "string-drain-next-back-value-snapshot",
+        STRING_DRAIN_NEXT_BACK_VALUE_SRC,
+        "Some('/')\n[ac]\n",
+    );
+}
+
+const JOIN_BUILT_MUTATE_SRC: &str = r#"
+use std::cmp::Ordering;
+use std::path::PathBuf;
+fn main() {
+    let mut s = ["a", "b"].join("/");
+    s.push('x');
+    println!("{}", s);
+    s.push_str("yz");
+    println!("{}", s);
+    let mut c = ["a", "b"].concat();
+    c.push('x');
+    println!("{}", c);
+    assert_eq!(s, "a/bxyz");
+    assert_eq!(s.len(), 6);
+    assert_eq!(s.cmp(&String::from("a/bxyz")), Ordering::Equal);
+    let p = PathBuf::from(s.clone());
+    println!("{:?}", p);
+    let mut i = ["he", "llo"].join("");
+    i.insert(0, 'X');
+    i.insert_str(6, "!");
+    println!("{}", i);
+    let mut r = ["a", "b", "c"].join("/");
+    r.replace_range(0..1, "z");
+    let ch = r.remove(4);
+    println!("{} {}", r, ch);
+    let mut a = ["a", "b"].join("/");
+    a += "zz";
+    println!("{}", a);
+}
+"#;
+
+#[test]
+fn run_mode_join_built_string_mutations() {
+    // A `join` / `concat` result stored in a place is the
+    // vector's element form (the elements past the first keep
+    // the `MaybeUninit` union wrapper), which the mutation
+    // path's place read must denominate like the operand
+    // readers do; the write-back is the abstract form, so the
+    // downstream readers (equality, ordering, `PathBuf::from`)
+    // see the mutated text. The expected text is native output.
+    run_ok(
+        "join-built-mutate",
+        JOIN_BUILT_MUTATE_SRC,
+        "a/bx\na/bxyz\nabx\n\"a/bxyz\"\nXhello!\nz/b/ c\na/bzz\n",
+    );
+}
+
+const JOIN_BUILT_TEXT_AT_SRC: &str = r#"
+fn main() {
+    let mut l = ["a", "b", "c"].join("/");
+    l.retain(|ch| ch != 'b');
+    println!("{}", l);
+    let mut m = ["a", "b", "c"].join("/");
+    {
+        let _dr = m.drain(0..2);
+    }
+    println!("{}", m);
+    let mut t = ["a", "b", "c"].join("/");
+    t.truncate(3);
+    let p = t.pop();
+    println!("{} {:?}", t, p);
+    let tail = t.split_off(2);
+    println!("{} {}", t, tail);
+}
+"#;
+
+#[test]
+fn run_mode_join_built_string_retain_and_drain_drop() {
+    // The read-only place read behind `retain` (and the
+    // removal a dropped `Drain` performs through the mutation
+    // path) shares the mutation read's composition, so a
+    // stored `join` result serves both. The expected text is
+    // native output.
+    run_ok(
+        "join-built-text-at",
+        JOIN_BUILT_TEXT_AT_SRC,
+        "a//c\nb/c\na/ Some('b')\na/ \n",
+    );
+}
+
+const VEC_FROM_JOIN_SRC: &str = r#"
+fn main() {
+    // `Vec<u8>: From<String>` is `String::into_bytes`: the
+    // bytes of a join-built (real aggregate) string as the
+    // vector's elements, consumable downstream like any
+    // other byte vector.
+    let v: Vec<u8> = Vec::from(["ab", "cd"].join("-"));
+    println!("{}|{:?}", v.len(), v);
+    let w: Vec<u8> = ["a", "b"].join("/").into();
+    println!("{:?}", w);
+    let back = String::from_utf8(v).unwrap();
+    println!("{}", back);
+    println!("vec-from-join-ok");
+}
+"#;
+
+#[test]
+fn run_mode_vec_u8_from_join_built_string() {
+    run_ok(
+        "vec-from-join",
+        VEC_FROM_JOIN_SRC,
+        "5|[97, 98, 45, 99, 100]\n[97, 47, 98]\nab-cd\nvec-from-join-ok\n",
     );
 }
