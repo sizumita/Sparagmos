@@ -399,6 +399,7 @@ impl<'a> Interpreter<'a> {
             concrete,
             traits,
             drop_glue,
+            type_id,
             ..
         } = head_value
         else {
@@ -412,6 +413,9 @@ impl<'a> Interpreter<'a> {
             concrete,
             traits,
             drop_glue,
+            // The swap re-bases the same concrete type on the
+            // loaded pointee: its TypeId segments carry over.
+            type_id,
         };
         let mut probe = arg_values.to_vec();
         probe[0] = swapped.clone();
