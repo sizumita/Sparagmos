@@ -381,6 +381,25 @@ denominator. Runs on every push to `main` and on manual dispatch.
   reproduces the reference compiler's crash, and the record
   judges that reproduction against the status the test
   declares for it.
+- A compile-check view compiletest compiles in check mode
+  (`--emit=metadata`: a UI view carrying `check-pass` or
+  `check-fail`, a UI view with no pass/fail/run directive —
+  compiletest's UI default is check-fail — or an incremental
+  `cpass` revision) is judged on the metadata-visible
+  verdicts only. The reference check compilation never runs
+  the monomorphization collector or code generation, so the
+  driver's codegen-level verdicts — the collector walk's
+  required-constant and `check_mono_item` findings, the
+  duplicate-symbol, common-linkage, panic-runtime and
+  LTO/prefer-dynamic verdicts, the unshimmed-intrinsic
+  verdict, and the SIMD / atomic / layout body checks — are
+  computed and printed as notes but do not fail the
+  compilation; each was verified against the pinned compiler
+  to stay silent under `--emit=metadata` while firing in a
+  full build (issue #509). The runner passes
+  `--compiletest-check-mode` for such views; build-mode
+  views (build-pass / build-fail / run modes) and every
+  other suite keep the full verdict chain.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact

@@ -2025,7 +2025,8 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             captured["rustc_args"] = list(rustc_args)
             captured["aux_libs"] = list(aux_libs)
             captured["capture_stdout"] = capture_stdout
@@ -2128,7 +2129,8 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             calls.append(list(rustc_args))
             return conv()
 
@@ -2151,7 +2153,8 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             calls.append(list(rustc_args))
             for rev, res in by_rev.items():
                 if rev in rustc_args or \
@@ -2381,7 +2384,8 @@ class ProcessStage2Tests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -2654,6 +2658,14 @@ class ConvertSideTests(unittest.TestCase):
         finally:
             run.run_cmd = orig
 
+    def test_check_mode_adds_driver_option(self):
+        argv, out = self.run_argv(check_mode=True)
+        self.assertIn("--compiletest-check-mode", argv)
+
+    def test_check_mode_absent_by_default(self):
+        argv, out = self.run_argv()
+        self.assertNotIn("--compiletest-check-mode", argv)
+
     def test_not_demanded_lines_are_parsed(self):
         out = self.run_stdout(
             "sparagmos-driver: t.rs (Stable MIR, 1.100.0)\n"
@@ -2796,7 +2808,8 @@ class ProcessStage2AuxTests(unittest.TestCase):
 
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -3160,7 +3173,8 @@ class ProcessStage2RevisionTests(unittest.TestCase):
         orig = run.convert_side
         def stub(path, edition, driver_bin, rustc_args=(),
                  aux_specs=(), env_extra=None, env_remove=(),
-                 jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                 jit=False, aux_env_scrub=(), capture_stdout=False,
+                 aux_libs=(), check_mode=False):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -4088,7 +4102,8 @@ class ProcMacroExternTests(unittest.TestCase):
 
         def capture(path, edition, driver_bin, rustc_args=(),
                     aux_specs=(), env_extra=None, env_remove=(),
-                    jit=False, aux_env_scrub=(), capture_stdout=False, aux_libs=()):
+                    jit=False, aux_env_scrub=(), capture_stdout=False,
+                    aux_libs=(), check_mode=False):
             seen["args"] = list(rustc_args)
             return conv()
 
@@ -4122,7 +4137,7 @@ class ProcMacroExternTests(unittest.TestCase):
         def capture(path, edition, driver_bin, rustc_args=(),
                     aux_specs=(), env_extra=None, env_remove=(),
                     jit=False, aux_env_scrub=(), capture_stdout=False,
-                    aux_libs=()):
+                    aux_libs=(), check_mode=False):
             seen["args"] = list(rustc_args)
             return conv(exit_code=1, compilation_failed=True)
 
@@ -4148,6 +4163,42 @@ class ProcMacroExternTests(unittest.TestCase):
                                    stage2=True)
             self.assertEqual(res["status"], "pass")
             self.assertNotIn("--check-cfg", seen["args"])
+        finally:
+            run.convert_side = orig
+
+    def test_stage2_attempt_passes_check_mode_for_check_views(
+            self):
+        # A check-pass view is a compiletest check compilation:
+        # stage 2 hands the driver --compiletest-check-mode via
+        # convert_side's check_mode (issue #509). A build-fail
+        # view is a full build and does not get it.
+        rec = {"suite": "ui", "path": "tests/ui/t.rs",
+               "nature": "compile-check", "single_file": True,
+               "ffi": False, "env_excluded": False}
+        seen = {}
+        orig = run.convert_side
+
+        def capture(path, edition, driver_bin, rustc_args=(),
+                    aux_specs=(), env_extra=None, env_remove=(),
+                    jit=False, aux_env_scrub=(), capture_stdout=False,
+                    aux_libs=(), check_mode=False):
+            seen["check_mode"] = check_mode
+            if check_mode:
+                return conv()
+            return conv(exit_code=1, compilation_failed=True)
+
+        run.convert_side = capture
+        try:
+            self.write("t.rs", "//@ check-pass\nfn main() {}\n")
+            res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                                   stage2=True)
+            self.assertEqual(res["status"], "pass")
+            self.assertTrue(seen["check_mode"])
+            self.write("t.rs", "//@ build-fail\nfn main() {}\n")
+            res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                                   stage2=True)
+            self.assertEqual(res["status"], "pass")
+            self.assertFalse(seen["check_mode"])
         finally:
             run.convert_side = orig
 
@@ -4997,6 +5048,49 @@ class JitSideTests(unittest.TestCase):
                                Path("/fake/driver"))
         self.assertEqual(seen[0][1], "t.rs")
         self.assertIsNone(out["jit_compiled"])
+
+
+class CompiletestCheckModeTests(unittest.TestCase):
+    """compiletest_check_mode: which views compiletest
+    compiles with --emit=metadata (issue #509)."""
+
+    def view(self, text):
+        return run.Header(text).view(None)
+
+    def test_check_pass_and_check_fail_are_check_mode(self):
+        self.assertTrue(run.compiletest_check_mode(
+            "ui", self.view("//@ check-pass\nfn main() {}\n")))
+        self.assertTrue(run.compiletest_check_mode(
+            "ui", self.view("//@ check-fail\nfn main() {}\n")))
+
+    def test_directive_less_ui_view_is_check_mode(self):
+        # compiletest's UI default is check-fail.
+        self.assertTrue(run.compiletest_check_mode(
+            "ui", self.view("fn main() {}\n")))
+
+    def test_build_modes_are_not_check_mode(self):
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ build-pass\nfn main() {}\n")))
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ build-fail\nfn main() {}\n")))
+
+    def test_run_modes_are_not_check_mode(self):
+        self.assertFalse(run.compiletest_check_mode(
+            "ui", self.view("//@ run-pass\nfn main() {}\n")))
+
+    def test_incremental_cpass_is_check_mode(self):
+        h = run.Header("//@ revisions: cpass1 bfail1\n"
+                       "fn main() {}\n")
+        self.assertTrue(run.compiletest_check_mode(
+            "incremental", h.view("cpass1")))
+        self.assertFalse(run.compiletest_check_mode(
+            "incremental", h.view("bfail1")))
+
+    def test_other_suites_are_not_check_mode(self):
+        self.assertFalse(run.compiletest_check_mode(
+            "mir-opt", self.view("//@ check-pass\nfn main() {}\n")))
+        self.assertFalse(run.compiletest_check_mode(
+            "crashes", self.view("fn main() {}\n")))
 
 
 class SparagmosSideExitCodeTests(unittest.TestCase):

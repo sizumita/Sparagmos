@@ -165,6 +165,25 @@
 //!   relocation (a pointer constant is not a zero
 //!   initializer) or a non-zero byte.
 //!
+//! - Check mode: when the compilation being judged is a
+//!   compiletest check compilation (`--emit=metadata` — a
+//!   `check-pass` / `check-fail` test, or an incremental
+//!   `cpass` revision), the collector and code generation
+//!   never run in the reference compilation, so the verdicts
+//!   above that replay them cannot decide it: the
+//!   required-constant walk, the `check_mono_item` forces,
+//!   the duplicate-symbol, common-linkage, panic-runtime and
+//!   LTO / prefer-dynamic verdicts, the unshimmed-intrinsic
+//!   verdict, and the body checks (SIMD / atomic / layout).
+//!   Each was verified against the pinned compiler to stay
+//!   silent under `--emit=metadata` while firing in a full
+//!   build (Issue #509). In check mode the driver computes
+//!   the session-level ones and reports them as notes, and
+//!   the verdict rests on the metadata-visible findings:
+//!   the materialization-lint finding above and the
+//!   generic-export verdict (which does fire under
+//!   `--emit=metadata`). See `set_check_mode`.
+//!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
 //! positively present, mirroring the corresponding rustc error.
@@ -1505,6 +1524,37 @@ pub fn check_required_consts() -> Option<String> {
              above)"
         ));
     }
+    if check_mode() {
+        // A check compilation never runs the collector, so
+        // the walk does not run either: its findings replay
+        // collector work, and its constant evaluations emit
+        // the very diagnostics the check compilation cannot
+        // produce. (Its crash witnessing belongs to the
+        // collector replay too; conversion's own crash
+        // containment is unaffected.) The generic-export
+        // verdict is metadata-visible, so it still decides;
+        // the session-level codegen verdicts are computed
+        // for the record and reported as notes. The
+        // duplicate-symbol verdict runs over the export
+        // roots alone — the collected-instance set is the
+        // walk's.
+        if let Some(finding) = generic_export_finding(tcx) {
+            return Some(finding);
+        }
+        let roots_only = std::collections::HashSet::new();
+        for finding in [
+            duplicate_symbol_finding(tcx, &roots_only),
+            common_linkage_finding(tcx),
+            panic_runtime_finding(tcx),
+            lto_prefer_dynamic_finding(tcx),
+        ] {
+            if let Some(finding) = finding {
+                note_check_mode_verdict(finding);
+            }
+        }
+        *MONO_ITEM_FINDING.lock().unwrap() = None;
+        return None;
+    }
     let mut walk = RequiredConstWalk {
         tcx,
         visited: std::collections::HashSet::new(),
@@ -1547,6 +1597,66 @@ static MONO_ITEM_FINDING: std::sync::Mutex<Option<String>> =
 /// `check_required_consts` call overwrites it regardless.
 pub fn take_mono_item_finding() -> Option<String> {
     MONO_ITEM_FINDING.lock().unwrap().take()
+}
+
+/// Whether this process judges a compiletest check
+/// compilation, set once from the driver's
+/// `--compiletest-check-mode` flag before the compiler runs
+/// (see `set_check_mode`).
+static CHECK_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this process judges a compiletest check
+/// compilation (`--emit=metadata`): the runner sets the flag
+/// for the views compiletest compiles in check mode
+/// (check-pass / check-fail and directive-less UI views,
+/// incremental `cpass` revisions). In check mode the
+/// codegen-level verdicts of this module are reported as
+/// notes instead of deciding the compilation, because the
+/// reference compilation never runs the monomorphization
+/// collector or code generation and cannot raise them
+/// (Issue #509).
+pub fn set_check_mode(on: bool) {
+    CHECK_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process judges a compiletest check
+/// compilation (see `set_check_mode`).
+pub fn check_mode() -> bool {
+    CHECK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The codegen-level verdicts a check-mode compilation
+/// computed but did not apply, in the order they were
+/// recorded; drained by `take_check_mode_notes`.
+static CHECK_MODE_NOTES: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a codegen-level verdict a check-mode compilation
+/// computed but did not apply (see `set_check_mode`).
+pub fn note_check_mode_verdict(finding: String) {
+    CHECK_MODE_NOTES.lock().unwrap().push(finding);
+}
+
+/// Divert a codegen-level verdict in check mode: the
+/// finding is recorded as a note and does not fail the
+/// compilation. Outside check mode the finding passes
+/// through unchanged.
+pub fn divert_check_mode(finding: Option<String>) -> Option<String> {
+    if check_mode() {
+        if let Some(finding) = finding {
+            note_check_mode_verdict(finding);
+        }
+        None
+    } else {
+        finding
+    }
+}
+
+/// The recorded check-mode notes (see
+/// `note_check_mode_verdict`), drained.
+pub fn take_check_mode_notes() -> Vec<String> {
+    std::mem::take(&mut *CHECK_MODE_NOTES.lock().unwrap())
 }
 
 /// The exported-symbol verdict over the crate's export roots,
