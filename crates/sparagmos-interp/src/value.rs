@@ -672,6 +672,62 @@ impl Value {
         }
     }
 
+    /// The unsigned integer formed by the first `width` bytes
+    /// of a byte-form scalar, little-endian: the scalar of
+    /// that width the string denotes when the string continues
+    /// past it (a snapshot of an allocation from the scalar
+    /// on, whose remaining bytes are the scalar's siblings).
+    /// `None` when the string is shorter than the width or
+    /// the width is no scalar width (1..=16 bytes).
+    pub fn bytes_prefix_as_uint(&self, width: usize) -> Option<u128> {
+        let Value::Bytes(bytes) = self else {
+            return None;
+        };
+        if width == 0 || width > 16 || bytes.len() < width {
+            return None;
+        }
+        let mut buf = [0u8; 16];
+        buf[..width].copy_from_slice(&bytes[..width]);
+        Some(u128::from_le_bytes(buf))
+    }
+
+    /// The signed integer formed by the first `width` bytes
+    /// of a byte-form scalar: the little-endian fold
+    /// sign-extended from `width`, the width the value was
+    /// stored at. `None` under the same condition as
+    /// [`Value::bytes_prefix_as_uint`].
+    pub fn bytes_prefix_as_int(&self, width: usize) -> Option<i128> {
+        let bits = self.bytes_prefix_as_uint(width)?;
+        let shift = (128 - 8 * width) as u32;
+        Some(((bits << shift) as i128) >> shift)
+    }
+
+    /// The unsigned integer a byte-form scalar denotes: the
+    /// little-endian fold of its bytes. Exact when the length
+    /// is one of the model's integer widths (1..=16 bytes): a
+    /// scalar read out of byte-form storage (a constant
+    /// allocation's pointee, above all) carries exactly its
+    /// own width's bytes, in the little-endian order every
+    /// other byte reading in the model uses. Any other length
+    /// is no scalar's representation and answers `None`.
+    pub fn bytes_as_uint(&self) -> Option<u128> {
+        let Value::Bytes(bytes) = self else {
+            return None;
+        };
+        self.bytes_prefix_as_uint(bytes.len())
+    }
+
+    /// The signed integer a byte-form scalar denotes: the
+    /// little-endian fold sign-extended from the byte string's
+    /// own length, the width the value was stored at. `None`
+    /// under the same condition as [`Value::bytes_as_uint`].
+    pub fn bytes_as_int(&self) -> Option<i128> {
+        let Value::Bytes(bytes) = self else {
+            return None;
+        };
+        self.bytes_prefix_as_int(bytes.len())
+    }
+
     /// Number of elements of an aggregate/byte/string value, for
     /// `Len` and index resolution. `Str` counts bytes, as MIR `Len`
     /// on a `str` place does.

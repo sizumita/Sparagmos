@@ -554,6 +554,43 @@ impl<'a> Interpreter<'a> {
             .retain(|cont| cont.callee_frame != frame.id);
     }
 
+    /// The switch bits of a discriminant held in its byte form
+    /// (a scalar read out of byte-form storage, which
+    /// `Value::switch_bits` cannot read on its own: the byte
+    /// string carries neither its signedness nor its width --
+    /// it may be the scalar's whole storage or an allocation
+    /// snapshot from the scalar on). The discriminant place's
+    /// own type supplies both: the scalar is the string's
+    /// first `width` bytes, read unsigned for an unsigned type
+    /// (bool included; char is a `Uint` in this IR) and
+    /// sign-extended from the width for a signed type --
+    /// exactly the canonical forms conversion normalises the
+    /// switch targets to. `None` when the operand names no
+    /// typed place or the type is no switch scalar, keeping
+    /// the caller's mismatch verdict.
+    fn switch_bits_of_byte_form(
+        &self,
+        body: &Body,
+        discr: &Operand,
+        value: &Value,
+    ) -> Option<u128> {
+        if !matches!(value, Value::Bytes(_)) {
+            return None;
+        }
+        let place = match discr {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return None,
+        };
+        match self.place_result_ty(body, place)? {
+            Ty::Uint(ut) => value.bytes_prefix_as_uint(ut.bits() as usize / 8),
+            Ty::Bool => value.bytes_prefix_as_uint(1),
+            Ty::Int(it) => value
+                .bytes_prefix_as_int(it.bits() as usize / 8)
+                .map(|v| v as u128),
+            _ => None,
+        }
+    }
+
     /// The run loop: execute until the frame stack shrinks to
     /// `stop_depth`, then return the value the frame that was on
     /// top returned. The top-level [`Interpreter::run`] drives with
@@ -648,13 +685,18 @@ impl<'a> Interpreter<'a> {
                     otherwise,
                 } => {
                     let value = self.eval_operand(frames, body, discr)?;
-                    let bits = value.switch_bits().ok_or_else(|| {
-                        InterpError::type_mismatch(
-                            "SwitchInt discriminant",
-                            "integer or bool",
-                            value.kind_name(),
-                        )
-                    })?;
+                    let bits = match value.switch_bits() {
+                        Some(bits) => bits,
+                        None => self
+                            .switch_bits_of_byte_form(body, discr, &value)
+                            .ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "SwitchInt discriminant",
+                                    "integer or bool",
+                                    value.kind_name(),
+                                )
+                            })?,
+                    };
                     let target = match &dblock.switch {
                         // Sorted table with all-unique patterns:
                         // binary search finds the same target the
