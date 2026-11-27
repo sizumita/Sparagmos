@@ -33,6 +33,69 @@ fn code_int(seed: u64, offset: usize, bits: u32) -> u128 {
     value
 }
 
+/// Whether `items` (the slots of an array value) positively
+/// hold the model's scalar-packed form over the first `n`
+/// bytes: the first slot is one scalar, every later slot is
+/// uninitialised, and the scalar carries a nonzero byte past
+/// the first element's own width -- a genuinely written first
+/// element followed by uninitialised slots has no such byte,
+/// so the two shapes stay apart exactly where they disagree.
+/// A range inside the first element is the packed form's
+/// bytes under either reading and does not count as evidence.
+fn packed_scalar_form(items: &[Value], slot: usize, n: usize) -> bool {
+    if items.len() < 2 || n <= slot {
+        return false;
+    }
+    if scalar_storage_len(&items[0]).is_none() {
+        return false;
+    }
+    if items[1..].iter().any(|item| *item != Value::Uninit) {
+        return false;
+    }
+    (slot..n).any(|k| scalar_storage_byte(&items[0], k).is_some_and(|b| b != 0))
+}
+
+/// The first `n` bytes of a scalar-packed array value (see
+/// [`packed_scalar_form`]): the packed scalar's own storage
+/// bytes. `None` when the value is not positively the packed
+/// form, or a byte past the scalar's storage is asked for.
+fn packed_scalar_bytes(items: &[Value], slot: usize, n: usize) -> Option<Vec<u8>> {
+    if !packed_scalar_form(items, slot, n) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        out.push(scalar_storage_byte(&items[0], k)?);
+    }
+    Some(out)
+}
+
+/// A scalar element value constructed from its little-endian
+/// storage `bytes` under the element type `ty` (the read side
+/// of the scalar-packed form). `None` for a non-scalar type or
+/// a byte pattern the type rejects (a `char` out of range).
+fn scalar_elem_from_bytes(ty: &Ty, bytes: &[u8]) -> Option<Value> {
+    let mut buf = [0u8; 16];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let bits = u128::from_le_bytes(buf);
+    Some(match ty {
+        Ty::Bool => Value::Bool(bytes.first().copied().unwrap_or(0) != 0),
+        Ty::Uint(t) => Value::Uint(bits & t.max()),
+        Ty::Int(t) => Value::Int(wrap_signed(bits as i128, t.bits())),
+        Ty::Float(f) => match f {
+            crate::ir::FloatTy::F16 => {
+                Value::Float(crate::mir_convert::f16_to_f64(bits as u16))
+            }
+            crate::ir::FloatTy::F32 => {
+                Value::Float(crate::f128::f32_bits_to_f64_exact(bits as u32))
+            }
+            crate::ir::FloatTy::F64 => Value::Float(f64::from_bits(bits as u64)),
+            crate::ir::FloatTy::F128 => Value::Float128(bits),
+        },
+        _ => return None,
+    })
+}
+
 impl<'a> Interpreter<'a> {
     /// The base value a bulk byte operation reads at `target`:
     /// the resolved value, or -- for a pointer displaced into a
@@ -139,6 +202,221 @@ impl<'a> Interpreter<'a> {
             })
             .and_then(|ty| byte_scalar_of_ty(Some(&ty)));
         Ok(scalar_storage_byte_as(&base, kind, disp).map(|byte| Value::Uint(u128::from(byte))))
+    }
+
+    /// The elements a scalar-packed array value denotes (see
+    /// `packed_scalar_bytes`): element values constructed from
+    /// the packed scalar's storage bytes under the element
+    /// type. `None` when the value is not positively the packed
+    /// form or an element cannot be constructed.
+    fn packed_scalar_elems(
+        &self,
+        base: &Value,
+        elem: &Ty,
+        n: usize,
+    ) -> Option<Vec<Value>> {
+        let es = usize::try_from(self.ty_size(elem)?).ok()?;
+        let bytes = match base {
+            Value::Tuple(items) => packed_scalar_bytes(items, es, n)?,
+            // The packed form can also surface as one bare
+            // scalar: the whole array's storage held in a
+            // single scalar value (the shape a sequence of
+            // displaced writes into an uninit-born nested array
+            // leaves behind, where the place read itself
+            // collapses to the scalar). The evidence rule is
+            // the same as the tuple form's: a nonzero byte
+            // past the first element's own width, which a
+            // genuinely lone scalar followed by uninitialised
+            // storage cannot produce.
+            scalar => {
+                if n <= 1 || scalar_storage_len(scalar).is_none() {
+                    return None;
+                }
+                let total = n.checked_mul(es)?;
+                if !(es..total).any(|k| {
+                    scalar_storage_byte(scalar, k).is_some_and(|b| b != 0)
+                }) {
+                    return None;
+                }
+                let mut bytes = Vec::with_capacity(total);
+                for k in 0..total {
+                    bytes.push(scalar_storage_byte(scalar, k)?);
+                }
+                bytes
+            }
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(scalar_elem_from_bytes(elem, &bytes[i * es..(i + 1) * es])?);
+        }
+        Some(out)
+    }
+
+    /// A byte-granular copy over an array-shaped destination
+    /// whose elements are wider than a byte (the destination
+    /// the element-indexed write cannot denominate: a byte
+    /// copy into an uninit-born nested array, whose slots the
+    /// indexed access would name as whole elements). The
+    /// transfer moves the source's bytes into the destination
+    /// array value's own slots -- into the packed scalar when
+    /// the destination positively holds the scalar-packed
+    /// form, otherwise into each element slot the byte
+    /// position falls in -- and writes the array value back
+    /// whole. `None` when either end's shape is not one this
+    /// transfer judges (the caller keeps the existing paths);
+    /// `Some` carries the write's own result.
+    fn byte_copy_into_array(
+        &self,
+        frames: &mut Vec<Frame>,
+        src_target: &Resolved,
+        src_base: &Value,
+        dst_target: &Resolved,
+        n: usize,
+        elem: Option<&Ty>,
+    ) -> Option<InterpResult<()>> {
+        let dst_projection = match dst_target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection.clone(),
+        };
+        let Value::Tuple(items) = self.read_resolved(frames, dst_target).ok()?
+        else {
+            return None;
+        };
+        // The width of one destination slot: the sequence's
+        // recorded element size when conversion recorded it,
+        // otherwise the denoted type's size divided by the
+        // array's element count (a wrapper the type walk can
+        // size but not see through), otherwise -- for a copy
+        // that exactly fills the array's slots with scalar
+        // storage -- the copy's own length divided by the
+        // count.
+        let slot = self
+            .seq_slot_size(frames, dst_target, &dst_projection)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 1)
+            .or_else(|| {
+                let ty =
+                    self.target_denoted_ty(frames, dst_target, &dst_projection)?;
+                let size = usize::try_from(self.ty_size(&ty)?).ok()?;
+                (size > items.len() && size % items.len() == 0)
+                    .then(|| size / items.len())
+            })
+            .or_else(|| {
+                (n % items.len() == 0
+                    && items.iter().all(|item| {
+                        *item == Value::Uninit
+                            || scalar_storage_len(item).is_some()
+                    }))
+                .then(|| n / items.len())
+            })?;
+        if slot <= 1 || items.len().checked_mul(slot)? < n {
+            return None;
+        }
+        // The source's bytes: the value-level reading of the
+        // source base when it is an array value (packed or
+        // per-element), otherwise the sequence snapshot the
+        // scalar-tree reroute above also takes.
+        let bytes = match self.array_value_bytes(frames, src_target, src_base, n) {
+            Some(bytes) => bytes,
+            None => {
+                fn seq_byte(value: &Value) -> Option<u8> {
+                    match value {
+                        Value::Uint(b) if *b <= 0xFF => Some(*b as u8),
+                        Value::Int(b) if (0..=255).contains(b) => {
+                            Some(*b as u8)
+                        }
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            seq_byte(&fields[0])
+                        }
+                        _ => None,
+                    }
+                }
+                let mut bytes = Vec::with_capacity(n);
+                for i in 0..n {
+                    match self.read_seq_at_with_elem(frames, src_target, i, elem) {
+                        Ok(v) => bytes.push(seq_byte(&v)?),
+                        Err(_) => return None,
+                    }
+                }
+                bytes
+            }
+        };
+        let mut items = items;
+        if packed_scalar_form(&items, slot, n) {
+            // The destination holds the packed form: the bytes
+            // splice into the first slot's scalar, the form's
+            // own storage (see `packed_scalar_bytes`).
+            for (pos, byte) in bytes.iter().enumerate() {
+                if !splice_scalar_storage_byte_as(
+                    &mut items[0],
+                    None,
+                    pos,
+                    *byte,
+                ) {
+                    return None;
+                }
+            }
+        } else {
+            for (pos, byte) in bytes.iter().enumerate() {
+                if !splice_scalar_storage_byte_as(
+                    &mut items[pos / slot],
+                    None,
+                    pos % slot,
+                    *byte,
+                ) {
+                    return None;
+                }
+            }
+        }
+        Some(self.write_resolved(frames, dst_target, Value::Tuple(items)))
+    }
+
+    /// The first `n` storage bytes of an array value (a tuple
+    /// of scalar element slots), read value-level: from the
+    /// packed scalar when the value positively holds the
+    /// scalar-packed form, otherwise from each element slot's
+    /// own storage bytes priced by the sequence's recorded
+    /// slot size. `None` when the value is not such an array
+    /// or a byte position holds no definite byte.
+    fn array_value_bytes(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        base: &Value,
+        n: usize,
+    ) -> Option<Vec<u8>> {
+        let Value::Tuple(items) = base else {
+            return None;
+        };
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection.clone(),
+        };
+        let slot = self
+            .seq_slot_size(frames, target, &projection)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 0)
+            .or_else(|| {
+                let ty = self.target_denoted_ty(frames, target, &projection)?;
+                let size = usize::try_from(self.ty_size(&ty)?).ok()?;
+                (size > items.len() && size % items.len() == 0)
+                    .then(|| size / items.len())
+            })?;
+        if items.len().checked_mul(slot)? < n {
+            return None;
+        }
+        if let Some(bytes) = packed_scalar_bytes(items, slot, n) {
+            return Some(bytes);
+        }
+        let mut out = Vec::with_capacity(n);
+        for pos in 0..n {
+            out.push(scalar_storage_byte(&items[pos / slot], pos % slot)?);
+        }
+        Some(out)
     }
 
     /// The element copy behind `copy_nonoverlapping`, shared by the
@@ -372,6 +650,25 @@ impl<'a> Interpreter<'a> {
                     )
                 };
                 let src_base = self.read_bulk_base(frames, &src_target, elem)?;
+                if n > 1 && byte_granular {
+                    // A byte copy over an array-shaped
+                    // destination whose elements are wider than
+                    // a byte (see `byte_copy_into_array`): the
+                    // transfer denominates in bytes over the
+                    // array value's own slots, which the element
+                    // paths below cannot express.
+                    if let Some(result) = self.byte_copy_into_array(
+                        frames,
+                        &src_target,
+                        &src_base,
+                        &dst_target,
+                        n,
+                        elem,
+                    ) {
+                        result?;
+                        return Ok(());
+                    }
+                }
                 // The elements are values of the element type. When
                 // that type is known and the value found at the
                 // source IS one element -- possibly inside a
@@ -405,7 +702,18 @@ impl<'a> Interpreter<'a> {
                     }
                     None => n == 1 && !aggregate(&src_base),
                 };
-                let elems: Vec<Value> = if src_single {
+                // A source array holding the scalar-packed
+                // form (see `packed_scalar_bytes`): its elements
+                // are the packed scalar's bytes, which neither
+                // the single-element reading nor the indexed
+                // access can take apart (the indexed slots past
+                // the first are the uninitialised slots the form
+                // packs over).
+                let packed_elems = elem
+                    .and_then(|e| self.packed_scalar_elems(&src_base, e, n));
+                let elems: Vec<Value> = if let Some(packed) = packed_elems {
+                    packed
+                } else if src_single {
                     let mut elems = Vec::with_capacity(n);
                     if mu_elem {
                         elems.push(maybe_uninit_form(src_base.clone()));
