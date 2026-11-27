@@ -1162,6 +1162,33 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The bytes of the string window a receiver denotes, when
+    /// the receiver (behind any number of plain reference
+    /// layers) is a fat pointer: the reading
+    /// [`Self::byte_slice_of_fat_ref`] gives, whose length is
+    /// the fat pointer's own, so a window over part of a larger
+    /// byte storage yields the window's bytes, not the
+    /// storage's. `None` for any other receiver shape, and for
+    /// a window whose elements are not all bytes.
+    fn string_window_bytes(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        let mut receiver = self.read_ref_once(frames, arg)?;
+        while matches!(receiver, Value::Ref(_)) {
+            let next = self.read_ref_once(frames, &receiver)?;
+            if next == receiver {
+                break;
+            }
+            receiver = next;
+        }
+        Ok(match receiver {
+            Value::FatRef { .. } => self.byte_slice_of_fat_ref(frames, &receiver),
+            _ => None,
+        })
+    }
+
     /// `AsRef::as_ref` / `AsMut::as_mut`: the receiver viewed as
     /// the target type, computed from the modelled data (see the
     /// `Builtin::AsRef` note). `generic_args` are the trait's
@@ -1239,7 +1266,46 @@ impl<'a> Interpreter<'a> {
             }
         }
         let value = self.resolve_value(frames, arg)?;
-        let view = self.view_value_as(frames, value, base_ty, target_ty, what)?;
+        // A string view over a window of byte storage — the
+        // `char::encode_utf8` result is the shape that reaches
+        // here: a fat pointer whose base denotes one element of
+        // a byte array and whose length is the encoded length —
+        // does not survive the resolution above: following the
+        // fat pointer reads the denoted element alone, so the
+        // value that arrives is a byte scalar or a one-element
+        // tuple, never the window's bytes. Where the resolved
+        // form is none of the shapes the string view denominates
+        // and the receiver is such a fat pointer, denominate
+        // the window's bytes instead, read through the fat
+        // pointer itself (its length is the view's length, the
+        // reading `os_str_bytes` gives an `&OsStr` argument).
+        // A window whose bytes cannot be read that way — a
+        // view longer than the backing storage included — keeps
+        // the resolved form and the verdict it already produced.
+        let window = if is_string_like_ty(base_ty)
+            && (target_ty == "[u8]"
+                || target_ty == "str"
+                || target_ty == "std::ffi::OsStr"
+                || target_ty == "std::path::Path"
+                || target_ty == base_ty)
+            && !matches!(
+                value,
+                Value::Str(_) | Value::Bytes(_) | Value::Enum { .. }
+            ) {
+            self.string_window_bytes(frames, arg)?
+        } else {
+            None
+        };
+        let view = match window {
+            Some(bytes) => {
+                let denominated = match String::from_utf8(bytes) {
+                    Ok(text) => Value::Str(text),
+                    Err(err) => Value::Bytes(err.into_bytes()),
+                };
+                self.view_value_as(frames, denominated, base_ty, target_ty, what)?
+            }
+            None => self.view_value_as(frames, value, base_ty, target_ty, what)?,
+        };
         // `as_ref` returns a reference: a view that came out as the
         // bare pointee data (an identity view of an aggregate —
         // `Box<T> -> &T`, `Vec<T> -> &Vec<T>`, a self view) must be

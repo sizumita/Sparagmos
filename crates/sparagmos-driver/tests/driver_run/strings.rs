@@ -3816,3 +3816,116 @@ fn run_mode_str_byte_slice_casts_denominate_both_ways() {
         "stdout={stdout}"
     );
 }
+
+const OS_STRING_PUSH_ENCODE_UTF8_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    let mut char_buf = [0u8; 4];
+    let mut one = OsString::new();
+    one.push('x'.encode_utf8(&mut char_buf));
+    println!("{:?}", one.into_encoded_bytes());
+
+    let mut two = OsString::new();
+    two.push('é'.encode_utf8(&mut char_buf));
+    println!("{:?}", two.into_encoded_bytes());
+}
+"#;
+
+#[test]
+fn run_mode_os_string_push_encode_utf8_window() {
+    // `OsString::push` views its argument as an `&OsStr`; for
+    // a `char::encode_utf8` result the receiver of that view
+    // is a fat pointer whose base denotes one element of the
+    // char buffer and whose length is the encoded length.
+    // The view denominates the window's bytes (one byte for
+    // an ASCII char, two for `é`), not the buffer's capacity
+    // and not the single denoted element.
+    run_ok(
+        "os-string-push-encode-utf8",
+        OS_STRING_PUSH_ENCODE_UTF8_SRC,
+        "[120]\n[195, 169]\n",
+    );
+}
+
+const OS_STRING_TMPNAME_WINDOW_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // The shape tempfile's `tmpname` builds: a
+    // capacity-reserved `OsString`, a plain prefix, then one
+    // `encode_utf8` push per name char.
+    let mut name = OsString::with_capacity(16);
+    name.push("tmp");
+    for c in ['a', 'é', 'z', 'ß'] {
+        let mut char_buf = [0u8; 4];
+        name.push(c.encode_utf8(&mut char_buf));
+    }
+    assert_eq!(name.into_encoded_bytes(), "tmpaézß".as_bytes());
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_os_string_tmpname_encode_utf8_loop() {
+    run_ok(
+        "os-string-tmpname-window",
+        OS_STRING_TMPNAME_WINDOW_SRC,
+        "ok\n",
+    );
+}
+
+const STR_WINDOW_VIEWS_SRC: &str = r#"
+fn main() {
+    let mut buf = [0u8; 4];
+    let w = 'é'.encode_utf8(&mut buf);
+    let b: &[u8] = w.as_ref();
+    println!("{:?}", b);
+    let w2: &str = w.as_ref();
+    println!("{:?}", w2);
+}
+"#;
+
+#[test]
+fn run_mode_str_window_as_ref_views() {
+    // The same window viewed as a byte slice and as a `str`
+    // itself: both denominate the fat pointer's length.
+    run_ok(
+        "str-window-as-ref-views",
+        STR_WINDOW_VIEWS_SRC,
+        "[195, 169]\n\"é\"\n",
+    );
+}
+
+const STR_WINDOW_TOO_LONG_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    let buf = [0u8; 4];
+    // A view claiming eight bytes over a four-byte buffer:
+    // the model must refuse it, not read past the storage.
+    let s = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(buf.as_ptr(), 8))
+    };
+    let mut name = OsString::new();
+    name.push(s);
+    println!("{name:?}");
+}
+"#;
+
+#[test]
+fn run_mode_str_window_longer_than_buffer_refused() {
+    let dir = temp_dir("str-window-too-long");
+    let src = fixture(&dir, "strwindowtoolong.rs", STR_WINDOW_TOO_LONG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-long window view is refused; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("expected string data"),
+        "the refusal is the string view's; stderr={stderr}"
+    );
+}
