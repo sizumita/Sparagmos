@@ -14,6 +14,7 @@ impl Converter {
             intrinsic_defs: std::collections::HashSet::new(),
             async_closure_defs: std::collections::HashSet::new(),
             vtable_identities: HashMap::new(),
+            vtable_methods_cache: HashMap::new(),
             vtable_demand: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
@@ -636,15 +637,21 @@ impl Converter {
             Vec::with_capacity(body.blocks.len());
         let mut unsize_type_ids: Vec<(u32, sm::Place, (u64, u64))> =
             Vec::new();
+        let mut unsize_vtable_methods: Vec<(
+            u32,
+            sm::Place,
+            Vec<String>,
+        )> = Vec::new();
         let mut blocks: Vec<sm::BasicBlockData> = body
             .blocks
             .iter()
             .enumerate()
             .map(|(index, b)| {
-                let (block, lines, ids) =
+                let (block, lines, ids, methods) =
                     self.basic_block(body, index as u32, b);
                 source_lines.push(lines);
                 unsize_type_ids.extend(ids);
+                unsize_vtable_methods.extend(methods);
                 block
             })
             .collect();
@@ -696,6 +703,7 @@ impl Converter {
             b.var_debug_info = debug_info;
             b.source_lines = source_lines;
             b.unsize_type_ids = unsize_type_ids;
+            b.unsize_vtable_methods = unsize_vtable_methods;
             Ok(b)
         } else {
             Err(std::mem::take(&mut self.errors))
@@ -984,6 +992,7 @@ impl Converter {
         sm::BasicBlockData,
         sm::BlockSourceLines,
         Vec<(u32, sm::Place, (u64, u64))>,
+        Vec<(u32, sm::Place, Vec<String>)>,
     ) {
         let statements: Vec<sm::Statement> = bb
             .statements
@@ -992,14 +1001,27 @@ impl Converter {
             .collect();
         // The `TypeId` segments of each unsizing cast's concrete
         // type in this block, keyed the way the converted body
-        // states them (see `sm::Body::unsize_type_ids`).
+        // states them (see `sm::Body::unsize_type_ids`), and the
+        // compiler-resolved vtable method names of the same
+        // casts (see `sm::Body::unsize_vtable_methods`). The two
+        // recordings are independent: either can succeed where
+        // the other cannot name its result.
         let mut unsize_type_ids = Vec::new();
+        let mut unsize_vtable_methods = Vec::new();
         for (stmt, converted) in bb.statements.iter().zip(&statements) {
-            let Some(ids) = self.unsize_cast_type_id(body, stmt) else {
+            let ids = self.unsize_cast_type_id(body, stmt);
+            let methods = self.unsize_cast_vtable_methods(body, stmt);
+            if ids.is_none() && methods.is_none() {
                 continue;
-            };
+            }
             if let sm::StatementKind::Assign(pair) = &converted.kind {
-                unsize_type_ids.push((bb_index, pair.0.clone(), ids));
+                if let Some(ids) = ids {
+                    unsize_type_ids.push((bb_index, pair.0.clone(), ids));
+                }
+                if let Some(methods) = methods {
+                    unsize_vtable_methods
+                        .push((bb_index, pair.0.clone(), methods));
+                }
             }
         }
         let lines = sm::BlockSourceLines {
@@ -1017,7 +1039,172 @@ impl Converter {
         // cleanup region is recovered structurally in
         // `convert_body` (see `mark_cleanup_region`).
         data.is_cleanup = false;
-        (data, lines, unsize_type_ids)
+        (data, lines, unsize_type_ids, unsize_vtable_methods)
+    }
+
+    /// The compiler-resolved method instance names of the
+    /// vtable the trait reference `tr` denotes: the entries of
+    /// the compiler's own vtable for the reference's `Self`,
+    /// supertrait vtables included through their `TraitVPtr`
+    /// entries, in vtable order. Resolution crosses into the
+    /// compiler and can panic on exotic traits; a panicking
+    /// reference records nothing, exactly as the dyn demand
+    /// pass treats it. Results are memoised per reference (see
+    /// `Converter::vtable_methods_cache`).
+    ///
+    /// A reference that still mentions a generic parameter is
+    /// never resolved: it arises from an unsizing cast inside a
+    /// generic body, where the cast's "concrete" type is the
+    /// parameter itself (or contains it), and asking the
+    /// compiler for its vtable ICEs in instance resolution
+    /// (`failed to resolve instance for <&T as Debug>::fmt`).
+    /// The ICE diagnostic is emitted into the session before
+    /// any containment can downgrade it, so the whole
+    /// compilation fails; such a reference records nothing and
+    /// dispatch keeps the pre-existing resolution chain.
+    pub(super) fn vtable_method_names(
+        &mut self,
+        tr: &rustc_public::ty::TraitRef,
+    ) -> Vec<String> {
+        let key = format!("{tr:?}");
+        if let Some(names) = self.vtable_methods_cache.get(&key) {
+            return names.clone();
+        }
+        let tr_args = tr.args();
+        if args_mention_params(&tr_args) {
+            self.vtable_methods_cache
+                .insert(key, Vec::new());
+            return Vec::new();
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut queue =
+            std::collections::VecDeque::from([tr.clone()]);
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        while let Some(tr) = queue.pop_front() {
+            if !seen.insert(format!("{tr:?}")) {
+                continue;
+            }
+            let Ok(entries) = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| tr.vtable_entries()),
+            ) else {
+                continue;
+            };
+            for entry in entries {
+                match entry {
+                    rustc_public::ty::VtblEntry::Method(inst) => {
+                        let name = inst.name().to_string();
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                    rustc_public::ty::VtblEntry::TraitVPtr(super_ref) => {
+                        queue.push_back(super_ref);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.vtable_methods_cache.insert(key, names.clone());
+        names
+    }
+
+    /// The compiler-resolved vtable method instance names for
+    /// the (concrete type, principal trait) pair a vtable
+    /// constant denotes: the trait reference is rebuilt with
+    /// the concrete type as `Self`, exactly as
+    /// `note_vtable_identity` rebuilds it for the demand pass,
+    /// and asked for its vtable. Empty when the constant
+    /// carries no principal trait reference.
+    pub(super) fn vtable_methods_for(
+        &mut self,
+        vty: &rustc_public::ty::Ty,
+        trait_ref: &Option<
+            rustc_public::ty::Binder<
+                rustc_public::ty::ExistentialTraitRef,
+            >,
+        >,
+    ) -> Vec<String> {
+        let Some(binder) = trait_ref else {
+            return Vec::new();
+        };
+        let erased = rustc_public::ty::ExistentialTraitRef {
+            def_id: binder.value.def_id,
+            generic_args: erase_bound_regions_args(
+                &binder.value.generic_args,
+            ),
+        };
+        let tr = erased.with_self_ty(*vty);
+        self.vtable_method_names(&tr)
+    }
+
+    /// The compiler-resolved vtable method instance names of
+    /// an unsizing cast statement, when the statement is a cast
+    /// to a `dyn` target and the concrete type can be named by
+    /// walking the cast's source and target types in parallel
+    /// (see `unsize_concrete_ty`): for each trait bound of the
+    /// `dyn` type, the trait reference the cast materializes --
+    /// the concrete type as `Self`, the bound's own arguments
+    /// with their binder regions erased, as the dyn demand
+    /// pass forms it -- is asked for its vtable, and the method
+    /// instance names of all bounds are collected in bound
+    /// order. `None` when the statement is not such a cast, the
+    /// concrete type is itself a `dyn` type (a supertrait
+    /// upcast: the value's own vtable carries over), or no
+    /// bound's vtable names a method.
+    fn unsize_cast_vtable_methods(
+        &mut self,
+        body: &mir::Body,
+        stmt: &mir::Statement,
+    ) -> Option<Vec<String>> {
+        let mir::StatementKind::Assign(_, rv) = &stmt.kind else {
+            return None;
+        };
+        let mir::Rvalue::Cast(
+            mir::CastKind::PointerCoercion(
+                mir::PointerCoercion::Unsize,
+            ),
+            operand,
+            target,
+        ) = rv
+        else {
+            return None;
+        };
+        let locals = body.locals();
+        let source = operand.ty(&locals).ok()?;
+        let concrete = unsize_concrete_ty(&source, target)?;
+        if matches!(
+            guarded_ty_kind(&concrete),
+            Some(TyKind::RigidTy(RigidTy::Dynamic(..)))
+        ) {
+            return None;
+        }
+        let bounds = unsize_dyn_bounds(&source, target)?;
+        let mut names: Vec<String> = Vec::new();
+        for bound in &bounds {
+            let rustc_public::ty::ExistentialPredicate::Trait(et) =
+                &bound.value
+            else {
+                continue;
+            };
+            let erased = rustc_public::ty::ExistentialTraitRef {
+                def_id: et.def_id,
+                generic_args: erase_bound_regions_args(
+                    &et.generic_args,
+                ),
+            };
+            let tr = erased.with_self_ty(concrete);
+            for name in self.vtable_method_names(&tr) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
     }
 
     /// The `TypeId` segments of the concrete type of an unsizing
@@ -1338,6 +1525,62 @@ fn dyn_in_ty(ty: &rustc_public::ty::Ty) -> bool {
 /// walk the interpreter's conversion performs on the converted
 /// types, so the two name the same type). `None` when the
 /// target holds no `dyn` type or the shapes diverge.
+/// The bounds of the `dyn` type inside `target`, found by
+/// walking the cast's source and target types in parallel the
+/// way `unsize_concrete_ty` walks them for the concrete type.
+fn unsize_dyn_bounds(
+    src: &rustc_public::ty::Ty,
+    target: &rustc_public::ty::Ty,
+) -> Option<
+    Vec<
+        rustc_public::ty::Binder<
+            rustc_public::ty::ExistentialPredicate,
+        >,
+    >,
+> {
+    match (guarded_ty_kind(src)?, guarded_ty_kind(target)?) {
+        (_, TyKind::RigidTy(RigidTy::Dynamic(bounds, _))) => {
+            Some(bounds)
+        }
+        (
+            TyKind::RigidTy(RigidTy::Ref(_, s, _)),
+            TyKind::RigidTy(RigidTy::Ref(_, t, _)),
+        ) => unsize_dyn_bounds(&s, &t),
+        (
+            TyKind::RigidTy(RigidTy::RawPtr(s, _)),
+            TyKind::RigidTy(RigidTy::RawPtr(t, _)),
+        ) => unsize_dyn_bounds(&s, &t),
+        (
+            TyKind::RigidTy(RigidTy::Adt(_, sargs)),
+            TyKind::RigidTy(RigidTy::Adt(_, targs)),
+        ) => {
+            let s_types: Vec<&rustc_public::ty::Ty> = sargs
+                .0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            let t_types: Vec<&rustc_public::ty::Ty> = targs
+                .0
+                .iter()
+                .filter_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            for (sa, ta) in s_types.iter().zip(t_types.iter()) {
+                if dyn_in_ty(ta) {
+                    return unsize_dyn_bounds(sa, ta);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn unsize_concrete_ty(
     src: &rustc_public::ty::Ty,
     target: &rustc_public::ty::Ty,

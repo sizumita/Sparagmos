@@ -27,6 +27,7 @@ impl<'a> Interpreter<'a> {
                 traits,
                 glue,
                 type_id,
+                vtable_methods,
             } => match v {
                 // A supertrait upcast: the data pointer, the
                 // concrete type and its drop glue carry over;
@@ -37,6 +38,7 @@ impl<'a> Interpreter<'a> {
                     concrete: existing,
                     drop_glue,
                     type_id: existing_id,
+                    vtable_methods: existing_methods,
                     ..
                 } => Ok(Value::DynRef {
                     base,
@@ -44,6 +46,7 @@ impl<'a> Interpreter<'a> {
                     traits: traits.clone(),
                     drop_glue,
                     type_id: existing_id,
+                    vtable_methods: existing_methods,
                 }),
                 Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
                     match concrete {
@@ -53,6 +56,7 @@ impl<'a> Interpreter<'a> {
                             traits: traits.clone(),
                             drop_glue: glue.clone().map(Box::new),
                             type_id: *type_id,
+                            vtable_methods: vtable_methods.clone(),
                         }),
                         // A `dyn`-to-`dyn` coercion whose operand
                         // is a reference to a place holding a
@@ -74,6 +78,7 @@ impl<'a> Interpreter<'a> {
                                     base,
                                     concrete: stored_concrete,
                                     type_id: stored_id,
+                                    vtable_methods: stored_methods,
                                     ..
                                 } => Ok(Value::DynRef {
                                     base,
@@ -81,6 +86,7 @@ impl<'a> Interpreter<'a> {
                                     traits: traits.clone(),
                                     drop_glue: None,
                                     type_id: stored_id,
+                                    vtable_methods: stored_methods,
                                 }),
                                 _ => Err(InterpError::UnsupportedRvalue {
                                     kind: "Unsize to dyn (no concrete type recorded)"

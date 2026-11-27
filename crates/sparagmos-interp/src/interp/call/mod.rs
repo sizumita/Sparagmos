@@ -12,7 +12,10 @@ pub(crate) use lookup::{
     impl_qualified_self_type, parse_coroutine_key, parse_coroutine_tag, split_generic_args,
     split_top_level_str, tag_sequence_elem,
 };
-use lookup::{elided_self_spellings, impl_path_primitive_op, impl_path_trait_method};
+use lookup::{
+    elided_self_spellings, impl_path_primitive_op, impl_path_trait_method,
+    vtable_entry_answers,
+};
 
 /// The value-semantics trait method an impl-path spelling of
 /// a call denotes: the name ends in `>::METHOD` and names the
@@ -409,6 +412,7 @@ impl<'a> Interpreter<'a> {
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
             ..
         } = head_value
         else {
@@ -425,6 +429,8 @@ impl<'a> Interpreter<'a> {
             // The swap re-bases the same concrete type on the
             // loaded pointee: its TypeId segments carry over.
             type_id,
+            // And its vtable method names.
+            vtable_methods,
         };
         let mut probe = arg_values.to_vec();
         probe[0] = swapped.clone();
@@ -475,6 +481,7 @@ impl<'a> Interpreter<'a> {
             base,
             concrete,
             traits,
+            vtable_methods,
             ..
         } = cursor
         else {
@@ -508,6 +515,42 @@ impl<'a> Interpreter<'a> {
         let (trait_path, method) = func.rsplit_once("::")?;
         if trait_path.is_empty() || method.is_empty() {
             return None;
+        }
+        // The vtable the pointer was formed for speaks first:
+        // the driver recorded the compiler-resolved method
+        // instance names of this pointer's own vtable at the
+        // site that formed it, and those names are the dispatch
+        // table a native call through this pointer consults.
+        // The rendered concrete tag erases the regions that
+        // distinguish two impls of one trait for region
+        // variants of one type (a `'static` fn pointer against
+        // its higher-ranked sibling), so a tag-based candidate
+        // can name the wrong impl's body while the recorded
+        // names cannot. A recorded name answers this call when
+        // it is an entry for the called method of the called
+        // trait and no bound the pointer currently answers to
+        // names that trait under different generic arguments
+        // (an upcast to another instantiation of the trait is
+        // not this vtable's entry). Exactly one such name,
+        // resident in the program, dispatches; anything else
+        // falls through to the spelling-based resolution below.
+        if !vtable_methods.is_empty() {
+            let mut hits: Vec<&str> = Vec::new();
+            for name in vtable_methods {
+                if vtable_entry_answers(name, trait_path, method, traits)
+                    && !hits.contains(&name.as_str())
+                {
+                    hits.push(name.as_str());
+                }
+            }
+            if hits.len() == 1 {
+                let candidate = hits[0].to_string();
+                if self.program.get(&candidate).is_some()
+                    || self.program.unconverted_reason(&candidate).is_some()
+                {
+                    return Some(Ok((candidate, receiver)));
+                }
+            }
         }
         let candidate = format!("<{concrete} as {trait_path}>::{method}");
         if self.program.get(&candidate).is_some()
@@ -1572,6 +1615,7 @@ pub(crate) fn default_hook_value() -> Value {
         ],
         drop_glue: None,
         type_id: None,
+        vtable_methods: Vec::new(),
     }
 }
 
@@ -1600,6 +1644,7 @@ pub(crate) fn updated_hook_value(update: Value, prev: Value) -> Value {
         ],
         drop_glue: None,
         type_id: None,
+        vtable_methods: Vec::new(),
     }
 }
 

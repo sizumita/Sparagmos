@@ -69,10 +69,12 @@ pub struct MirProgram {
     /// Vtable identities minted by the driver while decoding
     /// constants: for each vtable-pointer identity number, the
     /// (concrete type, principal trait names, concrete type's
-    /// `TypeId` segments) triple it denotes.
+    /// `TypeId` segments, vtable method instance names) tuple
+    /// it denotes.
     /// Converted into the interpreter's table (see
     /// `ir::Program::vtable_identities`).
-    pub vtable_identities: HashMap<u64, (mir::Ty, Vec<String>, Option<(u64, u64)>)>,
+    pub vtable_identities:
+        HashMap<u64, (mir::Ty, Vec<String>, Option<(u64, u64)>, Vec<String>)>,
     /// Per-variant field byte layouts of the monomorphic ADT
     /// instances in the program, as recorded by the driver
     /// (see [`mir::AdtFieldLayouts`]). Consulted by the

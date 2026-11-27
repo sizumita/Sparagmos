@@ -165,6 +165,15 @@ pub enum ConstValue {
         /// only for bodies reconstructed without the driver
         /// (the harness dump reader).
         type_id: Option<(u64, u64)>,
+        /// The compiler-resolved vtable method instance names
+        /// of the vtable this pointer carries, as the driver
+        /// resolves them from the vtable's trait reference at
+        /// decode time: a virtual call through the decoded
+        /// pointer dispatches by these names rather than by
+        /// matching the erased concrete tag against impl
+        /// spellings. Empty only for bodies reconstructed
+        /// without the driver (the harness dump reader).
+        vtable_methods: Vec<String>,
     },
 }
 

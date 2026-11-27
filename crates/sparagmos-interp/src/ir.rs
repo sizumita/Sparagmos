@@ -422,6 +422,10 @@ pub enum Constant {
         /// the decoded constant (see
         /// `sparagmos_mir::ConstValue::DynRef`).
         type_id: Option<(u64, u64)>,
+        /// The vtable's method instance names, carried from
+        /// the decoded constant (see
+        /// `sparagmos_mir::ConstValue::DynRef`).
+        vtable_methods: Vec<String>,
     },
     /// A function item constant: evaluates to the callable value
     /// naming the function.
@@ -1390,6 +1394,19 @@ pub enum UnsizeMeta {
         /// cast, and for supertrait upcasts (whose `concrete` is
         /// `None`: the value's own segments carry over instead).
         type_id: Option<(u64, u64)>,
+        /// The vtable's method instance names, resolved by the
+        /// driver for this cast site from the cast's own trait
+        /// references (see
+        /// `sparagmos_mir::Body::unsize_vtable_methods`): the
+        /// `DynRef` the cast forms carries them, so a virtual
+        /// call through it dispatches to the impl the compiler
+        /// itself selected for the cast's vtable even where
+        /// the concrete tag erases the regions that distinguish
+        /// the impl. Empty when the driver could not resolve
+        /// the cast's vtable, and for supertrait upcasts (whose
+        /// `concrete` is `None`: the value's own names carry
+        /// over instead).
+        vtable_methods: Vec<String>,
     },
 }
 
@@ -2541,6 +2558,15 @@ pub struct VTableIdentity {
     /// recovered objects then carry no segments and their
     /// downcasts fall back to tag comparison.
     pub type_id: Option<(u64, u64)>,
+    /// The vtable's method instance names, as the driver
+    /// resolved them from the vtable's trait reference: a
+    /// trait object recovered through this identity dispatches
+    /// by them, so its virtual calls reach the impl the
+    /// compiler itself selected for the vtable even where the
+    /// concrete type's rendered tag erases the regions that
+    /// distinguish the impl. Empty when the driver could not
+    /// resolve the vtable.
+    pub vtable_methods: Vec<String>,
 }
 
 /// A whole program: a set of named function bodies in one module.

@@ -757,6 +757,8 @@ impl Converter {
             concrete: self.ty(&concrete_ty),
             traits,
             type_id: type_id_segments(&concrete_ty),
+            vtable_methods: self
+                .vtable_methods_for(&concrete_ty, &trait_ref),
         })
     }
 
@@ -784,8 +786,15 @@ impl Converter {
         // recovered through this identity answers `dyn Any`
         // downcasts with them (see `ir::VTableIdentity`).
         let type_id = type_id_segments(vty);
-        self.vtable_identities
-            .insert(id, (concrete, traits, type_id));
+        // The vtable's compiler-resolved method instance
+        // names: a trait object recovered through this
+        // identity dispatches by them (see
+        // `ir::VTableIdentity`).
+        let vtable_methods = self.vtable_methods_for(vty, trait_ref);
+        self.vtable_identities.insert(
+            id,
+            (concrete, traits, type_id, vtable_methods),
+        );
         if let Some(binder) = trait_ref {
             // As in `dyn_trait_refs`: erase the existential
             // arguments' binder regions so the demanded

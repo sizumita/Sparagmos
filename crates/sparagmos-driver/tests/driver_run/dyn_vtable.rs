@@ -646,18 +646,55 @@ fn region_erasure_two_binderless_candidates_decline() {
     // Both impls are binderless and region-carrying, in
     // swapped positions of the same signature; both match
     // the erased tag `Foo<fn(&u8, &u8)>` up to region
-    // erasure, so the scan must resolve nothing rather than
-    // guess: the run fails with exit code 2, as it did
-    // before the erasure pass existed.
+    // erasure, so the spelling scan resolves nothing rather
+    // than guess. The dispatch is instead answered by the
+    // vtable the driver recorded for the formation cast:
+    // the cast's own trait reference still carries the
+    // binder position (`for<'a> fn(&'static u8, &'a u8)`),
+    // and the compiler's vtable for it names the first
+    // impl, so the call reaches it and the run succeeds.
     let dir = temp_dir("region-erasure-decline");
     let src = fixture(&dir, "main.rs", REGION_ERASURE_DECLINE_SRC);
-    let out = run_driver(&src);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "ambiguous erasure candidates must stay unresolved; stderr={stderr}"
-    );
+    assert_ok(&run_driver(&src));
+}
+
+const BOTH_REGION_IMPLS_SRC: &str = r#"
+#![allow(coherence_leak_check)]
+struct Foo<T: 'static>(T);
+fn useful<'a>(_: &'a u8) {}
+trait Probe {
+    fn probe(&mut self) -> u32;
+}
+impl Probe for Foo<fn(&'static u8)> {
+    fn probe(&mut self) -> u32 { 111 }
+}
+impl Probe for Foo<for<'a> fn(&'a u8)> {
+    fn probe(&mut self) -> u32 { 222 }
+}
+fn main() {
+    let mut a: Box<dyn Probe> = Box::new(Foo(useful as fn(&'static u8)));
+    assert_eq!(a.probe(), 111);
+    let mut b: Box<dyn Probe> = Box::new(Foo(useful as fn(&u8)));
+    assert_eq!(b.probe(), 222);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn hrtb_receiver_dispatches_by_recorded_vtable() {
+    // Both region impls of one trait are in the program and
+    // the method's return type cannot betray a wrong pick:
+    // both receivers' fat pointers carry the same erased
+    // concrete tag `Foo<fn(&u8)>`, so spelling-based
+    // resolution sends the higher-ranked receiver to the
+    // binderless impl (the erasure pass excludes the
+    // binder-carrying key). The vtable the driver recorded
+    // for each formation cast names the impl the compiler
+    // selected for that cast, and dispatch consults it
+    // first: each receiver reaches its own impl.
+    let dir = temp_dir("both-region-impls");
+    let src = fixture(&dir, "main.rs", BOTH_REGION_IMPLS_SRC);
+    assert_ok(&run_driver(&src));
 }
 
 const MULTI_INSTANCE_SUPERTRAIT_SRC: &str = r#"

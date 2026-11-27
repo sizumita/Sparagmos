@@ -174,6 +174,7 @@ fn strip_trailing_offsets_value(value: &Value) -> (Value, i128) {
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
         } => {
             let (base, total) = strip_trailing_offsets_value(base);
             (
@@ -183,6 +184,7 @@ fn strip_trailing_offsets_value(value: &Value) -> (Value, i128) {
                     traits: traits.clone(),
                     drop_glue: drop_glue.clone(),
                     type_id: *type_id,
+                    vtable_methods: vtable_methods.clone(),
                 },
                 total,
             )
@@ -3182,6 +3184,7 @@ impl<'a> Interpreter<'a> {
                 traits,
                 drop_glue,
                 type_id,
+                vtable_methods,
             } => match *base {
                 Value::Ref(_) => {
                     let base = self.ptr_offset_value(frames, *base, count, elem_size, wrapping)?;
@@ -3191,6 +3194,7 @@ impl<'a> Interpreter<'a> {
                         traits,
                         drop_glue,
                         type_id,
+                        vtable_methods,
                     })
                 }
                 ref other => Err(InterpError::type_mismatch(
@@ -4809,6 +4813,7 @@ mod ptr_equality_tests {
             traits: vec!["probe::T1".to_string()],
             drop_glue: None,
             type_id: None,
+            vtable_methods: Vec::new(),
         };
         let d2 = Value::DynRef {
             base: Box::new(base),
@@ -4816,6 +4821,7 @@ mod ptr_equality_tests {
             traits: vec!["probe::T2".to_string()],
             drop_glue: None,
             type_id: None,
+            vtable_methods: Vec::new(),
         };
         let addr_of = |v: &Value| interp.pointer_address(&[], v, None);
         let eq = eval_binary(BinOp::Eq, &d1, &d2, None, false, &addr_of)

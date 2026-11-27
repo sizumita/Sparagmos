@@ -739,6 +739,7 @@ impl<'a> Converter<'a> {
                 concrete,
                 traits,
                 type_id,
+                vtable_methods,
             } => {
                 // The data pointer constant converts as a
                 // reference to the concrete type the vtable
@@ -760,6 +761,7 @@ impl<'a> Converter<'a> {
                     traits: traits.clone(),
                     glue,
                     type_id: *type_id,
+                    vtable_methods: vtable_methods.clone(),
                 }
             }
             mir::ConstValue::ByRef { .. } => {

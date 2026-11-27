@@ -817,12 +817,14 @@ pub(super) fn project_pointee_cell(pointer: Value) -> InterpResult<Value> {
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
         } => Value::DynRef {
             base: Box::new(project_pointee_cell(*base)?),
             concrete,
             traits,
             drop_glue,
             type_id,
+            vtable_methods,
         },
         other => other,
     })

@@ -95,8 +95,31 @@ impl<'a> Converter<'a> {
                         .map(|(_, _, ids)| *ids),
                     _ => None,
                 };
-                let ir_rv =
-                    self.convert_rvalue(body, rv, dest_ty.as_ref(), site_type_id)?;
+                // The vtable method instance names the driver
+                // resolved for the same cast (see
+                // `mir::Body::unsize_vtable_methods`).
+                let site_vtable_methods = match rv {
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(
+                            mir::PointerCoercion::Unsize,
+                        ),
+                        ..,
+                    ) => body
+                        .unsize_vtable_methods
+                        .iter()
+                        .find(|(block, dest, _)| {
+                            *block == bb_index && dest == place
+                        })
+                        .map(|(_, _, names)| names.clone()),
+                    _ => None,
+                };
+                let ir_rv = self.convert_rvalue(
+                    body,
+                    rv,
+                    dest_ty.as_ref(),
+                    site_type_id,
+                    site_vtable_methods,
+                )?;
                 ir::Statement::assign(ir_place, ir_rv)
             }
             S::StorageLive(l) => ir::Statement {
@@ -2064,6 +2087,11 @@ impl<'a> Converter<'a> {
             concrete: Some(concrete),
             traits,
             glue,
+            // This unsize is synthesised from the callee's
+            // generic arguments, a site the driver recorded no
+            // vtable resolution for: dispatch matches spellings,
+            // as before.
+            vtable_methods: Vec::new(),
             // The segments name the source type itself: they
             // serve only when the concrete type is that type
             // (no reference layer was peeled to name it) and the
