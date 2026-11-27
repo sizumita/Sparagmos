@@ -2192,6 +2192,118 @@ impl<'a> Interpreter<'a> {
         self.read_resolved_typed(frames, target, None)
     }
 
+    /// The flat-storage read (see the offer in
+    /// [`Self::read_resolved_typed`]): a read through a
+    /// pointer displaced into the byte storage an allocation
+    /// or static root holds as [`Value::Bytes`]. The storage
+    /// is its own denomination -- its bytes are the value --
+    /// so no recorded type or layout is needed to price the
+    /// read (the byte view above declines a root with no type
+    /// on record, which is how the fabricated storages -- a
+    /// signal frame, a process argument string -- arrive
+    /// here, and the structural projector has no byte-level
+    /// view of a whole value's storage to reinterpret): the
+    /// projection's steps are byte steps (a byte offset, or
+    /// an index into the flat storage, the only element
+    /// denomination it has), at least one of them a positive
+    /// displacement -- the undisplaced shapes (a whole-value
+    /// read, an indexed element read) are the ordinary path's
+    /// own cases and keep its answers. The read's width is
+    /// the declared width of the scalar the caller's evidence
+    /// names, else the one byte a byte read carries (the
+    /// width rule of the write side's
+    /// `bytes_storage_splice`). The read applies only when
+    /// the whole width lands inside the storage; anything
+    /// else declines and the ordinary paths judge the read,
+    /// so an out-of-range displaced read keeps the projection
+    /// error it has today. Element blocks decline: their base
+    /// pointer denotes element 0 of the element tuple, a
+    /// denomination the allocation arm below already applies.
+    fn bytes_storage_read(
+        &self,
+        target: &Resolved,
+        ty: Option<&Ty>,
+    ) -> Option<InterpResult<Value>> {
+        let projection: &[RefProj] = match target {
+            Resolved::Alloc { id, projection } => {
+                if self.is_elem_block(*id) {
+                    return None;
+                }
+                projection
+            }
+            Resolved::Static { projection, .. } => projection,
+            _ => return None,
+        };
+        // The projection's byte position: every step over a
+        // flat storage is a byte step, and the read is the
+        // displaced shape only when some step displaces.
+        let mut pos: usize = 0;
+        let mut displaced = false;
+        for step in projection {
+            match step {
+                RefProj::ByteOffset(d) if *d >= 0 => {
+                    if *d > 0 {
+                        displaced = true;
+                    }
+                    pos = pos.checked_add(*d as usize)?;
+                }
+                RefProj::Index(i) => {
+                    pos = pos.checked_add(*i)?;
+                }
+                _ => return None,
+            }
+        }
+        if !displaced {
+            return None;
+        }
+        // The read's width and shape: the declared scalar
+        // width when the caller's evidence names a scalar,
+        // else the single byte a byte read carries.
+        let shape = ty.and_then(scalar_shape_of_ty);
+        let width = match &shape {
+            Some(shape) if shape.bits() % 8 == 0 => {
+                let width = (shape.bits() / 8) as usize;
+                if width == 0 || width > 16 {
+                    return None;
+                }
+                width
+            }
+            _ => 1,
+        };
+        let end = pos.checked_add(width)?;
+        let bytes: Vec<u8> = match target {
+            Resolved::Alloc { id, .. } => {
+                let store = self.allocs.borrow();
+                match store.get(id) {
+                    Some(Value::Bytes(bytes)) if end <= bytes.len() => {
+                        bytes[pos..end].to_vec()
+                    }
+                    _ => return None,
+                }
+            }
+            Resolved::Static { name, .. } => {
+                let store = self.statics.borrow();
+                match store.get(name) {
+                    Some(Value::Bytes(bytes)) if end <= bytes.len() => {
+                        bytes[pos..end].to_vec()
+                    }
+                    _ => return None,
+                }
+            }
+            _ => unreachable!("the target kinds were matched above"),
+        };
+        Some(match &shape {
+            Some(shape) => {
+                let mut bits: u128 = 0;
+                for (k, byte) in bytes.iter().enumerate() {
+                    bits |= u128::from(*byte) << (8 * k);
+                }
+                self.construct_scalar(bits, shape)
+            }
+            None => Ok(Value::Uint(u128::from(bytes[0]))),
+        })
+    }
+
     /// [`read_resolved`] with the declared type of the place
     /// being read, when the caller knows it (a MIR place read
     /// passes its place's type; a bulk copy passes its element
@@ -2224,6 +2336,15 @@ impl<'a> Interpreter<'a> {
                     Err(e) => return Err(e),
                 }
             }
+        }
+        // A read through a pointer displaced into the flat
+        // byte storage a target root holds as `Value::Bytes`
+        // is served out of the storage at the projection's
+        // byte position (see `bytes_storage_read`); the read
+        // declines the shapes that are not that, which the
+        // paths below judge unchanged.
+        if let Some(read) = self.bytes_storage_read(target, ty) {
+            return read;
         }
         match target {
             Resolved::Value(base, projection) => {
@@ -4124,5 +4245,208 @@ mod bytes_storage_splice_tests {
             .write_resolved(&mut frames, &target, Value::Int(7))
             .unwrap();
         assert_eq!(interp.alloc_value(id), Some(Value::Int(7)));
+    }
+}
+
+#[cfg(test)]
+mod bytes_storage_read_tests {
+    use super::*;
+
+    /// A byte read through a pointer displaced into a flat
+    /// byte storage (a `p.add(1)` deref of a fabricated
+    /// string's storage) serves the byte at the displacement:
+    /// the storage is its own denomination, as on the write
+    /// side (see `bytes_storage_splice`). The structural
+    /// projector has no byte-level view of the storage and
+    /// rejects the displaced step at the value boundary, and
+    /// the byte view declines a root with no type on record.
+    #[test]
+    fn displaced_byte_read_serves_the_byte_at_the_offset() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &target).unwrap(),
+            Value::Uint(101)
+        );
+        // The borrowing read shares the decision: it is the
+        // read the peek form lends through.
+        let lent = interp.read_resolved_ref(&frames, &target).unwrap();
+        assert_eq!(*lent, Value::Uint(101));
+    }
+
+    /// A wider scalar read at a displacement serves the
+    /// declared width's bytes, little-endian, constructed as
+    /// the scalar the caller's evidence names.
+    #[test]
+    fn displaced_wider_scalar_read_serves_the_declared_width() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(1)],
+        };
+        let ty = Ty::Uint(crate::ir::UintTy::U16);
+        assert_eq!(
+            interp
+                .read_resolved_typed(&frames, &target, Some(&ty))
+                .unwrap(),
+            Value::Uint(0x6c65)
+        );
+        // A signed byte read at a displacement sign-extends
+        // the byte it serves.
+        let id2 = interp.alloc_insert(Value::Bytes(vec![b'h', 0x80, b'l']));
+        let target2 = Resolved::Alloc {
+            id: id2,
+            projection: vec![RefProj::ByteOffset(1)],
+        };
+        let ty8 = Ty::Int(crate::ir::IntTy::I8);
+        assert_eq!(
+            interp
+                .read_resolved_typed(&frames, &target2, Some(&ty8))
+                .unwrap(),
+            Value::Int(-128)
+        );
+    }
+
+    /// A byte step after the displacement (a sequence access
+    /// over the displaced base) adds to the position, the
+    /// combination the projector's own scalar-storage arm
+    /// applies.
+    #[test]
+    fn displaced_read_combines_the_following_byte_steps() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(1), RefProj::Index(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &target).unwrap(),
+            Value::Uint(108)
+        );
+        let target2 = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(1), RefProj::ByteOffset(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &target2).unwrap(),
+            Value::Uint(108)
+        );
+    }
+
+    /// The same denomination at a static root: a displaced
+    /// read of a byte-string static's storage serves the
+    /// byte at the displacement.
+    #[test]
+    fn displaced_byte_read_serves_a_bytes_static() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        interp
+            .statics
+            .borrow_mut()
+            .insert("S".to_string(), Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Static {
+            name: "S".to_string(),
+            projection: vec![RefProj::ByteOffset(2)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &target).unwrap(),
+            Value::Uint(108)
+        );
+    }
+
+    /// A displaced read whose width lands past the storage's
+    /// end declines: the ordinary path keeps the projection
+    /// error it gives today.
+    #[test]
+    fn out_of_range_displaced_read_keeps_the_projection_error() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(5)],
+        };
+        let result = interp.read_resolved(&frames, &target);
+        assert!(result.is_err(), "out-of-range read must error: {result:?}");
+        let ty = Ty::Uint(crate::ir::UintTy::U16);
+        let target2 = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(4)],
+        };
+        let result2 = interp.read_resolved_typed(&frames, &target2, Some(&ty));
+        assert!(
+            result2.is_err(),
+            "a width overrunning the storage must error: {result2:?}"
+        );
+        assert_eq!(interp.alloc_value(id), Some(Value::Bytes(b"hello".to_vec())));
+    }
+
+    /// The undisplaced shapes keep the ordinary path's
+    /// answers: a whole-value read of the storage, and an
+    /// indexed element read (the flat storage's own element
+    /// denomination).
+    #[test]
+    fn undisplaced_reads_of_bytes_alloc_are_unchanged() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let frames: Vec<Frame> = Vec::new();
+        let whole = Resolved::Alloc {
+            id,
+            projection: vec![],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &whole).unwrap(),
+            Value::Bytes(b"hello".to_vec())
+        );
+        let at1 = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::Index(1)],
+        };
+        assert_eq!(
+            interp.read_resolved(&frames, &at1).unwrap(),
+            Value::Uint(101)
+        );
+    }
+
+    /// A displaced read of a root holding an aggregate is
+    /// not the flat storage's shape: the projector's
+    /// boundary error stands, as does a negative
+    /// displacement's.
+    #[test]
+    fn displaced_read_of_non_bytes_root_is_unchanged() {
+        let program = Program::default();
+        let interp = Interpreter::new(&program);
+        let id = interp.alloc_insert(Value::Tuple(vec![Value::Int(1), Value::Int(2)]));
+        let frames: Vec<Frame> = Vec::new();
+        let target = Resolved::Alloc {
+            id,
+            projection: vec![RefProj::ByteOffset(1)],
+        };
+        let result = interp.read_resolved(&frames, &target);
+        assert!(result.is_err(), "aggregate root must error: {result:?}");
+        let id2 = interp.alloc_insert(Value::Bytes(b"hello".to_vec()));
+        let target2 = Resolved::Alloc {
+            id: id2,
+            projection: vec![RefProj::ByteOffset(-1)],
+        };
+        let result2 = interp.read_resolved(&frames, &target2);
+        assert!(
+            result2.is_err(),
+            "negative displacement must error: {result2:?}"
+        );
     }
 }
