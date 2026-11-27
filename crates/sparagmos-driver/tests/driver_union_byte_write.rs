@@ -235,3 +235,101 @@ fn main() {
         "ab000007\n0\n",
     );
 }
+
+#[test]
+fn run_mode_generic_union_byte_write_at_base_read_back_through_fields() {
+    run_ok(
+        "generic-base",
+        r#"
+union BagOfBits<T: Copy> {
+    val: T,
+    bytes: [u8; 8],
+}
+
+fn main() {
+    let mut u = BagOfBits::<u64> { val: 0 };
+    unsafe {
+        (&mut u as *mut BagOfBits<u64> as *mut u8).write(1);
+        println!("{}", u.val);
+        println!("{}", u.bytes[0]);
+    }
+}
+"#,
+        "1\n1\n",
+    );
+}
+
+#[test]
+fn run_mode_generic_union_byte_write_displaced_read_back_through_wide_field() {
+    run_ok(
+        "generic-displaced",
+        r#"
+union BagOfBits<T: Copy> {
+    val: T,
+    bytes: [u8; 8],
+}
+
+fn main() {
+    let mut u = BagOfBits::<u64> { val: 0 };
+    unsafe {
+        (&mut u as *mut BagOfBits<u64> as *mut u8).add(3).write(0xAB);
+        println!("{:x}", u.val);
+    }
+}
+"#,
+        "ab000000\n",
+    );
+}
+
+#[test]
+fn run_mode_generic_struct_byte_write_read_back_through_fields() {
+    run_ok(
+        "generic-struct",
+        r#"
+struct Wrap<T> {
+    x: T,
+    pad: u8,
+}
+
+fn main() {
+    let mut w = Wrap::<u64> { x: 0, pad: 0 };
+    unsafe {
+        (&mut w as *mut Wrap<u64> as *mut u8).write(1);
+        (&mut w as *mut Wrap<u64> as *mut u8).add(8).write(7);
+        println!("{}", w.x);
+        println!("{}", w.pad);
+    }
+}
+"#,
+        "1\n7\n",
+    );
+}
+
+// Two recorded instances of one definition make the bare
+// `Ty::Adt` name ambiguous: the byte view must decline
+// rather than denominate the place by a guessed instance
+// (see `adt_instance_key`). A per-body denomination
+// channel, if one is ever recorded, updates this test
+// deliberately.
+#[test]
+fn run_mode_generic_union_byte_write_two_instances_stays_declined() {
+    run_err(
+        "generic-two-instances",
+        r#"
+union BagOfBits<T: Copy> {
+    val: T,
+    bytes: [u8; 8],
+}
+
+fn main() {
+    let small = BagOfBits::<u32> { val: 7 };
+    println!("{}", unsafe { small.val });
+    let mut u = BagOfBits::<u64> { val: 0 };
+    unsafe {
+        (&mut u as *mut BagOfBits<u64> as *mut u8).write(1);
+        println!("{}", u.val);
+    }
+}
+"#,
+    );
+}
