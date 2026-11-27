@@ -5091,6 +5091,25 @@ fn main() {
 }
 "#;
 
+const BOXED_STR_SORT_SRC: &str = r#"
+fn main() {
+    // A two-element sort is the smallest shape that reaches
+    // smallsort's `insert_tail`: it prices the neighbouring
+    // elements' copy ranges, and the fat element's stride is
+    // the element type's size -- sixteen, not the thin
+    // pointer's eight.
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "banana".into()];
+    v.sort();
+    println!("two={:?}", v);
+    let mut sorted: Vec<Box<str>> = vec!["apple".into(), "banana".into()];
+    sorted.sort();
+    println!("sorted={:?}", sorted);
+    let a: Box<str> = "pear".into();
+    let b: Box<str> = "banana".into();
+    println!("cmp={:?} eq={}", a.cmp(&b), a == b);
+}
+"#;
+
 #[test]
 fn run_mode_os_str_detached_deref_ordering() {
     run_ok(
@@ -5436,5 +5455,69 @@ fn run_mode_os_string_real_aggregate_drain() {
         "os-string-real-agg-drain",
         OS_STRING_REAL_AGGREGATE_DRAIN_SRC,
         "len=6\nboxed=\"banana\"\ndrained=[\"banana\", \"pear\"]\nrest=[]\n",
+    );
+}
+
+#[test]
+fn run_mode_boxed_str_vec_sort() {
+    run_ok(
+        "boxed-str-vec-sort",
+        BOXED_STR_SORT_SRC,
+        "two=[\"banana\", \"pear\"]\nsorted=[\"apple\", \"banana\"]\ncmp=Greater eq=false\n",
+    );
+}
+
+const BOXED_STR_MOVEMENT_SRC: &str = r#"
+fn main() {
+    // Element movement over fat-box elements that no
+    // comparison decides: reversal, rotation, swaps, and the
+    // shifting `remove` all move the sixteen-byte elements
+    // through the copy machinery.
+    let mut w: Vec<Box<str>> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+    w.reverse();
+    println!("rev={:?}", w);
+    w.rotate_left(1);
+    println!("rotl={:?}", w);
+    w.swap(0, 3);
+    println!("swap={:?}", w);
+    let r = w.remove(1);
+    println!("removed={} w={:?}", r, w);
+    let x: Box<str> = "hello".into();
+    let y = x.clone();
+    println!("clone={} eq={}", y, x == y);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_movement() {
+    run_ok(
+        "boxed-str-vec-movement",
+        BOXED_STR_MOVEMENT_SRC,
+        "rev=[\"d\", \"c\", \"b\", \"a\"]\nrotl=[\"c\", \"b\", \"a\", \"d\"]\nswap=[\"d\", \"b\", \"a\", \"c\"]\nremoved=b w=[\"d\", \"a\", \"c\"]\nclone=hello eq=true\n",
+    );
+}
+
+const BOXED_STR_SMART_POINTER_SORT_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    // The other fat smart pointers over `str`: their element
+    // stride is two words as well.
+    let mut rc: Vec<Rc<str>> = vec!["pear".into(), "banana".into()];
+    rc.sort();
+    println!("rc={:?}", rc);
+    let mut arc: Vec<Arc<str>> = vec!["pear".into(), "banana".into()];
+    arc.sort();
+    println!("arc={:?}", arc);
+}
+"#;
+
+#[test]
+fn run_mode_smart_pointer_str_vec_sort() {
+    run_ok(
+        "smart-pointer-str-vec-sort",
+        BOXED_STR_SMART_POINTER_SORT_SRC,
+        "rc=[\"banana\", \"pear\"]\narc=[\"banana\", \"pear\"]\n",
     );
 }

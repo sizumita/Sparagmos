@@ -778,6 +778,31 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
         let tag = tag.trim();
+        // A pointer-shaped tag -- a box, a reference, a raw
+        // pointer, an `Rc`/`Arc` -- over an unsized pointee is
+        // a fat pointer: two words, whatever the fixed table
+        // below answers for the pointee's text. The table's
+        // pointer arms answer the thin size for every pointee
+        // but the few textual cases they special-case, so they
+        // shadow the compiler-recorded layout of a fat box
+        // (recorded as two words, like every fat pointer) for
+        // every walk that denominates an element step by this
+        // resolution: a `Vec<Box<str>>` element step was
+        // denominated 8, halving the stride, and the sort's
+        // own `copy_nonoverlapping` precondition priced
+        // neighbouring elements as overlapping ranges. The
+        // fat answer is stated here, where the program's
+        // recorded DST layouts can take part in the unsized
+        // judgement (the same judgement the converter makes;
+        // see `ty_is_unsized` in `mir_convert`); the table
+        // stays the fallback for every other shape, including
+        // the thin pointers over sized pointees it prices
+        // correctly.
+        if let Some(pointee) = pointer_pointee_tag(tag) {
+            if self.tag_is_unsized(&pointee) {
+                return Some((16, 8));
+            }
+        }
         if let Some(layout) = type_layout(tag) {
             return Some(layout);
         }
@@ -821,6 +846,84 @@ impl<'a> Interpreter<'a> {
             .get(tag)
             .map(|&(size, align)| (u128::from(size), u128::from(align)))
     }
+
+    /// Whether a rendered type tag denotes an unsized type:
+    /// `str`, a slice or a trait object directly, a tuple by
+    /// its tail element, and an ADT instance the program
+    /// records a DST layout for (a struct or union whose tail
+    /// field is unsized -- `OsStr`, `Path`, `CStr`, and guest
+    /// DSTs alike). The rendered-tag mirror of the
+    /// converter's `ty_is_unsized`.
+    fn tag_is_unsized(&self, tag: &str) -> bool {
+        let tag = tag.trim();
+        if tag == "str" || tag.starts_with("dyn ") {
+            return true;
+        }
+        if tag.starts_with('[') && tag.ends_with(']') {
+            // `[T]` is a slice; `[T; n]` is an array, whose
+            // length separator sits at the bracket's own depth.
+            let inner = &tag[1..tag.len() - 1];
+            let mut depth = 0i32;
+            let mut prev = '\0';
+            for c in inner.chars() {
+                match c {
+                    '<' | '(' | '[' => depth += 1,
+                    '>' if prev == '-' => {}
+                    '>' | ')' | ']' => depth -= 1,
+                    ';' if depth == 0 => return false,
+                    _ => {}
+                }
+                prev = c;
+            }
+            return true;
+        }
+        if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
+            let inner = &tag[1..tag.len() - 1];
+            return split_top_level(inner)
+                .last()
+                .is_some_and(|tail| self.tag_is_unsized(tail));
+        }
+        self.program().adt_dst_layouts.contains_key(tag)
+    }
+}
+
+/// The pointee tag of a pointer-shaped rendered tag: a box's
+/// or smart pointer's first generic argument, a reference's
+/// referent (past its lifetime and mutability), a raw
+/// pointer's pointee. `None` for any other shape.
+fn pointer_pointee_tag(tag: &str) -> Option<String> {
+    let tag = tag.trim();
+    for prefix in ["*const ", "*mut "] {
+        if let Some(rest) = tag.strip_prefix(prefix) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    if let Some(rest) = tag.strip_prefix('&') {
+        let mut rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('\'') {
+            // A lifetime: skip its name and the following space.
+            rest = stripped
+                .split_once(' ')
+                .map(|(_, tail)| tail)
+                .unwrap_or(stripped)
+                .trim_start();
+        }
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim();
+        return Some(rest.to_string());
+    }
+    for prefix in [
+        "std::boxed::Box<",
+        "alloc::boxed::Box<",
+        "std::rc::Rc<",
+        "alloc::rc::Rc<",
+        "std::sync::Arc<",
+        "alloc::sync::Arc<",
+    ] {
+        if tag.starts_with(prefix) {
+            return generic_args_of(tag).into_iter().next();
+        }
+    }
+    None
 }
 
 pub(super) fn type_layout(tag: &str) -> Option<(u128, u128)> {
