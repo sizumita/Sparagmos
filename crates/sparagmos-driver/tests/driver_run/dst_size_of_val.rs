@@ -285,3 +285,88 @@ fn run_mode_size_of_val_raw_packed_field_offset_ice() {
     // 1 + 1 + 4*4 and the field read goes through the wrapper.
     run_ok("dst-field-offset-ice", FIELD_OFFSET_ICE_SRC, "ok\n");
 }
+
+// (pointer, length) pair -> fat reference (Issue #392): a
+// two-word tuple or struct shape (data pointer at offset 0,
+// length at offset 64) transmuted into a fat reference --
+// to a plain slice or to a DST-wrapper struct -- and back.
+// The tuple form already crossed through the DST-wrapper
+// arm; the struct form (an `AdtFields` shape) is what this
+// group adds.
+
+#[test]
+fn run_mode_tuple_pair_to_slice_ref() {
+    run_ok("fatref-tuple-slice", r#"
+fn main() {
+    let arr = [10u32, 20, 30];
+    let ptr = arr.as_ptr();
+    let s: &[u32] = unsafe { std::mem::transmute((ptr, 3usize)) };
+    println!("{} {} {}", s.len(), s[0], s[2]);
+    let raw: *const [u32] = unsafe { std::mem::transmute((ptr, 2usize)) };
+    println!("{}", unsafe { (*raw).len() });
+    let back: (*const u32, usize) = unsafe { std::mem::transmute(s) };
+    println!("{} {}", back.1, unsafe { *back.0 });
+}
+"#, "3 10 30\n2\n3 10\n");
+}
+#[test]
+fn run_mode_struct_pair_to_slice_ref() {
+    run_ok("fatref-struct-slice", r#"
+#[repr(C)]
+struct Pair { ptr: *const u32, len: usize }
+fn main() {
+    let arr = [7u32, 8, 9, 11];
+    let p = Pair { ptr: arr.as_ptr(), len: 4 };
+    let s: &[u32] = unsafe { std::mem::transmute(p) };
+    println!("{} {}", s.len(), s[3]);
+    let back: Pair = unsafe { std::mem::transmute(s) };
+    println!("{}", back.len);
+}
+"#, "4 11\n4\n");
+}
+#[test]
+fn run_mode_ref_len_tuple_to_slice_ref() {
+    run_ok("fatref-ref-tuple", r#"
+fn main() {
+    let arr = [5u32, 6];
+    let first = &arr[0];
+    let s: &[u32] = unsafe { std::mem::transmute((first, 2usize)) };
+    println!("{} {}", s.len(), s[1]);
+}
+"#, "2 6\n");
+}
+
+#[test]
+fn run_mode_tuple_struct_pair_to_slice_ref() {
+    run_ok("fatref-tuple-struct", r#"
+#[repr(C)]
+struct Pair2(*const u8, usize);
+fn main() {
+    let arr = [65u8, 66, 67];
+    let p = Pair2(arr.as_ptr(), 3);
+    let s: &[u8] = unsafe { std::mem::transmute(p) };
+    println!("{} {}", s.len(), s[1]);
+    let back: Pair2 = unsafe { std::mem::transmute(s) };
+    println!("{}", back.1);
+}
+"#, "3 66\n3\n");
+}
+#[test]
+fn run_mode_struct_pair_to_dst_wrapper_ref() {
+    run_ok("fatref-struct-dst", r#"
+#[repr(packed, C)]
+struct PackedSized { f: u8, d: [u32; 4] }
+#[repr(packed, C)]
+struct PackedUnsized { f: u8, d: [u32] }
+#[repr(C)]
+struct Raw { ptr: *const PackedSized, len: usize }
+fn main() { unsafe {
+    let p = PackedSized { f: 0, d: [1, 2, 3, 4] };
+    let raw = Raw { ptr: &p, len: 4 };
+    let r: &PackedUnsized = std::mem::transmute(raw);
+    let rp = r as *const PackedUnsized;
+    assert_eq!(std::mem::size_of_val_raw(rp), 1 + 4*4);
+    println!("ok");
+} }
+"#, "ok\n");
+}

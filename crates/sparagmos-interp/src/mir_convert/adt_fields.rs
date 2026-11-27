@@ -188,6 +188,28 @@ pub(super) fn fat_words_fields(shape: &ir::ScalarShape) -> bool {
                     ir::ScalarShape::Int { bits: 64, .. }
                 )
         }
+        // A struct of the same shape (Issue #392): its
+        // multi-field shape records each field at its layout
+        // offset, so the two words are the field at offset 0
+        // holding the pointer and the field at offset 64
+        // holding the 64-bit length, in either declaration
+        // order, and the whole storage is the two words.
+        ir::ScalarShape::AdtFields {
+            total_bits, fields, ..
+        } => {
+            *total_bits == 128
+                && fields.len() == 2
+                && fields.iter().any(|(_, off, s)| {
+                    *off == 0 && *s == ir::ScalarShape::Ptr
+                })
+                && fields.iter().any(|(_, off, s)| {
+                    *off == 64
+                        && matches!(
+                            s,
+                            ir::ScalarShape::Int { bits: 64, .. }
+                        )
+                })
+        }
         _ => false,
     }
 }
