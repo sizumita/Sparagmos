@@ -781,6 +781,12 @@ impl<'a> Interpreter<'a> {
                     message: "explicit abort".to_string(),
                 })
             }
+            Builtin::IntrinsicsUnreachable => {
+                arity(0)?;
+                Err(InterpError::Abort {
+                    message: "entered unreachable code".to_string(),
+                })
+            }
             Builtin::Stdout => {
                 arity(0)?;
                 Ok(Value::Enum {
