@@ -1304,7 +1304,9 @@ thread '{name}' ({tid}) panicked:
 
 /// Format an assertion message from its operand values, with
 /// core's exact text (`core::panicking`'s messages for the
-/// bounds-check and misaligned-dereference assertions).
+/// bounds-check, misaligned-dereference and invalid-enum-
+/// construction assertions; the null-pointer-dereference text
+/// is fixed and needs no operand).
 /// Returns None when a value does not render as an integer,
 /// leaving the caller its baked fallback text.
 pub(crate) fn format_assert_message(
@@ -1318,12 +1320,28 @@ pub(crate) fn format_assert_message(
             _ => None,
         }
     }
+    fn hex(v: &Value) -> Option<String> {
+        match v {
+            // The lang item takes the source as a `u128`: a
+            // signed discriminant renders as its bit pattern.
+            Value::Int(i) => Some(format!("{:#x}", *i as u128)),
+            Value::Uint(u) => Some(format!("{u:#x}")),
+            _ => None,
+        }
+    }
     match kind {
         crate::ir::AssertFormat::BoundsCheck => Some(format!(
             "index out of bounds: the len is {} but the index is {}",
             num(vals.first()?)?,
             num(vals.get(1)?)?,
         )),
+        crate::ir::AssertFormat::InvalidEnumConstruction => Some(format!(
+            "trying to construct an enum from an invalid value {}",
+            hex(vals.first()?)?,
+        )),
+        crate::ir::AssertFormat::NullPointerDereference => {
+            Some("null pointer dereference occurred".to_string())
+        }
         crate::ir::AssertFormat::MisalignedPointerDeref => Some(format!(
             "misaligned pointer dereference: address must be a multiple of {} but is {}",
             num(vals.first()?)?,

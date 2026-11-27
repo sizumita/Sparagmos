@@ -908,3 +908,76 @@ fn assert_bounds_check_message_formats_operands() {
         other => panic!("got: {other}"),
     }
 }
+
+#[test]
+fn assert_invalid_enum_construction_message_formats_operand() {
+    // An invalid-enum-construction assertion's panic message
+    // is formatted from the assertion's operand at run time,
+    // with core's exact text (`panic_invalid_enum_construction`
+    // renders the source value in hex) -- the message a native
+    // run prints and a `catch_unwind` caller observes.
+    let body = Body::new(
+        "invalid_enum",
+        0,
+        vec![Ty::i64(), Ty::Bool],
+        vec![
+            bb(
+                vec![assign(1, Rvalue::Use(Operand::const_bool(false)))],
+                TerminatorKind::Assert {
+                    cond: Operand::copy_local(1),
+                    expected: true,
+                    target: BasicBlock(1),
+                    message: "assertion failed: InvalidEnumConstruction".into(),
+                    format: Some(sparagmos_interp::ir::AssertFormat::InvalidEnumConstruction),
+                    operands: vec![Operand::const_uint(7)],
+                    overflow: false,
+                },
+            ),
+            bb(vec![], ret()),
+        ],
+    );
+    let p = program_of(body);
+    let err = interpret(&p, "invalid_enum", vec![]).unwrap_err();
+    match err {
+        InterpError::Panic { message, .. } => assert_eq!(
+            message,
+            "trying to construct an enum from an invalid value 0x7"
+        ),
+        other => panic!("got: {other}"),
+    }
+}
+
+#[test]
+fn assert_null_pointer_dereference_message_is_core_text() {
+    // A null-pointer-dereference assertion panics with core's
+    // fixed text (`panic_null_pointer_dereference`), not the
+    // baked kind text.
+    let body = Body::new(
+        "null_deref",
+        0,
+        vec![Ty::i64(), Ty::Bool],
+        vec![
+            bb(
+                vec![assign(1, Rvalue::Use(Operand::const_bool(false)))],
+                TerminatorKind::Assert {
+                    cond: Operand::copy_local(1),
+                    expected: true,
+                    target: BasicBlock(1),
+                    message: "null pointer dereference occurred".into(),
+                    format: Some(sparagmos_interp::ir::AssertFormat::NullPointerDereference),
+                    operands: vec![],
+                    overflow: false,
+                },
+            ),
+            bb(vec![], ret()),
+        ],
+    );
+    let p = program_of(body);
+    let err = interpret(&p, "null_deref", vec![]).unwrap_err();
+    match err {
+        InterpError::Panic { message, .. } => {
+            assert_eq!(message, "null pointer dereference occurred")
+        }
+        other => panic!("got: {other}"),
+    }
+}
