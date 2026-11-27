@@ -2204,21 +2204,27 @@ impl<'a> Interpreter<'a> {
     /// an element pointer into a value that stores no elements.
     /// Whether the position `pos` denotes holds a value in a
     /// vector's own shape: a sparse vector, or an aggregate
-    /// whose fields are all values of one kind -- an element
-    /// list. A struct aggregate's fields are its declared
-    /// fields, of heterogeneous kinds in general, so a
-    /// payload of that shape is not judged a vector (an empty
-    /// or one-field aggregate is vacuous: it has no field a
-    /// structural step could misread as an element). This is
-    /// the judgment the suspected-position arms apply to a
+    /// whose fields form an element list -- every field the
+    /// same top-level shape, or, for elements of one enum
+    /// type, the same shape within each variant (an enum's
+    /// variants are the one place elements of one type may
+    /// differ in shape at all). A struct aggregate's fields
+    /// are its declared fields, of distinct types in general,
+    /// and their shapes differ within the struct's single
+    /// variant: a reference-counted handle, whose fields are
+    /// a one-field wrapper around the allocation reference
+    /// beside two empty marker aggregates, is not an element
+    /// list, and a walk over it must take its field steps as
+    /// the field accesses they are. (An empty or one-field
+    /// aggregate is vacuous: it has no field a structural
+    /// step could misread as an element.) This is the
+    /// judgment the suspected-position arms apply to a
     /// payload the type tracking could not name (see the
     /// `buf_suspect` state in `resolve_place_mode`).
     fn suspected_vec_position(&self, frames: &[Frame], pos: &Resolved) -> bool {
         match self.read_resolved(frames, pos) {
             Ok(Value::SparseVec { .. }) => true,
-            Ok(Value::Enum { fields, .. }) => fields
-                .windows(2)
-                .all(|w| w[0].kind_name() == w[1].kind_name()),
+            Ok(Value::Enum { fields, .. }) => Self::fields_form_element_list(&fields),
             _ => false,
         }
     }
@@ -2228,6 +2234,49 @@ impl<'a> Interpreter<'a> {
             self.read_resolved(frames, pos),
             Ok(Value::Enum { .. } | Value::SparseVec { .. })
         )
+    }
+
+    /// Whether an aggregate's fields form an element list
+    /// (see [`Self::suspected_vec_position`]): every field
+    /// has the same top-level shape signature, or every
+    /// field is an enum value whose signature is constant
+    /// within each variant. A value's shape signature is
+    /// its kind, its variant for an enum value, and its
+    /// field count for an aggregate (a sequence value's
+    /// length is data, not shape, so byte blocks and
+    /// strings carry no count).
+    fn fields_form_element_list(fields: &[Value]) -> bool {
+        fn shape(value: &Value) -> (&'static str, Option<u32>, Option<usize>) {
+            match value {
+                Value::Enum { variant, fields } => {
+                    (value.kind_name(), Some(*variant), Some(fields.len()))
+                }
+                Value::Tuple(items) => {
+                    (value.kind_name(), None, Some(items.len()))
+                }
+                other => (other.kind_name(), None, None),
+            }
+        }
+        if fields.windows(2).all(|w| shape(&w[0]) == shape(&w[1])) {
+            return true;
+        }
+        if !fields.iter().all(|f| matches!(f, Value::Enum { .. })) {
+            return false;
+        }
+        let mut seen: Vec<(u32, (&'static str, Option<u32>, Option<usize>))> =
+            Vec::new();
+        for field in fields {
+            let Value::Enum { variant, .. } = field else {
+                unreachable!("checked above")
+            };
+            let sig = shape(field);
+            match seen.iter().find(|(v, _)| v == variant) {
+                Some((_, prev)) if *prev != sig => return false,
+                Some(_) => {}
+                None => seen.push((*variant, sig)),
+            }
+        }
+        true
     }
 
     /// The declared type of field `idx` of variant `variant` of

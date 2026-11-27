@@ -1875,3 +1875,115 @@ fn main() {
 fn run_mode_spin_loop_completes() {
     run_ok("spin-loop", SPIN_LOOP_SRC, "done\n");
 }
+
+const RC_TRY_UNWRAP_VEC_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let rc = Rc::new(vec![1, 2, 3]);
+    match Rc::try_unwrap(rc) {
+        Ok(v) => println!("ok {:?}", v),
+        Err(_) => println!("err"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_rc_try_unwrap_vec() {
+    // `try_unwrap`'s converted body reads the pointee through
+    // the handle stored inside a `ManuallyDrop`: the place
+    // walk must take the handle's field steps as field
+    // accesses, not as a vector buffer chain (the handle's
+    // fields are all aggregates, which the suspected-vector
+    // shape judgment once mistook for an element list).
+    run_ok("rc-try-unwrap-vec", RC_TRY_UNWRAP_VEC_SRC, "ok [1, 2, 3]\n");
+}
+
+const RC_TRY_UNWRAP_STRING_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let rc = Rc::new(String::from("hello"));
+    match Rc::try_unwrap(rc) {
+        Ok(v) => println!("ok {}", v),
+        Err(_) => println!("err"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_rc_try_unwrap_string() {
+    run_ok(
+        "rc-try-unwrap-string",
+        RC_TRY_UNWRAP_STRING_SRC,
+        "ok hello\n",
+    );
+}
+
+const ARC_TRY_UNWRAP_VEC_SRC: &str = r#"
+use std::sync::Arc;
+fn main() {
+    let a = Arc::new(vec![4, 5, 6]);
+    match Arc::try_unwrap(a) {
+        Ok(v) => println!("ok {:?}", v),
+        Err(_) => println!("err"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_arc_try_unwrap_vec() {
+    // The `Arc` handle has the same field shape as the `Rc`
+    // handle (a wrapper around the allocation reference
+    // beside two empty marker aggregates); the same place
+    // walk serves it.
+    run_ok("arc-try-unwrap-vec", ARC_TRY_UNWRAP_VEC_SRC, "ok [4, 5, 6]\n");
+}
+
+const RC_TRY_UNWRAP_ERR_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let rc = Rc::new(vec![9]);
+    let keep = rc.clone();
+    match Rc::try_unwrap(rc) {
+        Ok(_) => println!("unexpected ok"),
+        Err(rc) => {
+            println!("err {:?}", *rc);
+            drop(keep);
+            match Rc::try_unwrap(rc) {
+                Ok(v) => println!("ok {:?}", v),
+                Err(_) => println!("unexpected err"),
+            }
+        }
+    }
+}
+"#;
+
+#[test]
+fn run_mode_rc_try_unwrap_shared_returns_err() {
+    run_ok(
+        "rc-try-unwrap-err",
+        RC_TRY_UNWRAP_ERR_SRC,
+        "err [9]\nok [9]\n",
+    );
+}
+
+const MD_VEC_INTO_ITER_OPTION_SRC: &str = r#"
+fn main() {
+    let v = vec![Some(1), None, Some(3), None];
+    let sum: i32 = v.into_iter().flatten().sum();
+    println!("sum {}", sum);
+}
+"#;
+
+#[test]
+fn run_mode_manually_drop_vec_into_iter_option_elements() {
+    // The other side of the suspected-vector judgment: a
+    // `Vec` of enum elements whose variants differ in shape
+    // (`Some` beside `None`), reached through the
+    // `ManuallyDrop` inside `Vec::into_iter`, is an element
+    // list and keeps the buffer-chain treatment.
+    run_ok(
+        "md-vec-into-iter-option",
+        MD_VEC_INTO_ITER_OPTION_SRC,
+        "sum 4\n",
+    );
+}
