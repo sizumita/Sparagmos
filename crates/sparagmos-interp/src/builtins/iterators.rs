@@ -8753,6 +8753,25 @@ fn slice_iter_snapshot_bytes(state: &Value, self_ty: &str) -> InterpResult<Vec<u
     };
     let mut bytes = Vec::with_capacity(items.len());
     for item in &items {
+        // An element stored through the buffer's union view
+        // (the `MaybeUninit<u8>` spare-capacity region a
+        // `join` / `concat` fill writes through, whose stored
+        // elements a drain's converted construction snapshots
+        // verbatim) keeps the union's one-field form in the
+        // snapshot; the element is the byte it holds -- the
+        // same per-element peel the string readers apply
+        // (`string_from_element_form`,
+        // `string_from_real_aggregate`). The peel is one
+        // level, exactly as in those readers, and the peeled
+        // element faces the same byte judgement as a bare
+        // one, so every other shape keeps its rejection.
+        let item = match item {
+            Value::Enum {
+                variant: 0,
+                fields,
+            } if fields.len() == 1 => &fields[0],
+            other => other,
+        };
         match item {
             Value::Uint(v) => bytes.push(u8::try_from(*v).map_err(|_| {
                 InterpError::type_mismatch(
