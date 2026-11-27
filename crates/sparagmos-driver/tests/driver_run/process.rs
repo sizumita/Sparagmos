@@ -2021,3 +2021,101 @@ fn run_mode_exit_status_display() {
         "status: exit code: 5\ncode: Some(5)\n"
     );
 }
+
+const COMMAND_DEBUG_SRC: &str = r#"
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+
+fn main() {
+    let c = Command::new("foo");
+    println!("{:?}", c);
+    let mut c2 = Command::new("/path/to/rustc");
+    c2.arg("foo.rs")
+        .arg("--emit")
+        .arg("metadata")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env_remove("HOME")
+        .current_dir("/tmp/some dir");
+    println!("{:?}", c2);
+    println!("{:#?}", c2);
+    let mut c3 = Command::new("prog");
+    c3.env_clear().env("A", "1").env("B", "x y");
+    println!("{:?}", c3);
+    let mut c4 = Command::new("srv");
+    c4.uid(1000).gid(100).stdin(Stdio::null()).stdout(Stdio::piped());
+    println!("{:#?}", c4);
+    let mut c5 = Command::new("e");
+    c5.env("K", "v").env("K", "v2").env_remove("K").env("A", "1");
+    println!("{:?}", c5);
+}
+"#;
+
+#[test]
+fn run_mode_process_command_debug_format() {
+    // `Debug` for `std::process::Command` is handwritten in
+    // std -- a shell-like rendering in the plain form, a
+    // field struct under `{:#?}` -- while the value model
+    // holds a command as a handle into the command table, so
+    // the formatting engine composes std's text from the
+    // recorded state (environment changes folded into key
+    // order, as std's map storage iterates them). The
+    // expectation is the pinned toolchain's own output for
+    // the same commands.
+    let dir = temp_dir("command-debug");
+    let src = fixture(&dir, "cmd_debug.rs", COMMAND_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    let expected = concat!(
+        "\"foo\"\n",
+        "cd \"/tmp/some dir\" && env -u HOME RUSTC_BOOTSTRAP=\"1\" \"/path/to/rustc\" \"foo.rs\" \"--emit\" \"metadata\"\n",
+        "Command {\n",
+        "    program: \"/path/to/rustc\",\n",
+        "    args: [\n",
+        "        \"/path/to/rustc\",\n",
+        "        \"foo.rs\",\n",
+        "        \"--emit\",\n",
+        "        \"metadata\",\n",
+        "    ],\n",
+        "    env: CommandEnv {\n",
+        "        clear: false,\n",
+        "        vars: {\n",
+        "            \"HOME\": None,\n",
+        "            \"RUSTC_BOOTSTRAP\": Some(\n",
+        "                \"1\",\n",
+        "            ),\n",
+        "        },\n",
+        "    },\n",
+        "    cwd: Some(\n",
+        "        \"/tmp/some dir\",\n",
+        "    ),\n",
+        "    create_pidfd: false,\n",
+        "}\n",
+        "env -i A=\"1\" B=\"x y\" \"prog\"\n",
+        "Command {\n",
+        "    program: \"srv\",\n",
+        "    args: [\n",
+        "        \"srv\",\n",
+        "    ],\n",
+        "    uid: Some(\n",
+        "        1000,\n",
+        "    ),\n",
+        "    gid: Some(\n",
+        "        100,\n",
+        "    ),\n",
+        "    stdin: Some(\n",
+        "        Null,\n",
+        "    ),\n",
+        "    stdout: Some(\n",
+        "        MakePipe,\n",
+        "    ),\n",
+        "    create_pidfd: false,\n",
+        "}\n",
+        "env -u K A=\"1\" \"e\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "stderr={stderr}"
+    );
+}

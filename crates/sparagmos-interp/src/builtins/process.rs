@@ -602,7 +602,7 @@ pub(super) fn command_value(id: u64) -> Value {
 /// The command id a handle value carries, at whichever nesting
 /// the value arrives with (the bare handle, the sys `Command`
 /// aggregate, or the aggregate inside the public `Command`).
-fn command_handle_id(value: &Value) -> Option<u64> {
+pub(super) fn command_handle_id(value: &Value) -> Option<u64> {
     let mut cur = value;
     loop {
         match cur {

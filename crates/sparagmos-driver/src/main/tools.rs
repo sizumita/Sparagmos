@@ -800,6 +800,7 @@ pub(crate) fn tool_run(
     let mut edition: Option<String> = None;
     let mut crate_name: Option<String> = None;
     let mut crate_types: Vec<String> = Vec::new();
+    let mut test_crate = false;
     let mut forward: Vec<String> = Vec::new();
     let mut aux: Vec<String> = Vec::new();
     // The dependency version each `aux` entry binds, in
@@ -852,6 +853,10 @@ pub(crate) fn tool_run(
             }
         };
         match flag {
+            "--test" => {
+                test_crate = true;
+                forward.push(arg.clone());
+            }
             "--edition" => edition = take_value(inline, &mut i),
             "--crate-name" => crate_name = take_value(inline, &mut i),
             "--crate-type" => {
@@ -1078,7 +1083,15 @@ pub(crate) fn tool_run(
     let types: Vec<String> = if crate_types.is_empty() {
         let has_main = crate_root_has_main(&input_abs, &source_text);
         let wants_metadata = emits.iter().any(|(k, _)| k == "metadata");
-        if wants_metadata {
+        if test_crate {
+            // A `--test` build's primary output is the test
+            // binary, named after the crate, whether or not
+            // the root declares a `main` (the harness supplies
+            // it); a metadata emit the invocation also carries
+            // is recorded by the emit loop below, as rustc
+            // writes both.
+            vec!["bin".to_string()]
+        } else if wants_metadata {
             vec!["rmeta".to_string()]
         } else if has_main {
             vec!["bin".to_string()]

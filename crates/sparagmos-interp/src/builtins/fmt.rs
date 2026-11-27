@@ -3786,6 +3786,258 @@ impl<'a> Interpreter<'a> {
     /// field is the pointee reference (its `Debug` forwards to the
     /// pointee). An ADT with no recorded shape stays an explicit
     /// unsupported error.
+    /// Debug formatting of a `std::process::Command` value.
+    ///
+    /// The `Debug` impls of the public `Command` and of the
+    /// sys `Command` it forwards to are handwritten in std:
+    /// the plain form renders a shell-like invocation (an
+    /// optional `cd ... &&`, the environment changes as an
+    /// `env` prefix, then the quoted program and arguments),
+    /// and the alternate form renders a `Command` debug
+    /// struct over the fields that are set. Neither is the
+    /// derived form of the sys struct's storage, and the
+    /// value model does not hold that storage at all: a
+    /// command value is the handle aggregate the process
+    /// model builds (see `process::command_value`), whose
+    /// state lives in the command table. The text is
+    /// therefore composed here from the table snapshot,
+    /// following std's own rendering rules -- the
+    /// environment changes fold into key order, the way
+    /// std's `BTreeMap` storage iterates them, and a
+    /// removal recorded after `env_clear` deletes the entry
+    /// instead of naming a removal (the model's own log is
+    /// emptied by the clear, so only the post-clear calls
+    /// fold here). `None` when the type is not a command
+    /// type or the value carries no live command handle, in
+    /// which case the existing behaviour stands.
+    fn format_debug_command(
+        &mut self,
+        variant: u32,
+        fields: &[Value],
+        tag: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let head = tag.split('<').next().unwrap_or(tag).trim();
+        if head != "std::process::Command"
+            && head != "std::sys::process::unix::common::Command"
+        {
+            return Ok(None);
+        }
+        let aggregate = Value::Enum {
+            variant,
+            fields: fields.to_vec(),
+        };
+        let Some(id) = super::process::command_handle_id(&aggregate) else {
+            return Ok(None);
+        };
+        let Some(state) = self.command_snapshot(id) else {
+            return Ok(None);
+        };
+        let mut envs: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        for (key, value) in &state.envs {
+            match value {
+                Some(v) => {
+                    envs.insert(key.clone(), Some(v.clone()));
+                }
+                None => {
+                    if state.env_clear {
+                        envs.remove(key);
+                    } else {
+                        envs.insert(key.clone(), None);
+                    }
+                }
+            }
+        }
+        let os_debug = |bytes: &[u8]| -> Option<String> {
+            crate::platform::os_str_from_bytes(bytes).map(|os| format!("{os:?}"))
+        };
+        let argv0: &[u8] = state.argv0.as_deref().unwrap_or(&state.program);
+        if !options.alternate() {
+            let mut out = String::new();
+            if let Some(cwd) = &state.cwd {
+                let Some(cwd) = os_debug(cwd) else {
+                    return Ok(None);
+                };
+                out += &format!("cd {cwd} && ");
+            }
+            if state.env_clear {
+                out += "env -i ";
+            } else {
+                let mut any_removed = false;
+                for (key, value) in &envs {
+                    if value.is_none() {
+                        if !any_removed {
+                            out += "env ";
+                            any_removed = true;
+                        }
+                        out += &format!("-u {} ", String::from_utf8_lossy(key));
+                    }
+                }
+            }
+            for (key, value) in &envs {
+                if let Some(value) = value {
+                    let Some(value) = os_debug(value) else {
+                        return Ok(None);
+                    };
+                    out += &format!("{}={value} ", String::from_utf8_lossy(key));
+                }
+            }
+            if state.program != argv0 {
+                let Some(program) = os_debug(&state.program) else {
+                    return Ok(None);
+                };
+                out += &format!("[{program}] ");
+            }
+            let Some(text) = os_debug(argv0) else {
+                return Ok(None);
+            };
+            out += &text;
+            for arg in &state.args {
+                let Some(arg) = os_debug(arg) else {
+                    return Ok(None);
+                };
+                out += &format!(" {arg}");
+            }
+            return Ok(Some(pad_width(&out, options)));
+        }
+        // The alternate form: std's `debug_struct` over the
+        // fields that are set, in std's field order. A
+        // `Stdio` field the model recorded but cannot decode
+        // keeps the existing behaviour rather than a guessed
+        // rendering.
+        let pretty_list = |items: &[String], at: usize| -> String {
+            if items.is_empty() {
+                return "[]".to_string();
+            }
+            let inner = at + 4;
+            let mut out = String::from("[\n");
+            for item in items {
+                out += &" ".repeat(inner);
+                out += item;
+                out += ",\n";
+            }
+            out += &" ".repeat(at);
+            out += "]";
+            out
+        };
+        let pretty_some = |text: String, at: usize| -> String {
+            let inner = at + 4;
+            format!("Some(\n{}{},\n{})", " ".repeat(inner), text, " ".repeat(at))
+        };
+        let inner = indent + 4;
+        let mut out = String::from("Command {\n");
+        let mut field = |out: &mut String, name: &str, text: &str| {
+            out.push_str(&" ".repeat(inner));
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(text);
+            out.push_str(",\n");
+        };
+        let Some(program) = os_debug(&state.program) else {
+            return Ok(None);
+        };
+        field(&mut out, "program", &program);
+        let mut arg_texts = Vec::with_capacity(state.args.len() + 1);
+        let Some(text) = os_debug(argv0) else {
+            return Ok(None);
+        };
+        arg_texts.push(text);
+        for arg in &state.args {
+            let Some(arg) = os_debug(arg) else {
+                return Ok(None);
+            };
+            arg_texts.push(arg);
+        }
+        let args_text = pretty_list(&arg_texts, inner);
+        field(&mut out, "args", &args_text);
+        if state.env_clear || !envs.is_empty() {
+            let vars_inner = inner + 8;
+            let mut vars = String::new();
+            if envs.is_empty() {
+                vars += "{}";
+            } else {
+                vars += "{\n";
+                for (key, value) in &envs {
+                    let Some(key) = os_debug(key) else {
+                        return Ok(None);
+                    };
+                    vars += &" ".repeat(vars_inner);
+                    vars += &key;
+                    vars += ": ";
+                    match value {
+                        Some(v) => {
+                            let Some(v) = os_debug(v) else {
+                                return Ok(None);
+                            };
+                            vars += &pretty_some(v, vars_inner);
+                        }
+                        None => vars += "None",
+                    }
+                    vars += ",\n";
+                }
+                vars += &" ".repeat(inner + 4);
+                vars += "}";
+            }
+            let env_text = format!(
+                "CommandEnv {{\n{}clear: {},\n{}vars: {},\n{}}}",
+                " ".repeat(inner + 4),
+                state.env_clear,
+                " ".repeat(inner + 4),
+                vars,
+                " ".repeat(inner)
+            );
+            field(&mut out, "env", &env_text);
+        }
+        if let Some(cwd) = &state.cwd {
+            let Some(cwd) = os_debug(cwd) else {
+                return Ok(None);
+            };
+            field(&mut out, "cwd", &pretty_some(cwd, inner));
+        }
+        if let Some(uid) = state.uid {
+            field(&mut out, "uid", &pretty_some(uid.to_string(), inner));
+        }
+        if let Some(gid) = state.gid {
+            field(&mut out, "gid", &pretty_some(gid.to_string(), inner));
+        }
+        if let Some(groups) = &state.groups {
+            let items: Vec<String> =
+                groups.iter().map(|g| g.to_string()).collect();
+            let text = pretty_list(&items, inner + 4);
+            field(&mut out, "groups", &pretty_some(text, inner));
+        }
+        for (name, config) in [
+            ("stdin", state.stdin_stdio),
+            ("stdout", state.stdout_stdio),
+            ("stderr", state.stderr_stdio),
+        ] {
+            if let Some(config) = config {
+                // The alternate form shows the sys `Stdio`
+                // enum's derived `Debug`: the three routings
+                // with no descriptor to name. A descriptor
+                // form carries a host fd number the model
+                // does not hold, so it keeps the existing
+                // behaviour rather than a guessed rendering.
+                let text = match config {
+                    crate::interp::StdioConfig::Inherit => "Inherit",
+                    crate::interp::StdioConfig::Null => "Null",
+                    crate::interp::StdioConfig::Piped => "MakePipe",
+                    crate::interp::StdioConfig::File(_)
+                    | crate::interp::StdioConfig::Unmodelled => {
+                        return Ok(None);
+                    }
+                };
+                field(&mut out, name, &pretty_some(text.to_string(), inner));
+            }
+        }
+        field(&mut out, "create_pidfd", "false");
+        out += &" ".repeat(indent);
+        out += "}";
+        Ok(Some(out))
+    }
+
     fn format_debug_adt(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3810,6 +4062,11 @@ impl<'a> Interpreter<'a> {
         // rendering below.
         if let Some(text) =
             self.format_debug_collection(frames, variant, fields, tag, options, indent)?
+        {
+            return Ok(text);
+        }
+        if let Some(text) =
+            self.format_debug_command(variant, fields, tag, options, indent)?
         {
             return Ok(text);
         }
