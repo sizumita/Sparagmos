@@ -370,7 +370,17 @@ denominator. Runs on every push to `main` and on manual dispatch.
   input or rejects it cleanly is recorded as failing the
   crash expectation (`no crash (converted successfully)` /
   `no crash (clean rejection)`) until the crash itself is
-  reproduced.
+  reproduced. One evidence requirement refines the exit-code
+  condition: exit 101 passes only when the output carries
+  an internal compiler error, because the driver also exits
+  101 when one of its own panics escapes the compiler run,
+  and that driver-side abnormal exit is not a reproduction
+  of the reference compiler's crash; such a record fails as
+  `compiler crash not evidenced`, the same evidence rule a
+  declared failure status of 101 and the run-crash verdict
+  apply. Death by signal needs no further evidence: the
+  compiler process crashing is compiletest's condition
+  itself.
 - A failure-expecting compile-check test that declares the
   failure status it expects (`//@ failure-status: N`, scoped
   to the revision being judged) passes stage 2 on either of
