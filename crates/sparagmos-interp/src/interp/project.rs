@@ -2103,6 +2103,67 @@ fn stream_extract(
     (bits, init)
 }
 
+/// Decode one field of a union held in its byte form
+/// (`Value::UnionBytes`) from the storage bytes, for a plain
+/// field step that reaches the union's field without a
+/// union-field step (a `MaybeUninit` payload descent through
+/// an aggregate, where the step the conversion recorded is a
+/// field step): every union field sits at offset zero, so
+/// the field's value is the storage image's head span read
+/// through the field's scalar shape -- the same decode
+/// `Interpreter::union_field_read` performs for its byte-form
+/// arm. `None` when no type evidence reached here or the
+/// field's declared type has no scalar shape, leaving the
+/// caller's own judgement for that shape.
+fn union_bytes_field_value(
+    bytes: &[Option<u8>],
+    field_ty: Option<&Ty>,
+    func: &str,
+    place: &str,
+) -> Option<InterpResult<Value>> {
+    let shape = scalar_shape_of_ty(field_ty?)?;
+    let bits = shape.bits();
+    if bits == 0 || bits % 8 != 0 {
+        return None;
+    }
+    let width = (bits / 8) as usize;
+    let mut span: Vec<Option<u8>> = bytes.iter().take(width).cloned().collect();
+    span.resize(width, None);
+    if span.iter().all(|b| b.is_none()) {
+        return Some(Err(InterpError::UninitializedRead {
+            func: func.to_string(),
+            place: place.to_string(),
+        }));
+    }
+    let mut pattern: u128 = 0;
+    for (i, b) in span.iter().enumerate() {
+        if let Some(b) = b {
+            pattern |= u128::from(*b) << (8 * i);
+        }
+    }
+    // The scalar construction of
+    // `Interpreter::construct_scalar`, for the shapes
+    // `scalar_shape_of_ty` produces.
+    let value = match shape {
+        ScalarShape::Int { bits: w, signed } => {
+            if signed {
+                Value::Int(wrap_signed(pattern as i128, w))
+            } else {
+                Value::Uint(wrap_unsigned(pattern, w))
+            }
+        }
+        ScalarShape::Float { bits: w } => match w {
+            128 => Value::Float128(pattern),
+            16 => Value::Float(crate::mir_convert::f16_to_f64(pattern as u16)),
+            32 => Value::Float(crate::f128::f32_bits_to_f64_exact(pattern as u32)),
+            _ => Value::Float(f64::from_bits(pattern as u64)),
+        },
+        ScalarShape::Bool => Value::Bool(pattern != 0),
+        _ => return None,
+    };
+    Some(Ok(value))
+}
+
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],
@@ -2508,6 +2569,25 @@ pub(crate) fn project_value_ev(
                     drop_glue: None,
                     type_id: None,
                     vtable_methods: Vec::new(),
+                },
+                Value::UnionBytes { ref bytes } => {
+                    // A union in its byte form, reached by a
+                    // plain field step (see
+                    // `union_bytes_field_value`): the field's
+                    // value decodes from the storage bytes
+                    // through the field's scalar shape, as a
+                    // union-field step decodes it. A field with
+                    // no scalar shape keeps the mismatch below.
+                    match union_bytes_field_value(bytes, cur_ty.as_ref(), func, place) {
+                        Some(value) => value?,
+                        None => {
+                            return Err(InterpError::type_mismatch(
+                                format!("field projection on {place}"),
+                                "tuple or ADT value",
+                                "union byte storage",
+                            ));
+                        }
+                    }
                 },
                 ref other => {
                     return Err(InterpError::type_mismatch(
@@ -3972,6 +4052,37 @@ pub(crate) fn project_value_ref_ev<'a>(
                         return Ok(Cow::Owned(
                             project_value_ref(&owned, tail, func, place)?.into_owned(),
                         ));
+                    }
+                    Value::UnionBytes { bytes } => {
+                        // A union in its byte form, reached by
+                        // a plain field step (see
+                        // `union_bytes_field_value`): the
+                        // field's value decodes from the storage
+                        // bytes through the field's scalar shape,
+                        // as a union-field step decodes it. The
+                        // decoded value is owned, so the rest of
+                        // the projection continues by value, as
+                        // for the materialised arms above. A
+                        // field with no scalar shape keeps the
+                        // mismatch below.
+                        let field_ty =
+                            stepped_field_ty(program, cur_ty.as_ref(), variant, *idx);
+                        match union_bytes_field_value(bytes, field_ty.as_ref(), func, place)
+                        {
+                            Some(value) => {
+                                let value = value?;
+                                return Ok(Cow::Owned(project_value(
+                                    value, rest, func, place,
+                                )?));
+                            }
+                            None => {
+                                return Err(InterpError::type_mismatch(
+                                    format!("field projection on {place}"),
+                                    "tuple or ADT value",
+                                    "union byte storage",
+                                ));
+                            }
+                        }
                     }
                     other => {
                         return Err(InterpError::type_mismatch(

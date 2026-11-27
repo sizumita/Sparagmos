@@ -282,6 +282,35 @@ impl<'a> Interpreter<'a> {
             }
             Value::Uninit => Some(vec![None; size]),
             Value::Enum { fields, .. } => {
+                // A union of one field whose tag carries no
+                // layout (the generic wrappers, whose field
+                // tag is a skeleton) is spanned by that field
+                // whole, so a scalar field's own storage
+                // bytes are the union's image. A float field
+                // is not composed this way: its model form
+                // is the widened f64, not the field's
+                // declared width.
+                if fields.len() == 1 {
+                    if let Value::Int(_)
+                    | Value::Uint(_)
+                    | Value::Bool(_)
+                    | Value::Float128(_) = &fields[0]
+                    {
+                        let tag_priced = self
+                            .adt_field_tag(name, 0, 0)
+                            .and_then(|tag| self.layout_of(&tag))
+                            .is_some_and(|(field_size, _)| field_size > 0);
+                        if !tag_priced {
+                            return Some(
+                                (0..size)
+                                    .map(|pos| {
+                                        scalar_storage_byte(&fields[0], pos)
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
                 let mut widest: Option<Vec<Option<u8>>> = None;
                 for (f, field) in fields.iter().enumerate() {
                     if *field == Value::Uninit {
@@ -1003,6 +1032,77 @@ impl<'a> Interpreter<'a> {
                                     }
                                 }
                                 return Some(r);
+                            }
+                        }
+                    }
+                    // The layout chain above declines a held
+                    // field whose tag carries no layout of its
+                    // own (a generic wrapper's skeleton tag, a
+                    // `MaybeUninit<T>` field): a byte inside
+                    // that field's span still splices into the
+                    // field's own storage, keeping the aggregate
+                    // form. The span is priced by the field's
+                    // declared tag where the tag carries a
+                    // layout; a union of one field is spanned by
+                    // that field whole (a field's size is a
+                    // multiple of its alignment, so the union's
+                    // size is the field's size).
+                    if let Value::Enum { fields, .. } = slot {
+                        let single_field = fields.len() == 1;
+                        let mut live = fields
+                            .iter_mut()
+                            .enumerate()
+                            .filter(|(_, field)| **field != Value::Uninit);
+                        if let Some((f, field)) = live.next() {
+                            if live.next().is_none() {
+                                let field_size = self
+                                    .adt_field_tag(name, 0, f)
+                                    .and_then(|tag| self.layout_of(&tag))
+                                    .map(|(size, _)| size)
+                                    .filter(|size| *size > 0)
+                                    .or_else(|| {
+                                        if single_field {
+                                            self.program()
+                                                .adt_layouts
+                                                .get(name)
+                                                .map(|(size, _)| *size as u128)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                if let Some(field_size) = field_size {
+                                    if (pos as u128) < field_size {
+                                        if let Some(tag) =
+                                            self.adt_field_tag(name, 0, f)
+                                        {
+                                            if let Some(layout) =
+                                                self.byte_layout_of_tag(&tag)
+                                            {
+                                                if let Some(result) = self
+                                                    .splice_storage_byte(
+                                                        field, &layout, pos, byte,
+                                                    )
+                                                {
+                                                    return Some(result);
+                                                }
+                                            }
+                                        }
+                                        // A scalar held field
+                                        // whose tag carries no
+                                        // layout (the generic
+                                        // skeleton above) splices
+                                        // through the evidence-free
+                                        // scalar splice: the byte
+                                        // is inside the field's
+                                        // span, which is the
+                                        // scalar's own width.
+                                        if splice_scalar_storage_byte_as(
+                                            field, None, pos, byte,
+                                        ) {
+                                            return Some(Ok(()));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1943,6 +2043,149 @@ impl<'a> Interpreter<'a> {
                         false,
                     )))
                 }
+            }
+        }
+        let base_target = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: Vec::new(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: Vec::new(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: Vec::new(),
+            },
+            _ => return None,
+        };
+        Some(self.write_resolved(frames, &base_target, base))
+    }
+
+    /// A single-byte store whose target position is a
+    /// union (a byte pointer cast from a union pointer,
+    /// stored through with no displacement): the byte is
+    /// one byte of the union's storage, not a replacement
+    /// for the union value — storing it as the position's
+    /// whole value drops the storage's other bytes, which
+    /// a later read of the held payload then misses. The
+    /// byte splices into the base value's storage image at
+    /// the position, through the same byte view the
+    /// displaced store uses. `None` when the store is not
+    /// a single byte, the target is displaced or viewed
+    /// (those stores have their own paths), the position's
+    /// declared type is not a union wider than the byte,
+    /// or the byte view cannot judge the position.
+    pub(crate) fn union_byte_base_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: &Value,
+    ) -> Option<InterpResult<()>> {
+        let byte = value_as_storage_byte(value)?;
+        let (projection, mut base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        if projection.iter().any(|s| {
+            matches!(
+                s,
+                RefProj::ByteOffset(_)
+                    | RefProj::View(_)
+                    | RefProj::Index(_)
+                    | RefProj::Subslice { .. }
+                    | RefProj::VecLen
+                    | RefProj::UnionField { .. }
+            )
+        }) {
+            return None;
+        }
+        // The store belongs to a union's storage when
+        // some position on the descent from the birth root
+        // is declared as a union wider than the byte: the
+        // steps below it price inside the union's storage
+        // (a `MaybeUninit<T>` byte pointer denominates the
+        // store at the wrapped value inside the union's
+        // field, one field step below the union itself).
+        let mut cur = base_ty.clone();
+        let mut variant = 0usize;
+        let mut positions: Vec<Ty> = vec![cur.clone()];
+        for step in projection.iter() {
+            match step {
+                RefProj::Field(i) => {
+                    let Ty::Adt(name) = &cur else {
+                        return None;
+                    };
+                    // A field whose recorded type is absent
+                    // (its type mentions a generic parameter
+                    // at its head) steps by its field tag
+                    // instead: the tag names the field's
+                    // instance type, which is all the
+                    // container identification below asks
+                    // for.
+                    cur = match self.instance_field_ty(name, &cur, variant, *i)
+                    {
+                        Some(ty) => ty,
+                        None => {
+                            let tag =
+                                self.adt_field_tag(name, variant, *i)?;
+                            Ty::Adt(tag.trim().to_string())
+                        }
+                    };
+                    variant = 0;
+                    positions.push(cur.clone());
+                }
+                RefProj::Downcast(v) => variant = *v as usize,
+                _ => return None,
+            }
+        }
+        // The first position on the descent declared as a
+        // union wider than the byte: the store's position
+        // is inside that union's storage. The steps below
+        // the union are the pointer resolution's descent
+        // through the held field's transparent wrappers
+        // (a `ManuallyDrop` around the payload), each of
+        // which sits at offset zero like the union's own
+        // fields; any other step below the union is a
+        // position this offer does not price.
+        let mut union_at: Option<usize> = None;
+        for (i, ty) in positions.iter().enumerate() {
+            if let Ty::Adt(name) = ty {
+                if self.adt_is_union(name) {
+                    if let Some((union_size, _)) =
+                        self.program().adt_layouts.get(name)
+                    {
+                        if *union_size > 1 {
+                            union_at = Some(i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let union_at = union_at?;
+        if !projection[union_at..]
+            .iter()
+            .all(|s| matches!(s, RefProj::Field(0)))
+        {
+            return None;
+        }
+        let (pos, ..) =
+            self.projection_storage_offset(&base_ty, &projection[..union_at])?;
+        let pos = usize::try_from(pos).ok()?;
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        match self.splice_storage_byte(&mut base, &layout, pos, byte)? {
+            Ok(()) => {}
+            Err(ByteVerdict::Padding(_)) => {}
+            Err(verdict) => {
+                return Some(Err(self.byte_view_error(
+                    verdict,
+                    &func,
+                    &place_desc,
+                    false,
+                )))
             }
         }
         let base_target = match target {
@@ -3706,7 +3949,7 @@ impl<'a> Interpreter<'a> {
     /// does. The byte machinery is keyed by instance, so a
     /// place whose type stays a bare definition name cannot
     /// be extracted or constructed.
-    fn instance_field_ty(
+    pub(crate) fn instance_field_ty(
         &self,
         parent_name: &str,
         parent: &Ty,
