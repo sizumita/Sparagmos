@@ -333,6 +333,17 @@ impl<'a> Converter<'a> {
         if self.consumer_builtin_preempts(func) {
             return None;
         }
+        // The `SpecExtend::spec_extend` specialization for a
+        // `vec::IntoIter` source is not bound to its collected
+        // body either: that body projects the iterator's real
+        // buffer fields, which the builtin-produced state form
+        // does not carry, while the builtin performs the
+        // observable semantics (drain the remaining items into
+        // the target) directly on the state. Other instances
+        // keep their bodies (see `consumer_prefers_body`).
+        if self.spec_extend_builtin_preempts(func) {
+            return None;
+        }
         // An `Iterator::next` / `DoubleEndedIterator::
         // next_back` call on a `str` split-family or
         // matches-family iterator is not bound to a body
@@ -745,6 +756,31 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether this call is `SpecExtend::spec_extend` on a
+    /// `vec::IntoIter` source, the one instance the builtin
+    /// serves (see `Builtin::VecSpecExtend`). The iterator
+    /// type is the call's third generic argument (the target
+    /// `Vec` type and the element type come first).
+    fn spec_extend_builtin_preempts(&self, func: &mir::Operand) -> bool {
+        let Some((name, _, raw_generic_args)) = self.resolve_external_callee(func)
+        else {
+            return false;
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        if !matches!(
+            crate::builtins::lookup_qualified(&canonical),
+            Some(crate::builtins::Builtin::VecSpecExtend)
+        ) {
+            return false;
+        }
+        let Some(iter_ty) = raw_generic_args.get(2) else {
+            return false;
+        };
+        let tag = crate::builtins::ty_tag(iter_ty, self.names);
+        tag.starts_with("std::vec::IntoIter<")
+            || tag.starts_with("alloc::vec::IntoIter<")
+    }
+
     /// Whether a call to one of the iterator-consumer builtins
     /// (`Iterator::count` / `fold` / `for_each` / `collect`,
     /// `FromIterator::from_iter`) should be served by the
@@ -855,6 +891,27 @@ impl<'a> Converter<'a> {
                 return (crate::builtins::hash_collection_tag(&tag)
                     || crate::builtins::collection_container_tag(&tag))
                     && self.resolve_body_callee(func).is_some();
+            }
+            crate::builtins::Builtin::VecSpecExtend => {
+                // The builtin serves only the `vec::IntoIter`
+                // instance, whose source the modelled `next`
+                // machine drains from the builtin-produced
+                // state form (or from the real layout a
+                // collected body built, which the same machine
+                // steps). Every other instance's specialization
+                // body is the faithful execution: the
+                // generic body is a plain `next` loop, the
+                // `slice::Iter` body appends through the real
+                // storage places, and the cloned-element body
+                // appends clones the drain would not produce.
+                // The iterator type is the call's third
+                // generic argument.
+                let Some(iter_ty) = raw_generic_args.get(2) else {
+                    return true;
+                };
+                let tag = crate::builtins::ty_tag(iter_ty, self.names);
+                return !tag.starts_with("std::vec::IntoIter<")
+                    && !tag.starts_with("alloc::vec::IntoIter<");
             }
             crate::builtins::Builtin::VecExtendTrusted => {
                 // The trusted-extend builtin drains the

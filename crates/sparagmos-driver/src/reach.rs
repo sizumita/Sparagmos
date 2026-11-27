@@ -1696,6 +1696,26 @@ fn consumer_instance_needs_body(
                 if body_served_iterator_ty(ty))
         }) || last_ty.is_some_and(|ty| guest_stepped_iterator_ty(ty));
     }
+    // `SpecExtend::spec_extend`: the builtin serves only the
+    // `vec::IntoIter` instance -- the specialization body
+    // projects the iterator's real buffer fields, which the
+    // builtin-produced state form does not carry -- so every
+    // other instance keeps its collected body, which
+    // conversion prefers (see `consumer_prefers_body` in
+    // sparagmos-interp). The iterator type is the call's
+    // third generic argument (the target `Vec` type and the
+    // element type come first); an instance whose arguments
+    // do not name it keeps its body, as the faithful default.
+    if matches!(
+        canonical,
+        "std::vec::spec_extend::SpecExtend::spec_extend"
+            | "alloc::vec::spec_extend::SpecExtend::spec_extend"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.get(2) else {
+            return true;
+        };
+        return !vec_into_iter_ty(ty);
+    }
     // `Write::write_fmt`: the builtin serves the call itself
     // only for the receivers whose writes it models -- the
     // standard streams and their locks, `File`, and the
@@ -2104,6 +2124,20 @@ fn hash_iterator_ty(ty: &Ty) -> bool {
 /// Whether this `IntoIterator` `Self` type is a hash
 /// collection, or a reference to one, or a reference to a
 /// hash-collection iterator (the `&mut I` blanket impl).
+/// Whether this type is a `Vec`'s by-value iterator
+/// (`alloc::vec::IntoIter`), judged by the ADT definition
+/// name, as in `hash_collection_ty`.
+fn vec_into_iter_ty(ty: &Ty) -> bool {
+    matches!(
+        guarded_ty_kind(ty),
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _)))
+            if matches!(
+                def.name().as_str(),
+                "alloc::vec::IntoIter" | "std::vec::IntoIter"
+            )
+    )
+}
+
 fn hash_collection_ty(ty: &Ty) -> bool {
     if hash_iterator_ty(ty) {
         return true;

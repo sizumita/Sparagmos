@@ -900,3 +900,111 @@ fn run_mode_repeat_with_collect_and_find_map() {
         "[7, 7, 7] Some(22)\n"
     );
 }
+
+// ----- Vec::extend from a by-value Vec (SpecExtend) --------------------------
+
+const EXTEND_FROM_VEC_SRC: &str = r#"
+fn main() {
+    let mut r = vec!["x".to_string()];
+    r.extend(vec!["aa".to_string(), "bb".to_string()]);
+    println!("{:?}", r);
+    let mut n: Vec<i32> = vec![0];
+    n.extend(vec![1, 2, 3]);
+    println!("{:?}", n);
+}
+"#;
+
+#[test]
+fn run_mode_extend_from_vec_into_iter() {
+    // `Vec::extend` from a by-value `Vec` selects the
+    // `SpecExtend<T, IntoIter<T, A>>` specialization, whose
+    // collected body projects the iterator's real buffer
+    // fields; the builtin state form carries no such fields,
+    // so the entry is served by `Builtin::VecSpecExtend`,
+    // which drains the modelled state (see Issue #513).
+    let dir = temp_dir("extendfromvec");
+    let src = fixture(&dir, "extendfromvec.rs", EXTEND_FROM_VEC_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "[\"x\", \"aa\", \"bb\"]\n[0, 1, 2, 3]\n",
+        "stdout={stdout}"
+    );
+}
+
+const EXTEND_PARTIAL_SRC: &str = r#"
+fn main() {
+    let mut it = vec![
+        "a".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+    ]
+    .into_iter();
+    assert_eq!(it.next().unwrap(), "a");
+    let mut r = vec!["x".to_string()];
+    r.extend(it);
+    println!("{:?}", r);
+    let e: Vec<String> = Vec::new();
+    let mut r2: Vec<String> = Vec::new();
+    r2.extend(e);
+    println!("empty {}", r2.len());
+}
+"#;
+
+#[test]
+fn run_mode_extend_from_partially_consumed_into_iter() {
+    // Only the source's remaining items are appended: the
+    // builtin drains the state from its recorded index, the
+    // already-yielded head is not repeated, and an exhausted
+    // source appends nothing.
+    let dir = temp_dir("extendpartial");
+    let src = fixture(&dir, "extendpartial.rs", EXTEND_PARTIAL_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "[\"x\", \"b\", \"c\", \"d\"]\nempty 0\n",
+        "stdout={stdout}"
+    );
+}
+
+const EXTEND_OTHER_INSTANCES_SRC: &str = r#"
+fn main() {
+    let mut r: Vec<i32> = vec![1];
+    r.extend(vec![2, 3].into_iter().map(|x| x * 10));
+    println!("map: {:?}", r);
+    let src = vec!["p".to_string(), "q".to_string()];
+    let mut r2: Vec<String> = Vec::new();
+    r2.extend(src.iter().cloned());
+    println!("cloned: {:?}", r2);
+    let arr = [7, 8, 9];
+    let mut r3: Vec<i32> = Vec::new();
+    r3.extend(arr.iter());
+    println!("sliceiter: {:?}", r3);
+}
+"#;
+
+#[test]
+fn run_mode_extend_other_spec_extend_instances() {
+    // The other `SpecExtend` instances keep their collected
+    // bodies: the generic body (here a `Map` source) is a
+    // plain `next` loop, the cloned-element body appends
+    // clones, and the `slice::Iter` body appends through the
+    // real storage places. The builtin serves only the
+    // `vec::IntoIter` instance.
+    let dir = temp_dir("extendothers");
+    let src = fixture(&dir, "extendothers.rs", EXTEND_OTHER_INSTANCES_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "map: [1, 20, 30]\ncloned: [\"p\", \"q\"]\nsliceiter: [7, 8, 9]\n",
+        "stdout={stdout}"
+    );
+}
