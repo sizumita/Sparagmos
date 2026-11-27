@@ -2564,7 +2564,7 @@ impl<'a> Interpreter<'a> {
     /// recorded instance can only denote that instance. Two or
     /// more recorded instances make the name ambiguous here and
     /// resolve to `None`, as does an unrecorded name.
-    fn adt_instance_key(&self, name: &str) -> Option<String> {
+    pub(crate) fn adt_instance_key(&self, name: &str) -> Option<String> {
         if let Some(hit) = self.adt_instance_keys.borrow().get(name) {
             return hit.clone();
         }

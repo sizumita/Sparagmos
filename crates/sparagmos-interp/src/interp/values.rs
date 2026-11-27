@@ -669,6 +669,15 @@ impl<'a> Interpreter<'a> {
             {
                 Ok(value)
             }
+            // A union value in its byte form (see
+            // `Value::UnionBytes`) is a value of the union
+            // ADT whose bytes it holds: the form is only
+            // ever produced for union values (cross-field
+            // writes, constant materialisation, byte-view
+            // splices), so it stores into the union's place
+            // as it stands, and field reads decode from the
+            // bytes.
+            (Some(Ty::Adt(_)), Value::UnionBytes { .. }) => Ok(value),
             (Some(expected), other) => {
                 // A zero-sized place holds the type's single
                 // value, whatever shape the operand took: the
