@@ -5069,7 +5069,21 @@ def known_bug_carry_scope(rec, rust_dir):
             errors="ignore")
     except OSError:
         return None
-    return known_bug_scope(rec, Header(text).view(None))
+    header = Header(text)
+    scope = known_bug_scope(rec, header.view(None))
+    if scope is not None:
+        return scope
+    # The record-level verdict aggregates its revisions the
+    # way fill_result_revisions does -- a revision that cannot
+    # be attempted makes the record not attempted with that
+    # revision's bucket -- so every declared revision's view
+    # is consulted too: a revision-scoped `//@ known-bug:` (or
+    # a revision-scoped run mode) is invisible to view(None).
+    for rev in header.revisions():
+        scope = known_bug_scope(rec, header.view(rev))
+        if scope is not None:
+            return scope
+    return None
 
 
 def fill_result(rec, rust_dir, driver_bin, out, jit=False):
@@ -5138,6 +5152,24 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
         out["bucket"] = "not attempted (unevaluatable condition)"
         return
 
+    # The verdict-scope classifications (sanitizer, known-bug)
+    # say what the verdict *is*, not whether the attempt is in
+    # stage-1 scope, so they are recorded before the multi-file
+    # scope exclusion below: a record whose verdict no
+    # execution can judge keeps its classification bucket even
+    # when stage 1 would not have attempted it anyway -- the
+    # same verdict main's carry-through records for a record
+    # no stage selects.
+    view = header.view(None)
+    scope = sanitizer_scope(rec, view)
+    if scope is not None:
+        out["reason"], out["bucket"] = scope
+        return
+    scope = known_bug_scope(rec, view)
+    if scope is not None:
+        out["reason"], out["bucket"] = scope
+        return
+
     if not rec["single_file"] and not aux_specs \
             and not header.has("proc-macro"):
         out["reason"] = "multi-file / auxiliary crates (not in stage-1 scope)"
@@ -5149,14 +5181,6 @@ def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         view = header.view(None)
-        scope = sanitizer_scope(rec, view)
-        if scope is not None:
-            out["reason"], out["bucket"] = scope
-            return
-        scope = known_bug_scope(rec, view)
-        if scope is not None:
-            out["reason"], out["bucket"] = scope
-            return
         flags = compile_flags(view, src_base, td)
         screened = screen_flags(flags, targets={HOST_TARGET})
         if screened:
@@ -5487,6 +5511,24 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         flags = compile_flags(view, src_base, td)
+        # The verdict-scope classifications are consulted
+        # before flag screening, in the same order as the
+        # unrevisioned fill_result path: what the verdict is
+        # does not depend on whether this host could honour
+        # the view's compile-flags, so a view pinning a
+        # sanitizer report or a known codegen bug keeps its
+        # classification bucket even when its flags would
+        # also have been screened. Both helpers return None
+        # for a view with no run mode, so the compile-check
+        # branch below is unaffected.
+        scope = sanitizer_scope(rec, view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
+        scope = known_bug_scope(rec, view)
+        if scope is not None:
+            res["reason"], res["bucket"] = scope
+            return res
         screened = screen_flags(
             flags, targets={HOST_TARGET},
             allow_print=(mode is None
@@ -5502,14 +5544,6 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                         revision, res, edition,
                                         rev_args, flags, aux_specs,
                                         rust_dir, jit=jit)
-        scope = sanitizer_scope(rec, view)
-        if scope is not None:
-            res["reason"], res["bucket"] = scope
-            return res
-        scope = known_bug_scope(rec, view)
-        if scope is not None:
-            res["reason"], res["bucket"] = scope
-            return res
         pm_args, pm_err = proc_macro_extern_args(path, view, edition)
         if pm_err:
             res["reason"] = pm_err
