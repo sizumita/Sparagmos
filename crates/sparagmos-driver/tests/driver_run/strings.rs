@@ -4072,6 +4072,109 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
     );
 }
 
+const OS_STRING_FROM_PATHBUF_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+fn main() {
+    // `OsString: From<PathBuf>` hands the path's bytes to
+    // the OS string, whichever shape the path value was
+    // built in: pushed, joined, converted from a `String`,
+    // wrapped around a real aggregate `OsString`, or read
+    // back out of a vector of paths.
+    let mut p = PathBuf::from("/tmp");
+    p.push("alpha");
+    p.push("beta.txt");
+    let o = OsString::from(p);
+    println!("{:?} len={} eq={}", o, o.len(), o == OsString::from("/tmp/alpha/beta.txt"));
+    let j = PathBuf::from("/base").join("x").join("y");
+    let oj: OsString = j.into();
+    println!("{:?} len={}", oj, oj.len());
+    let s = PathBuf::from(String::from("hello/world"));
+    let os = OsString::from(s);
+    println!("{:?} len={}", os, os.len());
+    let mut a = OsString::with_capacity(16);
+    a.push("real/path");
+    let oa = OsString::from(PathBuf::from(a));
+    println!("{:?} len={}", oa, oa.len());
+    let v: Vec<PathBuf> = vec![PathBuf::from("one"), PathBuf::from("two/three")];
+    for p in v {
+        let o = OsString::from(p);
+        println!("{:?} len={}", o, o.len());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_pathbuf() {
+    run_ok(
+        "os-string-from-pathbuf",
+        OS_STRING_FROM_PATHBUF_SRC,
+        "\"/tmp/alpha/beta.txt\" len=19 eq=true\n\"/base/x/y\" len=9\n\"hello/world\" len=11\n\"real/path\" len=9\n\"one\" len=3\n\"two/three\" len=9\n",
+    );
+}
+
+const OS_STRING_FROM_REF_PATH_STRING_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // The borrowed conversions clone: `From<&Path>` (a
+    // path literal and a buffer's `as_path`) and
+    // `From<&String>` (the source string is untouched).
+    let o = OsString::from(Path::new("/a/b"));
+    println!("{:?} len={}", o, o.len());
+    let pb = PathBuf::from("/c/d");
+    let o2 = OsString::from(pb.as_path());
+    println!("{:?} len={} eq={}", o2, o2.len(), o2 == OsString::from("/c/d"));
+    let s = String::from("refstr");
+    let o3 = OsString::from(&s);
+    println!("{:?} len={} eq={}", o3, o3.len(), o3 == OsString::from("refstr"));
+    println!("src={}", s);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_ref_path_and_string() {
+    run_ok(
+        "os-string-from-ref-path-string",
+        OS_STRING_FROM_REF_PATH_STRING_SRC,
+        "\"/a/b\" len=4\n\"/c/d\" len=4 eq=true\n\"refstr\" len=6 eq=true\nsrc=refstr\n",
+    );
+}
+
+const OS_STRING_FROM_COW_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // `From<Cow<'_, OsStr>>` for `OsString` and
+    // `From<Cow<'_, Path>>` for `PathBuf` are `into_owned`:
+    // the borrowed variant clones the bytes, the owned
+    // variant hands its buffer over.
+    let borrowed: Cow<'_, OsStr> = Cow::Borrowed(OsStr::new("cowb"));
+    let o = OsString::from(borrowed);
+    println!("{:?} len={}", o, o.len());
+    let owned: Cow<'_, OsStr> = Cow::Owned(OsString::from("cowo"));
+    let o2 = OsString::from(owned);
+    println!("{:?} len={}", o2, o2.len());
+    let bp: Cow<'_, Path> = Cow::Borrowed(Path::new("cpb"));
+    println!("{:?}", PathBuf::from(bp));
+    let op: Cow<'_, Path> = Cow::Owned(PathBuf::from("cpo"));
+    println!("{:?}", PathBuf::from(op));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_from_cow() {
+    run_ok(
+        "os-string-from-cow",
+        OS_STRING_FROM_COW_SRC,
+        "\"cowb\" len=4\n\"cowo\" len=4\n\"cpb\"\n\"cpo\"\n",
+    );
+}
+
 const OS_STRING_INTO_BOXED_OS_STR_SRC: &str = r#"
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
