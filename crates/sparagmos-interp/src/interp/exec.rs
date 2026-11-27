@@ -2174,6 +2174,12 @@ impl<'a> Interpreter<'a> {
                                 Some(
                                     crate::ir::AssertFormat::MisalignedPointerDeref,
                                 ) => "core::panicking::panic_misaligned_pointer_dereference",
+                                Some(
+                                    crate::ir::AssertFormat::InvalidEnumConstruction,
+                                ) => "core::panicking::panic_invalid_enum_construction",
+                                Some(
+                                    crate::ir::AssertFormat::NullPointerDereference,
+                                ) => "core::panicking::panic_null_pointer_dereference",
                                 None => "core::panicking::panic",
                             }));
                             return Err(InterpError::panic(text));

@@ -464,6 +464,7 @@ pub(super) fn assert_message_text(msg: &mir::AssertMessage) -> String {
             other => format!("assertion failed: {other:?}"),
         },
         A::OverflowNeg(_) => "attempt to negate with overflow".to_string(),
+        A::NullPointerDereference => "null pointer dereference occurred".to_string(),
         A::DivisionByZero(_) => "attempt to divide by zero".to_string(),
         A::RemainderByZero(_) => {
             "attempt to calculate the remainder with a divisor of zero".to_string()

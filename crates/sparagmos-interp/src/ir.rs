@@ -1924,6 +1924,18 @@ pub enum AssertFormat {
     /// multiple of {required} but is {found}` -- operands
     /// are (required, found).
     MisalignedPointerDeref,
+    /// `trying to construct an enum from an invalid value
+    /// {source:#x}` -- operands are (source,), the value the
+    /// `CheckEnums` pass caught being read as an enum
+    /// discriminant (`core::panicking::
+    /// panic_invalid_enum_construction` takes it as a `u128`,
+    /// so a signed discriminant renders as its bit pattern).
+    InvalidEnumConstruction,
+    /// `null pointer dereference occurred` -- no operands;
+    /// the kind exists so the panic's origin names
+    /// `core::panicking::panic_null_pointer_dereference`
+    /// rather than the generic panic entry.
+    NullPointerDereference,
 }
 
 /// Terminator kinds (subset of rustc MIR `TerminatorKind`).

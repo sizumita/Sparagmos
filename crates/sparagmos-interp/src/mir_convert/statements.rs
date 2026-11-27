@@ -3366,6 +3366,17 @@ impl<'a> Converter<'a> {
                             self.convert_operand(body, found, None)?,
                         ],
                     ),
+                    mir::AssertMessage::InvalidEnumConstruction(source) => (
+                        Some(ir::AssertFormat::InvalidEnumConstruction),
+                        vec![self.convert_operand(body, source, None)?],
+                    ),
+                    // No operand to format, but the format kind
+                    // names the panic's origin entry point (the
+                    // null-pointer lang item, not generic panic).
+                    mir::AssertMessage::NullPointerDereference => (
+                        Some(ir::AssertFormat::NullPointerDereference),
+                        Vec::new(),
+                    ),
                     _ => (None, Vec::new()),
                 };
                 ir::TerminatorKind::Assert {

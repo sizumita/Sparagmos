@@ -284,8 +284,9 @@ pub(super) fn sign_extend(data: u128, bits: u32) -> i128 {
 /// `catch_unwind` caller observes as the panic's `&str` payload,
 /// so they must match core's text, not a paraphrase). Kinds whose
 /// message embeds operand values (bounds checks, misaligned
-/// dereferences) keep the stable kind text: the operands are not
-/// rendered.
+/// dereferences, invalid enum constructions) keep the stable
+/// kind text here: the operands are not rendered in this text,
+/// they are formatted at run time (see `AssertFormat`).
 pub(super) fn assert_message_text(msg: &mir::AssertMessage) -> String {
     use mir::AssertMessage as A;
     match msg {
@@ -313,6 +314,10 @@ pub(super) fn assert_message_text(msg: &mir::AssertMessage) -> String {
             other => format!("assertion failed: {other:?}"),
         },
         A::OverflowNeg(_) => "attempt to negate with overflow".to_string(),
+        // `core::panicking::panic_null_pointer_dereference`'s
+        // fixed text; the message embeds no operand value, so
+        // it is exact here as well as at run time.
+        A::NullPointerDereference => "null pointer dereference occurred".to_string(),
         A::DivisionByZero(_) => "attempt to divide by zero".to_string(),
         A::RemainderByZero(_) => {
             "attempt to calculate the remainder with a divisor of zero".to_string()

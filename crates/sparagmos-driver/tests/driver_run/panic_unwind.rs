@@ -3984,3 +3984,37 @@ fn main() {
 fn run_mode_assert_matches_passing_runs() {
     run_ok("assert-matches-ok", ASSERT_MATCHES_OK_SRC, "matches ok\n");
 }
+const INVALID_ENUM_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+enum Two {
+    A,
+    B,
+}
+fn main() {
+    let v: Two = unsafe { std::mem::transmute(7u8) };
+    println!("is_a={}", v == Two::A);
+}
+"#;
+
+#[test]
+fn run_mode_invalid_enum_construction_reports_core_message() {
+    // Reading the discriminant of an enum value outside its
+    // valid range trips the `CheckEnums` assertion; the report
+    // must carry core's run-time-formatted message (the source
+    // value in hex), not the baked kind text.
+    // The assertion is nounwind by design: the guest aborts (134)
+    // after the single report, exactly as native rustc 1.100.0 does.
+    let dir = temp_dir("invalid-enum");
+    let src = fixture(&dir, "invalid_enum.rs", INVALID_ENUM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "the nounwind validity assert must abort the guest (134); stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("trying to construct an enum from an invalid value 0x7"),
+        "panic report must carry core's formatted message: {stderr}"
+    );
+}
