@@ -2526,8 +2526,8 @@ impl<'a> Interpreter<'a> {
             Rvalue::BinaryOp(op, pair) => {
                 let lhs = self.eval_operand(frames, body, &pair.0)?;
                 let rhs = self.eval_operand(frames, body, &pair.1)?;
-                let leaf = operand_pointee_ty(body, &pair.0)
-                    .or_else(|| operand_pointee_ty(body, &pair.1));
+                let leaf = operand_address_pointee_ty(body, &pair.0)
+                    .or_else(|| operand_address_pointee_ty(body, &pair.1));
                 eval_binary(*op, &lhs, &rhs, dest_ty, false, &|v| {
                     self.pointer_address(frames, v, leaf.as_ref())
                 })
@@ -2536,8 +2536,8 @@ impl<'a> Interpreter<'a> {
             Rvalue::CheckedBinaryOp(op, pair) => {
                 let lhs = self.eval_operand(frames, body, &pair.0)?;
                 let rhs = self.eval_operand(frames, body, &pair.1)?;
-                let leaf = operand_pointee_ty(body, &pair.0)
-                    .or_else(|| operand_pointee_ty(body, &pair.1));
+                let leaf = operand_address_pointee_ty(body, &pair.0)
+                    .or_else(|| operand_address_pointee_ty(body, &pair.1));
                 let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true, &|v| {
                     self.pointer_address(frames, v, leaf.as_ref())
                 })?;
@@ -2671,7 +2671,7 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::PtrToInt(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                let leaf = operand_pointee_ty(body, operand);
+                let leaf = operand_address_pointee_ty(body, operand);
                 match self.pointer_address(frames, &value, leaf.as_ref()) {
                     Some(addr) => {
                         self.note_exposed_target(addr as u64, &value);

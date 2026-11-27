@@ -3435,6 +3435,223 @@ pub(crate) fn operand_pointee_ty(body: &Body, op: &Operand) -> Option<Ty> {
     }
 }
 
+/// The pointee type of a bare-local pointer operand for
+/// *address pricing* (see [`local_pointee_ty`]): like
+/// [`operand_pointee_ty`], but an erased local's leaf is the
+/// pointee its value carried before the erasure. Only the
+/// address a pointer denotes is priced from this leaf, never
+/// a transfer width: a copy through an erased pointer still
+/// moves unit elements, exactly as its declared type says.
+pub(crate) fn operand_address_pointee_ty(
+    body: &Body,
+    op: &Operand,
+) -> Option<Ty> {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return None;
+    };
+    if !place.projection.is_empty() {
+        return None;
+    }
+    local_pointee_ty(body, place.local)
+}
+
+/// The pointee type of a pointer local for *address pricing*,
+/// from its declared type.
+/// A local declared as a pointer to the unit type may hold a
+/// value whose pointee the declaration erased: core's
+/// `*const T::addr` (and its siblings on `*mut T` and
+/// `NonNull<T>`) casts the pointer to `*const ()` before
+/// transmuting it to an integer, so the erased local's declared
+/// type denominates nothing and every element position of a
+/// root-less target prices at the root's base. Where the body's
+/// own assignments prove the value entered the erased local
+/// through a cast (or a copy chain) from pointers of one and
+/// the same non-unit pointee, that pointee is the denomination
+/// the value's positions were formed under, and it is the
+/// answer; anything else keeps the declared unit (a genuine
+/// `*const ()` value's element positions are zero-width,
+/// exactly as declared).
+pub(crate) fn local_pointee_ty(body: &Body, local: Local) -> Option<Ty> {
+    match body.local_ty(local) {
+        Some(Ty::Ref(inner)) => {
+            let pointee = (**inner).clone();
+            if matches!(pointee, Ty::Unit) {
+                erasure_source_pointee(body, local).or(Some(pointee))
+            } else {
+                Some(pointee)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a callee name is a raw pointer `cast` method
+/// (`*const T::cast` / `*mut T::cast`): a pure retype whose
+/// result is the receiver value itself under a new pointee.
+fn is_ptr_cast_callee(func: &str) -> bool {
+    func.ends_with(">::cast")
+        && (func.contains("const_ptr::<impl *const T>")
+            || func.contains("mut_ptr::<impl *mut T>"))
+}
+
+/// The pointee an erased (unit-pointee) pointer local's value
+/// carried before its erasure, as proven by the body's own
+/// assignments (see [`local_pointee_ty`]): every assignment
+/// that can produce the local's value is a cast to the erased
+/// pointer type (a cast statement, a units cast, or a raw
+/// pointer `cast` call), or a plain copy, of a pointer operand whose
+/// formation pointee — its own declared pointee, chased through
+/// further erased locals — is one and the same non-unit type.
+/// `None` when the local is an argument (its value enters from
+/// the caller, under a formation this body cannot see), when
+/// any producer is a call result, a constant, or anything else
+/// the chase cannot read, when the producers disagree, or when
+/// the body is too large for the per-call scan (the pattern
+/// this serves lives in leaf accessor bodies).
+fn erasure_source_pointee(body: &Body, local: Local) -> Option<Ty> {
+    fn source_pointee(
+        body: &Body,
+        op: &Operand,
+        visited: &mut Vec<usize>,
+    ) -> Option<Ty> {
+        let (Operand::Copy(place) | Operand::Move(place)) = op else {
+            return None;
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        match body.local_ty(place.local) {
+            Some(Ty::Ref(inner)) if !matches!(**inner, Ty::Unit) => {
+                Some((**inner).clone())
+            }
+            Some(Ty::Ref(_)) => chase(body, place.local, visited),
+            _ => None,
+        }
+    }
+
+    fn chase(body: &Body, local: Local, visited: &mut Vec<usize>) -> Option<Ty> {
+        // An argument's value enters from the caller: its
+        // formation pointee is not this body's to know.
+        if local.0 >= 1 && local.0 <= body.arg_count {
+            return None;
+        }
+        if visited.contains(&local.0) {
+            return None;
+        }
+        visited.push(local.0);
+        let result = scan(body, local, visited);
+        visited.pop();
+        result
+    }
+
+    fn scan(body: &Body, local: Local, visited: &mut Vec<usize>) -> Option<Ty> {
+        let mut found: Option<Ty> = None;
+        let mut producers = 0usize;
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    StatementKind::Assign(place, rvalue)
+                        if place.local == local && place.projection.is_empty() =>
+                    {
+                        producers += 1;
+                        let candidate = match rvalue {
+                            Rvalue::Use(op) => {
+                                source_pointee(body, op, visited)?
+                            }
+                            // A units cast redenominates its
+                            // result in the target pointee's
+                            // units; the value it produces is
+                            // the source pointer's, formed
+                            // under the source operand's
+                            // pointee.
+                            Rvalue::PtrCastUnits(op, _) => {
+                                source_pointee(body, op, visited)?
+                            }
+                            Rvalue::Cast(op, dest) => match dest {
+                                // Only a cast *to* the erased
+                                // pointer type is an erasure
+                                // step; any other cast forms
+                                // the pointer here, under no
+                                // pointee this body records.
+                                Ty::Ref(inner)
+                                    if matches!(**inner, Ty::Unit) =>
+                                {
+                                    source_pointee(body, op, visited)?
+                                }
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        match &found {
+                            None => found = Some(candidate),
+                            Some(prev) if *prev == candidate => {}
+                            Some(_) => return None,
+                        }
+                    }
+                    StatementKind::ShapedStore { place, .. }
+                    | StatementKind::SetDiscriminant { place, .. }
+                        if place.local == local
+                            && place.projection.is_empty() =>
+                    {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            // A call writing the local produces a value whose
+            // formation this body cannot read — except a raw
+            // pointer `cast` call, which is a pure retype: the
+            // value it writes is its receiver's, formed under
+            // the receiver's pointee.
+            let destination = match &block.terminator {
+                TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } if destination.local == local
+                    && destination.projection.is_empty() =>
+                {
+                    if !is_ptr_cast_callee(func) {
+                        return None;
+                    }
+                    producers += 1;
+                    let candidate =
+                        source_pointee(body, args.first()?, visited)?;
+                    match &found {
+                        None => found = Some(candidate),
+                        Some(prev) if *prev == candidate => {}
+                        Some(_) => return None,
+                    }
+                    None
+                }
+                TerminatorKind::Call { destination, .. }
+                | TerminatorKind::CallIndirect { destination, .. }
+                | TerminatorKind::CallTrait { destination, .. }
+                | TerminatorKind::CallBuiltin { destination, .. } => {
+                    Some(destination)
+                }
+                _ => None,
+            };
+            if let Some(place) = destination {
+                if place.local == local && place.projection.is_empty() {
+                    return None;
+                }
+            }
+        }
+        if producers == 0 {
+            return None;
+        }
+        found
+    }
+
+    let total: usize = body.blocks.iter().map(|b| b.statements.len()).sum();
+    if total > 4096 {
+        return None;
+    }
+    chase(body, local, &mut Vec::new())
+}
+
 #[cfg(test)]
 mod resolved_route_tests {
     use super::*;
