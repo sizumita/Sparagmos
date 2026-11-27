@@ -39,6 +39,7 @@ mod static_align;
 mod string_mutators;
 mod strings;
 mod summary_mode;
+mod sort;
 mod sync;
 mod tool_interception;
 mod simd_displaced;
