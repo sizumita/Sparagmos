@@ -19,7 +19,8 @@
 //!
 //! The same treatment covers the other Unix-shaped host
 //! facilities the model uses: descriptor duplication of
-//! the standard input and of a listening socket, Unix mode
+//! the standard input and of a listening socket, the pipe
+//! ends' transfer into the file model, Unix mode
 //! permissions, and symlink creation (one operation on
 //! Unix; two on Windows, split by the target's kind). The
 //! same treatment covers the libc calls that exist only
@@ -302,5 +303,119 @@ pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
     target_os = "dragonfly"
 )))]
 pub(crate) fn host_clearenv() -> Option<std::ffi::c_int> {
+    None
+}
+
+/// A duplicate of a listening socket as a second
+/// `TcpListener` over the same host socket, for the
+/// descriptor-duplication model (`dup` of a listener):
+/// the duplicate shares the socket itself -- its address,
+/// its queue, its options. The duplication goes through
+/// the descriptor on Unix and through the socket handle
+/// on Windows.
+#[cfg(unix)]
+pub(crate) fn listener_dup(
+    socket: &std::net::TcpListener,
+) -> Option<std::net::TcpListener> {
+    use std::os::fd::AsFd as _;
+    socket.as_fd().try_clone_to_owned().ok().map(|owned| {
+        use std::os::fd::FromRawFd as _;
+        use std::os::fd::IntoRawFd as _;
+        // SAFETY: `owned` is the duplicate this call just
+        // made; `into_raw_fd` relinquishes it to the
+        // listener constructed from it, which closes it
+        // on drop.
+        unsafe { std::net::TcpListener::from_raw_fd(owned.into_raw_fd()) }
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn listener_dup(
+    socket: &std::net::TcpListener,
+) -> Option<std::net::TcpListener> {
+    use std::os::windows::io::AsSocket as _;
+    socket
+        .as_socket()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::net::TcpListener::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn listener_dup(
+    socket: &std::net::TcpListener,
+) -> Option<std::net::TcpListener> {
+    let _ = socket;
+    None
+}
+
+/// A host `File` over the read end of a host pipe, for
+/// the libc `pipe` model: the pipe end enters the file
+/// model as a real file over the same pipe, through the
+/// host's descriptor (Unix) or handle (Windows)
+/// duplication, as with [`stdin_dup_file`].
+#[cfg(unix)]
+pub(crate) fn file_from_pipe_reader(
+    reader: std::io::PipeReader,
+) -> Option<std::fs::File> {
+    use std::os::fd::AsFd as _;
+    reader
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+}
+
+#[cfg(windows)]
+pub(crate) fn file_from_pipe_reader(
+    reader: std::io::PipeReader,
+) -> Option<std::fs::File> {
+    use std::os::windows::io::AsHandle as _;
+    reader
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_from_pipe_reader(
+    reader: std::io::PipeReader,
+) -> Option<std::fs::File> {
+    let _ = reader;
+    None
+}
+
+/// A host `File` over the write end of a host pipe (see
+/// [`file_from_pipe_reader`]).
+#[cfg(unix)]
+pub(crate) fn file_from_pipe_writer(
+    writer: std::io::PipeWriter,
+) -> Option<std::fs::File> {
+    use std::os::fd::AsFd as _;
+    writer
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+}
+
+#[cfg(windows)]
+pub(crate) fn file_from_pipe_writer(
+    writer: std::io::PipeWriter,
+) -> Option<std::fs::File> {
+    use std::os::windows::io::AsHandle as _;
+    writer
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_from_pipe_writer(
+    writer: std::io::PipeWriter,
+) -> Option<std::fs::File> {
+    let _ = writer;
     None
 }

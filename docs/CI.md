@@ -483,17 +483,21 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - The enabled classes are `linux-x86_64` (the `measure` shards
   on `ubuntu-latest`) and, as the `measure-host` jobs,
   `linux-aarch64` (`ubuntu-24.04-arm`), `darwin-aarch64`
-  (`macos-15`) and `darwin-x86_64` (`macos-15-intel`); each
-  measure-host class runs with a driver the `build-host` job
-  builds natively on the class's runner and the runner's host
-  model selected through `SPARAGMOS_HOST_TARGET`. On the
-  survey of run 45564001677 the partition assigns 56 records
-  to `linux-aarch64`, 29 to `darwin-aarch64` and 2 to
-  `darwin-x86_64`: a record both macOS models admit goes to
-  `darwin-aarch64`, which precedes `darwin-x86_64` in the
-  partition order, so `darwin-x86_64` holds only the records
-  its model alone admits. Every other record stays in the
-  Linux class.
+  (`macos-15`), `darwin-x86_64` (`macos-15-intel`) and
+  `windows-msvc` (`windows-latest`); each measure-host class
+  runs with a driver the `build-host` job builds natively on
+  the class's runner and the runner's host model selected
+  through `SPARAGMOS_HOST_TARGET`. On the survey of run
+  45564001677 the partition assigns 56 records to
+  `linux-aarch64`, 29 to `darwin-aarch64`, 2 to
+  `darwin-x86_64` and 72 to `windows-msvc`: a
+  record both macOS models admit goes to `darwin-aarch64`,
+  which precedes `darwin-x86_64` in the partition order, so
+  `darwin-x86_64` holds only the records its model alone
+  admits. (One further record, tests/debuginfo/thread-names.rs,
+  is admitted by both the darwin and the windows-msvc models;
+  it goes to darwin, the earlier class.) Every other record
+  stays in the Linux class.
   The host jobs do not restore the rustdoc artifact tree (it is
   a Linux-built tree), so a class record whose stage 4 needs it
   records the same not-attempted verdict the Linux jobs record
@@ -520,12 +524,14 @@ denominator. Runs on every push to `main` and on manual dispatch.
   is classified out of environment. The remaining classes are
   defined in the runner's host profiles and in the partition
   rule but have no jobs yet, so their records stay in the
-  residual class: the Windows classes
-  (`x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`) wait on
-  the runner's process layer (process groups, `/proc`-based
-  memory accounting), which is POSIX-only, so a Windows runner
-  would record internal errors instead of verdicts (issue
-  #517).
+  residual class: the `windows-gnu` class
+  (`x86_64-pc-windows-gnu`) waits on a host toolchain entry of
+  its own: its host model is the pinned toolchain hosted on
+  the gnu target (a MinGW-hosted rustc and linker), while the
+  `windows-latest` jobs install the runner's native
+  MSVC-hosted toolchain, so the class's records (9 on that
+  survey) stay in the residual class until a job installs the
+  gnu-hosted toolchain (issue #517).
 - Auxiliary crates are built the way compiletest builds them:
   with the test's own compile arguments, which carry the
   revision's `--cfg` for a revised test (an incremental test's
@@ -637,9 +643,8 @@ denominator. Runs on every push to `main` and on manual dispatch.
   records naming those triples themselves specify --
   because those targets refuse to compile at all without
   one; a record naming a different cpu for them fails the
-  guest compile with a target-cpu ABI mismatch. The
-  measure-host (darwin) jobs do not run this step; the
-  table's triples are judged in the Linux class.
+  guest compile with a target-cpu ABI mismatch. The measure-host jobs do not run this
+  step; the table's triples are judged in the Linux class.
 
 ### Stage 4 (the rustdoc harness)
 

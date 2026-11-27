@@ -1107,28 +1107,16 @@ impl<'a> Interpreter<'a> {
     /// requires: the duplicate shares the socket itself
     /// (its address, its queue, its options).
     fn desc_clone_socket(&self, id: u64) -> Option<u64> {
-        use std::os::fd::AsFd as _;
         let cloned = self.with_socket(id, |entry| match entry {
             SocketEntry::Listener {
                 socket,
                 nonblocking,
-            } => socket
-                .as_fd()
-                .try_clone_to_owned()
-                .map(|owned| {
-                    use std::os::fd::IntoRawFd as _;
-                    use std::os::fd::FromRawFd as _;
-                    let listener = unsafe {
-                        std::net::TcpListener::from_raw_fd(
-                            owned.into_raw_fd(),
-                        )
-                    };
-                    SocketEntry::Listener {
-                        socket: listener,
-                        nonblocking: *nonblocking,
-                    }
-                })
-                .ok(),
+            } => crate::platform::listener_dup(socket).map(|listener| {
+                SocketEntry::Listener {
+                    socket: listener,
+                    nonblocking: *nonblocking,
+                }
+            }),
             SocketEntry::Stream {
                 socket,
                 nonblocking,
