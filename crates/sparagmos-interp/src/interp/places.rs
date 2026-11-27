@@ -1366,6 +1366,26 @@ impl<'a> Interpreter<'a> {
         resolved: Resolved,
         len: u64,
     ) -> Resolved {
+        // A target whose projection already passes through
+        // a recorded view denomination (a slice cast's
+        // regrouping of the storage it ranges over) denotes
+        // exactly the element the view's steps select: the
+        // cast's denomination governs the dereference, and
+        // re-windowing the target against the longer birth
+        // sequence behind the view would retarget it at a
+        // window of elements instead of the element itself.
+        let projection = match &resolved {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection,
+            Resolved::Value(_, projection) => projection,
+        };
+        if projection
+            .iter()
+            .any(|step| matches!(step, RefProj::View(_)))
+        {
+            return resolved;
+        }
         // An element position of a longer sequence (the
         // target ends in an index step, the shape a
         // sub-slice's `as_ptr` leaves): the array the
