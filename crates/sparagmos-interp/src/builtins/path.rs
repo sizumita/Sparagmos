@@ -997,6 +997,8 @@ pub(crate) fn path_lookup(canonical: &str) -> Option<Builtin> {
         "std::path::PathBuf::_push" => Builtin::PathBufPush,
         "std::path::PathBuf::pop" => Builtin::PathBufPop,
         "std::path::PathBuf::_set_extension" => Builtin::PathBufSetExtension,
+        "std::path::PathBuf::_set_file_name" => Builtin::PathBufSetFileName,
+        "std::sys::path::unix::absolute" => Builtin::SysPathAbsolute,
         "std::path::Path::_with_extension" => Builtin::PathWithExtension,
         "std::path::PathBuf::new" => Builtin::PathBufNew,
         "std::path::PathBuf::with_capacity" => Builtin::PathBufNew,

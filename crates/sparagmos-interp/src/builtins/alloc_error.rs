@@ -16,11 +16,14 @@
 //!   that shim, which reconstructs the `Layout` and runs the
 //!   guest's handler.
 //! * A program that links std and defines no handler runs
-//!   std's `rust_oom`: the default hook's output (modelled by
+//!   std's `rust_oom`: the installed hook when the guest set
+//!   one with `set_alloc_error_hook` (unstable; modelled —
+//!   the hook receives a fabricated `Layout` value, a hook
+//!   that returns is followed by `process::abort`, and a
+//!   hook that panics propagates its panic), otherwise the
+//!   default hook's output (modelled by
 //!   `Interpreter::print_alloc_error_default_hook`), then
-//!   `process::abort`. A guest-installed custom hook
-//!   (`set_alloc_error_hook`, unstable) is not observed by
-//!   the model; the default hook is what is modelled.
+//!   `process::abort`.
 //! * A program with neither falls back to alloc's
 //!   `__rdl_alloc_error_handler`: a nounwind panic with the
 //!   message `memory allocation of {size} bytes failed`,
@@ -122,6 +125,24 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `std::alloc::default_alloc_error_hook(layout)`: the
+    /// default hook as a callable value (what
+    /// `take_alloc_error_hook` hands back when no custom
+    /// hook is installed): print the default report, then
+    /// abort, exactly the endpoint `run_alloc_error` models.
+    pub(crate) fn exec_default_alloc_error_hook(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        layout: &Value,
+    ) -> InterpResult<Value> {
+        let layout = self.resolve_value(frames, layout)?;
+        let (size, _align) = layout_size_align(&layout);
+        self.print_alloc_error_default_hook(frames, size);
+        Err(InterpError::Abort {
+            message: "memory allocation failed".to_string(),
+        })
+    }
+
     /// The shared tail of both endpoints: the
     /// allocation-failure dispatch for one (size, align).
     fn run_alloc_error(
@@ -150,6 +171,27 @@ impl<'a> Interpreter<'a> {
             return match result {
                 Ok(_) => Err(InterpError::Abort {
                     message: "allocation error handler returned".to_string(),
+                }),
+                Err(e) => Err(e),
+            };
+        }
+        // A guest-installed custom hook: the handler shim a
+        // program without a `#[alloc_error_handler]` links
+        // calls the installed hook with the failed layout,
+        // and the process aborts when the hook returns.
+        if let Some(hook) = self.installed_alloc_error_hook() {
+            let layout = Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Uint(size),
+                    crate::interp::alignment_value(align),
+                ],
+            };
+            let result =
+                self.call_callable_to_completion(frames, &hook, vec![layout]);
+            return match result {
+                Ok(_) => Err(InterpError::Abort {
+                    message: "memory allocation failed".to_string(),
                 }),
                 Err(e) => Err(e),
             };
@@ -337,6 +379,9 @@ pub(crate) fn alloc_lookup(canonical: &str) -> Option<Builtin> {
             Builtin::HandleAllocError
         }
         "alloc::raw_vec::handle_error" => Builtin::RawVecHandleError,
+        "std::alloc::set_alloc_error_hook" => Builtin::AllocErrorHookSet,
+        "std::alloc::take_alloc_error_hook" => Builtin::AllocErrorHookTake,
+        "std::alloc::default_alloc_error_hook" => Builtin::AllocErrorDefaultHook,
         _ => return None,
     })
 }

@@ -119,6 +119,12 @@ pub(crate) fn panic_lookup(canonical: &str) -> Option<Builtin> {
         "core::panicking::panic" => Builtin::PanicStr,
         "std::rt::panic_fmt" | "core::panicking::panic_fmt" => Builtin::PanicFmt,
         "core::panicking::assert_failed" => Builtin::AssertFailed,
+        // The non-generic leaf the generic `assert_failed`
+        // forwards to (and `assert_matches_failed` calls
+        // directly, with the operands already erased to
+        // `&dyn Debug`): same dispatch, whose operands the
+        // fmt engine renders through their vtables.
+        "core::panicking::assert_failed_inner" => Builtin::AssertFailed,
         "core::panicking::panic_nounwind_fmt" => Builtin::PanicNounwindFmt,
         // `panic_nounwind(&str)` and `Option::expect_failed(&str)`
         // panic with exactly the given message, as `panic` does.

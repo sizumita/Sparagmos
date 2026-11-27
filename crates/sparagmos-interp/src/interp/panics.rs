@@ -185,6 +185,23 @@ impl<'a> Interpreter<'a> {
             .unwrap_or_else(default_hook_value)
     }
 
+    /// Install the guest's allocation-error hook (see
+    /// [`Interpreter::alloc_error_hook`]).
+    pub(crate) fn set_alloc_error_hook(&self, hook: Value) {
+        *self.alloc_error_hook.borrow_mut() = Some(hook);
+    }
+
+    /// Take the guest's allocation-error hook, leaving the
+    /// default in its place; `None` when none was installed.
+    pub(crate) fn take_alloc_error_hook(&self) -> Option<Value> {
+        self.alloc_error_hook.borrow_mut().take()
+    }
+
+    /// The guest's installed allocation-error hook, if any.
+    pub(crate) fn installed_alloc_error_hook(&self) -> Option<Value> {
+        self.alloc_error_hook.borrow().clone()
+    }
+
     /// Install the hook `std::panic::update_hook` produces:
     /// a chain marker carrying the update closure and the
     /// hook in place before it (the default-hook marker when

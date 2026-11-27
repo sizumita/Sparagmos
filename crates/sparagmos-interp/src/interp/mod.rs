@@ -649,6 +649,12 @@ pub struct Interpreter<'a> {
     /// [`Interpreter::fire_panic_hook`] prints itself.
     /// Interior-mutable: most execution paths hold only `&self`.
     panic_hook: std::cell::RefCell<Option<Value>>,
+    /// The guest's allocation-error hook, installed by
+    /// `std::alloc::set_alloc_error_hook` (the `fn(Layout)`
+    /// value as the guest handed it over); `None` is std's
+    /// default hook. Interior-mutable, like `panic_hook`:
+    /// most execution paths hold only `&self`.
+    alloc_error_hook: std::cell::RefCell<Option<Value>>,
     /// The report context of the panic whose hook is
     /// currently running (see [`HookReportCtx`]); stashed by
     /// `call_panic_hook` for the length of the invocation.
@@ -1696,6 +1702,7 @@ impl<'a> Interpreter<'a> {
             pending_asm_outgoing: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
+            alloc_error_hook: std::cell::RefCell::new(None),
             hook_report_ctx: std::cell::RefCell::new(None),
             backtrace_style: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
