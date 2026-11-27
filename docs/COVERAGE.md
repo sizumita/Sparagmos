@@ -11,14 +11,14 @@ Sparagmos の目標は「Rust 1.100.0 を 99% のレベルで実行できるこ�
 |---|---|
 | 1. MIR バリアント網羅率 | 77.5% (実装済み 31 / 母数 40) |
 | 2(a). 自前コーパスのパス率 | 100% (47 / 47) |
-| 2(b). rustc テストスイート部分集合のパス率 | 88.627% (パス 22,101 / 母数 24,937 の全母数換算) |
+| 2(b). rustc テストスイート部分集合のパス率 | 88.483% (パス 22,065 / 母数 24,937 の全母数換算) |
 | 2(c). rustc 自体の実行 | 未着手 |
 | 参考. コーパスの JIT 経路パス率 | 100% (47 / 47) |
-| 3. std 機能網羅率 | 98.070% (1,677 / 1,710) |
-| 4. テストスイート全体の JIT パス率 | 69.728% (17,388 / 24,937) |
+| 3. std 機能網羅率 | 97.826% (1,710 / 1,748) |
+| 4. テストスイート全体の JIT パス率 | 69.535% (17,340 / 24,937) |
 
-現在の実測値は、Official Measurement run 46028839415 (main ヘッド
-`d8af459bbb`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
+現在の実測値は、Official Measurement run 46043193970 (main ヘッド
+`916dc044`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
 判定できました (詳細は指標2(b) の節)。
 
 ## 指標1: MIR バリアント網羅率
@@ -93,16 +93,16 @@ FFI を含むテスト、補助ファイルやビルドステップを要する�
 
 | 判定種別 | 件数 | 判定済み | 現在のパス |
 |---|---|---|---|
-| 実行 (exec) | 4,149 | 4,149 | 3,931 (94.746%) |
-| コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,943 (97.878%) |
-| 手順 (procedure / run-make) | 551 | 551 | 86 (15.608%) |
+| 実行 (exec) | 4,149 | 4,149 | 3,933 (94.794%) |
+| コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,901 (97.649%) |
+| 手順 (procedure / run-make) | 551 | 551 | 90 (16.334%) |
 | デバッガ実行 (exec-debugger) | 170 | 170 | 141 (82.941%) |
 | rustdoc 検証 | 1,735 | 1,735 | 0 |
-| 合計 | 24,937 | 24,937 | **22,101** |
+| 合計 | 24,937 | 24,937 | **22,065** |
 
-パス率は全母数換算で **88.627%** (22,101 / 24,937) です。パスして
-いないのは 2,836 件で、全て判定済みの失敗です (種別ごとの残りは、
-実行 218、コンパイル時検証 389、rustdoc 検証 1,735、手順 465、
+パス率は全母数換算で **88.483%** (22,065 / 24,937) です。パスして
+いないのは 2,872 件で、全て判定済みの失敗です (種別ごとの残りは、
+実行 216、コンパイル時検証 431、rustdoc 検証 1,735、手順 461、
 デバッガ実行 29)。
 
 #### Windows クラスの判定について
@@ -120,49 +120,43 @@ stage-3 のサポートビルド失敗) と
 
 #### 前回確定値との差分
 
-前回の確定値 (run 46015526965) と両方で判定できた範囲の差分は
-gain 13 / loss 0 です。gain の内訳は、PR #892 が 1 件
-(`tests/ui/limits/vtable-try-as-dyn.rs`、コンパイル時検証)、
-PR #899 が 1 件
-(`tests/ui/macros/rfc-2011-nicer-assert-messages/feature-gate-generic_assert.rs`、
-実行)、PR #879 が 1 件
-(`tests/ui/async-await/async-closures/precise-captures.rs`、実行)、
-PR #859 が 1 件
-(`tests/ui-fulldeps/derive-generic-type-visitable.rs`、実行)、
-PR #887 が 1 件 (`tests/ui/async-await/async-closure.rs`、実行)、
-PR #891 が 1 件 (`tests/ui/static/static-align.rs`、実行)、
-PR #881 が 1 件 (`tests/ui/process/issue-20091.rs`、実行)、
-PR #900 が 1 件 (`tests/ui/simd/issue-32947.rs`、実行)、
-PR #902 が 1 件 (`tests/ui/unsized/unsized3-rpass.rs`、実行)、
-PR #879 / #886 が 1 件 (`tests/mir-opt/coroutine/async_drop.rs`、
-コンパイル時検証) です。残る 3 件は帰属が推定のものと負荷揺れです:
-`tests/ui/feature-gates/issue-43106-gating-of-builtin-attrs.rs`
-(コンパイル時検証、PR #810 が最有力)、
-`tests/ui/array-slice-vec/driftsort-off-by-one-issue-136103.rs`
-(実行、タイムアウトからの回復で PR #884 / #898 の作業量削減が
-候補)、`tests/ui/threads-sendsync/mpsc_stress.rs` (実行、
-タイムアウトからの回復だが head 間隔内に修正は無く負荷揺れと
-整合) です。以前の run で新規 loss となった 14 件のうち、
-`tests/ui/limits/vtable-try-as-dyn.rs` と
-`tests/ui/macros/rfc-2011-nicer-assert-messages/feature-gate-generic_assert.rs`
-の 2 件は上記のとおり回復し、`mpsc_stress.rs` は修正なしで
-パスに戻りました。残る 11 件は今回も同じ理由で失敗しています:
-`tests/ui/panics/issue-47429-short-backtraces.rs`、
-`tests/ui/panics/runtime-switch.rs` (いずれも実行、標準エラー不一致。
-修正はこの head の後に着地済み)、
-`tests/run-make/prefer-rlib` (手順、レシピ失敗)、
-`tests/ui-fulldeps/internal-lints/` 配下の 4 件
-(`direct-use-of-rustc-type-ir.rs`、`import-of-type-ir-inherent.rs`、
+前回の確定値 (run 46028839415) と両方で判定できた範囲の差分は
+gain 41 / loss 77 です。loss の主体は実装の退行ではありません。
+loss 77 件のうち 74 件は `tests/crashes/` 配下のレコードで、
+PR #920 が crashes スイートのパスに ICE の証拠を要求するように
+なったことで、それまで終了コード 101 のみでパスしていた
+hollow pass が、新しいバケット `compiler crash not evidenced`
+として正直に失敗へ再分類されたものです。PR #920 の判定変更を
+除けば、今 run は 22,139 件 = 88.780% 相当です。
+
+gain のうち帰属が確定しているのは 17 件です: PR #908 が 8 件
+(`tests/ui-fulldeps/internal-lints/` 配下の 4 件
+`direct-use-of-rustc-type-ir.rs`、`import-of-type-ir-inherent.rs`、
 `import-of-type-ir-traits.rs`、
-`non_glob_import_of_type_ir_inherent.rs`、いずれもコンパイル時検証、
-失敗すべきテストでの compiler crash)、
+`non_glob_import_of_type_ir_inherent.rs`、
 `tests/ui/lifetimes/issue-91763.rs`、
 `tests/ui/lint/redundant-semicolon/redundant-semi-proc-macro.rs`、
-`tests/ui/suggestions/issue-61963.rs` (いずれもコンパイル時検証、
-同種の compiler crash)、
-`tests/ui/traits/next-solver/overflow/recursion-limit-zero-issue-115351.rs`
-(コンパイル時検証、成功すべきテストで再帰上限超過) です。
-これら 11 件は帰属が判明しており、修正の着地が進んでいます。
+`tests/ui/suggestions/issue-61963.rs`、
+`tests/ui/traits/next-solver/overflow/recursion-limit-zero-issue-115351.rs`)、
+PR #909 が 1 件 (`tests/run-make/prefer-rlib`、手順)、PR #889 が
+2 件 (`tests/ui/panics/issue-47429-short-backtraces.rs`、
+`tests/ui/panics/runtime-switch.rs`、いずれも実行。これで以前の
+run で loss となった 4 件は全件回復しました)、PR #913 が 2 件
+(`rustc_dump_def_path`、`rustc_dump_symbol_name`、いずれも
+コンパイル時検証)、PR #914 が 4 件 (unsafe binder 関連) です。
+残る gain 24 件のうち 23 件は機構と整合するもの
+(symbol-names 系の判定クラスタ 18 件、by-ref 定数 2 件、
+手順 3 件) で、1 件は帰属なしです。
+
+loss の残り 3 件のうち 1 件は
+`tests/ui/recursion/recursion_limit/zero-overflow.rs`
+(コンパイル時検証) で、予測どおりの loss 化です。このレコードの
+以前のパスは PR #834 の走査クラッシュが偶然作ったもので、
+変換が成功するようになった今、失敗すべきテストで変換が成功する
+ために失敗します。根因のギャップは Issue #509 に記録済みです。
+残る 2 件 (`tests/ui/imports/ambiguous-reachable.rs`、
+コンパイル時検証、`tests/ui/impl-trait/example-calendar.rs`、
+実行) は帰属が判明しておらず、トリアージ中です。
 
 #### パスの定義
 
@@ -223,7 +217,7 @@ by-value 反復 (IntoIter) も要素型ごとのレイアウトで実行でき�
 
 出現ベースで定義します。指標2のプログラム群 (自前コーパス + テスト
 部分集合の stage-1 候補) の変換済み MIR に実際に呼び出し先として現れる
-`std` / `core` / `alloc` の関数パスの集合が母数です。現在 **1,710** 件。
+`std` / `core` / `alloc` の関数パスの集合が母数です。現在 **1,748** 件。
 変換できるプログラムが増えると現れるパスも増えるため、母数は測定ごとに
 動き得ます。
 
@@ -231,9 +225,12 @@ by-value 反復 (IntoIter) も要素型ごとのレイアウトで実行でき�
 
 あるパスへの呼び出しがインタプリタで実行可能であること。すなわち、
 変換済みプログラムにその関数の本体が含まれるか、インタプリタの
-ビルトインとして解決できること。現在 **1,677 / 1,710 (98.070%)**。
-全プログラムで本体が揃うことを要求する厳密値では 1,661 / 1,710 (97.135%)
-です。母数と項目集合は前回と同一で、共通項目の flip は 0 件です。
+ビルトインとして解決できること。現在 **1,710 / 1,748 (97.826%)**。
+全プログラムで本体が揃うことを要求する厳密値では 1,694 / 1,748 (96.911%)
+です。母数は、PR #937 の計測条件変更 (measure-host ジョブへの
+全ターゲット導入) により前回から 38 件増えました。共通する
+1,710 項目の flip は上下とも 0 件で、新規 38 件のうち 33 件は
+既に実行可能です。
 
 ## 指標4: テストスイート全体の JIT パス率
 
@@ -253,13 +250,11 @@ procedure / exec-debugger / rustdoc のレコードは現在 JIT 経路では
 
 ### 現在値
 
-**17,388 / 24,937 (69.728%)**。内訳はコンパイル時検証
-15,960 / 18,332、実行 1,428 / 4,149 で、procedure / exec-debugger /
-rustdoc の nature は 0 件です。前回の確定値との差分は gain 2 /
-loss 0 で、gain の 2 件は PR #892 の
-`tests/ui/limits/vtable-try-as-dyn.rs` と PR #810 が最有力の
-`tests/ui/feature-gates/issue-43106-gating-of-builtin-attrs.rs`
-(いずれもコンパイル時検証) です。主な失敗要因は、JIT ロワリング未対応 (その他) と、
+**17,340 / 24,937 (69.535%)**。内訳はコンパイル時検証
+15,908 / 18,332、実行 1,432 / 4,149 で、procedure / exec-debugger /
+rustdoc の nature は 0 件です。前回の確定値 (run 46028839415) との
+差分は gain 39 / loss 87 で、loss のうち 74 件は PR #920 の
+再分類によるものです。主な失敗要因は、JIT ロワリング未対応 (その他) と、
 変換済み本体を持たない関数への呼び出しです。この値は、未対応の
 呼び出しを到達時点で失敗するトラップとして下げ、String をヒープ
 機構で処理する現在の jit-compile の意味論のもとで測ったものです。
