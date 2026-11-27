@@ -30,7 +30,13 @@ with this compiler, so that triple stays blocked regardless of
 this pipeline). Core-only triples (the `-none` family and
 similar) have no std to build; `core,alloc` is their ceiling,
 and records whose test files use std then fail at the guest
-compile on their merits instead of staying unattempted.
+compile on their merits instead of staying unattempted. The
+OS triples in the table (sparc/mips/mips64 linux, hexagon
+musl, powerpc64 AIX, i686 darwin, wasm64) carry the full
+`core,std,panic_unwind` set, matching what a distributed std
+for those targets would provide. Apart from the two targets
+called out below, no entry needs an explicit `-C target-cpu`
+to build: each entry's ticket build ran without one.
 
 Two targets (amdgcn-amd-amdhsa, avr-none) refuse to compile
 anything at all without an explicit `-C target-cpu`, so their
@@ -62,7 +68,18 @@ TIER3_STD = {
     "aarch64-unknown-linux-pauthtest": ("core", "std", "panic_unwind"),
     "amdgcn-amd-amdhsa": ("core", "alloc"),
     "avr-none": ("core", "alloc"),
+    "bpfeb-unknown-none": ("core", "alloc"),
+    "bpfel-unknown-none": ("core", "alloc"),
+    "hexagon-unknown-linux-musl": ("core", "std", "panic_unwind"),
+    "i686-apple-darwin": ("core", "std", "panic_unwind"),
+    "mips-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "mips64-unknown-linux-gnuabi64": ("core", "std", "panic_unwind"),
+    "msp430-none-elf": ("core", "alloc"),
+    "powerpc64-ibm-aix": ("core", "std", "panic_unwind"),
     "riscv32e-unknown-none-elf": ("core", "alloc"),
+    "sparc-unknown-linux-gnu": ("core", "std", "panic_unwind"),
+    "sparc-unknown-none-elf": ("core", "alloc"),
+    "wasm64-unknown-unknown": ("core", "std", "panic_unwind"),
 }
 
 # triple -> the `-C target-cpu` its build-std run must carry.

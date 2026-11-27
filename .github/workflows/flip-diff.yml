@@ -327,8 +327,19 @@ jobs:
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/aarch64-unknown-linux-pauthtest
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/amdgcn-amd-amdhsa
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/avr-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfeb-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/bpfel-unknown-none
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/hexagon-unknown-linux-musl
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/i686-apple-darwin
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/mips64-unknown-linux-gnuabi64
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/msp430-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/powerpc64-ibm-aix
             ${{ steps.sysroot.outputs.path }}/lib/rustlib/riscv32e-unknown-none-elf
-          key: tier3-std-1.100.0-v2
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-linux-gnu
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/sparc-unknown-none-elf
+            ${{ steps.sysroot.outputs.path }}/lib/rustlib/wasm64-unknown-unknown
+          key: tier3-std-1.100.0-v3
 
       - name: Build tier-3 std from source
         if: steps.cfg.outputs.skip != '1'

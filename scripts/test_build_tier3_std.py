@@ -89,6 +89,45 @@ class TableTest(unittest.TestCase):
         self.assertEqual(bts.TIER3_STD["riscv32e-unknown-none-elf"],
                          ("core", "alloc"))
 
+    def test_increment3_entries(self):
+        full = ("core", "std", "panic_unwind")
+        self.assertEqual(bts.TIER3_STD["hexagon-unknown-linux-musl"], full)
+        self.assertEqual(bts.TIER3_STD["i686-apple-darwin"], full)
+        self.assertEqual(bts.TIER3_STD["mips-unknown-linux-gnu"], full)
+        self.assertEqual(
+            bts.TIER3_STD["mips64-unknown-linux-gnuabi64"], full)
+        self.assertEqual(bts.TIER3_STD["powerpc64-ibm-aix"], full)
+        self.assertEqual(bts.TIER3_STD["sparc-unknown-linux-gnu"], full)
+        self.assertEqual(bts.TIER3_STD["wasm64-unknown-unknown"], full)
+        self.assertEqual(bts.TIER3_STD["bpfeb-unknown-none"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["bpfel-unknown-none"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["msp430-none-elf"],
+                         ("core", "alloc"))
+        self.assertEqual(bts.TIER3_STD["sparc-unknown-none-elf"],
+                         ("core", "alloc"))
+
+    def test_table_entry_set_is_the_union(self):
+        self.assertEqual(set(bts.TIER3_STD), {
+            "aarch64-unknown-linux-pauthtest",
+            "aarch64v8r-unknown-none",
+            "amdgcn-amd-amdhsa",
+            "avr-none",
+            "bpfeb-unknown-none",
+            "bpfel-unknown-none",
+            "hexagon-unknown-linux-musl",
+            "i686-apple-darwin",
+            "mips-unknown-linux-gnu",
+            "mips64-unknown-linux-gnuabi64",
+            "msp430-none-elf",
+            "powerpc64-ibm-aix",
+            "riscv32e-unknown-none-elf",
+            "sparc-unknown-linux-gnu",
+            "sparc-unknown-none-elf",
+            "wasm64-unknown-unknown",
+        })
+
 
 class TargetCpuTest(unittest.TestCase):
     def test_cpu_table_only_names_table_triples(self):
