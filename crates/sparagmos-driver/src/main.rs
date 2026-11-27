@@ -882,6 +882,13 @@ fn driver_main_inner() {
     let mut debug_dialect = "gdb".to_string();
     let mut input: Option<String> = None;
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
+    // The invocation's own binding designations for the
+    // main compilation (`--aux-bind <name>=<source>`, see
+    // `ToolRegistry::designated_aux_specs`): for a name
+    // built from several sources in this conversion, the
+    // one build each designation names is the name's
+    // binding here.
+    let mut aux_binds: Vec<(String, String)> = Vec::new();
     let mut aux_lib_specs: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
     let mut aux_native_lib_dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut aux_env_scrub: Vec<String> = Vec::new();
@@ -1003,6 +1010,24 @@ fn driver_main_inner() {
                     Ok(parsed) => aux_specs.push(parsed),
                     Err(reason) => {
                         eprintln!("{reason}");
+                        exit_process(2);
+                    }
+                }
+            }
+            "--aux-bind" => {
+                i += 1;
+                let spec = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--aux-bind needs a <name>=<source> value");
+                    exit_process(2);
+                });
+                match spec.split_once('=') {
+                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                        aux_binds.push((name.to_string(), path.to_string()));
+                    }
+                    _ => {
+                        eprintln!(
+                            "--aux-bind needs a <name>=<source> value, got: {spec}"
+                        );
                         exit_process(2);
                     }
                 }
@@ -1132,6 +1157,12 @@ fn driver_main_inner() {
                 if let Some(edition) = &spec.edition {
                     text += &format!(";edition={edition}");
                 }
+                for (need_name, need_path) in &spec.needs {
+                    text += &format!(";need={need_name}={need_path}");
+                }
+                if let Some(uniq) = &spec.uniq {
+                    text += &format!(";uniq={uniq}");
+                }
                 text
             })
             .collect();
@@ -1202,6 +1233,7 @@ fn driver_main_inner() {
         .map(|(name, path, collect)| AuxBuilt {
             name: name.clone(),
             extern_name: name.clone(),
+            source: None,
             artifact: Some(path.clone()),
             collect: *collect,
             // No build flags to resolve from: `main` records the
@@ -1335,6 +1367,10 @@ fn driver_main_inner() {
         input: input.clone(),
         edition: edition.clone(),
         aux: aux_specs.iter().map(render_aux_spec).collect(),
+        aux_binds: aux_binds
+            .iter()
+            .map(|(name, path)| format!("{name}={path}"))
+            .collect(),
         rustc_args: rustc_args.clone(),
     };
     args.extend(rustc_args);
@@ -1367,6 +1403,20 @@ fn driver_main_inner() {
         for built in &aux_built {
             if let Some(artifact) = &built.artifact {
                 for bind in bind_names_for(built, &top_names, &binding_declared) {
+                    // A name the invocation designated (see
+                    // `--aux-bind`) binds the one build the
+                    // designation names, as an auxiliary
+                    // build's designated names do (see
+                    // `designated_elsewhere`). An
+                    // undesignated name binds every build
+                    // providing it: several distinct
+                    // candidates are the compilation's own
+                    // E0464 to refuse, as a native invocation
+                    // handed them all refuses (the
+                    // crateresolve shape).
+                    if designated_elsewhere(&aux_binds, bind, built) {
+                        continue;
+                    }
                     args.push("--extern".to_string());
                     args.push(format!("{}={}", bind, artifact.display()));
                 }

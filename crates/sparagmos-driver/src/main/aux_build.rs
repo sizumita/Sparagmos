@@ -522,7 +522,7 @@ fn expand_aux_flag_variables(flag: &str, src_path: &str) -> String {
 /// One `--aux` specification: the crate name and source path from
 /// `<name>=<file.rs>`, plus the optional per-crate attributes that
 /// followed the path (`;crate-type=<type>`, `;edition=<ed>`,
-/// `;cfg=<name>`).
+/// `;cfg=<name>`, `;need=<name>=<path>`, `;uniq=<token>`).
 pub(crate) struct AuxSpec {
     pub(crate) name: String,
     pub(crate) path: String,
@@ -536,11 +536,41 @@ pub(crate) struct AuxSpec {
     /// meet the same rustc_private gate the real artifact
     /// raises.
     pub(crate) force_unstable: bool,
+    /// The dependency bindings the producing invocation
+    /// designated for this crate (see
+    /// `ToolRegistry::designated_aux_specs`): (binding
+    /// name, source path) pairs naming, for each
+    /// dependency name this crate's build bound, the one
+    /// recorded build of that name the binding denoted.
+    /// An auxiliary build binds a designated name to
+    /// exactly the designated build; a name no designation
+    /// covers is bound by the name-matching rule as
+    /// before. Empty unless the spec came from a
+    /// tool-interception tail.
+    pub(crate) needs: Vec<(String, String)>,
+    /// A uniqueness token for this spec's build (see
+    /// `ToolRegistry::designated_aux_specs`): when one
+    /// conversion builds the same crate name from several
+    /// sources, the builds must stand as distinct crates
+    /// to every consumer -- distinct artifact files and
+    /// distinct crate identities -- so the build carries
+    /// `-C extra-filename=-sparagmos<token>` and
+    /// `-C metadata=sparagmos<token>` (each only when its
+    /// own flags do not already carry one): the
+    /// extra-filename keeps the files apart in the shared
+    /// directory, and the metadata value is what separates
+    /// the crates' StableCrateIds, so a consumer binds one
+    /// by designation and reaches the other through its
+    /// dependent's recorded demand, exactly as a native
+    /// multi-version build does. `None` when the name is
+    /// built once in the conversion.
+    pub(crate) uniq: Option<String>,
 }
 
 /// Parse one `--aux` value: `<name>=<file.rs>` optionally followed
-/// by `;crate-type=<type>`, `;edition=<ed>`, `;cfg=<name>` and/or
-/// `;force-unstable=yes` attributes. Anything else is a usage
+/// by `;crate-type=<type>`, `;edition=<ed>`, `;cfg=<name>`,
+/// `;force-unstable=yes`, `;need=<name>=<path>` and/or
+/// `;uniq=<token>` attributes. Anything else is a usage
 /// error.
 pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
     let (name, rest) = spec
@@ -559,6 +589,8 @@ pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
         edition: None,
         cfgs: Vec::new(),
         force_unstable: false,
+        needs: Vec::new(),
+        uniq: None,
     };
     for attr in parts {
         let (key, value) = attr
@@ -569,6 +601,18 @@ pub(crate) fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
             "crate-type" => parsed.crate_type = Some(value.to_string()),
             "edition" => parsed.edition = Some(value.to_string()),
             "cfg" => parsed.cfgs.push(value.to_string()),
+            "need" => {
+                let (dep_name, dep_path) = value
+                    .split_once('=')
+                    .filter(|(n, p)| !n.is_empty() && !p.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "--aux need attribute needs <name>=<path>, got: {value}"
+                        )
+                    })?;
+                parsed.needs.push((dep_name.to_string(), dep_path.to_string()));
+            }
+            "uniq" => parsed.uniq = Some(value.to_string()),
             "force-unstable" => match value {
                 "yes" => parsed.force_unstable = true,
                 "no" => parsed.force_unstable = false,
@@ -637,6 +681,13 @@ pub(crate) struct AuxBuilt {
     /// (`my_api::utils`), neither of which is a valid `--crate-name`
     /// for the auxiliary build itself.
     pub(crate) extern_name: String,
+    /// The source path the build compiled (the `--aux`
+    /// spec's path): what identifies this build among
+    /// several builds of one crate name, and what a
+    /// consumer's designated binding names its dependency
+    /// by (see `AuxSpec::needs`). `None` for a prebuilt
+    /// library (--aux-lib), which no designation names.
+    pub(crate) source: Option<String>,
     /// Artifact to link with `--extern`; `None` for crate types
     /// that expose no Rust API (cdylib and friends).
     pub(crate) artifact: Option<std::path::PathBuf>,
@@ -714,6 +765,70 @@ pub(crate) fn bind_names_for<'a>(
         .into_iter()
         .filter(|name| declared.contains(*name))
         .collect()
+}
+
+/// Whether `designations` -- a consumer's recorded binding
+/// designations as (name, source path) pairs (an auxiliary
+/// spec's `needs`, the main compilation's `--aux-bind`
+/// values) -- name the binding `bind` for a build other
+/// than `built`: the name is designated, and `built`'s
+/// source is not among the sources the designations name
+/// for it. Such a binding is not emitted for `built`: the
+/// designated build is the name's binding for this
+/// consumer, and a second candidate is E0464 to rustc
+/// (picking one by order would silently bind the wrong
+/// version where it is not). A build with no recorded
+/// source (a prebuilt library) is never displaced: no
+/// designation names it, and its binding is the harness's
+/// own contract.
+pub(crate) fn designated_elsewhere(
+    designations: &[(String, String)],
+    bind: &str,
+    built: &AuxBuilt,
+) -> bool {
+    let Some(source) = &built.source else {
+        return false;
+    };
+    let mut designated = false;
+    for (name, path) in designations {
+        if name == bind {
+            designated = true;
+            if path == source {
+                return false;
+            }
+        }
+    }
+    designated
+}
+
+/// Whether an auxiliary build whose binding
+/// `designations` these are binds the name `bind` to
+/// `built`: a designated name binds exactly its
+/// designated build (see `designated_elsewhere`); an
+/// undesignated name binds the last build providing it
+/// -- the build whose artifact every consumer
+/// effectively saw before same-name builds stood under
+/// distinct files (see `AuxSpec::uniq`), when they
+/// overwrote one another in the shared directory, so
+/// this preserves the standing behaviour for every name
+/// no invocation designated. (The main compilation does
+/// not use this rule: it binds every candidate of an
+/// undesignated name and lets the compilation refuse
+/// duplicates itself with E0464, as a native invocation
+/// handed them all does.)
+pub(crate) fn binding_decision(
+    designations: &[(String, String)],
+    bind: &str,
+    built: &AuxBuilt,
+    is_last_provider: bool,
+) -> bool {
+    if designated_elsewhere(designations, bind, built) {
+        return false;
+    }
+    if designations.iter().any(|(name, _)| name == bind) {
+        return true;
+    }
+    is_last_provider
 }
 
 /// Compile one auxiliary source file with the pinned rustc into
@@ -840,9 +955,24 @@ pub(crate) fn compile_aux(
     deps.extend(locator_extern_names(&own_flags));
     let mut binding_declared = declared_binding_names(&src_text);
     binding_declared.extend(locator_extern_names(&own_flags));
-    for prev in previous {
+    // For each name the previous builds provide, the
+    // last build providing it (see `binding_decision`).
+    let mut last_provider: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (idx, prev) in previous.iter().enumerate() {
+        if prev.artifact.is_some() {
+            for bind in bind_names_for(prev, &deps, &binding_declared) {
+                last_provider.insert(bind.to_string(), idx);
+            }
+        }
+    }
+    for (idx, prev) in previous.iter().enumerate() {
         if let Some(artifact) = &prev.artifact {
             for bind in bind_names_for(prev, &deps, &binding_declared) {
+                let is_last = last_provider.get(bind).copied() == Some(idx);
+                if !binding_decision(&spec.needs, bind, prev, is_last) {
+                    continue;
+                }
                 cmd.arg("--extern")
                     .arg(format!("{}={}", bind, artifact.display()));
             }
@@ -911,6 +1041,33 @@ pub(crate) fn compile_aux(
     // with the `{{...}}` template variables expanded).
     for flag in declared_compile_flags(&src_text, &spec.cfgs) {
         cmd.arg(expand_aux_flag_variables(&flag, src_path));
+    }
+    // A spec carrying a uniqueness token (this conversion
+    // builds the same crate name from several sources) names
+    // its artifact after the token and stamps the token as
+    // the build's `-C metadata`: the extra-filename keeps
+    // the builds' files from overwriting one another in the
+    // shared directory, and the metadata value separates
+    // the builds' crate identities (StableCrateIds), which
+    // an extra-filename alone does not -- with one identity
+    // the session loading two of the builds fails with
+    // colliding StableCrateIds, and a dependent's recorded
+    // demand could not tell them apart. A build whose own
+    // flags already carry an extra-filename or a metadata
+    // value keeps it (the crateresolve shape, whose
+    // suffixes already distinguish the files).
+    if let Some(uniq) = &spec.uniq {
+        let current: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if extra_filename_suffix(&current).is_none() {
+            cmd.arg("-C")
+                .arg(format!("extra-filename=-sparagmos{uniq}"));
+        }
+        if !codegen_opt_present(&current, "metadata=") {
+            cmd.arg("-C").arg(format!("metadata=sparagmos{uniq}"));
+        }
     }
     // The crate's own overflow-checks setting, resolved from
     // the very command line it is about to be built with (its
@@ -1037,6 +1194,7 @@ pub(crate) fn compile_aux(
     Ok(AuxBuilt {
         name: effective_name.to_string(),
         extern_name: name.to_string(),
+        source: Some(spec.path.clone()),
         artifact: if link { artifact } else { None },
         collect,
         overflow_checks,
@@ -1078,6 +1236,33 @@ fn snapshot_dir(dir: &std::path::Path) -> std::collections::HashMap<String, DirS
 /// carries, in any of the spellings rustc accepts (`-C` /
 /// `--codegen`, joined to the value or as the next argument);
 /// the last one wins, as in rustc itself.
+/// Whether a `-C <key>=...` codegen option is present in
+/// `args`, in either the split (`-C`, `key=...`) or glued
+/// (`-Ckey=...` / `--codegen=key=...`) spelling -- the scan
+/// `extra_filename_suffix` performs for its one key.
+fn codegen_opt_present(args: &[String], key: &str) -> bool {
+    let mut codegen_next = false;
+    for arg in args {
+        let value = if codegen_next {
+            codegen_next = false;
+            Some(arg.as_str())
+        } else if arg == "-C" || arg == "--codegen" {
+            codegen_next = true;
+            None
+        } else if let Some(value) = arg.strip_prefix("--codegen=") {
+            Some(value)
+        } else {
+            arg.strip_prefix("-C")
+        };
+        if let Some(value) = value {
+            if value.starts_with(key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn extra_filename_suffix(args: &[String]) -> Option<String> {
     let mut suffix = None;
     let mut codegen_next = false;
