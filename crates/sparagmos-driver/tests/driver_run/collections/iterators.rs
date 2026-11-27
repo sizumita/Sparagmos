@@ -1307,6 +1307,40 @@ fn run_mode_group_by_adapter_only_consumption() {
     );
 }
 
+const GROUP_BY_COMBINED_MAIN: &str = r#"
+fn main() {
+    // Both consumption shapes in one program: the
+    // direct-`next` composition and the generic helpers'
+    // collect / count.
+    assert_eq!(weeks_uniq(), vec![(0, 7), (1, 3)]);
+    assert_eq!(summarize(dates()), vec![(0, 10)]);
+    assert_eq!(chained_groups(dates()), 3);
+    println!("group_by combined ok");
+}
+"#;
+
+#[test]
+fn run_mode_group_by_combined_consumption_shapes() {
+    // The helpers' collect demands the `Map` over the
+    // `GroupBy` composition's collected `next` body; the
+    // direct-`next` composition's own `Map` instantiations
+    // are served by the modelled state machine and collect
+    // no body. The conversion scan for a trait-method call
+    // must not bind the direct composition's `next` call to
+    // the one collected `Map` body just because the base
+    // names agree: it did, and the foreign body walked the
+    // machine-shaped value with its own type's layout,
+    // stepping the innermost `RangeFrom` one field too deep
+    // ("type mismatch in iterator state of
+    // std::ops::RangeFrom<i32>: expected ADT value, found
+    // signed integer").
+    run_ok(
+        "group-by-combined",
+        &format!("{GROUP_BY_COMPOSITIONS_SRC}{GROUP_BY_COMBINED_MAIN}"),
+        "group_by combined ok\n",
+    );
+}
+
 /// `Peekable::next` has no modelled state-machine step:
 /// its state is the genuine struct the collected `peek`
 /// body manipulates, so a direct `next` call on a
