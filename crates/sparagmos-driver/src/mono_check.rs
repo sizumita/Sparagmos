@@ -2128,6 +2128,11 @@ impl<'tcx> RequiredConstWalk<'tcx> {
     /// - every local static: collecting a static evaluates its
     ///   initializer, and a non-nested static's type also gets
     ///   its drop glue collected.
+    /// - every `global_asm!` item's constant operands: the item
+    ///   is a root of its own and emitting its assembly evaluates
+    ///   the operands unconditionally; they are anonymous
+    ///   constants parented by the item, evaluated where they
+    ///   are found (see `collect_global_asm_const`).
     ///
     /// The instances the driver's own demand passes resolved are
     /// NOT roots. Conversion translates every local body,
@@ -2212,6 +2217,19 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                     rustc_hir::def::DefKind::Static { nested, .. } => {
                         self.collect_root_static(def_id, nested);
                     }
+                    rustc_hir::def::DefKind::AnonConst => {
+                        // The constant operands of a `global_asm!`
+                        // item are anonymous constants parented by
+                        // the item; the item is a collector root of
+                        // its own, so they are collected (and
+                        // evaluated) with it.
+                        if matches!(
+                            tcx.def_kind(tcx.parent(def_id)),
+                            rustc_hir::def::DefKind::GlobalAsm
+                        ) {
+                            self.collect_global_asm_const(def_id);
+                        }
+                    }
                     _ => {}
                 }
             }));
@@ -2240,6 +2258,51 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                      (rustc reports the evaluation error during \
                      monomorphization collection)",
                     tcx.def_path_str(def_id)
+                ));
+            }
+            Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
+        }
+    }
+
+    /// Collect one `global_asm!` constant operand the way the
+    /// collector treats a `MonoItem::GlobalAsm`: emitting the
+    /// item's assembly evaluates every constant operand
+    /// unconditionally, so a constant whose evaluation is
+    /// reported as an error (E0080) fails the whole compilation
+    /// (tests/ui/asm/fail-const-eval-issue-121099). The operands
+    /// live outside every body, so no body's required-constant
+    /// list ever names them and the walk must evaluate them
+    /// where they are found. Only a positively reported
+    /// evaluation error is a finding, as everywhere in this
+    /// walk; the evaluated value is chased like a required
+    /// constant's. (The item's `sym` operands name items the
+    /// collector also collects; not following them only narrows
+    /// the check, never widens it.)
+    fn collect_global_asm_const(&mut self, def_id: rustc_span::def_id::DefId) {
+        let tcx = self.tcx;
+        // An anonymous constant carries one synthetic type
+        // parameter (its own type, `<const_ty>`), so
+        // `Instance::mono` refuses it; the identity arguments
+        // are the instance the operand is evaluated under, the
+        // same shape the compiler's own global-assembly
+        // emission builds for it.
+        let gid = rustc_middle::mir::interpret::GlobalId {
+            instance: rustc_middle::ty::Instance::new_raw(
+                def_id,
+                rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
+            ),
+            promoted: None,
+        };
+        let evaluated =
+            tcx.const_eval_global_id(fully_monomorphized(), gid, tcx.def_span(def_id));
+        match evaluated {
+            Ok(value) => self.chase_value(value),
+            Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                self.finding = Some(format!(
+                    "constant operand of the `global_asm!` item `{}` \
+                     failed to evaluate (rustc reports the evaluation \
+                     error when it emits the global assembly)",
+                    tcx.def_path_str(tcx.parent(def_id))
                 ));
             }
             Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}

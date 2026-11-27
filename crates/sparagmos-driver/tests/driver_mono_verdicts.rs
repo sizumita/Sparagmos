@@ -16,7 +16,12 @@
 //! that must be overridden but has no backend shim (the internal
 //! error code generation raises for it), and a
 //! `#[linkage = "common"]` static with a non-zero initializer
-//! (the LLVM verifier's rejection of the module). The driver now
+//! (the LLVM verifier's rejection of the module). A
+//! `global_asm!` item's constant operands are pinned as well:
+//! emitting the assembly evaluates them unconditionally, so an
+//! operand whose evaluation fails (E0080) is a compilation
+//! failure even though the operands live outside every body
+//! and no required-constant list names them. The driver now
 //! replays the verdicts in `mono_check`; each
 //! test below pins one rejection and the nearby acceptance that
 //! guards it against over-rejection. A rejected compilation
@@ -1040,6 +1045,48 @@ fn finite_adapter_tower_converts() {
              let n = total(&mut itr);\n\
              println!(\"{n}\");\n\
          }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn global_asm_const_eval_failure_rejected() {
+    // tests/ui/asm/fail-const-eval-issue-121099: the operands
+    // of a `global_asm!` item are evaluated when the assembly
+    // is emitted, so a failing operand is a compilation error
+    // (E0080) -- but the operands are anonymous constants
+    // outside every body, so conversion alone never evaluates
+    // them and used to accept the crate.
+    let case = Case::new("global-asm-bad-const");
+    let src = case.write(
+        "case.rs",
+        "use std::arch::global_asm;\n\
+         \n\
+         fn main() {}\n\
+         \n\
+         global_asm!(\"/* {} */\", const 1 << 500);\n\
+         global_asm!(\"/* {} */\", const 1 / 0);\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(stderr.contains("compilation failed"), "stderr={stderr}");
+    assert!(stderr.contains("E0080"), "stderr={stderr}");
+}
+
+#[test]
+fn global_asm_const_operands_accepted() {
+    // The acceptance guarding the rejection above: operands
+    // that evaluate cleanly keep the crate converting.
+    let case = Case::new("global-asm-good-const");
+    let src = case.write(
+        "case.rs",
+        "use std::arch::global_asm;\n\
+         \n\
+         fn main() {}\n\
+         \n\
+         global_asm!(\"/* {} */\", const 1 << 5);\n\
+         global_asm!(\"/* {} */\", const 40 + 2);\n",
     );
     let (code, _stdout, stderr) = case.convert(&src, &[], false);
     assert_eq!(code, 0, "stderr={stderr}");
