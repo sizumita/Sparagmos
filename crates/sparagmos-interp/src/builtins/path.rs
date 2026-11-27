@@ -534,6 +534,138 @@ pub(super) fn rsplit_file_at_dot(name: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) 
     }
 }
 
+impl<'a> Interpreter<'a> {
+    /// The bytes an `OsString` value in its real aggregate
+    /// form denotes: the two one-field wrappers (`OsString`
+    /// around its `Buf`) around a `Vec<u8>` in its real
+    /// aggregate form ([buffer, length], see
+    /// `vec_real_aggregate_parts`), whose buffer the
+    /// converted library bodies filled through raw-pointer
+    /// copies -- the shape `OsString::with_capacity` plus
+    /// `push` builds and hands around. The bytes are the
+    /// buffer pointer's elements up to the vector's live
+    /// length, read through the pointer model like any other
+    /// bulk-memory source -- the same reading
+    /// `string_from_real_aggregate` performs for `String`,
+    /// with no UTF-8 judgement, as OS-string bytes are not
+    /// text. Any other shape returns `None` and leaves the
+    /// caller's ordinary judgement to stand.
+    pub(super) fn os_string_bytes_from_real_aggregate(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        let [buf] = fields.as_slice() else {
+            return Ok(None);
+        };
+        let Value::Enum {
+            fields: vec_fields, ..
+        } = buf
+        else {
+            return Ok(None);
+        };
+        let [vec] = vec_fields.as_slice() else {
+            return Ok(None);
+        };
+        let Some((raw_vec, len)) = vec_real_aggregate_parts(vec) else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // The buffer value is the `RawVec` aggregate: its
+        // first field is the `RawVecInner` triple, whose
+        // first field is the one-field `NonNull` wrapper
+        // around the data pointer.
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &raw_vec
+        else {
+            return Ok(None);
+        };
+        let Some(Value::Enum {
+            fields: inner_fields,
+            ..
+        }) = buf_fields.first()
+        else {
+            return Ok(None);
+        };
+        let Some(Value::Enum {
+            fields: ptr_fields, ..
+        }) = inner_fields.first()
+        else {
+            return Ok(None);
+        };
+        if ptr_fields.len() != 1 {
+            return Ok(None);
+        }
+        let ptr = &ptr_fields[0];
+        if !matches!(ptr, Value::Ref(_)) {
+            return Ok(None);
+        }
+        let target = self.deref_value(frames, ptr)?;
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            let elem = self.read_seq_at(frames, &target, i)?;
+            // A byte stored through the buffer's union view
+            // keeps the union's one-field form; the region
+            // reads as the byte it holds, like every reader
+            // of such a region.
+            let elem = match &elem {
+                Value::Enum { variant: 0, fields } if fields.len() == 1 => &fields[0],
+                _ => &elem,
+            };
+            match elem {
+                Value::Uint(b) if *b <= 0xFF => bytes.push(*b as u8),
+                Value::Int(b) if (0..=255).contains(b) => bytes.push(*b as u8),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(bytes))
+    }
+
+    /// The bytes of an `OsString` value in any of the
+    /// model's shapes: the shapes the pure
+    /// [`os_string_bytes`] reads (the string form and the
+    /// element-list buffer form) first, then the real
+    /// aggregate form, whose buffer only the interpreter's
+    /// allocation store can read.
+    pub(super) fn os_string_bytes_any(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        if let Some(bytes) = os_string_bytes(value) {
+            return Ok(Some(bytes));
+        }
+        self.os_string_bytes_from_real_aggregate(frames, value)
+    }
+
+    /// The bytes of a `PathBuf` value in any of the model's
+    /// shapes: [`path_buf_bytes`] for the pure shapes, then
+    /// the real aggregate form of the `OsString` the
+    /// buffer's one field holds.
+    pub(super) fn path_buf_bytes_any(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        if let Some(bytes) = path_buf_bytes(value) {
+            return Ok(Some(bytes));
+        }
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        let [os_string] = fields.as_slice() else {
+            return Ok(None);
+        };
+        self.os_string_bytes_from_real_aggregate(frames, os_string)
+    }
+}
+
 /// The bytes of an `OsString` value, in either of the model's
 /// two shapes: the string form (the inner data is the string
 /// itself) and the buffer form (an `OsString` wrapping a `Buf`

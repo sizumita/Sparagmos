@@ -660,6 +660,25 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // An `OsString` denotes the bytes its buffer holds,
+        // in whichever of the model's shapes it is stored --
+        // the element form the pure `os_string_bytes` reads,
+        // or the real aggregate form
+        // `os_string_bytes_from_real_aggregate` reads through
+        // the buffer pointer (the shape `with_capacity` plus
+        // `push` builds, whose storage arrangement -- a fresh
+        // allocation per clone -- is not part of the value's
+        // identity): when both sides yield their OS-string
+        // bytes they compare as those bytes. A side that
+        // yields no bytes decides nothing, and the pair keeps
+        // the structural comparison below, exactly as the
+        // element-form loop above.
+        if let (Some(x), Some(y)) = (
+            self.os_string_bytes_any(frames, a.as_ref())?,
+            self.os_string_bytes_any(frames, b.as_ref())?,
+        ) {
+            return Ok(x == y);
+        }
         // A scalar in its byte form against the same scalar in
         // its integer form: the pointee of a CTFE-extracted
         // reference, above all, against the integer the same

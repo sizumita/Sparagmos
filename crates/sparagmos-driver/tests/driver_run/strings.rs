@@ -3929,3 +3929,89 @@ fn run_mode_str_window_longer_than_buffer_refused() {
         "the refusal is the string view's; stderr={stderr}"
     );
 }
+
+const OS_STRING_REAL_AGGREGATE_DEREF_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+
+fn main() {
+    // An `OsString` built by `with_capacity` plus `push` is
+    // stored in its real aggregate form (its bytes behind the
+    // buffer's raw pointer); dereferencing it to `&OsStr`
+    // reads the bytes through that buffer.
+    let mut s = OsString::with_capacity(16);
+    s.push("hello");
+    let r: &OsStr = &s;
+    println!("len={}", r.len());
+    println!("empty={}", s.is_empty());
+    let empty = OsString::with_capacity(4);
+    println!("len0={}", empty.len());
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_deref() {
+    run_ok(
+        "os-string-real-aggregate-deref",
+        OS_STRING_REAL_AGGREGATE_DEREF_SRC,
+        "len=5\nempty=false\nlen0=0\n",
+    );
+}
+
+const OS_STRING_REAL_AGGREGATE_EQ_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // The real aggregate form and the element form of the
+    // same bytes are the same `OsString`: equality reads the
+    // bytes each side's buffer holds, not the storage
+    // arrangement (a clone owns a fresh allocation).
+    let mut a = OsString::with_capacity(16);
+    a.push("same");
+    let b = OsString::from("same");
+    println!("eq={}", a == b);
+    println!("eq_self={}", a == a.clone());
+    let c = OsString::from("diff");
+    println!("ne={}", a != c);
+    let empty = OsString::with_capacity(4);
+    println!("eq_empty={}", empty == OsString::new());
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_equality() {
+    run_ok(
+        "os-string-real-aggregate-equality",
+        OS_STRING_REAL_AGGREGATE_EQ_SRC,
+        "eq=true\neq_self=true\nne=true\neq_empty=true\n",
+    );
+}
+
+const OS_STRING_REAL_AGGREGATE_FMT_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // `Debug` of the real aggregate form is the quoted
+    // content, and the value hands its bytes to the
+    // `PathBuf` conversion and the lossy conversion.
+    let mut a = OsString::with_capacity(16);
+    a.push("ab");
+    println!("{:?}", a);
+    println!("{}", a.to_string_lossy());
+    let p = PathBuf::from(a);
+    println!("{:?}", p);
+    println!("{}", p.display());
+    let r: &Path = &p;
+    println!("{:?}", r);
+    println!("eq={}", p == PathBuf::from("ab"));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
+    run_ok(
+        "os-string-real-aggregate-fmt",
+        OS_STRING_REAL_AGGREGATE_FMT_SRC,
+        "\"ab\"\nab\n\"ab\"\nab\n\"ab\"\neq=true\n",
+    );
+}
