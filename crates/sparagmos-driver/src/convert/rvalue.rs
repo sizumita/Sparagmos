@@ -143,7 +143,10 @@ impl Converter {
     /// argument list (see `sm::Constant::generic_type_ids`):
     /// the compiler's generic arguments still spell the regions
     /// conversion erases, so the segments are computed from
-    /// them directly, one per type argument, in order.
+    /// them directly, one per type argument, in order. A type
+    /// argument Stable MIR cannot spell (a coroutine-closure
+    /// type) voids the whole list rather than shifting the
+    /// indices of the arguments after it.
     fn constant_fn_type_ids(
         &mut self,
         c: &mir::ConstOperand,
@@ -152,17 +155,14 @@ impl Converter {
         let TyKind::RigidTy(RigidTy::FnDef(_, args)) = kind else {
             return None;
         };
-        Some(
-            args.0
-                .iter()
-                .filter_map(|a| match a {
-                    GenericArgKind::Type(t) => Some(type_id_segments(t)),
-                    GenericArgKind::Const(_) | GenericArgKind::Lifetime(_) => {
-                        None
-                    }
-                })
-                .collect(),
-        )
+        let mut ids = Vec::new();
+        for a in &args.0 {
+            match a {
+                GenericArgKind::Type(t) => ids.push(type_id_segments(t)?),
+                GenericArgKind::Const(_) | GenericArgKind::Lifetime(_) => {}
+            }
+        }
+        Some(ids)
     }
 
     pub(crate) fn constant(&mut self, c: &mir::ConstOperand) -> sm::Constant {

@@ -72,7 +72,7 @@ pub struct MirProgram {
     /// `TypeId` segments) triple it denotes.
     /// Converted into the interpreter's table (see
     /// `ir::Program::vtable_identities`).
-    pub vtable_identities: HashMap<u64, (mir::Ty, Vec<String>, (u64, u64))>,
+    pub vtable_identities: HashMap<u64, (mir::Ty, Vec<String>, Option<(u64, u64)>)>,
     /// Per-variant field byte layouts of the monomorphic ADT
     /// instances in the program, as recorded by the driver
     /// (see [`mir::AdtFieldLayouts`]). Consulted by the

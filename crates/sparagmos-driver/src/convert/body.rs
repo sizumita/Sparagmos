@@ -1020,7 +1020,7 @@ impl Converter {
         ) {
             return None;
         }
-        Some(type_id_segments(&concrete))
+        type_id_segments(&concrete)
     }
 
     /// The source line of one block's terminator. A call is

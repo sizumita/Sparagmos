@@ -2503,8 +2503,12 @@ pub struct VTableIdentity {
     /// The concrete type's `TypeId` segments, as the driver
     /// computed them from the compiler's spelling of the type:
     /// a trait object recovered through this identity carries
-    /// them, so its `dyn Any` downcasts compare exactly.
-    pub type_id: (u64, u64),
+    /// them, so its `dyn Any` downcasts compare exactly. `None`
+    /// when the concrete type cannot be spelled at all (a
+    /// coroutine-closure type, which Stable MIR cannot render):
+    /// recovered objects then carry no segments and their
+    /// downcasts fall back to tag comparison.
+    pub type_id: Option<(u64, u64)>,
 }
 
 /// A whole program: a set of named function bodies in one module.

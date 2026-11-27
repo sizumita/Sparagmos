@@ -317,7 +317,7 @@ impl Converter {
                 // value itself; a pointer field pointing at it (the
                 // value's own first segment) denotes the segment's
                 // bits.
-                let (lo, hi) = type_id_segments(&tid_ty);
+                let (lo, hi) = type_id_segments(&tid_ty)?;
                 if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
                     return Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Adt {
                         variant: 0,
@@ -620,7 +620,7 @@ impl Converter {
             base: Box::new(base),
             concrete: self.ty(&concrete_ty),
             traits,
-            type_id: Some(type_id_segments(&concrete_ty)),
+            type_id: type_id_segments(&concrete_ty),
         })
     }
 

@@ -1716,7 +1716,7 @@ impl Converter {
                 self.fn_pointer_value(&inst)
             }
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::TypeId { ty: tid_ty }) => {
-                let (lo, _) = type_id_segments(&tid_ty);
+                let (lo, _) = type_id_segments(&tid_ty)?;
                 Some(sm::ConstValue::IntPtr(lo))
             }
             ResolvedAlloc::Other(mir::alloc::GlobalAlloc::VTable(vty, trait_ref)) => {

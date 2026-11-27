@@ -1341,7 +1341,7 @@ impl<'a> Interpreter<'a> {
             concrete: identity.concrete.clone(),
             traits: identity.traits.clone(),
             drop_glue: identity.glue.clone().map(Box::new),
-            type_id: Some(identity.type_id),
+            type_id: identity.type_id,
         })
     }
 
