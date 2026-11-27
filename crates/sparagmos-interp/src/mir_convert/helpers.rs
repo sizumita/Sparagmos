@@ -1066,6 +1066,74 @@ fn canonical_self_matches(key: &str, query: &str) -> bool {
     }
 }
 
+/// Whether an impl key's `Self` section denotes `self_name`
+/// once the regions in the key's spelling are erased: the
+/// fallback for a receiver whose rendered concrete type
+/// dropped every region (see `erase_regions`). The
+/// comparison is the canonical one (see
+/// `canonical_self_matches`) between the key's erased
+/// canonical spelling and the queried name's canonical
+/// spelling, with one structural exclusion: a key whose
+/// canonical `Self` spelling carries a binder (a
+/// `for<'a> fn(&'a u8)` argument) never matches by
+/// erasure. The higher-ranked impl's binder survives in
+/// its key, while an erased spelling has no binder to
+/// offer, so the erased form cannot select it: among the
+/// region variants of one erased shape, only the
+/// binderless keys take part, and the scans' uniqueness
+/// contract keeps the call unresolved when more than one
+/// of them remains. Mirrors the copy of the same name in
+/// `interp::call::lookup`.
+pub(super) fn impl_self_matches_erased(self_part: &str, self_name: &str) -> bool {
+    let key = normalize_impl_self(self_part);
+    if key.contains("for<") {
+        return false;
+    }
+    canonical_self_matches(&erase_regions(&key), &normalize_impl_self(self_name))
+}
+
+/// The spelling of a type with every lifetime token
+/// removed: `'static`, `'a`, `'_` and the like, together
+/// with the one space that follows the token in a
+/// reference (`&'static u8` renders as `&u8`, `&'a mut u8`
+/// as `&mut u8`). This is the erasure a rendered concrete
+/// type applies to regions in the positions the canonical
+/// spelling keeps -- inside a function pointer's
+/// signature above all, where the instance key spells
+/// `fn(&'static u8)` and the fat pointer's concrete tag
+/// spells `fn(&u8)`. A quote that does not start a
+/// lifetime (a character constant's closing quote, an
+/// escape) is left as it stands. Mirrors the copy of the same name in
+/// `interp::call::lookup`.
+pub(super) fn erase_regions(spelling: &str) -> String {
+    let chars: Vec<char> = spelling.chars().collect();
+    let mut out = String::with_capacity(spelling.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+            {
+                j += 1;
+            }
+            // A lifetime token is a non-empty identifier not
+            // closed by a second quote (a character constant
+            // such as `'a'` keeps both of its quotes).
+            if j > i + 1 && chars.get(j) != Some(&'\'') {
+                i = j;
+                if chars.get(i) == Some(&' ') {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Whether a canonical argument is a generic definition's
 /// parameter name standing alone: a single identifier that
 /// does not name a primitive type.
