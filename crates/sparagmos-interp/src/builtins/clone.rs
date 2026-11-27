@@ -11,6 +11,31 @@ use crate::value::{RefProj, RefTarget, Value};
 
 use super::*;
 
+
+/// The modelled form a real-aggregate vector's translation
+/// takes, normalised for cloning: a sparse value whose
+/// elements are all materialised becomes the element-list
+/// aggregate. A clone's storage is a fresh allocation of
+/// exactly the declared length (the discipline the sparse
+/// arm of the `Vec` clone in `clone_modelled_value`
+/// states), so the spare capacity the source's aggregate
+/// recorded does not carry into the clone -- and the
+/// element-list form is the one the string accessors read
+/// when the vector is a string's buffer, where the sparse
+/// form's capacity accounting would leave the cloned
+/// string's bytes unreadable to them.
+fn clone_modelled_vec_form(value: Value) -> Value {
+    match value {
+        Value::SparseVec { elems, len, .. } if elems.len() as u128 == len => {
+            Value::Enum {
+                variant: 0,
+                fields: elems,
+            }
+        }
+        other => other,
+    }
+}
+
 impl<'a> Interpreter<'a> {
     /// `Iterator::next`: mutate the iterator in place through the
     /// `&mut` argument and return the `Option` value.
@@ -166,6 +191,26 @@ impl<'a> Interpreter<'a> {
                 // likewise, so the elements go through the
                 // same owned clone (a `Vec<Box<T>>` clone
                 // must not alias the source's boxes).
+                //
+                // A `Vec` value in its real-aggregate form
+                // (the `RawVec` + length pair, as above) does
+                // not hold its elements as fields, so it is
+                // translated to the modelled element form
+                // before the element-wise clone below; a value
+                // the translation cannot read keeps the plain
+                // copy the fall-through below gives it.
+                let value = if (self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<"))
+                    && vec_real_aggregate_parts(&value).is_some()
+                {
+                    match self.vec_from_real_form(frames.as_slice(), &value) {
+                        Some(Ok(modelled)) => clone_modelled_vec_form(modelled),
+                        Some(Err(e)) => return Err(e),
+                        None => value,
+                    }
+                } else {
+                    value
+                };
                 let value = if self_ty.starts_with("std::vec::Vec<")
                     || self_ty.starts_with("alloc::vec::Vec<")
                 {
@@ -821,6 +866,40 @@ impl<'a> Interpreter<'a> {
             .or_else(|| generic_first_arg(ty, "alloc::vec::Vec<"))
             .or_else(|| slice_pointee_elem_tag(ty))
         {
+            // A vector in its real-aggregate form (the
+            // `RawVec` + length pair a converted constructor
+            // leaves -- the buffer inside an `OsString` built
+            // by `with_capacity` + `push` takes this form)
+            // does not hold its elements as fields: the match
+            // below would clone the `RawVec` as an element,
+            // and the shape-only owned clone reads the
+            // buffer's `NonNull` as a built box, keeping only
+            // the first element's bytes. Translate the value
+            // to the modelled element form first (the
+            // translation the collection builtins share) and
+            // clone that under the same tag; a value the
+            // translation cannot read keeps the plain copy a
+            // direct clone of the same value receives, never
+            // the element treatment.
+            if vec_real_aggregate_parts(value).is_some() {
+                return match self.vec_from_real_form(frames, value) {
+                    Some(Ok(modelled)) => {
+                        let modelled = clone_modelled_vec_form(modelled);
+                        match self.clone_typed_aggregate(
+                            frames,
+                            &modelled,
+                            None,
+                            ty,
+                            glue,
+                        )? {
+                            Some(cloned) => Ok(Some(cloned)),
+                            None => Ok(Some(modelled)),
+                        }
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Ok(Some(value.clone())),
+                };
+            }
             let elem_glue = glue.and_then(|g| g.elem_plan());
             match value {
                 Value::Enum { variant, fields } => {

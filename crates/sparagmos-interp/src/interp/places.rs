@@ -489,7 +489,7 @@ impl<'a> Interpreter<'a> {
                     fat_anchor = None;
                     let idx = self.read_index_local(frames, body, *local, place)?;
                     let via_fat = fat_cap.is_some_and(|cap| {
-                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
+                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_ty.as_ref(), fat_elem_string)
                     });
                     if let Some(cap) = fat_cap {
                         if idx as u128 >= cap {
@@ -595,7 +595,7 @@ impl<'a> Interpreter<'a> {
                         },
                     };
                     let via_fat = fat_cap.is_some_and(|cap| {
-                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
+                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_ty.as_ref(), fat_elem_string)
                     });
                     fat_cap = None;
                     fat_elem_string = None;
@@ -2379,6 +2379,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         cur: &Resolved,
         fat_len: u128,
+        elem_ty: Option<&Ty>,
         _elem_string: Option<bool>,
     ) -> bool {
         // A position that ends at one element of a container,
@@ -2423,10 +2424,42 @@ impl<'a> Interpreter<'a> {
             // storage element count, and judging by it appended a
             // second index step that read into the element.
             Ok(value) => {
-                matches!(
-                    &*value,
-                    Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
-                ) && value.len() == Some(fat_len)
+                // An ADT value at a position that ends at an
+                // element is one *element* of the slice, not
+                // the slice's storage, on the same grounds as
+                // the fat-pointer and string elements above:
+                // its `len()` is its field count, which can
+                // coincide with the slice's length (an
+                // `OsString`'s single field against a
+                // one-element drain slice), and judging storage
+                // by it appended a second index step that read
+                // the element's first field as the slice's
+                // first element. The slice's element type
+                // decides: a value matching that ADT's recorded
+                // shape is an element of the slice. A vector
+                // value in any of its forms is exempt: it is a
+                // storage aggregate (its elements are the
+                // slice's), not an ADT element, and keeps the
+                // count judgment below.
+                let projection: &[RefProj] = match cur {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection,
+                };
+                let adt_element = matches!(&*value, Value::Enum { .. })
+                    && crate::builtins::vec_real_aggregate_parts(&value).is_none()
+                    && projection_ends_at_element(projection)
+                    && elem_ty.is_some_and(|ty| {
+                        matches!(ty, Ty::Adt(_))
+                            && value_matches_adt_shape(self.program(), &value, ty, 0)
+                    });
+                !adt_element
+                    && matches!(
+                        &*value,
+                        Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
+                    )
+                    && value.len() == Some(fat_len)
             }
             Err(_) => false,
         }
@@ -2819,6 +2852,93 @@ pub(crate) fn projection_is_base(projection: &[RefProj]) -> bool {
     projection
         .iter()
         .all(|s| matches!(s, RefProj::Index(0) | RefProj::ByteOffset(0)))
+}
+
+/// Whether `value` is a stored instance of the ADT type
+/// `ty`: its variant and field count match the shape the
+/// program records for the ADT, and every field is itself in
+/// a form the field's declared skeleton accepts -- a field
+/// declared as a vector accepts any of the model's vector
+/// forms (the element list, the sparse form, the real
+/// aggregate), since the declared field aggregate (buffer +
+/// length) is not the form the model stores. A shape the
+/// tables do not record, or a nesting past the depth cap,
+/// judges the value no instance: the caller's shape-only
+/// judgment then stands.
+pub(crate) fn value_matches_adt_shape(
+    program: &Program,
+    value: &Value,
+    ty: &Ty,
+    depth: usize,
+) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    let Ty::Adt(name) = ty else { return false };
+    if is_vec_adt_ty(ty) {
+        return matches!(
+            value,
+            Value::Enum { .. } | Value::SparseVec { .. }
+        );
+    }
+    let Value::Enum { variant, fields } = value else {
+        return false;
+    };
+    let Some(declared) = program
+        .adt_field_tys
+        .get(name)
+        .and_then(|variants| variants.get(*variant as usize))
+    else {
+        return false;
+    };
+    fields.len() == declared.len()
+        && fields
+            .iter()
+            .zip(declared.iter())
+            .all(|(field, field_ty)| match field_ty {
+                // A field whose declared type the table could
+                // not track cannot be judged against the value.
+                None => true,
+                Some(field_ty) => {
+                    value_matches_ty_shape(program, field, field_ty, depth + 1)
+                }
+            })
+}
+
+/// The field-level form of [`value_matches_adt_shape`]: a
+/// stored field against its declared skeleton type.
+fn value_matches_ty_shape(
+    program: &Program,
+    value: &Value,
+    ty: &Ty,
+    depth: usize,
+) -> bool {
+    match (ty, value) {
+        (Ty::Adt(_), _) => value_matches_adt_shape(program, value, ty, depth),
+        (Ty::Uint(_), Value::Uint(_))
+        | (Ty::Int(_), Value::Int(_))
+        | (Ty::Bool, Value::Bool(_))
+        | (Ty::Float(_), Value::Float(_) | Value::Float128(_))
+        | (Ty::Unit, Value::Unit) => true,
+        (Ty::Str, Value::Str(_) | Value::Bytes(_)) => true,
+        (
+            Ty::Ref(_),
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. },
+        ) => true,
+        (Ty::Tuple(ts), Value::Tuple(items)) => {
+            items.len() == ts.len()
+                && items.iter().zip(ts.iter()).all(|(item, t)| {
+                    value_matches_ty_shape(program, item, t, depth + 1)
+                })
+        }
+        (Ty::Array(elem, n), Value::Tuple(items)) => {
+            items.len() as u64 == *n
+                && items
+                    .iter()
+                    .all(|item| value_matches_ty_shape(program, item, elem, depth + 1))
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn projection_ends_at_element(projection: &[RefProj]) -> bool {

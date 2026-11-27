@@ -1475,3 +1475,30 @@ fn run_mode_path_absolute() {
         "equal: true\nalready: /already/abs\ndotted equal: true\n",
     );
 }
+
+
+const PATH_BUF_REAL_AGGREGATE_CLONE_SRC: &str = r#"
+use std::path::PathBuf;
+
+fn main() {
+    let mut pb = PathBuf::with_capacity(16);
+    pb.push("banana");
+    let c = pb.clone();
+    println!("clone={:?}", c);
+}
+"#;
+
+#[test]
+fn run_mode_path_buf_real_aggregate_clone() {
+    // A `PathBuf` built by `with_capacity` + `push` holds its
+    // `OsString` in the real-aggregate form, as an `OsString`
+    // built the same way does: its clone goes through the
+    // same real-form translation (see the `OsString` clone
+    // case in the strings family). The expected text is
+    // native output.
+    run_ok(
+        "pathbuf-real-agg-clone",
+        PATH_BUF_REAL_AGGREGATE_CLONE_SRC,
+        "clone=\"banana\"\n",
+    );
+}

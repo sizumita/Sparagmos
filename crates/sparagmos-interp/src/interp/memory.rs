@@ -1977,7 +1977,7 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     if ends_at_element
-                        && !self.deref_denotes_storage(frames, &resolved, len, elem_string)
+                        && !self.deref_denotes_storage(frames, &resolved, len, elem_ty, elem_string)
                     {
                         Ok(*base)
                     } else {

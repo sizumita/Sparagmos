@@ -5290,3 +5290,86 @@ fn run_mode_string_join_as_ref_views() {
         "joined=foo/bar/baz len=11\nbytes=[102, 111, 111, 47, 98, 97, 114, 47, 98, 97, 122]\n",
     );
 }
+
+
+const OS_STRING_REAL_AGGREGATE_CLONE_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg() -> OsString {
+    let mut o = OsString::with_capacity(16);
+    o.push("banana");
+    o
+}
+
+fn main() {
+    let v: Vec<OsString> = vec![agg()];
+    let c = v.clone();
+    println!("clone={:?}", c);
+    let boxed: Vec<Box<std::ffi::OsStr>> =
+        c.into_iter().map(|o| o.into_boxed_os_str()).collect();
+    println!("clone-box={:?}", boxed);
+    let both: Vec<OsString> = vec![OsString::from("pear"), agg()];
+    let bc = both.clone();
+    println!("mixed-clone={:?}", bc);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_clone() {
+    // An `OsString` built by `with_capacity` + `push` is in
+    // its real-aggregate form (the buffer's `Vec` is a
+    // `RawVec` + length pair, not an element list): cloning a
+    // vector of them treated that pair as elements, and the
+    // shape-only clone read the buffer's `NonNull` as a built
+    // box, so the clone kept only the first byte
+    // ("b\0\0\0\0\0"). The clone now translates the real
+    // form to the modelled element form first. The expected
+    // text is native output.
+    run_ok(
+        "os-string-real-agg-clone",
+        OS_STRING_REAL_AGGREGATE_CLONE_SRC,
+        "clone=[\"banana\"]\nclone-box=[\"banana\"]\nmixed-clone=[\"pear\", \"banana\"]\n",
+    );
+}
+
+const OS_STRING_REAL_AGGREGATE_DRAIN_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn agg() -> OsString {
+    let mut o = OsString::with_capacity(16);
+    o.push("banana");
+    o
+}
+
+fn main() {
+    let mut v: Vec<OsString> = vec![agg()];
+    let mut d = v.drain(..);
+    let item = d.next().unwrap();
+    println!("len={}", item.len());
+    println!("boxed={:?}", item.into_boxed_os_str());
+    drop(d);
+    let mut v2: Vec<OsString> = vec![agg(), OsString::from("pear")];
+    let drained: Vec<OsString> = v2.drain(..).collect();
+    println!("drained={:?}", drained);
+    println!("rest={:?}", v2);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_real_aggregate_drain() {
+    // The converted `Vec::drain` construction builds its
+    // iterator state over the vector's first-element pointer;
+    // taking that pointer of the range slice (itself a
+    // first-element pointer) appended a second index step, so
+    // the drain's element read projected into the element
+    // value and yielded its first field (the `Buf`) in place
+    // of the `OsString` -- consumers then refused the ADT
+    // value. The first-element judgment now keeps an ADT
+    // element at an element position as an element. The
+    // expected text is native output.
+    run_ok(
+        "os-string-real-agg-drain",
+        OS_STRING_REAL_AGGREGATE_DRAIN_SRC,
+        "len=6\nboxed=\"banana\"\ndrained=[\"banana\", \"pear\"]\nrest=[]\n",
+    );
+}
