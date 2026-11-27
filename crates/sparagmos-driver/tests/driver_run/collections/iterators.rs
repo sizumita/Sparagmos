@@ -1466,3 +1466,31 @@ fn run_mode_peekable_owned_consumers() {
         "stdout={stdout}"
     );
 }
+
+const COLLECT_PAIRS_ANY_SRC: &str = r#"
+fn main() {
+    let all: Vec<(String, String)> = (0..17)
+        .map(|i| (format!("k{i}"), format!("v{i}")))
+        .collect();
+    println!("any-last {}", all.iter().any(|(k, _v)| k == "k16"));
+    println!("any-none {}", all.iter().any(|(k, _v)| k == "nope"));
+    println!("count {}", all.iter().count());
+}
+"#;
+
+#[test]
+fn run_mode_collect_pairs_iter_any_full_scan() {
+    // A full-scan `any` over a collect-built vector of pairs:
+    // the scan drives the borrowed iteration to the end
+    // position and through the closure's string comparisons
+    // on every element, and has to find the last element and
+    // report a miss correctly. (The collect-built vector is
+    // stored as a field sequence, so its iteration keeps the
+    // element snapshot; the shape pins that the scan over it
+    // stays exact.)
+    run_ok(
+        "collect-pairs-any",
+        COLLECT_PAIRS_ANY_SRC,
+        "any-last true\nany-none false\ncount 17\n",
+    );
+}
