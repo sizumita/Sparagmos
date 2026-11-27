@@ -22,6 +22,22 @@
 //!   recorded under the impl-block path form
 //!   (`...::<impl Trait for Self>::method`); the scan must
 //!   parse that form and match its `Self` section.
+//! * An impl whose `Self` is a reference type keeps the
+//!   reference's lifetime in the instance key
+//!   (`<&'a isize as Trait>::get`), while the fat pointer's
+//!   concrete tag drops it (`&isize`); the impl scan's
+//!   canonical spelling must drop reference lifetimes too,
+//!   without equating two different reference pointees
+//!   (tests/ui/regions/regions-close-over-type-parameter-
+//!   successfully.rs).
+//! * A `final` trait method is not in the vtable: the
+//!   compiler resolves a call through the trait object to
+//!   the trait's own body with `Self` set to the trait
+//!   object type, and that body is stored under the
+//!   callee's plain name with a trait-object receiver. The
+//!   virtual lookup must decline such a call so the direct
+//!   path runs that body with the fat pointer as receiver
+//!   (tests/ui/traits/final/dyn-compat.rs).
 //! * A closure `Self` is spelled with the compiler's span
 //!   form (`{closure@<file>:16:17: 16:23}`) in the impl
 //!   instance key but with the definition path's indexed
@@ -285,5 +301,81 @@ fn run_mode_guest_declared_vtable_intrinsics_override_fallback() {
     // in the vtable -- the concrete type's layout.
     let dir = temp_dir("vtable-intrinsic");
     let src = fixture(&dir, "vtintr.rs", VTABLE_INTRINSIC_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const REF_SELF_DYN_SRC: &str = r#"
+trait Get { fn get(&self) -> isize; }
+impl<'a> Get for &'a isize {
+    fn get(&self) -> isize { **self }
+}
+impl<'a> Get for &'a str {
+    fn get(&self) -> isize { self.len() as isize }
+}
+fn make_object<'a, A: Get + 'a>(v: A) -> Box<dyn Get + 'a> {
+    Box::new(v) as Box<dyn Get + 'a>
+}
+fn main() {
+    let i: isize = 22;
+    let obj = make_object(&i);
+    assert_eq!(obj.get(), 22);
+    let s: &str = "abcd";
+    let obj2 = make_object(s);
+    assert_eq!(obj2.get(), 4);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_call_on_reference_self_impl() {
+    // The impl instance key spells the `Self` type with its
+    // lifetime (`<&'a isize as Get>::get`); the fat pointer's
+    // concrete tag drops it (`&isize`). The two reference
+    // impls must still dispatch to their own bodies.
+    let dir = temp_dir("dyn-ref-self");
+    let src = fixture(&dir, "main.rs", REF_SELF_DYN_SRC);
+    assert_ok(&run_driver(&src));
+}
+
+const FINAL_DYN_SRC: &str = r#"
+#![feature(final_associated_functions)]
+trait FinalGeneric {
+    final fn generic<T>(&self, _value: T) {}
+}
+trait FinalSelfReturn {
+    final fn self_return(&self) -> &Self { self }
+}
+trait Val {
+    fn val(&self) -> i32;
+    final fn doubled(&self) -> i32 { self.val() * 2 }
+}
+struct S;
+impl FinalGeneric for S {}
+impl FinalSelfReturn for S {}
+impl Val for S {
+    fn val(&self) -> i32 { 21 }
+}
+fn main() {
+    let s = S;
+    let obj_generic: &dyn FinalGeneric = &s;
+    obj_generic.generic(1u8);
+    let obj_return: &dyn FinalSelfReturn = &s;
+    let _ = obj_return.self_return();
+    let obj_val: &dyn Val = &s;
+    assert_eq!(obj_val.doubled(), 42);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn dyn_call_final_trait_method() {
+    // A `final` method has no vtable slot: the call through
+    // the trait object names the trait's own body at
+    // `Self = dyn Trait`, stored under the plain trait name
+    // with a trait-object receiver. It must run directly --
+    // including a nested virtual call on `self` from inside
+    // the final body (`doubled` reaching `val`).
+    let dir = temp_dir("dyn-final-method");
+    let src = fixture(&dir, "main.rs", FINAL_DYN_SRC);
     assert_ok(&run_driver(&src));
 }

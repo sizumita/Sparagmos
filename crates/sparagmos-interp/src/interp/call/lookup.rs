@@ -668,12 +668,39 @@ pub(super) fn impl_self_matches(self_part: &str, name: &str) -> bool {
         == name.rsplit("::").next().unwrap_or(name)
 }
 
+/// A type spelling with the lifetime of every reference in
+/// it removed (`&'a isize` -> `&isize`, `&'a mut isize` ->
+/// `&mut isize`): rendered type names drop reference
+/// lifetimes entirely, while instance keys keep them, so
+/// the two sides of an impl-`Self` comparison legitimately
+/// differ in exactly this part. Lifetimes in other
+/// positions (generic arguments) are not touched here;
+/// `normalize_impl_self`'s list processing handles those.
+fn strip_reference_lifetimes(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '&' && chars.peek() == Some(&'\'') {
+            // Drop the lifetime token and the space after it.
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n == ' ' {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The spelling of an impl `Self` type (or of a queried
 /// concrete type) with the parts the two sides legitimately
 /// differ in removed, so spellings of one type compare
 /// equal: lifetime arguments (`'_`, `'static`, named
-/// lifetimes), which rendered type names drop and instance
-/// keys keep, and the defaulted allocator argument
+/// lifetimes) and reference lifetimes (`&'a isize`), which
+/// rendered type names drop and instance keys keep, and
+/// the defaulted allocator argument
 /// (`std::alloc::Global`), which rendered names spell out
 /// and instance keys elide. Argument lists are processed at
 /// every nesting level; a list emptied by the removals is
@@ -683,7 +710,7 @@ pub(super) fn impl_self_matches(self_part: &str, name: &str) -> bool {
 /// canonicalised to the item's path (see `fn_item_spelling`),
 /// which the two sides spell differently.
 pub(super) fn normalize_impl_self(name: &str) -> String {
-    let name = &fn_item_spelling(name);
+    let name = &strip_reference_lifetimes(&fn_item_spelling(name));
     fn list(chars: &[char], start: usize) -> (String, usize) {
         // `chars[start]` is '<': render the argument list
         // (possibly to nothing) and return the index just
