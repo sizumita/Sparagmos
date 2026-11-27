@@ -1285,31 +1285,32 @@ fn main() {
 
 
 #[test]
-fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
-    // Converting a `become` (explicit tail call) makes rustc_public
-    // panic (`unimplemented!()` in Stable MIR's terminator
-    // conversion). The driver contains that panic at the compiler
-    // boundary and skips the body with the named tail-call reason,
-    // so conversion completes; the call in `main` then reports the
-    // unconverted body under the usual run-mode contract — exit 2 —
-    // instead of the whole run dying with the panic (exit 101 and
-    // a default panic dump on stderr).
+fn run_mode_tail_call_body_is_converted_and_call_executes() {
+    // Converting a `become` (explicit tail call) makes the Stable
+    // MIR fetch itself panic (`unimplemented!()` in rustc_public's
+    // terminator conversion). The driver contains that panic at
+    // the compiler boundary and materializes the body through the
+    // compiler's internal MIR instead, rewriting the tail call as
+    // the call into the return place plus a return (Issue #384),
+    // so conversion completes and the call in `main` executes the
+    // native computation: `countdown(3)` runs to completion and
+    // the run exits 0, instead of the call reporting an
+    // unconverted body (exit 2) or the whole run dying with the
+    // panic (exit 101 and a default panic dump on stderr). (The
+    // value a rewritten tail call computes is pinned by the
+    // driver_tail_call run fixture.)
     let dir = temp_dir("tailcall");
     let src = fixture(&dir, "tailcall.rs", TAIL_CALL_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "calling an unconverted body is unsupported (exit 2), not a process panic; stderr={stderr}"
+        Some(0),
+        "the converted tail-call body executes to completion (exit 0); stderr={stderr}"
     );
     assert!(
-        stderr.contains("no converted body"),
-        "the reason names the unconverted body: {stderr}"
-    );
-    assert!(
-        stderr.contains("tailcall::countdown"),
-        "the reason names the skipped function: {stderr}"
+        !stderr.contains("no converted body"),
+        "the body is converted, not reported unconverted: {stderr}"
     );
     assert!(
         !stderr.contains("panicked"),
@@ -1317,7 +1318,7 @@ fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
     );
     assert!(
         !stderr.contains("RUST_BACKTRACE"),
-        "the default panic dump is suppressed, the message is reported as the reason: {stderr}"
+        "the default panic dump is suppressed: {stderr}"
     );
     assert!(
         out.stdout.is_empty(),
