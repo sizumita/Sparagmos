@@ -413,6 +413,41 @@ pub enum Builtin {
     /// operation code the host function dispatches on (see
     /// `host_str_op`).
     StrOp(u8),
+    /// `std::time::Instant::now()`: the host monotonic clock,
+    /// served as the (seconds, nanoseconds) pair the value's
+    /// layout holds, exactly the pair the interpreter's
+    /// `InstantNow` builtin stores.
+    InstantNow,
+    /// `std::time::SystemTime::now()`: the host wall clock, as
+    /// for `InstantNow` (the interpreter's `SystemTimeNow`).
+    SystemTimeNow,
+    /// `std::mem::size_of::<T>()`: the byte size of `T`, a
+    /// compile-time constant the front end computes from the
+    /// type's layout (the interpreter's `MemSizeOf`).
+    MemSizeOf,
+    /// `std::mem::align_of::<T>()`: as `MemSizeOf`, for the
+    /// alignment.
+    MemAlignOf,
+    /// `ToString::to_string(&value)`: the receiver's `Display`
+    /// text as a fresh `String`, for the receiver shapes the
+    /// front end models (a `str` / `String` receiver is its own
+    /// text; a scalar receiver is formatted by the host, whose
+    /// `Display` impls are the very code the guest's std ships).
+    ToStringToString,
+    /// `Box::<T>::new(value)`: move the value into a fresh host
+    /// allocation and return its pointer (the interpreter's
+    /// `BoxNew`). The allocation is registered with the context
+    /// (see `host_box_alloc`), so the guest's drop path frees
+    /// the allocation's start, not the slot-model base.
+    BoxNew,
+    /// `Option::<T>::unwrap(option)`: the `Some` payload, or the
+    /// `called \`Option::unwrap()\` on a \`None\` value` panic
+    /// (the interpreter's `OptionUnwrap`).
+    OptionUnwrap,
+    /// `std::option::unwrap_failed()`: raise the `Option::unwrap`
+    /// panic message (the sink a converted `Option::unwrap` body
+    /// calls on `None`; the interpreter's `OptionUnwrapFailed`).
+    OptionUnwrapFailed,
 }
 
 /// Look a canonical callee name up in the registry.
@@ -499,6 +534,24 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
+        "std::time::Instant::now" => Builtin::InstantNow,
+        "std::time::SystemTime::now" => Builtin::SystemTimeNow,
+        "std::mem::size_of" | "core::mem::size_of" | "std::intrinsics::size_of"
+        | "core::intrinsics::size_of" => Builtin::MemSizeOf,
+        "std::mem::align_of" | "core::mem::align_of" | "std::intrinsics::align_of"
+        | "core::intrinsics::align_of" => Builtin::MemAlignOf,
+        "std::string::ToString::to_string" | "alloc::string::ToString::to_string" => {
+            Builtin::ToStringToString
+        }
+        "std::option::unwrap_failed" | "core::option::unwrap_failed" => {
+            Builtin::OptionUnwrapFailed
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::unwrap") => {
+            Builtin::OptionUnwrap
+        }
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
+            Builtin::BoxNew
+        }
         _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
             Builtin::RangeInclusiveNew
         }
@@ -747,6 +800,12 @@ pub struct BuiltinCtx {
     descriptors: Vec<FmtDescriptor>,
     strings: Vec<String>,
     store: Vec<StoreEntry>,
+    /// Allocations a `Box::new` builtin call produced, as
+    /// (slot-model base, allocation start, size, align): the
+    /// guest's drop path hands `__rust_dealloc` the base it
+    /// knows, and the host layer translates it back to the
+    /// allocation's start here.
+    box_allocs: Vec<(i64, i64, usize, usize)>,
     stdout: String,
     stderr: String,
     panic_flag: *mut u64,
@@ -759,6 +818,7 @@ impl BuiltinCtx {
             descriptors: tables.descriptors,
             strings: tables.strings,
             store: Vec::new(),
+            box_allocs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
             panic_flag: std::ptr::null_mut(),
@@ -777,6 +837,15 @@ impl BuiltinCtx {
     /// Clear the store and the captured output (a fresh run).
     pub fn reset(&mut self) {
         self.store.clear();
+        // Free any box allocations a previous run leaked (its
+        // guest code never dropped them) before forgetting them.
+        for (_, start, size, align) in std::mem::take(&mut self.box_allocs) {
+            if let Some(layout) = guest_layout(size as i64, align as i64) {
+                // Safety: the entry names a live allocation of
+                // exactly this layout, produced by `host_box_alloc`.
+                unsafe { std::alloc::dealloc(start as *mut u8, layout) };
+            }
+        }
         self.stdout.clear();
         self.stderr.clear();
     }
@@ -913,6 +982,16 @@ pub const HOST_PANIC_STR: u32 = 27;
 pub const HOST_PANIC_FMT: u32 = 28;
 /// Host table index of [`host_panic_assert_failed`].
 pub const HOST_PANIC_ASSERT_FAILED: u32 = 29;
+/// Host table index of [`host_instant_now`].
+pub const HOST_INSTANT_NOW: u32 = 30;
+/// Host table index of [`host_system_time_now`].
+pub const HOST_SYSTEM_TIME_NOW: u32 = 31;
+/// Host table index of [`host_box_alloc`].
+pub const HOST_BOX_ALLOC: u32 = 32;
+/// Host table index of [`host_to_string_scalar`].
+pub const HOST_TO_STRING_SCALAR: u32 = 33;
+/// Host table index of [`host_panic_fixed`].
+pub const HOST_PANIC_FIXED: u32 = 34;
 
 /// The host function table, in [`HOST_*`] index order. The program
 /// layer copies these addresses into the backend's program context.
@@ -948,6 +1027,11 @@ pub fn host_fns() -> Vec<usize> {
         host_panic_str as usize,
         host_panic_fmt as usize,
         host_panic_assert_failed as usize,
+        host_instant_now as usize,
+        host_system_time_now as usize,
+        host_box_alloc as usize,
+        host_to_string_scalar as usize,
+        host_panic_fixed as usize,
     ]
 }
 
@@ -1219,13 +1303,30 @@ extern "C" fn host_rust_alloc_zeroed(
 /// program, but the guard keeps the model total). Arguments:
 /// (pointer, size, align, _, _).
 extern "C" fn host_rust_dealloc(
-    _ctx: *mut BuiltinCtx,
+    ctx: *mut BuiltinCtx,
     ptr: i64,
     size: i64,
     align: i64,
     _a: i64,
     _b: i64,
 ) -> HostRet {
+    // A pointer a `Box::new` builtin call produced names the
+    // value's slot-model base, not the allocation's start; the
+    // registry the allocation recorded translates it back (the
+    // guest's own size/align words describe the pointee type,
+    // not this allocation, so they are not consulted here).
+    {
+        let ctx = unsafe { &mut *ctx };
+        if let Some(pos) = ctx.box_allocs.iter().position(|(base, ..)| *base == ptr) {
+            let (_, start, alloc_size, alloc_align) = ctx.box_allocs.remove(pos);
+            if let Some(layout) = guest_layout(alloc_size as i64, alloc_align as i64) {
+                // Safety: the entry names a live allocation of
+                // exactly this layout, produced by `host_box_alloc`.
+                unsafe { std::alloc::dealloc(start as *mut u8, layout) };
+            }
+            return HostRet::one(0);
+        }
+    }
     if ptr == 0 || size == 0 {
         return HostRet::one(0);
     }
@@ -2668,6 +2769,164 @@ fn exp_body(digits: &str, upper: bool) -> String {
         format!("{}.{}", &mantissa[..1], &mantissa[1..])
     };
     format!("{mantissa}{}{exp}", if upper { 'E' } else { 'e' })
+}
+
+/// `std::time::Instant::now()`: the host monotonic clock as the
+/// (seconds, nanoseconds) pair the value's layout holds -- the
+/// elapsed time since this process's first reading, so the
+/// values are non-negative and follow the host clock's order
+/// (the epoch itself is unobservable for `Instant`, as
+/// natively; the interpreter's `monotonic_now` computes the
+/// same form). Arguments: (_, _, _, _, _).
+extern "C" fn host_instant_now(
+    _ctx: *mut BuiltinCtx,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+    _e: i64,
+) -> HostRet {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    let d = std::time::Instant::now().duration_since(*base);
+    HostRet::pair(d.as_secs() as i64, d.subsec_nanos() as i64)
+}
+
+/// `std::time::SystemTime::now()`: the host wall clock as the
+/// (seconds, nanoseconds) pair since the Unix epoch (negative
+/// seconds for earlier times, as `SystemTime` allows; the
+/// interpreter's `wall_now`). Arguments: (_, _, _, _, _).
+extern "C" fn host_system_time_now(
+    _ctx: *mut BuiltinCtx,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+    _e: i64,
+) -> HostRet {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => HostRet::pair(d.as_secs() as i64, d.subsec_nanos() as i64),
+        Err(e) => {
+            let d = e.duration();
+            HostRet::pair(-(d.as_secs() as i64), -(d.subsec_nanos() as i64))
+        }
+    }
+}
+
+/// The allocation half of `Box::new`: allocate `size` bytes
+/// (the front end passes the pointee's leaf count times the
+/// slot width) at word alignment, record the allocation in the
+/// context's box registry, and return the value's slot-model
+/// base -- the address of its first leaf, from which the
+/// remaining leaves descend, the addressing every memory place
+/// uses. The front end stores the value's leaves through the
+/// base; the guest's drop path later hands the base back to
+/// `__rust_dealloc`, which the registry translates to the
+/// allocation's start. A zero size allocates nothing: the
+/// aligned dangling address is the pointer, as in core.
+/// Arguments: (size in bytes, _, _, _, _).
+extern "C" fn host_box_alloc(
+    ctx: *mut BuiltinCtx,
+    size: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    if size < 0 {
+        return ctx.fail("Box::new with a negative size");
+    }
+    if size == 0 {
+        return HostRet::one(8);
+    }
+    let Some(layout) = guest_layout(size, 8) else {
+        return ctx.fail("Box::new with an invalid layout");
+    };
+    // Safety: the layout is non-zero and well-formed; the
+    // result is checked before use.
+    let start = unsafe { std::alloc::alloc(layout) };
+    if start.is_null() {
+        return ctx.fail("memory allocation failed");
+    }
+    let base = start as i64 + size - 8;
+    ctx.box_allocs
+        .push((base, start as i64, size as usize, 8));
+    HostRet::one(base)
+}
+
+/// `ToString::to_string` for a scalar receiver: format the
+/// receiver word with the host's own `Display` impl (the very
+/// code the guest's std ships, so the text matches exactly) and
+/// write the result as a `String` at the destination address.
+/// Arguments: (destination address, receiver word, kind code,
+/// bit width, _) -- kind 0 is a signed integer (sign-extended
+/// from the width), 1 an unsigned integer (masked to the
+/// width), 2 a `bool`, 3 a `char`, 4 an `f64`, 5 an `f32`.
+extern "C" fn host_to_string_scalar(
+    ctx: *mut BuiltinCtx,
+    dst: i64,
+    value: i64,
+    kind: i64,
+    bits: i64,
+    _a: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let text = match kind {
+        0 => {
+            let bits = u32::try_from(bits).unwrap_or(64).min(64);
+            if bits == 0 {
+                return ctx.fail("ToString::to_string of a zero-width integer");
+            }
+            let shift = 64 - bits;
+            (((value << shift) >> shift) as i64).to_string()
+        }
+        1 => {
+            let bits = u32::try_from(bits).unwrap_or(64).min(64);
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            ((value as u64) & mask).to_string()
+        }
+        2 => {
+            if value != 0 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        3 => match u32::try_from(value).ok().and_then(char::from_u32) {
+            Some(c) => c.to_string(),
+            None => return ctx.fail("ToString::to_string of an invalid char value"),
+        },
+        4 => f64::from_bits(value as u64).to_string(),
+        5 => f32::from_bits(value as u32).to_string(),
+        _ => return ctx.fail("ToString::to_string of an unmodelled scalar"),
+    };
+    write_string_at(ctx, dst, text.as_bytes())
+}
+
+/// Raise a guest panic with one of the front end's interned
+/// literal strings as the message (the fixed panic texts of
+/// the modelled entry points, e.g. `unwrap_failed`'s).
+/// Arguments: (string index, location index, _, _, _) -- the
+/// location index is the front end's panic-location table
+/// index for the call site (-1 for none).
+extern "C" fn host_panic_fixed(
+    ctx: *mut BuiltinCtx,
+    index: i64,
+    loc: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let Some(text) = ctx.strings.get(index as usize).cloned() else {
+        return ctx.fail("fixed panic string index out of range");
+    };
+    ctx.fail_at(&text, loc as u64)
 }
 
 #[cfg(test)]

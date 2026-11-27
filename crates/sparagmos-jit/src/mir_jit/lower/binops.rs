@@ -1132,6 +1132,33 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
+            mir::CastKind::BoxDerefTransmute => {
+                // The cast yields a pointer to the box's
+                // pointee: the box value's first word is the
+                // pointer itself (the `Box` / `Unique` /
+                // `NonNull` wrapper chain projects to offset 0
+                // at every layer, the shape the interpreter's
+                // `BoxDerefTransmute` unwraps to), and a fat
+                // pointee's metadata word follows it.
+                let src_ty = self
+                    .operand_place_ty(operand)
+                    .unwrap_or_else(|| target.clone());
+                let src_count = flatten(&src_ty, &self.func.name, self.layouts)?;
+                let dst_count = flatten(target, &self.func.name, self.layouts)?;
+                if dst_count == 0 || dst_count > src_count {
+                    return Err(self.err(&format!(
+                        "BoxDerefTransmute from a {src_count}-leaf box to a                          {dst_count}-leaf pointer"
+                    )));
+                }
+                let leaves = self.operand_leaves(operand, &src_ty, src_count)?;
+                for k in 0..dst_count {
+                    self.emit(Instr::Copy {
+                        dst: dst + k as u32,
+                        src: IrOperand::Value(leaves[k]),
+                    });
+                }
+                Ok(())
+            }
             other => Err(self.err(&format!("cast {other:?}"))),
         }
     }

@@ -269,3 +269,67 @@ fn jit_panic_report_names_assert_location() {
         "stderr must name the assert site: {stderr}"
     );
 }
+
+#[test]
+fn jit_instant_now_reaches_the_panic() {
+    // #550 remainder: `Instant::now` was an unmodelled callee
+    // reached before the panic, so the run reported the
+    // unknown-callee text instead of the guest's message.
+    expect_jit_panic(
+        "instant-now",
+        "fn main() { let _t = std::time::Instant::now(); panic!(\"after instant\"); }\n",
+        "after instant",
+    );
+}
+
+#[test]
+fn jit_system_time_now_reaches_the_panic() {
+    expect_jit_panic(
+        "system-time-now",
+        "fn main() { let _t = std::time::SystemTime::now(); panic!(\"after systime\"); }\n",
+        "after systime",
+    );
+}
+
+#[test]
+fn jit_box_new_value_is_readable_before_the_panic() {
+    // #550 remainder: `Box::new` was an unmodelled callee. The
+    // box the builtin builds must read back through the
+    // `BoxDerefTransmute` cast the dereference lowers to.
+    expect_jit_panic(
+        "box-new",
+        "fn main() { let b = Box::new(41u64); assert_eq!(*b + 1, 42); panic!(\"after box\"); }\n",
+        "after box",
+    );
+}
+
+#[test]
+fn jit_option_unwrap_none_reports_the_std_message() {
+    // #550 remainder: `Option::unwrap` was an unmodelled
+    // callee; on `None` the run must report std's own unwrap
+    // message at the call site, not the unknown-callee text.
+    expect_jit_panic(
+        "unwrap-none",
+        "fn main() { let x: Option<u64> = None; let _y = x.unwrap(); }\n",
+        "called `Option::unwrap()` on a `None` value",
+    );
+}
+
+#[test]
+fn jit_option_unwrap_some_reaches_the_panic() {
+    expect_jit_panic(
+        "unwrap-some",
+        "fn main() { let x: Option<u64> = Some(7); assert_eq!(x.unwrap(), 7); panic!(\"after unwrap\"); }\n",
+        "after unwrap",
+    );
+}
+
+#[test]
+fn jit_size_of_in_generic_context_reaches_the_panic() {
+    expect_jit_panic(
+        "size-of-generic",
+        "fn sz<T>() -> usize { std::mem::size_of::<T>() }\n\
+         fn main() { assert_eq!(sz::<u32>(), 4); assert_eq!(sz::<(u8, u64)>(), 16); panic!(\"after sizeof\"); }\n",
+        "after sizeof",
+    );
+}

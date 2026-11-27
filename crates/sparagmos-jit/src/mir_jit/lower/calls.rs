@@ -2051,6 +2051,334 @@ impl<'a> FnLower<'a> {
                 self.finish_builtin_call(&dst_loc, dst, target, true);
                 Ok(())
             }
+            Builtin::InstantNow | Builtin::SystemTimeNow => {
+                if !args.is_empty() {
+                    return Err(self.err("time-now call with arguments"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 2 {
+                    return Err(self.err(&format!("time-now destination is not two words: {count}")));
+                }
+                let host = if kind == Builtin::InstantNow {
+                    builtins::HOST_INSTANT_NOW
+                } else {
+                    builtins::HOST_SYSTEM_TIME_NOW
+                };
+                self.emit_host_call(host, dst, Some(dst + 1), vec![]);
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::MemSizeOf | Builtin::MemAlignOf => {
+                if !args.is_empty() {
+                    return Err(self.err("size_of/align_of call with arguments"));
+                }
+                let Some(ty) = generic_args.first() else {
+                    return Err(self.err("size_of/align_of without a type"));
+                };
+                let ty = ty.clone();
+                let layout = byte_size_align(&ty).or_else(|| {
+                    // The buffer ADTs have a fixed layout the
+                    // builtin layer itself defines (see
+                    // `builtin_adt_layout`): a `String` / `Vec`
+                    // is its (pointer, capacity, length) triple,
+                    // a `Box` is its pointer.
+                    let mir::Ty::Adt(def, _) = &ty else {
+                        return None;
+                    };
+                    let name = builtins::canonical_name(&self.callee_name(*def));
+                    if name == "std::string::String"
+                        || name.starts_with("std::vec::Vec")
+                    {
+                        Some((24, 8))
+                    } else if name.starts_with("std::boxed::Box") {
+                        Some((8, 8))
+                    } else {
+                        None
+                    }
+                });
+                let Some((size, align)) = layout else {
+                    return Err(self.err(&format!(
+                        "size_of/align_of for {}",
+                        ty.kind_name()
+                    )));
+                };
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("size_of/align_of destination is not one word"));
+                }
+                let imm = if kind == Builtin::MemSizeOf { size } else { align };
+                self.emit(Instr::Const {
+                    dst,
+                    imm: imm as i64,
+                });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::ToStringToString => {
+                if args.len() != 1 {
+                    return Err(self.err("ToString::to_string with wrong arity"));
+                }
+                let Some(self_ty) = generic_args.first() else {
+                    return Err(self.err("ToString::to_string without a Self type"));
+                };
+                let self_ty = self_ty.clone();
+                // A `str` receiver: the text is its own bytes.
+                let is_str = match &self_ty {
+                    mir::Ty::Str => true,
+                    mir::Ty::Ref(_, inner, _) => matches!(&**inner, mir::Ty::Str),
+                    _ => false,
+                };
+                if is_str {
+                    let (ptr, len) = self.operand_pair(&args[0])?;
+                    let addr = self.string_destination(destination)?;
+                    let dummy = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_STRING_FROM_STR,
+                        dummy,
+                        None,
+                        vec![
+                            IrOperand::Value(addr),
+                            IrOperand::Value(ptr),
+                            IrOperand::Value(len),
+                        ],
+                    );
+                    self.finish_string_call(target);
+                    return Ok(());
+                }
+                // A `String` receiver: a copy of its bytes.
+                let is_string = match &self_ty {
+                    mir::Ty::Adt(def, _) => {
+                        builtins::canonical_name(&self.callee_name(*def))
+                            == "std::string::String"
+                    }
+                    mir::Ty::Ref(_, inner, _) => match &**inner {
+                        mir::Ty::Adt(def, _) => {
+                            builtins::canonical_name(&self.callee_name(*def))
+                                == "std::string::String"
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if is_string {
+                    let value_addr =
+                        self.arg_word(&args[0], "ToString::to_string argument")?;
+                    let pair = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_DEREF_BUFFER,
+                        pair,
+                        Some(pair + 1),
+                        vec![IrOperand::Value(value_addr)],
+                    );
+                    let addr = self.string_destination(destination)?;
+                    let dummy = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_STRING_FROM_STR,
+                        dummy,
+                        None,
+                        vec![
+                            IrOperand::Value(addr),
+                            IrOperand::Value(pair),
+                            IrOperand::Value(pair + 1),
+                        ],
+                    );
+                    self.finish_string_call(target);
+                    return Ok(());
+                }
+                // A scalar receiver: the host formats the word
+                // with its own `Display` impl.
+                let scalar_ty = match &self_ty {
+                    mir::Ty::Ref(_, inner, _) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let (code, bits): (i64, i64) = match &scalar_ty {
+                    mir::Ty::Int(it) => (0, int_bits(*it) as i64),
+                    mir::Ty::Uint(ut) => (1, uint_bits(*ut) as i64),
+                    mir::Ty::Bool => (2, 1),
+                    mir::Ty::Char => (3, 32),
+                    mir::Ty::Float(mir::FloatTy::F64) => (4, 64),
+                    mir::Ty::Float(mir::FloatTy::F32) => (5, 32),
+                    _ => {
+                        return Err(self.err(&format!(
+                            "ToString::to_string for {}",
+                            self_ty.kind_name()
+                        )))
+                    }
+                };
+                if bits > 64 {
+                    return Err(self.err("ToString::to_string of a 128-bit integer"));
+                }
+                let value_addr =
+                    self.arg_word(&args[0], "ToString::to_string argument")?;
+                let value = self.fresh();
+                self.emit(Instr::LoadPtr {
+                    dst: value,
+                    ptr: IrOperand::Value(value_addr),
+                });
+                let addr = self.string_destination(destination)?;
+                let dummy = self.fresh();
+                self.emit_host_call(
+                    builtins::HOST_TO_STRING_SCALAR,
+                    dummy,
+                    None,
+                    vec![
+                        IrOperand::Value(addr),
+                        IrOperand::Value(value),
+                        IrOperand::Const(code),
+                        IrOperand::Const(bits),
+                    ],
+                );
+                self.finish_string_call(target);
+                Ok(())
+            }
+            Builtin::BoxNew => {
+                if args.len() != 1 {
+                    return Err(self.err("Box::new with wrong arity"));
+                }
+                let Some(pointee_ty) = generic_args
+                    .first()
+                    .cloned()
+                    .or_else(|| self.operand_place_ty(&args[0]))
+                else {
+                    return Err(self.err("Box::new without a pointee type"));
+                };
+                let count = flatten(&pointee_ty, &self.func.name, self.layouts)?;
+                let leaves = if count == 0 {
+                    Vec::new()
+                } else {
+                    self.operand_leaves(&args[0], &pointee_ty, count)?
+                };
+                let (dst_loc, dst, dcount) = self.builtin_destination(destination)?;
+                if dcount == 0 {
+                    return Err(self.err("Box::new destination has no pointer word"));
+                }
+                let base = self.fresh();
+                self.emit_host_call(
+                    builtins::HOST_BOX_ALLOC,
+                    base,
+                    None,
+                    vec![IrOperand::Const((count * 8) as i64)],
+                );
+                // Store the value's leaves through the base, at
+                // the descending addresses every memory place
+                // uses (leaf `k` at `base - 8 * k`).
+                for (k, leaf) in leaves.iter().enumerate() {
+                    let a = if k == 0 {
+                        base
+                    } else {
+                        let d = self.fresh();
+                        self.emit(Instr::BinOp {
+                            dst: d,
+                            op: IrBinOp::Sub,
+                            lhs: IrOperand::Value(base),
+                            rhs: IrOperand::Const((k * 8) as i64),
+                        });
+                        d
+                    };
+                    self.emit(Instr::StorePtr {
+                        ptr: IrOperand::Value(a),
+                        src: IrOperand::Value(*leaf),
+                    });
+                }
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(base),
+                });
+                // The remaining destination words are the
+                // `Box` struct's allocator / marker words: zero,
+                // the value the guest's own construction of a
+                // default-allocator box carries in this model.
+                for k in 1..dcount {
+                    self.emit(Instr::Const {
+                        dst: dst + k as u32,
+                        imm: 0,
+                    });
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::OptionUnwrap => {
+                // A trailing caller-location stamp (the callee
+                // is `#[track_caller]`) is not the receiver.
+                if args.is_empty() {
+                    return Err(self.err("Option::unwrap with no arguments"));
+                }
+                let Some(option_ty) = self.operand_place_ty(&args[0]) else {
+                    return Err(self.err("Option::unwrap argument without a type"));
+                };
+                let mir::Ty::Adt(def, _) = option_ty else {
+                    return Err(self.err("Option::unwrap of a non-Option value"));
+                };
+                let layout = self.adt_layout(&option_ty)?;
+                let Some(slot) = layout.field(1, 0).cloned() else {
+                    return Err(self.err("Option::unwrap payload outside the layout"));
+                };
+                let count = flatten(&option_ty, &self.func.name, self.layouts)?;
+                let leaves = self.operand_leaves(&args[0], &option_ty, count)?;
+                let (dst_loc, dst, dcount) = self.builtin_destination(destination)?;
+                if dcount != slot.width {
+                    return Err(self.err("Option::unwrap destination shape mismatch"));
+                }
+                // The `None` test: the tag leaf against the
+                // `None` discriminant, or -- under a niche
+                // layout with no tag leaf -- the payload's first
+                // word against zero (the niche value).
+                let is_none = self.fresh();
+                if layout.tag {
+                    let none_tag = self.discriminant_value(def, 0)?;
+                    self.emit(Instr::BinOp {
+                        dst: is_none,
+                        op: IrBinOp::Eq,
+                        lhs: IrOperand::Value(leaves[0]),
+                        rhs: IrOperand::Const(none_tag),
+                    });
+                } else {
+                    self.emit(Instr::BinOp {
+                        dst: is_none,
+                        op: IrBinOp::Eq,
+                        lhs: IrOperand::Value(leaves[slot.offset]),
+                        rhs: IrOperand::Const(0),
+                    });
+                }
+                let msg = self
+                    .messages
+                    .intern("called `Option::unwrap()` on a `None` value");
+                let panic_blk = self.panic_block(msg);
+                let ok_blk = self.new_block();
+                self.seal_and_continue(
+                    IrTerminator::Branch {
+                        cond: IrOperand::Value(is_none),
+                        then_blk: panic_blk,
+                        else_blk: ok_blk,
+                    },
+                    ok_blk,
+                );
+                for j in 0..slot.width {
+                    self.emit(Instr::Copy {
+                        dst: dst + j as u32,
+                        src: IrOperand::Value(leaves[slot.offset + j]),
+                    });
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::OptionUnwrapFailed => {
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("unwrap_failed destination is not never"));
+                }
+                let index =
+                    self.intern_string("called `Option::unwrap()` on a `None` value");
+                let loc = self.entry_loc_arg();
+                self.emit_host_call(
+                    builtins::HOST_PANIC_FIXED,
+                    dst,
+                    None,
+                    vec![IrOperand::Const(index as i64), IrOperand::Const(loc)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
             Builtin::StrOp(op) => {
                 if args.len() != 2 {
                     return Err(self.err("str search with wrong arity"));
