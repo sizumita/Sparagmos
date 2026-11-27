@@ -1242,3 +1242,183 @@ fn run_mode_path_is_file_is_dir() {
          missing: is_file=false is_dir=false\n",
     );
 }
+
+const COW_OS_STR_OWNED_DEREF_SRC: &str = r#"use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
+
+fn report(tag: &str, cow: &Cow<'_, OsStr>) {
+    let s: &OsStr = &**cow;
+    println!("{tag} len={} to_str={:?} lossy={} debug={:?}",
+        s.len(), s.to_str(), s.to_string_lossy(), s);
+}
+
+fn main() {
+    // Owned through `Cow::from(OsString)`.
+    let from: Cow<'_, OsStr> = Cow::from(OsString::from("hello os"));
+    report("from", &from);
+    // Owned constructed directly.
+    let direct: Cow<'_, OsStr> = Cow::Owned(OsString::from("direct owned"));
+    report("direct", &direct);
+    // Owned from a PathBuf's OsString.
+    let pb = PathBuf::from("/tmp/some/dir");
+    let from_pb: Cow<'_, OsStr> = Cow::Owned(pb.into_os_string());
+    report("pathbuf", &from_pb);
+    // Owned whose OsString came from `to_owned` on a borrowed
+    // OsStr (the bare string form of the value).
+    let from_ref: Cow<'_, OsStr> = Cow::from(OsStr::new("relative/path").to_owned());
+    report("to_owned", &from_ref);
+    // Owned over a real-aggregate OsString (with_capacity + push).
+    let mut built = OsString::with_capacity(16);
+    built.push("built ");
+    built.push("by push");
+    let agg: Cow<'_, OsStr> = Cow::Owned(built);
+    report("aggregate", &agg);
+    // Borrowed control and cross-form equality / ordering.
+    let borrowed: Cow<'_, OsStr> = Cow::Borrowed(OsStr::new("hello os"));
+    report("borrowed", &borrowed);
+    println!("eq={} lt={}", from == borrowed, from < direct);
+    // Back out again.
+    let back: OsString = from.into_owned();
+    println!("back={back:?}");
+    println!("cow os str owned deref ok");
+}
+"#;
+
+#[test]
+fn run_mode_cow_os_str_owned_deref() {
+    // The `Deref` builtin's `Cow` arm returned the owned
+    // field itself for a `Cow<OsStr>`: an `OsString`
+    // aggregate where the guest expected the `&OsStr`
+    // reference shape, so every deref consumer stopped on
+    // the type mismatch. The owned field now denominates
+    // through the shared OS-string byte readers (whichever
+    // stored form it takes: canonical enum, real aggregate,
+    // or the bare string form `to_owned` produces) and
+    // derefs to the sub-path value, exactly as
+    // `OsString::deref` itself does. `Cow::from` /
+    // `Into` into a `Cow` target are covered here too:
+    // they had no arm at all before.
+    let dir = temp_dir("cow-os-str-owned-deref");
+    let src = fixture(&dir, "cow_os_str_owned_deref.rs", COW_OS_STR_OWNED_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "owned Cow<OsStr> deref must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from len=8 to_str=Some(\"hello os\") lossy=hello os debug=\"hello os\"\ndirect len=12 to_str=Some(\"direct owned\") lossy=direct owned debug=\"direct owned\"\npathbuf len=13 to_str=Some(\"/tmp/some/dir\") lossy=/tmp/some/dir debug=\"/tmp/some/dir\"\nto_owned len=13 to_str=Some(\"relative/path\") lossy=relative/path debug=\"relative/path\"\naggregate len=13 to_str=Some(\"built by push\") lossy=built by push debug=\"built by push\"\nborrowed len=8 to_str=Some(\"hello os\") lossy=hello os debug=\"hello os\"\neq=true lt=false\nback=\"hello os\"\ncow os str owned deref ok\n"
+    );
+}
+
+const COW_PATH_OWNED_DEREF_SRC: &str = r#"use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // Owned through `Cow::from(PathBuf)`.
+    let owned: Cow<'_, Path> = Cow::from(PathBuf::from("/a/b/c.txt"));
+    let p: &Path = &*owned;
+    println!("len={}", p.as_os_str().len());
+    println!("debug={p:?}");
+    println!("file_name={:?}", p.file_name());
+    println!("parent={:?}", owned.parent());
+    println!("is_absolute={}", owned.is_absolute());
+    // Owned constructed directly.
+    let direct: Cow<'_, Path> = Cow::Owned(PathBuf::from("rel/file.rs"));
+    println!("direct_ext={:?}", direct.extension());
+    // Borrowed control and cross-form equality.
+    let borrowed: Cow<'_, Path> = Cow::Borrowed(Path::new("/a/b/c.txt"));
+    println!("eq={}", owned == borrowed);
+    println!("cow path owned deref ok");
+}
+"#;
+
+#[test]
+fn run_mode_cow_path_owned_deref() {
+    // The same owned-form hole for `Cow<Path>`: the owned
+    // `PathBuf` field denominates through the shared path
+    // byte readers and derefs to the sub-path value, as
+    // `PathBuf::deref` does.
+    let dir = temp_dir("cow-path-owned-deref");
+    let src = fixture(&dir, "cow_path_owned_deref.rs", COW_PATH_OWNED_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "owned Cow<Path> deref must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=10\ndebug=\"/a/b/c.txt\"\nfile_name=Some(\"c.txt\")\nparent=Some(\"/a/b\")\nis_absolute=true\ndirect_ext=Some(\"rs\")\neq=true\ncow path owned deref ok\n"
+    );
+}
+
+const COW_FROM_REFERENCE_SRC: &str = r#"use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // From<&B> constructions (Borrowed variant).
+    let a: Cow<'_, str> = Cow::from("literal text");
+    println!("a={} borrowed={}", &*a, matches!(a, Cow::Borrowed(_)));
+
+    let os = OsString::from("ref os");
+    let b: Cow<'_, OsStr> = Cow::from(os.as_os_str());
+    println!("b_len={} borrowed={}", (&*b).len(), matches!(b, Cow::Borrowed(_)));
+
+    let bytes: &[u8] = &[9, 8, 7];
+    let c: Cow<'_, [u8]> = Cow::from(bytes);
+    println!("c_len={} borrowed={}", c.len(), matches!(c, Cow::Borrowed(_)));
+
+    // From<&Owned> constructions (Borrowed over the deref shape).
+    let owned_string = String::from("ref string");
+    let d: Cow<'_, str> = Cow::from(&owned_string);
+    println!("d={} borrowed={}", &*d, matches!(d, Cow::Borrowed(_)));
+
+    let e: Cow<'_, OsStr> = Cow::from(&os);
+    println!("e_len={} borrowed={}", (&*e).len(), matches!(e, Cow::Borrowed(_)));
+
+    let pb = PathBuf::from("/ref/path");
+    let f: Cow<'_, Path> = Cow::from(&pb);
+    println!("f_debug={:?} borrowed={}", &*f, matches!(f, Cow::Borrowed(_)));
+
+    let v = vec![5u8, 6];
+    let g: Cow<'_, [u8]> = Cow::from(&v);
+    println!("g_len={} borrowed={}", g.len(), matches!(g, Cow::Borrowed(_)));
+
+    // Into: owned sources.
+    let h: Cow<'_, OsStr> = OsString::from("into os").into();
+    println!("h_len={} owned={}", (&*h).len(), matches!(h, Cow::Owned(_)));
+
+    let i: Cow<'_, str> = String::from("into str").into();
+    println!("i={} owned={}", &*i, matches!(i, Cow::Owned(_)));
+}
+"#;
+
+#[test]
+fn run_mode_cow_from_reference_sources() {
+    // `From<&T>` / `From<&Owned>` for a `Cow` target build
+    // the borrowed variant: over the reference itself for
+    // a borrowed-type source, and over the dereferenced
+    // value for a reference to the owned type. The
+    // `&Vec<T>` source must not be confused with the
+    // owned `Vec<T>` source (that mix-up wrapped the
+    // reference as the owned variant).
+    let dir = temp_dir("cow-from-reference");
+    let src = fixture(&dir, "cow_from_reference.rs", COW_FROM_REFERENCE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cow from reference sources must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=literal text borrowed=true\nb_len=6 borrowed=true\nc_len=3 borrowed=true\nd=ref string borrowed=true\ne_len=6 borrowed=true\nf_debug=\"/ref/path\" borrowed=true\ng_len=2 borrowed=true\nh_len=7 owned=true\ni=into str owned=true\n"
+    );
+}

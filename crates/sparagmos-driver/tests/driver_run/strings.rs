@@ -4650,6 +4650,16 @@ fn main() {
 }
 "#;
 
+const COW_FROM_OWNED_SRC: &str = r#"use std::borrow::Cow;
+
+fn main() {
+    let c: Cow<'_, str> = Cow::from(String::from("from string"));
+    println!("deref={}", &*c);
+    let v: Cow<'_, [u8]> = Cow::from(vec![1u8, 2, 3]);
+    println!("vlen={}", v.len());
+}
+"#;
+
 #[test]
 fn run_mode_join_built_string_mutations() {
     // A `join` / `concat` result stored in a place is the
@@ -4721,5 +4731,28 @@ fn run_mode_vec_u8_from_join_built_string() {
         "vec-from-join",
         VEC_FROM_JOIN_SRC,
         "5|[97, 98, 45, 99, 100]\n[97, 47, 98]\nab-cd\nvec-from-join-ok\n",
+    );
+}
+
+#[test]
+fn run_mode_cow_from_owned_sources() {
+    // `Cow::from(String)` / `Cow::from(Vec<T>)` (and the
+    // matching `Into`): the generic From/Into handler had
+    // arms whose source was a `Cow` but none whose target
+    // was one, so every construction of a `Cow` through
+    // `From` stopped as unsupported. The owned source
+    // wraps as the owned variant.
+    let dir = temp_dir("cow-from-owned");
+    let src = fixture(&dir, "cow_from_owned.rs", COW_FROM_OWNED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cow from owned sources must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "deref=from string\nvlen=3\n"
     );
 }
