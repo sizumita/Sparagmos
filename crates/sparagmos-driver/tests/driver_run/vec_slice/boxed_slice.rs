@@ -1236,3 +1236,44 @@ fn run_mode_boxed_slice_collect() {
         "[0, 1, 2, 3, 4]\n[\"a\", \"bb\"]\n[] 0\nboxed collect ok\n"
     );
 }
+
+const BOXED_SLICE_INTO_ASREF_SRC: &str = r#"
+#![feature(box_into_boxed_slice)]
+fn main() {
+    // `Box::into_boxed_slice` is a guest body: the box it
+    // leaves behind is the real aggregate form (the
+    // Box / Unique / NonNull wrapper chain around the fat
+    // pointer), not the one-field aggregate the `Box::new`
+    // builtin builds. `AsRef` / `AsMut` must still extract
+    // the stored pointer from the chain's bottom.
+    let b: Box<[u8]> = Box::into_boxed_slice(Box::new(5u8));
+    let s: &[u8] = b.as_ref();
+    println!("len={} first={}", s.len(), s[0]);
+    let mut b2: Box<[u8]> = Box::into_boxed_slice(Box::new(7u8));
+    let m: &mut [u8] = b2.as_mut();
+    m[0] = 9;
+    let s2: &[u8] = b2.as_ref();
+    println!("after={}", s2[0]);
+    let c: Box<[[u8; 1]]> = Box::into_boxed_slice(Box::new([25u8]));
+    let t: &[[u8; 1]] = c.as_ref();
+    println!("nested={} {}", t.len(), t[0][0]);
+    println!("boxed slice asref ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_into_boxed_slice_asref() {
+    let dir = temp_dir("boxed-into-asref");
+    let src = fixture(&dir, "boxed_into_asref.rs", BOXED_SLICE_INTO_ASREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AsRef/AsMut on a guest-built into_boxed_slice box must extract the wrapper chain's fat pointer; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=1 first=5\nafter=9\nnested=1 25\nboxed slice asref ok\n"
+    );
+}
