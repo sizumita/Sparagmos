@@ -211,3 +211,186 @@ fn main() {
         ">abxcdefghij!\n",
     );
 }
+/// The pin's own shape: a loop-carried `String::new()`
+/// accumulator fed by `push_str` in a loop. The abstract
+/// form survives the loop-header merge on the back edge;
+/// the walk must still run at every optimisation level.
+#[test]
+fn loop_carried_accumulator_matches_native() {
+    run_ok_all_opts(
+        "loop-carried-accumulator",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let digits: &[&str] = &["5", "-67", "890", "-12345", "0"];
+    let mut acc = String::new();
+    for s in digits {
+        acc.push_str(black_box(*s));
+        acc.push(0x7cu8 as char);
+    }
+    println!("{acc}");
+}
+"#,
+        "5|-67|890|-12345|0|\n",
+    );
+}
+
+/// A string element of a vector accumulated in a loop: the
+/// string lives inside an allocation, so the walk's
+/// preparation cannot run under the allocation store's
+/// borrow; the growth and the walk must still complete and
+/// the element must stay readable afterwards.
+#[test]
+fn vec_element_accumulates_in_loop() {
+    run_ok_all_opts(
+        "vec-element-loop",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let digits: &[&str] = &["5", "-67", "890"];
+    let mut v: Vec<String> = vec![String::new()];
+    for s in digits {
+        v[0].push_str(black_box(*s));
+        v[0].push(0x7cu8 as char);
+    }
+    println!("{}", v[0]);
+}
+"#,
+        "5|-67|890|\n",
+    );
+}
+
+/// An allocation-resident string that is abstract before
+/// the walk (a modelled push rewrote it), then walked, then
+/// read back through Display; and a second element driven
+/// through the full loop shape.
+#[test]
+fn vec_elements_abstract_first_walk() {
+    run_ok_all_opts(
+        "vec-elements-abstract-first",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let mut v: Vec<String> = vec![String::new(), String::new()];
+    v[0].push(0x7cu8 as char);
+    v[0].push_str(black_box("world"));
+    for s in &["5", "-67", "890"] {
+        v[1].push_str(black_box(*s));
+        v[1].push(0x21u8 as char);
+        v[1].push(0x20u8 as char);
+    }
+    v[1].push_str(black_box("f"));
+    println!("{} {}", v[0], v[1]);
+}
+"#,
+        "|world 5! -67! 890! f\n",
+    );
+}
+
+/// Elements accumulated through `iter_mut` references.
+#[test]
+fn mut_iter_elements_accumulate() {
+    run_ok_all_opts(
+        "mut-iter-elements",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let mut v: Vec<String> = vec![String::new(), String::new()];
+    for e in v.iter_mut() {
+        e.push(0x7cu8 as char);
+        e.push_str(black_box("x"));
+        e.push(0x20u8 as char);
+    }
+    println!("{}{}", v[0], v[1]);
+}
+"#,
+        "|x |x \n",
+    );
+}
+
+/// A boxed string accumulated through the walk.
+#[test]
+fn boxed_string_accumulates() {
+    run_ok_all_opts(
+        "boxed-string",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let mut b: Box<String> = Box::new(String::new());
+    b.push(0x7cu8 as char);
+    b.push_str(black_box("boxed"));
+    println!("{}", b);
+}
+"#,
+        "|boxed\n",
+    );
+}
+
+/// A `format!`-born accumulator fed in a loop.
+#[test]
+fn format_born_accumulator_in_loop() {
+    run_ok_all_opts(
+        "format-born-loop",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let digits: &[&str] = &["5", "-67", "890"];
+    let mut acc = format!(">");
+    for s in digits {
+        acc.push_str(black_box(*s));
+        acc.push(0x7cu8 as char);
+    }
+    println!("{acc}");
+}
+"#,
+        ">5|-67|890|\n",
+    );
+}
+
+/// Explicit `try_reserve` / `reserve_exact` on an
+/// allocation-resident string between two walks: the
+/// try-reserve entry prepares the form the same way.
+#[test]
+fn element_try_reserve_then_walk() {
+    run_ok_all_opts(
+        "element-try-reserve",
+        r#"
+use std::hint::black_box;
+fn main() {
+    let mut v: Vec<String> = vec![String::new()];
+    v[0].push(0x7cu8 as char);
+    v[0].try_reserve(16).unwrap();
+    v[0].push_str(black_box("abc"));
+    v[0].reserve_exact(32);
+    v[0].push_str(black_box("def"));
+    println!("{}", v[0]);
+}
+"#,
+        "|abcdef\n",
+    );
+}
+
+/// The walk runs in a helper frame, on an element reached
+/// through the helper's `&mut` parameter.
+#[test]
+fn helper_fn_accumulates_vec_element() {
+    run_ok_all_opts(
+        "helper-fn-element",
+        r#"
+use std::hint::black_box;
+fn add(acc: &mut String, s: &str) {
+    acc.push_str(black_box(s));
+    acc.push(0x7cu8 as char);
+}
+fn main() {
+    let digits: &[&str] = &["5", "-67", "890"];
+    let mut v: Vec<String> = vec![String::new()];
+    for s in digits {
+        add(&mut v[0], s);
+    }
+    println!("{}", v[0]);
+}
+"#,
+        "5|-67|890|\n",
+    );
+}
