@@ -534,6 +534,61 @@ fn main() {
     assert_eq!(stdout, "abcde\n\"abcde\"\n   abcde\nhello\n\"hello\"\n");
 }
 
+/// A DST struct's `str` tail field in sequence-element
+/// position (a `Vec<&str>` / array / tuple element being
+/// `Debug`-formatted): the element reader hands the fmt
+/// machinery the fat pointer itself, whose base denotes a
+/// region of the sized twin's aggregate storage, and the
+/// string it denotes must format as a string -- not as the
+/// byte list the storage region's elements spell. The
+/// `&str`-backed wrapper's tail and sub-slices of a tail
+/// behave the same; a byte slice element keeps its byte
+/// list.
+#[test]
+fn dst_str_tail_as_sequence_element_formats_as_string() {
+    let stdout = run_ok(
+        "dst-str-elem-fmt",
+        "dst_str_elem_fmt.rs",
+        r#"
+use std::mem;
+use std::ptr;
+struct Baz {
+    f1: usize,
+    f2: str,
+}
+struct Baz_ {
+    f1: usize,
+    f2: [u8; 5],
+}
+struct BazS {
+    f2: str,
+}
+fn main() {
+    unsafe {
+        let data: Box<Baz_> =
+            Box::new(Baz_ { f1: 42, f2: [97, 98, 99, 100, 101] });
+        let x: &Baz = mem::transmute(ptr::slice_from_raw_parts(&*data, 5));
+        let t: &str = "hello";
+        let y: &BazS = mem::transmute(t);
+        let b: &[u8] = b"abcde";
+        println!("{:?}", vec![&x.f2]);
+        println!("{:?}", vec!["zz", &x.f2]);
+        println!("{:?}", [&x.f2, "zz"]);
+        println!("{:?}", (&x.f2, 7));
+        println!("{:?}", vec![&y.f2]);
+        println!("{:?}", vec![&x.f2[..]]);
+        println!("{:?}", vec![&x.f2[1..3]]);
+        println!("{:?}", vec![&b[1..3]]);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "[\"abcde\"]\n[\"zz\", \"abcde\"]\n[\"abcde\", \"zz\"]\n(\"abcde\", 7)\n[\"hello\"]\n[\"abcde\"]\n[\"bc\"]\n[[98, 99]]\n"
+    );
+}
+
 /// (pointer, length) tuple -> fat reference to a
 /// DST-wrapper struct: the `PackedSized::unsize` transmute.
 #[test]
