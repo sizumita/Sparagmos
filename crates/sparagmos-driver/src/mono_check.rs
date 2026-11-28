@@ -3241,7 +3241,14 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             // on the module evidence below.
             true
         } else {
+            // The module evidence is conclusive only when no
+            // public re-export exposes the item either: an
+            // item under a non-public module is still seeded
+            // into the reachable set — and its MIR encoded —
+            // when a public `pub use` (glob or named) puts it
+            // on the home crate's API surface.
             !has_nonpublic_module_ancestor(tcx, def_id)
+                || exposed_through_reexports(tcx, def_id)
         };
         if native_encoded {
             return None;
@@ -3856,9 +3863,11 @@ fn is_trait_impl_item(
 
 /// Whether some module on `def_id`'s ancestor chain in its
 /// home crate is not public: the item then cannot be named
-/// from outside the crate through any path, so only a mention
-/// from a reachable body or signature could have put it in
-/// the reachable set the metadata encoder consults.
+/// from outside the crate through its definition path, so
+/// only a mention from a reachable body or signature — or a
+/// public re-export, the evidence of
+/// `exposed_through_reexports` — could have put it in the
+/// reachable set the metadata encoder consults.
 fn has_nonpublic_module_ancestor(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     def_id: rustc_span::def_id::DefId,
@@ -3876,6 +3885,110 @@ fn has_nonpublic_module_ancestor(
         cur = parent;
     }
     false
+}
+
+/// Whether `def_id` is exposed on its home crate's public
+/// API surface through re-exports: starting from the crate
+/// root, enter every module a public binding names and mark
+/// every item a public binding of an entered module names,
+/// proper children and re-exports (glob or named) alike,
+/// each under its own binding visibility. This replays, for
+/// the re-export paths, the effective-visibility judgement
+/// the home crate's privacy pass seeds the reachable set
+/// with — the metadata downstream carries only each item's
+/// own (definition-path) visibility, so the re-export graph
+/// is walked here from the module children the metadata
+/// does carry. Names two glob imports bring in together
+/// descend to ambiguity in the resolver and are recorded
+/// apart from the other children; both records are walked.
+/// An inherent method rides on its self type,
+/// the composition the privacy pass applies to impl items:
+/// the method is exposed when the type is and the method's
+/// own visibility is public.
+fn exposed_through_reexports(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    def_id: rustc_span::def_id::DefId,
+) -> bool {
+    let root = rustc_span::def_id::DefId {
+        krate: def_id.krate,
+        index: rustc_span::def_id::CRATE_DEF_INDEX,
+    };
+    let mut exposed: std::collections::HashSet<rustc_span::def_id::DefId> =
+        std::collections::HashSet::new();
+    let mut entered: std::collections::HashSet<rustc_span::def_id::DefId> =
+        std::collections::HashSet::new();
+    let mut worklist = vec![root];
+    entered.insert(root);
+    while let Some(module) = worklist.pop() {
+        let mut consider =
+            |child: &rustc_middle::middle::resolve::ModChild,
+             exposed: &mut std::collections::HashSet<rustc_span::def_id::DefId>,
+             entered: &mut std::collections::HashSet<rustc_span::def_id::DefId>,
+             worklist: &mut Vec<rustc_span::def_id::DefId>| {
+                if !matches!(child.vis, rustc_middle::ty::Visibility::Public) {
+                    return;
+                }
+                let rustc_hir::def::Res::Def(kind, child_id) = child.res
+                else {
+                    return;
+                };
+                if child_id.krate != def_id.krate {
+                    return;
+                }
+                if exposed.insert(child_id)
+                    && matches!(kind, rustc_hir::def::DefKind::Mod)
+                    && entered.insert(child_id)
+                {
+                    worklist.push(child_id);
+                }
+            };
+        for child in tcx.module_children(module) {
+            consider(child, &mut exposed, &mut entered, &mut worklist);
+        }
+        for ambig in ambig_module_children(tcx, module) {
+            consider(&ambig.main, &mut exposed, &mut entered, &mut worklist);
+            consider(&ambig.second, &mut exposed, &mut entered, &mut worklist);
+        }
+    }
+    if exposed.contains(&def_id) {
+        return true;
+    }
+    // An inherent method is exposed through its self type.
+    if matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::AssocFn)
+        && matches!(
+            tcx.visibility(def_id),
+            rustc_middle::ty::Visibility::Public
+        )
+    {
+        if let Some(impl_id) = tcx.inherent_impl_of_assoc(def_id) {
+            let self_ty = tcx.type_of(impl_id).skip_binder();
+            if let Some(adt) = self_ty.ty_adt_def() {
+                return exposed.contains(&adt.did());
+            }
+        }
+    }
+    false
+}
+
+/// The ambiguous children of an upstream module: names two
+/// glob imports bring in together, recorded apart from the
+/// module's other children in a table no query exposes. The
+/// crate store's concrete type is its only reader — the
+/// resolver itself reads it the same way when it rebuilds an
+/// extern crate's namespace from metadata — so it is
+/// reached through the `CrateStore` trait's downcast hatch.
+/// Empty when the store is not the metadata crate store.
+fn ambig_module_children(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    module: rustc_span::def_id::DefId,
+) -> Vec<rustc_middle::middle::resolve::AmbigModChild> {
+    let cstore = tcx.cstore_untracked();
+    let Some(cstore) =
+        cstore.as_any().downcast_ref::<rustc_metadata::creader::CStore>()
+    else {
+        return Vec::new();
+    };
+    cstore.ambig_module_children_untracked(tcx, module).collect()
 }
 
 struct MentionScan<'a, 'tcx> {

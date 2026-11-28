@@ -32,7 +32,8 @@
 //! the demand; the verdict replays the native encoding rule
 //! for the auxiliary crates, over the conclusive evidence
 //! (a metadata-only auxiliary build, or a demand from a local
-//! body for a non-trait-impl item under a non-public module).
+//! body for a non-trait-impl item under a non-public module
+//! that no public re-export exposes).
 //! The target-cpu session validation is pinned as well:
 //! rustc rejects, as code generation starts, a target whose
 //! spec requires an explicit cpu when none is set, and a
@@ -1756,6 +1757,66 @@ pub macro m() {
         stderr.contains("missing optimized MIR"),
         "stderr={stderr}"
     );
+}
+
+#[test]
+fn missing_mir_glob_reexported_generic_converts() {
+    // The record's own shape (tests/ui/imports/
+    // ambiguous-reachable): a generic function under a
+    // private module of the auxiliary crate, re-exported
+    // from the auxiliary's root by a public glob (a second
+    // glob brings a non-generic namesake, which is what
+    // makes the import ambiguous). The function is on the
+    // auxiliary's public API surface, so it is in the home
+    // crate's reachable set and its MIR is encoded natively;
+    // the module-ancestor evidence alone must not conclude
+    // otherwise.
+    let case = Case::new("missing-mir-glob-reexport");
+    let aux = case.write(
+        "ambiguous-reachable-extern.rs",
+        r##"mod m1 {
+    pub fn generic<T>() {
+        let x = 10;
+        let y = 11;
+        println!("hello {x} world {:?}", y);
+    }
+}
+
+mod m2 {
+    pub fn generic() {}
+}
+
+pub use m1::*;
+pub use m2::*;
+"##,
+    );
+    let src = case.write(
+        "case.rs",
+        "//@ aux-crate:dep=ambiguous-reachable-extern.rs\n\n#![allow(ambiguous_glob_imports)]\n\nextern crate dep;\n\nfn main() {\n    dep::generic::<u8>();\n}\n",
+    );
+    let (code, stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn missing_mir_named_reexported_generic_converts() {
+    // The named sibling of the glob shape above: a generic
+    // function under a private module of the auxiliary
+    // crate, re-exported from the root by name. Same
+    // reachable-set membership, same native encoding.
+    let case = Case::new("missing-mir-named-reexport");
+    let aux = case.write(
+        "named-reexport-extern.rs",
+        "mod m1 {\n    pub fn generic<T>(x: T) -> T { x }\n}\n\npub use m1::generic;\n",
+    );
+    let src = case.write(
+        "case.rs",
+        "//@ aux-crate:dep=named-reexport-extern.rs\n\nextern crate dep;\n\nfn main() {\n    let _ = dep::generic::<u8>(3);\n}\n",
+    );
+    let (code, stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
 }
 
 #[test]
