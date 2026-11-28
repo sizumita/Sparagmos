@@ -1082,6 +1082,7 @@ impl<'a> Interpreter<'a> {
                     // constructs the closure's coroutine from
                     // the call arguments and the environment.
                     let async_kind;
+                    let demoted_kind;
                     let kind = match kind {
                         FnCallKind::CallOnce
                             if self.fn_call_receiver_is_async_closure(
@@ -1106,6 +1107,39 @@ impl<'a> Interpreter<'a> {
                         {
                             async_kind = FnCallKind::AsyncCall;
                             &async_kind
+                        }
+                        // An `AsyncFn`-family call whose receiver
+                        // is a function pointer value (a function
+                        // item passed where an `AsyncFn` bound is
+                        // required, above all) constructs no
+                        // coroutine: the shim's meaning is the
+                        // function call itself, whose return value
+                        // is the future, so the call is served by
+                        // the corresponding `Fn`-family dispatch
+                        // below.
+                        FnCallKind::AsyncCallOnce
+                            if self.fn_call_receiver_is_fn_ptr(
+                                frames, body, receiver, true,
+                            ) =>
+                        {
+                            demoted_kind = FnCallKind::CallOnce;
+                            &demoted_kind
+                        }
+                        FnCallKind::AsyncCallMut
+                            if self.fn_call_receiver_is_fn_ptr(
+                                frames, body, receiver, false,
+                            ) =>
+                        {
+                            demoted_kind = FnCallKind::CallMut;
+                            &demoted_kind
+                        }
+                        FnCallKind::AsyncCall
+                            if self.fn_call_receiver_is_fn_ptr(
+                                frames, body, receiver, false,
+                            ) =>
+                        {
+                            demoted_kind = FnCallKind::Call;
+                            &demoted_kind
                         }
                         other => other,
                     };

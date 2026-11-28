@@ -6011,7 +6011,7 @@ impl<'a> Interpreter<'a> {
                     // the fat pointer itself, and dereferencing it
                     // yields that pointer — the `&dyn` the trait
                     // methods dispatch through.
-                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    let pointee = self.resolve_box_value(frames, &vals[0])?;
                     if let Value::DynRef { .. } = pointee {
                         return Ok(pointee);
                     }
@@ -9608,7 +9608,7 @@ impl<'a> Interpreter<'a> {
                 } else if self_ty.starts_with("std::boxed::Box<")
                     || self_ty.starts_with("alloc::boxed::Box<")
                 {
-                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    let pointee = self.resolve_box_value(frames, &vals[0])?;
                     // As in `Deref`: a `Box<dyn Trait>` dereferences
                     // to the fat pointer itself, and a built box
                     // dereferences to its allocation pointer — a
