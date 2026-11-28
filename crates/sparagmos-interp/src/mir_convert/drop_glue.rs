@@ -572,6 +572,56 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // `CoroutineState`.
                 return Some(self.variant_fields_plan(def, args)?);
             }
+            "std::future::PollFn" | "core::future::PollFn" => {
+                // The `poll_fn` future: a one-field adapter holding
+                // the poll closure, with no `Drop` impl of its own,
+                // so dropping it drops the closure (its captures).
+                // The generic path refuses it because the driver
+                // certifies no drop fact for it: it is dropped as a
+                // saved field of the futures that await it and as a
+                // `Pin`'s pointee, neither of which the driver's
+                // dropped-type scan certifies.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
+            "std::thread::spawnhook::SpawnHooks"
+            | "std::thread::spawnhook::SpawnHook" => {
+                // The thread spawn-hook list and its nodes.
+                // `SpawnHooks` has a manual `Drop` impl in std, but
+                // it only unlinks the `Arc` chain iteratively to
+                // bound the recursion depth; its observable effect
+                // is the head field's glue, which is the fields'
+                // glue planned here. A `SpawnHook` node has no
+                // impl of its own: its glue is its fields' (the
+                // boxed hook and the next node's `Arc`). Neither
+                // type's impl situation is visible to the name
+                // table (the impl is in std, unrecorded), so the
+                // generic path refuses both.
+                return Some(self.variant_fields_plan(def, args)?);
+            }
+            "std::io::error::CustomOwner" | "core::io::error::CustomOwner" => {
+                // The owner of an `io::Error` custom payload,
+                // "effectively a `Box<Custom>`": its `Drop` impl
+                // calls the payload's stored outer-drop function,
+                // which drops the boxed `Custom` value in the
+                // allocation the owner points at. In the value
+                // model that allocation holds the `Custom` payload
+                // the `IoCustomOwnerFromBox` builtin assembled, and
+                // the only owned part of it is the boxed trait
+                // object at field 1 -- exactly the payload glue the
+                // packed representation's drop runs (see
+                // `DropPlan::IoErrorRepr`). The plan is the box
+                // plan over that field plan: the owner's value is
+                // the one-field aggregate around the allocation
+                // pointer, the shape the box plan's wrapper-chain
+                // judgment descends.
+                return Some(P::BoxPointee {
+                    pointee: Box::new(P::At {
+                        path: vec![RefProj::Field(1)],
+                        plan: Box::new(P::Dyn),
+                    }),
+                });
+            }
             "std::result::Result" => {
                 // Same value shape as `Option`: variant 0 is `Ok`,
                 // variant 1 is `Err`, the payload sits at field 0.

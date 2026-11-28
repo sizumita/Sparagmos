@@ -4744,3 +4744,147 @@ fn run_mode_packed_struct_drop_aligned_record() {
         "",
     );
 }
+
+// ----- Drop glue for std-internal types (census B-8) -----
+
+const POLL_FN_DROP_SRC: &str = r#"
+use std::future::{poll_fn, Future};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+struct Guard(&'static str);
+impl Drop for Guard {
+    fn drop(&mut self) { println!("dropped {}", self.0); }
+}
+
+fn main() {
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(&waker);
+    {
+        let g = Guard("capture");
+        let fut = poll_fn(move |_| { let _ = &g; Poll::Ready(()) });
+        let mut fut = pin!(fut);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(()));
+        println!("polled");
+    }
+    println!("direct done");
+    {
+        let fut = async {
+            let g = Guard("suspended");
+            let mut first = true;
+            poll_fn(move |_| {
+                let _ = &g;
+                if first { first = false; Poll::Pending } else { Poll::Ready(()) }
+            }).await;
+            println!("resumed");
+        };
+        let mut fut = pin!(fut);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+        println!("suspended now");
+    }
+    println!("after");
+}
+"#;
+
+#[test]
+fn run_mode_poll_fn_future_drop_runs_capture_destructors() {
+    // `std::future::PollFn` is a one-field adapter with no `Drop`
+    // impl of its own, but the drop-glue builder's generic path
+    // refused it as a foreign ADT whose impl it could not rule
+    // out, so every `Drop` of a `poll_fn` future -- directly, as a
+    // `Pin`'s pointee, or as a saved field of a suspended async
+    // block -- stopped the conversion with "unsupported
+    // terminator: Drop" (tests/ui/async-await/async-drop/
+    // async-drop-initial.rs, where a `PollFn` is the
+    // `test_idempotency` future held by the async-drop futures).
+    run_ok(
+        "poll-fn-drop",
+        POLL_FN_DROP_SRC,
+        "polled\ndropped capture\ndirect done\nsuspended now\ndropped suspended\nafter\n",
+    );
+}
+
+const IO_ERROR_CUSTOM_DROP_SRC: &str = r#"
+use std::fmt;
+#[derive(Debug)]
+struct MyErr;
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "my err") }
+}
+impl std::error::Error for MyErr {}
+impl Drop for MyErr {
+    fn drop(&mut self) { println!("MyErr dropped"); }
+}
+fn main() {
+    {
+        let e = std::io::Error::new(std::io::ErrorKind::Other, MyErr);
+        println!("kind={:?}", e.kind());
+    }
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_io_error_custom_payload_drop_runs() {
+    // Dropping an `io::Error` data value whose `Custom` variant
+    // holds a `core::io::error::CustomOwner` stopped the
+    // conversion with "unsupported terminator: Drop": the owner
+    // is a foreign ADT whose `Drop` impl (a call through the
+    // payload's stored outer-drop function pointer) the builder
+    // could neither execute nor rule out. The modelled plan runs
+    // the boxed trait object's glue in the owner's allocation,
+    // exactly as the packed representation's drop does, so the
+    // payload's destructor runs here.
+    run_ok(
+        "io-error-custom-drop",
+        IO_ERROR_CUSTOM_DROP_SRC,
+        "kind=Other\nMyErr dropped\nafter drop\n",
+    );
+}
+
+const SPAWN_HOOK_SRC: &str = r#"
+#![feature(thread_spawn_hook)]
+fn main() {
+    std::thread::add_spawn_hook(|_| || { println!("child hook"); });
+    std::thread::add_spawn_hook(|_| || { println!("child hook2"); });
+    println!("registered");
+}
+"#;
+
+#[test]
+fn run_mode_spawn_hook_registration_past_drop_conversion() {
+    // Registering a thread spawn hook drops `SpawnHooks` values
+    // (the thread-local list head taken out of its `Cell` and the
+    // scope-end locals of std's hook functions); the drop-glue
+    // builder refused that foreign std-internal type, so the
+    // conversion stopped with "unsupported terminator: Drop"
+    // (tests/ui/std/add-spawn-hook-reentrancy-159923.rs). The
+    // conversion now passes that point: registration completes
+    // and the run stops later, in the drop of the hook list's
+    // `Arc` chain, whose handles were built through the raw
+    // allocation path and do not carry the reference-counted
+    // handle shape the count machinery recognises -- a separate
+    // mechanism from the `Drop` conversion.
+    let dir = temp_dir("spawn-hook-drop");
+    let src = fixture(&dir, "case.rs", SPAWN_HOOK_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "registered\n",
+        "hook registration must complete; stderr={stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the run stops at the Arc chain drop, past conversion; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("unsupported terminator: Drop"),
+        "the Drop conversion must not be the stop: {stderr}"
+    );
+    assert!(
+        stderr.contains("reference-counted handle drop glue"),
+        "the stop is the Arc handle shape, past the Drop conversion: {stderr}"
+    );
+}
