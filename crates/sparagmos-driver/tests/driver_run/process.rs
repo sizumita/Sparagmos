@@ -1179,6 +1179,98 @@ fn main() {
 }
 "#;
 
+const PROCESS_HOST_STDIO_CHAIN_SRC: &str = r#"
+use std::fs::File;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+
+// The `tests/ui/std/stdio-from.rs` chain, in miniature:
+//     $ me <file | me | me >file
+// Each child doubles what it reads, so one input line
+// reaches the output file eight times. The middle child's
+// stdin is the first child's taken `ChildStdout`, and its
+// stdout is the last child's taken `ChildStdin`: the last
+// child observes end-of-file on its stdin only once every
+// writer end of that pipe is closed -- including the
+// parent-side copy the builder's `Stdio` held, whose drop
+// the model must settle at spawn or the chain deadlocks
+// (the parent waits on the last child, which reads its
+// stdin forever).
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && matches!(args[1].as_str(), "first" | "second" | "third") {
+        // Child: double everything on stdin onto stdout.
+        let mut input = vec![];
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        return;
+    }
+    let dir = &args[1];
+    let me = std::env::current_exe().unwrap();
+    let input_path = format!("{dir}/chain-input");
+    let output_path = format!("{dir}/chain-output");
+    File::create(&input_path)
+        .unwrap()
+        .write_all(b"foo\n")
+        .unwrap();
+
+    let mut child1 = Command::new(&me)
+        .arg("first")
+        .stdin(File::open(&input_path).unwrap())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child3 = Command::new(&me)
+        .arg("third")
+        .stdin(Stdio::piped())
+        .stdout(File::create(&output_path).unwrap())
+        .spawn()
+        .unwrap();
+    let mut child2 = Command::new(&me)
+        .arg("second")
+        .stdin(child1.stdout.take().unwrap())
+        .stdout(child3.stdin.take().unwrap())
+        .spawn()
+        .unwrap();
+
+    assert!(child1.wait().unwrap().success());
+    assert!(child2.wait().unwrap().success());
+    assert!(child3.wait().unwrap().success());
+
+    let mut data = String::new();
+    File::open(&output_path)
+        .unwrap()
+        .read_to_string(&mut data)
+        .unwrap();
+    assert_eq!(data.lines().count(), 8);
+    for line in data.lines() {
+        assert_eq!(line, "foo");
+    }
+    println!("stdio-chain-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_host_stdio_chain_child_stdin_as_stdout() {
+    let dir = temp_dir("proc-host-stdio-chain");
+    let src = fixture(
+        &dir,
+        "process_host_stdio_chain.rs",
+        PROCESS_HOST_STDIO_CHAIN_SRC,
+    );
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let out = run_driver_with_process_host_timeout(
+        &src,
+        &["--guest-arg", &dir_arg],
+        &dir,
+        std::time::Duration::from_secs(120),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "stdio-chain-ok\n");
+}
+
 #[test]
 fn run_mode_process_host_stdio_from_file_and_child_handles() {
     let dir = temp_dir("proc-host-stdio-from");
