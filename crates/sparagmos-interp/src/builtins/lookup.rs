@@ -1004,7 +1004,9 @@ fn float128_method(method: &str) -> Option<Builtin> {
 /// [`lookup`]: super::lookup
 pub(crate) fn direct_intrinsic_lookup(canonical: &str) -> Option<Builtin> {
     Some(match canonical {
-        "std::intrinsics::caller_location" => Builtin::CallerLocation,
+        "std::intrinsics::caller_location" | "core::intrinsics::caller_location" => {
+            Builtin::CallerLocation
+        }
         "std::intrinsics::va_arg" | "core::intrinsics::va_arg" => Builtin::VaArg,
         _ => return None,
     })

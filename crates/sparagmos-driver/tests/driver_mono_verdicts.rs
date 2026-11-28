@@ -756,6 +756,57 @@ fn shimmed_must_override_intrinsic_converts() {
 }
 
 #[test]
+fn locally_declared_codegen_served_intrinsic_converts() {
+    // A `#[rustc_intrinsic]` declaration has no MIR body in any
+    // backend: code generation serves the call in the caller.
+    // The collector credited such a declaration only when a
+    // demand reached it; declared in the target crate and
+    // accounted by the item loop instead, it read as a
+    // target-crate skip, which failed the cargo-shim build-std
+    // conversion of core (its lib.rs declares the codegen-served
+    // float and fence intrinsics).
+    let case = Case::new("local-codegen-intrinsic");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn sqrtf32(x: f32) -> f32;\n\
+         fn main() { let _x = unsafe { sqrtf32(2.0f32) }; }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.lines().any(|l| {
+            l.starts_with("target-crate converted:") && l.ends_with("skipped: 0")
+        }),
+        "the intrinsic declaration must count as converted: {stdout}"
+    );
+}
+
+#[test]
+fn locally_declared_caller_location_converts() {
+    // `caller_location` is served by the interpreter's model
+    // under both its `std::` and its `core::` canonical
+    // spellings: when core itself is the target crate, the
+    // intrinsic lookup re-canonicalizes the definition's name
+    // to the `core::` form, which the registry missed, so the
+    // override verdict rejected core's own build (intrinsic
+    // `caller_location` must be overridden by codegen backend,
+    // but isn't). A guest crate declaring the intrinsic itself
+    // reaches the same lookup.
+    let case = Case::new("local-caller-location");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn caller_location() -> &'static std::panic::Location<'static>;\n\
+         fn main() { let _l = caller_location(); }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+}
+
+#[test]
 fn codegen_only_float_intrinsic_converts() {
     // `sqrtf32` must be overridden too, and the interpreter
     // has no model for the sized float spellings — but code

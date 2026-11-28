@@ -17,6 +17,39 @@ fn fail_all(
     }
 }
 
+/// Whether a demand for this instance is served without a
+/// body: the instance is a compiler intrinsic, and a backend
+/// serves the call without a converted body — the interpreter
+/// models it, code generation lowers it, or its calls are
+/// confined to constant contexts and evaluated there (the
+/// served judgement `mono_check` applies in its intrinsic
+/// override check). A crate that declares such an intrinsic
+/// — core itself, in a build-std compilation — otherwise
+/// fails every demand naming the declaration, although the
+/// declaration is exactly as served there as in any other
+/// crate.
+pub(crate) fn bodyless_intrinsic_served(
+    inst: &rustc_public::mir::mono::Instance,
+) -> bool {
+    if !matches!(
+        inst.kind,
+        rustc_public::mir::mono::InstanceKind::Intrinsic
+            | rustc_public::mir::mono::InstanceKind::LlvmIntrinsic
+    ) && rustc_public::ty::FnDef(inst.def.def_id())
+        .as_intrinsic()
+        .is_none()
+    {
+        return false;
+    }
+    let canonical =
+        sparagmos_interp::builtins::canonical_name(&inst.def.def_id().name());
+    if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+        return true;
+    }
+    let bare = canonical.rsplit("::").next().unwrap_or(&canonical);
+    sparagmos_driver::mono_check::intrinsic_served_without_body(bare)
+}
+
 /// Fail the owners of one demand fetch (`fetch_instance_body`)
 /// with the fetch's reason, translating the body-fetch
 /// normalization overflow (see
@@ -300,6 +333,23 @@ pub(crate) fn collect_local_instances(
             targets.extend(sparagmos_driver::reach::fndef_constants(&body));
         }
         for (def, args) in targets {
+            // Mentions whose arguments still mention parameters
+            // are not demands this pass can satisfy: the seed
+            // body is itself generic (a generic-context constant
+            // body is the standing shape -- the item loop
+            // converts those, and their mentions keep the
+            // enclosing definition's parameters), and resolving
+            // or fetching such an instance poses the
+            // normalization of a projection over a bare
+            // parameter, which the compiler cannot answer in a
+            // fully-monomorphized environment. Monomorphized
+            // bodies that use the generic definition carry the
+            // substituted mentions, so the demand arrives again
+            // in concrete form wherever it is real (the same
+            // judgment the closure and drop demand passes make).
+            if args_mention_params(&args) {
+                continue;
+            }
             let referenced = def.def_id();
             let inst = match sparagmos_driver::convert::resolve_instance_guarded(def, &args) {
                 Some(inst) => inst,
@@ -426,19 +476,21 @@ pub(crate) fn collect_local_instances(
             // never matches. An intrinsic with no model falls
             // through: with a fallback body, the body is
             // converted and run; without one, the demand is
-            // unmet below.
+            // unmet below -- unless the backend the verdict
+            // mirrors serves it without a model (code
+            // generation lowers it, or its calls are confined
+            // to constant contexts), which
+            // `bodyless_intrinsic_served` decides.
             if matches!(
                 inst.kind,
                 rustc_public::mir::mono::InstanceKind::Intrinsic
+                    | rustc_public::mir::mono::InstanceKind::LlvmIntrinsic
             ) || rustc_public::ty::FnDef(inst.def.def_id())
                 .as_intrinsic()
                 .is_some()
             {
                 conv.note_intrinsic(&inst);
-                let canonical = sparagmos_interp::builtins::canonical_name(
-                    &inst.def.def_id().name(),
-                );
-                if sparagmos_interp::builtins::intrinsic_lookup(&canonical).is_some() {
+                if bodyless_intrinsic_served(&inst) {
                     for owner in &owners {
                         demands.entry(*owner).or_default().converted += 1;
                     }
@@ -781,6 +833,12 @@ pub(crate) fn collect_closure_instances(
                     continue;
                 }
                 if !inst.has_body() {
+                    if bodyless_intrinsic_served(&inst) {
+                        for owner in &owners {
+                            target_demands.entry(*owner).or_default().converted += 1;
+                        }
+                        continue;
+                    }
                     fail_all(&mut *target_demands, &owners, "no MIR body available".to_string());
                     continue;
                 }
@@ -1040,6 +1098,12 @@ pub(crate) fn collect_const_closure_instances(
                     return;
                 }
                 if !inst.has_body() {
+                    if bodyless_intrinsic_served(&inst) {
+                        for owner in &owners {
+                            target_demands.entry(*owner).or_default().converted += 1;
+                        }
+                        return;
+                    }
                     // A foreign data constructor mentioned by a
                     // constant (a tuple-struct constructor coerced
                     // to a `dyn Fn` value in a promoted constant
@@ -1282,6 +1346,12 @@ pub(crate) fn collect_const_fn_instances(
                     return;
                 }
                 if !inst.has_body() {
+                    if bodyless_intrinsic_served(&inst) {
+                        for owner in &owners {
+                            target_demands.entry(*owner).or_default().converted += 1;
+                        }
+                        return;
+                    }
                     // A foreign data constructor mentioned by a
                     // constant (a tuple-struct constructor coerced
                     // to a `dyn Fn` value in a promoted constant
@@ -1495,6 +1565,12 @@ pub(crate) fn collect_coroutine_instances(
                             continue;
                         }
                         if !inst.has_body() {
+                            if bodyless_intrinsic_served(&inst) {
+                                for owner in &owners {
+                                    demands.entry(*owner).or_default().converted += 1;
+                                }
+                                continue;
+                            }
                             fail_all(
                                 &mut *demands,
                                 &owners,

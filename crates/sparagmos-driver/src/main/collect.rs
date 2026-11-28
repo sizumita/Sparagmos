@@ -652,6 +652,27 @@ fn collect() -> ControlFlow<()> {
                     account_trivial_const(&mut report, name);
                     continue;
                 }
+                // A compiler intrinsic declaration has no body
+                // in any backend: the call is served in the
+                // caller (the interpreter's model, code
+                // generation's lowering, or constant-context
+                // evaluation), so a declaration the served
+                // judgement covers is converted without a body,
+                // like a demanded data constructor. An intrinsic
+                // no backend serves keeps the skip below (and,
+                // when called, the override check's error).
+                if bodyless_intrinsic_served(&instance) {
+                    conv.note_intrinsic(&instance);
+                    report.bodyless_converted += 1;
+                    report.functions.push(FnReport {
+                        name,
+                        blocks: 0,
+                        locals: 0,
+                        arg_count: 0,
+                        outcome: FnOutcome::Converted,
+                    });
+                    continue;
+                }
                 // An extern-item-impl (EII) function declaration
                 // has no body of its own; the registered
                 // implementation's body, instantiated with the
