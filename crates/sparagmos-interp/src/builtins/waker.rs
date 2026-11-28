@@ -200,15 +200,25 @@ impl<'a> Interpreter<'a> {
                 vtable.kind_name(),
             ));
         };
-        let Some(Value::FnPtr(clone_name)) = vtable_fields.first() else {
+        // The clone entry is taken as the value it was stored
+        // as: a plain function item is a `FnPtr`, while a
+        // non-capturing closure literal in the vtable constant
+        // stays a `Closure` value (its coercion to a function
+        // pointer is a type-level fact the value model does not
+        // rewrite), exactly as the wake entries above and the
+        // `WakerDrop` glue judge their entries.
+        let Some(clone_callable) = vtable_fields.first().filter(|entry| {
+            matches!(entry, Value::FnPtr(_) | Value::Closure { .. })
+        }) else {
             return Err(InterpError::type_mismatch(
                 format!("builtin {name}"),
                 "a RawWakerVTable with a function-pointer clone entry",
                 vtable.kind_name(),
             ));
         };
-        let clone_name = clone_name.clone();
-        let new_raw = self.call_sync(frames, &clone_name, vec![data])?;
+        let clone_callable = clone_callable.clone();
+        let new_raw =
+            self.call_callable_sync(frames, &clone_callable, None, vec![data])?;
         Ok(if wrapped {
             Value::Enum { variant, fields: vec![new_raw] }
         } else {
