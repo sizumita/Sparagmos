@@ -804,6 +804,64 @@ impl<'a> Interpreter<'a> {
         })?;
         Ok(())
     }
+
+    /// Grow the capacity of the vector a resolved target
+    /// denotes, when the target holds the real aggregate
+    /// form, on a detached copy of the value, written back
+    /// through the ordinary resolved write -- the route
+    /// `vec_append_resolved` takes for the same form, for
+    /// the same reason: growth can materialise the storage
+    /// behind a storage-less buffer pointer, an allocation
+    /// the modify path cannot run while it lends the slot
+    /// under the allocation store's borrow (a vector inside
+    /// an allocation -- a string's vector inside a vector
+    /// element or a box pointee, above all). The target may
+    /// denote the vector place itself or the string place
+    /// whose vector field the capacity operates on (the
+    /// form a string materialisation just wrote back; see
+    /// `materialise_resolved_string`). Returns whether the
+    /// target held the real form and the growth ran here;
+    /// every other form is left to the caller's modify path.
+    pub(super) fn vec_reserve_real_form(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        additional: usize,
+        exact: bool,
+        uninit_elem: &Value,
+        elem_size: usize,
+    ) -> InterpResult<bool> {
+        let Ok(current) = self.read_resolved_peek(frames, target) else {
+            return Ok(false);
+        };
+        // The vector value the capacity operates on: the
+        // target's own value when it denotes the vector
+        // place, or the vector field inside the one-field
+        // string wrapper when it denotes the string place.
+        let string_slot = if vec_real_aggregate_parts(&current).is_some() {
+            false
+        } else if matches!(
+            &*current,
+            Value::Enum { fields, .. } if fields.len() == 1
+                && vec_real_aggregate_parts(&fields[0]).is_some()
+        ) {
+            true
+        } else {
+            return Ok(false);
+        };
+        let mut value = current.into_owned();
+        let slot: &mut Value = if string_slot {
+            let Value::Enum { fields, .. } = &mut value else {
+                unreachable!("the wrapper shape was checked above")
+            };
+            &mut fields[0]
+        } else {
+            &mut value
+        };
+        vec_ensure_capacity(self, slot, additional, exact, uninit_elem, elem_size);
+        self.write_resolved(frames, target, value)?;
+        Ok(true)
+    }
 }
 
 /// Append `items` to the vector value in `slot`, in place:

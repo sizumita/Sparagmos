@@ -8256,12 +8256,36 @@ impl<'a> Interpreter<'a> {
                 let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 let target = self.deref_value(frames, &vals[0])?;
                 let exact = name.ends_with("reserve_exact");
+                // A reserve on a string's vector place is
+                // the entry of a body-level raw-parts walk
+                // over the string: prepare the form the walk
+                // operates on at the target first (see
+                // `materialise_resolved_string`), because the
+                // modification below lends the slot under the
+                // allocation store's borrow when the string
+                // lives inside an allocation, where the
+                // preparation's own allocation cannot run.
+                self.materialise_resolved_string(frames, &target)?;
+                // A target holding the real aggregate form
+                // grows on a detached copy (see
+                // `vec_reserve_real_form`): growth can
+                // materialise a storage-less buffer, which
+                // the modify path below cannot allocate
+                // while it lends the slot.
+                if self.vec_reserve_real_form(
+                    frames,
+                    &target,
+                    additional,
+                    exact,
+                    &uninit_elem,
+                    elem_size,
+                )? {
+                    return Ok(Value::Unit);
+                }
                 self.modify_resolved(frames, &target, |slot| {
-                    // A reserve on a string's vector place is
-                    // the entry of a body-level raw-parts walk
-                    // over the string: the walk operates on the
-                    // vector slot the raw-parts entry prepares
-                    // (see `raw_parts_vec_slot`).
+                    // The walk operates on the vector slot
+                    // the raw-parts entry prepared (see
+                    // `raw_parts_vec_slot`).
                     let slot = self.raw_parts_vec_slot(slot);
                     vec_ensure_capacity(self, slot, additional, exact, &uninit_elem, elem_size);
                     Ok(Value::Unit)
@@ -8324,21 +8348,35 @@ impl<'a> Interpreter<'a> {
                         usize::try_from(additional).unwrap_or(usize::MAX);
                     let target = self.deref_value(frames, &vals[0])?;
                     let exact = name.ends_with("try_reserve_exact");
-                    self.modify_resolved(frames, &target, |slot| {
-                        // As in `VecReserve` above: a reserve
-                        // on a string's vector place opens a
-                        // body-level raw-parts walk.
-                        let slot = self.raw_parts_vec_slot(slot);
-                        vec_ensure_capacity(
-                            self,
-                            slot,
-                            additional,
-                            exact,
-                            &uninit_elem,
-                            elem_size,
-                        );
-                        Ok(Value::Unit)
-                    })?;
+                    // As in `VecReserve` above: prepare the
+                    // raw-parts form at the target first.
+                    self.materialise_resolved_string(frames, &target)?;
+                    // As in `VecReserve` above: a real-form
+                    // target grows on a detached copy.
+                    if !self.vec_reserve_real_form(
+                        frames,
+                        &target,
+                        additional,
+                        exact,
+                        &uninit_elem,
+                        elem_size,
+                    )? {
+                        self.modify_resolved(frames, &target, |slot| {
+                            // As in `VecReserve` above: a reserve
+                            // on a string's vector place opens a
+                            // body-level raw-parts walk.
+                            let slot = self.raw_parts_vec_slot(slot);
+                            vec_ensure_capacity(
+                                self,
+                                slot,
+                                additional,
+                                exact,
+                                &uninit_elem,
+                                elem_size,
+                            );
+                            Ok(Value::Unit)
+                        })?;
+                    }
                     Ok(Value::Enum {
                         variant: 0,
                         fields: vec![Value::Unit],

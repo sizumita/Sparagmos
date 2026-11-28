@@ -1943,35 +1943,96 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Materialise the storage a string's raw parts denote
+    /// at the place a resolved target denotes, when the
+    /// target holds the abstract string form, and report
+    /// whether it did: the materialised wrapper (see
+    /// `materialise_string_slot`) is built detached and
+    /// written back through the ordinary resolved write, so
+    /// the slot a raw-parts walk's entry then modifies (a
+    /// `Vec::reserve` above all) already holds the aggregate
+    /// form. The preparation cannot run inside that
+    /// modification: when the string lives inside an
+    /// allocation -- a vector element, a box pointee -- the
+    /// modification lends the slot under the allocation
+    /// store's own borrow, and materialising there would
+    /// allocate the byte buffer inside the borrow, which
+    /// the store refuses. A target whose form the plain
+    /// read cannot judge (a projection crossing a union
+    /// field, whose write composes with the held field's
+    /// bytes) is left to the modification's own paths,
+    /// exactly as it stands.
+    pub(crate) fn materialise_resolved_string(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+    ) -> InterpResult<bool> {
+        if matches!(target, Resolved::Value(..)) {
+            return Ok(false);
+        }
+        let projection: &[RefProj] = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection,
+            Resolved::Value(..) => unreachable!("value targets return above"),
+        };
+        if projection
+            .iter()
+            .any(|step| matches!(step, RefProj::UnionField { .. }))
+        {
+            return Ok(false);
+        }
+        // A target whose projection crosses a stored pointer
+        // denotes the pointee's storage past the pointer
+        // (see `pointer_crossed_target`): judge the crossed
+        // target, as the write and modify paths do.
+        if let Some(crossed) = self.pointer_crossed_target(frames, target) {
+            return self.materialise_resolved_string(frames, &crossed);
+        }
+        let Ok(value) = self.read_resolved(frames, target) else {
+            return Ok(false);
+        };
+        if !matches!(value, Value::Str(_)) {
+            return Ok(false);
+        }
+        let mut value = value;
+        self.materialise_string_slot(&mut value);
+        self.write_resolved(frames, target, value)?;
+        Ok(true)
+    }
+
     /// The vector slot a body-level raw-parts walk over a
     /// string operates on, given the slot its `Vec::reserve`
-    /// resolved: a slot holding the abstract string form is
-    /// materialised first (see `materialise_string_slot`),
-    /// and the walk's slot is the vector field inside the
-    /// materialised wrapper -- the navigation that resolved
-    /// the walk's target could not descend past the abstract
-    /// form, so it lent the string's own slot, while a walk
-    /// over an already-aggregate string resolves to the
-    /// vector field directly and is lent that slot as it
-    /// stands.
+    /// resolved: a slot already holding the vector's real
+    /// aggregate form stands as it is (the navigation
+    /// descended the string's wrapper to the vector field);
+    /// a slot holding the one-field string wrapper (the
+    /// navigation lent the string's own slot) descends to
+    /// the vector field inside it. A slot still holding the
+    /// abstract string form -- the target's preparation
+    /// ahead of the lend declined it (see
+    /// `materialise_resolved_string`) -- is materialised
+    /// in place first, the entry's original route.
     pub(crate) fn raw_parts_vec_slot<'x>(
         &self,
         slot: &'x mut Value,
     ) -> &'x mut Value {
-        if !matches!(slot, Value::Str(_)) {
+        if crate::builtins::vec_real_aggregate_parts(slot).is_some() {
             return slot;
         }
-        self.materialise_string_slot(slot);
-        // The materialised value is the one-field string
-        // wrapper by construction: the walk's slot is the
-        // vector field inside it.
-        let has_field = matches!(
+        if matches!(slot, Value::Str(_)) {
+            self.materialise_string_slot(slot);
+        }
+        // The string wrapper by shape: one field, holding
+        // the vector's real aggregate form.
+        let is_wrapper = matches!(
             &*slot,
-            Value::Enum { fields, .. } if !fields.is_empty()
+            Value::Enum { fields, .. } if fields.len() == 1
+                && crate::builtins::vec_real_aggregate_parts(&fields[0]).is_some()
         );
-        if has_field {
+        if is_wrapper {
             let Value::Enum { fields, .. } = &mut *slot else {
-                unreachable!("field presence checked above")
+                unreachable!("wrapper shape checked above")
             };
             &mut fields[0]
         } else {
