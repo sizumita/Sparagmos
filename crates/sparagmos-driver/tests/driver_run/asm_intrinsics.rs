@@ -381,6 +381,39 @@ fn run_mode_inline_asm_const_operands() {
     run_ok("asm-const", ASM_CONST_SRC, "7 15\n");
 }
 
+const ASM_CONST_USIZE_SRC: &str = r#"
+use std::arch::asm;
+fn const_generic<const X: usize>() -> usize {
+    unsafe {
+        let a: usize;
+        asm!("mov {}, {}", out(reg) a, const X);
+        a
+    }
+}
+const fn constfn(x: usize) -> usize { x }
+fn main() {
+    unsafe {
+        let a: usize;
+        asm!("mov {}, {}", out(reg) a, const 5);
+        let b: usize;
+        asm!("mov {}, {}", out(reg) b, const constfn(5));
+        let c: usize;
+        asm!("mov {}, {}", out(reg) c, const constfn(5) + constfn(5));
+        println!("{a} {b} {c} {}", const_generic::<5>());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_const_usize_operands() {
+    // Regression (tests/ui/asm/aarch64/const.rs and
+    // tests/ui/asm/x86_64/const.rs): `usize` asm const operands
+    // used to panic during Stable MIR conversion with "attempt
+    // to shift left with overflow" when the operand's bits were
+    // masked to its 64-bit width in `asm_const_literal`.
+    run_ok("asm-const-usize", ASM_CONST_USIZE_SRC, "5 5 10 5\n");
+}
+
 const ASM_UNARY_SRC: &str = r#"
 use std::arch::asm;
 fn main() {

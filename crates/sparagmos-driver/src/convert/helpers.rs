@@ -1123,7 +1123,14 @@ pub(crate) fn asm_const_literal(raw: &str) -> Option<(u64, u32)> {
         None => return None,
     };
     let value: i128 = num.parse().ok()?;
-    let bits = if width >= 128 {
+    // Masking to the type width must not shift by the width of
+    // the mask type itself: a 64-bit (or wider) operand already
+    // fills the returned `u64`, so its bits are the value's low
+    // 64 bits as-is. Shifting `1u64 << 64` panics with "attempt
+    // to shift left with overflow" under overflow checks, which
+    // is what `usize`/`u64`/`i64` asm const operands (e.g.
+    // tests/ui/asm/{aarch64,x86_64}/const.rs) used to hit.
+    let bits = if width >= 64 {
         value as u64
     } else {
         (value as u64) & ((1u64 << width) - 1)
@@ -1393,5 +1400,71 @@ fn ty_mentions_param_walk(ty: &Ty) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asm_const_literal;
+
+    #[test]
+    fn asm_const_literal_narrow_widths_mask_to_width() {
+        assert_eq!(
+            asm_const_literal("Const { value: const 5_u8 }"),
+            Some((5, 8))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_i8 }"),
+            Some((0xFF, 8))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_i16 }"),
+            Some((0xFFFF, 16))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_i32 }"),
+            Some((0xFFFF_FFFF, 32))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const 7_u32 }"),
+            Some((7, 32))
+        );
+    }
+
+    #[test]
+    fn asm_const_literal_full_width_operands_do_not_overflow() {
+        // Regression: 64-bit asm const operands (the `usize`
+        // constants of tests/ui/asm/aarch64/const.rs and
+        // tests/ui/asm/x86_64/const.rs) used to panic in this
+        // conversion with "attempt to shift left with overflow"
+        // from masking with `1u64 << 64`.
+        assert_eq!(
+            asm_const_literal("Const { value: const 5_usize }"),
+            Some((5, 64))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const 5_u64 }"),
+            Some((5, 64))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_i64 }"),
+            Some((u64::MAX, 64))
+        );
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_isize }"),
+            Some((u64::MAX, 64))
+        );
+        // Wider than the returned bits: the low 64 bits are kept.
+        assert_eq!(
+            asm_const_literal("Const { value: const -1_i128 }"),
+            Some((u64::MAX, 128))
+        );
+    }
+
+    #[test]
+    fn asm_const_literal_rejects_non_integer_shapes() {
+        assert_eq!(asm_const_literal("Const { value: const X }"), None);
+        assert_eq!(asm_const_literal("In { reg: RegClass(X86(reg)) }"), None);
+        assert_eq!(asm_const_literal("Const { value: const 5_f32 }"), None);
     }
 }
