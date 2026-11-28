@@ -1246,3 +1246,143 @@ fn run_mode_slice_iter_write_through_cell_field_seq() {
         "tuple 11 12 42\narray 11 12 13\nmut [11, 12, 13]\n",
     );
 }
+
+const SLICE_ITER_CELL_WRITE_OUTER_STEP_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Holder {
+    v: Vec<Cell<i32>>,
+}
+
+struct Tagged {
+    tag: i32,
+    v: Vec<Cell<i32>>,
+}
+
+fn main() {
+    let vv: Vec<Vec<Cell<i32>>> = vec![
+        vec![Cell::new(1), Cell::new(2), Cell::new(3)],
+        vec![Cell::new(4), Cell::new(5)],
+    ];
+    for c in vv[0].iter() {
+        c.set(c.get() + 10);
+    }
+    println!("vv0 {} {} {}", vv[0][0].get(), vv[0][1].get(), vv[0][2].get());
+    for c in vv[1].iter() {
+        c.set(c.get() + 100);
+    }
+    println!("vv1 {} {}", vv[1][0].get(), vv[1][1].get());
+    let hs: Vec<Holder> = vec![
+        Holder { v: vec![Cell::new(1), Cell::new(2)] },
+        Holder { v: vec![Cell::new(3)] },
+    ];
+    for c in hs[0].v.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("hs0 {} {}", hs[0].v[0].get(), hs[0].v[1].get());
+    for c in &hs[1].v {
+        c.set(c.get() + 10);
+    }
+    println!("hs1 {}", hs[1].v[0].get());
+    let ts: Vec<Tagged> = vec![Tagged { tag: 7, v: vec![Cell::new(1), Cell::new(2)] }];
+    for c in ts[0].v.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("ts0 {} {} {}", ts[0].tag, ts[0].v[0].get(), ts[0].v[1].get());
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_write_through_cell_outer_step() {
+    // A sequence behind an outer element step: the inner
+    // vector of a `Vec<Vec<Cell>>` element, and a struct
+    // field's vector inside a `Vec<Holder>` element (the
+    // field in position 0 and in a later position alike).
+    // The element positions the builder produces for the
+    // inner sequence end in a field step after the outer
+    // index step, which the step machinery read as a field
+    // of the outer element, and the builder's entry-suffix
+    // advance read the field step that selects the inner
+    // vector (in field position 0) as a whole-value entry
+    // into the outer element -- so the storage state was
+    // declined (or built over the outer sequence) and a
+    // write through a yielded reference stopped with
+    // "expected mutable place, found constant aggregate".
+    // The spanned length denominates the two readings: a
+    // position that is itself a sequence of exactly the
+    // spanned length is that sequence behind a genuine
+    // field step, and the element step the builder appends
+    // for it is spelled as the index step the machinery
+    // reads back. The writes land in the inner vectors.
+    run_ok(
+        "slice-iter-cell-write-outer-step",
+        SLICE_ITER_CELL_WRITE_OUTER_STEP_SRC,
+        "vv0 11 12 13\nvv1 104 105\nhs0 11 12\nhs1 13\nts0 7 11 12\n",
+    );
+}
+
+const SLICE_ITER_MUT_OUTER_STEP_SRC: &str = r#"
+struct Holder {
+    v: Vec<i32>,
+}
+
+fn main() {
+    let mut vv: Vec<Vec<i32>> = vec![vec![1, 2, 3], vec![4, 5]];
+    for x in vv[0].iter_mut() {
+        *x += 10;
+    }
+    println!("vv0 {:?}", vv[0]);
+    for x in &mut vv[1] {
+        *x += 100;
+    }
+    println!("vv1 {:?}", vv[1]);
+    let mut hs: Vec<Holder> = vec![Holder { v: vec![1, 2] }, Holder { v: vec![3] }];
+    for x in hs[0].v.iter_mut() {
+        *x += 10;
+    }
+    println!("hs0 {:?}", hs[0].v);
+    for x in &mut hs[1].v {
+        *x += 10;
+    }
+    println!("hs1 {:?}", hs[1].v);
+    let mut a: Vec<Holder> = vec![Holder { v: vec![1, 2, 3] }, Holder { v: vec![4] }];
+    for x in a[0].v.iter_mut() {
+        *x += 10;
+    }
+    println!("a0 {:?}", a[0].v);
+    let mut b: Vec<Holder> = vec![Holder { v: vec![1, 2] }, Holder { v: vec![3] }, Holder { v: vec![4] }];
+    for x in b[1].v.iter_mut() {
+        *x += 10;
+    }
+    println!("b1 {:?}", b[1].v);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_behind_outer_step() {
+    // `iter_mut` over a sequence behind an outer element
+    // step, in both state shapes: the modelled `&mut`
+    // iteration (the `slice::IterMut` states the builtins
+    // build, whose element positions carry the same
+    // field-after-index ambiguity as the shared case) and
+    // the collected `<[T]>::iter_mut` body over a raw-parts
+    // slice, whose data pointer denotes the inner vector's
+    // position. For the field vector inside a `Vec<Holder>`
+    // element, the first-element pointer formation read
+    // that position as the outer element entered (the
+    // entered-element fit test: the inner vector's length
+    // fit inside the outer vector at the base index), so
+    // the pointer arithmetic ranged over the outer elements
+    // and the second element's read stopped displaced from
+    // a value boundary. A position whose value is the
+    // slice's own storage aggregate of exactly the fat
+    // length denotes that storage. The `a` and `b` cases
+    // pin the length combinations the fit test separates:
+    // an inner length past the outer count already judged
+    // storage, an inner length within it did not.
+    run_ok(
+        "slice-iter-mut-outer-step",
+        SLICE_ITER_MUT_OUTER_STEP_SRC,
+        "vv0 [11, 12, 13]\nvv1 [104, 105]\nhs0 [11, 12]\nhs1 [13]\na0 [11, 12, 13]\nb1 [13]\n",
+    );
+}
