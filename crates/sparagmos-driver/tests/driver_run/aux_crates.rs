@@ -1132,3 +1132,84 @@ fn run_mode_aux_ctor_as_dyn_fn_value() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ctor ok\n");
 }
+
+
+const AUX_TRAIT_DEP_SRC: &str = r#"
+pub trait Trait {}
+pub struct OtherType;
+pub fn do_something<T: Trait>(_: T) {}
+"#;
+
+const AUX_TRAIT_FAIL_MAIN_SRC: &str = r#"
+extern crate dependency;
+use dependency::{OtherType, do_something};
+fn main() {
+    do_something(OtherType);
+}
+"#;
+
+const AUX_TRAIT_CLEAN_MAIN_SRC: &str = r#"
+extern crate dependency;
+use dependency::do_something;
+struct MyType;
+impl dependency::Trait for MyType {}
+fn main() {
+    do_something(MyType);
+    println!("clean ok");
+}
+"#;
+
+#[test]
+fn run_mode_failing_crate_diagnostic_uses_trimmed_def_paths() {
+    // A converted crate's session carries the trimmed def-path
+    // map (as rustc's own entry configures it), so the
+    // diagnostics it emits print the visible spelling of an
+    // imported item: the trait-bound note names the bound's
+    // function `do_something`, not `dependency::do_something`,
+    // exactly as the native compiler prints it.
+    let dir = temp_dir("aux-trimmed-diag");
+    let aux = fixture(&dir, "dependency.rs", AUX_TRAIT_DEP_SRC);
+    let src = fixture(&dir, "failmain.rs", AUX_TRAIT_FAIL_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("dependency", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a trait-bound failure is a conversion failure; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("required by a bound in `do_something`"),
+        "the bound note uses the trimmed spelling: {stderr}"
+    );
+    assert!(
+        !stderr.contains("required by a bound in `dependency::do_something`"),
+        "the bound note must not use the full def path: {stderr}"
+    );
+}
+
+#[test]
+fn run_mode_clean_conversion_stays_clear_of_the_trimmed_paths_check() {
+    // Evaluating the trimmed-path map is recorded by the
+    // diagnostic context as a promise that a diagnostic
+    // follows, and a clean conversion breaks that promise: it
+    // prints types for its own naming without emitting one.
+    // The conversion therefore runs under
+    // `with_no_trimmed_paths!`, and converting a clean crate
+    // that exercises generic calls into an auxiliary crate
+    // must not trip the teardown panic.
+    let dir = temp_dir("aux-trimmed-clean");
+    let aux = fixture(&dir, "dependency.rs", AUX_TRAIT_DEP_SRC);
+    let src = fixture(&dir, "cleanmain.rs", AUX_TRAIT_CLEAN_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("dependency", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean conversion must succeed; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "clean ok\n");
+    assert!(
+        !stderr.contains("diagnostics were expected"),
+        "the trimmed-paths teardown check must not fire: {stderr}"
+    );
+}
