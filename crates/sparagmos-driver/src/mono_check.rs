@@ -1671,6 +1671,7 @@ pub fn check_required_consts() -> Option<String> {
         finding: None,
         crash: None,
         pending_crash: None,
+        deferred_layout_finding: None,
         recursion_limit_finding: None,
         mono_finding: None,
         force_abandoned: false,
@@ -1698,6 +1699,7 @@ pub fn check_required_consts() -> Option<String> {
         return None;
     }
     walk.finding
+        .or_else(|| walk.deferred_layout_finding.take())
         .or_else(|| generic_export_finding(tcx))
         .or_else(|| duplicate_symbol_finding(tcx, &walk.visited))
         .or_else(|| common_linkage_finding(tcx))
@@ -2779,6 +2781,15 @@ struct RequiredConstWalk<'tcx> {
     /// after `check_bodies`, whose findings name some of the
     /// same rejections more precisely.
     mono_finding: Option<String>,
+    /// The first layout verdict a panicked `check_mono_item`
+    /// force produced (see `process`): the recorded layout
+    /// failure of a type the instance's collection demands.
+    /// Kept apart from `finding` and reported only once the
+    /// walk has run its course, like a force's crash (see
+    /// `pending_crash`): the ABI demand it replays is a
+    /// codegen-phase event, and collection-phase verdicts
+    /// pre-empt it.
+    deferred_layout_finding: Option<String>,
     /// Set by `process` when this instance's `check_mono_item`
     /// force took the abandonment branch (the force panicked
     /// with no errors counted before it) AND the instance is
@@ -3359,6 +3370,38 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 self.force_abandoned = !instance_types_normalize(tcx, instance);
                 tcx.dcx().reset_err_count();
             }
+            // A force that panicked may have died in its ABI
+            // check, on the layout of a type the instance's
+            // collection demands: the panic reaches the walk
+            // with an opaque payload (the query system
+            // delivers a layout cycle by resume, not as a
+            // diagnostic the walk can read), so the verdict
+            // is tied to the conversion's own record — when a
+            // type among the instance's arguments or its
+            // instantiated signature's types is one whose
+            // speculative layout query failed with discounted
+            // diagnostics (see `convert::guarded_layout`),
+            // the failure is this compilation's. The verdict
+            // is deferred like a force's crash (see
+            // `pending_crash`): collection runs before the
+            // ABI demands in the compiler, so a
+            // collection-phase verdict further along the
+            // walk pre-empts it. An instance whose types do
+            // not normalize is one the collector never
+            // forces (see the abandonment branch above), so
+            // it makes no ABI demand to replay — and posing
+            // its signature's queries is exactly what the
+            // abandoned force died doing.
+            if forced.is_err()
+                && self.deferred_layout_finding.is_none()
+                && instance_types_normalize(tcx, instance)
+            {
+                if let Some(ty) = demanded_layout_failure(tcx, instance) {
+                    self.deferred_layout_finding = Some(format!(
+                        "collecting `{key}` demands the layout of                          `{ty}`, whose computation failed (rustc                          reports the layout error for the instances                          it collects; see the diagnostics above)"
+                    ));
+                }
+            }
         }
         // A body the collector collects is one rustc itself
         // materializes in its own pipeline, so the evaluation
@@ -3507,6 +3550,30 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             let Some(mono_const) = self.monomorphize(instance, const_op.const_) else {
                 continue;
             };
+            // A required constant that measures a type's
+            // layout (see `is_layout_measuring_const`) is the
+            // collector itself demanding that layout: when
+            // the conversion's speculative layout query for
+            // the measured type failed and its diagnostics
+            // were discounted (see `convert::guarded_layout`),
+            // the demand makes the failure this compilation's
+            // verdict, the way the evaluation error below
+            // does for a constant that fails to evaluate. A
+            // measured type nothing recorded stays silent:
+            // the query may be one the reference compilation
+            // never poses.
+            if let rustc_middle::mir::Const::Unevaluated(uc, _) = &mono_const {
+                if is_layout_measuring_const(tcx, uc.def) {
+                    if let Some(ty) = recorded_layout_failure(uc.args) {
+                        self.finding = Some(format!(
+                            "a required constant of `{}` demands the layout of                              `{}`, whose computation failed (rustc reports                              the layout error for the instances it collects;                              see the diagnostics above)",
+                            tcx.def_path_str(instance.def.def_id()),
+                            ty
+                        ));
+                        return;
+                    }
+                }
+            }
             match mono_const.eval(tcx, fully_monomorphized(), const_op.span) {
                 Ok(value) => self.chase_value(value),
                 Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
@@ -3820,6 +3887,108 @@ fn unsize_lockstep_tails<'tcx>(
         }
     }
     (source, target)
+}
+
+/// Whether `def` is one of the `SizedTypeProperties`
+/// associated constants whose evaluation is defined by the
+/// measured type's layout — `SIZE`, `ALIGN`, `ALIGNMENT`
+/// and `IS_ZST` in `core::mem` (re-exported through
+/// `std::mem`): a required constant of this shape in a
+/// collected body is the collector demanding the layout of
+/// the constant's self type, the demand the native
+/// compilation answers with the layout query itself.
+fn is_layout_measuring_const(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    def: rustc_span::def_id::DefId,
+) -> bool {
+    let path = tcx.def_path_str(def);
+    (path.starts_with("core::mem::SizedTypeProperties::")
+        || path.starts_with("std::mem::SizedTypeProperties::"))
+        && ["::SIZE", "::ALIGN", "::ALIGNMENT", "::IS_ZST"]
+            .iter()
+            .any(|name| path.ends_with(name))
+}
+
+/// A type search for the first type whose speculative
+/// layout query failed during conversion with discounted
+/// diagnostics (see `convert::layout_failure_recorded`).
+struct RecordedLayoutFailure {
+    hit: Option<rustc_middle::ty::Ty<'static>>,
+}
+
+impl<'tcx> rustc_middle::ty::TypeVisitor<rustc_middle::ty::TyCtxt<'tcx>>
+    for RecordedLayoutFailure
+{
+    type Result = std::ops::ControlFlow<()>;
+
+    fn visit_ty(
+        &mut self,
+        ty: rustc_middle::ty::Ty<'tcx>,
+    ) -> Self::Result {
+        if crate::convert::layout_failure_recorded(ty) {
+            // The registry's types live in the running
+            // compilation's context, which outlives the
+            // walk (the same erasure as the registry's own).
+            self.hit = Some(unsafe {
+                std::mem::transmute::<
+                    rustc_middle::ty::Ty<'tcx>,
+                    rustc_middle::ty::Ty<'static>,
+                >(ty)
+            });
+            return std::ops::ControlFlow::Break(());
+        }
+        use rustc_middle::ty::TypeSuperVisitable as _;
+        ty.super_visit_with(self)
+    }
+}
+
+/// The first recorded layout failure among the types
+/// `value` mentions, rendered for a finding, if any.
+fn recorded_layout_failure<'tcx, V>(value: V) -> Option<String>
+where
+    V: rustc_middle::ty::TypeVisitable<rustc_middle::ty::TyCtxt<'tcx>>,
+{
+    let mut search = RecordedLayoutFailure { hit: None };
+    let _ = value.visit_with(&mut search);
+    search.hit.map(|ty| {
+        use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
+        with_resolve_crate_name!(with_no_trimmed_paths!(format!("{ty}")))
+    })
+}
+
+/// The recorded layout failure a collected instance's own
+/// collection demands, if any: a failure among the types of
+/// the instance's generic arguments (the demanded type
+/// itself for a drop glue) or of its instantiated
+/// signature — the types the per-instance force's ABI
+/// check lays out. The signature is read under containment:
+/// an instance whose signature the queries refuse (a shim
+/// shape) simply has no signature demand to replay.
+fn demanded_layout_failure<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+) -> Option<String> {
+    if let Some(hit) = recorded_layout_failure(instance.args) {
+        return Some(hit);
+    }
+    if !matches!(instance.def, rustc_middle::ty::InstanceKind::Item(_)) {
+        return None;
+    }
+    let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let sig = instance
+            .ty(tcx, fully_monomorphized())
+            .fn_sig(tcx);
+        let sig = tcx.instantiate_bound_regions_with_erased(sig);
+        tcx.try_normalize_erasing_regions(
+            fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(sig),
+        )
+        .ok()
+    }));
+    let Ok(Some(sig)) = sig else {
+        return None;
+    };
+    recorded_layout_failure(sig)
 }
 
 fn required_const_finding(

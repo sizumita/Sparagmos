@@ -175,6 +175,23 @@ pub fn with_body_materialization<R>(key: &str, f: impl FnOnce() -> R) -> R {
 /// and the session's error count grew during it, the count
 /// is reset. A successful query keeps whatever it emitted,
 /// exactly as before.
+///
+/// The discount is recorded, not forgotten, following the
+/// materialization discipline: a failure whose diagnostics
+/// were discounted is remembered by its (interned) type in
+/// the layout-failure registry below, and the collector
+/// replay in `mono_check` turns the record into a finding
+/// when collected code actually demands that type's layout
+/// — through a layout-measuring required constant, or
+/// through the per-instance force's ABI check. The two
+/// failure kinds the discount covers are told apart there,
+/// not here: the failure reaches this guard as an opaque
+/// panic or an uninformative `Err`, with nothing in the
+/// outcome that says whether the reference compilation
+/// poses the same query (a layout cycle it reports,
+/// E0391) or never poses it at all (the depth-limit shape
+/// above). A type whose layout no collected instance
+/// demands keeps its discount for good.
 pub fn guarded_layout(
     ty: &rustc_public::ty::Ty,
 ) -> Option<rustc_public::abi::Layout> {
@@ -188,6 +205,7 @@ pub fn guarded_layout(
         _ => {
             if let (Some(dcx), Some(before)) = (dcx, errors_before) {
                 if dcx.err_count() > before {
+                    note_layout_failure(ty);
                     dcx.reset_err_count();
                 }
             }
@@ -224,6 +242,62 @@ thread_local! {
     static MATERIALIZATION_BUGS: std::cell::RefCell<
         std::collections::HashMap<String, String>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// Interned types whose speculative layout query failed
+    /// with diagnostics that `guarded_layout` discounted.
+    /// Written during conversion, read by the compile verdict
+    /// (the collector replay in `mono_check`); one
+    /// compilation runs per process, so nothing clears it.
+    /// The types are erased to 'static like the compiler
+    /// context itself (see `COMPILER_TCX`): they are
+    /// interned in the running compilation's context, which
+    /// outlives every read of the registry.
+    static LAYOUT_FAILURES: std::cell::RefCell<
+        std::collections::HashSet<rustc_middle::ty::Ty<'static>>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn note_layout_failure(ty: &rustc_public::ty::Ty) {
+    let Some(tcx) = compiler_tcx() else {
+        return;
+    };
+    // The registry is bookkeeping beside the conversion,
+    // never a reason to disturb it: a type the stable-to-
+    // internal bridge cannot carry simply goes unrecorded,
+    // keeping its discount.
+    let internal = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| {
+            rustc_public::rustc_internal::internal(tcx, *ty)
+        }),
+    );
+    if let Ok(internal) = internal {
+        LAYOUT_FAILURES.with(|set| {
+            set.borrow_mut().insert(internal);
+        });
+    }
+}
+
+/// Whether the speculative layout query for `ty` failed
+/// during conversion with diagnostics that were discounted
+/// at the query (see `guarded_layout`). The verdict side
+/// (`mono_check`'s collector replay) turns a recorded
+/// failure into a finding only for a type whose layout
+/// collected code actually demands; a type nothing demands
+/// keeps its discount for good.
+pub fn layout_failure_recorded(ty: rustc_middle::ty::Ty<'_>) -> bool {
+    // The registry's types are the running compilation's
+    // own, interned in the context that outlives the
+    // callback; the caller's type comes from the same
+    // context (the same erasure as `COMPILER_TCX`).
+    let ty = unsafe {
+        std::mem::transmute::<
+            rustc_middle::ty::Ty<'_>,
+            rustc_middle::ty::Ty<'static>,
+        >(ty)
+    };
+    LAYOUT_FAILURES.with(|set| set.borrow().contains(&ty))
 }
 
 /// The compiler-bug panic record of the materialization of
