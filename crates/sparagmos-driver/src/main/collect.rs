@@ -162,6 +162,7 @@ fn collect_with_tcx(tcx: rustc_middle::ty::TyCtxt) -> ControlFlow<()> {
 }
 
 fn collect() -> ControlFlow<()> {
+    note_library_conversion();
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
     let mut bodies: Vec<(String, Body)> = Vec::new();
@@ -650,6 +651,27 @@ fn collect() -> ControlFlow<()> {
                     // The constant has an instance but no body: a
                     // trivial constant (see `account_trivial_const`).
                     account_trivial_const(&mut report, name);
+                    continue;
+                }
+                // A compiler intrinsic declaration has no body
+                // in any backend: the call is served in the
+                // caller (the interpreter's model, code
+                // generation's lowering, or constant-context
+                // evaluation), so a declaration the served
+                // judgement covers is converted without a body,
+                // like a demanded data constructor. An intrinsic
+                // no backend serves keeps the skip below (and,
+                // when called, the override check's error).
+                if bodyless_intrinsic_served(&instance) {
+                    conv.note_intrinsic(&instance);
+                    report.bodyless_converted += 1;
+                    report.functions.push(FnReport {
+                        name,
+                        blocks: 0,
+                        locals: 0,
+                        arg_count: 0,
+                        outcome: FnOutcome::Converted,
+                    });
                     continue;
                 }
                 // An extern-item-impl (EII) function declaration

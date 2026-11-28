@@ -170,7 +170,8 @@ use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
 use sparagmos_driver::convert::{
-    args_mention_params, clear_captured_panic, closure_kind, coroutine_closure_args,
+    args_mention_params, args_mention_params_strict, clear_captured_panic, closure_kind,
+    coroutine_closure_args,
     peek_captured_panic, record_captured_panic, stable_mir_panic_reason,
     take_captured_panic, take_compiler_crash, Converter, CONST_EXPR_REASON,
     COROUTINE_CLOSURE_TYPE_REASON,

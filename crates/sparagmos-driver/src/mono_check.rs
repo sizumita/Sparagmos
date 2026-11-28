@@ -542,6 +542,21 @@ fn codegen_served_unmodelled(name: &str) -> bool {
     }
 }
 
+/// Whether the named intrinsic is served without a body by
+/// the backend the verdict mirrors: a compile-time intrinsic
+/// (its calls are confined to constant contexts and evaluated
+/// there) or one code generation lowers although the
+/// interpreter has no model for it. The collection passes'
+/// demand accounting consults the same judgement as
+/// `check_intrinsic_overrides`: a crate that declares such an
+/// intrinsic (core itself, in a build-std compilation) is
+/// otherwise failed on every demand that names the
+/// declaration, although the declaration is exactly as served
+/// there as in any other crate.
+pub fn intrinsic_served_without_body(name: &str) -> bool {
+    comptime_intrinsic(name) || codegen_served_unmodelled(name)
+}
+
 fn check_body(
     body: &Body,
     layout_memo: &mut std::collections::HashMap<(Ty, bool), Option<String>>,
@@ -2243,16 +2258,37 @@ fn dump_symbol_finding(tcx: rustc_middle::ty::TyCtxt<'_>) -> Option<String> {
     }
     for local_def_id in tcx.iter_local_def_id() {
         let def_id = local_def_id.to_def_id();
-        for dump in [
-            (
-                rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpSymbolName(..)),
-                "symbol-name",
-            ),
-            (
-                rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpDefPath(..)),
-                "def-path",
-            ),
-        ] {
+        // The attribute probe reads the item's HIR node; a
+        // definition created while lowering another item (an
+        // opaque type's captured lifetime is the standing
+        // shape) has no HIR node of its own, and asking for
+        // its attributes panics inside the compiler. Such a
+        // definition cannot carry a dump attribute -- they
+        // are written on items -- so the probe runs under
+        // the resolution containment and a contained failure
+        // simply takes no part in the check (the discipline
+        // `duplicate_symbol_finding` follows for its naming
+        // probes, for the same reason).
+        let (probe, _emitted) = crate::convert::with_instance_resolution_contained(|| {
+            [
+                (
+                    rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpSymbolName(..)),
+                    "symbol-name",
+                ),
+                (
+                    rustc_attr_ir::find_attr!(tcx, def_id, RustcDumpDefPath(..)),
+                    "def-path",
+                ),
+            ]
+        });
+        let dumps = match probe {
+            Ok(dumps) => dumps,
+            Err(_payload) => {
+                let _ = crate::convert::take_captured_panic();
+                continue;
+            }
+        };
+        for dump in dumps {
             if dump.0 {
                 return Some(format!(
                     "`{}` carries a rustc dump attribute, so code \

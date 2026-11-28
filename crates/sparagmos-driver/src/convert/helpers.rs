@@ -1257,6 +1257,86 @@ pub fn args_mention_params(args: &GenericArgs) -> bool {
     })
 }
 
+/// Whether generic arguments genuinely mention a parameter
+/// of the enclosing definition: a bare parameter, or an alias
+/// (projection) over one, anywhere in the arguments. This is
+/// the strict companion of [`args_mention_params`]: where
+/// that walk counts a type whose kind cannot be asked (a
+/// type passing through a coroutine-closure type) as
+/// mentioning a parameter -- the conservative answer for
+/// callers that defer or fall back -- this walk counts such
+/// a type as monomorphic, because a coroutine-closure type
+/// in a monomorphic position is a concrete type (an async
+/// closure's type is the standing shape). A caller that must
+/// not pose an argument to the compiler's normalization --
+/// the instance demand scan is the standing one -- uses
+/// this judgement: what it rejects is exactly what posing
+/// cannot answer, a projection over a bare parameter.
+pub fn args_mention_params_strict(args: &GenericArgs) -> bool {
+    args.0.iter().any(|arg| match arg {
+        GenericArgKind::Type(ty) => ty_mentions_param_strict(ty),
+        GenericArgKind::Const(konst) => const_mentions_param_strict(konst),
+        GenericArgKind::Lifetime(_) => false,
+    })
+}
+
+fn const_mentions_param_strict(konst: &rustc_public::ty::TyConst) -> bool {
+    match konst.kind() {
+        TyConstKind::Param(_) => true,
+        TyConstKind::Unevaluated(_, args) => args_mention_params_strict(args),
+        TyConstKind::Value(ty, _) | TyConstKind::ZSTValue(ty) => {
+            ty_mentions_param_strict(ty)
+        }
+        _ => false,
+    }
+}
+
+fn ty_mentions_param_strict(ty: &Ty) -> bool {
+    // A type whose kind cannot be asked passes through a
+    // coroutine-closure type; see the note on
+    // `args_mention_params_strict` for why this walk counts
+    // it as monomorphic where `ty_mentions_param` does not.
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    match kind {
+        TyKind::Param(_) => true,
+        TyKind::Alias(_, alias) => args_mention_params_strict(&alias.args),
+        TyKind::RigidTy(rigid) => match rigid {
+            RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _) | RigidTy::Slice(inner) => {
+                ty_mentions_param_strict(&inner)
+            }
+            RigidTy::Array(inner, len) => {
+                ty_mentions_param_strict(&inner) || const_mentions_param_strict(&len)
+            }
+            RigidTy::Pat(inner, _) => ty_mentions_param_strict(&inner),
+            RigidTy::Tuple(elems) => elems.iter().any(ty_mentions_param_strict),
+            RigidTy::FnPtr(sig) => sig
+                .value
+                .inputs_and_output
+                .iter()
+                .any(ty_mentions_param_strict),
+            RigidTy::Adt(_, args)
+            | RigidTy::FnDef(_, args)
+            | RigidTy::Closure(_, args)
+            | RigidTy::Coroutine(_, args)
+            | RigidTy::CoroutineClosure(_, args)
+            | RigidTy::CoroutineWitness(_, args) => args_mention_params_strict(&args),
+            RigidTy::Dynamic(bounds, _) => bounds.iter().any(|b| match &b.value {
+                ExistentialPredicate::Trait(t) => {
+                    args_mention_params_strict(&t.generic_args)
+                }
+                ExistentialPredicate::Projection(p) => {
+                    args_mention_params_strict(&p.generic_args)
+                }
+                ExistentialPredicate::AutoTrait(_) => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
     match konst.kind() {
         TyConstKind::Param(_) => true,

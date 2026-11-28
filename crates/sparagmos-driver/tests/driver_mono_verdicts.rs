@@ -756,6 +756,88 @@ fn shimmed_must_override_intrinsic_converts() {
 }
 
 #[test]
+fn library_declared_codegen_served_intrinsic_converts() {
+    // A `#[rustc_intrinsic]` declaration has no MIR body in any
+    // backend: code generation serves the call in the caller.
+    // In a library conversion — a crate being built, like a
+    // sysroot unit in a build-std compilation — such a
+    // declaration is surface other crates call, so the
+    // collector credits it (and demands naming it) without a
+    // body. Core's lib.rs declares the codegen-served float
+    // and fence intrinsics; read as target-crate skips, they
+    // failed the cargo-shim build-std conversion of core.
+    let case = Case::new("lib-codegen-intrinsic");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn sqrtf32(x: f32) -> f32;\n\
+         pub fn root(x: f32) -> f32 { unsafe { sqrtf32(x) } }\n",
+    );
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "--crate-type=lib"],
+        true,
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.lines().any(|l| {
+            l.starts_with("target-crate converted:") && l.ends_with("skipped: 0")
+        }),
+        "the intrinsic declaration must count as converted: {stdout}"
+    );
+}
+
+#[test]
+fn program_declared_codegen_served_intrinsic_stays_skipped() {
+    // The same declaration in a program conversion stays an
+    // ordinary conversion skip: the interpreter itself would
+    // have to serve the call at run time, and it has no model
+    // for the sized float spellings. (The verdict still
+    // forgives the call — code generation would have served
+    // it — so the conversion exits 0.)
+    let case = Case::new("prog-codegen-intrinsic");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn sqrtf32(x: f32) -> f32;\n\
+         fn main() { let _x = unsafe { sqrtf32(2.0f32) }; }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.lines().any(|l| {
+            l.starts_with("target-crate converted:") && l.ends_with("skipped: 1")
+        }),
+        "the intrinsic declaration must stay skipped: {stdout}"
+    );
+}
+
+#[test]
+fn locally_declared_caller_location_converts() {
+    // `caller_location` is served by the interpreter's model
+    // under both its `std::` and its `core::` canonical
+    // spellings: when core itself is the target crate, the
+    // intrinsic lookup re-canonicalizes the definition's name
+    // to the `core::` form, which the registry missed, so the
+    // override verdict rejected core's own build (intrinsic
+    // `caller_location` must be overridden by codegen backend,
+    // but isn't). A guest crate declaring the intrinsic itself
+    // reaches the same lookup.
+    let case = Case::new("local-caller-location");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn caller_location() -> &'static std::panic::Location<'static>;\n\
+         fn main() { let _l = caller_location(); }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+}
+
+#[test]
 fn codegen_only_float_intrinsic_converts() {
     // `sqrtf32` must be overridden too, and the interpreter
     // has no model for the sized float spellings — but code
