@@ -254,6 +254,37 @@ impl<'a> Interpreter<'a> {
     /// `debug_shape_for_def`): a recorded instance entry
     /// answers for a bare definition name, and a rendered
     /// instance name answers for itself.
+    /// The recorded layout of the ADT a name denotes, for
+    /// the judgments that turn only on the layout's size and
+    /// alignment: the name's own entry when one is recorded,
+    /// else the entry every recorded instance of the
+    /// definition agrees on. The IR's ADT types carry only
+    /// the definition's name, and a bare name with several
+    /// recorded instances resolves to no instance here (see
+    /// `adt_instance_key`); but a size the instances agree on
+    /// is the definition's size in this program whichever
+    /// instance the access denotes, so a judgment that asks
+    /// only for the size may use it. Instances that disagree
+    /// keep the decline.
+    pub(crate) fn adt_layout_for_def(&self, name: &str) -> Option<(u64, u64)> {
+        let program = self.program();
+        if let Some(layout) = program.adt_layouts.get(name) {
+            return Some(*layout);
+        }
+        let mut found: Option<(u64, u64)> = None;
+        for (key, layout) in &program.adt_layouts {
+            if key.split('<').next() != Some(name) {
+                continue;
+            }
+            match found {
+                None => found = Some(*layout),
+                Some(prev) if prev != *layout => return None,
+                _ => {}
+            }
+        }
+        found
+    }
+
     pub(crate) fn adt_is_union(&self, name: &str) -> bool {
         matches!(
             self.debug_shape_for_def(name),
@@ -278,7 +309,7 @@ impl<'a> Interpreter<'a> {
         value: &Value,
         name: &str,
     ) -> Option<Vec<Option<u8>>> {
-        let size = self.program().adt_layouts.get(name)?.0 as usize;
+        let size = self.adt_layout_for_def(name)?.0 as usize;
         match value {
             Value::UnionBytes { bytes } => {
                 let mut image = bytes.clone();
@@ -363,14 +394,44 @@ impl<'a> Interpreter<'a> {
     /// `variant` of the ADT instance `name`, from its debug
     /// shape; `None` when no shape is recorded.
     pub(crate) fn adt_field_tag(&self, name: &str, variant: usize, field: usize) -> Option<String> {
-        self.program()
+        if let Some(tag) = self
+            .program()
             .adt_debug_shapes
-            .get(name)?
-            .variants
-            .get(variant)?
-            .fields
-            .get(field)
+            .get(name)
+            .and_then(|shape| shape.variants.get(variant))
+            .and_then(|v| v.fields.get(field))
             .map(|f| f.ty.clone())
+        {
+            return Some(tag);
+        }
+        // A bare definition name with no shape of its own:
+        // the tag every recorded instance of the definition
+        // agrees on for this field answers for it, as for
+        // the definition-level shape judgments (see
+        // `debug_shape_for_def`). A field whose tag differs
+        // across instances -- a generic payload field above
+        // all -- keeps the decline, as does a field some
+        // instance's shape does not record.
+        let mut found: Option<String> = None;
+        for (key, shape) in &self.program().adt_debug_shapes {
+            if key.split('<').next() != Some(name) {
+                continue;
+            }
+            let Some(tag) = shape
+                .variants
+                .get(variant)
+                .and_then(|v| v.fields.get(field))
+                .map(|f| f.ty.clone())
+            else {
+                return None;
+            };
+            match &found {
+                None => found = Some(tag),
+                Some(prev) if *prev != tag => return None,
+                _ => {}
+            }
+        }
+        found
     }
 
     /// The declared type of field `i` of variant `variant` of
@@ -1003,10 +1064,8 @@ impl<'a> Interpreter<'a> {
                             })
                             .or_else(|| {
                                 let union_size = self
-                                    .program()
-                                    .adt_layouts
-                                    .get(name)
-                                    .map(|&(size, _)| size)?;
+                                    .adt_layout_for_def(name)
+                                    .map(|(size, _)| size)?;
                                 (0..8).find_map(|g| {
                                     let tag = self.adt_field_tag(name, 0, g)?;
                                     match self.layout_of(&tag) {
@@ -1098,10 +1157,8 @@ impl<'a> Interpreter<'a> {
                                     .filter(|size| *size > 0)
                                     .or_else(|| {
                                         if single_field {
-                                            self.program()
-                                                .adt_layouts
-                                                .get(name)
-                                                .map(|(size, _)| *size as u128)
+                                            self.adt_layout_for_def(name)
+                                                .map(|(size, _)| size as u128)
                                         } else {
                                             None
                                         }

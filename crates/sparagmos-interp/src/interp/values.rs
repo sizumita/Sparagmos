@@ -90,6 +90,41 @@ pub(crate) fn ptr_wrapper_pointer(value: &Value) -> Option<Value> {
 /// field (a builtin-built box's pointee) is not a wrapper chain,
 /// and only a descent that verifiably ends at a pointer proves
 /// the chain.
+/// The one pointer leaf an aggregate value holds, when the
+/// aggregate's remaining leaves are all zero-width (unit and
+/// uninitialised leaves, and aggregates composed of them):
+/// the payload of a niche-encoded enum over a pointer, whose
+/// payload the value model stores as the tuple or wrapper the
+/// source wrote (`Option<((), &T)>` holds its reference in a
+/// tuple field beside the unit). A second pointer leaf, or a
+/// leaf with bytes of its own beside the pointer, means the
+/// aggregate is not a pointer payload and the search declines.
+pub(crate) fn aggregate_payload_pointer(value: &Value) -> Option<Value> {
+    fn collect(value: &Value, found: &mut Option<Value>) -> bool {
+        match value {
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                if found.is_some() {
+                    return false;
+                }
+                *found = Some(value.clone());
+                true
+            }
+            Value::Unit | Value::Uninit => true,
+            Value::Enum { fields, .. } => {
+                fields.iter().all(|f| collect(f, found))
+            }
+            Value::Tuple(items) => items.iter().all(|f| collect(f, found)),
+            _ => false,
+        }
+    }
+    let mut found = None;
+    if collect(value, &mut found) {
+        found
+    } else {
+        None
+    }
+}
+
 pub(crate) fn layered_wrapper_pointer(value: &Value) -> Option<Value> {
     let mut cur = value;
     loop {
@@ -684,9 +719,27 @@ impl<'a> Interpreter<'a> {
             // the pointer the wrapper chain holds is the value
             // the place denotes.
             (Some(Ty::Ref(_)), Value::Enum { .. })
-                if ptr_wrapper_pointer(&value).is_some() =>
+                if ptr_wrapper_pointer(&value)
+                    .or_else(|| aggregate_payload_pointer(&value))
+                    .is_some() =>
             {
-                Ok(ptr_wrapper_pointer(&value).expect("guard checked"))
+                Ok(ptr_wrapper_pointer(&value)
+                    .or_else(|| aggregate_payload_pointer(&value))
+                    .expect("guard checked"))
+            }
+            // A payload-less variant value stored into a
+            // pointer place: the value reached the place
+            // through a reinterpretation (a raw-pointer cast
+            // read of the storage an enum value occupies), and
+            // a variant carrying no payload is the niche
+            // pattern of a pointer-niche enum -- the null
+            // pointer, the one pointer value its bytes denote.
+            // A variant with a payload, or any other aggregate
+            // shape, keeps the mismatch below.
+            (Some(Ty::Ref(_)), Value::Enum { variant: 0, fields })
+                if fields.is_empty() =>
+            {
+                Ok(Value::Ref(RefTarget::Null))
             }
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
             (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
