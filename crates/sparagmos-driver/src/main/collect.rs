@@ -6,13 +6,22 @@ use super::*;
 /// `run_with_tcx!` callback shape, written out so the run can
 /// also configure the session the way the real rustc entry point
 /// does. rustc's own entry enters through `TimePassesCallbacks`,
-/// whose `config` sets `trimmed_def_paths`; type printing
-/// consults that flag when the compiler itself prints
-/// (`-Zunpretty` dumps, `--print` answers), so without it a
-/// printed Stable MIR body names `std::vec::Vec` where rustc
-/// prints `Vec`. The flag is set exactly for those printing
-/// invocations; every other run keeps the session the
-/// rustc_public callbacks would have built.
+/// whose `config` sets `trimmed_def_paths` for the whole run:
+/// the trimmed-path map that flag builds is consulted by every
+/// piece of compiler printing -- `-Zunpretty` dumps and
+/// `--print` answers (a printed Stable MIR body names `Vec`
+/// where the untrimmed form is `std::vec::Vec`), and
+/// diagnostics alike: a crate failing type checking reports
+/// its trait bounds against the paths its own imports make
+/// visible only with the map in place, and prints full def
+/// paths without it. The flag is therefore set
+/// unconditionally here, and the conversion itself runs
+/// under `with_no_trimmed_paths!` (see `after_analysis`):
+/// it prints types and paths for its own naming without
+/// emitting diagnostics, and evaluating the map outside a
+/// diagnostic is recorded as a promise that one follows --
+/// a promise a clean conversion never keeps, which the
+/// diagnostic context answers with a panic at teardown.
 struct ConversionCallbacks {
     result: Option<std::ops::ControlFlow<()>>,
 }
@@ -40,9 +49,7 @@ impl ConversionCallbacks {
 
 impl rustc_driver::Callbacks for ConversionCallbacks {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
-        if config.opts.pretty.is_some() || !config.opts.prints.is_empty() {
-            config.opts.trimmed_def_paths = true;
-        }
+        config.opts.trimmed_def_paths = true;
     }
 
     fn after_analysis<'tcx>(
@@ -51,7 +58,14 @@ impl rustc_driver::Callbacks for ConversionCallbacks {
         tcx: rustc_middle::ty::TyCtxt<'tcx>,
     ) -> rustc_driver::Compilation {
         rustc_public::rustc_internal::run(tcx, || {
-            self.result = Some(collect_with_tcx(tcx));
+            // The conversion's own printing stays out of the
+            // trimmed-path map (see the struct comment).
+            // Diagnostics the compiler itself emitted during
+            // analysis were printed before this callback,
+            // outside this scope, and keep their trimmed paths.
+            self.result = Some(rustc_middle::ty::print::with_no_trimmed_paths!({
+                collect_with_tcx(tcx)
+            }));
         })
         .unwrap();
         if self.result.as_ref().is_some_and(|val| val.is_continue()) {
@@ -105,6 +119,13 @@ impl ResolutionVerdictCallbacks {
 }
 
 impl rustc_driver::Callbacks for ResolutionVerdictCallbacks {
+    fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        // As for a conversion (see ConversionCallbacks): this
+        // session's diagnostics are the guest's verdict text,
+        // printed the way the real compiler prints them.
+        config.opts.trimmed_def_paths = true;
+    }
+
     fn after_expansion(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
