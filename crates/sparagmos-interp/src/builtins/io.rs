@@ -854,6 +854,8 @@ pub(crate) fn io_lookup(canonical: &str) -> Option<Builtin> {
             Builtin::BufGuardRemaining
         }
         "std::io::_eprint" => Builtin::Eprint,
+        "std::io::stdio::attempt_print_to_stdout" => Builtin::AttemptPrint,
+        "std::io::stdio::attempt_print_to_stderr" => Builtin::AttemptEprint,
         _ => return None,
     })
 }

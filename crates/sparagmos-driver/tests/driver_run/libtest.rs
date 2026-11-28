@@ -1284,3 +1284,116 @@ fn run_mode_libtest_show_output_should_panic_reports_spend_the_note() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }
+const BENCH_ONLY_SRC: &str = r#"
+#![feature(test)]
+
+extern crate test;
+
+use test::Bencher;
+
+#[bench]
+fn my_bench(_b: &mut test::Bencher) {}
+
+#[bench]
+fn iter_bench(b: &mut Bencher) {
+    b.iter(|| assert_eq!(1 + 1, 2));
+}
+"#;
+
+/// A `--test` binary whose entries are benches: the harness
+/// expansion wraps each `#[bench]` function in a one-argument
+/// closure (`|__bench_x| assert_test_result(x(__bench_x))`)
+/// carried by a bench descriptor, and libtest runs such a
+/// descriptor as a test by invoking its callable with a
+/// single-iteration `&mut Bencher`. The unwinding harness
+/// model invoked every callable with no arguments, so a bench
+/// closure body (environment plus the bencher parameter) was
+/// entered with only its environment and the run stopped with
+/// "type mismatch in call to `bench::my_bench::{closure#0}`:
+/// expected 2 argument(s), found 1 argument(s)" (the shape of
+/// tests/coverage/bench.rs).
+#[test]
+fn run_mode_libtest_harness_runs_bench_descriptors_as_tests() {
+    let dir = temp_dir("libtest-bench");
+    let src = fixture(&dir, "bench.rs", BENCH_ONLY_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("running 2 tests"), "stdout={stdout}");
+    assert!(stdout.contains("test iter_bench ... ok"), "stdout={stdout}");
+    assert!(stdout.contains("test my_bench ... ok"), "stdout={stdout}");
+    assert!(
+        stdout.contains("test result: ok. 2 passed; 0 failed"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stderr.contains("type mismatch in call"),
+        "stderr={stderr}"
+    );
+}
+
+const TERMINATION_BENCH_SRC: &str = r#"
+#![feature(test)]
+
+extern crate test;
+
+use std::num::ParseIntError;
+use test::Bencher;
+
+#[test]
+fn is_a_num() -> Result<(), ParseIntError> {
+    let _: u32 = "22".parse()?;
+    Ok(())
+}
+
+#[bench]
+fn test_a_positive_bench(_: &mut Bencher) -> Result<(), ParseIntError> {
+    Ok(())
+}
+
+#[bench]
+#[should_panic]
+fn test_a_neg_bench(_: &mut Bencher) -> Result<(), ParseIntError> {
+    let _: u32 = "abc".parse()?;
+    Ok(())
+}
+"#;
+
+/// The termination-trait bench shape (tests/ui/rfcs/
+/// rfc-1937-termination-trait/termination-trait-in-test.rs):
+/// bench functions returning a `Termination` are still
+/// carried by the same one-argument harness closure as plain
+/// benches, so the harness must hand the callable its bencher
+/// before the closure's `assert_test_result` wrapper can
+/// report the returned `Result` — an `Err` bench under
+/// `#[should_panic]` passes through the panic that report
+/// raises. The run used to stop with "type mismatch in call
+/// to `test_a_neg_bench::{closure#0}`: expected 2
+/// argument(s), found 1 argument(s)".
+#[test]
+fn run_mode_libtest_harness_runs_termination_benches() {
+    let dir = temp_dir("libtest-termination-bench");
+    let src = fixture(&dir, "termination_bench.rs", TERMINATION_BENCH_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("test is_a_num ... ok"), "stdout={stdout}");
+    assert!(
+        stdout.contains("test test_a_positive_bench ... ok"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("test test_a_neg_bench - should panic ... ok"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 3 passed; 0 failed"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stderr.contains("type mismatch in call"),
+        "stderr={stderr}"
+    );
+}
