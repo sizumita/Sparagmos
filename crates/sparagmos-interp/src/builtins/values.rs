@@ -360,6 +360,43 @@ pub(super) fn refcell_guard(cell: &RefTarget) -> Value {
     }
 }
 
+/// A `Ref` / `RefMut` guard for a borrow whose receiver arrived
+/// through an unsizing coercion (`RefCell<dyn Trait>`): the
+/// guard's value reference keeps the receiver's dyn denomination
+/// (with the cell's value place as its base), so dereferencing
+/// the guard yields the same `&dyn Trait` the receiver denoted
+/// and virtual dispatch sees the vtable identity. Any other
+/// receiver shape yields the plain guard.
+pub(super) fn refcell_guard_for(cell: &RefTarget, receiver: &Value) -> Value {
+    let guard = refcell_guard(cell);
+    if let Value::DynRef {
+        concrete,
+        traits,
+        drop_glue,
+        type_id,
+        vtable_methods,
+        ..
+    } = receiver
+    {
+        if let Value::Enum { variant, fields } = &guard {
+            let mut fields = fields.clone();
+            fields[0] = Value::DynRef {
+                base: Box::new(fields[0].clone()),
+                concrete: concrete.clone(),
+                traits: traits.clone(),
+                drop_glue: drop_glue.clone(),
+                type_id: *type_id,
+                vtable_methods: vtable_methods.clone(),
+            };
+            return Value::Enum {
+                variant: *variant,
+                fields,
+            };
+        }
+    }
+    guard
+}
+
 pub(super) fn some_value(value: Value) -> Value {
     Value::Enum {
         variant: 1,

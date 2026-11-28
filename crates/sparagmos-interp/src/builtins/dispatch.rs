@@ -9785,31 +9785,35 @@ impl<'a> Interpreter<'a> {
                 let state = self.resolve_value(frames, &vals[0])?;
                 match cell_held(&state).cloned() {
                     Some(value) => Ok(value),
-                    None => Err(InterpError::type_mismatch(
-                        "Cell value",
-                        "cell aggregate",
-                        state.kind_name(),
-                    )),
+                    // `Cell<T>` is transparent over `UnsafeCell<T>`
+                    // over `T`, and the `Cell::from_mut` /
+                    // `as_slice_of_cells` family legally re-reads
+                    // a `T` place as a `Cell<T>` place: storage the
+                    // conversion denominated as the bare held value
+                    // is the cell's contents as it stands.
+                    None => Ok(state),
                 }
             }
             Builtin::CellSet | Builtin::CellReplace => {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let state = self.read_resolved(frames, &target)?;
-                let old = match cell_held(&state).cloned() {
-                    Some(value) => value,
-                    None => {
-                        return Err(InterpError::type_mismatch(
-                            "Cell::set",
-                            "cell aggregate",
-                            state.kind_name(),
-                        ))
-                    }
+                // The cell place's denomination decides the form
+                // of both the old value and the write: the natural
+                // `Cell { UnsafeCell { value } }` aggregate, or --
+                // for a place the `Cell::from_mut` /
+                // `as_slice_of_cells` reinterpretation produced --
+                // the bare held value the storage is denominated
+                // as (see the `CellGet` arm).
+                let (old, wrap) = match cell_held(&state).cloned() {
+                    Some(value) => (value, true),
+                    None => (state, false),
                 };
+                let new_value = vals.into_iter().nth(1).expect("arity checked");
                 self.write_resolved(
                     frames,
                     &target,
-                    cell_value(vals.into_iter().nth(1).expect("arity checked")),
+                    if wrap { cell_value(new_value) } else { new_value },
                 )?;
                 if kind == Builtin::CellReplace {
                     Ok(old)
@@ -9842,7 +9846,7 @@ impl<'a> Interpreter<'a> {
                     }
                     self.refcell_set_flag(frames, &flag_target, flag + 1)?;
                 }
-                Ok(refcell_guard(&cell))
+                Ok(refcell_guard_for(&cell, &vals[0]))
             }
             Builtin::RefCellTryBorrow | Builtin::RefCellTryBorrowMut => {
                 arity(1)?;
@@ -9870,7 +9874,7 @@ impl<'a> Interpreter<'a> {
                 )?;
                 Ok(Value::Enum {
                     variant: 0,
-                    fields: vec![refcell_guard(&cell)],
+                    fields: vec![refcell_guard_for(&cell, &vals[0])],
                 })
             }
             Builtin::RefCellGetMut | Builtin::RefCellAsPtr => {
