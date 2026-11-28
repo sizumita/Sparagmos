@@ -588,3 +588,100 @@ fn main() {
         "ab 0\n",
     );
 }
+
+// A byte-displaced store into an element of a
+// `[MaybeUninit<u32>; 2]` array: the pointer cast from the
+// array's base denotes a flat byte position across the
+// elements, and the payload read through `assume_init_ref`
+// sees the spliced byte. On the base tree the store stops
+// with "write through a pointer displaced 5 bytes from a
+// value boundary": the byte view priced the array's
+// element size with the bare-name walk, the element type
+// names `MaybeUninit` by its bare definition name (the IR
+// types erase generic arguments), and no recorded layout
+// answers to that name, so the position walk declined and
+// the projected assignment judged the flat offset instead.
+#[test]
+fn run_mode_maybeuninit_array_displaced_byte_write_second_element() {
+    run_ok(
+        "maybeuninit-array-displaced-write-elem1",
+        r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    unsafe {
+        let mut arr: [MaybeUninit<u32>; 2] = [MaybeUninit::new(0x11223344), MaybeUninit::new(0x55667788)];
+        let base = arr.as_mut_ptr() as *mut u8;
+        *base.add(5) = 0xAB;
+        println!("{:x} {:x}", arr[0].assume_init_ref(), arr[1].assume_init_ref());
+    }
+}
+"#,
+        "11223344 5566ab88\n",
+    );
+}
+
+// The same store displaced into the first element.
+#[test]
+fn run_mode_maybeuninit_array_displaced_byte_write_first_element() {
+    run_ok(
+        "maybeuninit-array-displaced-write-elem0",
+        r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    unsafe {
+        let mut arr: [MaybeUninit<u32>; 2] = [MaybeUninit::new(0x11223344), MaybeUninit::new(0x55667788)];
+        let base = arr.as_mut_ptr() as *mut u8;
+        *base.add(1) = 0xAB;
+        println!("{:x} {:x}", arr[0].assume_init_ref(), arr[1].assume_init_ref());
+    }
+}
+"#,
+        "1122ab44 55667788\n",
+    );
+}
+
+// The same store displaced exactly onto the second
+// element's first byte.
+#[test]
+fn run_mode_maybeuninit_array_displaced_byte_write_element_boundary() {
+    run_ok(
+        "maybeuninit-array-displaced-write-boundary",
+        r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    unsafe {
+        let mut arr: [MaybeUninit<u32>; 2] = [MaybeUninit::new(0x11223344), MaybeUninit::new(0x55667788)];
+        let base = arr.as_mut_ptr() as *mut u8;
+        *base.add(4) = 0xAB;
+        println!("{:x} {:x}", arr[0].assume_init_ref(), arr[1].assume_init_ref());
+    }
+}
+"#,
+        "11223344 556677ab\n",
+    );
+}
+
+// A byte-displaced read of the array's storage prices the
+// same position walk: the byte at flat offset 5 is the
+// second element's second byte.
+#[test]
+fn run_mode_maybeuninit_array_displaced_byte_read() {
+    run_ok(
+        "maybeuninit-array-displaced-read",
+        r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    unsafe {
+        let arr: [MaybeUninit<u32>; 2] = [MaybeUninit::new(0x11223344), MaybeUninit::new(0x55667788)];
+        let base = arr.as_ptr() as *const u8;
+        println!("{:x}", *base.add(5));
+    }
+}
+"#,
+        "77\n",
+    );
+}
