@@ -85,7 +85,15 @@ impl<'a> Interpreter<'a> {
 /// [`lookup`]: super::lookup
 pub(crate) fn primitives_lookup(canonical: &str) -> Option<Builtin> {
     Some(match canonical {
-        "std::intrinsics::black_box" => Builtin::BlackBox,
+        // The `hint` spellings name the public const fn whose
+        // whole body is the intrinsic call. Registering them is
+        // load-bearing for the instances whose argument type the
+        // runtime cannot represent in a converted body (an `f16`
+        // value, a reference to an extern type): collection skips
+        // those instances, so without a registry entry the call
+        // site is left with neither a body nor a builtin.
+        "std::intrinsics::black_box" | "core::intrinsics::black_box" => Builtin::BlackBox,
+        "std::hint::black_box" | "core::hint::black_box" => Builtin::BlackBox,
         "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(BitOp::CtPop),
         "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(BitOp::Ctlz),
         "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(BitOp::Cttz),

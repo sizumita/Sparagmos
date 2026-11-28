@@ -786,3 +786,19 @@ pub(crate) fn f16_lookup(canonical: &str) -> Option<Builtin> {
         _ => return None,
     })
 }
+
+/// Registration fragment of the builtin name registry: the
+/// scalar float intrinsics.
+///
+/// One contiguous slice of the table that [`lookup`] chains in
+/// registry order; the fragment lives with the family that serves
+/// these builtins, so a new name is registered here, in the
+/// family's own module, and nowhere else.
+///
+/// [`lookup`]: super::lookup
+pub(crate) fn float_intrinsic_lookup(canonical: &str) -> Option<Builtin> {
+    Some(match canonical {
+        "std::intrinsics::fabs" | "core::intrinsics::fabs" => Builtin::FloatAbs,
+        _ => return None,
+    })
+}

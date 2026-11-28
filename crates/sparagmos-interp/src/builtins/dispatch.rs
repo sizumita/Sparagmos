@@ -10271,6 +10271,23 @@ impl<'a> Interpreter<'a> {
                     _ => r,
                 }))
             }
+            Builtin::FloatAbs => {
+                arity(1)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match &vals[0] {
+                    Value::Float(x) => Ok(Value::Float(match tag {
+                        "f16" => round_to_f16((*x).abs()),
+                        "f32" => ((*x) as f32).abs() as f64,
+                        _ => (*x).abs(),
+                    })),
+                    Value::Float128(bits) => Ok(Value::Float128(crate::f128::abs(*bits))),
+                    other => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "float operand",
+                        other.kind_name(),
+                    )),
+                }
+            }
             Builtin::FloatToIntUnchecked => {
                 arity(1)?;
                 let tag = generic_args.get(1).map(String::as_str).unwrap_or("");

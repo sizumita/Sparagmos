@@ -1985,6 +1985,9 @@ fn i8_ty() -> mir::Ty {
 fn registry_round2_covers_the_new_callees() {
     let cases: &[(&str, Builtin)] = &[
         ("std::intrinsics::black_box", Builtin::BlackBox),
+        ("core::intrinsics::black_box", Builtin::BlackBox),
+        ("std::hint::black_box", Builtin::BlackBox),
+        ("core::hint::black_box", Builtin::BlackBox),
         ("std::string::String::new", Builtin::StringNew),
         ("std::string::String::with_capacity", Builtin::StringWithCapacity),
         ("std::intrinsics::va_arg", Builtin::VaArg),
@@ -4094,6 +4097,7 @@ const ALIGN_OF_VAL_INTR: mir::DefId = mir::DefId::new(0, 511);
 const FADD_FAST: mir::DefId = mir::DefId::new(0, 512);
 const FMUL_FAST: mir::DefId = mir::DefId::new(0, 513);
 const FLOAT_TO_INT_UNCHECKED: mir::DefId = mir::DefId::new(0, 514);
+const FABS: mir::DefId = mir::DefId::new(0, 515);
 
 fn names_ds3() -> HashMap<mir::DefId, String> {
     let mut names = names_ds2();
@@ -4106,6 +4110,7 @@ fn names_ds3() -> HashMap<mir::DefId, String> {
             FLOAT_TO_INT_UNCHECKED,
             "std::intrinsics::float_to_int_unchecked".to_string(),
         ),
+        (FABS, "std::intrinsics::fabs".to_string()),
     ]);
     names
 }
@@ -4154,6 +4159,8 @@ fn registry_covers_fast_float_and_intrinsic_size_align() {
         ("std::intrinsics::fdiv_fast", Builtin::FastFloat(FastFloatOp::Div)),
         ("std::intrinsics::frem_fast", Builtin::FastFloat(FastFloatOp::Rem)),
         ("std::intrinsics::float_to_int_unchecked", Builtin::FloatToIntUnchecked),
+        ("std::intrinsics::fabs", Builtin::FloatAbs),
+        ("core::intrinsics::fabs", Builtin::FloatAbs),
     ];
     for (name, expected) in cases {
         assert_eq!(
@@ -4205,6 +4212,39 @@ fn fast_float_ops_are_the_plain_operations_at_the_type_width() {
     );
     let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Float((1.1f32 * 1.1f32) as f64));
+}
+
+#[test]
+fn fabs_is_the_absolute_value_at_the_type_width() {
+    // fabs::<f64>(-1.5) == 1.5
+    let body = mir::Body::new(
+        decls(&[f64_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(FABS, vec![f64_ty()]), vec![const_f64(-1.5)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Float(1.5));
+    // fabs::<f32>(-0.5) == 0.5, and fabs::<f32>(1.25) == 1.25:
+    // the operation at the f32 width on the widened operand.
+    let body = mir::Body::new(
+        decls(&[f32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(FABS, vec![f32_ty()]), vec![const_f32(-0.5)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Float(0.5));
 }
 
 #[test]

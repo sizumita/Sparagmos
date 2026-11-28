@@ -10,6 +10,7 @@ use std::process::{Command, Output};
 mod alloc_error;
 mod asm_intrinsics;
 mod aux_crates;
+mod black_box_fabs;
 mod cargo_shim;
 mod closures_coroutines;
 mod collections;

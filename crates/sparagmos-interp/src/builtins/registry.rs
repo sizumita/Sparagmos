@@ -1566,6 +1566,17 @@ pub enum Builtin {
     /// assume the guest has no NaNs or infinities; neither
     /// changes the value of a single operation computed here.
     FastFloat(FastFloatOp),
+    /// `std::intrinsics::fabs(x)`: the absolute value of a
+    /// float, generic over the float width. The width rides on
+    /// the call's generic arguments, as for the `*_fast` family;
+    /// an `f128` operand arrives as its raw bit pattern and the
+    /// operation runs in the software binary128 module. The
+    /// float primitives' `abs` methods are served by the
+    /// `FloatMethod` models at their own call sites, but an
+    /// `abs` body that is itself converted (demanded as a value,
+    /// or reached in a const context) calls this intrinsic
+    /// directly, and the intrinsic has no body anywhere.
+    FloatAbs,
     /// `std::intrinsics::float_to_int_unchecked(value)`: a
     /// truncating float-to-integer conversion. Out-of-range and
     /// NaN inputs are undefined behaviour in the guest; the model
