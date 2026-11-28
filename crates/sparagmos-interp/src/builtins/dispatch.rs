@@ -9495,7 +9495,16 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         match base {
-                            Value::Tuple(_) => {
+                            // As for a place or static base above:
+                            // ADT (vector aggregate) elements and
+                            // sparse-vector elements are addressable
+                            // through an index projection on an
+                            // allocation too -- the projection layer
+                            // reads and writes `RefProj::Index` on
+                            // both shapes.
+                            Value::Tuple(_)
+                            | Value::Enum { .. }
+                            | Value::SparseVec { .. } => {
                                 let mut projection = projection;
                                 projection.push(RefProj::Index(idx));
                                 Ok(Value::Ref(RefTarget::Alloc { id, projection }))
