@@ -208,6 +208,14 @@ pub(crate) fn eval_binary(
             BitXor => Value::Bool(*a ^ *b),
             Eq => Value::Bool(a == b),
             Ne => Value::Bool(a != b),
+            // `bool` is ordered (`false < true`): MIR lowers a
+            // boolean `<` / `<=` / `>` / `>=` to the same binary
+            // operation it uses for integers, so the ordering
+            // operators belong here, not in the mismatch error.
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
             Cmp => ordering_of(a.cmp(b)),
             _ => {
                 return Err(InterpError::type_mismatch(
@@ -259,6 +267,64 @@ pub(crate) fn eval_binary(
     // applies at every place write).
     let lhs = &reinterpret_int(lhs, dest_ty);
     let rhs = &reinterpret_int(rhs, dest_ty);
+    // Mixed scalar denominations in a comparison: the two
+    // operands of one MIR binary operation always share one
+    // declared type, but a value can reach the operation under
+    // a different scalar kind tag than its partner -- a bool
+    // materialised as the integer 0/1 (a discriminant read, a
+    // constant stored bits, an aggregate element built under
+    // an integer kind), or an integer stored under the opposite
+    // signedness tag whose declared type a comparison bool
+    // destination does not carry for `reinterpret_int` to read.
+    // Rejecting the pair would reject the guest comparison;
+    // instead compare by the operands actual scalar values:
+    // a bool reads as 0/1 and an integer as the mathematical
+    // value its kind tag stores (signed values sign-extended,
+    // unsigned values as stored). Same-kind pairs keep the
+    // strict dispatch below, whose declared width governs
+    // wrapping and overflow.
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | Cmp) {
+        fn scalar_key(v: &Value) -> Option<(bool, u128)> {
+            match v {
+                Value::Bool(b) => Some((false, u128::from(*b))),
+                Value::Int(i) if *i >= 0 => Some((false, *i as u128)),
+                Value::Int(i) => Some((true, i.unsigned_abs())),
+                Value::Uint(u) => Some((false, *u)),
+                _ => None,
+            }
+        }
+        fn same_kind(a: &Value, b: &Value) -> bool {
+            matches!(
+                (a, b),
+                (Value::Bool(_), Value::Bool(_))
+                    | (Value::Int(_), Value::Int(_))
+                    | (Value::Uint(_), Value::Uint(_))
+            )
+        }
+        if !same_kind(lhs, rhs) {
+            if let (Some((an, am)), Some((bn, bm))) = (scalar_key(lhs), scalar_key(rhs)) {
+                let ord = match (an, bn) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => am.cmp(&bm),
+                    (true, true) => bm.cmp(&am),
+                };
+                if op == Cmp {
+                    return Ok((ordering_of(ord), false));
+                }
+                let v = match op {
+                    Eq => ord == std::cmp::Ordering::Equal,
+                    Ne => ord != std::cmp::Ordering::Equal,
+                    Lt => ord == std::cmp::Ordering::Less,
+                    Le => ord != std::cmp::Ordering::Greater,
+                    Gt => ord == std::cmp::Ordering::Greater,
+                    Ge => ord != std::cmp::Ordering::Less,
+                    _ => unreachable!(),
+                };
+                return Ok((Value::Bool(v), false));
+            }
+        }
+    }
     // Signed arithmetic.
     if let (Value::Int(a), Value::Int(b)) = (lhs, rhs) {
         let (a, b) = (*a, *b);
@@ -1017,4 +1083,44 @@ pub(crate) fn synthetic_addr(v: &Value) -> u128 {
     }
     const BASE: u128 = 0x1000_0000_0000;
     BASE + (h % (1 << 40)) * 65536
+}
+
+#[cfg(test)]
+mod binop_denom_tests {
+    use super::eval_binary;
+    use crate::ir::{BinOp, Ty};
+    use crate::value::Value;
+
+    fn run(op: BinOp, lhs: &Value, rhs: &Value) -> Value {
+        eval_binary(op, lhs, rhs, Some(&Ty::Bool), false, &|_| None)
+            .expect("comparison evaluates")
+            .0
+    }
+
+    /// `tests/ui/binop/binops.rs`: a boolean ordering reaches
+    /// MIR as `BinaryOp::Lt` on bool operands.
+    #[test]
+    fn bool_ordering_operations() {
+        assert_eq!(run(BinOp::Lt, &Value::Bool(false), &Value::Bool(true)), Value::Bool(true));
+        assert_eq!(run(BinOp::Lt, &Value::Bool(true), &Value::Bool(false)), Value::Bool(false));
+        assert_eq!(run(BinOp::Le, &Value::Bool(true), &Value::Bool(true)), Value::Bool(true));
+        assert_eq!(run(BinOp::Gt, &Value::Bool(true), &Value::Bool(false)), Value::Bool(true));
+        assert_eq!(run(BinOp::Ge, &Value::Bool(false), &Value::Bool(true)), Value::Bool(false));
+    }
+
+    /// `tests/ui/traits/inheritance/repeated-supertrait.rs`: an
+    /// equality whose sides arrive under different scalar kind
+    /// tags (bool against its integer 0/1 materialisation, and
+    /// signed against unsigned) compares by scalar value.
+    #[test]
+    fn mixed_denomination_equality() {
+        assert_eq!(run(BinOp::Eq, &Value::Bool(true), &Value::Uint(1)), Value::Bool(true));
+        assert_eq!(run(BinOp::Eq, &Value::Int(1), &Value::Bool(true)), Value::Bool(true));
+        assert_eq!(run(BinOp::Eq, &Value::Bool(false), &Value::Int(0)), Value::Bool(true));
+        assert_eq!(run(BinOp::Ne, &Value::Bool(true), &Value::Uint(0)), Value::Bool(true));
+        assert_eq!(run(BinOp::Eq, &Value::Int(-1), &Value::Uint(0)), Value::Bool(false));
+        assert_eq!(run(BinOp::Eq, &Value::Uint(7), &Value::Int(7)), Value::Bool(true));
+        assert_eq!(run(BinOp::Lt, &Value::Int(-1), &Value::Uint(0)), Value::Bool(true));
+        assert_eq!(run(BinOp::Gt, &Value::Uint(2), &Value::Bool(true)), Value::Bool(true));
+    }
 }
