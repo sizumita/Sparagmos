@@ -594,7 +594,12 @@ fn static_link_section(def: &mir::mono::StaticDef) -> Option<String> {
 /// per static).
 fn const_fn_targets(value: &sm::ConstValue) -> Vec<sm::DefId> {
     match value {
-        sm::ConstValue::FnDef(def) | sm::ConstValue::Closure(def) => vec![*def],
+        sm::ConstValue::FnDef(def) => vec![*def],
+        sm::ConstValue::Closure(def, env) => {
+            let mut out = vec![*def];
+            out.extend(env.iter().flat_map(const_fn_targets));
+            out
+        }
         sm::ConstValue::Tuple(elems) => elems.iter().flat_map(const_fn_targets).collect(),
         _ => Vec::new(),
     }

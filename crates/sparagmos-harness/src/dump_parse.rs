@@ -979,8 +979,14 @@ impl Conv {
             ("FnDef", Payload::Args(a)) if a.len() == 1 => {
                 mir::ConstValue::FnDef(Self::def_id(&a[0])?)
             }
-            ("Closure", Payload::Args(a)) if a.len() == 1 => {
-                mir::ConstValue::Closure(Self::def_id(&a[0])?)
+            ("Closure", Payload::Args(a)) if a.len() == 1 || a.len() == 2 => {
+                let mut env = Vec::new();
+                if a.len() == 2 {
+                    for e in as_list(&a[1])? {
+                        env.push(Self::const_value(e)?);
+                    }
+                }
+                mir::ConstValue::Closure(Self::def_id(&a[0])?, env)
             }
             ("IntPtr", Payload::Args(a)) if a.len() == 1 => {
                 mir::ConstValue::IntPtr(atom_parse(&a[0], "address")?)
@@ -1770,6 +1776,38 @@ Body {
         assert_eq!(
             parsed.program.names.get(&mir::DefId { krate: 0, index: 0 }),
             Some(&"sample::main".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_a_closure_constant_with_captured_environment() {
+        // A closure constant carries its captured environment:
+        // `Closure(DefId, [env..])`. The environment is empty
+        // for a non-capturing closure and holds one constant
+        // per upvar otherwise (a thread-local `replace` call
+        // inlined into a body is the shape that first
+        // produced one).
+        let dump = SAMPLE.replace(
+            "Scalar(\n                                                Int {\n                                                    data: 41,\n                                                    size: 4,\n                                                },\n                                            )",
+            "Closure(\n                                                DefId {\n                                                    krate: 0,\n                                                    index: 1,\n                                                },\n                                                [\n                                                    Bool(\n                                                        true,\n                                                    ),\n                                                ],\n                                            )",
+        );
+        assert_ne!(dump, SAMPLE, "the literal replacement must apply");
+        let parsed = parse_dump(&dump).expect("closure dump parses");
+        let f = &parsed.program.functions[0];
+        let mir::StatementKind::Assign(assign) =
+            &f.body.basic_blocks[0].statements[0].kind
+        else {
+            panic!("expected an assignment statement");
+        };
+        let mir::Rvalue::Use(mir::Operand::Constant(c)) = &assign.1 else {
+            panic!("expected a constant operand");
+        };
+        assert_eq!(
+            c.literal,
+            mir::ConstKind::Value(mir::ConstValue::Closure(
+                mir::DefId { krate: 0, index: 1 },
+                vec![mir::ConstValue::Bool(true)],
+            ))
         );
     }
 

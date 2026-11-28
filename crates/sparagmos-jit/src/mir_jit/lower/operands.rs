@@ -631,7 +631,7 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::FnDef(_) => {
                 return Err(self.err("function pointer constant"));
             }
-            mir::ConstValue::Closure(_) => {
+            mir::ConstValue::Closure(..) => {
                 return Err(self.err("closure constant"));
             }
             mir::ConstValue::Str(_) => return Err(self.err("string constant")),

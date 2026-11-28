@@ -725,8 +725,27 @@ impl<'a> Converter<'a> {
             mir::ConstValue::FnDef(def) => {
                 ir::Constant::FnDef(self.body_key(def))
             }
-            mir::ConstValue::Closure(def) => {
-                ir::Constant::Closure(self.body_key(def), Vec::new())
+            mir::ConstValue::Closure(def, env) => {
+                // The environment fields' contexts are the
+                // closure type's upvars tuple elements, when
+                // the context names the closure type.
+                let env_ctxs: Vec<Option<&mir::Ty>> = match ctx {
+                    Some(mir::Ty::Closure(_, tys)) if tys.len() == 1 => {
+                        match &tys[0] {
+                            mir::Ty::Tuple(elems) => {
+                                elems.iter().map(Some).collect()
+                            }
+                            _ => Vec::new(),
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                let mut converted_env = Vec::with_capacity(env.len());
+                for (i, e) in env.iter().enumerate() {
+                    let ectx = env_ctxs.get(i).copied().flatten();
+                    converted_env.push(self.convert_const_value(e, ectx)?);
+                }
+                ir::Constant::Closure(self.body_key(def), converted_env)
             }
             mir::ConstValue::IntPtr(addr) => ir::Constant::IntPtr(*addr),
             mir::ConstValue::VTablePtr(id) => ir::Constant::VTablePtr(*id),
