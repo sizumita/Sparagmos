@@ -3122,6 +3122,17 @@ impl<'a> Interpreter<'a> {
             // element step here; any other bare shape takes
             // the plain access.
             if at == projection.len() {
+                // A bare union base whose payload holds the
+                // sequence's raw storage (a `MaybeUninit`
+                // temporary buffer addressed through a cast of
+                // the union's own pointer): the element position
+                // is composed through the payload's storage
+                // component.
+                if let Some(composed) = self.union_storage_seq_target(
+                    frames, target, projection, index, elem,
+                )? {
+                    return Ok(Some(composed));
+                }
                 let stride = self.seq_slot_stride(frames, target, projection, elem);
                 if stride > 1 {
                     let mut projection = projection.to_vec();
@@ -3196,6 +3207,184 @@ impl<'a> Interpreter<'a> {
             },
             Resolved::Value(base, _) => Resolved::Value(base.clone(), projection),
         }))
+    }
+
+    /// The element position of a sequence access whose base is
+    /// a union place with no element step: the shape a
+    /// `MaybeUninit` temporary buffer takes in core's slice
+    /// rotation, where the buffer pointer is the union's own
+    /// address cast to the element type (`rawarray.as_mut_ptr()
+    /// as *mut T`), so the access's target is the bare union
+    /// place. The union's storage is its payload: descending
+    /// the held field (and any single-field wrapper forms the
+    /// payload arrives in) reaches the payload value, and the
+    /// raw storage component inside it -- its longest tuple
+    /// field, or a flat tuple payload itself -- is the sequence
+    /// the pointer denotes.
+    /// Elements are denominated one per storage slot, whole in
+    /// the slot: the denomination every access to this buffer
+    /// shares, since the buffer is only ever reached through
+    /// this pointer. Declines when: the element type is unknown
+    /// or byte-width (byte accesses keep the byte paths); the
+    /// base is not a union, or its stored form is not the
+    /// aggregate held-field form (a byte-form union is the byte
+    /// view's); the payload itself fits the element type (the
+    /// position then holds one element whole, and the caller's
+    /// single-element judgement owns it); the payload holds no
+    /// raw storage component; or the index runs past the
+    /// storage's slots.
+    fn union_storage_seq_target(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        projection: &[RefProj],
+        index: usize,
+        elem: Option<&Ty>,
+    ) -> InterpResult<Option<Resolved>> {
+        let Some((descent, storage_len)) =
+            self.union_storage_descent(frames, target, projection, elem)?
+        else {
+            return Ok(None);
+        };
+        if index >= storage_len {
+            return Ok(None);
+        }
+        let mut projection = projection.to_vec();
+        projection.extend_from_slice(&descent);
+        projection.push(RefProj::Index(index));
+        Ok(Some(match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection,
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection,
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection,
+            },
+            Resolved::Value(base, _) => {
+                Resolved::Value(base.clone(), projection)
+            }
+        }))
+    }
+
+    /// The descent into a union place's raw storage component
+    /// and that storage's slot count, when the place denotes
+    /// a sequence buffer in the sense of
+    /// [`Self::union_storage_seq_target`]. Shared with the bulk
+    /// copy's own single-element judgements, which must not
+    /// take such a buffer for one element: the union's stored
+    /// form is an enum value, which those judgements otherwise
+    /// read as a non-aggregate element and replace whole.
+    pub(crate) fn union_storage_descent(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        projection: &[RefProj],
+        elem: Option<&Ty>,
+    ) -> InterpResult<Option<(Vec<RefProj>, usize)>> {
+        let Some(elem) = elem else {
+            return Ok(None);
+        };
+        if matches!(
+            elem,
+            Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
+        ) {
+            return Ok(None);
+        }
+        let Some(Ty::Adt(union_name)) =
+            self.target_denoted_ty(frames, target, projection)
+        else {
+            return Ok(None);
+        };
+        if !self.adt_is_union(&union_name) {
+            return Ok(None);
+        }
+        let Ok(value) = self.read_resolved(frames, target) else {
+            return Ok(None);
+        };
+        let Value::Enum { fields, .. } = &value else {
+            return Ok(None);
+        };
+        if fields.len() != 1 {
+            return Ok(None);
+        }
+        let payload = &fields[0];
+        // The payload fitting the element type as it stands
+        // means the position holds one element whole (a swap
+        // temporary's `MaybeUninit<T>`): not a buffer.
+        if value_fits_ty(payload, elem) {
+            return Ok(None);
+        }
+        // Descend the held field and any single-field wrapper
+        // forms to the payload's storage component.
+        let mut descent: Vec<RefProj> = vec![RefProj::Field(0)];
+        let mut cur = payload;
+        let storage_len = loop {
+            if descent.len() > 6 {
+                return Ok(None);
+            }
+            match cur {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    descent.push(RefProj::Field(0));
+                    cur = &fields[0];
+                }
+                Value::Tuple(items) => {
+                    // A storage component among the fields: the
+                    // longest tuple field of length at least
+                    // two. The payload tuple's other fields are
+                    // the zero-sized tail the buffer type pairs
+                    // with its storage. The slots' contents are
+                    // no guide -- before the buffer is written
+                    // they are uninitialised, afterwards they
+                    // hold the elements themselves -- so the
+                    // component is judged by shape alone, and
+                    // two candidate components of the same
+                    // length decline rather than guess.
+                    let mut component: Option<(usize, usize)> = None;
+                    for (j, item) in items.iter().enumerate() {
+                        if let Value::Tuple(slots) = item {
+                            if slots.len() >= 2 {
+                                match component {
+                                    None => component = Some((j, slots.len())),
+                                    Some((_, len)) if slots.len() > len => {
+                                        component = Some((j, slots.len()));
+                                    }
+                                    Some((_, len)) if slots.len() == len => {
+                                        return Ok(None);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some((j, len)) = component {
+                        descent.push(RefProj::Field(j));
+                        break len;
+                    }
+                    // The payload tuple itself is the storage:
+                    // a bare array field's stored form, a flat
+                    // tuple of element values with no container
+                    // field of its own.
+                    if items.len() >= 2
+                        && items.iter().all(|item| {
+                            !matches!(item, Value::Tuple(_) | Value::Bytes(_))
+                        })
+                    {
+                        break items.len();
+                    }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        };
+        Ok(Some((descent, storage_len)))
     }
 
     /// The live place a `&RefCell` / `&mut RefCell` argument points

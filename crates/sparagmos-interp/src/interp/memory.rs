@@ -815,16 +815,33 @@ impl<'a> Interpreter<'a> {
                 // own readers (the union field read behind
                 // `assume_init`, the whole-place move) require.
                 let mu_elem = matches!(elem, Some(ty) if is_maybe_uninit_ty(ty));
-                let src_single = match elem {
-                    Some(_) if mu_elem => {
-                        !aggregate(&src_base)
-                            && !matches!(src_base, Value::SparseVec { .. })
-                    }
-                    Some(ty) => {
-                        value_fits_ty(self.copy_unwrap(&src_base), ty)
-                    }
-                    None => n == 1 && !aggregate(&src_base),
+                // A union place whose payload holds a raw
+                // storage array (a `MaybeUninit` temporary
+                // buffer, as in slice rotation) is a sequence
+                // buffer, not one element: its stored form is
+                // an enum value, which the single-element
+                // judgements on both sides would otherwise take
+                // for an element and read / replace whole.
+                let src_projection = match &src_target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection.clone(),
                 };
+                let src_union_buffer = self
+                    .union_storage_descent(frames, &src_target, &src_projection, elem)?
+                    .is_some();
+                let src_single = !src_union_buffer
+                    && match elem {
+                        Some(_) if mu_elem => {
+                            !aggregate(&src_base)
+                                && !matches!(src_base, Value::SparseVec { .. })
+                        }
+                        Some(ty) => {
+                            value_fits_ty(self.copy_unwrap(&src_base), ty)
+                        }
+                        None => n == 1 && !aggregate(&src_base),
+                    };
                 // A source array holding the scalar-packed
                 // form (see `packed_scalar_bytes`): its elements
                 // are the packed scalar's bytes, which neither
@@ -899,14 +916,24 @@ impl<'a> Interpreter<'a> {
                 // buffer being filled: the indexed path is the one
                 // that can create its elements.
                 let dst_current = self.read_resolved(frames, &dst_target).ok();
+                let dst_projection = match &dst_target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection.clone(),
+                };
+                let dst_union_buffer = self
+                    .union_storage_descent(frames, &dst_target, &dst_projection, elem)?
+                    .is_some();
                 let dst_single = match elem {
                     Some(ty) => match &dst_current {
                         Some(cur) => {
-                            !aggregate(cur)
-                                || value_fits_ty(
-                                    self.copy_unwrap(cur),
-                                    ty,
-                                )
+                            !dst_union_buffer
+                                && (!aggregate(cur)
+                                    || value_fits_ty(
+                                        self.copy_unwrap(cur),
+                                        ty,
+                                    ))
                         }
                         None => false,
                     },
