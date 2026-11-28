@@ -27,6 +27,25 @@ name: Auto Merge
 # CLEAN between selection and arming). Any other arming failure
 # fails the run.
 #
+# Queue draining: a merge this workflow performs itself is made
+# with the workflow's token, and events caused by that token do not
+# start new workflow runs, so after a direct merge the next pull
+# request in the queue would otherwise sit untouched until an
+# unrelated event arrived. The selection therefore repeats after
+# every direct merge, and a single run drains the directly
+# mergeable prefix of the queue. The run stops at the first pull
+# request it cannot merge directly: a draft, a pull request that
+# changes .github/workflows/, or an already-armed pull request ends
+# the run untouched, and a pull request that is not CLEAN yet is
+# armed (with the clean-status fallback above) as the run's last
+# action, since it merges on its own once its required checks
+# pass. A run merges at most 20 pull requests; needing a 21st
+# fails the run loudly. Two transient states are waited out with
+# bounded polls before the run acts on them: a pull request merged
+# earlier in the same run can still show as open for a few seconds,
+# and a merge state can read UNKNOWN while GitHub recomputes it
+# after a merge.
+#
 # This workflow only enables auto-merge or, for an already-CLEAN
 # pull request, performs the merge the required status checks have
 # already approved; whether a pull request actually merges is
@@ -36,10 +55,12 @@ name: Auto Merge
 # definition on main applies to every pull request regardless of
 # what the branch carries, and it never checks out the pull
 # request's code: it only calls the GitHub API. The closed event
-# re-runs the selection so the next-oldest pull request is armed as
-# soon as the previous one leaves the queue; workflow_dispatch
-# allows re-running the selection by hand. Runs are serialised so
-# two events cannot arm two different pull requests concurrently.
+# re-runs the selection so the next-oldest pull request is handled
+# as soon as the previous one leaves the queue, and the drain loop
+# above covers the merges this workflow performs itself;
+# workflow_dispatch allows re-running the selection by hand. Runs
+# are serialised so two events cannot arm two different pull
+# requests concurrently.
 
 on:
   pull_request_target:
@@ -65,42 +86,84 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          oldest="$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
-            --json number,isDraft,autoMergeRequest,createdAt,mergeStateStatus \
-            --jq 'sort_by(.createdAt) | .[0] // empty')"
-          if [ -z "$oldest" ]; then
-            echo "No open pull requests target main; nothing to arm."
-            exit 0
-          fi
-          number="$(printf '%s' "$oldest" | jq -r '.number')"
-          if [ "$(printf '%s' "$oldest" | jq -r '.autoMergeRequest != null')" = "true" ]; then
-            echo "Auto-merge is already enabled for the oldest open pull request #${number}." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [ "$(printf '%s' "$oldest" | jq -r '.isDraft')" = "true" ]; then
-            echo "The oldest open pull request #${number} is a draft, so auto-merge is not enabled; it waits for manual handling and no newer pull request is armed in its place." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          files="$(gh api "repos/${REPO}/pulls/${number}/files" --paginate --jq '.[].filename')"
-          if printf '%s\n' "$files" | grep -q '^\.github/workflows/'; then
-            echo "The oldest open pull request #${number} changes .github/workflows/, so auto-merge is not enabled; it is merged manually." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          state="$(printf '%s' "$oldest" | jq -r '.mergeStateStatus')"
-          if [ "$state" = "CLEAN" ]; then
-            gh pr merge "$number" --repo "$REPO" --squash
-            echo "The oldest open pull request #${number} is already CLEAN, so it was merged directly (squash) instead of arming auto-merge." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if ! arm_output="$(gh pr merge "$number" --repo "$REPO" --auto --squash 2>&1)"; then
-            printf '%s\n' "$arm_output"
-            if printf '%s\n' "$arm_output" | grep -q 'clean status'; then
-              gh pr merge "$number" --repo "$REPO" --squash
-              echo "Enabling auto-merge for the oldest open pull request #${number} reported the clean status, so it was merged directly (squash)." >> "$GITHUB_STEP_SUMMARY"
+          select_oldest() {
+            gh pr list --repo "$REPO" --state open --base main --limit 1000 \
+              --json number,isDraft,autoMergeRequest,createdAt,mergeStateStatus \
+              --jq 'sort_by(.createdAt) | .[0] // empty'
+          }
+          merges=0
+          merged_numbers=" "
+          stale_polls=0
+          while true; do
+            oldest="$(select_oldest)"
+            if [ -z "$oldest" ]; then
+              echo "No open pull requests target main; nothing to arm."
               exit 0
             fi
-            echo "Enabling auto-merge for the oldest open pull request #${number} failed." >&2
-            exit 1
-          fi
-          printf '%s\n' "$arm_output"
-          echo "Auto-merge (squash) enabled for the oldest open pull request #${number}." >> "$GITHUB_STEP_SUMMARY"
+            number="$(printf '%s' "$oldest" | jq -r '.number')"
+            case "$merged_numbers" in
+              *" ${number} "*)
+                # This pull request was merged earlier in this run
+                # but still shows as open; the API view has not
+                # caught up with the merge yet. Wait and select
+                # again, a bounded number of times, instead of
+                # acting on the stale entry.
+                stale_polls=$((stale_polls + 1))
+                if [ "$stale_polls" -gt 6 ]; then
+                  echo "Pull request #${number} still shows as open after this run merged it; failing loudly." >&2
+                  exit 1
+                fi
+                sleep 10
+                continue
+                ;;
+            esac
+            stale_polls=0
+            if [ "$(printf '%s' "$oldest" | jq -r '.autoMergeRequest != null')" = "true" ]; then
+              echo "Auto-merge is already enabled for the oldest open pull request #${number}." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$(printf '%s' "$oldest" | jq -r '.isDraft')" = "true" ]; then
+              echo "The oldest open pull request #${number} is a draft, so auto-merge is not enabled; it waits for manual handling and no newer pull request is armed in its place." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            files="$(gh api "repos/${REPO}/pulls/${number}/files" --paginate --jq '.[].filename')"
+            if printf '%s\n' "$files" | grep -q '^\.github/workflows/'; then
+              echo "The oldest open pull request #${number} changes .github/workflows/, so auto-merge is not enabled; it is merged manually." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            state="$(printf '%s' "$oldest" | jq -r '.mergeStateStatus')"
+            unknown_polls=0
+            while [ "$state" = "UNKNOWN" ] && [ "$unknown_polls" -lt 6 ]; do
+              # The merge state reads UNKNOWN while GitHub
+              # recomputes it, typically just after a merge; wait
+              # for it to settle before classifying the pull
+              # request.
+              sleep 10
+              unknown_polls=$((unknown_polls + 1))
+              state="$(gh pr view "$number" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"
+            done
+            if [ "$state" = "CLEAN" ]; then
+              if [ "$merges" -ge 20 ]; then
+                echo "This run already merged 20 pull requests and the oldest open pull request #${number} is still directly mergeable; failing loudly instead of merging further." >&2
+                exit 1
+              fi
+              gh pr merge "$number" --repo "$REPO" --squash
+              echo "The oldest open pull request #${number} is already CLEAN, so it was merged directly (squash) instead of arming auto-merge." >> "$GITHUB_STEP_SUMMARY"
+              merges=$((merges + 1))
+              merged_numbers="${merged_numbers}${number} "
+              continue
+            fi
+            if ! arm_output="$(gh pr merge "$number" --repo "$REPO" --auto --squash 2>&1)"; then
+              printf '%s\n' "$arm_output"
+              if printf '%s\n' "$arm_output" | grep -q 'clean status'; then
+                gh pr merge "$number" --repo "$REPO" --squash
+                echo "Enabling auto-merge for the oldest open pull request #${number} reported the clean status, so it was merged directly (squash)." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Enabling auto-merge for the oldest open pull request #${number} failed." >&2
+              exit 1
+            fi
+            printf '%s\n' "$arm_output"
+            echo "Auto-merge (squash) enabled for the oldest open pull request #${number}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          done
