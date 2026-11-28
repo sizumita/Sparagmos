@@ -6446,6 +6446,25 @@ impl<'a> Interpreter<'a> {
                 self.record_box_ty(&boxed, Ty::Slice(Box::new(Ty::Uint(crate::ir::UintTy::U8))));
                 Ok(boxed)
             }
+            Builtin::PathBufIntoBoxedPath => {
+                arity(1)?;
+                // The box holds the path's bytes themselves,
+                // the pointee form every `Box<Path>` consumer
+                // reads (through `Deref`, the comparisons,
+                // the counted-pointer conversions), as the
+                // `OsString::into_boxed_os_str` box holds the
+                // OS string's bytes. The `Path` pointee type
+                // recorded on the allocation is the signal
+                // the path-box recognition in tagless
+                // comparisons consults (see
+                // `operand_is_path_box`).
+                let bytes = self.os_str_bytes(frames, &vals[0])?;
+                let boxed = self.new_box(Value::Bytes(bytes));
+                if let Some(ty) = ty_from_tag("std::path::Path") {
+                    self.record_box_ty(&boxed, ty);
+                }
+                Ok(boxed)
+            }
             Builtin::NoAllocShimMarker => {
                 arity(0)?;
                 Ok(Value::Unit)
