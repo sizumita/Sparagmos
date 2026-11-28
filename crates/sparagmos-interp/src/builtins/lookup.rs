@@ -112,6 +112,11 @@ pub fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::OrdCmp
             | Builtin::PartialOrdRel(_)
             | Builtin::CloneClone
+            // The identity model: it returns its one argument
+            // unchanged and needs nothing conversion bakes in,
+            // so a `black_box` function item invoked through a
+            // value is served exactly as a direct call is.
+            | Builtin::BlackBox
             // `ToOwned::to_owned` likewise computes from the
             // argument value alone (a `str` receiver's owned
             // form is the string itself, a slice's is its
@@ -667,6 +672,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         .or_else(|| f16_lookup(canonical))
         .or_else(|| rc_arc_lookup(canonical))
         .or_else(|| unicode_lookup_slow(canonical))
+        .or_else(|| float_intrinsic_lookup(canonical))
         .or_else(|| float_method(canonical))
 }
 

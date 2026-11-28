@@ -1193,7 +1193,10 @@ fn note_pointer_operand(
 /// `CallBuiltin` terminator's arguments (a `write_bytes`
 /// memset writes through it in place, into the value the
 /// frame already holds) and `CopyNonOverlapping` (a memcpy
-/// between two such pointers). The rooted local materialises
+/// between two such pointers). The one builtin that is not a
+/// modelled operation in this sense is `black_box`: an address
+/// passed to it escapes, as it would to a guest call. The
+/// rooted local materialises
 /// as soon as the address leaves that flow: passed to a guest
 /// call, stored into a projected place or a constructed
 /// aggregate, returned in the return place, converted to an
@@ -1500,7 +1503,8 @@ fn body_stack_charge(body: &Body, size_of: &mut dyn FnMut(usize, &Ty) -> u64) ->
     }
     // Terminator uses of a flow pointer: a guest call (or an
     // assertion reading the value) observes the address; a
-    // modelled builtin call does not.
+    // modelled builtin call does not -- except `black_box`,
+    // whose whole contract is to observe its argument opaquely.
     let mut escape_operand = |flow: &std::collections::HashMap<usize, Vec<usize>>,
                               escaped: &mut Vec<bool>,
                               operand: &Operand| {
@@ -1521,6 +1525,24 @@ fn body_stack_charge(body: &Body, size_of: &mut dyn FnMut(usize, &Ty) -> u64) ->
             TerminatorKind::Call { args, .. } => {
                 for arg in args {
                     escape_operand(&flow, &mut escaped, arg);
+                }
+            }
+            TerminatorKind::CallBuiltin { name, args, .. } => {
+                // `black_box` is the one builtin whose argument
+                // address escapes: it is an opaque sink by
+                // definition -- the argument is observed by code
+                // the model cannot see through, which is exactly
+                // what forces the pointee to materialise in the
+                // native frame. Every other builtin is a modelled
+                // operation whose pointer arguments are read and
+                // written in place, so they stay in the flow.
+                if matches!(
+                    crate::builtins::lookup(name),
+                    Some(crate::builtins::Builtin::BlackBox)
+                ) {
+                    for arg in args {
+                        escape_operand(&flow, &mut escaped, arg);
+                    }
                 }
             }
             TerminatorKind::CallIndirect { func, args, .. } => {
