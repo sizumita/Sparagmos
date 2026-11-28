@@ -115,6 +115,42 @@ fn main() {{
 }
 
 #[test]
+fn async_fn_item_through_async_fn_bounds() {
+    // A function item satisfies an `AsyncFnOnce` / `AsyncFnMut` /
+    // `AsyncFn` bound through the blanket impls, and its
+    // `async_call_once` receiver is the function pointer value,
+    // not an async closure: the shim's meaning is the function
+    // call itself, whose return value is the future. (Measured on
+    // tests/ui/async-await/async-closures/async-fn-once-for-async-fn.rs,
+    // which stopped with "type mismatch in
+    // AsyncFnOnce::async_call_once receiver: expected async
+    // closure value, found function pointer".)
+    let src = format!(
+        r#"{POLL_PRELUDE}
+async fn foo() {{}}
+
+async fn needs_once(x: impl AsyncFnOnce()) {{ x().await; }}
+async fn needs_mut(mut x: impl AsyncFnMut()) {{ x().await; }}
+async fn needs_fn(x: impl AsyncFn()) {{ x().await; }}
+
+fn main() {{
+    match poll_once(async {{
+        needs_once(foo).await;
+        needs_mut(foo).await;
+        needs_fn(foo).await;
+        needs_once(async || {{}}).await;
+        needs_once(|| async {{}}).await;
+    }}) {{
+        Poll::Ready(()) => println!("fn item ok"),
+        Poll::Pending => println!("pending"),
+    }}
+}}
+"#
+    );
+    assert_run("fn-item", &src, "fn item ok\n");
+}
+
+#[test]
 fn async_closure_params_and_captures_field_order() {
     // The coroutine's state-0 fields are the call arguments first,
     // then the captures: two of each, of distinct types, so a

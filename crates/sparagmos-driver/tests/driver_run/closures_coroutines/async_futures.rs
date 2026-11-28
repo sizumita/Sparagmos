@@ -475,3 +475,67 @@ fn run_mode_polled_async_closure_future_drops_capture_once() {
         "each capture must drop exactly once; stderr={stderr}"
     );
 }
+
+const NESTED_ASYNC_GEN_SRC: &str = r#"
+#![allow(incomplete_features)]
+#![feature(async_iterator, gen_blocks, move_expr)]
+
+use std::async_iter::AsyncIterator;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+
+fn poll_next<I: AsyncIterator>(iter: Pin<&mut I>) -> Poll<Option<I::Item>> {
+    let cx = &mut Context::from_waker(Waker::noop());
+    AsyncIterator::poll_next(iter, cx)
+}
+
+fn ready_next<I: AsyncIterator>(iter: Pin<&mut I>) -> Option<I::Item> {
+    match poll_next(iter) {
+        Poll::Ready(item) => item,
+        Poll::Pending => panic!("async iterator unexpectedly returned pending"),
+    }
+}
+
+fn main() {
+    let y = Arc::new(String::from("nested"));
+    let weak = Arc::downgrade(&y);
+    let mut iter = Box::pin(async gen {
+        let mut inner = Box::pin(async gen {
+            let value = move(move(y.clone()));
+            yield Arc::strong_count(&value);
+        });
+        yield ready_next(inner.as_mut()).unwrap();
+    });
+    assert_eq!(weak.strong_count(), 2);
+    assert_eq!(ready_next(iter.as_mut()), Some(2));
+    drop(iter);
+    assert_eq!(weak.strong_count(), 1);
+    println!("nested async gen ok");
+}
+"#;
+
+#[test]
+fn run_mode_nested_async_gen_boxed_in_gen_body() {
+    // A `Box::pin`ed async gen block created inside another
+    // async gen block's body: the pinned value is a local saved
+    // as a field of the outer coroutine's state, and
+    // `Pin::as_mut` on it reaches `DerefMut::deref_mut` for
+    // `Box` with the box denominated through that state field's
+    // projection. The deref stopped with "type mismatch in
+    // DerefMut::deref_mut for Box: expected boxed value, found
+    // coroutine" (tests/ui/move-expr/async-gen-blocks.rs).
+    let dir = temp_dir("nested-async-gen");
+    let src = fixture(&dir, "nested_async_gen.rs", NESTED_ASYNC_GEN_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested async gen must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nested async gen ok\n"
+    );
+}

@@ -608,6 +608,56 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether the receiver of an `AsyncFn`-family trait call
+    /// is a function pointer value (a function item, or a
+    /// non-capturing closure coerced to a function pointer):
+    /// such a receiver has no closure environment and no
+    /// coroutine of its own for the call to construct - the
+    /// `AsyncFn` shim's meaning for it is the plain function
+    /// call, whose return value is the future. The peek reads
+    /// the receiver without consuming it, exactly as
+    /// `fn_call_receiver_is_async_closure` does. For
+    /// `async_call_once` the receiver is the value itself; for
+    /// `async_call` / `async_call_mut` it is a reference to the
+    /// value.
+    pub(crate) fn fn_call_receiver_is_fn_ptr(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        receiver: &Operand,
+        by_value: bool,
+    ) -> bool {
+        let recv = match receiver {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let Ok(resolved) = self.resolve_place(frames, body, place) else {
+                    return false;
+                };
+                let Ok(value) = self.read_resolved(frames, &resolved) else {
+                    return false;
+                };
+                value
+            }
+            Operand::Constant(c) => {
+                let Ok(value) = self.eval_constant(c) else {
+                    return false;
+                };
+                value
+            }
+        };
+        let value = if by_value {
+            recv
+        } else {
+            let Ok(resolved) = self.deref_value(frames, &recv) else {
+                return false;
+            };
+            let Ok(value) = self.read_resolved(frames, &resolved) else {
+                return false;
+            };
+            value
+        };
+        matches!(value, Value::FnPtr(_))
+    }
+
     pub(crate) fn eval_callable(
         &self,
         frames: &[Frame],

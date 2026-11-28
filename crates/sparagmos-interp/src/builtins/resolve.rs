@@ -330,6 +330,85 @@ impl<'a> Interpreter<'a> {
         Ok(self.resolve_ref(frames, value)?.into_owned())
     }
 
+    /// Resolve a `&Box<T>` / `&mut Box<T>` argument to the box
+    /// value it denotes, for the `Box` arms of `Deref` /
+    /// `DerefMut`. The direct resolution is the answer wherever
+    /// it lands on a box shape. It can overshoot by one field
+    /// step: a box held behind a one-field wrapper in projected
+    /// storage (a `Pin<Box<T>>` local saved as a coroutine state
+    /// field is the measured case) is reached through a
+    /// projection whose wrapper-entry step the dereference walk
+    /// itself supplies, so the stored projection carries the
+    /// box's own field step as well and the direct resolution
+    /// lands on the pointee instead of the box. When the direct
+    /// resolution is not a box shape and the argument's
+    /// projection ends in that field step, the resolution one
+    /// step shorter is tried, and it is the answer when it lands
+    /// on a box shape; anything else keeps the direct resolution
+    /// (and its error) unchanged.
+    pub(super) fn resolve_box_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        let resolved = self.resolve_value(frames, value)?;
+        if matches!(resolved, Value::Enum { .. } | Value::DynRef { .. }) {
+            return Ok(resolved);
+        }
+        let Value::Ref(target) = value else {
+            return Ok(resolved);
+        };
+        let shortened = match target {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } if matches!(projection.last(), Some(RefProj::Field(0))) => {
+                let mut projection = projection.clone();
+                projection.pop();
+                Value::Ref(RefTarget::Place {
+                    frame: *frame,
+                    local: *local,
+                    projection,
+                })
+            }
+            RefTarget::Static { name, projection }
+                if matches!(projection.last(), Some(RefProj::Field(0))) =>
+            {
+                let mut projection = projection.clone();
+                projection.pop();
+                Value::Ref(RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                })
+            }
+            RefTarget::Alloc { id, projection }
+                if matches!(projection.last(), Some(RefProj::Field(0))) =>
+            {
+                let mut projection = projection.clone();
+                projection.pop();
+                Value::Ref(RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                })
+            }
+            RefTarget::Value(base, projection)
+                if matches!(projection.last(), Some(RefProj::Field(0))) =>
+            {
+                let mut projection = projection.clone();
+                projection.pop();
+                Value::Ref(RefTarget::Value(base.clone(), projection))
+            }
+            _ => return Ok(resolved),
+        };
+        if let Ok(alt) = self.resolve_value(frames, &shortened) {
+            if matches!(alt, Value::Enum { .. } | Value::DynRef { .. }) {
+                return Ok(alt);
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Follow references in `value` until a non-reference value,
     /// borrowing the denoted data wherever it is already
     /// materialised: the borrowing form of [`resolve_value`], with
