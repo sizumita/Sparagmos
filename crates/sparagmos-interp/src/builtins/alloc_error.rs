@@ -125,6 +125,51 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The graceful failure of one oversized repeated fill
+    /// (`vec![elem; n]` / `std::vec::from_elem` past the
+    /// materialisation bound of the model): the failure the
+    /// native allocation path reports for the same request. A
+    /// byte size past `isize::MAX` is the RawVec
+    /// capacity-overflow panic (the `capacity overflow` panic
+    /// of `alloc::raw_vec::handle_error`'s `CapacityOverflow`
+    /// arm, with that arm's location stamp); any smaller
+    /// request whose allocation the model cannot materialise
+    /// runs the allocation-error dispatch
+    /// ([`Self::run_alloc_error`]) for the requested layout,
+    /// so an installed alloc error hook observes it (and may
+    /// panic, catchably) and the no-hook path prints the
+    /// default report and aborts, exactly as a failed native
+    /// allocation does. Never returns `Ok`: every path
+    /// diverges like the native one.
+    pub(crate) fn exec_oversized_fill_failure(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        byte_size: u128,
+        align: u128,
+    ) -> InterpResult<Value> {
+        if byte_size > isize::MAX as u128 {
+            if self.panic_location().is_none() {
+                self.note_panic_stamp(Value::Ref(RefTarget::value(
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Str(
+                                "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/alloc/src/raw_vec/mod.rs"
+                                    .to_string(),
+                            ),
+                            Value::Uint(29),
+                            Value::Uint(5),
+                        ],
+                    },
+                )));
+            }
+            self.note_panic_origin(PanicOrigin::PanicFn);
+            self.note_panic_no_backtrace(false);
+            return Err(InterpError::panic_str_payload("capacity overflow"));
+        }
+        self.run_alloc_error(frames, byte_size, align)
+    }
+
     /// `std::alloc::default_alloc_error_hook(layout)`: the
     /// default hook as a callable value (what
     /// `take_alloc_error_hook` hands back when no custom
@@ -145,7 +190,7 @@ impl<'a> Interpreter<'a> {
 
     /// The shared tail of both endpoints: the
     /// allocation-failure dispatch for one (size, align).
-    fn run_alloc_error(
+    pub(crate) fn run_alloc_error(
         &mut self,
         frames: &mut Vec<Frame>,
         size: u128,
