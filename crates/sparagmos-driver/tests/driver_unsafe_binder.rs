@@ -1,29 +1,36 @@
-//! Unsafe binder types (Issue #510): a body that merely
-//! mentions an unsafe binder type — a local's type, an
-//! argument or return type — converts with the binder erased
+//! Unsafe binders (Issue #510): a body that mentions an
+//! unsafe binder — in a type, or through the wrap/unwrap
+//! constructs themselves — converts with the binder erased
 //! to the type it wraps, because the binder is transparent
-//! at the value level and only the wrap/unwrap constructs
-//! themselves need the Stable MIR conversions that stay
-//! unimplemented. Before this, the kind question for a binder
-//! type panicked inside rustc_public (the `unimplemented!()`
-//! at convert/stable/ty.rs:471) and the whole body was
-//! skipped with the named unsafe-binder reason, so the
-//! compile-check records whose only binder contact is a type
+//! at the value level: wrapping and unwrapping are identity
+//! operations on the wrapped value. Before the type erasure,
+//! the kind question for a binder type panicked inside
+//! rustc_public (the `unimplemented!()` at
+//! convert/stable/ty.rs:471) and the whole body was skipped
+//! with the named unsafe-binder reason, so the compile-check
+//! records whose only binder contact is a type
 //! (tests/ui/unsafe-binders/simple.rs, unused-lifetimes.rs,
 //! unused-lifetimes-2.rs and
 //! debuginfo-escaping-bound-vars-issue-159576.rs) failed on
-//! conversion completeness. The fixtures pin both sides of
-//! the boundary: type-only contact converts completely, and
-//! a body that actually wraps a value with `wrap_binder!`
-//! still skips with the named reason instead of crashing.
+//! conversion completeness. The wrap/unwrap constructs
+//! stayed skipped longer: their Stable MIR conversions are
+//! `unimplemented!("FIXME(unsafe_binders):")`, so the fetch
+//! itself panicked; they now convert through the internal
+//! MIR materialization that erases them to the identity
+//! (see `convert::unsafe_binder_erased_body`), which covers
+//! the remaining records of this family:
+//! tests/ui/unsafe-binders/cat-projection.rs (the
+//! `unwrap_binder!` projection) and
+//! tests/mir-opt/gvn_on_unsafe_binder.rs (the
+//! `wrap_binder!` rvalue). The fixtures pin all of these
+//! shapes converting completely.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Fixture directories this test process created under the
 /// system temp directory, removed when the process exits.
-static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
-    std::sync::Mutex::new(Vec::new());
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 fn register_scratch_dir(dir: &std::path::Path) {
     static INSTALL: std::sync::Once = std::sync::Once::new();
@@ -179,17 +186,16 @@ pub fn woof() -> unsafe<'a, 'b> &'b Box<dyn Fn(Box<dyn Fn() -> &'a isize>)> {
 
 #[test]
 fn binder_typed_return_converts() {
-    let (code, stdout, stderr) =
-        convert("binder_return", BINDER_RETURN_RS, &["--crate-type=lib"]);
+    let (code, stdout, stderr) = convert("binder_return", BINDER_RETURN_RS, &["--crate-type=lib"]);
     assert_eq!(code, Some(0), "driver failed: {stderr}");
     assert_target_crate_complete(&stdout);
 }
 
-/// The other side of the boundary: a body that actually
-/// wraps a value with `wrap_binder!` needs the wrap
-/// conversion the bridge leaves unimplemented, so it still
-/// skips — with the named reason, never a crash (the shape
-/// of tests/mir-opt/gvn_on_unsafe_binder.rs).
+/// A body that actually wraps a value with `wrap_binder!`
+/// (the shape of tests/mir-opt/gvn_on_unsafe_binder.rs's
+/// `propagate`): the wrap rvalue's Stable MIR conversion is
+/// unimplemented, so the body converts through the internal
+/// materialization that erases the wrap to a plain use.
 const WRAP_BINDER_RS: &str = "\
 #![feature(unsafe_binders)]
 #![allow(incomplete_features)]
@@ -206,12 +212,70 @@ pub fn propagate() -> unsafe<'a> i32 {
 ";
 
 #[test]
-fn wrap_binder_body_still_skips_with_named_reason() {
-    let (code, stdout, stderr) =
-        convert("wrap_binder", WRAP_BINDER_RS, &["--crate-type=lib"]);
+fn wrap_binder_body_converts() {
+    let (code, stdout, stderr) = convert("wrap_binder", WRAP_BINDER_RS, &["--crate-type=lib"]);
     assert_eq!(code, Some(0), "driver failed: {stderr}");
-    assert!(
-        stdout.contains("body mentions an unsafe binder"),
-        "expected the named unsafe-binder skip reason, got:\n{stdout}"
-    );
+    assert_target_crate_complete(&stdout);
+}
+
+/// Wrapping a reference (the other body of
+/// tests/mir-opt/gvn_on_unsafe_binder.rs): the wrapped
+/// operand is a borrow, and the binder type is over the
+/// reference.
+const WRAP_BINDER_REF_RS: &str = "\
+#![feature(unsafe_binders)]
+#![allow(incomplete_features)]
+
+use std::unsafe_binder::wrap_binder;
+
+fn test() {
+    unsafe {
+        let x = 1;
+        let binder: unsafe<'a> &'a i32 = wrap_binder!(&x);
+        let _ = binder;
+    }
+}
+
+fn main() {}
+";
+
+#[test]
+fn wrap_binder_reference_body_converts() {
+    let (code, stdout, stderr) = convert("wrap_binder_ref", WRAP_BINDER_REF_RS, &[]);
+    assert_eq!(code, Some(0), "driver failed: {stderr}");
+    assert_target_crate_complete(&stdout);
+}
+
+/// A body that unwraps a binder argument with
+/// `unwrap_binder!`, by value and by reference, inside
+/// closures (the shape of
+/// tests/ui/unsafe-binders/cat-projection.rs): the unwrap
+/// is a place projection whose Stable MIR conversion is
+/// unimplemented, so these bodies convert through the
+/// internal materialization that drops the projection.
+const UNWRAP_BINDER_RS: &str = "\
+#![feature(unsafe_binders)]
+#![allow(incomplete_features)]
+
+use std::unsafe_binder::unwrap_binder;
+
+#[derive(Copy, Clone)]
+pub struct S([usize; 8]);
+
+pub fn by_value(x: unsafe<'a> S) -> usize {
+    unsafe { (|| unwrap_binder!(x).0[0])() }
+}
+
+pub fn by_ref(x: unsafe<'a> &'a S) -> usize {
+    unsafe { (|| unwrap_binder!(x).0[0])() }
+}
+
+fn main() {}
+";
+
+#[test]
+fn unwrap_binder_projection_bodies_convert() {
+    let (code, stdout, stderr) = convert("unwrap_binder", UNWRAP_BINDER_RS, &[]);
+    assert_eq!(code, Some(0), "driver failed: {stderr}");
+    assert_target_crate_complete(&stdout);
 }

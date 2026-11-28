@@ -541,18 +541,21 @@ fn main() { let _ = wrap::<i32>(1); }
 "#;
 
 #[test]
-fn summary_mode_demanded_generic_with_unconvertible_body_stays_skipped() {
-    // Demand does not excuse a body that cannot be converted: the
-    // generic definition is demanded concretely from `main`, its
-    // instance fails conversion with the named unsafe-binder
-    // reason (a body that wraps a value with `wrap_binder!` needs
-    // the WrapUnsafeBinder conversion Stable MIR leaves
-    // unimplemented — the remaining half of Issue #384), and the
-    // definition stays skipped — the target crate stays
-    // incomplete for that named reason alone. (The vehicle used
-    // to be a tail-call body; those convert since the internal
-    // MIR materialization, so the wrap body carries the contract
-    // now.)
+fn summary_mode_demanded_generic_wrap_binder_body_converts() {
+    // A generic definition demanded concretely from `main`
+    // whose body wraps a value with `wrap_binder!`: the
+    // wrap's Stable MIR conversion is unimplemented, so the
+    // demanded instance materializes through the compiler's
+    // internal MIR with the wrap erased to the identity
+    // (Issue #510), and the definition converts -- the target
+    // crate is complete. (This fixture used to pin the
+    // opposite outcome -- the demanded definition stayed
+    // skipped with the named unsafe-binder reason -- back
+    // when it carried the demanded-but-unconvertible
+    // contract; wrap bodies convert since the internal MIR
+    // materialization, the same transition tail-call bodies
+    // made before them, when this fixture's vehicle was
+    // swapped from a tail call to a wrap.)
     let dir = temp_dir("generic-binder");
     let src = fixture(&dir, "generic_binder.rs", WRAP_BINDER_GENERIC_SRC);
     let out = summarize_driver(&src);
@@ -562,12 +565,12 @@ fn summary_mode_demanded_generic_with_unconvertible_body_stays_skipped() {
         .find(|l| l.starts_with("fn generic_binder::wrap:"))
         .expect("summary lists the generic definition");
     assert!(
-        line.contains("SKIPPED") && line.contains("unsafe binder"),
-        "the demanded-but-unconvertible definition stays skipped with its reason: {line}"
+        line.contains("[converted]"),
+        "the demanded wrap definition converts: {line}"
     );
     assert!(
-        stdout.contains("target-crate converted: 1, skipped: 1"),
-        "the target crate stays incomplete for the demanded failure: {stdout}"
+        stdout.contains("target-crate converted: 2, skipped: 0"),
+        "the target crate is complete: {stdout}"
     );
 }
 
