@@ -5896,3 +5896,82 @@ fn run_mode_drop_in_place_fat_box_element() {
         "shifted=[\"apple\", \"pear\"]\nsliced=[[\"a\", \"b\"]]\n",
     );
 }
+
+const OS_STRING_BYTE_SLICE_DEBUG_THEN_HASH_SRC: &str = r#"
+use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
+fn agg() -> OsString { let mut s = OsString::with_capacity(16); s.push("key"); s }
+fn main() {
+    // The pin sequence from #513: byte-slice Debug prints of a
+    // real-aggregate OsString's encoded bytes (the direct route
+    // and the as_os_str route), a slice hash and an OsStr hash,
+    // and then a byte-slice Debug print of a from-form
+    // OsString's slice bound to a local. The last print stopped
+    // with "type mismatch in Debug sequence formatting:
+    // expected tuple or byte value, found ADT value" when the
+    // earlier prints preceded it; every statement passed
+    // without them, so the whole sequence is pinned here.
+    let a = agg();
+    let b1 = a.as_encoded_bytes();
+    println!("osstring-enc: len={} bytes={:?}", b1.len(), b1);
+    let s = a.as_os_str();
+    let b2 = s.as_encoded_bytes();
+    println!("osstr-enc: len={} bytes={:?}", b2.len(), b2);
+    let mut h = DefaultHasher::new(); b2.hash(&mut h); println!("enc-slice-hash={}", h.finish());
+    let mut h = DefaultHasher::new(); s.hash(&mut h); println!("osstr-hash={}", h.finish());
+    let f = OsString::from("key");
+    let b3 = f.as_os_str().as_encoded_bytes();
+    println!("from-osstr-enc: len={} bytes={:?}", b3.len(), b3);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_byte_slice_debug_then_hash() {
+    run_ok(
+        "os-string-byte-slice-debug-then-hash",
+        OS_STRING_BYTE_SLICE_DEBUG_THEN_HASH_SRC,
+        "osstring-enc: len=3 bytes=[107, 101, 121]\nosstr-enc: len=3 bytes=[107, 101, 121]\nenc-slice-hash=3076200174974209401\nosstr-hash=3076200174974209401\nfrom-osstr-enc: len=3 bytes=[107, 101, 121]\n",
+    );
+}
+
+const OS_STRING_BYTE_SLICE_DEBUG_ORDER_SRC: &str = r#"
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
+fn hash_of(f: impl Fn(&mut DefaultHasher)) -> u64 {
+    let mut h = DefaultHasher::new();
+    f(&mut h);
+    h.finish()
+}
+fn main() {
+    // Order permutation of the same family: the OsString hash
+    // is taken before and after the byte-slice Debug prints and
+    // must not change; a from-form slice print and a HashMap
+    // key's slice print follow in the same main.
+    let mut agg = OsString::with_capacity(16);
+    agg.push("key");
+    let before = hash_of(|h| agg.hash(h));
+    println!("bytes={:?}", agg.as_encoded_bytes());
+    println!("bytes2={:?}", agg.as_os_str().as_encoded_bytes());
+    let after = hash_of(|h| agg.hash(h));
+    let from = OsString::from("key");
+    println!("from-enc={:?}", from.as_os_str().as_encoded_bytes());
+    println!("before={} after={} same={}", before, after, before == after);
+    let mut m: HashMap<OsString, i32> = HashMap::new();
+    m.insert(agg.clone(), 7);
+    let k = m.keys().next().unwrap();
+    println!("key-enc={:?}", k.as_encoded_bytes());
+    println!("get={:?}", m.get(&from));
+}
+"#;
+
+#[test]
+fn run_mode_os_string_byte_slice_debug_order_permutations() {
+    run_ok(
+        "os-string-byte-slice-debug-order",
+        OS_STRING_BYTE_SLICE_DEBUG_ORDER_SRC,
+        "bytes=[107, 101, 121]\nbytes2=[107, 101, 121]\nfrom-enc=[107, 101, 121]\nbefore=3076200174974209401 after=3076200174974209401 same=true\nkey-enc=[107, 101, 121]\nget=Some(7)\n",
+    );
+}
