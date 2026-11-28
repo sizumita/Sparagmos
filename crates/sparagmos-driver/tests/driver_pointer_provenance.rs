@@ -323,3 +323,68 @@ fn main() {
         "copied [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\ndisjoint true\n",
     );
 }
+// A raw slice pointer compared from a generic context
+// (where the comparison stays a `PartialOrd` call naming
+// the raw pointer as its subject) orders by (data address,
+// length), never by pointee contents: here the buffer
+// addresses and the contents order in opposite directions,
+// and two pointers into one buffer at one address are
+// ordered by their lengths alone. The non-generic spelling
+// of the same comparisons lowers to pointer binary
+// operators and always ordered by address; the trait-call
+// path used to fall through to the slice content
+// comparison, which only agreed with the address order
+// when the stack colouring happened to place the buffers
+// that way.
+#[test]
+fn raw_slice_pointer_ordering_from_generic_context() {
+    let src = r#"
+fn ordered<T: PartialEq + PartialOrd>(x: &T, y: &T) -> bool {
+    x < y
+}
+
+fn main() {
+    let hi = vec![9u8, 9, 9];
+    let lo = vec![0u8, 0, 0];
+    let p_hi = hi.as_slice() as *const [u8];
+    let p_lo = lo.as_slice() as *const [u8];
+    assert!(p_hi < p_lo);
+    assert!(ordered(&p_hi, &p_lo));
+    assert!(!ordered(&p_lo, &p_hi));
+    assert!(p_hi != p_lo);
+    let v = vec![1u8, 2, 3];
+    let q0 = &v[..0] as *const [u8];
+    let q2 = &v[..2] as *const [u8];
+    assert!(ordered(&q0, &q2));
+    assert!(!ordered(&q2, &q0));
+    assert!(q0 != q2);
+    println!("ok");
+}
+"#;
+    assert_run("raw-slice-pointer-generic-ordering", src, "ok\n");
+}
+
+// The data pointer of a slice formed by deref-coercing a
+// `Vec` (`&*vec`) is the vector's buffer pointer, not the
+// address of the vector value itself: pricing it from the
+// vector local's slot puts the buffer's span over the
+// slot space, and two live vectors coloured one
+// vector-width apart then read as overlapping ranges to
+// the `copy_nonoverlapping` precondition of the full copy
+// below.
+#[test]
+fn deref_coerced_slice_data_pointer_is_the_vec_buffer() {
+    let src = r#"
+fn main() {
+    let a: Vec<i32> = (0..10).collect();
+    let mut b: Vec<i32> = vec![0; 10];
+    let s: &[i32] = &a;
+    assert_eq!(s.as_ptr(), a.as_ptr());
+    assert_ne!(s.as_ptr() as usize, &a as *const Vec<i32> as usize);
+    b.copy_from_slice(&a);
+    assert_eq!(b, a);
+    println!("ok");
+}
+"#;
+    assert_run("deref-coerced-slice-data-pointer", src, "ok\n");
+}

@@ -269,6 +269,53 @@ pub(crate) fn comparison_subject_is_dyn_pointer(generic_args: &[String]) -> bool
         .is_some_and(|pointee| pointee.starts_with("dyn "))
 }
 
+/// Whether a comparison call's own type tags name a raw
+/// pointer to a slice as the comparison's subject: the
+/// `Self` tag (the first generic argument), with one
+/// leading reference layer stripped, opens with
+/// `*const [` / `*mut [` and the bracketed pointee carries
+/// no size (no top-level `;` -- a sized array pointee is a
+/// thin subject and stays with
+/// `comparison_subject_is_raw_pointer`). Slice pointers
+/// are wide: their native equality and ordering are over
+/// the (data address, length) pair, which
+/// `comparison_subject_is_raw_pointer` deliberately
+/// leaves out of the thin path -- but the ordinary path
+/// compares pointee contents, which is neither word, so
+/// the raw-pointer arms judge slice subjects by that pair
+/// instead (see `raw_slice_pointer_operand_key`).
+pub(crate) fn comparison_subject_is_slice_pointer(generic_args: &[String]) -> bool {
+    let Some(tag) = generic_args.first() else {
+        return false;
+    };
+    let tag = tag
+        .strip_prefix("&mut ")
+        .or_else(|| tag.strip_prefix('&'))
+        .unwrap_or(tag);
+    let Some(pointee) = tag
+        .strip_prefix("*const ")
+        .or_else(|| tag.strip_prefix("*mut "))
+    else {
+        return false;
+    };
+    let Some(inner) = pointee
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 /// How many reference layers one operand of a raw-pointer
 /// comparison sits behind: the call passes a reference to
 /// the compared value, and when the subject is itself a
@@ -658,6 +705,39 @@ impl<'a> Interpreter<'a> {
         Some((addr, crate::interp::vtable_word(concrete, traits)))
     }
 
+    /// The comparison key of one operand of a slice
+    /// raw-pointer comparison (see
+    /// `comparison_subject_is_slice_pointer`): the data
+    /// address and the length word, the two words native
+    /// wide-pointer equality and ordering are defined
+    /// over. The length is the fat pointer's own metadata;
+    /// for a thin reference denoting a ranged position it
+    /// is the range's length. `None` when the operand does
+    /// not denote a slice pointer or its address cannot be
+    /// derived.
+    fn raw_slice_pointer_operand_key(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        layers: usize,
+    ) -> Option<(u128, u128)> {
+        let compared = self.raw_pointer_operand_compared(frames, value, layers)?;
+        let addr = self.pointer_address(frames, &compared, None)?;
+        let len = match &compared {
+            Value::FatRef { len, .. } => *len,
+            Value::Ref(RefTarget::Place { projection, .. }) => {
+                match projection.last() {
+                    Some(crate::value::RefProj::Subslice { len, .. }) => {
+                        *len as u128
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        Some((addr, len))
+    }
+
     /// Raw-pointer equality under the type's own `PartialEq`
     /// (see `comparison_subject_is_raw_pointer`): the native
     /// impls compare addresses, never the pointees the
@@ -678,6 +758,12 @@ impl<'a> Interpreter<'a> {
             let layers = raw_pointer_operand_layers(generic_args);
             let x = self.raw_pointer_operand_key(frames, a, layers)?;
             let y = self.raw_pointer_operand_key(frames, b, layers)?;
+            return Some(x == y);
+        }
+        if comparison_subject_is_slice_pointer(generic_args) {
+            let layers = raw_pointer_operand_layers(generic_args);
+            let x = self.raw_slice_pointer_operand_key(frames, a, layers)?;
+            let y = self.raw_slice_pointer_operand_key(frames, b, layers)?;
             return Some(x == y);
         }
         if !comparison_subject_is_raw_pointer(generic_args) {
@@ -706,6 +792,12 @@ impl<'a> Interpreter<'a> {
             let layers = raw_pointer_operand_layers(generic_args);
             let x = self.raw_pointer_operand_key(frames, a, layers)?;
             let y = self.raw_pointer_operand_key(frames, b, layers)?;
+            return Some(Some(x.cmp(&y)));
+        }
+        if comparison_subject_is_slice_pointer(generic_args) {
+            let layers = raw_pointer_operand_layers(generic_args);
+            let x = self.raw_slice_pointer_operand_key(frames, a, layers)?;
+            let y = self.raw_slice_pointer_operand_key(frames, b, layers)?;
             return Some(Some(x.cmp(&y)));
         }
         if !comparison_subject_is_raw_pointer(generic_args) {

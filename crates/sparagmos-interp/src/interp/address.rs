@@ -2272,6 +2272,45 @@ impl<'a> Interpreter<'a> {
         }
         match projection.first() {
             Some(RefProj::Index(_)) | Some(RefProj::Subslice { .. }) => {}
+            None => {
+                // The bare `Vec` place, priced as a pointer
+                // to the vector's element storage: the data
+                // pointer of a slice the guest formed by
+                // deref-coercing the vector itself (`&*vec`,
+                // and the thin pointer `as_ptr` extracts from
+                // that fat pointer). It denotes the buffer's
+                // first element, not the vector value's own
+                // storage -- pricing it from the local's slot
+                // would put the buffer's span over the slot
+                // space, where a neighbouring local's slot
+                // can fall inside it (two live vectors
+                // coloured one vector-width apart read as
+                // overlapping ranges to the
+                // `copy_nonoverlapping` precondition). The
+                // leaves that denote the element storage are
+                // the element type itself, the slice of it
+                // (a fat pointer's own pricing), and the
+                // unit pointee of the type-erased `*const ()`
+                // the core pointer helpers price through. A
+                // bare place priced with any other leaf --
+                // the `Vec` type itself, a field type --
+                // keeps the slot price below.
+                let leaf = leaf_ty?;
+                let (_, elem_ty) = self.sequence_elem(&WalkTy::Ty(root_ty.clone()))?;
+                let denotes_elements = match (&elem_ty, leaf) {
+                    // The type-erased pointee needs no
+                    // element identity.
+                    (_, Ty::Unit) => true,
+                    (WalkTy::Ty(elem), _) => {
+                        leaf == elem
+                            || matches!(leaf, Ty::Slice(inner) if &**inner == elem)
+                    }
+                    _ => false,
+                };
+                if !denotes_elements {
+                    return None;
+                }
+            }
             _ => return None,
         }
         let frame = frames.iter().find(|f| f.id == frame_id)?;
