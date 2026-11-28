@@ -3484,6 +3484,121 @@ fn run_mode_invalid_enum_assert_aborts_without_a_second_report() {
     );
 }
 
+const INVALID_ENUM_CLEANUP_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+enum Two {
+    A,
+    B,
+}
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let v: Two = unsafe { std::mem::transmute(9u8) };
+        println!("is_a={}", v == Two::A);
+    }
+}
+fn main() {
+    let _g = Guard;
+    panic!("outer");
+}
+"#;
+
+#[test]
+fn run_mode_invalid_enum_assert_in_cleanup_destructor_aborts_without_cleanup_report() {
+    // The pin left by PR #969 (Issue #513): a nounwind assert
+    // panic raised directly inside a cleanup frame -- here the
+    // invalid-enum assertion fires in a destructor that runs as
+    // the cleanup of an outer panic. The worry was that the
+    // unwinder's direct-panic guard would answer it with
+    // `panic_in_cleanup` before the block's action is judged.
+    // It does not: the assertion's panic is judged in the
+    // destructor frame's own unwind handling, whose block
+    // action is `Unreachable`, so PR #969's arm converts it to
+    // an abort there and it never surfaces as a fresh panic in
+    // the cleanup frame. Measured against native rustc
+    // 1.100.0: the outer report, then the assertion's own
+    // report (with the second panic's backtrace), then the
+    // non-unwinding line, exit 134 -- no `panic in a destructor
+    // during cleanup` report. That cleanup report belongs to a
+    // regular panic raised in a cleanup destructor (the
+    // double-fail shape above).
+    let dir = temp_dir("invalid-enum-cleanup");
+    let src = fixture(&dir, "invalid_enum_cleanup.rs", INVALID_ENUM_CLEANUP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a nounwind assertion in a cleanup destructor aborts: {stderr}"
+    );
+    let outer = stderr.find("outer").expect("outer report");
+    let assert_report = stderr
+        .find("trying to construct an enum from an invalid value 0x9")
+        .expect("assertion report");
+    assert!(
+        outer < assert_report,
+        "the outer panic reports first: {stderr}"
+    );
+    assert!(
+        stderr.contains("thread caused non-unwinding panic. aborting."),
+        "the non-unwinding line follows the reports: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panic in a destructor during cleanup"),
+        "no synthetic cleanup second report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panic in a function that cannot unwind"),
+        "no synthetic cannot-unwind second report: {stderr}"
+    );
+}
+
+const NULL_DEREF_CLEANUP_SRC: &str = r#"
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let p: *const u8 = std::ptr::null();
+        let v = unsafe { *p };
+        println!("v={v}");
+    }
+}
+fn main() {
+    let _g = Guard;
+    panic!("outer");
+}
+"#;
+
+#[test]
+fn run_mode_null_deref_assert_in_cleanup_destructor_aborts_without_cleanup_report() {
+    // The null-pointer member of the same nounwind assert
+    // family, in the same cleanup-destructor shape: native
+    // prints the outer report, then the assertion's own report
+    // ("null pointer dereference occurred", with the second
+    // panic's backtrace), then the non-unwinding line, and
+    // aborts (134) -- again with no `panic_in_cleanup` report.
+    let dir = temp_dir("null-deref-cleanup");
+    let src = fixture(&dir, "null_deref_cleanup.rs", NULL_DEREF_CLEANUP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a null-deref assertion in a cleanup destructor aborts: {stderr}"
+    );
+    assert!(
+        stderr.contains("null pointer dereference occurred"),
+        "the assertion's own report: {stderr}"
+    );
+    assert!(
+        stderr.contains("thread caused non-unwinding panic. aborting."),
+        "the non-unwinding line follows the reports: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panic in a destructor during cleanup"),
+        "no synthetic cleanup second report: {stderr}"
+    );
+}
+
 const ASSERT_ARRAY_SRC: &str = r#"
 fn main() { assert_eq!([1, 2, 3], [1, 2, 4]); }
 "#;
