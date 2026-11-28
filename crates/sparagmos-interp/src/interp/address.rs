@@ -957,7 +957,7 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         match body.local_tys.get(place.local.0)? {
-            Ty::Ref(pointee) => self.ty_size(pointee),
+            Ty::Ref(pointee) => self.ty_size_full(pointee),
             _ => None,
         }
     }
@@ -4211,7 +4211,7 @@ impl<'a> Interpreter<'a> {
             return Ok(projection);
         }
         let array_pos = match static_name {
-            Some(name) => self.static_array_position(name, &projection),
+            Some(name) => self.static_array_position(name, &projection, elem_size),
             None => self.array_position(frames, place, &projection, base, elem_size),
         };
         let array_judged = array_pos.is_some();
@@ -4426,6 +4426,30 @@ impl<'a> Interpreter<'a> {
                     let (size, elem) = self.sequence_elem(&cur)?;
                     ranged_elem = size;
                     cur = elem;
+                }
+                RefProj::Subslice { .. } => {
+                    // A sub-slice step ranges over the same
+                    // sequence: the position it denotes is a
+                    // sub-sequence of the array or slice the
+                    // walk is on, denominated in that
+                    // sequence's elements, and the walk
+                    // continues on the slice of those elements.
+                    // Without this arm the denomination guard
+                    // was blind at exactly the positions a
+                    // slice-derived pointer carries, and the
+                    // value-shape absorption denominated the
+                    // sub-sequence in the offset's own units.
+                    let WalkTy::Ty(ty) = &cur else {
+                        return None;
+                    };
+                    let elem = match ty {
+                        Ty::Array(elem, _) | Ty::Slice(elem) => {
+                            (**elem).clone()
+                        }
+                        _ => return None,
+                    };
+                    ranged_elem = self.ty_size_full(&elem);
+                    cur = WalkTy::Ty(Ty::Slice(Box::new(elem)));
                 }
                 RefProj::View(view) => {
                     cur = WalkTy::Ty(view.clone());
@@ -4890,7 +4914,23 @@ impl<'a> Interpreter<'a> {
                 _ => break,
             }
         }
-        let (cur, tail) = split_sequence_position(steps)?;
+        // Whether the sequence's elements are not themselves
+        // sequences, judged from the type the field path
+        // navigates to: only then does a first-element index
+        // step behind the leading index step denote the
+        // entered element itself (see
+        // `split_sequence_position`). An underivable type
+        // leaves the step unjudged, as it was before.
+        let index0_entry = (|| {
+            let mut seq_ty = WalkTy::Ty(body.local_tys.get(local)?.clone());
+            for &f in &path {
+                seq_ty = self.field_walk_ty(&seq_ty, 0, f)?;
+            }
+            let (_, elem) = self.sequence_elem(&seq_ty)?;
+            Some(!elem_is_sequence(&elem))
+        })()
+        .unwrap_or(false);
+        let (cur, tail, consumed) = split_sequence_position(steps, index0_entry)?;
         if !path.is_empty() {
             // A sequence held in a field: the position ends at
             // an element of it, or at its base — a bare field
@@ -5086,10 +5126,42 @@ impl<'a> Interpreter<'a> {
             if !held_is_container {
                 return None;
             }
-            return Some((path.len(), cur, i128::from(elem), tail.to_vec()));
+            return Some((
+                path.len() + consumed,
+                cur,
+                i128::from(elem),
+                tail.to_vec(),
+            ));
         }
         let elem = match body.local_tys.get(local)? {
-            Ty::Array(elem, _) => self.ty_size(elem)?,
+            // The full pricing, not the bare one: an element
+            // the bare table cannot size (a multi-field tuple,
+            // an ADT named without its generic arguments)
+            // still denominates the sequence, and leaving the
+            // position unjudged here carried an array-priced
+            // offset as a raw byte displacement the byte view
+            // then refused at the value boundary. The full
+            // pricing judges only offsets denominated in whole
+            // elements or more, though: a sub-element unit (a
+            // byte pointer's advance) over such an element
+            // denotes a storage position, and absorbing its
+            // boundary landing into an index would let a byte
+            // write replace the element's whole value (a
+            // `MaybeUninit` payload, an ADT element) instead
+            // of splicing its byte image, so the position
+            // stays unjudged for those, as it was while the
+            // element went unpriced, and the displacement is
+            // carried to the byte view.
+            Ty::Array(elem, _) => match self.ty_size(elem) {
+                Some(size) => size,
+                None => {
+                    let size = self.ty_size_full(elem)?;
+                    if matches!(elem_size, Some(u) if u > 0 && u < size) {
+                        return None;
+                    }
+                    size
+                }
+            },
             Ty::Adt(_) => {
                 // A sequence ADT (a `Vec` above all): the value
                 // the local holds is its element sequence, so a
@@ -5117,7 +5189,7 @@ impl<'a> Interpreter<'a> {
             }
             _ => return None,
         };
-        Some((0, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
+        Some((consumed, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
     }
 
     /// The array position a projection over the static `name`
@@ -5131,13 +5203,33 @@ impl<'a> Interpreter<'a> {
         &self,
         name: &str,
         projection: &[RefProj],
+        elem_size: Option<u64>,
     ) -> Option<(usize, i128, i128, Vec<RefProj>)> {
-        let elem = match self.program().static_tys.get(name)? {
-            Ty::Array(elem, _) => self.ty_size(elem)?,
+        let static_ty = self.program().static_tys.get(name)?;
+        let elem = match static_ty {
+            // The same denomination rule as the local arm
+            // (see `array_position`): the full pricing judges
+            // only offsets denominated in whole elements or
+            // more; a sub-element unit denotes a storage
+            // position the byte view resolves.
+            Ty::Array(elem, _) => match self.ty_size(elem) {
+                Some(size) => size,
+                None => {
+                    let size = self.ty_size_full(elem)?;
+                    if matches!(elem_size, Some(u) if u > 0 && u < size) {
+                        return None;
+                    }
+                    size
+                }
+            },
             _ => return None,
         };
-        let (cur, tail) = split_sequence_position(projection)?;
-        Some((0, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
+        let index0_entry = match self.sequence_elem(&WalkTy::Ty(static_ty.clone())) {
+            Some((_, elem)) => !elem_is_sequence(&elem),
+            None => false,
+        };
+        let (cur, tail, consumed) = split_sequence_position(projection, index0_entry)?;
+        Some((consumed, cur.unwrap_or(0), i128::from(elem), tail.to_vec()))
     }
 
     /// The value a `Resolved::Value` target denotes: its base
@@ -5170,7 +5262,12 @@ impl<'a> Interpreter<'a> {
 /// transparent wrapper or a union payload leaves
 /// (`[Index(k), Field(0)]` denotes element `k` entered through
 /// the wrapper, and entry steps with no index step enter the
-/// base element). The position is denominated in the
+/// base element), and a first-element index step directly
+/// behind the leading index step, the shape a cast to the
+/// element type leaves. A leading sub-slice step
+/// is navigation to a sub-sequence of the same elements and
+/// is reported as consumed, so the caller's prefix keeps it.
+/// The position is denominated in the
 /// sequence's own elements, whatever type the pointer was cast
 /// to: a cast changes the units a later offset counts in, not
 /// the slots the stored sequence is laid out in, so an offset
@@ -5179,15 +5276,72 @@ impl<'a> Interpreter<'a> {
 /// the sequence accesses compose it (see
 /// `Interpreter::seq_element_target`). Any other step shape
 /// denotes no plain sequence position.
+/// Whether a walked element type is itself a sequence an
+/// index step ranges over: an array or slice type, or a
+/// `Vec` ADT -- the sequence ADT whose elements an index
+/// composition over a held aggregate selects. A generic
+/// wrapper (`MaybeUninit`, `ManuallyDrop`) is not one: an
+/// index step over the wrapper denotes the wrapped value
+/// itself, which is what the cast-to-element-type spelling
+/// leaves on a position.
+fn elem_is_sequence(elem: &WalkTy) -> bool {
+    match elem {
+        WalkTy::Ty(Ty::Array(..) | Ty::Slice(..)) => true,
+        WalkTy::Ty(Ty::Ref(inner)) => {
+            elem_is_sequence(&WalkTy::Ty((**inner).clone()))
+        }
+        WalkTy::Ty(ty) => is_vec_adt_ty(ty),
+        WalkTy::Tag(tag) => {
+            let tag = tag.trim();
+            tag.starts_with('[') || is_vec_adt_ty(&Ty::Adt(tag.to_string()))
+        }
+    }
+}
+
 fn split_sequence_position(
     steps: &[RefProj],
-) -> Option<(Option<i128>, &[RefProj])> {
+    index0_entry: bool,
+) -> Option<(Option<i128>, &[RefProj], usize)> {
+    // A leading sub-slice step navigates to a sub-sequence of
+    // the sequence the position ranges over: the sub-sequence
+    // is denominated in the same elements, so the step is
+    // navigation (kept in the caller's prefix), and the
+    // position within it is what the remaining steps denote.
+    let (consumed, steps) = match steps.first() {
+        Some(RefProj::Subslice { .. }) => (1, &steps[1..]),
+        _ => (0, steps),
+    };
+    // Whole-value entry steps: a field-0 or downcast entry
+    // denotes the entered value itself, at its own first
+    // slot, so an offset over the position still ranges over
+    // the sequence the entry steps ranged over, and only
+    // whole-element landings absorb, with the entry steps
+    // kept. A first-element index step directly behind the
+    // leading index step is the spelling a cast to the
+    // element type leaves on the pointer: the leading index
+    // already denominated the position in the sequence's
+    // elements and the index-0 step selects the entered
+    // element's own first slot. That reading holds only when
+    // the sequence's elements are not themselves sequences
+    // (the caller judges, as `index0_entry`): over a
+    // sequence of sequences the same step ranges over the
+    // inner sequence, and the flat reading would denominate
+    // an inner offset in the outer element size. Behind a
+    // field entry the step likewise selects the field's own
+    // sequence's first element, so it is never an entry step
+    // there.
     let entry = |s: &RefProj| matches!(s, RefProj::Field(0) | RefProj::Downcast(_));
+    let after_index = |rest: &[RefProj]| {
+        rest.iter().all(entry)
+            || (index0_entry
+                && matches!(rest.first(), Some(RefProj::Index(0)))
+                && rest[1..].iter().all(entry))
+    };
     match steps {
-        [RefProj::Index(i), rest @ ..] if rest.iter().all(entry) => {
-            Some((Some(i128::try_from(*i).ok()?), rest))
+        [RefProj::Index(i), rest @ ..] if after_index(rest) => {
+            Some((Some(i128::try_from(*i).ok()?), rest, consumed))
         }
-        rest if rest.iter().all(entry) => Some((None, rest)),
+        rest if rest.iter().all(entry) => Some((None, rest, consumed)),
         _ => None,
     }
 }
