@@ -45,11 +45,11 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Whether a comparison call compares paths: the
-    /// call's generic arguments name a path type
-    /// (`path_cmp_subject`), or — for a call the converter
-    /// kept in generic form, which carries no type tags —
-    /// both operands are owned `PathBuf` values by shape
-    /// (`is_pathbuf_value`).
+    /// call's generic arguments name a path type, directly
+    /// or through a `Box` tag (`path_cmp_subject`), or —
+    /// for a call the converter kept in generic form, which
+    /// carries no type tags — both operands are owned
+    /// `PathBuf` values by shape (`is_pathbuf_value`).
     pub(super) fn comparison_is_path(
         &self,
         frames: &[Frame],
@@ -66,6 +66,21 @@ impl<'a> Interpreter<'a> {
             self.resolve_value(frames, v)
                 .is_ok_and(|resolved| is_pathbuf_value(&resolved))
         }) {
+            return true;
+        }
+        // The boxed form of the same signal: an operand is
+        // a stored box whose pointee allocation records a
+        // path type (see `operand_is_path_box`). The other
+        // operand is the same, or the bare pointee a sort's
+        // rotation extracted from such a box (a byte string
+        // or fat pointer, the forms `path_cmp_bytes` reads
+        // directly).
+        if vals.iter().any(|v| self.operand_is_path_box(frames, v))
+            && vals.iter().all(|v| {
+                self.operand_is_path_box(frames, v)
+                    || self.operand_is_bare_path_form(frames, v)
+            })
+        {
             return true;
         }
         // The reference form of the same signal: a `&Path`
@@ -124,6 +139,49 @@ impl<'a> Interpreter<'a> {
         false
     }
 
+    /// Whether a comparison operand is a stored box whose
+    /// pointee is a path: the box's pointer targets an
+    /// allocation whose creation point recorded a path
+    /// type (the record `record_box_ty` leaves, which the
+    /// model's own box formations make: the `From`
+    /// conversions, the `Box::new` model). The record is
+    /// exact: a
+    /// byte-slice box records a slice type, an `OsStr` box
+    /// the `OsStr` type, a `str` box `str`, so no other
+    /// box's comparison is claimed. A `Box<Path>` a
+    /// converted body assembled field by field (a
+    /// `PathBuf::into_boxed_path` box) wraps the buffer
+    /// allocation the path's vector created, recorded as
+    /// a byte slice; it carries no path record and is not
+    /// recognised here.
+    fn operand_is_path_box(&self, frames: &[Frame], value: &Value) -> bool {
+        let Some(ptr) = self.stored_box_pointer(frames, value) else {
+            return false;
+        };
+        let Value::Ref(RefTarget::Alloc { id, .. }) = ptr else {
+            return false;
+        };
+        matches!(
+            self.alloc_ty(id),
+            Some(crate::ir::Ty::Adt(ref name))
+                if name == "std::path::Path" || name == "std::path::PathBuf"
+        )
+    }
+
+    /// Whether a comparison operand is the bare pointee
+    /// form a stored box's extracted element takes (the
+    /// snapshot a sort's rotation hands the comparison in
+    /// place of the box): a byte string, a text string, or
+    /// a fat pointer over the bytes.
+    fn operand_is_bare_path_form(&self, frames: &[Frame], value: &Value) -> bool {
+        self.resolve_value(frames, value).is_ok_and(|resolved| {
+            matches!(
+                resolved,
+                Value::Bytes(_) | Value::Str(_) | Value::FatRef { .. }
+            )
+        })
+    }
+
     /// The bytes of a path argument: a path value is a fat
     /// pointer over the path's bytes (or a reference to one).
     /// The byte string a `PartialEq` operand for a path type
@@ -144,7 +202,28 @@ impl<'a> Interpreter<'a> {
                 return Ok(bytes);
             }
         }
-        self.os_str_bytes(frames, value)
+        match self.os_str_bytes(frames, value) {
+            Ok(bytes) => Ok(bytes),
+            Err(err) => {
+                // A boxed path operand (a `Box<Path>` the
+                // subject recognition claims through its
+                // tag): every reader above fails on the box
+                // aggregate, but the pointer it wraps denotes
+                // the path — a fat pointer over the path's
+                // bytes, or a thin pointer to the pointee
+                // the recursion reads in its own form (for
+                // `Box<PathBuf>`, the owned buffer). Only
+                // when the established readers have all
+                // failed does the box reading run, so no
+                // owned path's reading changes.
+                if let Some(ptr) = self.box_cmp_pointer(frames, value) {
+                    if let Ok(bytes) = self.path_cmp_bytes(frames, &ptr) {
+                        return Ok(bytes);
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     pub(super) fn path_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
@@ -239,17 +318,34 @@ pub(super) fn path_components(bytes: &[u8]) -> Vec<PathComponent<'_>> {
 
 /// Whether a comparison call's generic arguments name a
 /// path type (`Path` / `PathBuf`) as the `Self` or `Rhs`
-/// type. The callee name carries no impl subject in this
-/// model, so the path comparisons are recognised by the
-/// call's own generic arguments (the type tags, with any
-/// reference marker stripped).
+/// type — directly, or as the pointee of a `Box` tag, whose
+/// comparisons are the pointee's own. The callee name
+/// carries no impl subject in this model, so the path
+/// comparisons are recognised by the call's own generic
+/// arguments (the type tags, with any reference marker
+/// stripped).
 fn path_cmp_subject(generic_args: &[String]) -> bool {
     generic_args.iter().take(2).any(|tag| {
         let tag = tag
             .strip_prefix("&mut ")
             .or_else(|| tag.strip_prefix('&'))
             .unwrap_or(tag);
-        matches!(tag, "std::path::Path" | "std::path::PathBuf")
+        if matches!(tag, "std::path::Path" | "std::path::PathBuf") {
+            return true;
+        }
+        // A boxed path is a path subject too: std's
+        // comparison impls for `Box<Path>` / `Box<PathBuf>`
+        // are the pointee's own component-wise ones, so a
+        // `Box<..>` tag naming a path pointee names the
+        // comparison's subject through the box.
+        let Some(pointee) = box_pointee_tag(tag) else {
+            return false;
+        };
+        let pointee = pointee
+            .strip_prefix("&mut ")
+            .or_else(|| pointee.strip_prefix('&'))
+            .unwrap_or(pointee);
+        matches!(pointee, "std::path::Path" | "std::path::PathBuf")
     })
 }
 
