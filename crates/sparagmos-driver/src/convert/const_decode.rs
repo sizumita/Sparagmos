@@ -679,12 +679,26 @@ impl Converter {
     /// signature). Anything not recognisably an empty tuple counts
     /// as non-empty.
     fn closure_env_is_empty(args: &GenericArgs) -> bool {
+        match Self::closure_env_elems(args) {
+            Some(elems) => elems.is_empty(),
+            None => false,
+        }
+    }
+
+    /// The element types of a closure type's captured
+    /// environment: the closure generic arguments' last
+    /// argument is the upvars tuple, whose elements are the
+    /// captures in declaration order. `None` when the
+    /// arguments do not have that shape.
+    fn closure_env_elems(
+        args: &GenericArgs,
+    ) -> Option<Vec<rustc_public::ty::Ty>> {
         match args.0.last() {
             Some(GenericArgKind::Type(t)) => match t.kind() {
-                TyKind::RigidTy(RigidTy::Tuple(elems)) => elems.is_empty(),
-                _ => false,
+                TyKind::RigidTy(RigidTy::Tuple(elems)) => Some(elems),
+                _ => None,
             },
-            _ => false,
+            _ => None,
         }
     }
 
@@ -1086,15 +1100,36 @@ impl Converter {
                 self.decode_fn_pointer(alloc, offset)
             }
             TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                // A stored closure value with no captures is the
-                // callable itself; a captured environment has no
-                // constant form here and stays undecoded.
+                // A stored closure value: the callable plus its
+                // captured environment, which the allocation
+                // holds as the closure type's fields. The
+                // environment fields are decoded at the closure
+                // layout's offsets, the same arbitrary-offsets
+                // walk a tuple constant gets; a capture whose
+                // own decode fails leaves the whole constant
+                // undecoded.
+                self.note_const_closure(&def, &args);
+                let d = self.closure_def_id(&def, &args);
                 if Self::closure_env_is_empty(&args) {
-                    self.note_const_closure(&def, &args);
-                    let d = self.closure_def_id(&def, &args);
-                    Some(sm::ConstValue::Closure(d))
+                    Some(sm::ConstValue::Closure(d, Vec::new()))
                 } else {
-                    None
+                    let Some(elems) = Self::closure_env_elems(&args) else {
+                        return None;
+                    };
+                    let offsets = arbitrary_offsets(ty)?;
+                    if offsets.len() != elems.len() {
+                        return None;
+                    }
+                    let mut env = Vec::new();
+                    for (elem, off) in elems.iter().zip(offsets) {
+                        env.push(self.decode_const(
+                            elem,
+                            alloc,
+                            offset + off,
+                            depth + 1,
+                        )?);
+                    }
+                    Some(sm::ConstValue::Closure(d, env))
                 }
             }
             TyKind::RigidTy(RigidTy::Pat(inner, _)) => {

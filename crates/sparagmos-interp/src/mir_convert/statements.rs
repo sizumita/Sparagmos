@@ -190,7 +190,7 @@ impl<'a> Converter<'a> {
             return Vec::new();
         };
         let (def, env_locals) = match &c.literal {
-            mir::ConstKind::Value(mir::ConstValue::Closure(def)) => (def, 1),
+            mir::ConstKind::Value(mir::ConstValue::Closure(def, _)) => (def, 1),
             mir::ConstKind::Value(mir::ConstValue::FnDef(def)) => (def, 0),
             _ => return Vec::new(),
         };
@@ -2466,7 +2466,7 @@ impl<'a> Converter<'a> {
                     mir::Operand::Constant(c) if matches!(
                         c.literal,
                         mir::ConstKind::Value(
-                            mir::ConstValue::FnDef(_) | mir::ConstValue::Closure(_)
+                            mir::ConstValue::FnDef(_) | mir::ConstValue::Closure(..)
                         )
                     )
                 );

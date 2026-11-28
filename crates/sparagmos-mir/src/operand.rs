@@ -120,7 +120,12 @@ pub enum ConstValue {
     /// shim): the closure coerced to a function pointer. Only
     /// non-capturing closures coerce to function pointers, so the
     /// environment is empty by construction.
-    Closure(DefId),
+    ///
+    /// A stored closure value in its own right (an allocated
+    /// constant of closure type) carries its captured
+    /// environment, decoded field by field: the callable plus
+    /// the environment values, in capture order.
+    Closure(DefId, Vec<ConstValue>),
     /// A vtable pointer value, decoded from an allocation whose
     /// provenance names a vtable (`GlobalAlloc::VTable`). Vtables
     /// are not materialised in this model; the only observable

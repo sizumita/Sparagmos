@@ -48,7 +48,7 @@ impl Converter {
                     if let TyKind::RigidTy(RigidTy::Closure(def, args)) = t.kind() {
                         self.note_const_closure(&def, &args);
                         let d = self.closure_def_id(&def, &args);
-                        return Some(sm::ConstValue::Closure(d));
+                        return Some(sm::ConstValue::Closure(d, Vec::new()));
                     }
                 }
             }
@@ -56,7 +56,7 @@ impl Converter {
         if let TyKind::RigidTy(RigidTy::Closure(def, args)) = inst.ty().kind() {
             self.note_const_closure(&def, &args);
             let d = self.closure_def_id(&def, &args);
-            return Some(sm::ConstValue::Closure(d));
+            return Some(sm::ConstValue::Closure(d, Vec::new()));
         }
         self.note_const_fn(inst);
         let d = self.instance_def_id(inst.def.def_id(), inst);
@@ -286,7 +286,7 @@ impl Converter {
         }
         let d = self.def_id(def);
         self.async_closure_defs.insert(d);
-        Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Closure(d))))
+        Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Closure(d, Vec::new()))))
     }
 
     pub(crate) fn decode_ref(
