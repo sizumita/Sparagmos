@@ -535,13 +535,38 @@ impl<'a> Interpreter<'a> {
         Ok(boxed)
     }
 
+    /// The bytes a `&CStr` denotes, terminator included, in
+    /// either of the model's shapes: the fat reference over
+    /// the bytes (the shape a dereferenced `CString` hands
+    /// out), or the C string aggregate itself (the shape a
+    /// literal's place holds), whose single field is the
+    /// byte string. The plain element reading of the
+    /// aggregate yields its field list -- the byte string
+    /// itself as a single "element" -- which the byte
+    /// consumers refuse, so the aggregate shape is read
+    /// directly here.
+    pub(super) fn c_str_bytes_with_nul(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Vec<u8>> {
+        if let Ok(resolved) = self.resolve_value(frames, value) {
+            if let Value::Enum { fields, .. } = &resolved {
+                if let [Value::Bytes(bytes)] = fields.as_slice() {
+                    return Ok(bytes.clone());
+                }
+            }
+        }
+        self.arg_bytes(frames, value)
+    }
+
     /// The bytes a `&CStr` receiver denotes, without the
     /// terminating NUL: the receiver is the fat byte slice
     /// the C string was built from, terminator included, so
     /// the last byte (always a NUL in a well-formed value)
     /// is dropped.
     pub(super) fn c_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
-        let mut bytes = self.arg_bytes(frames, value)?;
+        let mut bytes = self.c_str_bytes_with_nul(frames, value)?;
         if bytes.last() == Some(&0) {
             bytes.pop();
         }
