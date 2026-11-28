@@ -10014,6 +10014,93 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Unit)
             }
+            Builtin::PtrRotate => {
+                arity(3)?;
+                // `ptr_rotate_gcd` / `ptr_rotate_swap` both take
+                // `(left, mid, right)`: the range of `left +
+                // right` elements ending and starting at `mid`
+                // rotates left by `left`.
+                let count_of = |v: &Value| -> InterpResult<usize> {
+                    match v {
+                        Value::Uint(n) => usize::try_from(*n).map_err(|_| {
+                            InterpError::type_mismatch(
+                                "ptr_rotate count",
+                                "count that fits in usize",
+                                format!("{n}"),
+                            )
+                        }),
+                        Value::Int(n) if *n >= 0 => {
+                            usize::try_from(*n).map_err(|_| {
+                                InterpError::type_mismatch(
+                                    "ptr_rotate count",
+                                    "count that fits in usize",
+                                    format!("{n}"),
+                                )
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "ptr_rotate count",
+                            "unsigned integer",
+                            other.kind_name(),
+                        )),
+                    }
+                };
+                let left = count_of(&vals[0])?;
+                let right = count_of(&vals[2])?;
+                if left == 0 || right == 0 {
+                    // A rotation by nothing, or of a range one
+                    // side of which is empty, moves no element.
+                    return Ok(Value::Unit);
+                }
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (size, _) = self.layout_of(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "ptr_rotate for {tag} is not runtime-supported"
+                    ))
+                })?;
+                if size == 0 {
+                    // A zero-sized element type: every element
+                    // is the same value, so the rotation is
+                    // unobservable.
+                    return Ok(Value::Unit);
+                }
+                let size = u64::try_from(size).map_err(|_| {
+                    unsupported(format!(
+                        "ptr_rotate for {tag} is not runtime-supported"
+                    ))
+                })?;
+                let n = left.checked_add(right).ok_or_else(|| {
+                    unsupported("ptr_rotate: range length overflows".to_string())
+                })?;
+                // The range starts `left` elements before the
+                // pointer the call hands over: rebase the
+                // pointer to the range's first element, in the
+                // element's own units.
+                let back = i128::try_from(left).map_err(|_| {
+                    unsupported("ptr_rotate: range length overflows".to_string())
+                })?;
+                let base_val = self.ptr_offset_value(
+                    frames,
+                    vals[1].clone(),
+                    -back,
+                    Some(size),
+                    false,
+                )?;
+                let base = self.deref_value(frames, &base_val)?;
+                // Snapshot the whole range before writing: the
+                // rotation's writes land on the positions its
+                // reads came from (the same discipline as the
+                // element swap above).
+                let mut elems = Vec::with_capacity(n);
+                for i in 0..n {
+                    elems.push(self.read_seq_at(frames, &base, i)?);
+                }
+                for i in 0..n {
+                    let src = (i + left) % n;
+                    self.write_seq_at(frames, &base, i, elems[src].clone())?;
+                }
+                Ok(Value::Unit)
+            }
             Builtin::MemSizeOf | Builtin::MemAlignOf => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");

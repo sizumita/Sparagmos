@@ -416,3 +416,114 @@ fn run_mode_offset_from_wrapper_denominated_pointer() {
         "dist 16\ndist2 -16\n",
     );
 }
+
+const ROTATE_SWAP_BRANCH_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<(u64, u64)> = (0..42u64).map(|i| (i, i * 10)).collect();
+    v.rotate_left(20);
+    println!("t42={:?}", v);
+    v.rotate_right(20);
+    println!("back={:?}", v);
+    let mut v: Vec<Box<str>> = (0..42).map(|i| format!("s{}", i).into_boxed_str()).collect();
+    v.rotate_left(20);
+    println!("bx={:?}", v);
+    let mut v: Vec<String> = (0..50).map(|i| format!("s{}", i)).collect();
+    v.rotate_left(20);
+    println!("st={:?}", v);
+    let mut v: Vec<(u16, u16)> = (0..200u16).map(|i| (i, i * 3)).collect();
+    v.rotate_left(101);
+    println!("tail={:?} {:?} {:?} {:?}", v[0], v[98], v[99], v[199]);
+}
+"#;
+
+#[test]
+fn run_mode_rotate_swap_branch() {
+    // Both segments over the memmove threshold and a
+    // segment sum of 24 or more: core's slice rotation
+    // takes the swap branch (`ptr_rotate_swap`), whose
+    // exchange runs through `ptr::swap_nonoverlapping`'s
+    // byte form -- `MaybeUninit<[u8; N]>` chunk loads and
+    // stores at byte positions inside element-shaped
+    // storage, which stopped the run on a displaced read
+    // (and, where the displacement absorbed into an index,
+    // silently exchanged the wrong units). The interpreter
+    // serves the branch over the element sequence (see
+    // `Builtin::PtrRotate`). The last case's range byte
+    // length is not a multiple of the chunk width, so the
+    // exchange's tail chunks run as well.
+    run_ok(
+        "rotate-swap-branch",
+        ROTATE_SWAP_BRANCH_SRC,
+        "t42=[(20, 200), (21, 210), (22, 220), (23, 230), (24, 240), (25, 250), (26, 260), (27, 270), (28, 280), (29, 290), (30, 300), (31, 310), (32, 320), (33, 330), (34, 340), (35, 350), (36, 360), (37, 370), (38, 380), (39, 390), (40, 400), (41, 410), (0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160), (17, 170), (18, 180), (19, 190)]\nback=[(0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160), (17, 170), (18, 180), (19, 190), (20, 200), (21, 210), (22, 220), (23, 230), (24, 240), (25, 250), (26, 260), (27, 270), (28, 280), (29, 290), (30, 300), (31, 310), (32, 320), (33, 330), (34, 340), (35, 350), (36, 360), (37, 370), (38, 380), (39, 390), (40, 400), (41, 410)]\nbx=[\"s20\", \"s21\", \"s22\", \"s23\", \"s24\", \"s25\", \"s26\", \"s27\", \"s28\", \"s29\", \"s30\", \"s31\", \"s32\", \"s33\", \"s34\", \"s35\", \"s36\", \"s37\", \"s38\", \"s39\", \"s40\", \"s41\", \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\", \"s12\", \"s13\", \"s14\", \"s15\", \"s16\", \"s17\", \"s18\", \"s19\"]\nst=[\"s20\", \"s21\", \"s22\", \"s23\", \"s24\", \"s25\", \"s26\", \"s27\", \"s28\", \"s29\", \"s30\", \"s31\", \"s32\", \"s33\", \"s34\", \"s35\", \"s36\", \"s37\", \"s38\", \"s39\", \"s40\", \"s41\", \"s42\", \"s43\", \"s44\", \"s45\", \"s46\", \"s47\", \"s48\", \"s49\", \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\", \"s12\", \"s13\", \"s14\", \"s15\", \"s16\", \"s17\", \"s18\", \"s19\"]\ntail=(101, 303) (199, 597) (0, 0) (100, 300)\n",
+    );
+}
+
+const ROTATE_GCD_BRANCH_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<[u64; 5]> = (0..22u64).map(|i| [i, i + 100, i + 200, i + 300, i + 400]).collect();
+    v.rotate_left(10);
+    println!("a5={:?}", v);
+    let mut v: Vec<[u64; 4]> = (0..23u64).map(|i| [i, i + 100, i + 200, i + 300]).collect();
+    v.rotate_left(11);
+    println!("a4={:?}", v);
+    let mut v: Vec<String> = (0..23).map(|i| format!("s{}", i)).collect();
+    v.rotate_left(9);
+    println!("st={:?}", v);
+    let mut a: [[u64; 5]; 22] = [[0; 5]; 22];
+    for i in 0..22u64 { a[i as usize] = [i, i + 100, i + 200, i + 300, i + 400]; }
+    a.rotate_left(10);
+    println!("stk={:?} {:?} {:?}", a[0], a[11], a[12]);
+}
+"#;
+
+#[test]
+fn run_mode_rotate_gcd_branch() {
+    // The GCD (juggling) branch of the rotation primitive
+    // (`ptr_rotate_gcd`): taken when the segment sum is
+    // below 24 or the element is wider than 32 bytes. Its
+    // single-element moves are typed, but over a stack
+    // array's storage the element read came back as the
+    // array's first scalar and the run stopped; the branch
+    // is served by the same modelled primitive as the swap
+    // branch (see `Builtin::PtrRotate`).
+    run_ok(
+        "rotate-gcd-branch",
+        ROTATE_GCD_BRANCH_SRC,
+        "a5=[[10, 110, 210, 310, 410], [11, 111, 211, 311, 411], [12, 112, 212, 312, 412], [13, 113, 213, 313, 413], [14, 114, 214, 314, 414], [15, 115, 215, 315, 415], [16, 116, 216, 316, 416], [17, 117, 217, 317, 417], [18, 118, 218, 318, 418], [19, 119, 219, 319, 419], [20, 120, 220, 320, 420], [21, 121, 221, 321, 421], [0, 100, 200, 300, 400], [1, 101, 201, 301, 401], [2, 102, 202, 302, 402], [3, 103, 203, 303, 403], [4, 104, 204, 304, 404], [5, 105, 205, 305, 405], [6, 106, 206, 306, 406], [7, 107, 207, 307, 407], [8, 108, 208, 308, 408], [9, 109, 209, 309, 409]]\na4=[[11, 111, 211, 311], [12, 112, 212, 312], [13, 113, 213, 313], [14, 114, 214, 314], [15, 115, 215, 315], [16, 116, 216, 316], [17, 117, 217, 317], [18, 118, 218, 318], [19, 119, 219, 319], [20, 120, 220, 320], [21, 121, 221, 321], [22, 122, 222, 322], [0, 100, 200, 300], [1, 101, 201, 301], [2, 102, 202, 302], [3, 103, 203, 303], [4, 104, 204, 304], [5, 105, 205, 305], [6, 106, 206, 306], [7, 107, 207, 307], [8, 108, 208, 308], [9, 109, 209, 309], [10, 110, 210, 310]]\nst=[\"s9\", \"s10\", \"s11\", \"s12\", \"s13\", \"s14\", \"s15\", \"s16\", \"s17\", \"s18\", \"s19\", \"s20\", \"s21\", \"s22\", \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\"]\nstk=[10, 110, 210, 310, 410] [21, 121, 221, 321, 421] [0, 100, 200, 300, 400]\n",
+    );
+}
+
+const ROTATE_FORMS_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<(u64, u64)> = (0..60u64).map(|i| (i, i * 10)).collect();
+    v[10..50].rotate_left(20);
+    println!("sub={:?}", v);
+    let mut v: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+    v.rotate_left(300);
+    println!("u8={} {} {}", v[0], v[300], v.iter().map(|b| *b as u64).sum::<u64>());
+    v.rotate_left(0);
+    v.rotate_left(600);
+    println!("noop={} {}", v[0], v[300]);
+    let mut b: Box<[(u64, u64)]> = (0..34u64).map(|i| (i, i * 10)).collect();
+    b.rotate_left(17);
+    println!("bx={:?}", b);
+    let mut w: Vec<(u64, u64)> = (0..34u64).map(|i| (i, i * 10)).collect();
+    let s: &mut [(u64, u64)] = &mut w[..];
+    s.rotate_left(17);
+    println!("sl={:?}", w);
+}
+"#;
+
+#[test]
+fn run_mode_rotate_forms() {
+    // The modelled rotation over the other storage forms
+    // a slice can denote: a sub-slice range inside a larger
+    // buffer (the elements outside the range must not
+    // move), a byte vector's flat storage, a boxed slice,
+    // a slice reborrow, and the empty rotations.
+    run_ok(
+        "rotate-forms",
+        ROTATE_FORMS_SRC,
+        "sub=[(0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (30, 300), (31, 310), (32, 320), (33, 330), (34, 340), (35, 350), (36, 360), (37, 370), (38, 380), (39, 390), (40, 400), (41, 410), (42, 420), (43, 430), (44, 440), (45, 450), (46, 460), (47, 470), (48, 480), (49, 490), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160), (17, 170), (18, 180), (19, 190), (20, 200), (21, 210), (22, 220), (23, 230), (24, 240), (25, 250), (26, 260), (27, 270), (28, 280), (29, 290), (50, 500), (51, 510), (52, 520), (53, 530), (54, 540), (55, 550), (56, 560), (57, 570), (58, 580), (59, 590)]\nu8=49 0 67503\nnoop=49 0\nbx=[(17, 170), (18, 180), (19, 190), (20, 200), (21, 210), (22, 220), (23, 230), (24, 240), (25, 250), (26, 260), (27, 270), (28, 280), (29, 290), (30, 300), (31, 310), (32, 320), (33, 330), (0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160)]\nsl=[(17, 170), (18, 180), (19, 190), (20, 200), (21, 210), (22, 220), (23, 230), (24, 240), (25, 250), (26, 260), (27, 270), (28, 280), (29, 290), (30, 300), (31, 310), (32, 320), (33, 330), (0, 0), (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160)]\n",
+    );
+}
