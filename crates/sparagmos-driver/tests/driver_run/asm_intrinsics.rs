@@ -1502,3 +1502,63 @@ fn run_mode_simd_funnel_shifts_are_ternary() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert!(stdout.contains("ok"), "stdout={stdout}");
 }
+
+const EMPTY_ASM_INOUT_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let a: i32;
+    unsafe {
+        asm!("", inout("eax") 435 => a);
+    }
+    println!("a={}", a);
+    let mut b: i32 = 7;
+    unsafe {
+        asm!("nop", inout("eax") b);
+    }
+    println!("b={}", b);
+}
+"#;
+
+#[test]
+fn run_mode_empty_asm_inout_writes_back_input() {
+    // The shape of tests/ui/asm/aarch64/llvm-58384.rs (there
+    // bound to the explicit register `x0`): an asm block whose
+    // template runs no instruction still delivers an `inout`
+    // operand's input value to its output place — the register
+    // holds the input when the block does nothing. Stepping
+    // over the block without the write-back left the output
+    // place uninitialised and the first read of it failed.
+    run_ok("empty-asm-inout", EMPTY_ASM_INOUT_SRC, "a=435\nb=7\n");
+}
+
+const EMPTY_ASM_PURE_OUT_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let a: i32;
+    unsafe {
+        asm!("", out("eax") a);
+    }
+    println!("a={}", a);
+}
+"#;
+
+#[test]
+fn run_mode_empty_asm_pure_out_stays_uninitialized() {
+    // A pure `out` operand of a block that runs no instruction
+    // is never written: its value is unspecified, and the read
+    // keeps the explicit uninitialised-place error rather than
+    // a fabricated value.
+    let dir = temp_dir("empty-asm-pure-out");
+    let src = fixture(&dir, "case.rs", EMPTY_ASM_PURE_OUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the unwritten output read is an explicit error; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("read of uninitialized place"),
+        "the error names the uninitialised read; stderr={stderr}"
+    );
+}

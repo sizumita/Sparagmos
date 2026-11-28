@@ -1095,6 +1095,57 @@ fn run_mode_extern_static_unwritten_read_is_explicit_error() {
     );
 }
 
+const STATIC_MUT_FOREIGN_SRC: &str = r#"
+#![allow(static_mut_refs)]
+use std::ffi::c_int;
+
+#[link(name = "rust_test_helpers", kind = "static")]
+extern "C" {
+    static mut rust_dbg_static_mut: c_int;
+    pub fn rust_dbg_static_mut_check_four();
+}
+
+unsafe fn static_bound(_: &'static c_int) {}
+
+fn static_bound_set(a: &'static mut c_int) {
+    *a = 3;
+}
+
+unsafe fn run() {
+    assert_eq!(rust_dbg_static_mut, 3);
+    rust_dbg_static_mut = 4;
+    assert_eq!(rust_dbg_static_mut, 4);
+    rust_dbg_static_mut_check_four();
+    rust_dbg_static_mut += 1;
+    assert_eq!(rust_dbg_static_mut, 5);
+    rust_dbg_static_mut *= 3;
+    assert_eq!(rust_dbg_static_mut, 15);
+    rust_dbg_static_mut = -3;
+    assert_eq!(rust_dbg_static_mut, -3);
+    static_bound(&rust_dbg_static_mut);
+    static_bound_set(&mut rust_dbg_static_mut);
+    println!("final={}", rust_dbg_static_mut);
+}
+
+pub fn main() {
+    unsafe { run() }
+}
+"#;
+
+#[test]
+fn run_mode_rust_test_helpers_static_mut_foreign() {
+    // The shape of tests/ui/abi/statics/static-mut-foreign.rs:
+    // the foreign static is the `rust_test_helpers` global
+    // `rust_dbg_static_mut`, whose C definition initialises it
+    // to 3, and the helper `rust_dbg_static_mut_check_four`
+    // asserts the guest's own writes through the declaration
+    // (the value 4 at the call). The modelled seed and the
+    // modelled check read and write the one storage, so the
+    // whole sequence runs instead of stopping at the first
+    // read with an uninitialised-place error.
+    run_ok("static-mut-foreign", STATIC_MUT_FOREIGN_SRC, "final=3\n");
+}
+
 const EXTERN_STATIC_FIRST_ELEM_SRC: &str = r#"
 extern "C" {
     static mut EXT_ARR: [u32; 2];

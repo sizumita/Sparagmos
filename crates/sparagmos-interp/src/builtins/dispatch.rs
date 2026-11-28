@@ -388,6 +388,32 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 Ok(Value::Ref(RefTarget::Null))
             }
+            Builtin::FfiStaticMutCheckFour => {
+                arity(0)?;
+                let current = self
+                    .static_by_item_name("rust_dbg_static_mut")
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "call to {name}: no seeded static named \
+                             `rust_dbg_static_mut` in this run"
+                        ))
+                    })?;
+                if matches!(current, Value::Uninit) {
+                    return Err(InterpError::UninitializedRead {
+                        func: name.to_string(),
+                        place: "static `rust_dbg_static_mut`".to_string(),
+                    });
+                }
+                if as_i128(&current, name)? != 4 {
+                    return Err(InterpError::Abort {
+                        message: format!(
+                            "{name}: assertion `rust_dbg_static_mut == 4` failed \
+                             (C assert in rust_test_helpers)"
+                        ),
+                    });
+                }
+                Ok(Value::Unit)
+            }
             Builtin::LibcAtol => {
                 arity(1)?;
                 let arg = self.c_str_arg(frames, &vals[0])?;

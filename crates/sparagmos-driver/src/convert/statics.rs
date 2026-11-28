@@ -531,6 +531,38 @@ fn init_section_order(section: &str) -> Option<(u8, u64)> {
 /// address is the null address, so a program that takes the
 /// declaration's value reads the null pointer rather than
 /// storage contents.
+/// The initial value of a foreign static whose contents are
+/// fixed by the `rust_test_helpers` C library, when the static
+/// is one of that library's modelled globals: the C source
+/// (`tests/auxiliary/rust_test_helpers.c`) defines
+/// `int rust_dbg_static_mut = 3;`, so a declaration importing
+/// that symbol denotes storage holding 3 before the program
+/// runs, exactly as the modelled helper *functions* in
+/// `foreign_helper_lookup` carry the C bodies' fixed semantics.
+/// Any other foreign static gets `None` here and keeps the
+/// uninitialised seed `foreign_static_seed` otherwise decides:
+/// inventing an initial value for a C library variable the
+/// session knows nothing about would fabricate program state.
+pub(crate) fn foreign_helper_static_seed(
+    def: &mir::mono::StaticDef,
+) -> Option<sm::ConstValue> {
+    let symbol = static_link_symbol(def);
+    let item = screen_question(|| {
+        let tcx = compiler_tcx()?;
+        let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+        Some(tcx.item_name(internal).to_string())
+    });
+    let is_dbg_static_mut = symbol.as_deref() == Some("rust_dbg_static_mut")
+        || item.as_deref() == Some("rust_dbg_static_mut");
+    if is_dbg_static_mut {
+        return Some(sm::ConstValue::Scalar(sm::Scalar::Int {
+            data: 3,
+            size: 4,
+        }));
+    }
+    None
+}
+
 pub(crate) fn static_is_extern_weak(def: &mir::mono::StaticDef) -> bool {
     screen_question(|| {
         let tcx = compiler_tcx()?;

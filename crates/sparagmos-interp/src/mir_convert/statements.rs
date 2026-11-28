@@ -2400,6 +2400,66 @@ impl<'a> Converter<'a> {
     /// written back at block exit. Only called for blocks the
     /// classifier accepted, so every operand is in the register
     /// class with a plain integer type.
+    /// The terminator for an asm block whose template runs no
+    /// real instruction (a no-op or step-over block), when the
+    /// block nevertheless has an operand whose value the block
+    /// must deliver: an `inout` operand, whose register the
+    /// (empty) program leaves holding its input value, so the
+    /// output place takes that input — the shape of
+    /// `asm!("", inout("x0") 435 => a)`, where stepping over
+    /// the block without the write-back leaves the output
+    /// place uninitialised and its first read fails. A split
+    /// `lateout` operand bound to the same modelled register
+    /// as an input operand is the same delivery (the register
+    /// file carries the input into the output). The block runs
+    /// as an `InlineAsm` terminator with no steps: the
+    /// executor's write-back rules give an inout operand its
+    /// input value, a pure `out` operand the program never
+    /// wrote stays untouched (its later read keeps the
+    /// uninitialised-read error), and clobber-only operands
+    /// stay inert. `None` when no operand delivers a value or
+    /// the block has no continuation to fall through to.
+    fn asm_step_over_terminator(
+        &self,
+        body: &mir::Body,
+        operands: &[mir::InlineAsmOperand],
+        destination: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some(target) = destination else {
+            return Ok(None);
+        };
+        let delivers = operands.iter().any(|op| match op.kind {
+            mir::AsmOperandKind::InOut => {
+                op.out_place.is_some()
+                    && op.in_value.is_some()
+                    && matches!(op.width, 8 | 16 | 32 | 64)
+            }
+            mir::AsmOperandKind::Out => {
+                op.out_place.is_some()
+                    && op.reg_name.as_deref().is_some_and(|name| {
+                        mir::arch_reg_index(name).is_some()
+                            && operands.iter().any(|other| {
+                                matches!(
+                                    other.kind,
+                                    mir::AsmOperandKind::In | mir::AsmOperandKind::InOut
+                                ) && other.reg_name.as_deref() == Some(name)
+                            })
+                    })
+            }
+            _ => false,
+        });
+        if !delivers {
+            return Ok(None);
+        }
+        Ok(Some(ir::TerminatorKind::InlineAsm {
+            regs: self.convert_asm_regs(body, operands)?,
+            steps: Vec::new(),
+            target: Some(ir::BasicBlock(target.index())),
+            ret: None,
+            arg_seeds: Vec::new(),
+        }))
+    }
+
     fn convert_asm_regs(
         &self,
         body: &mir::Body,
@@ -3519,13 +3579,20 @@ impl<'a> Converter<'a> {
                 ..
             } => {
                 if mir::inline_asm_is_noop(template, options) {
-                    match destination {
-                        Some(target) => ir::TerminatorKind::Goto {
-                            target: ir::BasicBlock(target.index()),
-                        },
-                        None => ir::TerminatorKind::Unsupported(
-                            "InlineAsm (no-op template without a destination)".to_string(),
-                        ),
+                    if let Some(term) =
+                        self.asm_step_over_terminator(body, operands, *destination)?
+                    {
+                        term
+                    } else {
+                        match destination {
+                            Some(target) => ir::TerminatorKind::Goto {
+                                target: ir::BasicBlock(target.index()),
+                            },
+                            None => ir::TerminatorKind::Unsupported(
+                                "InlineAsm (no-op template without a destination)"
+                                    .to_string(),
+                            ),
+                        }
                     }
                 } else if let Some(program) = mir::inline_asm_program(
                     template,
@@ -3539,15 +3606,25 @@ impl<'a> Converter<'a> {
                         // real instruction, whose operands the
                         // classifier leaves inert (e.g. the
                         // explicit-register operands of a
-                        // clobber-only block).
-                        match destination {
-                            Some(target) => ir::TerminatorKind::Goto {
-                                target: ir::BasicBlock(target.index()),
-                            },
-                            None => ir::TerminatorKind::Unsupported(
-                                "InlineAsm (no-op template without a destination)"
-                                    .to_string(),
-                            ),
+                        // clobber-only block) — except an operand
+                        // that delivers a value (an `inout`, whose
+                        // output is its input when no instruction
+                        // runs), which the step-over must write
+                        // back rather than drop.
+                        if let Some(term) =
+                            self.asm_step_over_terminator(body, operands, *destination)?
+                        {
+                            term
+                        } else {
+                            match destination {
+                                Some(target) => ir::TerminatorKind::Goto {
+                                    target: ir::BasicBlock(target.index()),
+                                },
+                                None => ir::TerminatorKind::Unsupported(
+                                    "InlineAsm (no-op template without a destination)"
+                                        .to_string(),
+                                ),
+                            }
                         }
                     } else {
                         // A naked block's return value is read

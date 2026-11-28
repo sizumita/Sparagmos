@@ -254,6 +254,32 @@ impl<'a> Interpreter<'a> {
         self.ensure_static(name, seed)
     }
 
+    /// The current value of the storage of the static whose
+    /// program key names the item `item` as its last path
+    /// segment, when exactly one seeded static matches. The
+    /// modelled `rust_test_helpers` check functions (see
+    /// `Builtin::FfiStaticMutCheckFour`) read the C library's
+    /// global through this: the guest's declaration of the
+    /// global and the C body denote the one storage, whose
+    /// program key is the declaration's own path, so the last
+    /// segment is the name both sides share. A key carrying
+    /// the `#DefId(..)` disambiguator suffix names the same
+    /// item once the suffix is stripped.
+    pub(crate) fn static_by_item_name(&self, item: &str) -> Option<Value> {
+        let store = self.statics.borrow();
+        let mut found: Option<&Value> = None;
+        for (key, value) in store.iter() {
+            let base = key.split('#').next().unwrap_or(key);
+            if base == item || base.rsplit("::").next() == Some(item) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(value);
+            }
+        }
+        found.cloned()
+    }
+
     /// The current value of the static `name`'s storage.
     pub(crate) fn static_base(&self, name: &str) -> InterpResult<Value> {
         self.statics
