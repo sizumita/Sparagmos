@@ -17,6 +17,7 @@ mod collections;
 mod constants;
 mod coverage;
 mod debug_mode;
+mod deref_patterns;
 mod drop_box;
 mod dst_size_of_val;
 mod dyn_vtable;

@@ -3532,6 +3532,7 @@ pub(crate) fn compose_projection(
     projection: &[RefProj],
     func: &str,
     place: &str,
+    root_ty: Option<&Ty>,
 ) -> Vec<RefProj> {
     let mut out: Vec<RefProj> = Vec::with_capacity(projection.len());
     let mut cur = value.clone();
@@ -3550,6 +3551,29 @@ pub(crate) fn compose_projection(
             };
             if j > i + 1 || subslice.is_some() {
                 let element = project_value(cur.clone(), &[RefProj::Index(a)], func, place);
+                // A pure index run at the head of the projection
+                // over a `Vec`-typed root, landing on an
+                // aggregate element, denotes element access into
+                // the vector aggregate itself: the vector value
+                // holds its elements as its fields, and an index
+                // step into one of them ranges inside the element
+                // as written. The shape-only judgment below
+                // cannot see this -- a vector holding exactly one
+                // scalar element has the very shape of the
+                // `MaybeUninit` union form over a scalar payload
+                // (a one-field variant-0 wrapper), so it would
+                // compose the run and read the element itself as
+                // the position value. The declared root type and
+                // the aggregate element together are the evidence
+                // that separates the two: a run over a scalar
+                // element, and a run carrying a trailing
+                // sub-slice step (a chunk window over the
+                // vector storage), still compose as before.
+                let vec_head_aggregate = i == 0
+                    && subslice.is_none()
+                    && matches!(root_ty, Some(ty) if is_vec_adt_ty(ty))
+                    && matches!(&element, Ok(Value::Enum { .. }));
+                if !vec_head_aggregate {
                 if let Ok(element) = element {
                     // An ADT value is the aggregate of its
                     // fields, and an index step into it is
@@ -3594,6 +3618,7 @@ pub(crate) fn compose_projection(
                             continue;
                         }
                     }
+                }
                 }
             }
         }
