@@ -268,6 +268,24 @@ pub enum Builtin {
     /// `Display` bodies that call it are inlined into guest
     /// code, which then calls it directly.
     FmtNumFmt,
+    /// `core::fmt::num::imp::<impl iN>::format_into` (and
+    /// the `core::fmt::num::<impl i128>::format_into` /
+    /// `core::fmt::num::<impl u128>::format_into` inherent
+    /// forms): the public `NumBuffer` entry of the integer
+    /// digit writer (see [`FmtNumFmt`]): write the value's
+    /// decimal digits -- with a leading `-` for a negative
+    /// signed value -- right-aligned into the buffer's
+    /// byte array and return the written suffix as a
+    /// `&str`. Like `_fmt`, its MIR body is not encoded in
+    /// the distributed core rlib. `buf_len` is the capacity
+    /// of the instance's `NumBuffer` byte array (the digit
+    /// count of the type's maximum, plus a sign slot for a
+    /// signed type): the length the buffer's array has
+    /// before any write materialises it.
+    FmtNumFormatInto {
+        signed: bool,
+        buf_len: usize,
+    },
     /// `std::fmt::Arguments::from_str(&str)`.
     ArgumentsFromStr,
     /// `std::fmt::Arguments::new(&[u8; N], &[Argument; M])`.
