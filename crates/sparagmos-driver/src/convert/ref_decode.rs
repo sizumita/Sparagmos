@@ -105,7 +105,10 @@ impl Converter {
     /// weakly (`#[linkage = "extern_weak"]`) with no definition
     /// in the session denotes the undefined weak symbol, whose
     /// address is the null address: the seed is the null
-    /// pointer. Any other foreign static — a C library's
+    /// pointer. A foreign static whose contents the
+    /// `rust_test_helpers` models fix (see
+    /// `foreign_helper_static_seed`) seeds with that modelled
+    /// initial value. Any other foreign static — a C library's
     /// variable — has no initializer the session can know, and
     /// its seed stays uninitialised: address-only uses keep
     /// working, and a read of the contents is the
@@ -152,6 +155,9 @@ impl Converter {
                     }
                 }
             }
+        }
+        if let Some(seed) = foreign_helper_static_seed(def) {
+            return seed;
         }
         if static_is_extern_weak(def) {
             return sm::ConstValue::NullPtr;

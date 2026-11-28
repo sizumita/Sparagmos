@@ -315,6 +315,7 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
         | "rust_dbg_extern_return_TwoU64s" => Builtin::FfiReturnTwo,
         "rust_dbg_extern_return_FiveU16s" => Builtin::FfiReturnFive,
         "rust_dbg_call" => Builtin::FfiDbgCall,
+        "rust_dbg_static_mut_check_four" => Builtin::FfiStaticMutCheckFour,
         "rust_dbg_extern_empty_struct" => Builtin::FfiEmptyStruct,
         "rust_get_test_int" => Builtin::FfiGetTestInt,
         "rust_get_null_ptr" => Builtin::FfiGetNullPtr,

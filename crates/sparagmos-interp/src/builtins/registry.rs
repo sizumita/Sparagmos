@@ -2203,6 +2203,19 @@ pub enum Builtin {
     FfiGetTestInt,
     /// `rust_get_null_ptr() -> NULL`.
     FfiGetNullPtr,
+    /// `rust_dbg_static_mut_check_four()`: the C body asserts
+    /// the `rust_test_helpers` global `rust_dbg_static_mut`
+    /// equals 4, reading the one storage the guest's own
+    /// declaration of that global denotes (seeded with the
+    /// C definition's initial value 3 by the driver's
+    /// `foreign_helper_static_seed` and updated by the guest's
+    /// writes). Modelled as the same check against the
+    /// interpreter's statics store: a failed check is the C
+    /// `assert` failure (a guest abort), and a run whose store
+    /// holds no such static is an explicit error, never a
+    /// silently passed check. Served only for callees with no
+    /// converted body (see [`foreign_helper_lookup`]).
+    FfiStaticMutCheckFour,
     /// The C library's `atol(s) -> c_long`: parse the
     /// initial numeric prefix of the C string `s`, delegated
     /// to the host's libc function of the same name (see
