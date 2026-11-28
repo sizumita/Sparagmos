@@ -1098,6 +1098,116 @@ impl<'a> Interpreter<'a> {
                     len: bytes.len() as u128,
                 })
             }
+            Builtin::FmtNumFormatInto { signed, buf_len } => {
+                arity(2)?;
+                // `core::fmt::num`'s `format_into` (see
+                // `Builtin::FmtNumFormatInto`): the decimal
+                // digits of the value -- with a leading `-`
+                // for a negative signed value -- written
+                // right-aligned into the `NumBuffer`'s byte
+                // array; the result is the buffer's written
+                // suffix as a `&str`, a fat reference into
+                // the buffer itself, not a copy.
+                let text = if signed {
+                    as_i128(&vals[0], name)?.to_string()
+                } else {
+                    as_u128(&vals[0], name)?.to_string()
+                };
+                let bytes = text.as_bytes();
+                let Value::Ref(buf_target) = &vals[1] else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a NumBuffer reference",
+                        vals[1].kind_name(),
+                    ));
+                };
+                let target = self.deref_value(frames, &vals[1])?;
+                let current = self.read_resolved(frames, &target)?;
+                // The buffer value's first field is the byte
+                // array; the second is the integer type's
+                // `PhantomData` marker.
+                let array = match &current {
+                    Value::Enum { fields, .. } if !fields.is_empty() => fields[0].clone(),
+                    Value::Tuple(items) if !items.is_empty() => items[0].clone(),
+                    other => {
+                        return Err(unsupported(format!(
+                            "builtin {name}: a {} buffer value is not modelled",
+                            other.kind_name()
+                        )))
+                    }
+                };
+                // The array's length: its own, once a write
+                // has materialised it; before that the array
+                // is the uninitialised value and the length
+                // is the capacity the buffer type defines.
+                let n = match &array {
+                    Value::Tuple(items) => items.len(),
+                    Value::Bytes(data) => data.len(),
+                    Value::SparseVec { len, .. } => *len as usize,
+                    Value::Enum { fields, .. } => fields.len(),
+                    Value::Uninit => buf_len,
+                    other => {
+                        return Err(unsupported(format!(
+                            "builtin {name}: a {} buffer array is not modelled",
+                            other.kind_name()
+                        )))
+                    }
+                };
+                let offset = n.checked_sub(bytes.len()).ok_or_else(|| {
+                    unsupported(format!(
+                        "builtin {name}: {} digits do not fit the {n}-byte buffer",
+                        bytes.len()
+                    ))
+                })?;
+                let new_array = match replace_slice_bytes(&array, offset, bytes) {
+                    Some(value) => value,
+                    None if matches!(array, Value::Uninit) => {
+                        let mut elems = vec![Value::Uninit; n];
+                        for (i, b) in bytes.iter().enumerate() {
+                            elems[offset + i] = Value::Uint(*b as u128);
+                        }
+                        Value::Tuple(elems)
+                    }
+                    None => {
+                        return Err(unsupported(format!(
+                            "builtin {name}: writing into a {} buffer array is not modelled",
+                            array.kind_name()
+                        )))
+                    }
+                };
+                let new_buf = match current {
+                    Value::Enum {
+                        variant,
+                        mut fields,
+                    } => {
+                        fields[0] = new_array;
+                        Value::Enum { variant, fields }
+                    }
+                    Value::Tuple(mut items) => {
+                        items[0] = new_array;
+                        Value::Tuple(items)
+                    }
+                    _ => unreachable!("the buffer shape was checked above"),
+                };
+                self.write_resolved(frames, &target, new_buf)?;
+                let step = RefProj::Subslice {
+                    offset,
+                    len: bytes.len(),
+                };
+                let base = buf_target
+                    .projected(RefProj::Field(0))
+                    .and_then(|target| target.projected(step))
+                    .map(Value::Ref)
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "builtin {name}: the buffer pointer denotes no storage"
+                        ))
+                    })?;
+                Ok(Value::FatRef {
+                    base: Box::new(base),
+                    len: bytes.len() as u128,
+                })
+            }
             Builtin::ArgumentsFromStr => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;

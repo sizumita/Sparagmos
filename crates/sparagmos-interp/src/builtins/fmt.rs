@@ -6400,6 +6400,60 @@ pub(crate) fn fmt_lookup(canonical: &str) -> Option<Builtin> {
         | "core::fmt::num::imp::<impl u64>::_fmt"
         | "core::fmt::num::imp::<impl usize>::_fmt"
         | "core::fmt::num::<impl u128>::_fmt" => Builtin::FmtNumFmt,
+        // The public `NumBuffer` entry of the same digit
+        // writer (see `Builtin::FmtNumFormatInto`): the
+        // `imp` submodule holds every type except the
+        // 128-bit pair, whose impls sit at the `num` level.
+        // The capacity is the digit count of the type's
+        // maximum, plus a sign slot for a signed type.
+        "core::fmt::num::imp::<impl i8>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 4,
+        },
+        "core::fmt::num::imp::<impl i16>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 6,
+        },
+        "core::fmt::num::imp::<impl i32>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 11,
+        },
+        "core::fmt::num::imp::<impl i64>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 20,
+        },
+        "core::fmt::num::imp::<impl isize>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 20,
+        },
+        "core::fmt::num::<impl i128>::format_into" => Builtin::FmtNumFormatInto {
+            signed: true,
+            buf_len: 40,
+        },
+        "core::fmt::num::imp::<impl u8>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 3,
+        },
+        "core::fmt::num::imp::<impl u16>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 5,
+        },
+        "core::fmt::num::imp::<impl u32>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 10,
+        },
+        "core::fmt::num::imp::<impl u64>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 20,
+        },
+        "core::fmt::num::imp::<impl usize>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 20,
+        },
+        "core::fmt::num::<impl u128>::format_into" => Builtin::FmtNumFormatInto {
+            signed: false,
+            buf_len: 39,
+        },
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
         }
