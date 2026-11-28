@@ -374,6 +374,32 @@ impl Converter {
         } else {
             None
         };
+        // A register operand holding a function pointer: the
+        // signature shape a `call` step through it executes
+        // through, resolved from the operand's own type.
+        let fn_call_sig = if matches!(kind, sm::AsmOperandKind::In | sm::AsmOperandKind::InOut) {
+            op.in_value
+                .as_ref()
+                .and_then(|v| v.ty(body.locals()).ok())
+                .and_then(|t| self.asm_fn_ptr_sig(&t))
+        } else {
+            None
+        };
+        // A sym operand denoting a static: its display name,
+        // for a `lea` step that materializes its address (the
+        // interpreter resolves the name to its static key,
+        // whose disambiguating suffix only conversion knows).
+        let static_key = if raw.starts_with("SymStatic {") {
+            static_name.clone()
+        } else {
+            None
+        };
+        let width = if fn_call_sig.is_some() && width == 0 {
+            // A function pointer occupies a full register.
+            64
+        } else {
+            width
+        };
         sm::InlineAsmOperand {
             kind,
             reg_class,
@@ -389,6 +415,8 @@ impl Converter {
                 None
             },
             call_sig,
+            fn_call_sig,
+            static_key,
         }
     }
 
@@ -454,7 +482,17 @@ impl Converter {
         if sig.c_variadic {
             return None;
         }
-        let abi = asm_abi_family(&sig.abi)?;
+        let abi = asm_abi_family(&sig.abi).or_else(|| {
+            // An `extern "custom"` callee is by construction a
+            // naked or `global_asm!` body: the call step forwards
+            // the register file to it, and the SysV64 shape only
+            // classifies its declared scalars.
+            if format!("{:?}", sig.abi).starts_with("Custom") {
+                Some(sm::AsmAbi::SysV64)
+            } else {
+                None
+            }
+        })?;
         let (output, inputs) = sig.inputs_and_output.split_last()?;
         let mut params = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -480,6 +518,63 @@ impl Converter {
         };
         Some(sm::AsmCallSig {
             name: def.name(),
+            abi,
+            params,
+            ret,
+        })
+    }
+
+    /// Resolve the signature *shape* of a function-pointer (or
+    /// function-item) type an asm register operand holds: the
+    /// register-passing signature a `call` step through the
+    /// register executes through, under the same scalar /
+    /// register-passed discipline as [`Self::asm_call_sig`].
+    /// The `custom` ABI family maps to the SysV64 register
+    /// model: a `custom` callee is by construction a naked or
+    /// `global_asm!` body whose register state the call step
+    /// forwards, and the shape only classifies its declared
+    /// scalars. The returned signature's `name` is empty: the
+    /// callee is the operand's runtime value.
+    fn asm_fn_ptr_sig(&mut self, ty: &Ty) -> Option<sm::AsmCallSig> {
+        let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Some(guarded_ty_kind(ty)?.fn_sig()?.skip_binder())
+        }))
+        .ok()??;
+        if sig.c_variadic {
+            return None;
+        }
+        let abi = asm_abi_family(&sig.abi).or_else(|| {
+            if format!("{:?}", sig.abi).starts_with("Custom") {
+                Some(sm::AsmAbi::SysV64)
+            } else {
+                None
+            }
+        })?;
+        let (output, inputs) = sig.inputs_and_output.split_last()?;
+        let mut params = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            params.push(asm_scalar(input)?);
+        }
+        let (mut ints, mut floats) = (0usize, 0usize);
+        for param in &params {
+            match param {
+                sm::AsmScalar::Float { .. } => floats += 1,
+                _ => ints += 1,
+            }
+        }
+        let register_passed = match abi {
+            sm::AsmAbi::SysV64 => ints <= 6 && floats <= 8,
+            sm::AsmAbi::Win64 => params.len() <= 4,
+        };
+        if !register_passed {
+            return None;
+        }
+        let ret = match guarded_ty_kind(output)? {
+            TyKind::RigidTy(RigidTy::Tuple(ts)) if ts.is_empty() => None,
+            _ => Some(asm_scalar(output)?),
+        };
+        Some(sm::AsmCallSig {
+            name: String::new(),
             abi,
             params,
             ret,

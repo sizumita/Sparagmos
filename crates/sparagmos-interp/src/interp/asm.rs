@@ -3,7 +3,7 @@
 use super::*;
 use crate::error::{InterpError, InterpResult};
 
-use crate::value::{Value};
+use crate::value::{RefTarget, Value};
 
 impl<'a> Interpreter<'a> {
     /// Execute one evaluable inline-asm block: seed a 64-bit slot
@@ -30,15 +30,28 @@ impl<'a> Interpreter<'a> {
         naked_shape: bool,
     ) -> InterpResult<AsmOutcome> {
         let mut slots: Vec<u64> = Vec::with_capacity(regs.len());
+        // The callee names of function-pointer operands, by slot:
+        // a function pointer's slot carries no bits (its value is
+        // a name in the interpreter's value model), and a `call`
+        // step through the register resolves the name here.
+        let mut fn_ptrs: Vec<Option<String>> = Vec::with_capacity(regs.len());
         for reg in regs {
+            let mut fn_ptr = None;
             let bits = match &reg.init {
                 Some(op) => {
                     let value = self.eval_operand(frames, body, op)?;
-                    asm_input_bits(&value, reg)?
+                    match &value {
+                        Value::FnPtr(name) => {
+                            fn_ptr = Some(name.clone());
+                            0
+                        }
+                        _ => asm_input_bits(&value, reg)?,
+                    }
                 }
                 None => 0,
             };
             slots.push(bits);
+            fn_ptrs.push(fn_ptr);
         }
         // The architectural register file: the 16 general-purpose
         // registers followed by 32 vector registers (only the low
@@ -132,6 +145,13 @@ impl<'a> Interpreter<'a> {
         let seeded_arch = arch;
         let seeded_written = arch_written;
         let mut written = vec![false; regs.len()];
+        // Slots whose current content a `lea` of a static's
+        // address established, by slot: their write-back is the
+        // static reference itself, not the priced bits (a raw
+        // pointer place holds a reference value in this model,
+        // and the bits alone do not type-check there).
+        let mut sym_addrs: Vec<Option<String>> = vec![None; regs.len()];
+        let mut flags = AsmFlags::default();
         let mut outcome = AsmOutcome::Fallthrough;
         for step in steps {
             match step {
@@ -140,6 +160,7 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
                 AsmStep::Call { sig } => {
+                    sym_addrs.iter_mut().for_each(|a| *a = None);
                     self.exec_asm_call(frames, &mut arch, &mut arch_written, sig)?;
                     // The call may have rewritten any register:
                     // resync the slots of bound operands with the
@@ -151,15 +172,120 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                step => exec_asm_step(
+                AsmStep::CallReg { idx, sig } => {
+                    sym_addrs.iter_mut().for_each(|a| *a = None);
+                    // The callee is the operand's runtime value:
+                    // a function pointer the seeding recorded by
+                    // name. Anything else in the slot is not a
+                    // callable the register model can name.
+                    let Some(name) = fn_ptrs.get(*idx).cloned().flatten() else {
+                        return Err(InterpError::UnsupportedTerminator {
+                            kind: "InlineAsm (call through a register whose value is not a function pointer)"
+                                .to_string(),
+                        });
+                    };
+                    let mut sig = sig.clone();
+                    sig.name = name;
+                    self.exec_asm_call(frames, &mut arch, &mut arch_written, &sig)?;
+                    for (a, slot) in bound.iter().enumerate() {
+                        if let Some(i) = slot {
+                            slots[*i] = arch[a];
+                            written[*i] = true;
+                        }
+                    }
+                }
+                AsmStep::LeaSym { dst, static_name } => {
+                    // The static's address under the same pricing
+                    // a reference to the static carries, so the
+                    // materialized pointer compares equal to one.
+                    // The step names the static by its display
+                    // name; the program's static key adds a
+                    // disambiguating suffix when several
+                    // definitions share it, so resolve the name
+                    // against the program's static tables first.
+                    let Some(static_key) = self.resolve_asm_static_key(static_name) else {
+                        return Err(InterpError::UnsupportedTerminator {
+                            kind: format!(
+                                "InlineAsm (lea of the address of static `{static_name}`, which the program does not record)"
+                            ),
+                        });
+                    };
+                    // Seed the static's storage first: a reference
+                    // the program never materialized through a
+                    // constant has no store entry yet, and the
+                    // write-back below hands out a reference to it.
+                    self.ensure_static_seeded(&static_key)?;
+                    let addr = self.static_price(&static_key) as u64;
+                    match dst {
+                        sparagmos_mir::AsmDst::Operand(idx, _) => {
+                            slots[*idx] = addr;
+                            written[*idx] = true;
+                            sym_addrs[*idx] = Some(static_key.clone());
+                            asm_sync_slot_to_arch(
+                                &slots,
+                                &mut arch,
+                                &mut arch_written,
+                                regs,
+                                *idx,
+                            );
+                        }
+                        sparagmos_mir::AsmDst::Arch(reg) => {
+                            asm_arch_write(&mut arch, *reg, addr);
+                            arch_written[reg.index as usize] = true;
+                            asm_sync_arch_to_slot(
+                                &arch,
+                                &mut slots,
+                                &mut written,
+                                &bound,
+                                *reg,
+                            );
+                        }
+                    }
+                }
+                step => {
+                    // A straight-line step that writes a slot (or
+                    // a bound architectural register) supersedes
+                    // any `lea`-of-static provenance that slot
+                    // carried: its content is the step's result.
+                    let dst_slot = match step {
+                        AsmStep::Mov { dst, .. }
+                        | AsmStep::Bin { dst, .. }
+                        | AsmStep::Un { dst, .. } => Some(*dst),
+                        AsmStep::SetCc {
+                            dst: sparagmos_mir::AsmDst::Operand(idx, _),
+                            ..
+                        }
+                        | AsmStep::Lea {
+                            dst: sparagmos_mir::AsmDst::Operand(idx, _),
+                            ..
+                        } => Some(*idx),
+                        AsmStep::MovArch { dst, .. }
+                        | AsmStep::BinArch { dst, .. }
+                        | AsmStep::UnArch { dst, .. } => bound[dst.index as usize],
+                        AsmStep::SetCc {
+                            dst: sparagmos_mir::AsmDst::Arch(reg),
+                            ..
+                        }
+                        | AsmStep::Lea {
+                            dst: sparagmos_mir::AsmDst::Arch(reg),
+                            ..
+                        } => bound[reg.index as usize],
+                        _ => None,
+                    };
+                    if let Some(idx) = dst_slot {
+                        sym_addrs[idx] = None;
+                    }
+                    exec_asm_step(
                     &mut slots,
                     &mut written,
                     &mut arch,
                     &mut arch_written,
                     &bound,
-                    regs,
-                    step,
-                )?,
+                        regs,
+                        &mut flags,
+                        step,
+                    )?;
+                }
             }
         }
         for (i, reg) in regs.iter().enumerate() {
@@ -181,7 +307,13 @@ impl<'a> Interpreter<'a> {
                     slots[i]
                 }
             };
-            let value = asm_output_value(bits, reg);
+            let value = match &sym_addrs[i] {
+                Some(key) => Value::Ref(RefTarget::Static {
+                    name: key.clone(),
+                    projection: Vec::new(),
+                }),
+                None => asm_output_value(bits, reg),
+            };
             self.write_place(frames, body, dest, value)?;
         }
         if matches!(outcome, AsmOutcome::Fallthrough) {
@@ -217,6 +349,35 @@ impl<'a> Interpreter<'a> {
             self.pending_asm_outgoing = Some((arch, out_written));
         }
         Ok(outcome)
+    }
+
+    /// Resolve an asm `lea` step's static display name to the
+    /// program's static key: the key is the name itself unless
+    /// conversion disambiguated a duplicated name with a
+    /// `#DefId(..)` suffix, in which case the unique recorded
+    /// key with that base name (among the seed and type tables)
+    /// is the static the operand denotes. `None` when the
+    /// program records no such static, or the name is ambiguous
+    /// between several recorded keys.
+    fn resolve_asm_static_key(&self, name: &str) -> Option<String> {
+        let program = self.program();
+        if program.static_seeds.contains_key(name) || program.static_tys.contains_key(name) {
+            return Some(name.to_string());
+        }
+        let mut found: Option<&String> = None;
+        for key in program
+            .static_seeds
+            .keys()
+            .chain(program.static_tys.keys())
+        {
+            if key.split('#').next() == Some(name) {
+                if found.is_some_and(|f| f != key) {
+                    return None;
+                }
+                found = Some(key);
+            }
+        }
+        found.cloned()
     }
 
     /// Execute one asm `call` step: assemble the arguments from
@@ -687,11 +848,53 @@ fn exec_asm_step(
     arch_written: &mut [bool; 48],
     bound: &[Option<usize>; 48],
     regs: &[AsmReg],
+    flags: &mut AsmFlags,
     step: &AsmStep,
 ) -> InterpResult<()> {
     use sparagmos_mir::AsmDst;
     match step {
-        AsmStep::Nop | AsmStep::Ret | AsmStep::Jump { .. } | AsmStep::Call { .. } => {}
+        AsmStep::Nop
+        | AsmStep::Ret
+        | AsmStep::Jump { .. }
+        | AsmStep::Call { .. }
+        | AsmStep::CallReg { .. }
+        | AsmStep::LeaSym { .. } => {}
+        AsmStep::Test { left, src } => {
+            let width = asm_src_width(slots, regs, arch, left);
+            let mask = asm_width_mask(width);
+            let a = asm_src_value(slots, regs, arch, arch_written, left)? & mask;
+            let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
+            *flags = AsmFlags::from_logic(a & b, width);
+        }
+        AsmStep::Cmp { left, src } => {
+            let width = asm_src_width(slots, regs, arch, left);
+            let mask = asm_width_mask(width);
+            let a = asm_src_value(slots, regs, arch, arch_written, left)? & mask;
+            let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
+            *flags = AsmFlags::from_sub(a, b, width);
+        }
+        AsmStep::SetCc { cond, dst } => {
+            let byte = u64::from(flags.test(*cond));
+            match dst {
+                AsmDst::Operand(idx, _) => {
+                    // Only the low byte is written; the rest of
+                    // the slot is preserved.
+                    slots[*idx] = (slots[*idx] & !0xff) | byte;
+                    written[*idx] = true;
+                    asm_sync_slot_to_arch(slots, arch, arch_written, regs, *idx);
+                }
+                AsmDst::Arch(reg) => {
+                    let low = sparagmos_mir::ArchReg {
+                        width: 8,
+                        high: reg.high,
+                        ..*reg
+                    };
+                    asm_arch_write(arch, low, byte);
+                    arch_written[reg.index as usize] = true;
+                    asm_sync_arch_to_slot(arch, slots, written, bound, *reg);
+                }
+            }
+        }
         AsmStep::Mov { dst, dst_mod, src } => {
             let value = asm_src_value(slots, regs, arch, arch_written, src)?;
             asm_write(slots, written, regs, *dst, *dst_mod, value);
@@ -708,6 +911,7 @@ fn exec_asm_step(
             let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
             let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
             let result = asm_bin_result(*op, a, b, width);
+            flags.update_bin(*op, a, b, result & mask, width);
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
             asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
@@ -716,6 +920,7 @@ fn exec_asm_step(
             let mask = asm_width_mask(width);
             let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
             let result = asm_un_result(*op, a);
+            flags.update_un(*op, a, result & mask, width);
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
             asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
@@ -732,6 +937,7 @@ fn exec_asm_step(
             let a = asm_arch_read(arch, *dst) & mask;
             let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
             let result = asm_bin_result(*op, a, b, width);
+            flags.update_bin(*op, a, b, result & mask, width);
             asm_arch_write(arch, *dst, result & mask);
             arch_written[dst.index as usize] = true;
             asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
@@ -742,6 +948,7 @@ fn exec_asm_step(
             check_incoming_rsp_read(arch_written, *dst)?;
             let a = asm_arch_read(arch, *dst) & mask;
             let result = asm_un_result(*op, a);
+            flags.update_un(*op, a, result & mask, width);
             asm_arch_write(arch, *dst, result & mask);
             arch_written[dst.index as usize] = true;
             asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
@@ -775,6 +982,153 @@ fn exec_asm_step(
         }
     }
     Ok(())
+}
+
+/// The flag state an asm program's `test` / `cmp` / arithmetic
+/// steps leave for a later `setcc`: the five status flags the
+/// condition codes read. A block starts with all flags clear;
+/// a step that does not define flags (moves, shifts, `lea`)
+/// leaves the state alone, as on hardware.
+#[derive(Clone, Copy, Default)]
+struct AsmFlags {
+    zf: bool,
+    sf: bool,
+    cf: bool,
+    of: bool,
+    pf: bool,
+}
+
+impl AsmFlags {
+    /// Flags of a logic result (`test`, `and`, `or`, `xor`):
+    /// CF and OF clear, the rest from the result.
+    fn from_logic(result: u64, width: u32) -> Self {
+        let mask = asm_width_mask(width);
+        let r = result & mask;
+        Self {
+            zf: r == 0,
+            sf: width > 0 && (r >> (width - 1)) & 1 == 1,
+            cf: false,
+            of: false,
+            pf: (r & 0xff).count_ones() % 2 == 0,
+        }
+    }
+
+    /// Flags of `a - b` at `width` bits (`cmp`, `sub`).
+    fn from_sub(a: u64, b: u64, width: u32) -> Self {
+        let mask = asm_width_mask(width);
+        let a = a & mask;
+        let b = b & mask;
+        let r = a.wrapping_sub(b) & mask;
+        let sign = |v: u64| width > 0 && (v >> (width - 1)) & 1 == 1;
+        Self {
+            zf: r == 0,
+            sf: sign(r),
+            cf: a < b,
+            of: sign(a) != sign(b) && sign(r) != sign(a),
+            pf: (r & 0xff).count_ones() % 2 == 0,
+        }
+    }
+
+    /// Flags of `a + b` at `width` bits (`add`).
+    fn from_add(a: u64, b: u64, width: u32) -> Self {
+        let mask = asm_width_mask(width);
+        let a = a & mask;
+        let b = b & mask;
+        let full = u128::from(a) + u128::from(b);
+        let r = (full as u64) & mask;
+        let sign = |v: u64| width > 0 && (v >> (width - 1)) & 1 == 1;
+        Self {
+            zf: r == 0,
+            sf: sign(r),
+            cf: width < 128 && (full >> width) & 1 == 1,
+            of: sign(a) == sign(b) && sign(r) != sign(a),
+            pf: (r & 0xff).count_ones() % 2 == 0,
+        }
+    }
+
+    /// Refresh the flags after a binary step, for the operation
+    /// shapes whose flag semantics are plain: shifts leave the
+    /// state alone (their CF/OF are defined but no step in the
+    /// class reads them, and approximating them would be worse
+    /// than leaving the prior state).
+    fn update_bin(&mut self, op: sparagmos_mir::AsmBinOp, a: u64, b: u64, result: u64, width: u32) {
+        use sparagmos_mir::AsmBinOp;
+        match op {
+            AsmBinOp::Add => *self = Self::from_add(a, b, width),
+            AsmBinOp::Sub => *self = Self::from_sub(a, b, width),
+            AsmBinOp::And | AsmBinOp::Or | AsmBinOp::Xor => {
+                *self = Self::from_logic(result, width)
+            }
+            AsmBinOp::Shl | AsmBinOp::Shr | AsmBinOp::Sar => {}
+        }
+    }
+
+    /// Refresh the flags after a unary step: `inc` / `dec`
+    /// preserve CF, `neg` sets CF from the operand, `not`
+    /// defines no flags.
+    fn update_un(&mut self, op: sparagmos_mir::AsmUnOp, a: u64, result: u64, width: u32) {
+        use sparagmos_mir::AsmUnOp;
+        match op {
+            AsmUnOp::Inc => {
+                let cf = self.cf;
+                *self = Self::from_add(a, 1, width);
+                self.cf = cf;
+            }
+            AsmUnOp::Dec => {
+                let cf = self.cf;
+                *self = Self::from_sub(a, 1, width);
+                self.cf = cf;
+            }
+            AsmUnOp::Neg => {
+                let mut f = Self::from_sub(0, a, width);
+                f.cf = a != 0;
+                *self = f;
+            }
+            AsmUnOp::Not => {
+                let _ = result;
+            }
+        }
+    }
+
+    /// Whether the condition holds over this flag state.
+    fn test(&self, cond: sparagmos_mir::AsmCond) -> bool {
+        use sparagmos_mir::AsmCond;
+        match cond {
+            AsmCond::E => self.zf,
+            AsmCond::Ne => !self.zf,
+            AsmCond::B => self.cf,
+            AsmCond::Ae => !self.cf,
+            AsmCond::L => self.sf != self.of,
+            AsmCond::Ge => self.sf == self.of,
+            AsmCond::Le => self.zf || self.sf != self.of,
+            AsmCond::G => !self.zf && self.sf == self.of,
+            AsmCond::A => !self.cf && !self.zf,
+            AsmCond::Be => self.cf || self.zf,
+            AsmCond::S => self.sf,
+            AsmCond::Ns => !self.sf,
+            AsmCond::O => self.of,
+            AsmCond::No => !self.of,
+            AsmCond::P => self.pf,
+            AsmCond::Np => !self.pf,
+        }
+    }
+}
+
+/// The width a `test` / `cmp` left operand operates at: an
+/// operand slot's instruction width, an architectural
+/// register's access width, an immediate's full width (the
+/// parser never admits an immediate on the left).
+fn asm_src_width(
+    _slots: &[u64],
+    regs: &[AsmReg],
+    _arch: &[u64; 48],
+    src: &sparagmos_mir::AsmSrc,
+) -> u32 {
+    match src {
+        sparagmos_mir::AsmSrc::Reg(idx, modifier) => asm_instr_width(regs, *idx, *modifier),
+        sparagmos_mir::AsmSrc::Arch(reg) => reg.width,
+        sparagmos_mir::AsmSrc::Imm(_) => 64,
+    }
 }
 
 /// The result of one binary asm operation at `width` bits.

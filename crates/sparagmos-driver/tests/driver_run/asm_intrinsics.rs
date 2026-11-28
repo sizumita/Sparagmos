@@ -1562,3 +1562,109 @@ fn run_mode_empty_asm_pure_out_stays_uninitialized() {
         "the error names the uninitialised read; stderr={stderr}"
     );
 }
+
+// ----- InlineAsm: flags / setcc, register-indirect call, lea sym -----
+// The shapes of the InlineAsm exec family (census B-5): naked
+// `extern "custom"` bodies whose results travel in registers
+// (`test`/`sete`), an asm `call` through a function-pointer
+// register, and a rip-relative `lea` of a static's address.
+
+const ASM_CUSTOM_ABI_SETCC_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+unsafe extern "custom" fn is_even() {
+    naked_asm!("test al, 1", "sete al", "ret");
+}
+
+#[unsafe(naked)]
+unsafe extern "custom" fn double() {
+    naked_asm!("add rax, rax", "ret");
+}
+
+#[unsafe(naked)]
+unsafe extern "custom" fn bitwise_not() {
+    naked_asm!("not rax", "ret");
+}
+
+fn main() {
+    let mut even: u8;
+    unsafe { asm!("call {}", sym is_even, inout("al") 42u8 => even) };
+    let mut odd: u8;
+    unsafe { asm!("call {}", sym is_even, inout("al") 41u8 => odd) };
+    let mut doubled: u64 = 21;
+    unsafe { asm!("call {}", sym double, inout("rax") doubled) };
+    let mut negated: u64 = 42;
+    unsafe { asm!("call {}", sym bitwise_not, inout("rax") negated) };
+    println!("{} {} {} {}", even != 0, odd != 0, doubled, negated == !42u64);
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_custom_abi_test_setcc() {
+    run_ok(
+        "asm-custom-setcc",
+        ASM_CUSTOM_ABI_SETCC_SRC,
+        "true false 42 true\n",
+    );
+}
+
+const ASM_CALL_REG_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+unsafe extern "custom" fn double() {
+    naked_asm!("add rax, rax", "ret");
+}
+
+fn caller(f: unsafe extern "custom" fn(), mut x: u64) -> u64 {
+    unsafe { asm!("call {}", in(reg) f, inout("rax") x) };
+    x
+}
+
+fn main() {
+    println!("{}", caller(double, 2));
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_call_through_register() {
+    run_ok("asm-call-reg", ASM_CALL_REG_SRC, "4\n");
+}
+
+const ASM_LEA_SYM_SRC: &str = r#"
+use std::arch::asm;
+
+static S1: u32 = 111;
+
+fn main() {
+    let addr: *const u32;
+    unsafe {
+        asm!("lea {}, [rip + {}]", out(reg) addr, sym S1);
+    }
+    println!("{}", addr == &S1 as *const u32);
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_lea_rip_sym_static() {
+    run_ok("asm-lea-sym", ASM_LEA_SYM_SRC, "true\n");
+}
+
+const ASM_CMP_SETCC_SRC: &str = r#"
+use std::arch::asm;
+
+fn main() {
+    let mut less: u8 = 0;
+    let mut greater: u8 = 0;
+    unsafe {
+        asm!("cmp {}, 5", "setl {}", "setg {}", in(reg) 3i32, out(reg_byte) less, out(reg_byte) greater);
+    }
+    println!("{} {}", less, greater);
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_cmp_setcc_operands() {
+    run_ok("asm-cmp-setcc", ASM_CMP_SETCC_SRC, "1 0\n");
+}

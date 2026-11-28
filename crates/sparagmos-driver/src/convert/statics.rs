@@ -262,7 +262,7 @@ impl Converter {
 /// tables live in core, so a foreign crate that fails
 /// enumeration loses nothing this pass exists to record —
 /// and one unenumerable crate must not abort the conversion.
-fn crate_statics(krate: &rustc_public::Crate) -> Vec<mir::mono::StaticDef> {
+pub(crate) fn crate_statics(krate: &rustc_public::Crate) -> Vec<mir::mono::StaticDef> {
     scan_question(|| krate.statics()).unwrap_or_default()
 }
 

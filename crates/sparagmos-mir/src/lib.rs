@@ -37,7 +37,7 @@ pub use statement::{
 };
 pub use terminator::{
     arch_reg_index, arch_reg_named, inline_asm_is_noop, inline_asm_program, ArchReg, AsmAbi,
-    AsmBinOp, AsmCallSig, AsmDst, AsmOperandKind, AsmProgram, AsmScalar, AsmSrc, AsmStep, AsmUnOp,
+    AsmBinOp, AsmCallSig, AsmCond, AsmDst, AsmOperandKind, AsmProgram, AsmScalar, AsmSrc, AsmStep, AsmUnOp,
     AssertMessage, BasicBlock, CallSource, CoroutineKind, InlineAsmOperand, SwitchTargets,
     TerminateKind, Terminator, TerminatorKind, UnwindAction, UnwindTerminateReason,
 };

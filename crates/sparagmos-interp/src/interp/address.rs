@@ -2131,7 +2131,7 @@ impl<'a> Interpreter<'a> {
     /// region, so distinct statics — zero-sized ones
     /// included — never share an address, and none lands on
     /// the dangling address its alignment would name.
-    fn static_price(&self, name: &str) -> u128 {
+    pub(crate) fn static_price(&self, name: &str) -> u128 {
         if let Some(p) = self.static_prices.borrow().get(name) {
             return *p;
         }
