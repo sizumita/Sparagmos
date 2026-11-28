@@ -2931,6 +2931,8 @@ fn asm_op(
         static_name: None,
         label_index: None,
         call_sig: None,
+        fn_call_sig: None,
+        static_key: None,
     }
 }
 
@@ -3252,6 +3254,8 @@ fn asm_op_named(
         static_name: None,
         label_index: None,
         call_sig: None,
+        fn_call_sig: None,
+        static_key: None,
     }
 }
 

@@ -193,6 +193,23 @@ pub struct InlineAsmOperand {
     /// modelled register-passing ABI: the signature a `call`
     /// step executes through. `None` for every other operand.
     pub call_sig: Option<AsmCallSig>,
+    /// For an `In` operand whose value is a function pointer (or
+    /// a function item) with a fully scalar register-passing
+    /// signature: the signature *shape* a `call` step through the
+    /// register executes through. Unlike [`Self::call_sig`] it
+    /// carries no callee name (the name field is empty): the
+    /// callee is the operand's runtime value, which the executor
+    /// resolves when the step runs. `None` for every other
+    /// operand.
+    pub fn_call_sig: Option<AsmCallSig>,
+    /// For a [`AsmOperandKind::Sym`] operand denoting a static:
+    /// the static's display name as the driver read it from the
+    /// operand. A `lea` step that materializes the static's
+    /// address carries this name; the interpreter resolves it
+    /// to its static key (whose disambiguating suffix only
+    /// conversion knows). `None` for sym operands denoting
+    /// functions and for every other kind.
+    pub static_key: Option<String>,
 }
 
 /// The register-passing ABI family of an [`AsmCallSig`].
@@ -255,31 +272,17 @@ pub struct ArchReg {
 
 /// The register-file index of the architectural register an
 /// explicit-register operand's raw name denotes (`ax`, `di`,
-/// `r8`, `xmm0`): the raw name is the register's identity at its
-/// 16-bit base form (or the r8..r15 / xmm forms) — the operand's
-/// own `width` field gives the access size. `None` for registers
+/// `r8`, `xmm0`): the raw name is the register's identity at
+/// whatever width the source spelled it — the operand's own
+/// `width` field gives the access size. `None` for registers
 /// the register file does not model (mask, MMX, x87, ...): an
 /// operand naming one can only be an inert clobber.
 pub fn arch_reg_index(name: &str) -> Option<u8> {
-    const GP: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
-    if let Some(i) = GP.iter().position(|&n| n == name) {
-        return Some(i as u8);
-    }
-    if let Some(rest) = name.strip_prefix('r') {
-        if let Ok(n) = rest.parse::<u8>() {
-            if (8..=15).contains(&n) {
-                return Some(n);
-            }
-        }
-    }
-    if let Some(rest) = name.strip_prefix("xmm") {
-        if let Ok(n) = rest.parse::<u8>() {
-            if n < 32 {
-                return Some(16 + n);
-            }
-        }
-    }
-    None
+    // The raw representation names the register at the width
+    // the source spelled it (`al`, `ax`, `eax`, `rax` are all
+    // register 0): any width spelling identifies the register,
+    // and the operand's own `width` field gives the access size.
+    arch_reg_named(name).map(|reg| reg.index)
 }
 
 /// An architectural register as named literally in a template
@@ -561,6 +564,44 @@ pub enum AsmUnOp {
     Dec,
 }
 
+/// A condition code a `setcc` instruction tests, over the flag
+/// state a preceding `test` / `cmp` (or arithmetic) step left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsmCond {
+    /// Equal / zero (`sete` / `setz`): ZF = 1.
+    E,
+    /// Not equal / not zero (`setne` / `setnz`): ZF = 0.
+    Ne,
+    /// Below / carry (`setb` / `setc` / `setnae`): CF = 1.
+    B,
+    /// Above or equal / no carry (`setae` / `setnb` / `setnc`): CF = 0.
+    Ae,
+    /// Less (`setl` / `setnge`): SF != OF.
+    L,
+    /// Greater or equal (`setge` / `setnl`): SF = OF.
+    Ge,
+    /// Less or equal (`setle` / `setng`): ZF = 1 or SF != OF.
+    Le,
+    /// Greater (`setg` / `setnle`): ZF = 0 and SF = OF.
+    G,
+    /// Above (`seta` / `setnbe`): CF = 0 and ZF = 0.
+    A,
+    /// Below or equal (`setbe` / `setna`): CF = 1 or ZF = 1.
+    Be,
+    /// Sign (`sets`): SF = 1.
+    S,
+    /// No sign (`setns`): SF = 0.
+    Ns,
+    /// Overflow (`seto`): OF = 1.
+    O,
+    /// No overflow (`setno`): OF = 0.
+    No,
+    /// Parity (`setp` / `setpe`): PF = 1.
+    P,
+    /// No parity (`setnp` / `setpo`): PF = 0.
+    Np,
+}
+
 /// One instruction of a classified asm program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AsmStep {
@@ -623,6 +664,50 @@ pub enum AsmStep {
     /// back into the file.
     Call {
         sig: AsmCallSig,
+    },
+    /// A `call` through a register operand holding a function
+    /// pointer: the callee's name is the operand's runtime
+    /// value; `sig` is the signature *shape* the driver resolved
+    /// from the operand's function-pointer type (its `name`
+    /// field is empty and is replaced by the runtime callee at
+    /// execution time).
+    CallReg {
+        idx: usize,
+        sig: AsmCallSig,
+    },
+    /// A `test` instruction: compute the flag state from
+    /// `left & src` at the width of `left`. Neither operand is
+    /// written.
+    Test {
+        left: AsmSrc,
+        src: AsmSrc,
+    },
+    /// A `cmp` instruction: compute the flag state from
+    /// `left - src` at the width of `left`. Neither operand is
+    /// written.
+    Cmp {
+        left: AsmSrc,
+        src: AsmSrc,
+    },
+    /// A `setcc` instruction: write the byte 1 to the
+    /// destination when the condition holds over the current
+    /// flag state, 0 otherwise. Only the destination's low byte
+    /// is written.
+    SetCc {
+        cond: AsmCond,
+        dst: AsmDst,
+    },
+    /// A `lea` that materializes the address of the static a
+    /// `sym` operand denotes (the `[rip + {sym}]` form): the
+    /// destination receives the static's address under the
+    /// interpreter's address pricing for its program key.
+    LeaSym {
+        dst: AsmDst,
+        /// The static's display name as the driver read it from
+        /// the operand; the executor resolves it to the
+        /// program's static key (which adds a disambiguating
+        /// suffix when several definitions share the name).
+        static_name: String,
     },
     Ret,
 }
@@ -954,11 +1039,15 @@ fn asm_src(token: &str, operands: &[InlineAsmOperand]) -> Option<AsmSrc> {
         }
         // A label or sym operand is not a value source: labels
         // are jump targets and syms are call targets, each read
-        // by its own instruction arm.
+        // by its own instruction arm. A function-pointer operand
+        // is not a value source either: its slot carries no bits
+        // (the executor resolves the callee by name), so only a
+        // `call` step may consume it.
         if matches!(
             operands[idx].kind,
             AsmOperandKind::Label | AsmOperandKind::Sym
-        ) {
+        ) || operands[idx].fn_call_sig.is_some()
+        {
             return None;
         }
         return Some(AsmSrc::Reg(idx, modifier));
@@ -1192,6 +1281,48 @@ fn asm_step(
             if args.len() != 2 {
                 return None;
             }
+            // The `[rip + {sym}]` form: the destination receives
+            // the address of the static the sym operand denotes.
+            // The bracket holds exactly the `rip` term and the
+            // sym placeholder, in either order, joined by `+`.
+            {
+                let inner = args[1].trim().strip_prefix('[').and_then(|t| t.strip_suffix(']'));
+                if let Some(inner) = inner {
+                    let terms: Vec<&str> = inner.split('+').map(str::trim).collect();
+                    if terms.len() == 2 {
+                        let sym_idx = if terms[0] == "rip" {
+                            asm_placeholder_idx(terms[1])
+                        } else if terms[1] == "rip" {
+                            asm_placeholder_idx(terms[0])
+                        } else {
+                            None
+                        };
+                        if let Some(idx) = sym_idx {
+                            let op = operands.get(idx)?;
+                            if op.kind == AsmOperandKind::Sym {
+                                let key = op.static_key.clone()?;
+                                return match asm_src(args[0], operands)? {
+                                    AsmSrc::Reg(didx, dmod) => {
+                                        if !asm_writable(operands, &AsmSrc::Reg(didx, dmod)) {
+                                            None
+                                        } else {
+                                            Some(AsmStep::LeaSym {
+                                                dst: AsmDst::Operand(didx, dmod),
+                                                static_name: key,
+                                            })
+                                        }
+                                    }
+                                    AsmSrc::Arch(reg) => Some(AsmStep::LeaSym {
+                                        dst: AsmDst::Arch(reg),
+                                        static_name: key,
+                                    }),
+                                    AsmSrc::Imm(_) => None,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             let (base, disp) = asm_lea_base(args[1], operands)?;
             match asm_src(args[0], operands)? {
                 AsmSrc::Reg(didx, dmod) => {
@@ -1230,11 +1361,73 @@ fn asm_step(
             }
             let idx = asm_placeholder_idx(args[0])?;
             let op = operands.get(idx)?;
-            if op.kind != AsmOperandKind::Sym {
+            if op.kind == AsmOperandKind::Sym {
+                let sig = op.call_sig.clone()?;
+                return Some(AsmStep::Call { sig });
+            }
+            // A call through a register operand holding a
+            // function pointer: the signature shape comes from
+            // the operand's type; the callee is its runtime
+            // value.
+            if matches!(op.kind, AsmOperandKind::In | AsmOperandKind::InOut) {
+                let sig = op.fn_call_sig.clone()?;
+                return Some(AsmStep::CallReg { idx, sig });
+            }
+            None
+        }
+        "test" | "cmp" => {
+            let (left, src) = dst_src(&args)?;
+            // The left operand is read, never written, and must
+            // be a register form (an immediate has no width to
+            // test at and no flags are defined for it).
+            if matches!(left, AsmSrc::Imm(_)) {
                 return None;
             }
-            let sig = op.call_sig.clone()?;
-            Some(AsmStep::Call { sig })
+            if mnemonic == "test" {
+                Some(AsmStep::Test { left, src })
+            } else {
+                Some(AsmStep::Cmp { left, src })
+            }
+        }
+        _ if mnemonic.starts_with("set") => {
+            if args.len() != 1 {
+                return None;
+            }
+            let cond = match mnemonic.as_str() {
+                "sete" | "setz" => AsmCond::E,
+                "setne" | "setnz" => AsmCond::Ne,
+                "setb" | "setc" | "setnae" => AsmCond::B,
+                "setae" | "setnb" | "setnc" => AsmCond::Ae,
+                "setl" | "setnge" => AsmCond::L,
+                "setge" | "setnl" => AsmCond::Ge,
+                "setle" | "setng" => AsmCond::Le,
+                "setg" | "setnle" => AsmCond::G,
+                "seta" | "setnbe" => AsmCond::A,
+                "setbe" | "setna" => AsmCond::Be,
+                "sets" => AsmCond::S,
+                "setns" => AsmCond::Ns,
+                "seto" => AsmCond::O,
+                "setno" => AsmCond::No,
+                "setp" | "setpe" => AsmCond::P,
+                "setnp" | "setpo" => AsmCond::Np,
+                _ => return None,
+            };
+            match asm_src(args[0], operands)? {
+                AsmSrc::Reg(didx, dmod) => {
+                    if !asm_writable(operands, &AsmSrc::Reg(didx, dmod)) {
+                        return None;
+                    }
+                    Some(AsmStep::SetCc {
+                        cond,
+                        dst: AsmDst::Operand(didx, dmod),
+                    })
+                }
+                AsmSrc::Arch(reg) => Some(AsmStep::SetCc {
+                    cond,
+                    dst: AsmDst::Arch(reg),
+                }),
+                AsmSrc::Imm(_) => None,
+            }
         }
         _ => None,
     }
@@ -1246,19 +1439,25 @@ fn asm_step(
 /// * the template, comments removed, is a straight-line sequence
 ///   of `mov` / `movd` / `movq` / `add` / `sub` / `and` / `or` /
 ///   `xor` / `shl` / `shr` / `sar` / `neg` / `not` / `inc` / `dec`
-///   / `nop` instructions whose operands are template
-///   placeholders, integer immediates and literal architectural
-///   register names, plus the three control forms below — no
-///   memory references but the `lea` bracket form (address
-///   arithmetic over one register and a displacement); or the
-///   template holds no real instructions at all (empty,
-///   comment-only or `nop`-only: the step-over class, where the
-///   operands are inert and never inspected);
+///   / `test` / `cmp` / `setcc` / `nop` instructions whose
+///   operands are template placeholders, integer immediates and
+///   literal architectural register names, plus the control
+///   forms below — no memory references but the `lea` bracket
+///   forms (address arithmetic over one register and a
+///   displacement, or the address of a `sym` static in the
+///   `[rip + {sym}]` form); or the template holds no real
+///   instructions at all (empty, comment-only or `nop`-only:
+///   the step-over class, where the operands are inert and
+///   never inspected);
 /// * a `lea` computes an address from one register operand and
-///   a signed displacement; a `jmp` to a label operand (whose
-///   blocks the driver restored into `targets`) may appear as
-///   the program's last step; a `call` to a `sym` operand with
-///   a resolved [`AsmCallSig`] may appear anywhere;
+///   a signed displacement, or materializes a `sym` static's
+///   address; a `jmp` to a label operand (whose blocks the
+///   driver restored into `targets`) may appear as the
+///   program's last step; a `call` to a `sym` operand with a
+///   resolved [`AsmCallSig`], or through a register operand
+///   holding a function pointer with a resolved signature
+///   shape, may appear anywhere; a `test` / `cmp` step leaves
+///   a flag state a later `setcc` step reads;
 /// * every operand of a non-empty program is a register-class
 ///   or explicit-register integer operand of width 8, 16, 32 or
 ///   64, a constant with known bits, a `sym` operand, or a label
@@ -1329,6 +1528,13 @@ pub fn inline_asm_program(
                 }
             }
             AsmOperandKind::In | AsmOperandKind::Out | AsmOperandKind::InOut => {
+                if op.fn_call_sig.is_some() {
+                    // A function-pointer operand: consumed only
+                    // by a `call` step (the parser gives it no
+                    // value-source use), so its slot carries no
+                    // integer width to gate.
+                    continue;
+                }
                 if op.kind == AsmOperandKind::Out && op.out_place.is_none() {
                     // A pure clobber (a `clobber_abi` expansion):
                     // inert whatever register it names.
@@ -1655,6 +1861,8 @@ mod tests {
             static_name: None,
             label_index: None,
             call_sig: None,
+            fn_call_sig: None,
+            static_key: None,
         }
     }
 
@@ -1764,6 +1972,113 @@ mod tests {
             inline_asm_program("mov {0}, {1}", "", &[asm_op(Out, 32), bad], &[], true)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn inline_asm_program_test_setcc_and_cmp() {
+        use AsmOperandKind::*;
+        // The naked `is_even` shape: test a literal register and
+        // set a byte from the flags, then return.
+        let prog = inline_asm_program("test al, 1\nsete al\nret", "", &[], &[], false)
+            .expect("test/sete program is in the class");
+        assert!(prog.returns);
+        assert_eq!(
+            prog.steps,
+            vec![
+                AsmStep::Test {
+                    left: AsmSrc::Arch(ArchReg {
+                        index: 0,
+                        width: 8,
+                        high: false,
+                    }),
+                    src: AsmSrc::Imm(1),
+                },
+                AsmStep::SetCc {
+                    cond: AsmCond::E,
+                    dst: AsmDst::Arch(ArchReg {
+                        index: 0,
+                        width: 8,
+                        high: false,
+                    }),
+                },
+                AsmStep::Ret,
+            ]
+        );
+        // cmp against an immediate, setcc into an operand slot.
+        let mut out = asm_op(InOut, 8);
+        out.out_place = Some(Place::from_local(crate::Local(2)));
+        let prog = inline_asm_program(
+            "cmp {0}, 5\nsetl {1}",
+            "",
+            &[asm_op(In, 32), out],
+            &[],
+            true,
+        )
+        .expect("cmp/setl program is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![
+                AsmStep::Cmp {
+                    left: AsmSrc::Reg(0, None),
+                    src: AsmSrc::Imm(5),
+                },
+                AsmStep::SetCc {
+                    cond: AsmCond::L,
+                    dst: AsmDst::Operand(1, None),
+                },
+            ]
+        );
+        // An unknown setcc spelling and a memory-form test stay out.
+        assert!(inline_asm_program("test al, 1\nsetzz al\nret", "", &[], &[], false).is_none());
+        assert!(inline_asm_program("test {}, 1", "", &[asm_op(In, 32)], &[], true).is_some());
+    }
+
+    #[test]
+    fn inline_asm_program_call_reg_and_lea_sym() {
+        use AsmOperandKind::*;
+        // A call through a function-pointer register operand.
+        let shape = AsmCallSig {
+            name: String::new(),
+            abi: AsmAbi::SysV64,
+            params: vec![],
+            ret: None,
+        };
+        let mut fp = asm_op(In, 64);
+        fp.fn_call_sig = Some(shape.clone());
+        let prog = inline_asm_program("call {0}", "", &[fp], &[], true)
+            .expect("call-through-register program is in the class");
+        assert_eq!(prog.steps, vec![AsmStep::CallReg { idx: 0, sig: shape }]);
+        // The same operand read as a value stays out.
+        let mut fp2 = asm_op(In, 64);
+        fp2.fn_call_sig = Some(AsmCallSig {
+            name: String::new(),
+            abi: AsmAbi::SysV64,
+            params: vec![],
+            ret: None,
+        });
+        assert!(inline_asm_program("mov {0}, {1}", "", &[asm_op(Out, 64), fp2], &[], true).is_none());
+        // A rip-relative lea of a static's address.
+        let mut sym = asm_op(Sym, 0);
+        sym.reg_class = false;
+        sym.static_name = Some("S1".to_string());
+        sym.static_key = Some("test::S1".to_string());
+        let mut out = asm_op(Out, 64);
+        out.out_place = Some(Place::from_local(crate::Local(2)));
+        let prog = inline_asm_program("lea {0}, [rip + {1}]", "", &[out, sym.clone()], &[], true)
+            .expect("lea-sym program is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::LeaSym {
+                dst: AsmDst::Operand(0, None),
+                static_name: "test::S1".to_string(),
+            }]
+        );
+        // Without a resolved static key the form stays out.
+        let mut unresolved = sym;
+        unresolved.static_key = None;
+        let mut out2 = asm_op(Out, 64);
+        out2.out_place = Some(Place::from_local(crate::Local(2)));
+        assert!(inline_asm_program("lea {0}, [rip + {1}]", "", &[out2, unresolved], &[], true).is_none());
     }
 
     #[test]

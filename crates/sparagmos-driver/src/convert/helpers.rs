@@ -850,9 +850,9 @@ pub(crate) fn borrow_kind(b: &mir::BorrowKind) -> sm::BorrowKind {
 }
 
 /// The width in bits of an inline-asm operand type: a plain
-/// integer type, `bool` (8) or `char` (32). 0 for anything else
-/// (floats, aggregates, pointers), which keeps the terminator
-/// outside the evaluable class. `isize`/`usize` are 64 on the
+/// integer type, `bool` (8), `char` (32) or a raw pointer (64).
+/// 0 for anything else (floats, aggregates), which keeps the
+/// terminator outside the evaluable class. `isize`/`usize` are 64 on the
 /// x86_64 target Sparagmos aims at.
 pub(crate) fn asm_type_width(ty: &Ty) -> u32 {
     match ty.kind() {
@@ -872,6 +872,10 @@ pub(crate) fn asm_type_width(ty: &Ty) -> u32 {
         },
         TyKind::RigidTy(RigidTy::Bool) => 8,
         TyKind::RigidTy(RigidTy::Char) => 32,
+        // A raw pointer occupies a full register: an asm block
+        // may materialize one (a `lea` of a static's address) or
+        // pass one through a register it never dereferences.
+        TyKind::RigidTy(RigidTy::RawPtr(..)) => 64,
         _ => 0,
     }
 }
@@ -888,9 +892,26 @@ pub(crate) fn asm_raw_reg_name(raw: &str) -> Option<String> {
 
 /// The item name of a `Sym` asm operand's raw representation
 /// (`SymFn { value: foo }`, `SymStatic { value: BAR }`).
+/// A static's raw form instead renders its definition id
+/// (`SymStatic { def_id: DefId(0:4 ~ krate[51d6]::BAR) }`):
+/// the name is the path after the `~`, with the crate
+/// segment's `[hash]` disambiguator removed, matching the
+/// path form `fn_defs` / `statics` report.
 pub(crate) fn asm_raw_sym_name(raw: &str) -> Option<String> {
-    let rest = raw.split("value: ").nth(1)?;
-    Some(rest.trim_end_matches('}').trim().to_string())
+    if let Some(rest) = raw.split("value: ").nth(1) {
+        return Some(rest.trim_end_matches('}').trim().to_string());
+    }
+    let inner = raw
+        .split("~ ")
+        .nth(1)?
+        .trim()
+        .trim_end_matches('}')
+        .trim()
+        .trim_end_matches(')')
+        .trim();
+    let (krate, rest) = inner.split_once("::")?;
+    let krate = krate.split('[').next()?;
+    Some(format!("{krate}::{rest}"))
 }
 
 /// The target index of a `Label` asm operand's raw

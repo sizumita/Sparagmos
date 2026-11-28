@@ -3661,9 +3661,18 @@ impl<'a> Converter<'a> {
                                     // register as its result, so a
                                     // return type with no scalar
                                     // shape keeps it outside the
-                                    // class. A bare-`ret` body with
-                                    // a unit return needs no shape.
-                                    if !bare_ret {
+                                    // class. A unit return needs no
+                                    // shape either: the body's
+                                    // result, if any, travels in
+                                    // its outgoing register file
+                                    // (the `extern "custom"` shape,
+                                    // whose callers read the
+                                    // registers directly).
+                                    let unit_ret = matches!(
+                                        body.local_decls.first().map(|d| &d.ty),
+                                        Some(mir::Ty::Tuple(ts)) if ts.is_empty()
+                                    );
+                                    if !bare_ret && !unit_ret {
                                         shape_ok = false;
                                     }
                                 }

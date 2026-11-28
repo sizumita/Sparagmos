@@ -1519,6 +1519,14 @@ impl Conv {
                 },
                 None => None,
             },
+            fn_call_sig: match f.iter().find(|(name, _)| name == "fn_call_sig") {
+                Some((_, v)) => match as_opt(v)? {
+                    Some(x) => Some(Self::asm_call_sig(x)?),
+                    None => None,
+                },
+                None => None,
+            },
+            static_key: Self::opt_string(f, "static_key")?,
         })
     }
 
