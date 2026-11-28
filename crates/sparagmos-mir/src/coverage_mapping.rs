@@ -88,6 +88,17 @@ pub struct CovFunction {
     /// The coverage-run report includes such records; the
     /// coverage-map dump of this crate's IR does not.
     pub binary_only: bool,
+    /// Whether this record is the home-crate copy of a split
+    /// record pair: the instance was monomorphised both by its
+    /// home crate and by another crate in the same binary, so
+    /// the native coverage mapping carries two records for it
+    /// (same symbol, one per codegen), and llvm-cov renders one
+    /// instantiation subview per record. The copy is
+    /// binary-only (the home crate emitted it, not this one);
+    /// the interpreter counts an execution into this copy when
+    /// the coverage statement runs in a home-crate context, and
+    /// into the pair's other record otherwise.
+    pub split_home_copy: bool,
     /// The program keys of the converted bodies whose execution
     /// feeds this record's counters (an instance can be
     /// converted under more than one key; executing any of them

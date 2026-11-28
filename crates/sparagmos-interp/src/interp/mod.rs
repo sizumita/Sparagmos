@@ -515,6 +515,14 @@ pub struct Interpreter<'a> {
     /// no coverage table.
     coverage_counts: std::cell::RefCell<Vec<Vec<u64>>>,
     coverage_by_body: std::collections::HashMap<String, usize>,
+    /// Split coverage record pairs: for an instance the native
+    /// mapping carries two records for (one per crate that
+    /// monomorphised it), maps either member's index to
+    /// `(away, home)` -- the record counting executions outside
+    /// the instance's home crate, and the home-crate copy
+    /// counting executions in a home-crate context.
+    coverage_split_pairs:
+        std::collections::HashMap<usize, (usize, usize)>,
     next_frame_id: u64,
     /// Buffers of abstract strings created by
     /// `String::with_capacity` under a guest allocator, keyed by
@@ -1709,6 +1717,36 @@ impl<'a> Interpreter<'a> {
                     f.body_names.iter().map(move |name| (name.clone(), i))
                 })
                 .collect(),
+            coverage_split_pairs: {
+                let mut by_symbol: std::collections::HashMap<
+                    &str,
+                    Vec<usize>,
+                > = std::collections::HashMap::new();
+                for (i, f) in program.coverage.functions.iter().enumerate() {
+                    by_symbol.entry(f.symbol.as_str()).or_default().push(i);
+                }
+                let mut pairs = std::collections::HashMap::new();
+                for members in by_symbol.values() {
+                    if members.len() != 2 {
+                        continue;
+                    }
+                    let (a, b) = (members[0], members[1]);
+                    let (fa, fb) = (
+                        &program.coverage.functions[a],
+                        &program.coverage.functions[b],
+                    );
+                    let (away, home) = if fa.split_home_copy && !fb.split_home_copy {
+                        (b, a)
+                    } else if fb.split_home_copy && !fa.split_home_copy {
+                        (a, b)
+                    } else {
+                        continue;
+                    };
+                    pairs.insert(a, (away, home));
+                    pairs.insert(b, (away, home));
+                }
+                pairs
+            },
             next_frame_id: 0,
             string_buffers: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
