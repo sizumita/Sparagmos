@@ -89,7 +89,12 @@ impl<'a> Interpreter<'a> {
             process_spawn_request(state, output_captured, files, self.child_sigpipe());
         match host.0.run(request) {
             Ok(outcome) => {
-                self.close_wired_stdin(state);
+                // The stderr entry is not closed here: a
+                // self-child's stderr reaches the guest by
+                // collection, and the caller still writes the
+                // collected bytes into the file the entry
+                // names (see `close_wired_stdio`).
+                self.close_wired_stdio(state, false);
                 Ok(Some(Ok(crate::interp::ToolRunOutcome {
                     exit_code: outcome.exit_code,
                     stdout: outcome.stdout,
@@ -166,7 +171,16 @@ impl<'a> Interpreter<'a> {
             process_spawn_request(state, false, files, self.child_sigpipe());
         match host.0.spawn(request) {
             Ok(spawned) => {
-                self.close_wired_stdin(state);
+                // A spawned stderr the host handed back is a
+                // collected stream (a self-child's channel):
+                // the entry its configuration names must
+                // survive until the child's collected bytes
+                // are written into it at wait time. A wired
+                // stderr the host kept no stream for was
+                // dup'd straight into the child, so its
+                // entry closes with the rest.
+                let stderr_direct = spawned.stderr.is_none();
+                self.close_wired_stdio(state, stderr_direct);
                 // The child's pipe ends join the file table;
                 // the guest's `Child` value carries a handle
                 // value for each stream it configured piped
@@ -260,23 +274,68 @@ impl<'a> Interpreter<'a> {
         Ok(files)
     }
 
-    /// Close the file-table entry a command's stdin
-    /// configuration named, once a spawn has taken the
-    /// wiring: the child holds its own duplicate of the
+    /// Close the file-table entries a command's stdio
+    /// configurations named, once a spawn has taken the
+    /// wiring: the child holds its own duplicate of each
     /// descriptor, and the builder's `Stdio` -- the
     /// parent-side owner, whose drop the model does not
-    /// observe -- must not keep the parent's end open. This
-    /// is what delivers EPIPE to a producer whose stdout
-    /// handle the guest handed to a consumer's stdin: once
-    /// the consumer is spawned and later exits, no reader
-    /// remains and the producer's writes meet a broken
-    /// pipe, as they do natively once the builder is gone.
-    fn close_wired_stdin(&self, state: &crate::interp::CommandState) {
-        if let Some(crate::interp::StdioConfig::File(id)) =
-            state.stdin_stdio
+    /// observe -- must not keep the parent's end open. For
+    /// the stdin wiring this is what delivers EPIPE to a
+    /// producer whose stdout handle the guest handed to a
+    /// consumer's stdin: once the consumer is spawned and
+    /// later exits, no reader remains and the producer's
+    /// writes meet a broken pipe, as they do natively once
+    /// the builder is gone. The stdout and stderr wirings
+    /// carry the symmetric obligation in the other
+    /// direction: a taken `ChildStdin` handed to a second
+    /// child's stdout is the only writer end of the first
+    /// child's stdin pipe once that child is spawned, so
+    /// a parent copy left open keeps the first child from
+    /// ever observing end-of-file on its stdin -- it reads
+    /// forever and the guest's wait on it never returns
+    /// (the pipe chain of `tests/ui/std/stdio-from.rs`
+    /// deadlocked this way). The stderr wiring is the one
+    /// exception, at the caller's direction
+    /// (`close_stderr`): a self-child's stderr is not
+    /// wired into the child but collected by the host and
+    /// written into the named file by the model once the
+    /// child's end is observed, so that entry must outlive
+    /// the spawn (and a run-to-completion) that started
+    /// the child.
+    fn close_wired_stdio(
+        &self,
+        state: &crate::interp::CommandState,
+        close_stderr: bool,
+    ) {
+        for (slot, config) in [
+            state.stdin_stdio,
+            state.stdout_stdio,
+            state.stderr_stdio,
+        ]
+        .into_iter()
+        .enumerate()
         {
-            if let Some(entry) = self.desc_entry_id(id) {
-                self.file_handle_closed(entry);
+            if slot == 2 && !close_stderr {
+                continue;
+            }
+            if let Some(crate::interp::StdioConfig::File(id)) = config {
+                if let Some(entry) = self.desc_entry_id(id) {
+                    // The stdin wiring closes whatever it
+                    // names, as it always has. The stdout
+                    // and stderr wirings close only a child
+                    // pipe end: a file or descriptor the
+                    // guest itself opened or numbered stays
+                    // the guest's to close (it may name the
+                    // descriptor again -- a `close` of the
+                    // number, a `dup2` restore -- where a
+                    // taken child pipe handle has no guest
+                    // lifetime left at all: its owner was
+                    // the builder's `Stdio`, and this close
+                    // is that owner's drop).
+                    if slot == 0 || self.is_child_stream_file(entry) {
+                        self.file_handle_closed(entry);
+                    }
+                }
             }
         }
     }

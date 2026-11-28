@@ -553,6 +553,20 @@ impl<'a> Interpreter<'a> {
         children.get_mut(&id).map(f)
     }
 
+    /// Whether the file-table entry `entry` is one of a
+    /// live child's own stream ends (the ends a spawned
+    /// child's piped streams registered): the ends whose
+    /// guest handles are child pipe handles (`ChildStdin`
+    /// and kin), as opposed to files and descriptors the
+    /// guest itself opened or numbered.
+    pub(crate) fn is_child_stream_file(&self, entry: u64) -> bool {
+        self.children.borrow().values().any(|child| {
+            child.stdin_file == Some(entry)
+                || child.stdout_file == Some(entry)
+                || child.stderr_file == Some(entry)
+        })
+    }
+
     /// Forget the child with the given id (its outcome was
     /// collected, or the guest dropped the handle).
     pub(crate) fn remove_child(&self, id: u64) -> Option<ChildState> {
