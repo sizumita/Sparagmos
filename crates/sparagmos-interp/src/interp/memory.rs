@@ -1891,6 +1891,94 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Materialise, in the slot itself, the storage a
+    /// string's raw parts denote, when the slot holds the
+    /// abstract string form: a fresh allocation holding the
+    /// text's bytes, wrapped in the real aggregate form (the
+    /// `[RawVec, len]` vector inside the one-field string
+    /// wrapper) a converted body builds field by field.
+    ///
+    /// The slot a `Vec::reserve` on a string's vector place
+    /// denotes is the string place's own slot (the wrapper
+    /// chain makes the two the same storage), and `reserve`
+    /// is the first step of the body-level raw-parts walks
+    /// -- the collected `Vec::append_elements` an inlined
+    /// `push_str` reaches, above all: it reads the buffer
+    /// pointer out of the aggregate, offsets it, writes the
+    /// new bytes through it and stores the advanced length
+    /// back. The abstract form has no buffer to point at:
+    /// the field-chain read returns the string itself and
+    /// the pointer offset is refused. A string reaches that
+    /// walk in the abstract form whenever a modelled mutator
+    /// rewrote it (a `String::push` the model serves stores
+    /// the text back as a plain string) or it was born
+    /// abstract (the `format!` result). Rewriting the slot
+    /// at the walk's own entry binds the data pointer to
+    /// the place; a slot holding any other form is left
+    /// exactly as it stands.
+    pub(crate) fn materialise_string_slot(&self, slot: &mut Value) {
+        if let Value::Str(text) = slot {
+            let bytes: Vec<Value> = text
+                .bytes()
+                .map(|b| Value::Uint(u128::from(b)))
+                .collect();
+            let len = bytes.len();
+            let id = self.alloc_insert(Value::Tuple(bytes));
+            self.mark_elem_block(id);
+            self.record_alloc_layout(id, len as u64, 1);
+            let ptr = Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            });
+            *slot = Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        crate::builtins::raw_vec_value(ptr, len),
+                        Value::Uint(len as u128),
+                    ],
+                }],
+            };
+        }
+    }
+
+    /// The vector slot a body-level raw-parts walk over a
+    /// string operates on, given the slot its `Vec::reserve`
+    /// resolved: a slot holding the abstract string form is
+    /// materialised first (see `materialise_string_slot`),
+    /// and the walk's slot is the vector field inside the
+    /// materialised wrapper -- the navigation that resolved
+    /// the walk's target could not descend past the abstract
+    /// form, so it lent the string's own slot, while a walk
+    /// over an already-aggregate string resolves to the
+    /// vector field directly and is lent that slot as it
+    /// stands.
+    pub(crate) fn raw_parts_vec_slot<'x>(
+        &self,
+        slot: &'x mut Value,
+    ) -> &'x mut Value {
+        if !matches!(slot, Value::Str(_)) {
+            return slot;
+        }
+        self.materialise_string_slot(slot);
+        // The materialised value is the one-field string
+        // wrapper by construction: the walk's slot is the
+        // vector field inside it.
+        let has_field = matches!(
+            &*slot,
+            Value::Enum { fields, .. } if !fields.is_empty()
+        );
+        if has_field {
+            let Value::Enum { fields, .. } = &mut *slot else {
+                unreachable!("field presence checked above")
+            };
+            &mut fields[0]
+        } else {
+            slot
+        }
+    }
+
     pub(crate) fn ptr_first_elem_value(
         &self,
         frames: &[Frame],
