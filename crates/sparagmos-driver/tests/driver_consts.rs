@@ -527,3 +527,113 @@ fn f128_constant_runs() {
     // through f64.
     run_ok("f128_const", F128_CONST_RS);
 }
+
+// ----- Target pointer width in allocated constants -------------
+
+/// Convert a fixture for a foreign `target` in summary mode.
+/// `None` when the target is not installed in the toolchain
+/// this test runs against (its conversion cannot be judged
+/// there), so the caller skips instead of failing.
+fn convert_with_target(name: &str, src: &str, target: &str) -> Option<String> {
+    let fixture = write_fixture(name, src);
+    let (stdout, stderr, status) = run_driver(
+        &["--rustc-arg", "--target", "--rustc-arg", target],
+        &fixture,
+    );
+    if !status.success()
+        || stdout.contains("compilation failed")
+        || stderr.contains("can't find crate")
+    {
+        return None;
+    }
+    Some(stdout)
+}
+
+const STATIC_PTR_RS: &str = "\
+static mut BAR: u32 = 12;
+static mut FOO: fn(&usize, &mut u32) -> Result<(), ()> = bar_fn;
+fn bar_fn(ptr: &usize, _: &mut u32) -> Result<(), ()> { let _ = *ptr; Ok(()) }
+pub fn get_bar() -> u32 { unsafe { BAR } }
+pub fn call_foo() { let mut buf = 7u32; unsafe { FOO(&1, &mut buf); } }
+fn main() { println!(\"{}\", get_bar()); call_foo(); }
+";
+
+#[test]
+fn static_pointer_constants_convert_on_32bit_target() {
+    // Reading a `static mut` in MIR goes through a constant of
+    // type `*mut T` naming the static. On a 32-bit target the
+    // allocation stores the pointer in 4 bytes; decoding it at
+    // the host's 8-byte pointer width failed the constant, and
+    // every function touching the static was skipped
+    // (`ConstantKind::Allocated (type ... RawPtr(Uint(U32)))`
+    // and `... RawPtr(FnPtr ...)`).
+    let Some(stdout) = convert_with_target("target_ptr32", STATIC_PTR_RS, "i686-unknown-linux-gnu")
+    else {
+        return;
+    };
+    assert!(
+        stdout.contains("fn target_ptr32::get_bar: blocks="),
+        "get_bar not converted on a 32-bit target:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("fn target_ptr32::call_foo: blocks="),
+        "call_foo not converted on a 32-bit target:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ConstantKind::Allocated"),
+        "allocated constant still unsupported on a 32-bit target:\n{stdout}"
+    );
+}
+
+const FOREIGN_PTR_RS: &str = "\
+unsafe extern \"C\" { safe static VAL: *mut (); }
+pub fn get_class() -> *mut () { VAL }
+fn main() { println!(\"{:?}\", get_class()); }
+";
+
+#[test]
+fn foreign_static_pointer_constant_converts_on_32bit_target() {
+    // Reading a foreign static goes through a constant of type
+    // `*mut *mut ()` naming it: the nested pointer word is
+    // target-sized too, so the same host-width decode failed
+    // it on 32-bit targets.
+    let Some(stdout) =
+        convert_with_target("foreign_ptr32", FOREIGN_PTR_RS, "i686-unknown-linux-gnu")
+    else {
+        return;
+    };
+    assert!(
+        stdout.contains("fn foreign_ptr32::get_class: blocks="),
+        "get_class not converted on a 32-bit target:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ConstantKind::Allocated"),
+        "allocated constant still unsupported on a 32-bit target:\n{stdout}"
+    );
+}
+
+const MDROP_PTR_RS: &str = "\
+use std::mem::ManuallyDrop;
+static mut X: u32 = 3;
+const M: ManuallyDrop<*mut u32> = ManuallyDrop::new(std::ptr::addr_of_mut!(X));
+fn main() { unsafe { println!(\"{}\", **M); } }
+";
+
+#[test]
+fn manually_drop_pointer_constant_converts_on_32bit_target() {
+    // A `ManuallyDrop` wrapping a raw-pointer constant: the
+    // pointer field inside the ADT is a target-sized word, so
+    // the aggregate decode needs the target width as well.
+    let Some(stdout) = convert_with_target("mdrop_ptr32", MDROP_PTR_RS, "i686-unknown-linux-gnu")
+    else {
+        return;
+    };
+    assert!(
+        stdout.contains("fn mdrop_ptr32::main: blocks="),
+        "main not converted on a 32-bit target:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ConstantKind::Allocated"),
+        "allocated constant still unsupported on a 32-bit target:\n{stdout}"
+    );
+}

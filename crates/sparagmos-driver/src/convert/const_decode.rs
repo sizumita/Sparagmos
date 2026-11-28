@@ -441,7 +441,8 @@ impl Converter {
         let Some(target) = self.memory_alloc(prov) else {
             return FatPointerRead::NotFat;
         };
-        let Ok(meta) = alloc.read_partial_uint(8..16) else {
+        let ps = target_ptr_size();
+        let Ok(meta) = alloc.read_partial_uint(ps..2 * ps) else {
             return FatPointerRead::NotFat;
         };
         let meta = meta as u64;
@@ -454,7 +455,7 @@ impl Converter {
         // the middle of its backing allocation), so read only the
         // denoted range rather than copying the whole backing
         // allocation or its prefix.
-        let offset = read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as usize;
+        let offset = read_uint_at(alloc, 0, target_ptr_size()).unwrap_or(0) as usize;
         let Some(range) = offset
             .checked_add(meta as usize)
             .map(|end| offset..end)
@@ -537,7 +538,7 @@ impl Converter {
                     if let Some((_, prov)) = alloc.provenance.ptrs.first() {
                         return sm::ConstValue::ByRef {
                             alloc_id: prov.0.to_index() as u64,
-                            offset: read_uint_at(alloc, 0, PTR_SIZE)
+                            offset: read_uint_at(alloc, 0, target_ptr_size())
                                 .unwrap_or(0) as u64,
                         };
                     }
@@ -555,7 +556,7 @@ impl Converter {
             // prefix, so the plain-pointee shortcuts below read
             // the denoted range instead of the whole allocation.
             let target_off =
-                read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as usize;
+                read_uint_at(alloc, 0, target_ptr_size()).unwrap_or(0) as usize;
             if let Some(pointee) = self.memory_alloc(prov) {
                 let plain = pointee.provenance.ptrs.is_empty();
                 match &inner_kind {
@@ -639,7 +640,7 @@ impl Converter {
             }
             return sm::ConstValue::ByRef {
                 alloc_id,
-                offset: read_uint_at(alloc, 0, PTR_SIZE).unwrap_or(0) as u64,
+                offset: read_uint_at(alloc, 0, target_ptr_size()).unwrap_or(0) as u64,
             };
         }
         // No provenance at all. A fat pointer (a slice reference)
@@ -650,8 +651,8 @@ impl Converter {
         // exactly observable, so it decodes as a `FatPtr`.
         if matches!(&inner_kind, Some(TyKind::RigidTy(RigidTy::Slice(_)))) {
             if let (Ok(addr), Ok(meta)) = (
-                alloc.read_partial_uint(0..PTR_SIZE),
-                alloc.read_partial_uint(PTR_SIZE..2 * PTR_SIZE),
+                alloc.read_partial_uint(0..target_ptr_size()),
+                alloc.read_partial_uint(target_ptr_size()..2 * target_ptr_size()),
             ) {
                 return sm::ConstValue::FatPtr {
                     addr: addr as u64,
@@ -662,7 +663,7 @@ impl Converter {
         // A stored zero word is a null pointer constant. Anything
         // else is an integer-derived address, which has no faithful
         // value form.
-        if alloc.read_partial_uint(0..PTR_SIZE).ok() == Some(0) {
+        if alloc.read_partial_uint(0..target_ptr_size()).ok() == Some(0) {
             return sm::ConstValue::NullPtr;
         }
         self.err(format!(
@@ -1359,7 +1360,7 @@ impl Converter {
                 .iter()
                 .enumerate()
                 .filter(|(i, field)| {
-                    if sizes[*i] != PTR_SIZE {
+                    if sizes[*i] != target_ptr_size() {
                         return false;
                     }
                     // The pointer may sit under single-field
@@ -1932,13 +1933,13 @@ impl Converter {
         }
         let prov = prov_at(alloc, offset);
         let Some(prov) = prov else {
-            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            let addr = read_uint_at(alloc, offset, target_ptr_size())?;
             if addr == 0 {
                 return Some(sm::ConstValue::NullPtr);
             }
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
-        let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
+        let target_off = read_uint_at(alloc, offset, target_ptr_size())? as usize;
         match self.resolve_alloc(prov) {
             ResolvedAlloc::Memory(target) => {
                 let block = self.decode_erased_alloc(&target, target_off, depth + 1)?;

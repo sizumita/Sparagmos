@@ -217,7 +217,8 @@ impl Converter {
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
                     return None;
                 }
-                let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                let count =
+                    read_uint_at(alloc, offset + target_ptr_size(), target_ptr_size())? as usize;
                 // The projection names the slice's backing array
                 // inside the static's declared type (the whole
                 // array, an array field, an array element): an
@@ -339,7 +340,7 @@ impl Converter {
             // pointer, `NonNull::dangling`): only the address
             // is observable, as an address-only reference
             // whose reads are explicit errors (Lane CE).
-            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            let addr = read_uint_at(alloc, offset, target_ptr_size())?;
             if addr == 0 {
                 return Some(sm::ConstValue::NullPtr);
             }
@@ -353,7 +354,7 @@ impl Converter {
                 inner.kind(),
                 TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str)
             ) {
-                let meta = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)?;
+                let meta = read_uint_at(alloc, offset + target_ptr_size(), target_ptr_size())?;
                 return Some(sm::ConstValue::FatPtr {
                     addr: addr as u64,
                     meta: meta as u64,
@@ -361,7 +362,7 @@ impl Converter {
             }
             return Some(sm::ConstValue::IntPtr(addr as u64));
         };
-        let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
+        let target_off = read_uint_at(alloc, offset, target_ptr_size())? as usize;
         let (target, static_def) = match self.resolve_alloc(prov) {
             ResolvedAlloc::Memory(target) => (target, None),
             // A reference to a static: the pointee is the static's
@@ -476,7 +477,8 @@ impl Converter {
                 // length word (the second word at the pointer
                 // slot), as for the slice arm below: the backing
                 // allocation may extend past the string.
-                let len = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                let len =
+                    read_uint_at(alloc, offset + target_ptr_size(), target_ptr_size())? as usize;
                 let bytes = alloc_bytes_in(&target, target_off..target_off + len)?;
                 if !self.spend_const_budget(bytes.len()) {
                     return None;
@@ -484,7 +486,8 @@ impl Converter {
                 String::from_utf8(bytes).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
-                let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                let count =
+                    read_uint_at(alloc, offset + target_ptr_size(), target_ptr_size())? as usize;
                 // A slice reference into a static's storage keeps
                 // the static's identity, as a thin static reference
                 // does: a detached snapshot of the elements would
@@ -748,7 +751,7 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let vtable_prov = prov_at(alloc, offset + PTR_SIZE);
+        let vtable_prov = prov_at(alloc, offset + target_ptr_size());
         let Some(vtable_prov) = vtable_prov else {
             // No vtable provenance: the pointer's dispatch
             // identity is unknowable. A data word that names an
@@ -761,7 +764,7 @@ impl Converter {
             if has_data_prov {
                 return None;
             }
-            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            let addr = read_uint_at(alloc, offset, target_ptr_size())?;
             return Some(if addr == 0 {
                 sm::ConstValue::NullPtr
             } else {
@@ -801,7 +804,7 @@ impl Converter {
         let base = if has_data_prov {
             self.decode_ref(&concrete_ty, alloc, offset, depth + 1)?
         } else {
-            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            let addr = read_uint_at(alloc, offset, target_ptr_size())?;
             if addr == 0 {
                 sm::ConstValue::NullPtr
             } else {
