@@ -2338,7 +2338,32 @@ pub enum Builtin {
     /// as an ordinary program; the true answer exists only
     /// inside a proc-macro expansion, which is compile-time.
     ProcMacroIsAvailable,
-
+    /// The Win32 `SetLastError(err)` of a guest crate's own
+    /// `kernel32` module: record `err` as the run's last-error
+    /// code (see `Win32GetLastError`). Served only for callees
+    /// with no converted body (see [`foreign_helper_lookup`]).
+    Win32SetLastError,
+    /// The Win32 `GetLastError() -> usize`: the code the last
+    /// modelled `SetLastError` recorded, or 0 before any call.
+    Win32GetLastError,
+    /// The Win32 `GetProcessHeap() -> HANDLE`: the handle of
+    /// the run's modelled process heap, named by the heap
+    /// block's synthetic address (the declarations name the
+    /// handle `usize`). The same handle is returned by every
+    /// call in a run.
+    Win32GetProcessHeap,
+    /// The Win32 `HeapAlloc(heap, flags, bytes) -> LPVOID`:
+    /// a fresh block of the modelled process heap, named by
+    /// its synthetic address; `flags & 0x8`
+    /// (`HEAP_ZERO_MEMORY`) zero-fills it, any other flags
+    /// leave it uninitialised. An unknown heap handle or an
+    /// over-large request fails the way the real call does:
+    /// the result is NULL (0).
+    Win32HeapAlloc,
+    /// The Win32 `HeapFree(heap, flags, mem) -> BOOL`: free
+    /// the process-heap block `mem` names; 1 on success, 0
+    /// when `mem` names no live heap block.
+    Win32HeapFree,
 }
 
 /// The `std::sys::fs` leaf operations the interpreter performs

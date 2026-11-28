@@ -17,7 +17,55 @@ use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Val
 
 use super::*;
 
+/// A Win32 word (a handle, a heap pointer, an error code) in
+/// the form the guest's own declaration carries it: an integer
+/// word, or a pointer whose synthetic address is the word.
+/// The kernel32 declarations name these slots `usize`, but a
+/// declaration may equally spell the same slot with a pointer
+/// type, and both forms denote the same word.
+fn win32_word(value: &Value, name: &str) -> InterpResult<u128> {
+    match value {
+        Value::Uint(v) => Ok(*v),
+        Value::Int(v) => Ok(*v as u128),
+        Value::Ref(RefTarget::Null) => Ok(0),
+        other => synthetic_address(other).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "integer or pointer word",
+                other.kind_name(),
+            )
+        }),
+    }
+}
+
 impl<'a> Interpreter<'a> {
+    /// The synthetic address naming this run's modelled
+    /// process heap (see the `win32_process_heap` field): the
+    /// heap block is created on first use, and its address --
+    /// the handle `GetProcessHeap` hands out and `HeapAlloc` /
+    /// `HeapFree` check against -- is stable for the rest of
+    /// the run.
+    pub(crate) fn win32_process_heap_address(&self) -> u128 {
+        let id = {
+            let mut slot = self.win32_process_heap.borrow_mut();
+            match *slot {
+                Some(id) => id,
+                None => {
+                    let id = self.alloc_insert(Value::Tuple(Vec::new()));
+                    self.mark_elem_block(id);
+                    self.record_alloc_layout(id, 0, 16);
+                    *slot = Some(id);
+                    id
+                }
+            }
+        };
+        synthetic_address(&Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        }))
+        .unwrap_or(0)
+    }
+
     /// Execute one `CallBuiltin` terminator. `name` is canonical;
     /// `generic_args` are the callee's rendered generic type tags.
     /// `unique_elem` is the conversion-baked element value of a
@@ -387,6 +435,82 @@ impl<'a> Interpreter<'a> {
             Builtin::FfiGetNullPtr => {
                 arity(0)?;
                 Ok(Value::Ref(RefTarget::Null))
+            }
+            Builtin::Win32SetLastError => {
+                arity(1)?;
+                self.win32_last_error.set(win32_word(&vals[0], name)?);
+                Ok(Value::Unit)
+            }
+            Builtin::Win32GetLastError => {
+                arity(0)?;
+                Ok(Value::Uint(self.win32_last_error.get()))
+            }
+            Builtin::Win32GetProcessHeap => {
+                arity(0)?;
+                Ok(Value::Uint(self.win32_process_heap_address()))
+            }
+            Builtin::Win32HeapAlloc => {
+                arity(3)?;
+                // An unknown heap handle fails the way the
+                // real call does: the result is NULL.
+                if win32_word(&vals[0], name)? != self.win32_process_heap_address() {
+                    return Ok(Value::Uint(0));
+                }
+                let flags = win32_word(&vals[1], name)?;
+                let size = alloc_size_arg(name, &vals[2])?;
+                if size > (1 << 28) {
+                    return Ok(Value::Uint(0));
+                }
+                // HEAP_ZERO_MEMORY (0x0008): the block is
+                // zero-filled; without it the block is
+                // uninitialised, like a `malloc` block.
+                let content = if flags & 0x8 != 0 {
+                    Value::Bytes(vec![0u8; size as usize])
+                } else {
+                    Value::Tuple(Vec::new())
+                };
+                let id = self.alloc_insert(content);
+                self.mark_elem_block(id);
+                self.record_alloc_layout(id, size as u64, 16);
+                let block = Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                });
+                let addr = synthetic_address(&block).ok_or_else(|| {
+                    unsupported(format!(
+                        "call to {name}: the heap block has no address"
+                    ))
+                })?;
+                // The declaration names the block by its
+                // address (an integer pointer type), so the
+                // address is registered as the block's owner:
+                // an integer-to-pointer cast of the returned
+                // word and `HeapFree` both find the block
+                // through it.
+                self.register_address_owner(addr as u64, id);
+                Ok(Value::Uint(addr))
+            }
+            Builtin::Win32HeapFree => {
+                arity(3)?;
+                let freed = match unwrap_wrapper(&vals[2]) {
+                    Value::Ref(RefTarget::Alloc { id, projection })
+                        if self.alloc_ptr_is_base(*id, projection) =>
+                    {
+                        self.free_alloc(*id);
+                        true
+                    }
+                    other => match win32_word(other, name) {
+                        Ok(addr) if addr != 0 => match self.take_address_owner(addr as u64) {
+                            Some(id) => {
+                                self.free_alloc(id);
+                                true
+                            }
+                            None => false,
+                        },
+                        _ => false,
+                    },
+                };
+                Ok(Value::Uint(u128::from(freed)))
             }
             Builtin::FfiStaticMutCheckFour => {
                 arity(0)?;

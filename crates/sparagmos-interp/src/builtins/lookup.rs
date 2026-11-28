@@ -270,7 +270,10 @@ pub fn net_trait_method(canonical: &str) -> Option<Builtin> {
 /// fixed outside the guest program: the C helpers of
 /// `rust_test_helpers` (the static library the rustc UI tests
 /// link for ABI checks; its source ships in the tree at
-/// `tests/auxiliary/rust_test_helpers.c`) and
+/// `tests/auxiliary/rust_test_helpers.c`), the Win32
+/// `kernel32` last-error and process-heap functions (whose
+/// semantics are the documented Win32 ones, modelled over
+/// the interpreter's own allocation store), and
 /// `proc_macro::is_available`.
 ///
 /// These names are deliberately absent from [`lookup`]: the
@@ -373,6 +376,17 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
         "rust_dbg_unpack_option_u64" | "rust_dbg_unpack_option_u64u64" => {
             Builtin::FfiUnpackOption
         }
+        // The Win32 kernel32 functions the guest declares in
+        // its own `kernel32` module (the `extern "system"`
+        // shape of the x86 stdcall ABI tests): the last-error
+        // pair and the process-heap family, modelled with
+        // their documented semantics (see the `Builtin`
+        // variants).
+        "SetLastError" => Builtin::Win32SetLastError,
+        "GetLastError" => Builtin::Win32GetLastError,
+        "GetProcessHeap" => Builtin::Win32GetProcessHeap,
+        "HeapAlloc" => Builtin::Win32HeapAlloc,
+        "HeapFree" => Builtin::Win32HeapFree,
         "rust_interesting_average" => Builtin::FfiInterestingAverage,
         "rust_valist_interesting_average" => Builtin::FfiValistInterestingAverage,
         "rust_va_list_next_i32" => Builtin::FfiVaListNextI32,
