@@ -915,6 +915,156 @@ fn adapter_second_source_ty(
     }
 }
 
+/// Collect drop candidates from one body's own drops: the
+/// places its `Drop` terminators drop, the pointees of its
+/// unsizing casts, its `std::mem::drop` arguments and the
+/// iterators its modelled owned-iterator consumers consume.
+/// Shared by the seed-body scan in `demand_drop_instances`
+/// and the drop-glue expansion there, which scans the
+/// compiler's own `drop_in_place` shim bodies with the same
+/// extractors.
+fn drop_scan_body(
+    body: &rustc_public::mir::Body,
+    candidates: &mut Vec<(Ty, rustc_public::ty::AdtDef, GenericArgs)>,
+    seen: &mut std::collections::HashSet<Ty>,
+) {
+    for bb in &body.blocks {
+        let rustc_public::mir::TerminatorKind::Drop { place, .. } = &bb.terminator.kind
+        else {
+            continue;
+        };
+        if let Some(ty) = drop_place_ty(body, place) {
+            drop_candidates(&ty, candidates, seen);
+        }
+    }
+    // An unsizing cast to a trait object makes the
+    // source pointee droppable through the object's
+    // vtable: the converter builds the pointee's glue
+    // into the cast, which needs the same destructor
+    // bodies a terminator would demand. The pointee of
+    // the cast operand (a reference, raw pointer or box
+    // around it, or the value itself) is a candidate.
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            let rustc_public::mir::StatementKind::Assign(
+                _,
+                rustc_public::mir::Rvalue::Cast(
+                    rustc_public::mir::CastKind::PointerCoercion(
+                        rustc_public::mir::PointerCoercion::Unsize,
+                    ),
+                    operand,
+                    target,
+                ),
+            ) = &stmt.kind
+            else {
+                continue;
+            };
+            let Some(target_kind) =
+                sparagmos_driver::convert::guarded_ty_kind(target)
+            else {
+                continue;
+            };
+            if !matches!(target_kind, TyKind::RigidTy(RigidTy::Dynamic(..)))
+                && !matches!(target_kind, TyKind::RigidTy(RigidTy::Adt(..)))
+            {
+                continue;
+            }
+            let (rustc_public::mir::Operand::Copy(place)
+            | rustc_public::mir::Operand::Move(place)) = operand
+            else {
+                continue;
+            };
+            let Some(src) = drop_place_ty(body, place) else {
+                continue;
+            };
+            let pointee = match sparagmos_driver::convert::guarded_ty_kind(&src) {
+                Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
+                Some(TyKind::RigidTy(RigidTy::RawPtr(inner, _))) => inner,
+                Some(TyKind::RigidTy(RigidTy::Adt(def, ref args)))
+                    if def.name() == "std::boxed::Box" =>
+                {
+                    match args.0.iter().find_map(|a| match a {
+                        GenericArgKind::Type(t) => Some(*t),
+                        _ => None,
+                    }) {
+                        Some(t) => t,
+                        None => continue,
+                    }
+                }
+                _ => src,
+            };
+            drop_candidates(&pointee, candidates, seen);
+        }
+    }
+    // A `std::mem::drop` call runs the dropped type's glue
+    // without a `Drop` terminator, and the interpreter
+    // accounts for that glue when it converts the call,
+    // which needs the same destructor bodies a terminator
+    // would demand.
+    for (def, args) in sparagmos_driver::reach::call_targets(body) {
+        if def.name() != "std::mem::drop" {
+            continue;
+        }
+        if let Some(ty) = args.0.iter().find_map(|a| match a {
+            GenericArgKind::Type(t) => Some(*t),
+            _ => None,
+        }) {
+            drop_candidates(&ty, candidates, seen);
+        }
+    }
+    // A call to a modelled consumer of an owned iterator
+    // (`collect`, `from_iter`, `fold`, ...) drops the
+    // iterator inside the callee's real body, where no
+    // `Drop` terminator for it exists in any collected
+    // body; the interpreter accounts for that glue when
+    // it converts the call, which needs the same
+    // destructor bodies a terminator would demand.
+    for (def, args) in sparagmos_driver::reach::call_targets(body) {
+        if let Some(ty) = consumer_iterator_ty(&def, &args) {
+            drop_candidates(&ty, candidates, seen);
+        }
+    }
+}
+
+/// Fetch the compiler's `drop_in_place` shim body for `ty`
+/// purely speculatively: the candidate expansion in
+/// `demand_drop_instances` only reads the shim's terminators
+/// to harvest further drop candidates; it does not demand
+/// the shim body itself. The fetch must therefore be inert.
+/// A type whose glue cannot be materialized without
+/// diagnostics -- an instantiation whose projections do not
+/// normalize in the monomorphized environment is the
+/// standing shape: posing the shim's ABI query emits the
+/// normalization ICE -- must leave no trace: the panic is
+/// contained, any diagnostics the queries emitted are
+/// discounted, and nothing is recorded in the
+/// materialization registries (fetching through
+/// `with_body_materialization` would record the emission
+/// under the shim's key, and a later genuine demand of that
+/// glue would then fail a compilation rustc accepts, even
+/// though the scan itself caused the emission). A candidate
+/// the fetch cannot resolve is simply not expanded; a type
+/// genuinely dropped by collected code is demanded again
+/// through the recording path, where its diagnostics keep
+/// their usual effect.
+fn speculative_drop_shim_body(ty: Ty) -> Option<rustc_public::mir::Body> {
+    let dcx = sparagmos_driver::convert::compiler_tcx().map(|tcx| tcx.dcx());
+    let errors_before = dcx.map(|d| d.err_count());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let inst = Instance::resolve_drop_in_place(ty);
+        if inst.is_empty_shim() || !inst.has_body() {
+            return None;
+        }
+        inst.body()
+    }));
+    if let (Some(dcx), Some(before)) = (dcx, errors_before) {
+        if dcx.err_count() > before {
+            dcx.reset_err_count();
+        }
+    }
+    result.ok().flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn demand_drop_instances(
     conv: &mut Converter,
@@ -968,101 +1118,48 @@ pub(crate) fn demand_drop_instances(
         let mut candidates = Vec::new();
         let mut seen = Default::default();
         for body in &batch {
-            for bb in &body.blocks {
-                let rustc_public::mir::TerminatorKind::Drop { place, .. } = &bb.terminator.kind
-                else {
-                    continue;
-                };
-                if let Some(ty) = drop_place_ty(body, place) {
-                    drop_candidates(&ty, &mut candidates, &mut seen);
-                }
+            drop_scan_body(body, &mut candidates, &mut seen);
+        }
+        // Expand the candidates through their own drop glue.
+        // The field walk in `drop_candidates` cannot see
+        // through an associated-type projection: `Cow`'s
+        // `Owned` field is declared as `<B as ToOwned>::Owned`,
+        // so the type the glue actually drops (`CString` for
+        // `Cow<CStr>`) never becomes a candidate and its
+        // destructor body is never demanded, even though the
+        // glue builder resolves the field type from body
+        // evidence and asks for that body. The compiler's own
+        // `drop_in_place` shim body names the types the glue
+        // drops with ordinary `Drop` terminators, so for a
+        // candidate whose declared field tree mentions an
+        // alias, scan its shim body with the same extractors.
+        // A shim resolution failure on an odd instantiation
+        // must not take the whole conversion down with it:
+        // the fetch is speculative (see
+        // `speculative_drop_shim_body`), so its panics are
+        // contained and its diagnostics discounted, leaving
+        // no trace in the materialization registries.
+        let mut idx = 0;
+        while idx < candidates.len() {
+            let (cand_ty, cand_def, cand_args) = candidates[idx].clone();
+            idx += 1;
+            if args_mention_params(&cand_args) {
+                continue;
             }
-            // An unsizing cast to a trait object makes the
-            // source pointee droppable through the object's
-            // vtable: the converter builds the pointee's glue
-            // into the cast, which needs the same destructor
-            // bodies a terminator would demand. The pointee of
-            // the cast operand (a reference, raw pointer or box
-            // around it, or the value itself) is a candidate.
-            for bb in &body.blocks {
-                for stmt in &bb.statements {
-                    let rustc_public::mir::StatementKind::Assign(
-                        _,
-                        rustc_public::mir::Rvalue::Cast(
-                            rustc_public::mir::CastKind::PointerCoercion(
-                                rustc_public::mir::PointerCoercion::Unsize,
-                            ),
-                            operand,
-                            target,
-                        ),
-                    ) = &stmt.kind
-                    else {
-                        continue;
-                    };
-                    let Some(target_kind) =
-                        sparagmos_driver::convert::guarded_ty_kind(target)
-                    else {
-                        continue;
-                    };
-                    if !matches!(target_kind, TyKind::RigidTy(RigidTy::Dynamic(..)))
-                        && !matches!(target_kind, TyKind::RigidTy(RigidTy::Adt(..)))
-                    {
-                        continue;
-                    }
-                    let (rustc_public::mir::Operand::Copy(place)
-                    | rustc_public::mir::Operand::Move(place)) = operand
-                    else {
-                        continue;
-                    };
-                    let Some(src) = drop_place_ty(body, place) else {
-                        continue;
-                    };
-                    let pointee = match sparagmos_driver::convert::guarded_ty_kind(&src) {
-                        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
-                        Some(TyKind::RigidTy(RigidTy::RawPtr(inner, _))) => inner,
-                        Some(TyKind::RigidTy(RigidTy::Adt(def, ref args)))
-                            if def.name() == "std::boxed::Box" =>
-                        {
-                            match args.0.iter().find_map(|a| match a {
-                                GenericArgKind::Type(t) => Some(*t),
-                                _ => None,
-                            }) {
-                                Some(t) => t,
-                                None => continue,
-                            }
-                        }
-                        _ => src,
-                    };
-                    drop_candidates(&pointee, &mut candidates, &mut seen);
-                }
+            let fields_mention_alias =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cand_def.variants().iter().any(|variant| {
+                        variant
+                            .fields()
+                            .iter()
+                            .any(|field| type_tree_has_alias(&field.ty(), 0))
+                    })
+                }));
+            if !matches!(fields_mention_alias, Ok(true)) {
+                continue;
             }
-            // A `std::mem::drop` call runs the dropped type's glue
-            // without a `Drop` terminator, and the interpreter
-            // accounts for that glue when it converts the call,
-            // which needs the same destructor bodies a terminator
-            // would demand.
-            for (def, args) in sparagmos_driver::reach::call_targets(body) {
-                if def.name() != "std::mem::drop" {
-                    continue;
-                }
-                if let Some(ty) = args.0.iter().find_map(|a| match a {
-                    GenericArgKind::Type(t) => Some(*t),
-                    _ => None,
-                }) {
-                    drop_candidates(&ty, &mut candidates, &mut seen);
-                }
-            }
-            // A call to a modelled consumer of an owned iterator
-            // (`collect`, `from_iter`, `fold`, ...) drops the
-            // iterator inside the callee's real body, where no
-            // `Drop` terminator for it exists in any collected
-            // body; the interpreter accounts for that glue when
-            // it converts the call, which needs the same
-            // destructor bodies a terminator would demand.
-            for (def, args) in sparagmos_driver::reach::call_targets(body) {
-                if let Some(ty) = consumer_iterator_ty(&def, &args) {
-                    drop_candidates(&ty, &mut candidates, &mut seen);
-                }
+            if let Some(shim_body) = speculative_drop_shim_body(cand_ty) {
+                drop_scan_body(&shim_body, &mut candidates, &mut seen);
             }
         }
         // Local types first: the shared cap must not let a

@@ -1715,6 +1715,51 @@ fn main() {
     println!("eq={} ord={:?}", b == CString::new("hello").unwrap().into_boxed_c_str(), b.cmp(&c));
 }
 "#;
+const COW_CSTR_BORROWED_DROP_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::CStr;
+fn main() {
+    {
+        let borrowed: Cow<'_, CStr> = Cow::Borrowed(c"abc");
+        println!("borrowed len={}", borrowed.to_bytes().len());
+    }
+    println!("after borrowed drop");
+}
+"#;
+
+#[test]
+fn run_mode_cow_cstr_borrowed_literal_drop_converts() {
+    // Dropping a `Cow<CStr>` local converts the enum's field
+    // glue, whose `Owned` field is declared as the projection
+    // `<CStr as ToOwned>::Owned`: the glue builder resolves
+    // the field type to `CString` from body evidence and asks
+    // for its destructor body, but the demand walk cannot
+    // substitute the projection, so `CString` only became a
+    // drop candidate when some other body dropped one
+    // directly. With no plain `CString` local anywhere in
+    // this guest, the drop used to stop the conversion with
+    // `unsupported terminator: Drop`.
+    run_ok(
+        "cow-cstr-borrowed-drop",
+        COW_CSTR_BORROWED_DROP_SRC,
+        "borrowed len=3\nafter borrowed drop\n",
+    );
+}
+
+const COW_CSTR_OWNED_DROP_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{CStr, CString};
+fn main() {
+    {
+        let owned: Cow<'_, CStr> = Cow::Owned(CString::new("hello").unwrap());
+        println!("owned len={}", owned.to_bytes().len());
+    }
+    println!("after owned drop");
+    let explicit: Cow<'_, CStr> = Cow::Owned(CString::new("hi").unwrap());
+    drop(explicit);
+    println!("after explicit drop");
+}
+"#;
 
 #[test]
 fn run_mode_cstring_into_boxed_c_str_keeps_its_bytes() {
@@ -1757,5 +1802,24 @@ fn run_mode_cstring_from_boxed_cstr_round_trips() {
         "cstring-from-boxed-cstr",
         CSTRING_FROM_BOXED_CSTR_SRC,
         "back=[119, 111, 114, 108, 100]\ndebug=\"world\"\nback2=[97, 98, 99] len=4\nempty=0 1\n",
+    );
+}
+
+#[test]
+fn run_mode_cow_cstr_owned_drop_converts() {
+    // The owned variant of the same drop: the `CString` is
+    // built in expression position and moved into the `Cow`,
+    // so no body ever drops a `CString` place directly and
+    // the destructor demand again depends on seeing through
+    // the `ToOwned::Owned` projection — the demand pass now
+    // scans the compiler's own `drop_in_place` shim body for
+    // `Cow<CStr>`, whose `Drop` terminator names the `CString`
+    // field place directly. The explicit `std::mem::drop`
+    // call exercises the same glue without a `Drop`
+    // terminator in the guest body.
+    run_ok(
+        "cow-cstr-owned-drop",
+        COW_CSTR_OWNED_DROP_SRC,
+        "owned len=5\nafter owned drop\nafter explicit drop\n",
     );
 }
