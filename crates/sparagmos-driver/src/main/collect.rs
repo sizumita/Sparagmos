@@ -149,6 +149,43 @@ pub(crate) fn run_resolution_verdict(
 /// context is installed for the conversion's span resolution
 /// (see `sparagmos_driver::convert::set_compiler_tcx`) and
 /// cleared on the way out, including on a panic.
+/// Account a constant definition whose own body cannot be
+/// materialized because evaluating one of its instance
+/// constants is too generic (`INSTANCE_CONST_REASON`) as
+/// `NotDemanded`, the accounting the generic-constant
+/// definitions get (see the item loop's constant arm): the
+/// constant's value exists only under a monomorphization
+/// whose context resolves the referenced associated constant
+/// (an assumed trait bound in both known shapes -- an
+/// associated constant written through `&Self` under the
+/// impl's own where clause, and a generic const item whose
+/// initializer resolves through its own where bound), so the
+/// definition body is needed by no converted body, and a
+/// monomorphized body that uses the constant carries its
+/// evaluated value. A constant a converted body actually
+/// demands is judged on the demand side (the required-consts
+/// verdict and the constant decoder), not here.
+fn account_instance_const_not_demanded(report: &mut ConversionReport, name: &str) {
+    report.functions.push(FnReport {
+        name: name.to_string(),
+        blocks: 0,
+        locals: 0,
+        arg_count: 0,
+        outcome: FnOutcome::NotDemanded {
+            reason: format!(
+                "generic constant definition \
+                 ({} x1); only \
+                 monomorphic instances are \
+                 converted, and \
+                 monomorphized bodies that \
+                 use the constant carry \
+                 its evaluated value",
+                sparagmos_driver::convert::INSTANCE_CONST_REASON
+            ),
+        },
+    });
+}
+
 fn collect_with_tcx(tcx: rustc_middle::ty::TyCtxt) -> ControlFlow<()> {
     struct ClearTcx;
     impl Drop for ClearTcx {
@@ -464,6 +501,8 @@ fn collect() -> ControlFlow<()> {
                                                             == "Rvalue::Repeat (count not evaluable)"
                                                         || r
                                                             == sparagmos_driver::convert::CONST_EXPR_REASON
+                                                        || r
+                                                            == sparagmos_driver::convert::INSTANCE_CONST_REASON
                                                 }) =>
                                         {
                                             Some(
@@ -489,7 +528,19 @@ fn collect() -> ControlFlow<()> {
                                 }
                             }
                             Ok(None) => account_trivial_const(&mut report, name),
-                            Err(reason) => skip_fn(&mut report, &name, reason),
+                            Err(reason) => {
+                                // A generic constant definition
+                                // whose own fetch dies evaluating
+                                // an instance constant is too
+                                // generic to materialize as a
+                                // definition (see
+                                // `account_instance_const_not_demanded`).
+                                if reason == sparagmos_driver::convert::INSTANCE_CONST_REASON {
+                                    account_instance_const_not_demanded(&mut report, &name);
+                                } else {
+                                    skip_fn(&mut report, &name, reason);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -779,7 +830,19 @@ fn collect() -> ControlFlow<()> {
                         continue;
                     }
                 }
-                if reason
+                if reason == sparagmos_driver::convert::INSTANCE_CONST_REASON
+                    && matches!(item.kind(), ItemKind::Const)
+                {
+                    // A constant definition whose own fetch
+                    // dies evaluating an instance constant is
+                    // too generic to materialize as a
+                    // definition (see
+                    // `account_instance_const_not_demanded`):
+                    // its value exists only under a
+                    // monomorphization that resolves the
+                    // referenced associated constant.
+                    account_instance_const_not_demanded(&mut report, &name);
+                } else if reason
                     == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
                 {
                     note_body_fetch_recursion_limit(
