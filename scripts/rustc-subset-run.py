@@ -4019,6 +4019,22 @@ def sparagmos_debug_side(path, edition, driver_bin, dialect, script_text,
             argv += ["--guest-arg", a]
         argv += ["--debug-script", script_path, "--debug-dialect", dialect]
         env = dict(BOOTSTRAP_ENV)
+        # The library path the run side gets (see
+        # sparagmos_side): the staged driver links the
+        # toolchain's shared rustc_driver library, which the
+        # Windows loader resolves through PATH; without the
+        # sysroot lib dir the driver cannot start on a Windows
+        # host (exit 3221225781, STATUS_DLL_NOT_FOUND).
+        lib_dirs = []
+        slib = sysroot_lib()
+        if slib:
+            lib_dirs.append(slib)
+        facts = host_facts()
+        if facts is not None and facts.target_lib_dir() is not None:
+            lib_dirs.append(str(facts.target_lib_dir()))
+        if lib_dirs:
+            name, value = _lib_path_entry(lib_dirs)
+            env[name] = value
         if env_extra:
             env.update(env_extra)
         res = run_cmd(argv, timeout=DRIVER_TIMEOUT, env_extra=env,
@@ -6066,6 +6082,25 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     for name in aux_env_scrub:
         argv += ["--aux-env-scrub", name]
     env = dict(BOOTSTRAP_ENV)
+    # The library path the run side gets (see sparagmos_side):
+    # the driver itself links the toolchain's shared
+    # rustc_driver library, which the Windows loader resolves
+    # through PATH (there is no rpath); a convert invocation
+    # without the sysroot lib dir cannot start the staged
+    # driver on a Windows host at all (exit 3221225781,
+    # STATUS_DLL_NOT_FOUND) -- the death every Windows
+    # host-class compile-check record showed. The test's own
+    # rustc-env (env_extra, applied after) still wins.
+    lib_dirs = []
+    slib = sysroot_lib()
+    if slib:
+        lib_dirs.append(slib)
+    facts = host_facts()
+    if facts is not None and facts.target_lib_dir() is not None:
+        lib_dirs.append(str(facts.target_lib_dir()))
+    if lib_dirs:
+        name, value = _lib_path_entry(lib_dirs)
+        env[name] = value
     if capture_stdout:
         # Bootstrap runs compiletest itself with
         # RUSTC_FORCE_RUSTC_VERSION=compiletest, and the compiler
