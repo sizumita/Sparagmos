@@ -118,6 +118,12 @@ impl<'a> Interpreter<'a> {
     fn follow_alloc(&self, value: Value) -> InterpResult<Option<Value>> {
         match value {
             Value::Ref(RefTarget::Alloc { id, projection }) => {
+                // The pointee was already dropped through a
+                // pointer (see `glue_dropped_allocs`): nothing
+                // is left to drop in it.
+                if self.glue_dropped_allocs.borrow().contains(&id) {
+                    return Ok(None);
+                }
                 let Ok(base) = self.alloc_base(id) else {
                     return Ok(None);
                 };
@@ -153,6 +159,19 @@ impl<'a> Interpreter<'a> {
         root: &RefTarget,
         path: &[RefProj],
     ) -> InterpResult<Option<Value>> {
+        // An allocation an earlier completed session already
+        // dropped through a pointer holds nothing left to drop
+        // (see `glue_dropped_allocs`): glue reaching it again,
+        // at any projection, finds the storage empty, exactly
+        // as the uninitialised storage the session-completion
+        // marking used to leave behind read. The entry is only
+        // ever recorded as a session completes, so a session's
+        // own reads of its root are never affected.
+        if let RefTarget::Alloc { id, .. } = root {
+            if self.glue_dropped_allocs.borrow().contains(id) {
+                return Ok(None);
+            }
+        }
         // The declared type of the root value, stepped alongside
         // the walk below as `read_place`'s reads step theirs: the
         // projectors' shape-only judgments (the single-array-field
@@ -1805,12 +1824,19 @@ impl<'a> Interpreter<'a> {
             // through a pointer (a `drop_in_place` on a raw
             // pointer into a heap allocation -- the pointee drop
             // inside a compiler `drop_glue` shim, say) leaves the
-            // storage uninitialised, as a native drop leaves the
-            // bytes dead: a later step reaching the same
+            // storage dropped: a later step reaching the same
             // allocation (the shim's destructor step, converted
             // to the box's glue plan, reaching the pointee
             // through the box) must find nothing left to drop a
-            // second time. Sessions nested inside another (a
+            // second time. The dropped state is recorded in
+            // `glue_dropped_allocs`, which only glue reads
+            // consult, instead of overwriting the storage: the
+            // shim's other later step is the box destructor's
+            // own converted body, whose `size_of_val` on the
+            // pointee reads the storage through the ordinary
+            // path to price the deallocation, exactly as a
+            // native drop leaves the bytes in place until the
+            // free. Sessions nested inside another (a
             // reference-counted pointee's glue, rooted at the
             // allocation's value field) keep the storage: their
             // enclosing session still owns it.
@@ -1820,7 +1846,7 @@ impl<'a> Interpreter<'a> {
             ) {
                 if let RefTarget::Alloc { id, projection } = &active.root {
                     if projection.is_empty() {
-                        self.allocs.borrow_mut().insert(*id, Value::Uninit);
+                        self.glue_dropped_allocs.borrow_mut().insert(*id);
                     } else if let Some(stored) = self.alloc_value_snapshot(id) {
                         // A projected cell is cleared only when it
                         // is part of a coroutine's state: a
