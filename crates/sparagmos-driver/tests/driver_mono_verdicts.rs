@@ -44,7 +44,18 @@
 //! output of the crate is a 'staticlib', 'bin' or 'cdylib'
 //! output, over the session's options alone, but only as
 //! code generation starts, so conversion accepted the
-//! combination. The driver now
+//! combination. The layout-failure replay is pinned as
+//! well: a type whose layout does not exist (a layout cycle,
+//! E0391) is rejected by rustc only once collected code
+//! demands the layout — through a `size_of`/`align_of`
+//! required constant, or through the ABI of a collected
+//! instance — while conversion's speculative layout queries
+//! fail for such types behind discounted diagnostics, and
+//! also fail, with the same discount, for types the
+//! reference compilation never lays out (the query depth
+//! limit). The driver records the discounted failures by
+//! type and replays them only at a collected demand. The
+//! driver now
 //! replays the verdicts in `mono_check`; each
 //! test below pins one rejection and the nearby acceptance that
 //! guards it against over-rejection. A rejected compilation
@@ -1779,4 +1790,171 @@ fn aux_private_helper_demanded_through_aux_caller_converts() {
     let (code, stdout, stderr) = case.convert_aux(&src, &[("dep", &aux)]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn layout_cycle_required_const_rejected() {
+    // The layout of `S<S<()>>` does not exist: the field
+    // type resolves to the struct itself, one level deeper
+    // (Issue #111176). rustc reports the cycle when the
+    // collector evaluates the `SizedTypeProperties::SIZE`
+    // required constant of the collected `size_of`
+    // instance; conversion's own layout query for the type
+    // fails behind the speculative discount, so only the
+    // recorded failure, replayed at the constant's demand,
+    // rejects the program.
+    let case = Case::new("layout-cycle-const");
+    let src = case.write(
+        "case.rs",
+        "use std::mem;\n\
+         pub struct S<T: Tr> {\n\
+             pub f: <T as Tr>::I,\n\
+         }\n\
+         pub trait Tr {\n\
+             type I: Tr;\n\
+         }\n\
+         impl<T: Tr> Tr for S<T> {\n\
+             type I = S<S<T>>;\n\
+         }\n\
+         impl Tr for () {\n\
+             type I = ();\n\
+         }\n\
+         fn foo<T: Tr>() -> usize {\n\
+             mem::size_of::<S<T>>()\n\
+         }\n\
+         fn main() {\n\
+             println!(\"{}\", foo::<S<()>>());\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("cycle detected when computing layout"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("demands the layout of"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn layout_cycle_post_mono_rejected() {
+    // The same cycle, demanded without any measuring
+    // constant: collecting `abi::<()>` lays out its
+    // signature's `Option<Wrapper<()>>` for the ABI check,
+    // and `Wrapper<()>`'s only field is itself. The
+    // collector force that replays the check panics on the
+    // cycle with an opaque payload; the verdict rests on
+    // the recorded failure of a signature type.
+    let case = Case::new("layout-cycle-post-mono");
+    let src = case.write(
+        "case.rs",
+        "trait Trait {\n\
+             type Assoc;\n\
+         }\n\
+         impl Trait for () {\n\
+             type Assoc = Wrapper<()>;\n\
+         }\n\
+         struct Wrapper<T: Trait> {\n\
+             _x: <T as Trait>::Assoc,\n\
+         }\n\
+         fn abi<T: Trait>(_: Option<Wrapper<T>>) {}\n\
+         fn indirect<T: Trait>() {\n\
+             abi::<T>(None);\n\
+         }\n\
+         fn main() {\n\
+             indirect::<()>();\n\
+         }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("cycle detected when computing layout"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("demands the layout of"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn size_of_acyclic_type_converts() {
+    // The acceptance beside the required-constant verdict:
+    // the same shape with a terminating associated type.
+    // The collected `size_of` instance demands the layout
+    // of `S<S<()>>`, whose layout exists, so no record
+    // exists and nothing fires.
+    let case = Case::new("layout-acyclic-sizeof");
+    let src = case.write(
+        "case.rs",
+        "use std::mem;\n\
+         pub struct S<T: Tr> {\n\
+             pub f: <T as Tr>::I,\n\
+         }\n\
+         pub trait Tr {\n\
+             type I: Tr;\n\
+         }\n\
+         impl<T: Tr> Tr for S<T> {\n\
+             type I = ();\n\
+         }\n\
+         impl Tr for () {\n\
+             type I = ();\n\
+         }\n\
+         fn foo<T: Tr>() -> usize {\n\
+             mem::size_of::<S<T>>()\n\
+         }\n\
+         fn main() {\n\
+             println!(\"{}\", foo::<S<()>>());\n\
+         }\n",
+    );
+    let (code, stdout, stderr) = case.convert(&src, &[], false);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+}
+
+#[test]
+fn undemanded_layout_failure_converts() {
+    // The acceptance beside both layout verdicts: under
+    // the next solver with a tight recursion limit,
+    // conversion's speculative layout queries for the
+    // coroutine witness types (`ExtData`, `Context`) fail
+    // with "queries overflow the depth limit!" and are
+    // discounted and recorded — but no collected instance
+    // demands those layouts, through a constant or an ABI,
+    // and the reference compilation never poses the query
+    // either, so the program converts.
+    let case = Case::new("layout-undemanded");
+    let src = case.write(
+        "case.rs",
+        "#![recursion_limit = \"6\"]\n\
+         async fn foo1() {}\n\
+         async fn foo2() {\n\
+             foo1().await\n\
+         }\n\
+         async fn foo3() {\n\
+             foo2().await\n\
+         }\n\
+         async fn foo4() {\n\
+             foo3().await\n\
+         }\n\
+         async fn foo5() {\n\
+             foo4().await\n\
+         }\n\
+         fn assert_send<T: Send>(_: T) {}\n\
+         fn main() {\n\
+             assert_send(foo5());\n\
+         }\n",
+    );
+    let (code, stdout, stderr) =
+        case.convert(&src, &["--rustc-arg", "-Znext-solver"], true);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("converted:"), "stdout={stdout}");
+    // The discount was genuinely exercised: the depth-limit
+    // diagnostic was emitted (and discounted) on the way.
+    assert!(
+        stderr.contains("queries overflow the depth limit"),
+        "stderr={stderr}"
+    );
 }
