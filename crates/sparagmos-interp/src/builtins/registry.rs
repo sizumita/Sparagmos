@@ -1505,6 +1505,27 @@ pub enum Builtin {
     /// itself is a whole-value operation, so it is served
     /// directly over the elements the pointers denote.
     SwapNonoverlapping,
+    /// `core::slice::rotate::ptr_rotate_gcd(left, mid, right)`
+    /// and `core::slice::rotate::ptr_rotate_swap(left, mid,
+    /// right)`: the two over-threshold branches of the slice
+    /// rotation primitive, rotating the `left + right` elements
+    /// ending and starting at `mid` left by `left`. The
+    /// collected bodies reach the exchange through
+    /// `ptr::swap_nonoverlapping`'s byte form, whose chunk
+    /// buffers (`MaybeUninit<[u8; N]>` loads and stores at byte
+    /// positions inside element-shaped storage) the value
+    /// model cannot follow -- the chunk width survives only
+    /// in the erased const generic, and a byte-displaced read
+    /// of a structured value is not a value (see
+    /// `SwapNonoverlapping`). The rotation itself is a
+    /// whole-element operation, so it is served directly over
+    /// the element sequence the pointer denotes, exactly as
+    /// the swap above is. The memmove branch
+    /// (`ptr_rotate_memmove`) keeps its collected body: its
+    /// exchange goes through the modelled `copy_nonoverlapping`
+    /// and the union temp buffer, both of which the model
+    /// follows.
+    PtrRotate,
     /// `std::mem::size_of::<T>()` (types with a known layout only).
     MemSizeOf,
     /// `std::mem::align_of::<T>()` (types with a known layout only).

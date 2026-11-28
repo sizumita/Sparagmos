@@ -1518,6 +1518,67 @@ impl<'a> Converter<'a> {
         }))
     }
 
+    /// A direct call to one of the over-threshold slice
+    /// rotation branches (`core::slice::rotate::ptr_rotate_gcd`
+    /// / `ptr_rotate_swap`) converts to a builtin node: the
+    /// collected bodies perform the exchange through
+    /// `ptr::swap_nonoverlapping`'s byte form, whose
+    /// `MaybeUninit<[u8; N]>` chunk loads and stores land at
+    /// byte positions inside element-shaped storage that the
+    /// value model cannot serve (the chunk width survives
+    /// only in the callee's erased const generic, so no
+    /// runtime judgment can recover it). The rotation is a
+    /// whole-element operation, so the builtin serves it over
+    /// the element sequence directly (see
+    /// `Builtin::PtrRotate`). The memmove branch is not
+    /// diverted: its body runs on the modelled
+    /// `copy_nonoverlapping` and the union temp buffer, and
+    /// stays the resolution. Every other call keeps the
+    /// normal paths.
+    fn ptr_rotate_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some((name, generic_args, _raw)) = self.resolve_external_callee(func) else {
+            return Ok(None);
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        if canonical != "core::slice::rotate::ptr_rotate_gcd"
+            && canonical != "core::slice::rotate::ptr_rotate_swap"
+        {
+            return Ok(None);
+        }
+        if args.len() != 3 {
+            return Ok(None);
+        }
+        let mut ir_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            ir_args.push(self.convert_operand(body, arg, None)?);
+        }
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args,
+            args: ir_args,
+            destination: self.convert_place(body, destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            consumed_glue: None,
+            skipped_glue: None,
+            elem_glue: None,
+            receiver_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+            unique_elem: None,
+            zeroed_value: None,
+            generic_type_ids: None,
+            validity_panic: None,
+        }))
+    }
+
     fn time_add_sub_terminator(
         &self,
         body: &mir::Body,
@@ -2527,6 +2588,14 @@ impl<'a> Converter<'a> {
                 )? {
                     term
                 } else if let Some(term) = self.ub_check_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
+                } else if let Some(term) = self.ptr_rotate_terminator(
                     body,
                     func,
                     args,

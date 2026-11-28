@@ -370,6 +370,13 @@ pub(crate) fn pointer_lookup(canonical: &str) -> Option<Builtin> {
         "std::ptr::swap_nonoverlapping" | "core::ptr::swap_nonoverlapping"
         | "std::intrinsics::typed_swap_nonoverlapping"
         | "core::intrinsics::typed_swap_nonoverlapping" => Builtin::SwapNonoverlapping,
+        // The over-threshold slice-rotation branches (see
+        // `Builtin::PtrRotate`): the calls are diverted at
+        // conversion (see `ptr_rotate_terminator` in
+        // `mir_convert`), because both branches have collected
+        // bodies the ordinary resolution would bind.
+        "core::slice::rotate::ptr_rotate_gcd"
+        | "core::slice::rotate::ptr_rotate_swap" => Builtin::PtrRotate,
         "std::mem::size_of" => Builtin::MemSizeOf,
         "std::mem::align_of" => Builtin::MemAlignOf,
         "std::mem::size_of_val" => Builtin::MemSizeOfVal,
