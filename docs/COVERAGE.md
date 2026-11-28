@@ -11,15 +11,17 @@ Sparagmos の目標は「Rust 1.100.0 を 99% のレベルで実行できるこ�
 |---|---|
 | 1. MIR バリアント網羅率 | 77.5% (実装済み 31 / 母数 40) |
 | 2(a). 自前コーパスのパス率 | 100% (47 / 47) |
-| 2(b). rustc テストスイート部分集合のパス率 | 88.639% (パス 22,104 / 母数 24,937 の全母数換算) |
+| 2(b). rustc テストスイート部分集合のパス率 | 88.651% (パス 22,107 / 母数 24,937 の全母数換算) |
 | 2(c). rustc 自体の実行 | 未着手 |
 | 参考. コーパスの JIT 経路パス率 | 100% (47 / 47) |
 | 3. std 機能網羅率 | 98.453% (1,718 / 1,745) |
-| 4. テストスイート全体の JIT パス率 | 69.800% (17,406 / 24,937) |
+| 4. テストスイート全体の JIT パス率 | 69.812% (17,409 / 24,937) |
 
-現在の実測値は、Official Measurement run 46121037139 (main ヘッド
-`caff474f`) の結果です。指標2(b) は今回、母数 24,937 件の全件を
-判定できました (詳細は指標2(b) の節)。
+現在の実測値は、Official Measurement run 46130581325 (main ヘッド
+`dd6ed868`) の結果です。この値は run 46126779916 で確定し、
+run 46128372340 と run 46130581325 でもレコード単位で同一でした。
+指標2(b) は母数 24,937 件の全件を判定できました
+(詳細は指標2(b) の節)。
 
 ## 指標1: MIR バリアント網羅率
 
@@ -93,48 +95,61 @@ FFI を含むテスト、補助ファイルやビルドステップを要する�
 
 | 判定種別 | 件数 | 判定済み | 現在のパス |
 |---|---|---|---|
-| 実行 (exec) | 4,149 | 4,149 | 3,954 (95.300%) |
-| コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,919 (97.747%) |
+| 実行 (exec) | 4,149 | 4,149 | 3,953 (95.276%) |
+| コンパイル時検証 (compile-check) | 18,332 | 18,332 | 17,923 (97.769%) |
 | 手順 (procedure / run-make) | 551 | 551 | 90 (16.334%) |
 | デバッガ実行 (exec-debugger) | 170 | 170 | 141 (82.941%) |
 | rustdoc 検証 | 1,735 | 1,735 | 0 |
-| 合計 | 24,937 | 24,937 | **22,104** |
+| 合計 | 24,937 | 24,937 | **22,107** |
 
-パス率は全母数換算で **88.639%** (22,104 / 24,937) です。パスして
-いないのは 2,833 件で、全て判定済みの失敗です (種別ごとの残りは、
-実行 195、コンパイル時検証 413、rustdoc 検証 1,735、手順 461、
+パス率は全母数換算で **88.651%** (22,107 / 24,937) です。パスして
+いないのは 2,830 件で、全て判定済みの失敗です (種別ごとの残りは、
+実行 196、コンパイル時検証 409、rustdoc 検証 1,735、手順 461、
 デバッガ実行 29)。
 
 #### Windows クラスの判定について
 
 Windows 両クラス (windows-msvc 72 件、windows-gnu 9 件、計 81 件)
 は、ネイティブの Windows ランナー上でビルドしたドライバで判定して
-います。今回の計測では 81 件すべてを判定できました。そのうち
-windows-gnu の次の 4 件は失敗として判定されています:
-`tests/run-make/mingw-export-call-convention`、
+います。今回の計測では 81 件すべてを判定できました。windows-gnu の
+9 件は全て失敗として判定されています。手順の 6 件
+(`tests/run-make/mingw-export-call-convention`、
 `tests/run-make/raw-dylib-custom-dlltool`、
-`tests/run-make/windows-gnu-corrupt-drective` (いずれも手順、
-stage-3 のサポートビルド失敗) と
-`tests/ui/linkage-attr/raw-dylib/windows/dlltool-failed.rs`
-(コンパイル時検証、失敗すべきテストでの compiler crash) です。
+`tests/run-make/windows-gnu-corrupt-drective`、
+`tests/run-make/compiler-rt-works-on-mingw`、
+`tests/run-make/raw-dylib-cross-compilation`、
+`tests/run-make/raw-dylib-whitespace`) はいずれも stage-3 の
+サポートビルド失敗、コンパイル時検証の 2 件
+(`tests/ui/linkage-attr/raw-dylib/windows/dlltool-failed.rs`、
+`tests/ui/linkage-attr/raw-dylib/windows/invalid-dlltool.rs`) は
+失敗すべきテストでの compiler crash、rustdoc 検証の 1 件
+(`tests/rustdoc-json/targets/x86_64_pc_windows_gnu.rs`) は
+未試行 (stage-4 のチェッカーツール) です。
 
 #### 前回確定値との差分
 
-前回の確定値 (run 46115245830) と両方で判定できた範囲の差分は
-gain 3 / loss 0 です。gain は、以前に loss としてトリアージ
-済みだった3件で、`tests/ui/layout/layout-cycle.rs` と
-`tests/ui/layout/post-mono-layout-cycle.rs` (共に
-コンパイル時検証、PR #982 のレイアウト失敗の記録・再生) と
-`tests/ui/impl-trait/example-calendar.rs` (実行、PR #984) です。
-判定が変わらないバケット移動は11件あります。手順の10件は
-失敗箇所が「変換済み本体を持たない関数への呼び出し」から
-「変換時の型不一致」へ移ったもので、実行の1件
-(`tests/ui-fulldeps/run-compiler-twice.rs`) は資源律速の
-揺れです。
+前回の確定値 (run 46121037139) との差分は gain 4 / loss 1 です。
+gain は unsafe-binder のコンパイル時検証 4 件
+(`tests/mir-opt/gvn_on_unsafe_binder.rs`、
+`tests/ui/unsafe-binders/cat-projection.rs`、
+`tests/ui/unsafe-binders/expr.rs`、
+`tests/ui/unsafe-binders/unsafe-binders-debuginfo.rs`) で、
+PR #992 (wrap/unwrap の identity bodies) によるものです。
+loss は `tests/ui/packed/packed-struct-drop-aligned.rs`
+(実行、終了コード不一致) の 1 件です。判定が変わらない
+バケット移動は、`tests/debuginfo/unsafe-binders.rs`
+(デバッガ実行) が「変換未完 (デバッガセッション)」から
+「デバッガ出力の不一致」へ移った 1 件です。
+`tests/ui-fulldeps/run-compiler-twice.rs` (実行) は既知の
+不安定レコードで、バケットが timeout とメモリ律速の間を
+行き来しています (現行の run では timeout)。
 
 以前にトリアージ済みの
-`tests/ui/imports/ambiguous-reachable.rs` (コンパイル時検証)
-は前回に続きパスしています。
+`tests/ui/layout/layout-cycle.rs`、
+`tests/ui/layout/post-mono-layout-cycle.rs` (共に
+コンパイル時検証)、`tests/ui/impl-trait/example-calendar.rs`
+(実行)、`tests/ui/imports/ambiguous-reachable.rs`
+(コンパイル時検証) は引き続きパスしています。
 `tests/ui/recursion/recursion_limit/zero-overflow.rs`
 (コンパイル時検証、根因のギャップは Issue #509 に記録済み)
 は今回も同じバケットで失敗したままです。
@@ -237,17 +252,23 @@ procedure / exec-debugger / rustdoc のレコードは現在 JIT 経路では
 
 ### 現在値
 
-**17,406 / 24,937 (69.800%)**。内訳はコンパイル時検証
-15,903 / 18,332、実行 1,503 / 4,149 で、procedure / exec-debugger /
-rustdoc の nature は 0 件です。前回の確定値 (run 46115245830) との
-差分は gain 2 / loss 2 で、合計は変わっていません。gain は
-layout-cycle 系の2件 (コンパイル時検証、指標2(b) の gain と
-同じレコード) で、loss は `tests/ui/sized/coinductive-1.rs` と
+**17,409 / 24,937 (69.812%)**。内訳はコンパイル時検証
+15,906 / 18,332、実行 1,503 / 4,149 で、procedure / exec-debugger /
+rustdoc の nature は 0 件です。前回の確定値 (run 46121037139) との
+差分は gain 3 / loss 0 です。gain は unsafe-binder の 3 件
+(`tests/mir-opt/gvn_on_unsafe_binder.rs`、
+`tests/ui/unsafe-binders/expr.rs`、
+`tests/ui/unsafe-binders/unsafe-binders-debuginfo.rs`、いずれも
+コンパイル時検証) で、指標2(b) の gain のうち JIT 経路でも
+反転したものです。残る 1 件
+(`tests/ui/unsafe-binders/cat-projection.rs`) は指標2(b) では
+パスしましたが、JIT 経路では JIT ロワリング未対応 (その他) で
+引き続き失敗しています。`tests/ui/sized/coinductive-1.rs` と
 `tests/ui/sized/coinductive-1-gat.rs` (共にコンパイル時検証、
-JIT ロワリング未対応 (その他)) です。バケットが動いたのは
-`tests/ui/sized/coinductive-2.rs` (実行、終了コード不一致から
-「変換済み本体を持たない関数への呼び出し」へ) の1件で、判定は
-変わっていません。主な失敗要因は、JIT ロワリング未対応 (その他) と、
+JIT ロワリング未対応 (その他)) と
+`tests/ui/sized/coinductive-2.rs` (実行、
+「変換済み本体を持たない関数への呼び出し」) も引き続き
+失敗しています。主な失敗要因は、JIT ロワリング未対応 (その他) と、
 変換済み本体を持たない関数への呼び出しです。この値は、未対応の
 呼び出しを到達時点で失敗するトラップとして下げ、String をヒープ
 機構で処理する現在の jit-compile の意味論のもとで測ったものです。
