@@ -525,6 +525,7 @@ impl<'a> Interpreter<'a> {
                                     let cont = DropContinuation {
                                         callee_frame: callee_id,
                                         session: GlueSession {
+                                            owns_root_alloc: plan_owns_box(&glue.root, &glue.adts),
                                             root,
                                             work: vec![(
                                                 Vec::new(),

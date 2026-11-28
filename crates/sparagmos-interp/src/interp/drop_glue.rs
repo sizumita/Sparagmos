@@ -39,6 +39,16 @@ pub(crate) enum GlueCleanupFlow {
 pub(crate) struct GlueSession {
     /// The dropped place the work applies to.
     pub(crate) root: RefTarget,
+    /// Whether the session's root plan is the glue of a box the
+    /// root place itself owns (a `BoxPointee` plan, possibly
+    /// under transparent field-0 wrappers such as `Pin<Box<T>>`
+    /// or an ADT table entry): only such a session releases the
+    /// root value's allocation when it finishes (see the release
+    /// at the end of `run_glue_session`). A root plan of any
+    /// other shape -- a `Pin<&mut T>` place, say, whose value is
+    /// the same one-field aggregate around a base reference --
+    /// owns no allocation, however box-shaped its value reads.
+    pub(crate) owns_root_alloc: bool,
     /// Remaining work items, a stack: the last item runs next.
     pub(crate) work: Vec<(Vec<RefProj>, crate::ir::DropPlan)>,
     /// ADT glue table of the originating `Drop` terminator.
@@ -68,6 +78,47 @@ pub(crate) enum GlueCompletion {
     /// spot (through `call_to_completion`) instead of
     /// suspending the session.
     Sync,
+}
+
+/// Whether `plan`, applied at a glue session's root, is the
+/// glue of a box the root place owns: a `BoxPointee` plan,
+/// reached directly, through a `DynOrPlain`'s plain form,
+/// through transparent field-0 wrappers (the `At` nodes
+/// conversion builds for `Pin` and other one-field newtypes),
+/// through an aligned-temporary or elided-element wrapper,
+/// through one arm of a sequence, or through an ADT table
+/// entry. Anything else owns no allocation at the root.
+pub(crate) fn plan_owns_box(
+    plan: &crate::ir::DropPlan,
+    adts: &[crate::ir::DropPlan],
+) -> bool {
+    use crate::ir::DropPlan as P;
+    fn inner(
+        plan: &crate::ir::DropPlan,
+        adts: &[crate::ir::DropPlan],
+        depth: usize,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match plan {
+            P::BoxPointee { .. } => true,
+            P::DynOrPlain { plain } => inner(plain, adts, depth + 1),
+            P::At { path, plan } => {
+                path.iter()
+                    .all(|step| matches!(step, RefProj::Field(0)))
+                    && inner(plan, adts, depth + 1)
+            }
+            P::AlignedTemp { plan } => inner(plan, adts, depth + 1),
+            P::Elided { plan, .. } => inner(plan, adts, depth + 1),
+            P::Seq(items) => items.iter().any(|item| inner(item, adts, depth + 1)),
+            P::Adt { index } => adts
+                .get(*index)
+                .is_some_and(|entry| inner(entry, adts, depth + 1)),
+            _ => false,
+        }
+    }
+    inner(plan, adts, 0)
 }
 
 /// Whether `value` is shaped like a lock guard the converted
@@ -479,6 +530,9 @@ impl<'a> Interpreter<'a> {
         target: BasicBlock,
     ) -> InterpResult<()> {
         let session = GlueSession {
+            owns_root_alloc: work.iter().any(|(path, plan)| {
+                path.is_empty() && plan_owns_box(plan, adts)
+            }),
             root,
             work,
             adts: adts.to_vec(),
@@ -511,6 +565,7 @@ impl<'a> Interpreter<'a> {
             projection: Vec::new(),
         };
         let session = GlueSession {
+            owns_root_alloc: plan_owns_box(&glue.root, &glue.adts),
             root,
             work: vec![(Vec::new(), glue.root.clone())],
             adts: glue.adts.clone(),
@@ -789,6 +844,7 @@ impl<'a> Interpreter<'a> {
                             self.vec_from_real_form(frames, &value)
                         {
                             let nested = GlueSession {
+                                owns_root_alloc: false,
                                 root: RefTarget::value(translated?),
                                 work: vec![(
                                     Vec::new(),
@@ -837,6 +893,7 @@ impl<'a> Interpreter<'a> {
                                 // `mem::drop` of a constant argument
                                 // runs its glue.
                                 let nested = GlueSession {
+                                    owns_root_alloc: plan_owns_box(&*plan, &active.adts),
                                     root: RefTarget::value(value),
                                     work: vec![(Vec::new(), *plan)],
                                     adts: active.adts.clone(),
@@ -1150,6 +1207,7 @@ impl<'a> Interpreter<'a> {
                         // destructor still reads strong = 0 and
                         // returns `None`, never a dangling error).
                         let release = GlueSession {
+                            owns_root_alloc: false,
                             root: RefTarget::Alloc {
                                 id,
                                 projection: Vec::new(),
@@ -1159,6 +1217,7 @@ impl<'a> Interpreter<'a> {
                             completion: GlueCompletion::Resume,
                         };
                         let nested = GlueSession {
+                            owns_root_alloc: false,
                             root: RefTarget::Alloc {
                                 id,
                                 projection: Vec::new(),
@@ -1202,6 +1261,7 @@ impl<'a> Interpreter<'a> {
                             continue;
                         };
                         let nested = GlueSession {
+                            owns_root_alloc: false,
                             root: RefTarget::Alloc {
                                 id,
                                 projection: Vec::new(),
@@ -1285,14 +1345,49 @@ impl<'a> Interpreter<'a> {
                                 vtable.kind_name(),
                             ));
                         };
-                        let Some(Value::FnPtr(drop_name)) = vtable_fields.get(3) else {
-                            return Err(InterpError::type_mismatch(
-                                "waker drop glue",
-                                "a RawWakerVTable with a function-pointer drop entry",
-                                vtable.kind_name(),
-                            ));
+                        // The drop entry is taken as the value
+                        // it was stored as: a plain function item
+                        // is a `FnPtr`, while a non-capturing
+                        // closure literal in the vtable constant
+                        // stays a `Closure` value (its coercion to
+                        // a function pointer is a type-level fact
+                        // the value model does not rewrite) --
+                        // exactly as `raw_waker_drop_fn` judges the
+                        // same entry. A function item is called
+                        // with the data pointer alone; a closure
+                        // value takes its environment argument
+                        // first, exactly as an indirect closure
+                        // call passes it.
+                        let drop_callable = match vtable_fields.get(3) {
+                            Some(
+                                callable @ (Value::FnPtr(_) | Value::Closure { .. }),
+                            ) => callable.clone(),
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "waker drop glue",
+                                    "a RawWakerVTable with a function-pointer drop entry",
+                                    vtable.kind_name(),
+                                ));
+                            }
                         };
-                        let drop_name = drop_name.clone();
+                        let (drop_name, call_args) = match &drop_callable {
+                            Value::FnPtr(name) => (name.clone(), vec![data]),
+                            Value::Closure { def, .. } => {
+                                let env = if self
+                                    .closure_body_takes_env_by_value(def)
+                                {
+                                    drop_callable.clone()
+                                } else {
+                                    Value::Ref(RefTarget::value(
+                                        drop_callable.clone(),
+                                    ))
+                                };
+                                (def.clone(), vec![env, data])
+                            }
+                            _ => unreachable!(
+                                "waker vtable drop entry is a callable only"
+                            ),
+                        };
                         let callee = self.program.get(&drop_name).ok_or_else(|| {
                             InterpError::UnknownFunction {
                                 name: drop_name.clone(),
@@ -1305,10 +1400,12 @@ impl<'a> Interpreter<'a> {
                         }
                         let (arg_count, local_count) =
                             (callee.arg_count, callee.local_count());
-                        if arg_count != 1 || local_count < 2 {
+                        if arg_count != call_args.len()
+                            || local_count < 1 + call_args.len()
+                        {
                             return Err(InterpError::type_mismatch(
                                 format!("waker vtable drop entry `{drop_name}`"),
-                                "one argument",
+                                format!("{} argument(s)", call_args.len()),
                                 format!("{arg_count} argument(s)"),
                             ));
                         }
@@ -1320,11 +1417,13 @@ impl<'a> Interpreter<'a> {
                             // the same session kind. A panic in it
                             // propagates as the consuming builtin's
                             // own panic.
-                            self.call_to_completion(frames, &drop_name, vec![data])?;
+                            self.call_to_completion(frames, &drop_name, call_args)?;
                             continue;
                         }
                         let mut locals = vec![Value::Uninit; local_count];
-                        locals[1] = data;
+                        for (index, arg) in call_args.into_iter().enumerate() {
+                            locals[1 + index] = arg;
+                        }
                         let frame_id = self.fresh_frame_id();
                         self.register_frame_base(&frames, frame_id, &drop_name);
                         self.drop_continuations.push(DropContinuation {
@@ -1460,6 +1559,7 @@ impl<'a> Interpreter<'a> {
                                 continue;
                             }
                             let release = GlueSession {
+                                owns_root_alloc: false,
                                 root: RefTarget::Alloc {
                                     id,
                                     projection: Vec::new(),
@@ -1473,6 +1573,7 @@ impl<'a> Interpreter<'a> {
                                 continue 'sessions;
                             }
                             let nested = GlueSession {
+                                owns_root_alloc: false,
                                 root: RefTarget::Alloc {
                                     id,
                                     projection: vec![RefProj::Field(2)],
@@ -1538,6 +1639,7 @@ impl<'a> Interpreter<'a> {
                             }
                         };
                         let nested = GlueSession {
+                            owns_root_alloc: plan_owns_box(&glue.root, &glue.adts),
                             root: pointee_root,
                             work: vec![(Vec::new(), glue.root)],
                             adts: glue.adts,
@@ -1600,6 +1702,7 @@ impl<'a> Interpreter<'a> {
                                 // box's field 0 denoting the
                                 // pointee did for the builtin form.
                                 let nested = GlueSession {
+                                    owns_root_alloc: plan_owns_box(&*pointee, &active.adts),
                                     root: target.clone(),
                                     work: vec![(Vec::new(), *pointee)],
                                     adts: active.adts.clone(),
@@ -1628,6 +1731,7 @@ impl<'a> Interpreter<'a> {
                                     unreachable!("base shape checked");
                                 };
                                 let nested = GlueSession {
+                                    owns_root_alloc: plan_owns_box(&*pointee, &active.adts),
                                     root: target.clone(),
                                     work: vec![(Vec::new(), *pointee)],
                                     adts: active.adts.clone(),
@@ -1699,6 +1803,7 @@ impl<'a> Interpreter<'a> {
                         // against the allocation in a nested session.
                         let id = self.alloc_insert(value);
                         let nested = GlueSession {
+                            owns_root_alloc: false,
                             root: RefTarget::Alloc {
                                 id,
                                 projection: Vec::new(),
@@ -1834,7 +1939,20 @@ impl<'a> Interpreter<'a> {
                 // nothing, and freeing its pointee would cut the
                 // owner's storage from under it.
                 if let Some((id, projection)) = box_alloc_pointer(&value) {
-                    if projection_is_base(&projection) {
+                    // Only a session whose root plan is a box's
+                    // own glue owns the allocation: a place of
+                    // any other type can hold the same box shape
+                    // without owning it -- a `Pin<&mut T>`
+                    // argument, say, is a one-field aggregate
+                    // holding a base reference into an allocation
+                    // the caller's `Box` owns, and dropping the
+                    // argument must not free the caller's storage
+                    // (a later poll of the same future would then
+                    // read a freed allocation). The plan, not the
+                    // value's shape, is the ownership evidence:
+                    // it is what `GlueSession::owns_root_alloc`
+                    // records.
+                    if projection_is_base(&projection) && active.owns_root_alloc {
                         self.note_box_free(frames, &value);
                         self.free_alloc(id);
                     }
