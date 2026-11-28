@@ -69,8 +69,10 @@ impl<'a> Interpreter<'a> {
         let target = self.deref_value(frames, base).ok()?;
         // A base denoting an element position denotes that
         // element of a container, not a scalar's storage: the
-        // sibling readings' shape.
-        if target_ends_at_element(&target) {
+        // sibling readings' shape. The position may be entered
+        // through a wrapper's field steps (an element-entry
+        // suffix) as well as ending at the index step itself.
+        if self.base_denotes_element_span(frames, &target, *len) {
             return None;
         }
         let scalar = self.read_resolved(frames, &target).ok()?;
@@ -819,6 +821,30 @@ impl<'a> Interpreter<'a> {
         !target_is_the_sequence
     }
 
+    /// Whether a fat pointer of length `fat_len` whose base
+    /// resolves to `target` denotes the span of elements from
+    /// the element the base denotes on, rather than that
+    /// element itself: the base ends at an element position --
+    /// an index step last, or an element-entry suffix (wrapper
+    /// field steps after the index step: the shape a
+    /// transparent-wrapper subslice formation leaves, a `CStr`
+    /// range index above all) that
+    /// [`Self::entry_suffix_denotes_elements`] judges to
+    /// denote the container's elements. A consumer that would
+    /// resolve such a base to the entered element reads a span
+    /// of any length as its first element alone, so consumers
+    /// that judge a base by the shape it denotes consult this
+    /// reading before following or claiming the base.
+    pub(super) fn base_denotes_element_span(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        fat_len: u128,
+    ) -> bool {
+        target_ends_at_element(target)
+            || self.entry_suffix_denotes_elements(frames, target, fat_len)
+    }
+
     /// The elements a fat pointer denotes when its base target
     /// ends in an element-entry suffix (see
     /// [`element_entry_suffix`]): the elements of the container
@@ -827,7 +853,9 @@ impl<'a> Interpreter<'a> {
     /// value (the first entered element alone) cannot give.
     /// `Ok(None)` when the base does not have that shape, or its
     /// container is not a sequence the entry can be distributed
-    /// over (the caller keeps its plain reading).
+    /// over (the caller keeps its plain reading). The containers
+    /// the entry distributes over are the aggregate forms and
+    /// the byte-string forms.
     fn entered_sequence_elements(
         &self,
         frames: &[Frame],
@@ -881,6 +909,16 @@ impl<'a> Interpreter<'a> {
                     stored: Cow::Owned(stored),
                     len: want,
                 }))
+            }
+            // A byte-string container (the storage form a
+            // boxed byte sequence takes): its elements are its
+            // bytes, each entered by the suffix's field steps
+            // as the aggregate containers' elements are.
+            Value::Bytes(bytes) => {
+                entered_byte_elements(&bytes, start, want, &entry)
+            }
+            Value::Str(text) => {
+                entered_byte_elements(text.as_bytes(), start, want, &entry)
             }
             _ => Ok(None),
         }
@@ -1740,6 +1778,33 @@ impl<'a> Interpreter<'a> {
         out.resize(count, Value::Uninit);
         Value::Tuple(out)
     }
+}
+
+/// The entered elements of a byte-string container for
+/// [`Interpreter::entered_sequence_elements`]: the container's
+/// bytes from `start` on, `want` of them, each entered by the
+/// suffix's field steps as the aggregate containers' elements
+/// are. `Ok(None)` when the container's span from `start` does
+/// not cover `want` elements.
+fn entered_byte_elements(
+    bytes: &[u8],
+    start: usize,
+    want: usize,
+    entry: &[RefProj],
+) -> InterpResult<Option<SliceElems<'static>>> {
+    if bytes.len() < start || bytes.len() - start < want {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(want);
+    for byte in &bytes[start..start + want] {
+        out.push(project_value(
+            Value::Uint(u128::from(*byte)),
+            entry,
+            "slice elements",
+            "fat pointer base",
+        )?);
+    }
+    Ok(Some(SliceElems::Values(Cow::Owned(out))))
 }
 
 /// The elements a slice-like value denotes, borrowed where the

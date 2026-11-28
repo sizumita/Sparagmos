@@ -2014,3 +2014,75 @@ fn run_mode_arc_cstr_from_boxed_cstr_reads_its_bytes() {
         "bytes=[97, 98, 99]\nfirst=97\ndebug=\"abc\"\nfrom_ref_src=[120, 121] len=2\nempty=0 1\ncount=1\n",
     );
 }
+
+const CSTR_RANGE_INDEX_SUBSLICE_SRC: &str = r#"
+use std::ffi::CString;
+fn main() {
+    let c = CString::new("abc").unwrap();
+    let s = (*c)[1..].to_bytes();
+    println!("len={}", s.len());
+    println!("idx={}", s[0]);
+    println!("sum={}", s.iter().map(|x| *x as u32).sum::<u32>());
+    println!("dbg={:?}", s);
+    println!("first={:?} get1={:?} last={:?}", s.first(), s.get(1), s.last());
+    let v: Vec<u8> = s.iter().copied().collect();
+    println!("collect={:?}", v);
+    println!("with_nul={:?}", (*c)[1..].to_bytes_with_nul());
+    println!("full={}", (*c)[0..].to_bytes().iter().map(|x| *x as u32).sum::<u32>());
+    let e = (*c)[3..].to_bytes();
+    println!("empty={} {:?}", e.len(), e);
+}
+"#;
+
+#[test]
+fn run_mode_cstr_range_index_subslice_reads_whole_span() {
+    // A `CStr` range index (`(*c)[1..]`) builds its result by
+    // casting a pointer into the owner's buffer: the fat
+    // pointer the `to_bytes` / `to_bytes_with_nul` projections
+    // hand back has a base denoting the buffer's element at
+    // the range start, entered through the wrapper's field
+    // step (an element-entry suffix). Length and single-index
+    // reads trust the carried length and the entered position,
+    // so they were always right; the span consumers judged
+    // the base by its last step alone and read the entered
+    // element itself -- iteration summed just the first byte
+    // (and read the rest as the scalar's own bytes), and the
+    // Debug list stopped on the scalar. The span readings now
+    // recognise the entry suffix, so every consumer reads the
+    // whole span.
+    run_ok(
+        "cstr-range-index-subslice",
+        CSTR_RANGE_INDEX_SUBSLICE_SRC,
+        "len=2\nidx=98\nsum=197\ndbg=[98, 99]\nfirst=Some(98) get1=Some(99) last=Some(99)\ncollect=[98, 99]\nwith_nul=[98, 99, 0]\nfull=294\nempty=0 []\n",
+    );
+}
+
+const BOXED_CSTR_RANGE_INDEX_SUBSLICE_SRC: &str = r#"
+use std::ffi::CString;
+fn main() {
+    let b = CString::new("abc").unwrap().into_boxed_c_str();
+    let s = b[1..].to_bytes();
+    println!("len={}", s.len());
+    println!("sum={}", s.iter().map(|x| *x as u32).sum::<u32>());
+    println!("dbg={:?}", s);
+    let v: Vec<u8> = s.iter().copied().collect();
+    println!("collect={:?}", v);
+    println!("with_nul={:?}", b[1..].to_bytes_with_nul());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_cstr_range_index_subslice_reads_whole_span() {
+    // The same range index over a `Box<CStr>`: the box's
+    // storage form is the byte string itself, so the entered
+    // span's container is a byte value rather than an
+    // aggregate of elements. The entered-element reading
+    // distributes the entry over byte containers too, so the
+    // boxed subslice iterates and formats as the bare
+    // `CString` one does.
+    run_ok(
+        "boxed-cstr-range-index-subslice",
+        BOXED_CSTR_RANGE_INDEX_SUBSLICE_SRC,
+        "len=2\nsum=197\ndbg=[98, 99]\ncollect=[98, 99]\nwith_nul=[98, 99, 0]\n",
+    );
+}
