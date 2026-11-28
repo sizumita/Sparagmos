@@ -888,6 +888,21 @@ impl<'a> Interpreter<'a> {
         // that are not dispatches through the receiver (a free
         // function taking a `&dyn` argument is the common shape),
         // which keep the direct lookup below.
+        // A call naming an `Fn`-family trait method by its
+        // plain trait path, which is not a vtable dispatch, is
+        // served by the `CallTrait` receiver dispatch on its
+        // (receiver, argument tuple) shape instead of by the
+        // one instance body registered under the plain name
+        // (see `try_plain_fn_trait_call`); when that dispatch
+        // does not serve the receiver, the registered body is
+        // entered as before.
+        if self.virtual_call_target(func, &arg_values).is_none() {
+            if let Some(result) =
+                self.try_plain_fn_trait_call(frames, func, &arg_values, destination, target)
+            {
+                return result;
+            }
+        }
         let callee = match self.virtual_call_target(func, &arg_values) {
             Some(vt) => match vt {
                 // A vtable call: dispatch to the concrete type's

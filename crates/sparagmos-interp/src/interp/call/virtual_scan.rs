@@ -7,6 +7,7 @@ use super::lookup::{
     parse_impl_key,
 };
 use super::ref_shaped_receiver;
+use super::unwrap_callable_wrapper;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::*;
 use crate::value::{RefProj, RefTarget, Value};
@@ -211,7 +212,12 @@ impl<'a> Interpreter<'a> {
             FnCallKind::AsyncCallMut => ("std::ops::AsyncFnMut", "async_call_mut"),
             FnCallKind::AsyncCallOnce => ("std::ops::AsyncFnOnce", "async_call_once"),
         };
-        let impl_name = self.scan_virtual_impl(concrete, trait_path, method)?;
+        let impl_name = self
+            .scan_virtual_impl(concrete, trait_path, method)
+            .or_else(|| {
+                self.scan_virtual_impl_by_arity(concrete, trait_path, method, arg_values.len())
+            })
+            .or_else(|| self.plain_trait_instance(concrete, trait_path, method))?;
         let wants_ref = matches!(
             self.program
                 .get(&impl_name)
@@ -233,6 +239,297 @@ impl<'a> Interpreter<'a> {
             destination,
             target,
         ))
+    }
+
+    /// The body registered under the plain trait-method path
+    /// itself (`std::ops::Fn::call` and siblings), when that
+    /// one registered instance's declared receiver type names
+    /// exactly `concrete`: static demand registers the first
+    /// demanded instance of a trait method under the plain
+    /// name, and when the instance is this concrete type's own
+    /// impl, its body is the callable's body even though no
+    /// impl key names it. An instance of any other type is not
+    /// this type's impl and never serves.
+    pub(crate) fn plain_trait_instance(
+        &self,
+        concrete: &str,
+        trait_path: &str,
+        method: &str,
+    ) -> Option<String> {
+        let mut plains = vec![format!("{trait_path}::{method}")];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            plains.push(format!("core::{rest}::{method}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            plains.push(format!("std::{rest}::{method}"));
+        }
+        for plain in plains {
+            let Some(body) = self.program.get(&plain) else {
+                continue;
+            };
+            let mut ty = body.local_tys.get(1)?;
+            while let Ty::Ref(inner) = ty {
+                ty = inner;
+            }
+            // The registered receiver type is the generic-free
+            // `Ty::Adt` rendering, while a `dyn` receiver's
+            // concrete tag spells the full generic arguments:
+            // the base name is the identity the two share.
+            let base = concrete.split('<').next().unwrap_or(concrete);
+            if matches!(ty, Ty::Adt(name) if name == base) {
+                return Some(plain);
+            }
+        }
+        None
+    }
+
+    /// The candidates for an `Fn`-family impl of `trait_path`
+    /// for `concrete` whose converted body's argument-tuple
+    /// parameter has exactly `argc` elements, when exactly one
+    /// such candidate exists. A type can carry several impls of
+    /// one `Fn` trait, one per argument tuple (the hand-written
+    /// overload sets `unboxed_closures` permits), which the
+    /// uniqueness scan above cannot tell apart: the call's own
+    /// argument count is what separates them, and the impl
+    /// body's declared tuple parameter is where that count is
+    /// recorded. Bodies that are not converted cannot be
+    /// arity-checked (or run), so they never serve here.
+    pub(crate) fn scan_virtual_impl_by_arity(
+        &self,
+        concrete: &str,
+        trait_path: &str,
+        method: &str,
+        argc: usize,
+    ) -> Option<String> {
+        let mut paths = vec![trait_path.to_string()];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            paths.push(format!("core::{rest}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            paths.push(format!("std::{rest}"));
+        }
+        let mut found: Option<String> = None;
+        for key in self
+            .program
+            .functions
+            .keys()
+            .chain(self.program.unconverted.keys())
+        {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            let Some((self_part, trait_base, key_method)) = (if base.contains("::<impl ") {
+                parse_impl_block_key(base)
+            } else {
+                parse_impl_key(base)
+            }) else {
+                continue;
+            };
+            if key_method != method
+                || !paths.iter().any(|p| p == &trait_base)
+                || !impl_self_matches(&self_part, concrete)
+            {
+                continue;
+            }
+            let Some(impl_body) = self.program.get(key) else {
+                continue;
+            };
+            let arity = match impl_body.local_tys.get(2) {
+                Some(Ty::Tuple(items)) => items.len(),
+                Some(Ty::Unit) => 0,
+                _ => continue,
+            };
+            if arity != argc {
+                continue;
+            }
+            if found.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(key.clone());
+        }
+        found
+    }
+
+    /// The concrete ADT type a `Fn`-trait call's receiver
+    /// operand declares, when it declares one: the receiver
+    /// place's local type, peeled through the reference a
+    /// `call` / `call_mut` receiver carries (a lone `Deref`
+    /// projection names the same pointee). The value model
+    /// carries no type on an ADT value itself, so the declared
+    /// type is the only name a direct (non-`dyn`) receiver's
+    /// hand-written `Fn` impl can be looked up by. `None` for
+    /// every other receiver shape, whose dispatch keeps its
+    /// usual outcome.
+    pub(crate) fn fn_receiver_concrete(&self, body: &Body, receiver: &Operand) -> Option<String> {
+        let (Operand::Copy(place) | Operand::Move(place)) = receiver else {
+            return None;
+        };
+        if !(place.projection.is_empty()
+            || matches!(place.projection.as_slice(), [ProjectionElem::Deref]))
+        {
+            return None;
+        }
+        let mut ty = body.local_tys.get(place.local.0)?;
+        while let Ty::Ref(inner) = ty {
+            ty = inner;
+        }
+        match ty {
+            Ty::Adt(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Dispatch a call that names an `Fn` / `FnMut` / `FnOnce`
+    /// trait method by its plain trait path (a function-item
+    /// value such as `Fn::<()>::call` taken and called through
+    /// a function pointer, or a generic body the converter kept
+    /// in generic form). The body registered under the plain
+    /// name is one monomorphic instance of the method, which
+    /// need not be the receiver's: the call's own shape --
+    /// (receiver, argument tuple) -- is exactly the `CallTrait`
+    /// shape, so the call is served by the same receiver
+    /// dispatch instead of by entering that instance. `None`
+    /// when the receiver does not resolve to a callable this
+    /// dispatch serves, leaving the caller to enter the
+    /// registered body as before.
+    pub(crate) fn try_plain_fn_trait_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: &[Value],
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> Option<InterpResult<()>> {
+        let kind = plain_fn_trait_kind(func)?;
+        if arg_values.len() != 2 {
+            return None;
+        }
+        let args = match &arg_values[1] {
+            Value::Tuple(items) => items.clone(),
+            Value::Unit => Vec::new(),
+            _ => return None,
+        };
+        let recv = arg_values[0].clone();
+        let mut dyn_concrete: Option<String> = None;
+        let (callable, env_ref) = match kind {
+            FnCallKind::CallOnce => match recv {
+                Value::DynRef { .. } => {
+                    if let Value::DynRef { concrete, .. } = &recv {
+                        dyn_concrete = Some(concrete.clone());
+                    }
+                    self.dyn_callable(frames, &recv).ok()?
+                }
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    let env = Value::Ref(RefTarget::value(recv.clone()));
+                    self.callable_through_refs(frames, recv, env).ok()?
+                }
+                value => {
+                    let (value, unwrapped) = unwrap_callable_wrapper(value);
+                    let env = if unwrapped {
+                        Value::Ref(RefTarget::value(value.clone()))
+                    } else if matches!(
+                        &value,
+                        Value::Closure { def, .. }
+                            if self.closure_body_takes_env_by_value(def)
+                    ) {
+                        value.clone()
+                    } else {
+                        Value::Ref(RefTarget::value(value.clone()))
+                    };
+                    (value, env)
+                }
+            },
+            FnCallKind::Call | FnCallKind::CallMut => match recv {
+                Value::DynRef { .. } => {
+                    if let Value::DynRef { concrete, .. } = &recv {
+                        dyn_concrete = Some(concrete.clone());
+                    }
+                    self.dyn_callable(frames, &recv).ok()?
+                }
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    let resolved = self.deref_value(frames, &recv).ok()?;
+                    let mut value = self.read_resolved(frames, &resolved).ok()?;
+                    let mut direct_ref = recv.clone();
+                    for _ in 0..8 {
+                        match &value {
+                            Value::Ref(_) | Value::FatRef { .. } => {
+                                let t = self.deref_value(frames, &value).ok()?;
+                                let v = self.read_resolved(frames, &t).ok()?;
+                                direct_ref = value.clone();
+                                value = v;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if matches!(value, Value::DynRef { .. }) {
+                        if let Value::DynRef { concrete, .. } = &value {
+                            dyn_concrete = Some(concrete.clone());
+                        }
+                        self.dyn_callable(frames, &value).ok()?
+                    } else {
+                        let (value, unwrapped) = unwrap_callable_wrapper(value);
+                        if unwrapped {
+                            let env = Value::Ref(RefTarget::value(value.clone()));
+                            (value, env)
+                        } else {
+                            (value, direct_ref)
+                        }
+                    }
+                }
+                value => {
+                    let (value, _unwrapped) = unwrap_callable_wrapper(value);
+                    let env = Value::Ref(RefTarget::value(value.clone()));
+                    (value, env)
+                }
+            },
+            FnCallKind::AsyncCall | FnCallKind::AsyncCallMut | FnCallKind::AsyncCallOnce => {
+                return None
+            }
+        };
+        match callable {
+            Value::Closure { def, .. } => {
+                // An async closure's call belongs to the
+                // `AsyncFn` machinery, not this dispatch.
+                if self.program.async_closure_captures.contains_key(&def) {
+                    return None;
+                }
+                let mut full = vec![env_ref];
+                full.extend(args);
+                Some(self.start_call(frames, &def, full, destination, target))
+            }
+            Value::FnPtr(name) => {
+                if plain_fn_trait_kind(&name).is_some() {
+                    None
+                } else {
+                    Some(self.start_call(frames, &name, args, destination, target))
+                }
+            }
+            other => {
+                if let Some(exposed) = self.exposed_callable(&other) {
+                    return match exposed {
+                        Value::Closure { def, .. } => {
+                            let mut full = vec![env_ref];
+                            full.extend(args);
+                            Some(self.start_call(frames, &def, full, destination, target))
+                        }
+                        Value::FnPtr(name) => {
+                            Some(self.start_call(frames, &name, args, destination, target))
+                        }
+                        _ => None,
+                    };
+                }
+                let concrete = dyn_concrete?;
+                self.dyn_adt_fn_call(
+                    frames,
+                    kind,
+                    &concrete,
+                    other,
+                    env_ref,
+                    args,
+                    destination,
+                    target,
+                )
+            }
+        }
     }
 
     pub(crate) fn dyn_callable(
@@ -417,5 +714,23 @@ impl<'a> Interpreter<'a> {
             }
         }
         Ok(Some(value.clone()))
+    }
+}
+
+/// The `Fn`-family call kind a plain trait-method path names
+/// (`std::ops::Fn::call` and its `core::` spelling, and the
+/// `FnMut` / `FnOnce` siblings), when the path is exactly the
+/// trait method's own -- a resolved instance key
+/// (`<T as Trait>::call`) is not a plain path and returns
+/// `None`.
+pub(crate) fn plain_fn_trait_kind(func: &str) -> Option<FnCallKind> {
+    let base = func.split('#').next().unwrap_or(func);
+    match base {
+        "std::ops::Fn::call" | "core::ops::Fn::call" => Some(FnCallKind::Call),
+        "std::ops::FnMut::call_mut" | "core::ops::FnMut::call_mut" => Some(FnCallKind::CallMut),
+        "std::ops::FnOnce::call_once" | "core::ops::FnOnce::call_once" => {
+            Some(FnCallKind::CallOnce)
+        }
+        _ => None,
     }
 }

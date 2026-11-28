@@ -1706,11 +1706,47 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         other => {
-                            // A dyn receiver whose concrete value
-                            // is an ADT value: a hand-written Fn
-                            // impl on that type, when the program
-                            // has its body, is the callable.
-                            if let Some(concrete) = dyn_concrete.clone() {
+                            // A callable that arrived as a plain
+                            // integer: a function value an earlier
+                            // cast exposed at that integer (see
+                            // `exposed_callable`) is the callable.
+                            if let Some(exposed) = self.exposed_callable(&other) {
+                                match exposed {
+                                    Value::Closure { def, .. } => {
+                                        let mut full = vec![env_ref];
+                                        full.extend(arg_values);
+                                        self.start_call(frames, &def, full, destination, *target)?;
+                                    }
+                                    Value::FnPtr(name) => {
+                                        self.start_call_stamped(
+                                            frames,
+                                            &name,
+                                            arg_values,
+                                            edge_stamp,
+                                            shim_stamp,
+                                            &destination,
+                                            *target,
+                                        )?;
+                                    }
+                                    _ => {
+                                        return Err(InterpError::type_mismatch(
+                                            "Fn trait call",
+                                            "callable value",
+                                            other.kind_name(),
+                                        ));
+                                    }
+                                }
+                            } else if let Some(concrete) = dyn_concrete
+                                .clone()
+                                .or_else(|| self.fn_receiver_concrete(body, receiver))
+                            {
+                                // A dyn receiver whose concrete
+                                // value is an ADT value, or a
+                                // direct receiver whose declared
+                                // type is an ADT: a hand-written
+                                // Fn impl on that type, when the
+                                // program has its body, is the
+                                // callable.
                                 if let Some(result) = self.dyn_adt_fn_call(
                                     frames,
                                     *kind,
