@@ -577,9 +577,22 @@ impl<'a> Converter<'a> {
         // model's consumers read as bytes as readily as as text
         // (`PtrMetadata` reports its byte length, byte reads go
         // through the same storage), so the value carries over.
+        // The same carry-over holds for a pointer to a
+        // DST-wrapper struct whose tail the length metadata
+        // describes (a `str` or slice tail): the fat value
+        // itself under the wrapper's declared type, exactly
+        // the identity the fat <-> DST-wrapper arm below
+        // judges for place operands -- a constant operand
+        // reaches that arm with no recorded source type, so
+        // the judgement is made here, where the constant's
+        // own form names it. A `dyn` tail stays excluded: its
+        // metadata is a vtable, which a string constant does
+        // not carry.
         if matches!(v, ir::Operand::Constant(ir::Constant::Str(_)))
-            && is_fat_ptr_ty(target)
-            && matches!(ptr_pointee(target), Some(t) if is_str_or_byte_slice(t))
+            && ((is_fat_ptr_ty(target)
+                && matches!(ptr_pointee(target), Some(t) if is_str_or_byte_slice(t)))
+                || (matches!(ptr_pointee(target), Some(mir::Ty::Adt(..)))
+                    && self.fat_tail_meta(target) == Some(ir::FatMeta::Len)))
         {
             return ir::Rvalue::Use(v.clone());
         }
