@@ -1632,6 +1632,7 @@ use std::ffi::{CStr, CString};
 fn main() {
     let b: Box<CStr> = Box::from(CString::new("abc").unwrap());
     println!("bytes_len={}", b.to_bytes().len());
+    println!("first={}", b.to_bytes()[0]);
     println!("with_nul={:?}", b.to_bytes_with_nul());
     println!("debug={:?}", b);
     let d: &CStr = &b;
@@ -1661,7 +1662,7 @@ fn run_mode_boxed_cstr_from_cstring_keeps_its_length() {
     run_ok(
         "boxed-cstr-from-cstring",
         BOXED_CSTR_FROM_CSTRING_SRC,
-        "bytes_len=3\nwith_nul=[97, 98, 99, 0]\ndebug=\"abc\"\nderef_debug=\"abc\"\neq=true ord=Less\nempty=0 1\nnonascii=[120, 128, 121, 0]\nlossy_len=3\n",
+        "bytes_len=3\nfirst=97\nwith_nul=[97, 98, 99, 0]\ndebug=\"abc\"\nderef_debug=\"abc\"\neq=true ord=Less\nempty=0 1\nnonascii=[120, 128, 121, 0]\nlossy_len=3\n",
     );
 }
 
@@ -1691,5 +1692,70 @@ fn run_mode_boxed_cstr_from_cow_keeps_its_length() {
         "boxed-cstr-from-cow",
         BOXED_CSTR_FROM_COW_SRC,
         "owned=3 4\nborrowed=3 4\nfrom_ref=3 4\n",
+    );
+}
+
+const INTO_BOXED_CSTR_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+fn main() {
+    let b = CString::new("hello").unwrap().into_boxed_c_str();
+    println!("bytes={:?}", b.to_bytes());
+    println!("with_nul={:?}", b.to_bytes_with_nul());
+    println!("debug={:?}", b);
+    println!("first={} len={}", b.to_bytes()[0], b.to_bytes().len());
+    let d: &CStr = &b;
+    println!("deref={:?}", d.to_bytes());
+    let e = CString::new("").unwrap().into_boxed_c_str();
+    println!("empty={} {}", e.to_bytes().len(), e.to_bytes_with_nul().len());
+    let n = unsafe { CString::from_vec_unchecked(vec![b'x', 0x80, b'y']) };
+    let nb = n.into_boxed_c_str();
+    println!("nonascii={:?}", nb.to_bytes_with_nul());
+    println!("lossy_len={}", nb.to_string_lossy().chars().count());
+    let c = CString::new("abd").unwrap().into_boxed_c_str();
+    println!("eq={} ord={:?}", b == CString::new("hello").unwrap().into_boxed_c_str(), b.cmp(&c));
+}
+"#;
+
+#[test]
+fn run_mode_cstring_into_boxed_c_str_keeps_its_bytes() {
+    // `CString::into_boxed_c_str` has no MIR body: the box
+    // holds the C string's bytes themselves, terminator
+    // included. Storing the fat reference instead left the
+    // place consumers (indexing `to_bytes()`, iterating
+    // it) projecting into a reference value, while the
+    // length-trusting and byte-scanning consumers read
+    // through it and hid the defect.
+    run_ok(
+        "cstring-into-boxed-cstr",
+        INTO_BOXED_CSTR_SRC,
+        "bytes=[104, 101, 108, 108, 111]\nwith_nul=[104, 101, 108, 108, 111, 0]\ndebug=\"hello\"\nfirst=104 len=5\nderef=[104, 101, 108, 108, 111]\nempty=0 1\nnonascii=[120, 128, 121, 0]\nlossy_len=3\neq=true ord=Greater\n",
+    );
+}
+
+const CSTRING_FROM_BOXED_CSTR_SRC: &str = r#"
+use std::ffi::CString;
+fn main() {
+    let b = CString::new("world").unwrap().into_boxed_c_str();
+    let back: CString = CString::from(b);
+    println!("back={:?}", back.to_bytes());
+    println!("debug={:?}", back);
+    let b2: Box<std::ffi::CStr> = Box::from(CString::new("abc").unwrap());
+    let back2: CString = b2.into();
+    println!("back2={:?} len={}", back2.to_bytes(), back2.to_bytes_with_nul().len());
+    let empty: CString = CString::from(CString::new("").unwrap().into_boxed_c_str());
+    println!("empty={} {}", empty.to_bytes().len(), empty.to_bytes_with_nul().len());
+}
+"#;
+
+#[test]
+fn run_mode_cstring_from_boxed_cstr_round_trips() {
+    // `CString: From<Box<CStr>>` is `into_c_string`: the
+    // owned C string over the box's bytes. The generic
+    // conversion had no arm for it and stopped as not
+    // runtime-supported.
+    run_ok(
+        "cstring-from-boxed-cstr",
+        CSTRING_FROM_BOXED_CSTR_SRC,
+        "back=[119, 111, 114, 108, 100]\ndebug=\"world\"\nback2=[97, 98, 99] len=4\nempty=0 1\n",
     );
 }

@@ -515,6 +515,26 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The `Box<CStr>` over the C string a fat reference
+    /// denotes: the bytes themselves, terminator included,
+    /// in a fresh box allocation. A stored fat reference
+    /// is not a place the projection engine can index
+    /// through, so the byte value is what the box's
+    /// consumers (indexing, iteration, formatting) read,
+    /// as for a boxed byte slice.
+    pub(super) fn boxed_c_str(
+        &self,
+        frames: &[Frame],
+        fat: &Value,
+    ) -> InterpResult<Value> {
+        let bytes = self.arg_bytes(frames, fat)?;
+        let boxed = self.new_box(Value::Bytes(bytes));
+        if let Some(ty) = ty_from_tag("std::ffi::CStr") {
+            self.record_box_ty(&boxed, ty);
+        }
+        Ok(boxed)
+    }
+
     /// The bytes a `&CStr` receiver denotes, without the
     /// terminating NUL: the receiver is the fat byte slice
     /// the C string was built from, terminator included, so
@@ -559,6 +579,7 @@ pub(crate) fn ffi_lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::ffi::CString::from_raw" => Builtin::CStringFromRaw,
         "std::ffi::CString::into_string" => Builtin::CStringIntoString,
+        "std::ffi::CString::into_boxed_c_str" => Builtin::CStringIntoBoxedCStr,
         "std::ffi::OsStr::to_ascii_lowercase" => Builtin::OsStrToAsciiLowercase,
         "std::ffi::OsString::to_string_lossy" => Builtin::ToStringLossy,
         "std::ffi::OsString::into_boxed_os_str" => Builtin::OsStringIntoBoxedOsStr,

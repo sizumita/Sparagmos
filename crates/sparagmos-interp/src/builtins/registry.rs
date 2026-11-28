@@ -1833,6 +1833,10 @@ pub enum Builtin {
     /// error carries the string back (`IntoStringError {
     /// inner, error }`).
     CStringIntoString,
+    /// `CString::into_boxed_c_str` (no MIR body): the box
+    /// holds the C string's bytes themselves, terminator
+    /// included (see `boxed_c_str`).
+    CStringIntoBoxedCStr,
     /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8` and
     /// `__rust_alloc_zeroed`: a fresh block in the allocation
     /// store, named by a new allocation id. The uninitialised

@@ -4228,6 +4228,15 @@ impl<'a> Interpreter<'a> {
                     }),
                 })
             }
+            Builtin::CStringIntoBoxedCStr => {
+                arity(1)?;
+                let receiver = Value::Ref(RefTarget::Value(
+                    Box::new(vals[0].clone()),
+                    Vec::new(),
+                ));
+                let fat = self.c_string_deref(frames, &receiver)?;
+                self.boxed_c_str(frames, &fat)
+            }
             Builtin::CStringFromRaw => {
                 arity(1)?;
                 // The real body recomputes the length with
@@ -4863,6 +4872,33 @@ impl<'a> Interpreter<'a> {
                     } else {
                         self.boxed_slice_value(value, pointee_ty, "From::from to Box<[T]>")
                     }
+                } else if target == "std::ffi::CString"
+                    && (generic_first_arg(source, "std::boxed::Box<")
+                        == Some("std::ffi::CStr")
+                        || generic_first_arg(
+                            source,
+                            "alloc::boxed::Box<",
+                        ) == Some("std::ffi::CStr"))
+                {
+                    // `CString: From<Box<CStr>>` is
+                    // `into_c_string`: the owned C string over
+                    // the box's bytes, the terminator dropped
+                    // here and rebuilt by `c_string_value`.
+                    let pointee = self
+                        .box_pointee(frames, &value)
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "From::from to CString",
+                                "a boxed C string",
+                                value.kind_name(),
+                            )
+                        })?;
+                    let mut bytes =
+                        self.arg_bytes(frames, &pointee)?;
+                    if bytes.last() == Some(&0) {
+                        bytes.pop();
+                    }
+                    Ok(self.c_string_value(bytes))
                 } else if (target.starts_with("std::boxed::Box<")
                     || target.starts_with("alloc::boxed::Box<"))
                     && (generic_first_arg(target, "std::boxed::Box<")
@@ -4875,10 +4911,9 @@ impl<'a> Interpreter<'a> {
                 {
                     // `From<CString> for Box<CStr>` (and the
                     // owned Cow source) is `into_boxed_c_str`:
-                    // the box holds the C string's fat slice
-                    // itself -- the shape `CString::deref`
-                    // produces and the shape the `&CStr` source
-                    // below boxes -- not the `CString` aggregate.
+                    // the box holds the C string's bytes
+                    // themselves (see `boxed_c_str`) -- not
+                    // the `CString` aggregate.
                     // Boxing the aggregate (the catch-all `Box`
                     // arm's verbatim move) would leave the
                     // length-trusting consumers (`to_bytes`,
@@ -4905,13 +4940,7 @@ impl<'a> Interpreter<'a> {
                                     fields.pop().expect("len checked");
                                 let fat = self
                                     .resolve_value(frames, &held)?;
-                                let boxed = self.new_box(fat);
-                                if let Some(ty) = ty_from_tag(
-                                    "std::ffi::CStr",
-                                ) {
-                                    self.record_box_ty(&boxed, ty);
-                                }
-                                return Ok(boxed);
+                                return self.boxed_c_str(frames, &fat);
                             }
                             Value::Enum {
                                 variant: 1,
@@ -4933,13 +4962,9 @@ impl<'a> Interpreter<'a> {
                         Box::new(owned),
                         Vec::new(),
                     ));
-                    let pointee =
+                    let fat =
                         self.c_string_deref(frames, &receiver)?;
-                    let boxed = self.new_box(pointee);
-                    if let Some(ty) = ty_from_tag("std::ffi::CStr") {
-                        self.record_box_ty(&boxed, ty);
-                    }
-                    Ok(boxed)
+                    self.boxed_c_str(frames, &fat)
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
                     let boxed = self.new_box(value);
