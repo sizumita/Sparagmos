@@ -1138,3 +1138,111 @@ fn run_mode_slice_iter_write_through_cell_vec_literal() {
         "iter 7 7\nref 9 9\nslice 3 3 z\nrefcell 2 9\n",
     );
 }
+
+const SLICE_ITER_CELL_WRITE_FIELD_VEC_SRC: &str = r#"
+use std::cell::Cell;
+
+struct First {
+    v: Vec<Cell<i32>>,
+}
+
+struct Second {
+    tag: i32,
+    v: Vec<Cell<i32>>,
+}
+
+fn main() {
+    let a = First { v: vec![Cell::new(1), Cell::new(2), Cell::new(3)] };
+    for c in a.v.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("first {} {} {}", a.v[0].get(), a.v[1].get(), a.v[2].get());
+    let b = Second { tag: 7, v: vec![Cell::new(1), Cell::new(2), Cell::new(3)] };
+    for c in &b.v {
+        c.set(c.get() + 10);
+    }
+    println!("second {} {} {} {}", b.tag, b.v[0].get(), b.v[1].get(), b.v[2].get());
+    let e = First { v: vec![] };
+    for c in e.v.iter() {
+        c.set(99);
+    }
+    println!("empty {}", e.v.len());
+    let o = First { v: vec![Cell::new(5)] };
+    for c in o.v.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("one {}", o.v[0].get());
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_write_through_cell_field_vec() {
+    // A `vec!` vector stored in a struct field: the element
+    // positions `iter_mut_element_ref` builds over it carry
+    // the field step that reaches the vector ahead of the
+    // element step -- [Field(field), Field(elem)] -- and
+    // `elem_step_pos` read the element-0 step `Field(0)` as
+    // a whole-value entry step into the field's value, so
+    // `slice_iter_storage_state` declined the positions and
+    // borrowed iteration kept the element snapshot, stopping
+    // with "expected mutable place, found constant
+    // aggregate" at the first write through a yielded
+    // reference. Entry steps hang off an `Index` step (the
+    // element-entry suffix shape), so a `Field(0)` step
+    // preceded only by `Field` steps is the element step
+    // itself; with that judgement the positions denote the
+    // field vector's own elements and the writes land in
+    // it, in field position 0 and later alike, for the
+    // `iter()` and `&Vec` forms and the empty and
+    // one-element vectors.
+    run_ok(
+        "slice-iter-cell-write-field-vec",
+        SLICE_ITER_CELL_WRITE_FIELD_VEC_SRC,
+        "first 11 12 13\nsecond 7 11 12 13\nempty 0\none 15\n",
+    );
+}
+
+const SLICE_ITER_CELL_WRITE_FIELD_SEQ_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Arr {
+    a: [Cell<i32>; 3],
+}
+
+struct Mut {
+    v: Vec<i32>,
+}
+
+fn main() {
+    let t: (Vec<Cell<i32>>, i32) = (vec![Cell::new(1), Cell::new(2)], 42);
+    for c in t.0.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("tuple {} {} {}", t.0[0].get(), t.0[1].get(), t.1);
+    let h = Arr { a: [Cell::new(1), Cell::new(2), Cell::new(3)] };
+    for c in h.a.iter() {
+        c.set(c.get() + 10);
+    }
+    println!("array {} {} {}", h.a[0].get(), h.a[1].get(), h.a[2].get());
+    let mut m = Mut { v: vec![1, 2, 3] };
+    for x in m.v.iter_mut() {
+        *x += 10;
+    }
+    println!("mut {:?}", m.v);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_write_through_cell_field_seq() {
+    // The neighbouring field-sequence shapes: a `vec!`
+    // vector in a tuple field (the same [Field, Field]
+    // element positions as a struct field), an array in a
+    // struct field (index-step element positions behind a
+    // field step), and `iter_mut` over a struct field's
+    // vector. The writes land in the fields' own storage.
+    run_ok(
+        "slice-iter-cell-write-field-seq",
+        SLICE_ITER_CELL_WRITE_FIELD_SEQ_SRC,
+        "tuple 11 12 42\narray 11 12 13\nmut [11, 12, 13]\n",
+    );
+}

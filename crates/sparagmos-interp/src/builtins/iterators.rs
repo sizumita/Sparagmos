@@ -8420,24 +8420,31 @@ fn slice_iter_elem_size(self_ty: &str) -> Option<u64> {
 /// the last `Index` or `Field` step, with only whole-value
 /// entry steps (a transparent wrapper's field 0, a downcast)
 /// after it. A `Field(0)` step counts as an entry step only
-/// when an element step precedes it: a lone leading `Field(0)`
-/// is the element step itself (element 0 of a field-stored
-/// sequence), and a non-zero `Field` step after an `Index`
-/// step denotes a field of the element, whose position is the
-/// `Index` step's. Any other trailing step means the
-/// projection does not end at an element position.
+/// when an `Index` step precedes it: entry steps hang off
+/// the index step that selects the entered element (the
+/// element-entry suffix shape, see `element_entry_suffix`),
+/// so a `Field(0)` step preceded only by `Field` steps is
+/// the element step itself -- element 0 of the sequence the
+/// earlier steps denote, whose `Field` steps walk the
+/// aggregates that hold it (a struct field's sequence, an
+/// outer element of a nested sequence). A non-zero `Field`
+/// step after an `Index` step denotes a field of the
+/// element, whose position is the `Index` step's. Any other
+/// trailing step means the projection does not end at an
+/// element position.
 fn elem_step_pos(projection: &[RefProj]) -> Option<usize> {
     let mut pos = projection.len();
     while pos > 0 {
         match projection[pos - 1] {
             RefProj::Index(_) => return Some(pos - 1),
             RefProj::Field(f) => {
-                let earlier_element = projection[..pos - 1]
+                let earlier_index = projection[..pos - 1]
                     .iter()
-                    .any(|s| matches!(s, RefProj::Index(_) | RefProj::Field(_)));
-                if f == 0 && earlier_element {
-                    // A whole-value entry step into an element
-                    // the earlier steps denote: keep scanning.
+                    .any(|s| matches!(s, RefProj::Index(_)));
+                if f == 0 && earlier_index {
+                    // A whole-value entry step into the element
+                    // the earlier `Index` step denotes: keep
+                    // scanning.
                     pos -= 1;
                 } else if f != 0
                     && projection[..pos - 1]
