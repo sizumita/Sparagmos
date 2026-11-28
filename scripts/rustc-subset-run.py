@@ -7596,6 +7596,7 @@ STAGE3_SUPPORT_TIMEOUT = 1800
 # stage-3 budget -- is still open behind that stop.
 STAGE3_CARGO_SHIM_RECORDS = {
     "tests/run-make-cargo/same-crate-name-and-macro-name",
+    "tests/run-make-cargo/panic-strategies",
 }
 
 
