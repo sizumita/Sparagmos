@@ -4628,3 +4628,119 @@ fn run_mode_dyn_any_downcast_lifetime_only_difference_rejected() {
         "ok\n",
     );
 }
+
+// ----- packed field drops (packed-struct-drop-aligned) ----------------------
+
+const PACKED_DROP_ALIGNED_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Aligned<'a>(&'a Cell<usize>);
+impl<'a> Drop for Aligned<'a> {
+    fn drop(&mut self) {
+        let p = self as *mut Self as usize;
+        assert_eq!(p % std::mem::align_of::<Self>(), 0);
+        self.0.set(self.0.get() + 1);
+    }
+}
+struct NotCopy(u8);
+#[repr(packed)]
+struct Packed<'a>(NotCopy, Aligned<'a>);
+
+fn main() {
+    let drops = Cell::new(0);
+    {
+        let a = Aligned(&drops);
+        let mut p = Packed(NotCopy(0), a);
+        p.1 = Aligned(&drops);
+        assert_eq!(drops.get(), 1);
+    }
+    assert_eq!(drops.get(), 2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_packed_field_drops_from_aligned_temporary() {
+    // A `repr(packed)` struct's own alignment is its pack cap,
+    // so a field whose type needs more alignment is dropped by
+    // the compiler's glue from an aligned temporary it moves
+    // the field into: the destructor must observe an aligned
+    // self pointer both for the reassignment drop (which drop
+    // elaboration moves into a temporary of its own) and for
+    // the scope-exit drop of the whole local, whose field the
+    // glue decomposes in place. Regression for
+    // tests/ui/packed/packed-struct-drop-aligned.rs.
+    run_ok("packed-drop-aligned", PACKED_DROP_ALIGNED_SRC, "ok\n");
+}
+
+const PACKED_DROP_ALIGNED_RECORD_SRC: &str = r#"#![feature(coroutines, stmt_expr_attributes)]
+#![feature(coroutine_trait)]
+#![allow(unused_assignments, unused_variables)]
+
+use std::cell::Cell;
+use std::mem;
+use std::ops::Coroutine;
+use std::pin::Pin;
+
+struct Aligned<'a> {
+    drop_count: &'a Cell<usize>,
+}
+
+#[inline(never)]
+fn check_align(ptr: *const Aligned) {
+    assert_eq!(ptr as usize % mem::align_of::<Aligned>(), 0);
+}
+
+impl<'a> Drop for Aligned<'a> {
+    fn drop(&mut self) {
+        check_align(self);
+        self.drop_count.set(self.drop_count.get() + 1);
+    }
+}
+
+#[repr(transparent)]
+struct NotCopy(u8);
+
+#[repr(packed)]
+struct Packed<'a>(NotCopy, Aligned<'a>);
+
+fn main() {
+    let drop_count = &Cell::new(0);
+    {
+        let mut p = Packed(NotCopy(0), Aligned { drop_count });
+        p.1 = Aligned { drop_count };
+        assert_eq!(drop_count.get(), 1);
+    }
+    assert_eq!(drop_count.get(), 2);
+
+    let drop_count = &Cell::new(0);
+    let mut g = #[coroutine]
+    || {
+        let mut p = Packed(NotCopy(0), Aligned { drop_count });
+        let _ = &p;
+        p.1 = Aligned { drop_count };
+        assert_eq!(drop_count.get(), 1);
+        // Test that a coroutine drop function moves a value from a packed
+        // struct to a separate local before dropping it. We move out the
+        // first field to generate and open drop for the second field.
+        drop(p.0);
+        yield;
+    };
+    Pin::new(&mut g).resume(());
+    assert_eq!(drop_count.get(), 1);
+    drop(g);
+    assert_eq!(drop_count.get(), 2);
+}
+"#;
+
+#[test]
+fn run_mode_packed_struct_drop_aligned_record() {
+    // The full record: the plain-function half above plus the
+    // coroutine half, whose saved packed field drops when the
+    // coroutine itself is dropped after the yield.
+    run_ok(
+        "packed-drop-aligned-record",
+        PACKED_DROP_ALIGNED_RECORD_SRC,
+        "",
+    );
+}

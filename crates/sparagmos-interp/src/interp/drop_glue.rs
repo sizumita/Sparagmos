@@ -1679,6 +1679,38 @@ impl<'a> Interpreter<'a> {
                             active.work.push((path, P::CallDtor { func }));
                         }
                     }
+                    P::AlignedTemp { plan } => {
+                        let Some(value) =
+                            self.read_at(frames, &active.root, &path)?
+                        else {
+                            // Moved out of / never written: no glue,
+                            // as with rustc's drop flags.
+                            continue;
+                        };
+                        // The value sits at an unaligned address
+                        // inside a packed parent: the compiler's
+                        // glue drops such a field from an aligned
+                        // temporary it moves the field into. Park
+                        // the field's value in an allocation of its
+                        // own -- as `drop_value_sync` parks a
+                        // consumed value, so a destructor that
+                        // writes back into its receiver has somewhere
+                        // to write -- and run the field's plan
+                        // against the allocation in a nested session.
+                        let id = self.alloc_insert(value);
+                        let nested = GlueSession {
+                            root: RefTarget::Alloc {
+                                id,
+                                projection: Vec::new(),
+                            },
+                            work: vec![(Vec::new(), *plan)],
+                            adts: active.adts.clone(),
+                            completion: GlueCompletion::Resume,
+                        };
+                        suspended
+                            .push(std::mem::replace(&mut active, nested));
+                        continue 'sessions;
+                    }
                     P::CallDtor { func } => {
                         if self.read_at(frames, &active.root, &path)?.is_none() {
                             // Moved out of / never written: no glue, as
