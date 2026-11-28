@@ -963,6 +963,74 @@ fn run_mode_boxed_path_into_boxed_sort_component_order() {
     run_ok("boxed-path-into-sort", BOXED_PATH_INTO_SORT_SRC, "boxed-path-into-sort-ok\n");
 }
 
+const BOXED_PATH_FROM_SRC: &str = r#"
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+fn strs(v: &[Box<Path>]) -> Vec<String> {
+    v.iter().map(|p| p.to_str().unwrap().to_string()).collect()
+}
+
+fn main() {
+    // `Box::from(PathBuf)` -- std's `From<PathBuf> for
+    // Box<Path>`, `into_boxed_path` by definition -- forms
+    // the box over the path's bytes, so every `Deref`
+    // consumer reads it (the generic `From` handler must
+    // not box the `PathBuf` aggregate itself).
+    let b: Box<Path> = Box::from(PathBuf::from("a/b"));
+    assert_eq!(b.file_name().unwrap().to_str().unwrap(), "b");
+    assert_eq!(format!("{}", b.display()), "a/b");
+    assert_eq!(format!("{:?}", b), "\"a/b\"");
+    assert_eq!(b.to_str(), Some("a/b"));
+    assert_eq!(
+        b.components().map(|c| c.as_os_str().to_str().unwrap().to_string()).collect::<Vec<_>>(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(b.parent().unwrap().to_str().unwrap(), "a");
+    // The two formations of the same path compare and
+    // order equal, in both directions, and the tagless
+    // generic sort orders the `From` formation by
+    // components, mixed with the builtin formation.
+    let c: Box<Path> = PathBuf::from("a/b").into_boxed_path();
+    assert!(b == c && c == b);
+    assert_eq!(b.cmp(&c), std::cmp::Ordering::Equal);
+    let mut v: Vec<Box<Path>> = vec![
+        Box::from(PathBuf::from("a.b/c")),
+        Box::from(PathBuf::from("a/c")),
+        Box::from(PathBuf::from("/x")),
+    ];
+    v.sort();
+    assert_eq!(strs(&v), vec!["/x".to_string(), "a/c".to_string(), "a.b/c".to_string()]);
+    let mut w: Vec<Box<Path>> = vec![
+        PathBuf::from("a.b/c").into_boxed_path(),
+        Box::from(PathBuf::from("a/c")),
+    ];
+    w.sort();
+    assert_eq!(strs(&w), vec!["a/c".to_string(), "a.b/c".to_string()]);
+    // The `Into` spelling and the `Cow` sources form
+    // the same box.
+    let i: Box<Path> = PathBuf::from("a/b").into();
+    assert_eq!(i, b);
+    let cb: Box<Path> = Box::from(Cow::Borrowed(Path::new("c/d")));
+    assert_eq!(cb.file_name().unwrap().to_str().unwrap(), "d");
+    assert_eq!(format!("{}", cb.display()), "c/d");
+    let co: Box<Path> = Box::from(Cow::Owned(PathBuf::from("e/f")));
+    assert_eq!(co.file_name().unwrap().to_str().unwrap(), "f");
+    // The neighbouring owned-pointee box keeps its
+    // aggregate pointee: `Box<PathBuf>` still derefs to
+    // the buffer and mutates through it.
+    let mut pb: Box<PathBuf> = Box::from(PathBuf::from("g"));
+    pb.push("h");
+    assert_eq!(format!("{}", pb.display()), "g/h");
+    println!("boxed-path-from-ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_path_from_pathbuf_deref_consumers() {
+    run_ok("boxed-path-from", BOXED_PATH_FROM_SRC, "boxed-path-from-ok\n");
+}
+
 const PATH_ANCESTORS_SRC: &str = r#"
 use std::path::Path;
 

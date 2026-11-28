@@ -5096,6 +5096,68 @@ impl<'a> Interpreter<'a> {
                     let fat =
                         self.c_string_deref(frames, &receiver)?;
                     self.boxed_c_str(frames, &fat)
+                } else if (target.starts_with("std::boxed::Box<")
+                    || target.starts_with("alloc::boxed::Box<"))
+                    && (generic_first_arg(target, "std::boxed::Box<")
+                        == Some("std::path::Path")
+                        || generic_first_arg(target, "alloc::boxed::Box<")
+                            == Some("std::path::Path"))
+                    && (source == "std::path::PathBuf"
+                        || source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                {
+                    // `From<PathBuf> for Box<Path>` is
+                    // `into_boxed_path`, and `From<Cow<'_,
+                    // Path>>` hands over a clone of the
+                    // borrowed path or the owned buffer's
+                    // box: in every case the box holds the
+                    // path's bytes themselves, the pointee
+                    // form every `Box<Path>` consumer reads
+                    // (see the `PathBufIntoBoxedPath`
+                    // builtin), with the `Path` type recorded
+                    // on the allocation. Boxing the `PathBuf`
+                    // aggregate (the catch-all `Box` arm's
+                    // verbatim move) leaves the allocation
+                    // holding an ADT value the path
+                    // projection refuses ("expected path
+                    // byte string, found ADT value"), so the
+                    // `Deref` consumers of the box
+                    // (`file_name`, `display`, the component
+                    // machinery) all stopped, while the owned
+                    // value's own readers accept the
+                    // aggregate and hide the defect until
+                    // the box is formed.
+                    let owned = if source == "std::path::PathBuf" {
+                        value
+                    } else {
+                        // A Cow source: the borrowed
+                        // variant's field is the `&Path`
+                        // itself, which already denotes the
+                        // path's bytes; the owned variant's
+                        // field is the `PathBuf` the byte
+                        // reader below reads. Both are the
+                        // single field of their variant.
+                        match self.resolve_value(frames, &value)? {
+                            Value::Enum { mut fields, .. }
+                                if fields.len() == 1 =>
+                            {
+                                fields.pop().expect("len checked")
+                            }
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to Box<Path>",
+                                    "cow aggregate",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    };
+                    let bytes = self.os_str_bytes(frames, &owned)?;
+                    let boxed = self.new_box(Value::Bytes(bytes));
+                    if let Some(ty) = ty_from_tag("std::path::Path") {
+                        self.record_box_ty(&boxed, ty);
+                    }
+                    Ok(boxed)
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
                     let boxed = self.new_box(value);
