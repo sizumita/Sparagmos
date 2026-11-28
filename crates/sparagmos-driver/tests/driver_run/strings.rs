@@ -5653,6 +5653,65 @@ fn run_mode_boxed_str_vec_swap_siblings() {
     );
 }
 
+const BOXED_STR_VEC_ROTATE_SRC: &str = r#"
+fn main() {
+    // Slice rotation moves a multi-element segment through
+    // the `MaybeUninit` temporary buffer core stages behind
+    // the union's own address: the segment's elements must
+    // land in the buffer's storage and come back whole, or
+    // the access stops on the buffer's stored value (and the
+    // elements that do come back are fragments).
+    let mut v: Vec<Box<str>> = vec!["apple".into(), "plum".into(), "pear".into(), "kiwi".into()];
+    v.rotate_right(2);
+    println!("rotr2={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["apple".into(), "plum".into(), "pear".into(), "kiwi".into(), "fig".into()];
+    v.rotate_right(2);
+    println!("rotr2_5={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["apple".into(), "plum".into(), "pear".into(), "kiwi".into()];
+    v.rotate_left(2);
+    println!("rotl2={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["apple".into(), "plum".into(), "pear".into(), "kiwi".into()];
+    v.rotate_right(1);
+    v.rotate_right(3);
+    println!("back={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "kiwi".into(), "apple".into(), "plum".into()];
+    v.rotate_right(2);
+    v.sort();
+    println!("sorted={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_rotate() {
+    run_ok(
+        "boxed-str-vec-rotate",
+        BOXED_STR_VEC_ROTATE_SRC,
+        "rotr2=[\"pear\", \"kiwi\", \"apple\", \"plum\"]\nrotr2_5=[\"kiwi\", \"fig\", \"apple\", \"plum\", \"pear\"]\nrotl2=[\"pear\", \"kiwi\", \"apple\", \"plum\"]\nback=[\"apple\", \"plum\", \"pear\", \"kiwi\"]\nsorted=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\n",
+    );
+}
+
+const BOXED_SLICE_VEC_ROTATE_SRC: &str = r#"
+fn main() {
+    // The same rotation over boxed byte slices: the buffer
+    // segment holds two and three fat-box elements.
+    let mut v: Vec<Box<[u8]>> = vec![vec![1u8, 2].into_boxed_slice(), vec![3u8].into_boxed_slice(), vec![4u8, 5, 6].into_boxed_slice(), vec![7u8].into_boxed_slice()];
+    v.rotate_right(2);
+    println!("rotr2={:?}", v);
+    let mut v: Vec<Box<[u8]>> = vec![vec![1u8].into_boxed_slice(), vec![2u8].into_boxed_slice(), vec![3u8].into_boxed_slice(), vec![4u8].into_boxed_slice(), vec![5u8].into_boxed_slice()];
+    v.rotate_right(3);
+    println!("rotr3={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_vec_rotate() {
+    run_ok(
+        "boxed-slice-vec-rotate",
+        BOXED_SLICE_VEC_ROTATE_SRC,
+        "rotr2=[[4, 5, 6], [7], [1, 2], [3]]\nrotr3=[[3], [4], [5], [1], [2]]\n",
+    );
+}
+
 const BOXED_STR_SMART_POINTER_SORT_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
