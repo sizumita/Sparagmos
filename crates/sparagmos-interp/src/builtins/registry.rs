@@ -1978,6 +1978,25 @@ pub enum Builtin {
     /// forwards to `handle_alloc_error`. See
     /// `builtins::alloc_error`.
     RawVecHandleError,
+    /// `core::alloc::Layout::from_size_alignment_unchecked(
+    /// size, Alignment) -> Layout` and its `usize`-alignment
+    /// sibling `from_size_align_unchecked(size, align)`:
+    /// `#[rustc_const_stable]` constructors Stable MIR ships
+    /// no body for, called from the collected bodies of the
+    /// other `Layout` constructors (`for_value`, `array`,
+    /// `pad_to_align`) on every allocation path. The model is
+    /// the construction itself: a `Layout` value carrying the
+    /// size and the alignment argument (the `Alignment` form
+    /// passes through unchanged; the `usize` form is wrapped
+    /// by `alignment_value`). See `builtins::alloc_error`.
+    LayoutFromSizeAlignUnchecked,
+    /// `hashbrown::raw::Fallibility::capacity_overflow(self)
+    /// -> TryReserveError`: hashbrown's allocation-path
+    /// overflow endpoint, likewise body-less. `Fallible`
+    /// answers `TryReserveError::CapacityOverflow`;
+    /// `Infallible` panics with `Hash table capacity
+    /// overflow`. See `builtins::alloc_error`.
+    HashbrownCapacityOverflow,
     /// `libc::unix::malloc(size) -> *mut u8`: the bottom of the
     /// system allocator's call chain — a fresh uninitialised
     /// block of `size` bytes in the allocation store, the same
