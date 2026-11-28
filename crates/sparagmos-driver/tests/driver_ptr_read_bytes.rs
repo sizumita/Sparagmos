@@ -10,8 +10,10 @@
 //! `MaybeUninit` slot read back with `assume_init`, an
 //! `assume_init_read` of a byte-written slot, the write side
 //! (an enum written through a byte pointer, read back as a
-//! byte and as the enum), a reference transmute read, and the
-//! invalid-tag read, whose tag names no variant: the value
+//! byte and as the enum), a reference transmute read, an
+//! enum whose payload is uninitialised `MaybeUninit` storage
+//! read whole through a field reference, and the invalid-tag
+//! read, whose tag names no variant: the value
 //! model holds no such enum value, so the read fails with the
 //! validity error the transmute path reports for the same
 //! materialisation, naming the discriminant problem instead
@@ -334,4 +336,72 @@ fn main() {{
         stderr.contains("bit pattern 0x9"),
         "stderr must name the offending pattern; stderr={stderr}"
     );
+}
+
+/// An enum whose variant payload is uninitialised
+/// `MaybeUninit` array storage, read as a whole value
+/// through a reference to a struct field (the inline-data
+/// shape a `SmallVec` holds): the discriminant byte is
+/// definite, the payload bytes are unwritten union storage,
+/// and the read carries them as the value's own
+/// uninitialised span instead of failing as a read of an
+/// uninitialised place.
+#[test]
+fn read_enum_with_uninit_payload_through_ref() {
+    let stdout = run_ok(
+        "enum-uninit-payload",
+        "enum_uninit_payload.rs",
+        r#"use std::mem::MaybeUninit;
+enum Data {
+    Inline(MaybeUninit<[u32; 4]>),
+    Heap(u32),
+}
+struct SV {
+    capacity: usize,
+    data: Data,
+}
+fn main() {
+    let v = SV { capacity: 4, data: Data::Inline(MaybeUninit::uninit()) };
+    match &v.data {
+        Data::Inline(_) => println!("n {}", v.capacity - 4),
+        Data::Heap(_) => println!("heap"),
+    }
+}
+"#,
+    );
+    assert_eq!(stdout, "n 0\n");
+}
+
+/// The same shape with the payload wrapped in
+/// `ManuallyDrop`, the spelling the inline-data enum holds
+/// in the wild: the wrapper is one more union layer over the
+/// same unwritten storage, and the whole-value read through
+/// the field reference judges it the same way.
+#[test]
+fn read_enum_with_manuallydrop_uninit_payload_through_ref() {
+    let stdout = run_ok(
+        "enum-manuallydrop-uninit-payload",
+        "enum_manuallydrop_uninit_payload.rs",
+        r#"use std::mem::{ManuallyDrop, MaybeUninit};
+enum Data {
+    Inline(ManuallyDrop<MaybeUninit<[u32; 4]>>),
+    Heap(u32),
+}
+struct SV {
+    capacity: usize,
+    data: Data,
+}
+fn main() {
+    let v = SV {
+        capacity: 4,
+        data: Data::Inline(ManuallyDrop::new(MaybeUninit::uninit())),
+    };
+    match &v.data {
+        Data::Inline(_) => println!("n {}", v.capacity - 4),
+        Data::Heap(_) => println!("heap"),
+    }
+}
+"#,
+    );
+    assert_eq!(stdout, "n 0\n");
 }

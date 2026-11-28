@@ -720,7 +720,18 @@ impl<'a> Interpreter<'a> {
                     let image = self.union_storage_image(value, name)?;
                     return match image.get(pos) {
                         Some(Some(byte)) => Some(Ok(StorageByte::Byte(*byte))),
-                        Some(None) => Some(Err(ByteVerdict::Uninit)),
+                        // A position the image leaves unwritten
+                        // is indeterminate storage, not an
+                        // uninitialised field: a union's bytes
+                        // are only ever determined where a write
+                        // determined them (the judgement the
+                        // foreign read keeps for a byte-form
+                        // root), and a use of the indeterminate
+                        // byte is judged where it is consumed --
+                        // a scalar construction declines it, an
+                        // aggregate construction carries it as
+                        // the value's own uninitialised span.
+                        Some(None) => Some(Ok(StorageByte::Padding)),
                         None => Some(Err(ByteVerdict::Outside(pos))),
                     };
                 }
