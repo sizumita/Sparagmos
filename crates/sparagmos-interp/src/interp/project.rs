@@ -2192,7 +2192,7 @@ pub(crate) fn project_value_ev(
 ) -> InterpResult<Value> {
     let composed;
     let projection = if projection_needs_composition(projection) {
-        composed = compose_projection(&value, projection, func, place);
+        composed = compose_projection(&value, projection, func, place, root_ty.as_ref());
         &composed[..]
     } else {
         projection
@@ -3534,7 +3534,7 @@ pub(crate) fn assign_projected(
     // into the element at the run's head.
     let composed;
     let (projection, ty) = if projection_needs_composition(projection) {
-        composed = compose_projection(slot, projection, func, place);
+        composed = compose_projection(slot, projection, func, place, ty.as_ref());
         if composed.as_slice() == projection {
             // Composition left the steps nested as written
             // (the element at the run's head is itself an
@@ -3793,7 +3793,7 @@ pub(crate) fn project_value_ref_ev<'a>(
 ) -> InterpResult<Cow<'a, Value>> {
     let composed;
     let projection = if projection_needs_composition(projection) {
-        composed = compose_projection(value, projection, func, place);
+        composed = compose_projection(value, projection, func, place, root_ty.as_ref());
         &composed[..]
     } else {
         projection
@@ -4485,7 +4485,7 @@ pub(crate) fn navigate_mut_grow<'x>(
     }
     let composed;
     let (projection, ty) = if projection_needs_composition(projection) {
-        composed = compose_projection(slot, projection, func, place);
+        composed = compose_projection(slot, projection, func, place, ty.as_ref());
         // As in `assign_projected`: the type walk follows the
         // projection when composition left it unchanged, and
         // only a rewritten projection drops the evidence.

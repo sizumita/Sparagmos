@@ -5964,7 +5964,31 @@ impl<'a> Interpreter<'a> {
                                 // deref produces.
                                 self.c_string_deref(frames, &field)
                             } else {
-                                Ok(field)
+                                // The remaining owned case: the
+                                // borrowed type is the field type
+                                // itself (a `Cow` of a `Cow`, above
+                                // all), so the deref target is the
+                                // field value's own type and the
+                                // deref yields a reference to the
+                                // field when the Cow lives in a
+                                // place, as the slice arm above
+                                // produces -- the field value itself
+                                // for a detached Cow, as there. The
+                                // bare field value is not a
+                                // reference, and returning it as the
+                                // deref result leaves the next
+                                // consumer (a chained `Deref` call
+                                // on the result, above all) holding
+                                // the field's contents in place of
+                                // the reference it expects.
+                                match self.place_projected_ref(
+                                    frames,
+                                    &vals[0],
+                                    RefProj::Field(0),
+                                )? {
+                                    Some(reference) => Ok(reference),
+                                    None => Ok(field),
+                                }
                             }
                         }
                         ref other => Err(InterpError::type_mismatch(
