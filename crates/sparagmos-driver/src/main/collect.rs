@@ -162,6 +162,7 @@ fn collect_with_tcx(tcx: rustc_middle::ty::TyCtxt) -> ControlFlow<()> {
 }
 
 fn collect() -> ControlFlow<()> {
+    note_library_conversion();
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
     let mut bodies: Vec<(String, Body)> = Vec::new();

@@ -756,16 +756,47 @@ fn shimmed_must_override_intrinsic_converts() {
 }
 
 #[test]
-fn locally_declared_codegen_served_intrinsic_converts() {
+fn library_declared_codegen_served_intrinsic_converts() {
     // A `#[rustc_intrinsic]` declaration has no MIR body in any
     // backend: code generation serves the call in the caller.
-    // The collector credited such a declaration only when a
-    // demand reached it; declared in the target crate and
-    // accounted by the item loop instead, it read as a
-    // target-crate skip, which failed the cargo-shim build-std
-    // conversion of core (its lib.rs declares the codegen-served
-    // float and fence intrinsics).
-    let case = Case::new("local-codegen-intrinsic");
+    // In a library conversion — a crate being built, like a
+    // sysroot unit in a build-std compilation — such a
+    // declaration is surface other crates call, so the
+    // collector credits it (and demands naming it) without a
+    // body. Core's lib.rs declares the codegen-served float
+    // and fence intrinsics; read as target-crate skips, they
+    // failed the cargo-shim build-std conversion of core.
+    let case = Case::new("lib-codegen-intrinsic");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn sqrtf32(x: f32) -> f32;\n\
+         pub fn root(x: f32) -> f32 { unsafe { sqrtf32(x) } }\n",
+    );
+    let (code, stdout, stderr) = case.convert(
+        &src,
+        &["--rustc-arg", "--crate-type=lib"],
+        true,
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.lines().any(|l| {
+            l.starts_with("target-crate converted:") && l.ends_with("skipped: 0")
+        }),
+        "the intrinsic declaration must count as converted: {stdout}"
+    );
+}
+
+#[test]
+fn program_declared_codegen_served_intrinsic_stays_skipped() {
+    // The same declaration in a program conversion stays an
+    // ordinary conversion skip: the interpreter itself would
+    // have to serve the call at run time, and it has no model
+    // for the sized float spellings. (The verdict still
+    // forgives the call — code generation would have served
+    // it — so the conversion exits 0.)
+    let case = Case::new("prog-codegen-intrinsic");
     let src = case.write(
         "case.rs",
         "#![feature(intrinsics)]\n\
@@ -777,9 +808,9 @@ fn locally_declared_codegen_served_intrinsic_converts() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         stdout.lines().any(|l| {
-            l.starts_with("target-crate converted:") && l.ends_with("skipped: 0")
+            l.starts_with("target-crate converted:") && l.ends_with("skipped: 1")
         }),
-        "the intrinsic declaration must count as converted: {stdout}"
+        "the intrinsic declaration must stay skipped: {stdout}"
     );
 }
 
