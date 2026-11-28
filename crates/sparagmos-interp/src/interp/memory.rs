@@ -1614,11 +1614,9 @@ impl<'a> Interpreter<'a> {
                 // aggregate over an allocation pointer), and
                 // reading it as a handle would name a position
                 // inside its buffer instead of the value.
-                if let Some(id) = self.rc_inner_id(base) {
-                    return Ok(Resolved::Alloc {
-                        id,
-                        projection: vec![RefProj::Field(2)],
-                    });
+                if let Some((id, mut projection)) = self.rc_inner_loc(base) {
+                    projection.push(RefProj::Field(2));
+                    return Ok(Resolved::Alloc { id, projection });
                 }
                 match &**base {
                     // A built box base: its single field is the

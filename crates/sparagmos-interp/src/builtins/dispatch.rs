@@ -6074,7 +6074,9 @@ impl<'a> Interpreter<'a> {
                     match rc_handle_id(&pointee) {
                         Some(id) => Ok(Value::Ref(RefTarget::Alloc {
                             id,
-                            projection: vec![RefProj::Field(2)],
+                            projection: self
+                                .rc_pointee_projection(&pointee)
+                                .expect("handle checked"),
                         })),
                         None => Err(InterpError::type_mismatch(
                             "Deref::deref for Rc/Arc",
@@ -7989,10 +7991,16 @@ impl<'a> Interpreter<'a> {
                 let id = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
                         if projection.is_empty()
-                            || matches!(
-                                projection.as_slice(),
-                                [RefProj::Field(2)]
-                            ) =>
+                            || (projection.last()
+                                == Some(&RefProj::Field(2))
+                                && projection[..projection.len() - 1]
+                                    .iter()
+                                    .all(|s| matches!(
+                                        s,
+                                        RefProj::Index(0)
+                                            | RefProj::Field(0)
+                                            | RefProj::ByteOffset(0)
+                                    ))) =>
                     {
                         Some(*id)
                     }
@@ -9695,7 +9703,9 @@ impl<'a> Interpreter<'a> {
                     match rc_handle_id(&pointee) {
                         Some(id) => Ok(Value::Ref(RefTarget::Alloc {
                             id,
-                            projection: vec![RefProj::Field(2)],
+                            projection: self
+                                .rc_pointee_projection(&pointee)
+                                .expect("handle checked"),
                         })),
                         None => Err(InterpError::type_mismatch(
                             "DerefMut::deref_mut for Rc/Arc",

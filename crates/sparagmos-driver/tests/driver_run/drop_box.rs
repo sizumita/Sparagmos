@@ -4852,39 +4852,78 @@ fn main() {
 "#;
 
 #[test]
-fn run_mode_spawn_hook_registration_past_drop_conversion() {
+fn run_mode_spawn_hook_registration_completes() {
     // Registering a thread spawn hook drops `SpawnHooks` values
     // (the thread-local list head taken out of its `Cell` and the
     // scope-end locals of std's hook functions); the drop-glue
     // builder refused that foreign std-internal type, so the
     // conversion stopped with "unsupported terminator: Drop"
-    // (tests/ui/std/add-spawn-hook-reentrancy-159923.rs). The
-    // conversion now passes that point: registration completes
-    // and the run stops later, in the drop of the hook list's
-    // `Arc` chain, whose handles were built through the raw
-    // allocation path and do not carry the reference-counted
-    // handle shape the count machinery recognises -- a separate
-    // mechanism from the `Drop` conversion.
-    let dir = temp_dir("spawn-hook-drop");
+    // (tests/ui/std/add-spawn-hook-reentrancy-159923.rs). Past
+    // that conversion, the run then stopped in the drop of the
+    // hook list's `Arc` chain: those handles are built by
+    // `UniqueArc::into_arc` over a raw allocator block, so
+    // their pointer carries the block's first-slot / first-field
+    // steps and the inner aggregate sits behind the block's
+    // slot and a wrapper field -- a shape the reference-count
+    // machinery did not recognise. The machinery now finds the
+    // inner through those steps, so registration and the chain
+    // drop complete. (Running the hooks at thread spawn is a
+    // separate mechanism: the full reentrancy record still
+    // stops there, with the hook count at 0.)
+    let dir = temp_dir("spawn-hook-registration");
     let src = fixture(&dir, "case.rs", SPAWN_HOOK_SRC);
     let out = run_driver_extra(&src, &["--edition", "2024"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "registered\n",
-        "hook registration must complete; stderr={stderr}"
+        out.status.code(),
+        Some(0),
+        "hook registration and the Arc chain drop must complete; stderr={stderr}"
     );
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "the run stops at the Arc chain drop, past conversion; stderr={stderr}"
+        String::from_utf8_lossy(&out.stdout),
+        "registered\n",
+        "hook registration stdout mismatch; stderr={stderr}"
     );
-    assert!(
-        !stderr.contains("unsupported terminator: Drop"),
-        "the Drop conversion must not be the stop: {stderr}"
-    );
-    assert!(
-        stderr.contains("reference-counted handle drop glue"),
-        "the stop is the Arc handle shape, past the Drop conversion: {stderr}"
+}
+
+const UNIQUE_ARC_SRC: &str = r#"
+#![feature(unique_rc_arc)]
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, UniqueArc};
+static DROPS: AtomicU32 = AtomicU32::new(0);
+struct Tracked(u32);
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::Relaxed);
+        println!("dropped {}", self.0);
+    }
+}
+fn main() {
+    let unique = UniqueArc::new(Tracked(7));
+    let arc = UniqueArc::into_arc(unique);
+    let arc2 = arc.clone();
+    println!("strong={} val={}", Arc::strong_count(&arc), arc.0);
+    drop(arc);
+    println!("after first drop drops={}", DROPS.load(Ordering::Relaxed));
+    drop(arc2);
+    println!("after last drop drops={}", DROPS.load(Ordering::Relaxed));
+}
+"#;
+
+#[test]
+fn run_mode_unique_arc_into_arc_handle_counts_and_drops() {
+    // `UniqueArc::into_arc` builds the `Arc` handle over a raw
+    // allocator block (its real body goes through `Box::new_in`
+    // and the raw allocation path), so the handle's pointer
+    // carries the block's first-slot and wrapper first-field
+    // steps and the `ArcInner` sits behind them. The
+    // reference-count machinery now recognises that shape:
+    // deref reads the pointee, the clone increments the strong
+    // count, and the last drop runs the pointee's destructor
+    // exactly once.
+    run_ok(
+        "unique-arc-into-arc",
+        UNIQUE_ARC_SRC,
+        "strong=2 val=7\nafter first drop drops=0\ndropped 7\nafter last drop drops=1\n",
     );
 }

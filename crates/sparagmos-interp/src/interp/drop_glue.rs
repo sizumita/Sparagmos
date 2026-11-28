@@ -1216,13 +1216,23 @@ impl<'a> Interpreter<'a> {
                             adts: active.adts.clone(),
                             completion: GlueCompletion::Resume,
                         };
+                        // The pointee sits at the inner
+                        // aggregate's value field; the inner
+                        // itself may sit behind a raw
+                        // allocation block's slot / wrapper
+                        // steps (see `rc_inner_loc`).
+                        let mut pointee_projection = self
+                            .rc_inner_loc(&handle)
+                            .map(|(_, prefix)| prefix)
+                            .unwrap_or_default();
+                        pointee_projection.push(RefProj::Field(2));
                         let nested = GlueSession {
                             owns_root_alloc: false,
                             root: RefTarget::Alloc {
                                 id,
-                                projection: Vec::new(),
+                                projection: pointee_projection,
                             },
-                            work: vec![(vec![RefProj::Field(2)], *value)],
+                            work: vec![(Vec::new(), *value)],
                             adts: active.adts.clone(),
                             completion: GlueCompletion::Resume,
                         };
@@ -1553,7 +1563,8 @@ impl<'a> Interpreter<'a> {
                         // it to zero runs the glue the value carries,
                         // against the allocation's value field, with
                         // the weak bundle released after it.
-                        let rc_base = self.rc_inner_id(&base);
+                        let rc_loc = self.rc_inner_loc(&base);
+                        let rc_base = rc_loc.as_ref().map(|(id, _)| *id);
                         if let Some(id) = rc_base {
                             if !self.rc_dec_strong(id)? {
                                 continue;
@@ -1572,11 +1583,16 @@ impl<'a> Interpreter<'a> {
                                 suspended.push(std::mem::replace(&mut active, release));
                                 continue 'sessions;
                             }
+                            let mut pointee_projection = rc_loc
+                                .as_ref()
+                                .map(|(_, prefix)| prefix.clone())
+                                .unwrap_or_default();
+                            pointee_projection.push(RefProj::Field(2));
                             let nested = GlueSession {
                                 owns_root_alloc: false,
                                 root: RefTarget::Alloc {
                                     id,
-                                    projection: vec![RefProj::Field(2)],
+                                    projection: pointee_projection,
                                 },
                                 work: vec![(Vec::new(), glue.root)],
                                 adts: glue.adts,
@@ -1600,7 +1616,14 @@ impl<'a> Interpreter<'a> {
                             // value field in the store.
                             Value::Enum { .. } if rc_base.is_some() => RefTarget::Alloc {
                                 id: rc_base.expect("checked"),
-                                projection: vec![RefProj::Field(2)],
+                                projection: {
+                                    let mut projection = rc_loc
+                                        .as_ref()
+                                        .map(|(_, prefix)| prefix.clone())
+                                        .unwrap_or_default();
+                                    projection.push(RefProj::Field(2));
+                                    projection
+                                },
                             },
                             // A built box's single field is its
                             // allocation pointer: the pointee lives
