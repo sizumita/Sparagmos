@@ -336,6 +336,32 @@ pub(super) fn bencher_value() -> Value {
     }))
 }
 
+/// Fold a harness callable's returned value into the
+/// outcome the harness accounts for: the generated test and
+/// bench closures return `test::assert_test_result`'s
+/// `Result<(), String>`, and libtest folds an `Err` value into
+/// the run's caught-payload channel exactly like a panic
+/// carrying that string (`fold_err` over the caught unwind),
+/// so a termination failure is judged by the descriptor's
+/// should-panic mode instead of counting as a pass. Any other
+/// returned value (the `Ok` of that result, or a plain unit
+/// return) stands as a normal return.
+pub(super) fn fold_test_result(
+    interp: &Interpreter,
+    frames: &[Frame],
+    result: InterpResult<Value>,
+) -> InterpResult<Value> {
+    match &result {
+        Ok(Value::Enum { variant: 1, fields }) if fields.len() == 1 => {
+            match interp.resolve_string(frames, &fields[0]) {
+                Ok(message) => Err(InterpError::panic_string_payload(message)),
+                Err(_) => result,
+            }
+        }
+        _ => result,
+    }
+}
+
 /// The panic report of a `panic=abort` harness's spawned test
 /// process, as its default hook prints it to the child's
 /// stderr: the test runs on the child's main thread, and the
@@ -410,6 +436,7 @@ impl<'a> Interpreter<'a> {
             Vec::new()
         };
         let result = self.call_callable_scheduled(frames, &test.callable, args);
+        let result = fold_test_result(self, frames, result);
         self.set_panic_report_suppressed(false);
         let (cap_out, cap_err) = if nocapture {
             (String::new(), String::new())

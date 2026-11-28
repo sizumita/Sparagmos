@@ -20,6 +20,15 @@ pub enum Builtin {
     Print,
     /// `std::io::_eprint(Arguments)`: format and append to guest stderr.
     Eprint,
+    /// `std::io::stdio::attempt_print_to_stdout(Arguments)`:
+    /// format and append to guest stdout, ignoring write
+    /// errors (std's own account: a failed attempt must not
+    /// panic, as the panic path itself prints through here).
+    AttemptPrint,
+    /// `std::io::stdio::attempt_print_to_stderr(Arguments)`:
+    /// the stderr twin of `AttemptPrint` — the print path a
+    /// `Termination` report's `Error: ...` line takes.
+    AttemptEprint,
     /// `std::env::args() -> Args`: the run's argument iterator
     /// (argv[0] plus the configured guest arguments).
     EnvArgs,

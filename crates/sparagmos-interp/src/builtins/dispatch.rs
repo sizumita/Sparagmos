@@ -298,6 +298,23 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Unit)
             }
+            Builtin::AttemptPrint => {
+                arity(1)?;
+                self.note_stdout_use(frames)?;
+                let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
+                // std's attempt print ignores write errors:
+                // the call sites (a `Termination` report, the
+                // panic output path) cannot themselves fail
+                // with the print failure they were reporting.
+                let _ = self.write_stdout(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            Builtin::AttemptEprint => {
+                arity(1)?;
+                let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
+                let _ = self.write_stderr_bytes(text.as_bytes());
+                Ok(Value::Unit)
+            }
             Builtin::FfiIdentity => {
                 arity(1)?;
                 Ok(vals[0].clone())
@@ -1962,12 +1979,23 @@ impl<'a> Interpreter<'a> {
                     // A test body is an arbitrary guest
                     // program: it runs as a scheduled region so
                     // its own threads interleave with it (see
-                    // `Interpreter::drive_scheduled`).
-                    let result = self.call_callable_scheduled(
-                        frames,
-                        &test.callable,
-                        Vec::new(),
-                    );
+                    // `Interpreter::drive_scheduled`). A bench
+                    // descriptor's callable is the harness
+                    // expansion's one-argument closure over the
+                    // bench function, so it is invoked with the
+                    // single-iteration bencher a bench-as-test
+                    // run hands it, exactly as in the
+                    // `panic=abort` harness (see
+                    // `run_abort_child`); a plain test's
+                    // callable takes no argument.
+                    let args = if test.bench {
+                        vec![bencher_value()]
+                    } else {
+                        Vec::new()
+                    };
+                    let result =
+                        self.call_callable_scheduled(frames, &test.callable, args);
+                    let result = fold_test_result(self, frames, result);
                     // The test's own output since the marks: in
                     // capture mode it is drained here (kept only
                     // for a failure's section); in nocapture mode
