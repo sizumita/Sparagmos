@@ -4015,6 +4015,25 @@ pub(crate) fn project_value_ref_ev<'a>(
                     {
                         cur
                     }
+                    // The string's length slot, as in
+                    // `project_value`: field 1 of a string the
+                    // model holds as bare string data is the
+                    // vector's length slot, the string's length.
+                    // The length is a synthesized value, not
+                    // storage the walk can lend, so the
+                    // projection materializes it as an owned
+                    // value and any remaining steps project into
+                    // it, as for the materialised arms below.
+                    Value::Str(text) if *idx == 1 => {
+                        let owned = Value::Uint(text.len() as u128);
+                        if tail.is_empty() {
+                            return Ok(Cow::Owned(owned));
+                        }
+                        return Ok(Cow::Owned(
+                            project_value_ref(&owned, tail, func, place)?
+                                .into_owned(),
+                        ));
+                    }
                     Value::Formatter(_) => {
                         // The captured `Formatter`'s synthesized
                         // `buf` field, as in `project_value`: the

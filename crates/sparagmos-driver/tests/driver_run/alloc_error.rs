@@ -155,6 +155,124 @@ fn run_mode_no_std_default_alloc_error_reaches_panic_handler() {
 }
 
 
+// ----- the handler-side string's length slot -----
+//
+// The two `tests/ui/allocator/no_std-alloc-error-handler-*`
+// records read the length of a `String` the interpreter holds as
+// bare string data: in the default-handler record the panic
+// handler takes `panic_info.to_string()` and passes `s.as_ptr()`
+// / `s.len()` to `libc::write`; in the custom-handler record the
+// alloc error handler builds its message with `fmt::write` and
+// reads the same slots. MIR inlines `String::len` to the place
+// projection `_s.0.1` (the `vec` field's `len` slot), and the
+// borrowing projector must answer field 1 of a bare string with
+// its length, as the owning projector does.
+
+const NO_STD_TOSTRING_LEN_SRC: &str = r#"
+#![no_std]
+#![no_main]
+extern crate alloc;
+use core::alloc::{GlobalAlloc, Layout};
+use alloc::boxed::Box;
+use alloc::string::ToString;
+
+struct FailAlloc;
+unsafe impl GlobalAlloc for FailAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() >= 4096 { core::ptr::null_mut() } else { core::ptr::without_provenance_mut(0x1000) }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+#[global_allocator]
+static GLOBAL: FailAlloc = FailAlloc;
+
+#[panic_handler]
+fn ph(info: &core::panic::PanicInfo) -> ! {
+    let s = info.to_string();
+    let l = s.len();
+    let p = s.as_ptr();
+    panic!("handler len={} ptr_nonnull={}", l, !p.is_null())
+}
+
+#[no_mangle]
+extern "C" fn main() -> i32 {
+    let b = Box::new([0u64; 512]);
+    b[0] as i32
+}
+"#;
+
+#[test]
+fn run_mode_no_std_panic_handler_reads_tostring_string_len() {
+    let dir = temp_dir("alloc-error-tostring-len");
+    let src = fixture(&dir, "tostring_len.rs", NO_STD_TOSTRING_LEN_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--edition", "2021", "--rustc-arg", "-C", "--rustc-arg", "panic=abort"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("handler len=84 ptr_nonnull=true"),
+        "the panic handler reads the to_string String's length slot \
+         (the Display text is 84 bytes): {stderr}"
+    );
+}
+
+const NO_STD_BUILT_STRING_LEN_SRC: &str = r#"
+#![no_std]
+#![no_main]
+#![feature(alloc_error_handler)]
+extern crate alloc;
+use core::alloc::{GlobalAlloc, Layout};
+use alloc::boxed::Box;
+
+struct FailAlloc;
+unsafe impl GlobalAlloc for FailAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() >= 4096 { core::ptr::null_mut() } else { core::ptr::without_provenance_mut(0x1000) }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+#[global_allocator]
+static GLOBAL: FailAlloc = FailAlloc;
+
+#[alloc_error_handler]
+fn my_oom(layout: Layout) -> ! {
+    use alloc::fmt::write;
+    let size = layout.size();
+    let mut s = alloc::string::String::new();
+    write(&mut s, format_args!("My OOM: failed to allocate {} bytes!\n", size)).unwrap();
+    let l = s.len();
+    let p = s.as_ptr();
+    panic!("oom len={} ptr_nonnull={}", l, !p.is_null())
+}
+
+#[panic_handler]
+fn ph(_info: &core::panic::PanicInfo) -> ! { loop {} }
+
+#[no_mangle]
+extern "C" fn main() -> i32 {
+    let b = Box::new([0u64; 512]);
+    b[0] as i32
+}
+"#;
+
+#[test]
+fn run_mode_no_std_alloc_error_handler_reads_built_string_len() {
+    let dir = temp_dir("alloc-error-built-len");
+    let src = fixture(&dir, "built_len.rs", NO_STD_BUILT_STRING_LEN_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--edition", "2021", "--rustc-arg", "-C", "--rustc-arg", "panic=abort"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("oom len=39 ptr_nonnull=true"),
+        "the alloc error handler reads the fmt::write-built String's \
+         length slot (the message is 39 bytes): {stderr}"
+    );
+}
+
+
 // ----- allocation-error hook (`set_alloc_error_hook`) -----
 //
 // `std::alloc::set_alloc_error_hook` / `take_alloc_error_hook`
