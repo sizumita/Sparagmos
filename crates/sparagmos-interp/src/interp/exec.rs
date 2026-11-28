@@ -3811,6 +3811,28 @@ impl<'a> Interpreter<'a> {
                         }),
                     _ => None,
                 };
+                // A slice borrow of a place holding a vector
+                // in its real aggregate form (the storage
+                // field chain a converted `&self.inner` body
+                // borrows -- `OsStr::as_encoded_bytes` over
+                // an `OsString` place above all): the slice
+                // denotes the vector's buffer, not the
+                // aggregate itself. A fat pointer over the
+                // aggregate place would index the aggregate's
+                // fields (its first field is the `RawVec`),
+                // so the fat base is the buffer pointer the
+                // aggregate carries, the same base the
+                // vector's own slice models form.
+                let fat_base_override = match (fat_len, dest_ty) {
+                    (Some(_), Some(Ty::Ref(inner)))
+                        if matches!(&**inner, Ty::Slice(_) | Ty::Str) =>
+                    {
+                        self.read_resolved_peek(frames, &target)
+                            .ok()
+                            .and_then(|v| Self::real_vec_buffer_ptr(&v))
+                    }
+                    _ => None,
+                };
                 let thin = match target {
                     Resolved::Place {
                         frame_pos,
@@ -3855,7 +3877,7 @@ impl<'a> Interpreter<'a> {
                 }
                 match fat_len {
                     Some(len) => Ok(Value::FatRef {
-                        base: Box::new(thin),
+                        base: Box::new(fat_base_override.unwrap_or(thin)),
                         len,
                     }),
                     None => Ok(thin),

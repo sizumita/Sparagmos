@@ -4215,6 +4215,123 @@ fn run_mode_boxed_os_str_make_ascii() {
     );
 }
 
+const OS_STR_TO_OWNED_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+
+fn agg() -> OsString {
+    let mut o = OsString::with_capacity(16);
+    o.push("banana");
+    o
+}
+
+fn main() {
+    // `ToOwned::to_owned` on an `&OsStr` owns an `OsString`:
+    // the value must be the OS string aggregate denominated
+    // by its bytes, in whichever shape the source string is
+    // stored -- the real aggregate form `with_capacity` plus
+    // `push` builds, the element form, and a literal.
+    let o = agg();
+    let t = o.as_os_str().to_owned();
+    println!("owned={:?}", t);
+    println!("eq={} len={}", t == o, t.len());
+    let e = OsString::from("pear");
+    let t2 = e.as_os_str().to_owned();
+    println!("elem={:?} len={}", t2, t2.len());
+    let lit: &OsStr = OsStr::new("plum");
+    let t3 = lit.to_owned();
+    println!("lit={:?} len={}", t3, t3.len());
+}
+"#;
+
+#[test]
+fn run_mode_os_str_to_owned_denominates_os_string() {
+    // The generic `ToOwned` model handed back the byte
+    // sequence itself (a slice's element list) for an
+    // `&OsStr` receiver, whose consumers refuse it as a
+    // differently shaped ADT (the `Debug` formatter reports
+    // a different field count, `len()` through `Deref` an
+    // ADT where an OS string value belongs). The expected
+    // text is native output.
+    run_ok(
+        "os-str-to-owned-denominates-os-string",
+        OS_STR_TO_OWNED_SRC,
+        "owned=\"banana\"\neq=true len=6\nelem=\"pear\" len=4\nlit=\"plum\" len=4\n",
+    );
+}
+
+const PATH_CSTR_TO_OWNED_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // The same denomination for the other borrowed types
+    // whose owned form is a byte-denominated aggregate: a
+    // `Path` owns a `PathBuf`, a `CStr` a `CString`.
+    let p: &Path = Path::new("/tmp/alpha");
+    let b: PathBuf = p.to_owned();
+    println!("pathbuf={:?} len={}", b, b.as_os_str().len());
+    let c = CString::new("abc").unwrap();
+    let s: &CStr = &c;
+    let owned: CString = s.to_owned();
+    println!("cstr={:?} bytes={:?}", owned, owned.to_bytes());
+    // The plain sequence and string receivers keep their
+    // generic readings.
+    let sl: &[u8] = b"xy";
+    let v: Vec<u8> = sl.to_owned();
+    println!("vec={:?}", v);
+    let w: String = "abc".to_owned();
+    println!("str={} len={}", w, w.len());
+}
+"#;
+
+#[test]
+fn run_mode_path_and_cstr_to_owned() {
+    run_ok(
+        "path-and-cstr-to-owned",
+        PATH_CSTR_TO_OWNED_SRC,
+        "pathbuf=\"/tmp/alpha\" len=10\ncstr=\"abc\" bytes=[97, 98, 99]\nvec=[120, 121]\nstr=abc len=3\n",
+    );
+}
+
+const MUT_OS_STR_ENCODED_BYTES_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+
+fn main() {
+    // An explicitly bound `&mut OsStr` over a real
+    // aggregate `OsString` (the `DerefMut` conversion hands
+    // out the owner's place itself): `as_encoded_bytes`
+    // borrows the owner's storage field chain, and its
+    // elements read as the buffer's bytes.
+    let mut s = OsString::with_capacity(16);
+    s.push("hello");
+    {
+        let m: &mut OsStr = &mut s;
+        println!("b0={}", m.as_encoded_bytes()[0]);
+        println!("b1={}", m.as_encoded_bytes()[1]);
+        println!("all={:?}", m.as_encoded_bytes());
+    }
+    // The owner stays coherent after the borrow.
+    s.push("!");
+    println!("after={:?} len={}", s, s.len());
+}
+"#;
+
+#[test]
+fn run_mode_mut_os_str_encoded_bytes_elements() {
+    // The slice the converted `as_encoded_bytes` body forms
+    // over the owner's field chain used to denominate the
+    // vector aggregate itself as the sequence, so element 0
+    // read back as the vector's first field (its `RawVec`)
+    // and `Display` formatting refused the ADT. The slice
+    // now denominates the buffer the aggregate carries.
+    // The expected text is native output.
+    run_ok(
+        "mut-os-str-encoded-bytes-elements",
+        MUT_OS_STR_ENCODED_BYTES_SRC,
+        "b0=104\nb1=101\nall=[104, 101, 108, 108, 111]\nafter=\"hello!\" len=6\n",
+    );
+}
+
 const OS_STRING_FROM_PATHBUF_SRC: &str = r#"
 use std::ffi::OsString;
 use std::path::PathBuf;

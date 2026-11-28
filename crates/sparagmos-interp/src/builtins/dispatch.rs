@@ -9977,6 +9977,33 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ToOwned => {
                 arity(1)?;
+                // The owned type is named by the call's
+                // generic arguments (the borrowed type). For
+                // the borrowed types whose owned form is an
+                // aggregate denominated by its bytes -- an
+                // `OsStr` receiver owns an `OsString`, a
+                // `Path` a `PathBuf`, a `CStr` a `CString` --
+                // build that aggregate from the receiver's
+                // bytes: the generic arms below would hand
+                // back the byte sequence itself (a slice's
+                // element list, or the string value), which
+                // the owned type's consumers refuse as a
+                // differently shaped ADT.
+                match generic_args.first().map(String::as_str) {
+                    Some("std::ffi::OsStr") => {
+                        let bytes = self.os_str_bytes(frames, &vals[0])?;
+                        return Ok(os_string_value(&bytes));
+                    }
+                    Some("std::path::Path") => {
+                        let bytes = self.os_str_bytes(frames, &vals[0])?;
+                        return Ok(pathbuf_value(&bytes));
+                    }
+                    Some("std::ffi::CStr") => {
+                        let bytes = self.c_str_bytes(frames, &vals[0])?;
+                        return Ok(self.c_string_value(bytes));
+                    }
+                    _ => {}
+                }
                 // A `str` receiver reached through a fat
                 // reference: the owned form is a `String`, whose
                 // value is the string itself -- not the byte
