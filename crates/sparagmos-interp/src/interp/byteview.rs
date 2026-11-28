@@ -3490,6 +3490,35 @@ impl<'a> Interpreter<'a> {
     /// unsupported error, never a silent no-op.
     pub(crate) fn refcell_place(&self, value: &Value, name: &str) -> InterpResult<RefTarget> {
         match value {
+            // A receiver that arrived through an unsizing
+            // coercion (an `Rc<RefCell<dyn Trait>>` deref, a
+            // `Box<RefCell<dyn Trait>>` deref) is a dyn reference
+            // whose base is the reference to the cell place: the
+            // coercion changes the reference's denomination, not
+            // the place it denotes, so unwrap to the base. A fat
+            // reference unwraps the same way.
+            Value::DynRef { base, .. } | Value::FatRef { base, .. } => {
+                self.refcell_place(base, name)
+            }
+            // A smart-pointer handle in aggregate form (the base
+            // an unsizing coercion of an `Rc` / `Arc` handle
+            // carries, or the handle handed over directly): the
+            // cell place is the stored-value field of the
+            // handle's inner allocation, the same place the
+            // handle's own dereference denotes.
+            _ if crate::interp::rc_handle_id(value).is_some() => {
+                let id = crate::interp::rc_handle_id(value).expect("guard checked");
+                Ok(RefTarget::Alloc {
+                    id,
+                    projection: vec![RefProj::Field(2)],
+                })
+            }
+            // A one-field pointer wrapper in aggregate form (a
+            // `Box` the coercion carried as the aggregate itself):
+            // the cell place is the place its field denotes.
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                self.refcell_place(&fields[0], name)
+            }
             Value::Ref(
                 target @ (RefTarget::Place { .. }
                 | RefTarget::Static { .. }
