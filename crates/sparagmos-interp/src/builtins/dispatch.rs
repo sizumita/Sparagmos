@@ -5003,6 +5003,26 @@ impl<'a> Interpreter<'a> {
                         == Some("std::ffi::CStr")
                         || generic_first_arg(target, "alloc::boxed::Box<")
                             == Some("std::ffi::CStr"))
+                    && source == "&std::ffi::CStr"
+                {
+                    // `From<&CStr> for Box<CStr>`: the box
+                    // holds a copy of the borrowed string's
+                    // bytes, terminator included (see
+                    // `boxed_c_str`). Boxing the fat reference
+                    // itself (the catch-all `Box` arm's
+                    // verbatim move) leaves the allocation
+                    // holding a reference value, which the
+                    // projection engine cannot index through:
+                    // every element read of the boxed string
+                    // (`to_bytes()[i]`, subslicing, iteration)
+                    // stopped on it.
+                    self.boxed_c_str(frames, &value)
+                } else if (target.starts_with("std::boxed::Box<")
+                    || target.starts_with("alloc::boxed::Box<"))
+                    && (generic_first_arg(target, "std::boxed::Box<")
+                        == Some("std::ffi::CStr")
+                        || generic_first_arg(target, "alloc::boxed::Box<")
+                            == Some("std::ffi::CStr"))
                     && (source == "std::ffi::CString"
                         || source.starts_with("std::borrow::Cow<")
                         || source.starts_with("alloc::borrow::Cow<"))

@@ -1823,3 +1823,97 @@ fn run_mode_cow_cstr_owned_drop_converts() {
         "owned len=5\nafter owned drop\nafter explicit drop\n",
     );
 }
+
+const BOXED_CSTR_FROM_REF_ACCESS_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+fn main() {
+    let b: Box<CStr> = Box::from(&*CString::new("abc").unwrap());
+    println!("bytes={:?}", b.to_bytes());
+    println!("first={}", b.to_bytes()[0]);
+    println!("sub={:?}", &b.to_bytes()[1..]);
+    println!("iter_sum={}", b.to_bytes().iter().map(|x| *x as u32).sum::<u32>());
+    println!("with_nul={:?}", b.to_bytes_with_nul());
+    println!("debug={:?}", b);
+    let d: &CStr = &b;
+    println!("deref={:?}", d.to_bytes());
+    let e: Box<CStr> = Box::from(&*CString::new("").unwrap());
+    println!("empty={} {}", e.to_bytes().len(), e.to_bytes_with_nul().len());
+}
+"#;
+
+#[test]
+fn run_mode_boxed_cstr_from_ref_element_access() {
+    // `From<&CStr> for Box<CStr>`: the box holds a copy of
+    // the borrowed string's bytes, terminator included --
+    // not the fat reference itself. Boxing the reference
+    // (the generic handler's catch-all move) left the
+    // allocation holding a reference value, and every
+    // element read of the boxed string (indexing
+    // `to_bytes()`, subslicing it, iterating it) stopped
+    // in the index projection on that allocation.
+    run_ok(
+        "boxed-cstr-from-ref-access",
+        BOXED_CSTR_FROM_REF_ACCESS_SRC,
+        "bytes=[97, 98, 99]\nfirst=97\nsub=[98, 99]\niter_sum=294\nwith_nul=[97, 98, 99, 0]\ndebug=\"abc\"\nderef=[97, 98, 99]\nempty=0 1\n",
+    );
+}
+
+const RC_CSTR_FROM_BOXED_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+use std::rc::Rc;
+fn main() {
+    let b: Box<CStr> = Box::from(CString::new("abc").unwrap());
+    let r: Rc<CStr> = Rc::from(b);
+    println!("bytes={:?}", r.to_bytes());
+    println!("first={}", r.to_bytes()[0]);
+    println!("debug={:?}", r);
+    let b2: Box<CStr> = Box::from(&*CString::new("xy").unwrap());
+    let r2: Rc<CStr> = b2.into();
+    println!("from_ref_src={:?} len={}", r2.to_bytes(), r2.to_bytes().len());
+    let empty: Rc<CStr> = Rc::from(CString::new("").unwrap().into_boxed_c_str());
+    println!("empty={} {}", empty.to_bytes().len(), empty.to_bytes_with_nul().len());
+    println!("count={}", Rc::strong_count(&r));
+}
+"#;
+
+#[test]
+fn run_mode_rc_cstr_from_boxed_cstr_reads_its_bytes() {
+    // `Rc<CStr>: From<Box<CStr>>`: the counted handle
+    // takes over the box's byte value, so the handle's
+    // element reads work for every box source (owned,
+    // borrowed, `into_boxed_c_str`).
+    run_ok(
+        "rc-cstr-from-boxed-cstr",
+        RC_CSTR_FROM_BOXED_SRC,
+        "bytes=[97, 98, 99]\nfirst=97\ndebug=\"abc\"\nfrom_ref_src=[120, 121] len=2\nempty=0 1\ncount=1\n",
+    );
+}
+
+const ARC_CSTR_FROM_BOXED_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+use std::sync::Arc;
+fn main() {
+    let b: Box<CStr> = Box::from(CString::new("abc").unwrap());
+    let a: Arc<CStr> = Arc::from(b);
+    println!("bytes={:?}", a.to_bytes());
+    println!("first={}", a.to_bytes()[0]);
+    println!("debug={:?}", a);
+    let b2: Box<CStr> = Box::from(&*CString::new("xy").unwrap());
+    let a2: Arc<CStr> = b2.into();
+    println!("from_ref_src={:?} len={}", a2.to_bytes(), a2.to_bytes().len());
+    let empty: Arc<CStr> = Arc::from(CString::new("").unwrap().into_boxed_c_str());
+    println!("empty={} {}", empty.to_bytes().len(), empty.to_bytes_with_nul().len());
+    println!("count={}", Arc::strong_count(&a));
+}
+"#;
+
+#[test]
+fn run_mode_arc_cstr_from_boxed_cstr_reads_its_bytes() {
+    // `Arc<CStr>: From<Box<CStr>>`: the `Arc` twin of the
+    // counted-handle takeover above.
+    run_ok(
+        "arc-cstr-from-boxed-cstr",
+        ARC_CSTR_FROM_BOXED_SRC,
+        "bytes=[97, 98, 99]\nfirst=97\ndebug=\"abc\"\nfrom_ref_src=[120, 121] len=2\nempty=0 1\ncount=1\n",
+    );
+}
