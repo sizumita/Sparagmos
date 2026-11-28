@@ -1314,11 +1314,21 @@ impl Converter {
     /// the stored bytes as that field's type — so decoding every
     /// field from the same bytes at offset 0 (where all union
     /// fields live) is exactly the semantics a later field read
-    /// performs. Scalar and aggregate decodes are total on bytes,
-    /// so a multi-payload union decodes field by field; a field
-    /// whose decode fails (a pointer without provenance is the
-    /// usual case, handled by the disambiguation below when it is
-    /// the stored field) fails the whole constant, honestly.
+    /// performs. Scalar and aggregate decodes are total on
+    /// initialised bytes, so a multi-payload union decodes field
+    /// by field; a field whose decode fails over a fully
+    /// initialised span (a pointer without provenance is the
+    /// usual case, handled by the disambiguation below when it
+    /// is the stored field) fails the whole constant, honestly.
+    /// A field whose span is only partially initialised -- the
+    /// constant was written through a narrower field, so this
+    /// reading spans bytes the constant never determined --
+    /// decodes as uninitialised instead (see the field loop
+    /// below), provided a decoded field's image covers every
+    /// byte the span determines: the union's storage image is
+    /// composed from the fields that decode, so a determined
+    /// byte no decoded field carries would be lost, and that
+    /// shape stays undecoded for the erased form.
     fn decode_union(
         &mut self,
         def: &AdtDef,
@@ -1398,10 +1408,102 @@ impl Converter {
                 });
             }
         }
-        let mut out = Vec::new();
+        // Decode every field first: whether an undetermined
+        // field may decode as uninitialised (below) depends on
+        // the fields that do decode, in either order.
+        let mut decoded: Vec<Option<sm::ConstValue>> = Vec::new();
+        let mut budget_hits: Vec<bool> = Vec::new();
         for field in fields.iter() {
             let fty = field.ty_with_args(args);
-            out.push(self.decode_const(&fty, alloc, offset, depth + 1)?);
+            let budget_before = (
+                self.const_budget_failed,
+                self.const_scan_failed,
+                self.const_work_failed,
+            );
+            decoded.push(self.decode_const(&fty, alloc, offset, depth + 1));
+            budget_hits.push(
+                (self.const_budget_failed && !budget_before.0)
+                    || (self.const_scan_failed && !budget_before.1)
+                    || (self.const_work_failed && !budget_before.2),
+            );
+        }
+        // The widest span a genuinely decoded field covers with
+        // fully initialised bytes: its storage image reproduces
+        // the constant's bytes over that whole span.
+        let full_init_cover = fields
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                decoded[*i].is_some()
+                    && !self.range_partially_uninit(alloc, offset, sizes[*i] as usize)
+            })
+            .map(|(i, _)| sizes[i])
+            .max()
+            .unwrap_or(0);
+        let mut out = Vec::new();
+        let mut any_decoded = false;
+        let mut any_undetermined = false;
+        for (i, value) in decoded.into_iter().enumerate() {
+            match value {
+                Some(value) => {
+                    any_decoded = true;
+                    out.push(value);
+                }
+                None => {
+                    // A field whose span the constant's bytes do
+                    // not fully determine has no value of its
+                    // type: the constant was written through a
+                    // narrower field, so this wider reading spans
+                    // initialised and uninitialised bytes, and a
+                    // scalar leaf spanning both has no value form
+                    // (the failure the erased-block fallback in
+                    // `decode_ref` answers for a whole pointee).
+                    // Inside a union the field is not necessarily
+                    // lost: a union value's fields are readings of
+                    // one byte span, and the interpreter composes
+                    // the union's storage image from the fields
+                    // that do decode -- so the undetermined field
+                    // decodes as uninitialised, the same form the
+                    // provenance disambiguation above gives a
+                    // field that is not the stored one, PROVIDED
+                    // every byte this field's span determines is
+                    // covered by a decoded field's image: a
+                    // determined byte inside the undetermined
+                    // span itself (the constant's only write
+                    // landed there) has no other carrier, and
+                    // losing it would corrupt the constant, so
+                    // that shape keeps the erased form, which
+                    // preserves the bytes exactly. A failure the
+                    // budgets caused, or one over a fully
+                    // initialised span (an undecodable type, not
+                    // an undetermined reading), likewise keeps
+                    // the whole constant undecoded, honestly.
+                    if sizes[i] == 0
+                        || budget_hits[i]
+                        || !self.range_partially_uninit(alloc, offset, sizes[i] as usize)
+                    {
+                        return None;
+                    }
+                    let span = alloc
+                        .bytes
+                        .get(offset..offset + sizes[i] as usize)
+                        .unwrap_or(&[]);
+                    if let Some(highest) = span.iter().rposition(|b| b.is_some()) {
+                        if highest >= full_init_cover as usize {
+                            return None;
+                        }
+                    }
+                    any_undetermined = true;
+                    out.push(sm::ConstValue::Uninit);
+                }
+            }
+        }
+        // When no field's reading is determined at all, the
+        // structured form would hold nothing the constant
+        // determines, where the erased form preserves its bytes
+        // exactly: keep the constant undecoded for it.
+        if any_undetermined && !any_decoded {
+            return None;
         }
         Some(sm::ConstValue::Adt {
             variant: 0,
